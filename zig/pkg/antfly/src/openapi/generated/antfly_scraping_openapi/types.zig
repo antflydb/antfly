@@ -40,7 +40,7 @@ pub const HTTPCredentialConfig = struct {
 
 /// Configuration for remote content fetching (remotePDF, remoteMedia, remoteText templates). Consolidates S3 credentials and security settings separate from backup storage. **Credential Resolution Order:** 1. Explicit `credentials="name"` parameter in template 2. First credential where `buckets` glob pattern matches URL's bucket 3. `default_s3` credential 4. Legacy fallback: `storage.s3` credentials (backward compatibility)
 pub const RemoteContentConfig = struct {
-    /// Global security defaults for remote content operations. Overrides top-level content_security when set.
+    /// Global security defaults for remote content operations.
     security: ?ContentSecurityConfig = null,
     /// Default S3 credential name when no bucket pattern matches.
     default_s3: ?[]const u8 = null,

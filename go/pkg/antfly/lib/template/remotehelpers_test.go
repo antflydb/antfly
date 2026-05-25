@@ -151,8 +151,10 @@ func TestErrorToDirective(t *testing.T) {
 
 func TestResolveCredentialsDoesNotResolveS3ForHTTPURL(t *testing.T) {
 	scraping.SetDefaultS3Credentials(nil)
-	scraping.SetDefaultSecurityConfig(nil)
-	scraping.InitRemoteContentConfig(&scraping.RemoteContentConfig{
+	scraping.InitRemoteContentConfigWithOptions(&scraping.RemoteContentConfig{
+		Security: scraping.ContentSecurityConfig{
+			BlockPrivateIps: false,
+		},
 		S3: map[string]scraping.S3CredentialConfig{
 			"github": {
 				Endpoint:        "s3.amazonaws.com",
@@ -162,6 +164,9 @@ func TestResolveCredentialsDoesNotResolveS3ForHTTPURL(t *testing.T) {
 			},
 		},
 		DefaultS3: "github",
+	}, scraping.RemoteContentInitOptions{
+		GlobalSecurityConfigured:        true,
+		GlobalBlockPrivateIpsConfigured: true,
 	})
 	defer scraping.InitRemoteContentConfig(nil)
 
@@ -181,5 +186,6 @@ func TestResolveCredentialsDoesNotResolveS3ForHTTPURL(t *testing.T) {
 	s3Creds, securityConfig := resolveCredentials("https://raw.githubusercontent.com/antflydb/antfly/HEAD/README.md", "")
 	require.Nil(t, s3Creds)
 	require.NotNil(t, securityConfig)
+	require.False(t, securityConfig.BlockPrivateIps)
 	require.NotContains(t, logs.String(), "credential resolution failed")
 }

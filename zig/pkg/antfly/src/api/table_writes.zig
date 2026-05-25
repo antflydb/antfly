@@ -5615,10 +5615,19 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
 }
 
 fn parseIndexConfig(alloc: std.mem.Allocator, index_name: []const u8, index_json: []const u8) !db_mod.types.IndexConfig {
+    return try parseIndexConfigWithOptions(alloc, index_name, index_json, .{});
+}
+
+fn parseIndexConfigWithOptions(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    index_json: []const u8,
+    options: managed_embedder.InitOptions,
+) !db_mod.types.IndexConfig {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
     defer parsed.deinit();
     const kind = try parseIndexKind(parsed.value);
-    const config_json = try extractIndexConfigJson(alloc, index_name, parsed.value);
+    const config_json = try extractIndexConfigJsonWithOptions(alloc, index_name, parsed.value, options);
     errdefer alloc.free(config_json);
     return .{
         .name = try alloc.dupe(u8, index_name),
@@ -5628,7 +5637,16 @@ fn parseIndexConfig(alloc: std.mem.Allocator, index_name: []const u8, index_json
 }
 
 pub fn validateIndexConfig(alloc: std.mem.Allocator, index_name: []const u8, index_json: []const u8) !void {
-    const cfg = try parseIndexConfig(alloc, index_name, index_json);
+    return try validateIndexConfigWithOptions(alloc, index_name, index_json, .{});
+}
+
+pub fn validateIndexConfigWithOptions(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    index_json: []const u8,
+    options: managed_embedder.InitOptions,
+) !void {
+    const cfg = try parseIndexConfigWithOptions(alloc, index_name, index_json, options);
     defer {
         alloc.free(cfg.name);
         alloc.free(cfg.config_json);
@@ -5644,10 +5662,19 @@ pub fn validateIndexConfig(alloc: std.mem.Allocator, index_name: []const u8, ind
 }
 
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {
+    return try extractIndexConfigJsonWithOptions(alloc, index_name, value, .{});
+}
+
+fn extractIndexConfigJsonWithOptions(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    value: std.json.Value,
+    options: managed_embedder.InitOptions,
+) ![]u8 {
     if (value != .object) return try alloc.dupe(u8, "{}");
     const kind = try parseIndexKind(value);
     switch (kind) {
-        .dense_vector, .sparse_vector => return try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, value),
+        .dense_vector, .sparse_vector => return try managed_embedder.translateEmbeddingsIndexConfigJsonWithOptions(alloc, index_name, value, options),
         else => {},
     }
 
@@ -5672,6 +5699,55 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
         const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    index_json: []const u8,
+    options: managed_embedder.InitOptions,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed.deinit();
+    if (try managed_embedder.normalizeEmbeddingsIndexDimensionJsonWithOptions(alloc, index_name, parsed.value, options)) |normalized| {
+        return normalized;
+    }
+    return try alloc.dupe(u8, index_json);
+}
+
+pub fn normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    options: managed_embedder.InitOptions,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonString(alloc, &out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        if (try managed_embedder.normalizeEmbeddingsIndexDimensionJsonWithOptions(alloc, entry.key_ptr.*, entry.value_ptr.*, options)) |normalized| {
+            defer alloc.free(normalized);
+            try out.appendSlice(alloc, normalized);
+        } else {
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        }
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
@@ -5710,6 +5786,12 @@ test "table write index validation checks expanded algebraic config semantics" {
     try std.testing.expectError(error.InvalidCreateTableRequest, validateIndexConfig(alloc, "sales_rollup",
         \\{"type":"algebraic","table":"sales","schema_version":1,"capability_fingerprint":"sales:v1","group_fields":[{"name":"customer","path":"customer","type":"keyword"}],"measure_fields":[{"name":"amount","path":"amount","type":"number"}],"materializations":[{"name":"sum_by_customer","op":"sum","group_by":["missing"],"measure":"amount"}]}
     ));
+}
+
+test "table write index parser trusts normalized managed embedding dimension without provider probe" {
+    try validateIndexConfig(std.testing.allocator, "semantic_idx",
+        \\{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+    );
 }
 
 fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {

@@ -41,6 +41,7 @@ const CliConfig = struct {
     compaction_enabled: ?bool = null,
     prune_enabled: ?bool = null,
     enrichment_enabled: ?bool = null,
+    remote_content_block_private_ips: ?bool = null,
     help: bool = false,
 };
 
@@ -73,6 +74,13 @@ pub fn runFromIterator(
         return;
     }
 
+    var remote_content: ?antfly.common.config.Config.RemoteContentConfig = null;
+    if (cli.remote_content_block_private_ips orelse parseEnvOptionalBool(init.environ_map, "ANTFLY_SERVERLESS_REMOTE_CONTENT_BLOCK_PRIVATE_IPS")) |block_private_ips| {
+        remote_content = .{
+            .security = .{ .block_private_ips = block_private_ips },
+        };
+    }
+
     const bootstrap = serverless.BootstrapConfig{
         .artifacts_uri = try resolveRequired(init.environ_map, cli.artifacts_uri, "ANTFLY_SERVERLESS_ARTIFACTS_URI"),
         .manifests_uri = try resolveRequired(init.environ_map, cli.manifests_uri, "ANTFLY_SERVERLESS_MANIFESTS_URI"),
@@ -93,6 +101,7 @@ pub fn runFromIterator(
         .compaction_enabled = cli.compaction_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_COMPACTION_ENABLED", true),
         .prune_enabled = cli.prune_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_PRUNE_ENABLED", true),
         .enrichment_enabled = cli.enrichment_enabled orelse parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_ENRICHMENT_ENABLED", true),
+        .remote_content = if (remote_content) |*cfg| cfg else null,
     };
     const listener_enabled = forced_listener orelse listenerEnabledForRole(bootstrap.role);
     const listener = if (listener_enabled) serverless_serverConfigFromEnv(init.environ_map, cli) else null;
@@ -282,6 +291,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.enrichment_enabled = try parseBoolArg(args.next() orelse return error.InvalidArguments);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--remote-content-block-private-ips")) {
+            cfg.remote_content_block_private_ips = try parseBoolArg(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
         return error.InvalidArguments;
     }
     return cfg;
@@ -316,6 +329,14 @@ fn parseEnvBoolOrDefault(
 ) bool {
     const raw = env_map.get(env_name) orelse return default;
     return parseBool(raw) catch default;
+}
+
+fn parseEnvOptionalBool(
+    env_map: *std.process.Environ.Map,
+    env_name: []const u8,
+) ?bool {
+    const raw = env_map.get(env_name) orelse return null;
+    return parseBool(raw) catch null;
 }
 
 fn serverless_serverConfigFromEnv(
@@ -382,6 +403,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --compaction-enabled <true|false>
         \\  --prune-enabled <true|false>
         \\  --enrichment-enabled <true|false>
+        \\  --remote-content-block-private-ips <true|false>
         \\  --help
         \\
         \\supported uri schemes:
@@ -408,6 +430,7 @@ fn printUsage(argv0: []const u8) void {
         \\  ANTFLY_SERVERLESS_COMPACTION_ENABLED default: true
         \\  ANTFLY_SERVERLESS_PRUNE_ENABLED default: true
         \\  ANTFLY_SERVERLESS_ENRICHMENT_ENABLED default: true
+        \\  ANTFLY_SERVERLESS_REMOTE_CONTENT_BLOCK_PRIVATE_IPS default: unset
         \\
     ,
         .{argv0},

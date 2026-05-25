@@ -41,6 +41,7 @@ pub const RenderConfig = struct {
 };
 
 const remote_fetch_security = scraping.ContentSecurityConfig{
+    .block_private_ips = true,
     .max_download_size_bytes = 4 << 20,
 };
 
@@ -279,14 +280,14 @@ fn downloadRemoteContentOutcomeAlloc(
     return try scraping.downloadContentOutcomeAllocWithHeaders(
         render_ctx.alloc,
         url,
-        resolved.security orelse &remote_fetch_security,
+        &resolved.security,
         if (resolved.s3_credentials) |*creds| creds else null,
         resolved.http_headers,
     );
 }
 
 const ResolvedRemoteContentFetchOptions = struct {
-    security: ?*const scraping.ContentSecurityConfig = null,
+    security: scraping.ContentSecurityConfig = remote_fetch_security,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
     http_headers: ?[]scraping.HTTPHeader = null,
 
@@ -311,26 +312,45 @@ fn resolveRemoteContentFetchOptions(
     credential_name: ?[]const u8,
 ) !ResolvedRemoteContentFetchOptions {
     const cfg = remote_content orelse return .{};
-    const parsed = std.Uri.parse(url) catch return .{ .security = if (cfg.security) |*security| security else null };
+    const parsed = std.Uri.parse(url) catch return .{ .security = effectiveRemoteContentSecurity(cfg, null) };
     if (isUriScheme(parsed, "s3")) {
         const credential = selectS3Credential(cfg, parsed, credential_name);
         return .{
-            .security = if (credential) |creds|
-                if (creds.security) |*security| security else if (cfg.security) |*security| security else null
-            else if (cfg.security) |*security| security else null,
+            .security = effectiveRemoteContentSecurity(cfg, if (credential) |creds| creds.security else null),
             .s3_credentials = if (credential) |creds| try resolveS3Credential(alloc, secret_store, creds) else null,
         };
     }
     if (isUriScheme(parsed, "http") or isUriScheme(parsed, "https")) {
         const credential = selectHttpCredential(cfg, url, credential_name);
         return .{
-            .security = if (credential) |creds|
-                if (creds.security) |*security| security else if (cfg.security) |*security| security else null
-            else if (cfg.security) |*security| security else null,
+            .security = effectiveRemoteContentSecurity(cfg, if (credential) |creds| creds.security else null),
             .http_headers = if (credential) |creds| try resolveHttpHeaders(alloc, secret_store, creds) else null,
         };
     }
-    return .{ .security = if (cfg.security) |*security| security else null };
+    return .{ .security = effectiveRemoteContentSecurity(cfg, null) };
+}
+
+fn effectiveRemoteContentSecurity(
+    cfg: *const scraping.RemoteContentConfig,
+    credential_security: ?scraping.ContentSecurityConfig,
+) scraping.ContentSecurityConfig {
+    var effective = remote_fetch_security;
+    if (cfg.security) |security| applyContentSecurityOverride(&effective, security);
+    if (credential_security) |security| applyContentSecurityOverride(&effective, security);
+    return effective;
+}
+
+fn applyContentSecurityOverride(
+    effective: *scraping.ContentSecurityConfig,
+    override: scraping.ContentSecurityConfig,
+) void {
+    if (override.allowed_hosts) |value| effective.allowed_hosts = value;
+    if (override.block_private_ips) |value| effective.block_private_ips = value;
+    if (override.max_download_size_bytes) |value| effective.max_download_size_bytes = value;
+    if (override.download_timeout_seconds) |value| effective.download_timeout_seconds = value;
+    if (override.max_image_dimension) |value| effective.max_image_dimension = value;
+    if (override.allowed_paths) |value| effective.allowed_paths = value;
+    if (override.user_agent) |value| effective.user_agent = value;
 }
 
 fn isUriScheme(parsed: std.Uri, scheme: []const u8) bool {
@@ -456,6 +476,28 @@ test "template remote does not apply s3 credentials to http urls" {
     defer resolved.deinit(alloc);
 
     try std.testing.expect(resolved.s3_credentials == null);
+    try std.testing.expectEqual(@as(?bool, true), resolved.security.block_private_ips);
+}
+
+test "template remote applies remote content security to http urls" {
+    const alloc = std.testing.allocator;
+
+    var cfg = scraping.RemoteContentConfig{
+        .security = .{ .block_private_ips = false },
+    };
+    defer cfg.deinit(alloc);
+
+    var resolved = try resolveRemoteContentFetchOptions(
+        alloc,
+        &cfg,
+        null,
+        "http://127.0.0.1:8080/doc.txt",
+        null,
+    );
+    defer resolved.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?bool, false), resolved.security.block_private_ips);
+    try std.testing.expectEqual(@as(?u64, 4 << 20), resolved.security.max_download_size_bytes);
 }
 
 test "template remote renders remotePDF extract with injected pdf backend" {
@@ -522,9 +564,14 @@ test "template remote renders remotePDF extract with injected pdf backend" {
         .extract_text_fn = FakePdfBackend.extract,
         .render_first_page_png_fn = FakePdfBackend.render,
     };
+    var remote_content = scraping.RemoteContentConfig{
+        .security = .{ .block_private_ips = false },
+    };
+    defer remote_content.deinit(alloc);
 
     const rendered = try renderJsonToTextWithConfig(alloc, "{{remotePDF url=pdf_url}}", json_doc, .{
         .pdf_backend = backend,
+        .remote_content = &remote_content,
     });
     defer alloc.free(rendered);
     try std.testing.expectEqualStrings("pdf extracted text", rendered);
@@ -580,9 +627,14 @@ test "template remote renders remoteMedia pdf mode=render with injected pdf back
         .extract_text_fn = FakePdfBackend.extract,
         .render_first_page_png_fn = FakePdfBackend.render,
     };
+    var remote_content = scraping.RemoteContentConfig{
+        .security = .{ .block_private_ips = false },
+    };
+    defer remote_content.deinit(alloc);
 
     const parts = try renderJsonToPartsWithConfig(alloc, "{{remoteMedia url=pdf_url mode=\"render\"}}", json_doc, .{
         .pdf_backend = backend,
+        .remote_content = &remote_content,
     });
     defer template_mod.freeContentParts(alloc, parts);
 
@@ -630,8 +682,14 @@ test "template remote preserves http status from shared scraping fetches" {
 
     const json_doc = try std.fmt.allocPrint(alloc, "{{\"missing_url\":{f}}}", .{std.json.fmt(missing_url, .{})});
     defer alloc.free(json_doc);
+    var remote_content = scraping.RemoteContentConfig{
+        .security = .{ .block_private_ips = false },
+    };
+    defer remote_content.deinit(alloc);
 
-    const rendered = try renderJsonToTextWithConfig(alloc, "{{remoteText url=missing_url}}", json_doc, .{});
+    const rendered = try renderJsonToTextWithConfig(alloc, "{{remoteText url=missing_url}}", json_doc, .{
+        .remote_content = &remote_content,
+    });
     defer alloc.free(rendered);
 
     const directives = try template_mod.parseErrorDirectives(alloc, rendered);

@@ -160,8 +160,10 @@ func parseConfigWithOptions(v *viper.Viper, opts parseConfigOptions) (*common.Co
 		return nil, err
 	}
 
-	// Initialize remote content configuration for S3 URL downloads in templates
-	scraping.InitRemoteContentConfig(&config.RemoteContent)
+	// Initialize remote content configuration for template helpers. Viper tracks
+	// field presence, which lets block_private_ips: false override the safe
+	// default even though the generated Go config uses a plain bool.
+	scraping.InitRemoteContentConfigWithOptions(&config.RemoteContent, remoteContentInitOptions(v, &config))
 
 	// Set default Termite URL from config so all consumers (embeddings,
 	// generators, rerankers, chunkers) can resolve it without explicit config.
@@ -173,6 +175,26 @@ func parseConfigWithOptions(v *viper.Viper, opts parseConfigOptions) (*common.Co
 	common.InitRegistryFromConfig(&config)
 
 	return &config, nil
+}
+
+func remoteContentInitOptions(v *viper.Viper, config *common.Config) scraping.RemoteContentInitOptions {
+	opts := scraping.RemoteContentInitOptions{
+		GlobalSecurityConfigured:        v.IsSet("remote_content.security"),
+		GlobalBlockPrivateIpsConfigured: v.IsSet("remote_content.security.block_private_ips"),
+		S3SecurityConfigured:            make(map[string]bool, len(config.RemoteContent.S3)),
+		S3BlockPrivateIpsConfigured:     make(map[string]bool, len(config.RemoteContent.S3)),
+		HTTPSecurityConfigured:          make(map[string]bool, len(config.RemoteContent.Http)),
+		HTTPBlockPrivateIpsConfigured:   make(map[string]bool, len(config.RemoteContent.Http)),
+	}
+	for name := range config.RemoteContent.S3 {
+		opts.S3SecurityConfigured[name] = v.IsSet(fmt.Sprintf("remote_content.s3.%s.security", name))
+		opts.S3BlockPrivateIpsConfigured[name] = v.IsSet(fmt.Sprintf("remote_content.s3.%s.security.block_private_ips", name))
+	}
+	for name := range config.RemoteContent.Http {
+		opts.HTTPSecurityConfigured[name] = v.IsSet(fmt.Sprintf("remote_content.http.%s.security", name))
+		opts.HTTPBlockPrivateIpsConfigured[name] = v.IsSet(fmt.Sprintf("remote_content.http.%s.security.block_private_ips", name))
+	}
+	return opts
 }
 
 func getLogger(c *common.Config) *zap.Logger {

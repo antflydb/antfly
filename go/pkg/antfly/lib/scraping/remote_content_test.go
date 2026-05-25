@@ -208,6 +208,97 @@ func TestSecurityConfigMerge(t *testing.T) {
 	}
 }
 
+func TestSecurityConfigMerge_CredentialExplicitFalseOverridesGlobal(t *testing.T) {
+	InitRemoteContentConfigWithOptions(&RemoteContentConfig{
+		Security: ContentSecurityConfig{
+			BlockPrivateIps: true,
+		},
+		S3: map[string]S3CredentialConfig{
+			"local": {
+				Endpoint:        "localhost:9000",
+				AccessKeyId:     "local-key",
+				SecretAccessKey: "local-secret",
+				Security: ContentSecurityConfig{
+					BlockPrivateIps: false,
+				},
+			},
+		},
+	}, RemoteContentInitOptions{
+		GlobalSecurityConfigured:        true,
+		GlobalBlockPrivateIpsConfigured: true,
+		S3SecurityConfigured: map[string]bool{
+			"local": true,
+		},
+		S3BlockPrivateIpsConfigured: map[string]bool{
+			"local": true,
+		},
+	})
+	defer InitRemoteContentConfig(nil)
+
+	_, sec, err := ResolveS3Credentials("s3://any-bucket/doc.pdf", "local")
+	if err != nil {
+		t.Fatalf("ResolveS3Credentials failed: %v", err)
+	}
+	if sec.BlockPrivateIps {
+		t.Error("expected credential security block_private_ips=false to override global true")
+	}
+}
+
+func TestGetEffectiveSecurity_ExplicitFalseOverridesDefault(t *testing.T) {
+	InitRemoteContentConfigWithOptions(&RemoteContentConfig{
+		Security: ContentSecurityConfig{
+			BlockPrivateIps: false,
+		},
+	}, RemoteContentInitOptions{
+		GlobalSecurityConfigured:        true,
+		GlobalBlockPrivateIpsConfigured: true,
+	})
+	defer InitRemoteContentConfig(nil)
+
+	sec := GetEffectiveSecurity()
+	if sec.BlockPrivateIps {
+		t.Error("expected explicit block_private_ips=false to override default true")
+	}
+	if sec.MaxDownloadSizeBytes != 100*1024*1024 {
+		t.Errorf("expected default max download size, got %d", sec.MaxDownloadSizeBytes)
+	}
+	if sec.DownloadTimeoutSeconds != 30 {
+		t.Errorf("expected default download timeout, got %d", sec.DownloadTimeoutSeconds)
+	}
+	if sec.MaxImageDimension != 2048 {
+		t.Errorf("expected default max image dimension, got %d", sec.MaxImageDimension)
+	}
+}
+
+func TestResolveS3Credentials_FallbackUsesRemoteContentSecurity(t *testing.T) {
+	SetDefaultS3Credentials(&S3Credentials{
+		Endpoint:        "s3.amazonaws.com",
+		AccessKeyId:     "fallback-key",
+		SecretAccessKey: "fallback-secret",
+	})
+	defer SetDefaultS3Credentials(nil)
+	InitRemoteContentConfigWithOptions(&RemoteContentConfig{
+		Security: ContentSecurityConfig{
+			BlockPrivateIps: false,
+		},
+	}, RemoteContentInitOptions{
+		GlobalSecurityConfigured:        true,
+		GlobalBlockPrivateIpsConfigured: true,
+	})
+	defer InitRemoteContentConfig(nil)
+
+	creds, sec, err := ResolveS3Credentials("s3://unmatched-bucket/doc.pdf", "")
+	if err != nil {
+		t.Fatalf("ResolveS3Credentials failed: %v", err)
+	}
+	if creds.AccessKeyId != "fallback-key" {
+		t.Errorf("expected fallback-key, got %s", creds.AccessKeyId)
+	}
+	if sec.BlockPrivateIps {
+		t.Error("expected fallback S3 security to use remote_content.security block_private_ips=false")
+	}
+}
+
 func TestExtractBucket(t *testing.T) {
 	tests := []struct {
 		url    string
