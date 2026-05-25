@@ -2514,7 +2514,7 @@ fn recordArtifactBytes(runtime: *EnrichmentRuntime, kind: enrichment_artifact_co
     switch (kind) {
         .dense_embedding => runtime.dense_artifact_bytes_written += bytes,
         .sparse_embedding => runtime.sparse_artifact_bytes_written += bytes,
-        .chunk_json, .summary_text => runtime.chunk_artifact_bytes_written += bytes,
+        .chunk_json, .asset => runtime.chunk_artifact_bytes_written += bytes,
         .graph_edge => {},
     }
 }

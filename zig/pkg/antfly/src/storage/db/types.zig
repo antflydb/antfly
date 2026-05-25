@@ -176,13 +176,13 @@ pub fn freeIndexConfigs(alloc: Allocator, configs: []IndexConfig) void {
 
 pub const EnrichmentKind = enum {
     chunk,
-    summary,
+    asset,
     embedding,
 };
 
 pub const ArtifactKind = enum {
     chunk,
-    summary,
+    asset,
     embedding,
 };
 
@@ -270,19 +270,6 @@ pub fn freeEnrichmentConfigs(alloc: Allocator, configs: []EnrichmentConfig) void
     if (configs.len > 0) alloc.free(configs);
 }
 
-pub const EnrichmentSummaryWrite = struct {
-    index_name: []u8,
-    doc_key: []u8,
-    text: []u8,
-
-    pub fn deinit(self: *EnrichmentSummaryWrite, alloc: Allocator) void {
-        alloc.free(self.index_name);
-        alloc.free(self.doc_key);
-        alloc.free(self.text);
-        self.* = undefined;
-    }
-};
-
 pub const EnrichmentDenseEmbeddingWrite = struct {
     index_name: []u8,
     doc_key: []u8,
@@ -333,7 +320,6 @@ pub const ExtractEnrichmentsResult = struct {
     cleaned_writes: []BatchWrite = &.{},
     dense_embeddings: []EnrichmentDenseEmbeddingWrite = &.{},
     sparse_embeddings: []EnrichmentSparseEmbeddingWrite = &.{},
-    summaries: []EnrichmentSummaryWrite = &.{},
     graph_writes: []GraphEdgeWrite = &.{},
 
     pub fn deinit(self: *ExtractEnrichmentsResult, alloc: Allocator) void {
@@ -348,9 +334,6 @@ pub const ExtractEnrichmentsResult = struct {
 
         for (self.sparse_embeddings) |*embedding| embedding.deinit(alloc);
         if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
-
-        for (self.summaries) |*summary| summary.deinit(alloc);
-        if (self.summaries.len > 0) alloc.free(self.summaries);
 
         for (self.graph_writes) |*write| {
             alloc.free(@constCast(write.index_name));

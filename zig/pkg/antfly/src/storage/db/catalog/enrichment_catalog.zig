@@ -17,7 +17,7 @@ const Allocator = std.mem.Allocator;
 
 pub const EnrichmentType = enum {
     chunk,
-    summary,
+    asset,
     embedding,
 };
 

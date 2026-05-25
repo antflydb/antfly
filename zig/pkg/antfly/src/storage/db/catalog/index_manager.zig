@@ -5222,7 +5222,7 @@ pub const IndexManager = struct {
                     return error.InvalidEnrichmentConfig;
                 }
             },
-            .summary => {},
+            .asset => {},
         }
     }
 
@@ -5258,7 +5258,7 @@ pub const IndexManager = struct {
                     }
                 }
             },
-            .summary => {},
+            .asset => {},
         }
         return false;
     }
@@ -9707,7 +9707,7 @@ const GraphConfig = struct {
 fn publicEnrichmentKindToInternal(kind: types.EnrichmentKind) enrichment_catalog.EnrichmentType {
     return switch (kind) {
         .chunk => .chunk,
-        .summary => .summary,
+        .asset => .asset,
         .embedding => .embedding,
     };
 }
@@ -9729,7 +9729,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
 fn internalEnrichmentKindToPublic(kind: enrichment_catalog.EnrichmentType) types.EnrichmentKind {
     return switch (kind) {
         .chunk => .chunk,
-        .summary => .summary,
+        .asset => .asset,
         .embedding => .embedding,
     };
 }

@@ -3271,7 +3271,6 @@ pub const DB = struct {
                     .mentioned_graph_indexes = &.{},
                     .dense_embeddings = &.{},
                     .sparse_embeddings = &.{},
-                    .summaries = &.{},
                 };
                 extracted_initialized += 1;
                 try store_writes.append(self.alloc, .{
@@ -5655,11 +5654,6 @@ pub const DB = struct {
             for (sparse_embeddings.items) |*embedding| embedding.deinit(alloc);
             sparse_embeddings.deinit(alloc);
         }
-        var summaries = std.ArrayListUnmanaged(types.EnrichmentSummaryWrite).empty;
-        errdefer {
-            for (summaries.items) |*summary| summary.deinit(alloc);
-            summaries.deinit(alloc);
-        }
         var graph_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
         errdefer {
             for (graph_writes.items) |*write| {
@@ -5709,13 +5703,6 @@ pub const DB = struct {
                     .values = try alloc.dupe(f32, embedding.values),
                 });
             }
-            for (extracted.summaries) |summary| {
-                try summaries.append(alloc, .{
-                    .index_name = try alloc.dupe(u8, summary.index_name),
-                    .doc_key = try alloc.dupe(u8, summary.doc_key),
-                    .text = try alloc.dupe(u8, summary.text),
-                });
-            }
             for (extracted.graph_writes) |graph_write| {
                 try graph_writes.append(alloc, .{
                     .index_name = try alloc.dupe(u8, graph_write.index_name),
@@ -5734,7 +5721,6 @@ pub const DB = struct {
             .cleaned_writes = try cleaned_writes.toOwnedSlice(alloc),
             .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
             .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
-            .summaries = try summaries.toOwnedSlice(alloc),
             .graph_writes = try graph_writes.toOwnedSlice(alloc),
         };
     }
@@ -10470,7 +10456,7 @@ fn artifactProjectionValue(alloc: Allocator, artifact_ref: types.ArtifactRef, ra
                 try putOwnedValue(alloc, &obj, "value", .{ .string = try alloc.dupe(u8, raw) });
             }
         },
-        .summary => {
+        .asset => {
             try putOwnedValue(alloc, &obj, "value", .{ .string = try artifactTextPayloadAlloc(alloc, raw) });
         },
         .embedding => {
@@ -10561,7 +10547,7 @@ fn artifactRefJsonValue(alloc: Allocator, artifact_ref: types.ArtifactRef) !std.
 fn artifactKindText(kind: types.ArtifactKind) []const u8 {
     return switch (kind) {
         .chunk => "chunk",
-        .summary => "summary",
+        .asset => "asset",
         .embedding => "embedding",
     };
 }
@@ -10569,7 +10555,7 @@ fn artifactKindText(kind: types.ArtifactKind) []const u8 {
 fn artifactSetKindText(kind: types.ArtifactKind) []const u8 {
     return switch (kind) {
         .chunk => "chunk_set",
-        .summary => "summary_set",
+        .asset => "asset_set",
         .embedding => "embedding_set",
     };
 }
@@ -10577,14 +10563,14 @@ fn artifactSetKindText(kind: types.ArtifactKind) []const u8 {
 fn artifactContentType(kind: types.ArtifactKind) []const u8 {
     return switch (kind) {
         .chunk => "application/json",
-        .summary => "text/plain",
+        .asset => "application/octet-stream",
         .embedding => "application/vnd.antfly.embedding+binary",
     };
 }
 
 fn artifactTextPayloadAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
     const header = enrichment_artifact_codec.decodeHeader(raw) catch return try alloc.dupe(u8, raw);
-    if (header.kind != .summary_text) return try alloc.dupe(u8, raw);
+    if (header.kind != .asset) return try alloc.dupe(u8, raw);
     return try alloc.dupe(u8, raw[enrichment_artifact_codec.header_len..][0..header.payload_len]);
 }
 
@@ -21924,14 +21910,12 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
     try std.testing.expectEqualStrings("sparse_idx", result.sparse_embeddings[0].index_name);
     try std.testing.expectEqual(@as(usize, 2), result.sparse_embeddings[0].indices.len);
 
-    try std.testing.expectEqual(@as(usize, 0), result.summaries.len);
-
     try std.testing.expectEqual(@as(usize, 1), result.graph_writes.len);
     try std.testing.expectEqualStrings("graph_v1", result.graph_writes[0].index_name);
     try std.testing.expectEqualStrings("doc:b", result.graph_writes[0].target);
 }
 
-test "db extractEnrichments rejects unsupported summaries field" {
+test "db extractEnrichments rejects unsupported legacy summaries field" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -21941,7 +21925,7 @@ test "db extractEnrichments rejects unsupported summaries field" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try std.testing.expectError(error.UnsupportedSummaryField, db.extractEnrichments(alloc, &.{
+    try std.testing.expectError(error.UnsupportedReservedField, db.extractEnrichments(alloc, &.{
         .{
             .key = "doc:a",
             .value = "{\"title\":\"alpha\",\"_summaries\":{\"sum_idx\":\"brief\"}}",
@@ -32509,6 +32493,16 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
     defer alloc.free(dense_key);
     try putDenseEmbeddingArtifactForTest(&db, alloc, dense_key, null, &[_]f32{ 1, 2, 3 });
 
+    var ocr_ref = types.ArtifactRef{
+        .document_id = try alloc.dupe(u8, "doc:a"),
+        .name = try alloc.dupe(u8, "page_ocr_v1"),
+        .kind = .asset,
+    };
+    defer ocr_ref.deinit(alloc);
+    const ocr_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, ocr_ref);
+    defer alloc.free(ocr_key);
+    try db.core.store.put(ocr_key, "Revenue increased");
+
     var result = (try db.lookup(alloc, "doc:a", .{
         .fields = &.{ "title", "_artifacts" },
         .include_all_fields = false,
@@ -32536,6 +32530,13 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
     try std.testing.expectEqualStrings("application/vnd.antfly.embedding+binary", embedding.get("content_type").?.string);
     try std.testing.expectEqual(@as(i64, 3), embedding.get("dims").?.integer);
     try std.testing.expect(embedding.get("value").? == .null);
+
+    const ocr = artifacts.get("page_ocr_v1").?.object;
+    try std.testing.expect(std.mem.startsWith(u8, ocr.get("artifact_id").?.string, "af1:asset:"));
+    try std.testing.expectEqualStrings("asset", ocr.get("artifact_ref").?.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("asset", ocr.get("kind").?.string);
+    try std.testing.expectEqualStrings("application/octet-stream", ocr.get("content_type").?.string);
+    try std.testing.expectEqualStrings("Revenue increased", ocr.get("value").?.string);
 }
 
 test "db search includes chunk artifacts on hydrated hits when _chunks is requested" {

@@ -935,7 +935,7 @@ const JsonWritePair = struct {
 fn artifactKindLabel(kind: db_mod.types.ArtifactKind) []const u8 {
     return switch (kind) {
         .chunk => "chunk",
-        .summary => "summary",
+        .asset => "asset",
         .embedding => "embedding",
     };
 }
@@ -1044,25 +1044,6 @@ const JsonSparseEnrichmentWrite = struct {
     }
 };
 
-const JsonSummaryEnrichmentWrite = struct {
-    index_name: []const u8,
-    doc_key_b64: []u8,
-    text: []const u8,
-
-    fn init(alloc: Allocator, write: db_mod.types.EnrichmentSummaryWrite) !JsonSummaryEnrichmentWrite {
-        return .{
-            .index_name = write.index_name,
-            .doc_key_b64 = try dupBase64(alloc, write.doc_key),
-            .text = write.text,
-        };
-    }
-
-    fn deinit(self: *JsonSummaryEnrichmentWrite, alloc: Allocator) void {
-        alloc.free(self.doc_key_b64);
-        self.* = undefined;
-    }
-};
-
 const JsonGraphWrite = struct {
     index_name: []const u8,
     source_b64: []u8,
@@ -1120,7 +1101,6 @@ const JsonDocumentEnrichmentWrite = struct {
 const JsonExtractEnrichmentsResult = struct {
     dense_embeddings: []JsonDenseEnrichmentWrite,
     sparse_embeddings: []JsonSparseEnrichmentWrite,
-    summaries: []JsonSummaryEnrichmentWrite,
     graph_writes: []JsonGraphWrite,
 
     fn deinit(self: *JsonExtractEnrichmentsResult, alloc: Allocator) void {
@@ -1128,8 +1108,6 @@ const JsonExtractEnrichmentsResult = struct {
         if (self.dense_embeddings.len > 0) alloc.free(self.dense_embeddings);
         for (self.sparse_embeddings) |*item| item.deinit(alloc);
         if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
-        for (self.summaries) |*item| item.deinit(alloc);
-        if (self.summaries.len > 0) alloc.free(self.summaries);
         for (self.graph_writes) |*item| item.deinit(alloc);
         if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
         self.* = undefined;
@@ -1181,17 +1159,6 @@ fn buildJsonExtractEnrichmentsResult(
         sparse_initialized += 1;
     }
 
-    var summaries = try alloc.alloc(JsonSummaryEnrichmentWrite, result.summaries.len);
-    var summaries_initialized: usize = 0;
-    errdefer {
-        for (summaries[0..summaries_initialized]) |*item| item.deinit(alloc);
-        alloc.free(summaries);
-    }
-    for (result.summaries, 0..) |item, i| {
-        summaries[i] = try JsonSummaryEnrichmentWrite.init(alloc, item);
-        summaries_initialized += 1;
-    }
-
     var graph_writes = try alloc.alloc(JsonGraphWrite, result.graph_writes.len);
     var graph_initialized: usize = 0;
     errdefer {
@@ -1206,7 +1173,6 @@ fn buildJsonExtractEnrichmentsResult(
     return .{
         .dense_embeddings = dense_embeddings,
         .sparse_embeddings = sparse_embeddings,
-        .summaries = summaries,
         .graph_writes = graph_writes,
     };
 }

@@ -32,11 +32,14 @@ Storage keys should use:
 Examples:
 
 - `<doc>:e:chunk:body_chunks_v1:0`
-- `<doc>:e:summary:tldr_v1`
+- `<doc>:e:asset:ocr_text_v1`
 - `<doc>:e:embedding:body_dense_v1`
 
-This keeps artifact type explicit and allows one chunking or summary pass to
-feed multiple indexes without duplicating sidecar storage.
+This keeps artifact type explicit and allows one chunking or asset-output
+pass to feed multiple indexes without duplicating sidecar storage.
+Model-produced text, OCR, transcripts, classifications, entity extraction, and
+other derived payloads use the generic `asset` artifact type, with the specific
+media/schema encoded by `content_type`, artifact name, and enrichment metadata.
 
 Current first implementation:
 
