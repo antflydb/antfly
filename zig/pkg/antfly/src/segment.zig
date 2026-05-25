@@ -193,6 +193,7 @@ pub const SegmentWriter = struct {
     pub fn build(self: *SegmentWriter) ![]u8 {
         var out = std.ArrayListUnmanaged(u8).empty;
         defer out.deinit(self.alloc);
+        try out.ensureTotalCapacity(self.alloc, self.estimatedBuildSize());
 
         // 1. Write stored fields
         const stored_offset: u64 = out.items.len;
@@ -232,6 +233,33 @@ pub const SegmentWriter = struct {
         try out.appendSlice(self.alloc, &magic);
 
         return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn estimatedBuildSize(self: *const SegmentWriter) usize {
+        var total: usize = 1 + 4 + self.stored_fields.items.len * 8;
+        for (self.stored_fields.items) |doc| {
+            total +|= 2 + doc.id.len + 4;
+            if (doc.is_compressed) {
+                total +|= doc.data.len;
+            } else {
+                // Snappy's worst case is slightly larger than input; this is
+                // only a capacity hint, so keep it simple and conservative.
+                total +|= doc.data.len + doc.data.len / 8 + 64;
+            }
+        }
+
+        var section_count: usize = 0;
+        for (self.fields.items) |field| {
+            total +|= 2 + field.name.len + 2;
+            section_count +|= field.sections.items.len;
+            for (field.sections.items) |section| {
+                total +|= section.data.len;
+                total +|= 2 + 8 + 8;
+            }
+        }
+        total +|= section_count * @sizeOf(SectionLoc);
+        total +|= 40;
+        return total;
     }
 
     fn writeStoredFields(self: *SegmentWriter, out: *std.ArrayListUnmanaged(u8)) !void {

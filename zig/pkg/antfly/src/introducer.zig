@@ -633,6 +633,20 @@ fn appendTypedFieldProjectionValue(
     });
 }
 
+pub fn detectTypedFieldProjectionValue(
+    alloc: Allocator,
+    field_name: []const u8,
+    value: std.json.Value,
+    text_analysis: TextAnalysisConfig,
+) !?TypedFieldValue {
+    const detected = detectTypedValue(field_name, value, text_analysis) orelse return null;
+    return .{
+        .field_name = try alloc.dupe(u8, field_name),
+        .value_type = detected.value_type,
+        .value = try cloneTypedValue(alloc, detected.value),
+    };
+}
+
 fn cloneTypedValue(alloc: Allocator, value: typed_dv.TypedValue) !typed_dv.TypedValue {
     return switch (value) {
         .bytes_val => |bytes| .{ .bytes_val = try alloc.dupe(u8, bytes) },

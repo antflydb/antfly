@@ -119,10 +119,28 @@ pub const WriteProfile = struct {
 
 pub const SparseIndex = struct {
     next_doc_num: u64 = 0,
+    chunk_size: u32 = 1024,
 
     pub const Stats = struct {
         doc_count: u64 = 0,
         term_count: u64 = 0,
+    };
+
+    pub const SegmentCompactionOptions = struct {
+        min_segments: usize = 32,
+        max_segments: usize = 128,
+    };
+
+    pub const SegmentCompactionTask = struct {
+        pub fn deinit(self: *SegmentCompactionTask, _: Allocator) void {
+            self.* = undefined;
+        }
+    };
+
+    pub const SegmentCompactionResult = struct {
+        pub fn deinit(self: *SegmentCompactionResult, _: Allocator) void {
+            self.* = undefined;
+        }
     };
 
     pub fn open(_: Allocator, _: [*:0]const u8, _: SparseIndexOptions) !SparseIndex {
@@ -170,6 +188,18 @@ pub const SparseIndex = struct {
     }
 
     pub fn batchWithOptions(_: *SparseIndex, _: []const SparseWrite, _: []const []const u8, _: BatchOptions) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn beginSegmentCompactionTask(_: *SparseIndex, _: Allocator, _: SegmentCompactionOptions) !?SegmentCompactionTask {
+        return null;
+    }
+
+    pub fn executeSegmentCompactionTask(_: Allocator, _: *const SegmentCompactionTask, _: u32) !SegmentCompactionResult {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn finishSegmentCompactionTask(_: *SparseIndex, _: *const SegmentCompactionTask, _: *SegmentCompactionResult) !bool {
         return error.UnsupportedPlatform;
     }
 

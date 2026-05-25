@@ -956,6 +956,20 @@ pub const IndexManager = struct {
         index: sparse_mod.SparseIndex,
     };
 
+    pub const SparseCompactionTask = struct {
+        index_name: []u8,
+        chunk_size: u32,
+        task: sparse_mod.SparseIndex.SegmentCompactionTask,
+
+        pub fn deinit(self: *SparseCompactionTask, alloc: Allocator) void {
+            self.task.deinit(alloc);
+            alloc.free(self.index_name);
+            self.* = undefined;
+        }
+    };
+
+    pub const SparseCompactionResult = sparse_mod.SparseIndex.SegmentCompactionResult;
+
     pub const GraphIndex = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
@@ -3927,6 +3941,41 @@ pub const IndexManager = struct {
             };
             defer result.deinit(self.alloc);
             _ = try self.finishTextMergeTask(&task, &result);
+            completed += 1;
+        }
+        return completed;
+    }
+
+    pub fn beginSparseCompactionTask(self: *IndexManager) !?SparseCompactionTask {
+        for (self.sparse_indexes.items) |*entry| {
+            var task = (try entry.index.beginSegmentCompactionTask(self.alloc, .{})) orelse continue;
+            errdefer task.deinit(self.alloc);
+            return .{
+                .index_name = try self.alloc.dupe(u8, entry.config.name),
+                .chunk_size = entry.index.chunk_size,
+                .task = task,
+            };
+        }
+        return null;
+    }
+
+    pub fn executeSparseCompactionTask(alloc: Allocator, task: *const SparseCompactionTask) !SparseCompactionResult {
+        return try sparse_mod.SparseIndex.executeSegmentCompactionTask(alloc, &task.task, task.chunk_size);
+    }
+
+    pub fn finishSparseCompactionTask(self: *IndexManager, task: *const SparseCompactionTask, result: *SparseCompactionResult) !bool {
+        const entry = self.findSparseIndexEntry(task.index_name) orelse return false;
+        return try entry.index.finishSegmentCompactionTask(&task.task, result);
+    }
+
+    pub fn runSparseCompactionScheduler(self: *IndexManager, max_steps: usize) !usize {
+        var completed: usize = 0;
+        while (completed < max_steps) {
+            var task = (try self.beginSparseCompactionTask()) orelse break;
+            defer task.deinit(self.alloc);
+            var result = try executeSparseCompactionTask(self.alloc, &task);
+            defer result.deinit(self.alloc);
+            _ = try self.finishSparseCompactionTask(&task, &result);
             completed += 1;
         }
         return completed;

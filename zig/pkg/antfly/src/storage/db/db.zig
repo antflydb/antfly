@@ -98,6 +98,7 @@ const db_query_metrics = @import("query_metrics.zig");
 const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
+const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
 const transform_mod = @import("transform.zig");
 const sim_fixture = @import("../sim_fixture.zig");
 const storage_sim = @import("../sim_runtime.zig");
@@ -160,6 +161,7 @@ pub const OpenOptions = struct {
     ttl_cleanup: ttl_runtime_mod.Config = .{},
     transaction_recovery: transaction_runtime_mod.Config = .{},
     text_merge: text_merge_runtime_mod.Config = .{},
+    sparse_compaction: sparse_compaction_runtime_mod.Config = .{},
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
@@ -233,6 +235,7 @@ const AsyncContext = struct {
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
+    sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
     applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
     stats: AsyncContentionStats = .{},
 
@@ -2234,6 +2237,7 @@ pub const DB = struct {
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
+    sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
     shadow: ?ShadowState,
     bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
     flushing_bulk_ingest_coalescer: bool = false,
@@ -2413,6 +2417,7 @@ pub const DB = struct {
                 .transaction_recovery_identity_context = null,
                 .transaction_runtime = null,
                 .text_merge_runtime = null,
+                .sparse_compaction_runtime = null,
                 .shadow = null,
             };
             var executor_ready = false;
@@ -2682,6 +2687,24 @@ pub const DB = struct {
         self.async_context.text_merge_runtime = runtime;
     }
 
+    fn initOptionalSparseCompactionRuntime(self: *DB, cfg: sparse_compaction_runtime_mod.Config) !void {
+        if (!self.start_index_workers) return;
+        if (!cfg.enabled) return;
+        const resources = self.core.asyncResources();
+        const runtime = try self.runtime_alloc.create(sparse_compaction_runtime_mod.SparseCompactionRuntime);
+        errdefer self.runtime_alloc.destroy(runtime);
+        runtime.* = try sparse_compaction_runtime_mod.SparseCompactionRuntime.init(
+            self.runtime_alloc,
+            resources.index_manager,
+            resources.apply_mutex,
+            self.backend_runtime,
+            cfg,
+        );
+        errdefer runtime.deinit();
+        self.sparse_compaction_runtime = runtime;
+        self.async_context.sparse_compaction_runtime = runtime;
+    }
+
     fn initOptionalRuntimes(self: *DB, opts: OpenOptions) !void {
         if (opts.enrichment) |raw_enrichment_cfg| {
             var enrichment_cfg = raw_enrichment_cfg;
@@ -2696,6 +2719,7 @@ pub const DB = struct {
             try self.initOptionalTransactionRuntime(opts.transaction_recovery);
         }
         try self.initOptionalTextMergeRuntime(opts.text_merge);
+        try self.initOptionalSparseCompactionRuntime(opts.sparse_compaction);
     }
 
     fn startOptionalRuntimes(self: *DB) !void {
@@ -2703,6 +2727,7 @@ pub const DB = struct {
         if (self.ttl_runtime) |runtime| try runtime.start();
         if (self.transaction_runtime) |runtime| try runtime.start();
         if (self.text_merge_runtime) |runtime| try runtime.start();
+        if (self.sparse_compaction_runtime) |runtime| try runtime.start();
     }
 
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
@@ -2733,6 +2758,11 @@ pub const DB = struct {
         self.runtime_alloc.destroy(self.executor);
         if (self.text_merge_runtime) |runtime| {
             self.async_context.text_merge_runtime = null;
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+        }
+        if (self.sparse_compaction_runtime) |runtime| {
+            self.async_context.sparse_compaction_runtime = null;
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
@@ -9077,10 +9107,20 @@ pub const DB = struct {
         const metric_name = self.denseQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
         defer db_query_metrics.observe(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
+        const bench_profile = benchQueryProfileEnabled();
+        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var algebraic_ns: u64 = 0;
+        var prove_ns: u64 = 0;
+        var inner_ns: u64 = 0;
+        const algebraic_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
+        if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
+        const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
-        return try db_query_search.searchDense(alloc, algebraic_filter.req, dense, .{
+        if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
+        const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        const result = try db_query_search.searchDense(alloc, algebraic_filter.req, dense, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .dense_index = denseIndexCallback,
@@ -9099,6 +9139,14 @@ pub const DB = struct {
             .hbc_search_profiled = hbcSearchProfiledCallback,
             .postprocess = postprocessVectorSearchResultCallback,
         });
+        if (bench_profile) {
+            inner_ns = platform_time.monotonicNs() - inner_start_ns;
+            std.log.info(
+                "antfly_bench_db_dense_wrapper total_us={d} algebraic_us={d} prove_us={d} inner_us={d}",
+                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
+            );
+        }
+        return result;
     }
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
@@ -9254,6 +9302,9 @@ pub const DB = struct {
 
     fn searchRequestWithAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
         if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return .{ .req = req };
+        if (!req.require_algebraic_filter_resolution and req.doc_filter_bindings.len == 0) {
+            if (try self.searchRequestWithDynamicStructuredDocFilterAlloc(req)) |direct| return direct;
+        }
         const entry = self.core.index_manager.algebraicIndex(null) orelse {
             self.recordUnsupportedDocSetFilterShape();
             if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
@@ -9382,6 +9433,34 @@ pub const DB = struct {
             .index = &entry.index,
             .filter_doc_ids = filter_doc_ids,
             .exclude_doc_ids = exclude_doc_ids,
+            .resolved_doc_filter = resolved_filter,
+            .resolved_doc_filter_alloc = self.alloc,
+        };
+    }
+
+    fn searchRequestWithDynamicStructuredDocFilterAlloc(self: *DB, req: types.SearchRequest) !?AlgebraicDocFilterRequest {
+        var resolved = (try db_query_search.resolveStructuredDocFilterForComposedAlloc(self.alloc, req, .{
+            .ctx = self,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
+            .project_ordinals_to_doc_ids = false,
+            .identity_read_generation = req.identity_read_generation,
+        })) orelse return null;
+        errdefer resolved.deinit(self.alloc);
+
+        const resolved_filter = try self.alloc.create(doc_set.ResolvedDocFilter);
+        errdefer self.alloc.destroy(resolved_filter);
+        resolved_filter.* = resolved;
+        resolved = .{};
+
+        var next = req;
+        next.resolved_doc_filter = resolved_filter;
+        next.filter_query_json = "";
+        next.exclusion_query_json = "";
+        return .{
+            .req = next,
             .resolved_doc_filter = resolved_filter,
             .resolved_doc_filter_alloc = self.alloc,
         };
@@ -13784,6 +13863,7 @@ fn applyDerivedBatchProfiled(self: *DB, batch: derived_types.DerivedBatch, profi
         runtime.notify();
         runtime.applyBackpressure();
     }
+    if (self.sparse_compaction_runtime) |runtime| runtime.notify();
 }
 
 fn applyDerivedBatchTargetsProfiled(self: *DB, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile) !void {
@@ -13794,6 +13874,7 @@ fn applyDerivedBatchTargetsProfiled(self: *DB, batch: derived_types.DerivedBatch
         runtime.notify();
         runtime.applyBackpressure();
     }
+    if (self.sparse_compaction_runtime) |runtime| runtime.notify();
 }
 
 fn applyDerivedBatchContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !void {
@@ -16323,6 +16404,9 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
         if (ctx.text_merge_deferred.load(.acquire)) return true;
         runtime.notify();
         runtime.applyBackpressure();
+    };
+    if (index_ref.kind == .sparse_vector) if (ctx.sparse_compaction_runtime) |runtime| {
+        runtime.notify();
     };
     return true;
 }
