@@ -98,7 +98,7 @@ Use `github.com/ajroetker/go-highway` for hot paths:
 ```protobuf
 edition = "2023";
 package antfly.lib.sparseindex;
-option go_package = "github.com/antflydb/antfly/lib/sparseindex";
+option go_package = "github.com/antflydb/antfly/go/pkg/antfly/lib/sparseindex";
 
 message SparseVector {
   repeated int32 indices = 1;   // vocabulary term IDs, sorted

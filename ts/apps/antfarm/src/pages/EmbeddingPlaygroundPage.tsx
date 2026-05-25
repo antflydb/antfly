@@ -21,7 +21,7 @@ import {
   SelectValue,
   Textarea,
 } from "@antfly/design-system";
-import { type EmbedResponse, TermiteClient } from "@antfly/termite-sdk";
+import { type EmbedResponse, TermiteClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ArrowDownUp,
@@ -229,7 +229,9 @@ const EmbeddingPlaygroundPage: React.FC = () => {
       const allTexts = [query, ...nonEmptyDocs];
       const response: EmbedResponse = await termiteClient.embed(selectedModel, allTexts);
 
-      const embeddings = response.embeddings;
+      const embeddings = response.data
+        .map((item) => item.embedding)
+        .filter((embedding): embedding is number[] => Array.isArray(embedding));
       if (!embeddings || embeddings.length < 2) {
         throw new Error("No embeddings returned");
       }

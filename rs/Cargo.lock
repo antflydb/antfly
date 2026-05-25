@@ -43,7 +43,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5192cca8006f1fd4f7237516f40fa183bb07f8fbdfedaa0036de5ea9b0b45e78"
 
 [[package]]
-name = "antfly-client"
+name = "antfly-sdk"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -1436,7 +1436,7 @@ dependencies = [
 name = "pgaf"
 version = "0.1.0"
 dependencies = [
- "antfly-client",
+ "antfly-sdk",
  "pgrx",
  "pgrx-tests",
  "reqwest 0.12.28",

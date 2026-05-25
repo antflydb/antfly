@@ -26,7 +26,7 @@ const public_text_query_mod = @import("public_text_query.zig");
 const public_query_string_mod = @import("public_query_string.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
-const bleve_openapi = @import("antfly_bleve_query_openapi");
+const query_openapi = @import("antfly_query_openapi");
 const reranking_mod = @import("antfly_reranking");
 const vector_codec = @import("antfly_vector").codec;
 const algebraic_ir = db_mod.algebraic.ir;
@@ -3599,7 +3599,7 @@ fn parseGeneratedBleveTextQuery(alloc: std.mem.Allocator, query: std.json.Value)
     const arena = arena_impl.allocator();
 
     const normalized = try normalizeGeneratedBleveQuery(arena, query);
-    const parsed = try std.json.parseFromValue(bleve_openapi.Query, arena, normalized, .{});
+    const parsed = try std.json.parseFromValue(query_openapi.Query, arena, normalized, .{});
     return try parseGeneratedBleveQueryValue(alloc, parsed.value);
 }
 
@@ -3770,7 +3770,7 @@ fn appendPatternFilterQueryValue(
 
 fn parseGeneratedBleveBooleanQuery(
     alloc: std.mem.Allocator,
-    boolean_query: *const bleve_openapi.BooleanQuery,
+    boolean_query: *const query_openapi.BooleanQuery,
 ) anyerror!db_mod.types.TextBoolQuery {
     var must = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
     errdefer deinitTextQueryArrayList(alloc, &must);
@@ -3810,7 +3810,7 @@ fn parseGeneratedBleveBooleanQuery(
 
 fn parseGeneratedBleveQuerySlice(
     alloc: std.mem.Allocator,
-    queries: []const bleve_openapi.Query,
+    queries: []const query_openapi.Query,
 ) ![]const db_mod.types.TextQuery {
     if (queries.len == 0) return &.{};
     const out = try alloc.alloc(db_mod.types.TextQuery, queries.len);
@@ -3826,9 +3826,9 @@ fn parseGeneratedBleveQuerySlice(
     return out;
 }
 
-fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: bleve_openapi.Query) anyerror!db_mod.types.TextQuery {
+fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.Query) anyerror!db_mod.types.TextQuery {
     const query_string_has_default_operator = comptime blk: {
-        const QueryStringType = @TypeOf((@as(bleve_openapi.Query, undefined)).query_string_query);
+        const QueryStringType = @TypeOf((@as(query_openapi.Query, undefined)).query_string_query);
         break :blk switch (@typeInfo(QueryStringType)) {
             .pointer => |pointer| @hasField(pointer.child, "default_operator"),
             else => @hasField(QueryStringType, "default_operator"),
@@ -4005,7 +4005,7 @@ const ParsedFuzziness = struct {
     auto_fuzzy: bool,
 };
 
-fn parseBleveFuzziness(value: ?bleve_openapi.Fuzziness, default_edits: u8) !ParsedFuzziness {
+fn parseBleveFuzziness(value: ?query_openapi.Fuzziness, default_edits: u8) !ParsedFuzziness {
     if (value == null) return .{ .max_edits = default_edits, .auto_fuzzy = false };
     return switch (value.?) {
         .integer => |int_value| .{ .max_edits = @intCast(int_value), .auto_fuzzy = false },

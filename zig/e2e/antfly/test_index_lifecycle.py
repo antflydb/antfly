@@ -1030,7 +1030,7 @@ def test_table_chunker_full_text_index_routes_template_chunks(table_api, openai_
                     "body": "body text without the keyword",
                 }
             },
-            sync_level="full_text" if table_api.backend == "stateful" else "write",
+            sync_level="full_text",
         )
         assert batch["inserted"] == 1
         if table_api.backend == "serverless":

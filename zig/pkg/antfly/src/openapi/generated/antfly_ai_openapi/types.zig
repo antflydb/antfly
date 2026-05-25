@@ -338,9 +338,9 @@ pub const ChatMessage = struct {
 pub const ChatToolsConfig = struct {
     /// List of tools to enable. If empty, defaults to filter, clarification, and search.
     enabled_tools: ?[]const ChatToolName = null,
-    /// Web search provider configuration. Required when websearch tool is enabled. See lib/websearch/openapi.yaml for provider-specific options.
+    /// Web search provider configuration. Required when websearch tool is enabled. See go/pkg/antfly/lib/websearch/openapi.yaml for provider-specific options.
     websearch_config: ?antfly_websearch_openapi.WebSearchConfig = null,
-    /// URL fetching configuration. See lib/websearch/openapi.yaml for available options and security controls.
+    /// URL fetching configuration. See go/pkg/antfly/lib/websearch/openapi.yaml for available options and security controls.
     fetch_config: ?antfly_websearch_openapi.FetchConfig = null,
     /// Maximum number of tool call iterations per turn. Prevents infinite loops in tool execution.
     max_tool_iterations: ?i64 = null,

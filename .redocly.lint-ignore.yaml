@@ -1,3 +1,0 @@
-openapi.yaml:
-  no-unused-components:
-    - "#/components/schemas/AntflyType"

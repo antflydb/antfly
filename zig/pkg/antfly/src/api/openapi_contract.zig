@@ -20,7 +20,7 @@ pub const schema_generated = @import("antfly_schema_openapi");
 pub const indexes_generated = @import("antfly_indexes_openapi");
 pub const ai_generated = @import("antfly_ai_openapi");
 pub const eval_generated = @import("antfly_eval_openapi");
-pub const bleve_generated = @import("antfly_bleve_query_openapi");
+pub const query_generated = @import("antfly_query_openapi");
 pub const metadata_generated = @import("antfly_metadata_openapi");
 pub const usermgr_generated = @import("antfly_usermgr_openapi");
 pub const chunking_generated = @import("antfly_chunking_openapi");
@@ -196,9 +196,9 @@ test "generated extractors: route table covers public API" {
 }
 
 test "bleve and metadata openapi modules are generated and wired" {
-    try std.testing.expect(@hasDecl(bleve_generated, "Query"));
-    try std.testing.expect(@hasDecl(bleve_generated, "BooleanQuery"));
-    try std.testing.expect(@hasDecl(bleve_generated, "TermQuery"));
+    try std.testing.expect(@hasDecl(query_generated, "Query"));
+    try std.testing.expect(@hasDecl(query_generated, "BooleanQuery"));
+    try std.testing.expect(@hasDecl(query_generated, "TermQuery"));
     try std.testing.expect(@hasDecl(metadata_generated, "TableStatus"));
     try std.testing.expect(@hasDecl(metadata_generated, "IndexStatus"));
     try std.testing.expect(@hasDecl(metadata_generated, "BatchResponse"));
@@ -380,10 +380,10 @@ test "public query contract exposes reranker and pruner fields" {
     try std.testing.expect(@hasField(generated.QueryRequest, "pruner"));
 }
 
-test "bleve query integration generates a recursive query union" {
-    try std.testing.expect(@typeInfo(bleve_generated.Query) == .@"union");
-    try std.testing.expect(@hasField(bleve_generated.Query, "match_query"));
-    try std.testing.expect(@hasField(bleve_generated.Query, "boolean_query"));
+test "query OpenAPI integration generates a recursive query union" {
+    try std.testing.expect(@typeInfo(query_generated.Query) == .@"union");
+    try std.testing.expect(@hasField(query_generated.Query, "match_query"));
+    try std.testing.expect(@hasField(query_generated.Query, "boolean_query"));
 }
 
 test "public and metadata query wrappers still keep raw full_text_search payloads" {

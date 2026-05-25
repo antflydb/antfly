@@ -9,7 +9,7 @@ import {
   Label,
   Switch,
 } from "@antfly/design-system";
-import type { bleve_components, components } from "@antfly/sdk";
+import type { components, query_components } from "@antfly/sdk";
 import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
 import type React from "react";
 import AggregationBuilder, { type AggregationConfig } from "@/components/AggregationBuilder";
@@ -18,7 +18,7 @@ import type { BasicField, SearchableField } from "../../utils/fieldUtils";
 import FieldSelector from "./FieldSelector";
 import QueryNode from "./QueryNode";
 
-type Query = bleve_components["schemas"]["Query"];
+type Query = query_components["schemas"]["Query"];
 type QueryRequest = components["schemas"]["QueryRequest"];
 type SortField = NonNullable<QueryRequest["order_by"]>[number];
 

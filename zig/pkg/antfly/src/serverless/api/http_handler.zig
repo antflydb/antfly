@@ -59,6 +59,7 @@ const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const search_sources = @import("../search_sources.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
+const scraping = @import("antfly_scraping");
 const platform_time = @import("../../platform/time.zig");
 const graph_segment_mod = @import("../graph_segment/mod.zig");
 const foreign_mod = @import("../../foreign/mod.zig");
@@ -176,6 +177,7 @@ pub const HttpHandler = struct {
     query: *query_mod.QueryRuntime,
     query_cache: ?*query_mod.QueryCache = null,
     managed_query_embedder: ?*managed_embedder.ManagedEmbedder = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     published_search_sources: search_sources.PublishedSearchSources = .{},
     runtime_status: *const api_types.RuntimeStatusResult,
@@ -279,6 +281,10 @@ pub const HttpHandler = struct {
     ) void {
         self.managed_query_embedder = embedder;
         self.published_search_sources = search_sources.withDenseQueryIndexName(self.published_search_sources, index_name);
+    }
+
+    pub fn setRemoteContent(self: *HttpHandler, remote_content: ?*const scraping.RemoteContentConfig) void {
+        self.remote_content = remote_content;
     }
 
     pub fn setPublishedSearchSources(self: *HttpHandler, sources: search_sources.PublishedSearchSources) void {
@@ -2868,7 +2874,9 @@ pub const HttpHandler = struct {
             var table = (try self.catalog.getTableAlloc(self.alloc, name)) orelse return error.InvalidQueryRequest;
             defer table.deinit(self.alloc);
 
-            var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJson(self.alloc, table.indexes_json);
+            var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(self.alloc, table.indexes_json, .{
+                .remote_content = self.remote_content,
+            });
             defer runtime.deinit();
             if (runtime.hasDenseEntries()) {
                 plan.request.vector = if (plan.request.embedding_template) |value|
@@ -4287,6 +4295,11 @@ pub const HttpHandler = struct {
         if (status.full_text_index_actions.len > 0) {
             for (status.full_text_index_actions) |entry| {
                 if (entry.action == .rebuild) return false;
+                if (entry.chunked_source_count > 0 and
+                    (status.pending_materialization_families.chunk_preview or !status.chunk_preview_complete))
+                {
+                    return false;
+                }
             }
             return true;
         }
@@ -7457,7 +7470,7 @@ test "http handler index status exposes chunk preview blocker for chunk-backed f
         },
         "{\"version\":0}",
         "",
-        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"semantic_chunked_idx\":{\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4}}}}",
+        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"semantic_chunked_idx\":{\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":0}}}}",
     ));
 
     const first = [_]api_types.DocumentMutation{
@@ -7547,7 +7560,7 @@ test "http handler index status exposes chunk embeddings blocker for chunked den
         },
         "{\"version\":0}",
         "",
-        "{\"semantic_chunked_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":4}}}}",
+        "{\"semantic_chunked_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":4,\"overlap_tokens\":0}}}}",
     ));
 
     const first = [_]api_types.DocumentMutation{

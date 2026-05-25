@@ -11,10 +11,10 @@ Add audio processing capabilities to Antfly following the existing registry-base
 
 ```go
 import (
-    "github.com/antflydb/antfly/lib/audio"
-    _ "github.com/antflydb/antfly/lib/audio/openai"     // Register OpenAI provider
-    _ "github.com/antflydb/antfly/lib/audio/google"     // Register Google provider
-    _ "github.com/antflydb/antfly/lib/audio/elevenlabs" // Register ElevenLabs provider
+    "github.com/antflydb/antfly/go/pkg/antfly/lib/audio"
+    _ "github.com/antflydb/antfly/go/pkg/antfly/lib/audio/openai"     // Register OpenAI provider
+    _ "github.com/antflydb/antfly/go/pkg/antfly/lib/audio/google"     // Register Google provider
+    _ "github.com/antflydb/antfly/go/pkg/antfly/lib/audio/elevenlabs" // Register ElevenLabs provider
 )
 
 // Text-to-Speech

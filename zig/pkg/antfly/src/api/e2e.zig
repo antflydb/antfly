@@ -40,7 +40,7 @@ const test_contract_helpers = @import("test_contract_helpers.zig");
 const public_test_helpers = @import("../public_test_helpers.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
-const bleve_openapi = @import("antfly_bleve_query_openapi");
+const query_openapi = @import("antfly_query_openapi");
 const RetrievalAgentResult = metadata_openapi.RetrievalAgentResult;
 const AgentStatus = metadata_openapi.AgentStatus;
 const RetrievalStrategy = metadata_openapi.RetrievalStrategy;
@@ -883,7 +883,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expectEqual(@as(i64, 1), filtered_query_result.hits.?.total.?);
     try std.testing.expectEqualStrings("doc:a", filtered_query_result.hits.?.hits.?[0]._id);
 
-    const phrase_query_body = try test_contract_helpers.encodeBleveQueryRequest(std.testing.allocator, bleve_openapi.MatchPhraseQuery{
+    const phrase_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.MatchPhraseQuery{
         .match_phrase = "full text",
         .field = "body",
     }, &.{ "title", "body" }, 10);
@@ -896,7 +896,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expectEqual(@as(i64, 1), phrase_query_result.hits.?.total.?);
     try std.testing.expectEqualStrings("doc:a", phrase_query_result.hits.?.hits.?[0]._id);
 
-    const fuzzy_query_body = try test_contract_helpers.encodeBleveQueryRequest(std.testing.allocator, bleve_openapi.FuzzyQuery{
+    const fuzzy_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.FuzzyQuery{
         .term = "helo",
         .field = "body",
         .fuzziness = .{ .integer = 1 },
@@ -918,7 +918,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expect(saw_doc_a);
     try std.testing.expect(saw_doc_c);
 
-    const numeric_range_query_body = try test_contract_helpers.encodeBleveQueryRequest(std.testing.allocator, bleve_openapi.NumericRangeQuery{
+    const numeric_range_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.NumericRangeQuery{
         .field = "score",
         .min = 9,
         .max = 10,
@@ -933,7 +933,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expectEqual(@as(i64, 1), numeric_range_query_result.hits.?.total.?);
     try std.testing.expectEqualStrings("doc:a", numeric_range_query_result.hits.?.hits.?[0]._id);
 
-    const prefix_query_body = try test_contract_helpers.encodeBleveQueryRequest(std.testing.allocator, bleve_openapi.PrefixQuery{
+    const prefix_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.PrefixQuery{
         .prefix = "alp",
         .field = "title",
     }, &.{"title"}, 10);
@@ -946,7 +946,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expectEqual(@as(i64, 1), prefix_query_result.hits.?.total.?);
     try std.testing.expectEqualStrings("doc:a", prefix_query_result.hits.?.hits.?[0]._id);
 
-    const wildcard_query_body = try test_contract_helpers.encodeBleveQueryRequest(std.testing.allocator, bleve_openapi.WildcardQuery{
+    const wildcard_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.WildcardQuery{
         .wildcard = "*ta",
         .field = "title",
     }, &.{"title"}, 10);
@@ -959,7 +959,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expectEqual(@as(i64, 1), wildcard_query_result.hits.?.total.?);
     try std.testing.expectEqualStrings("doc:b", wildcard_query_result.hits.?.hits.?[0]._id);
 
-    const regexp_query_body = try test_contract_helpers.encodeBleveQueryRequest(std.testing.allocator, bleve_openapi.RegexpQuery{
+    const regexp_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.RegexpQuery{
         .regexp = "^g.*a$",
         .field = "title",
     }, &.{"title"}, 10);
@@ -972,7 +972,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expectEqual(@as(i64, 1), regexp_query_result.hits.?.total.?);
     try std.testing.expectEqualStrings("doc:c", regexp_query_result.hits.?.hits.?[0]._id);
 
-    const term_range_query_body = try test_contract_helpers.encodeBleveQueryRequest(std.testing.allocator, bleve_openapi.TermRangeQuery{
+    const term_range_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.TermRangeQuery{
         .field = "title",
         .min = "alpha",
         .max = "beta",
@@ -987,7 +987,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expectEqual(@as(i64, 1), term_range_query_result.hits.?.total.?);
     try std.testing.expectEqualStrings("doc:a", term_range_query_result.hits.?.hits.?[0]._id);
 
-    const date_range_query_body = try test_contract_helpers.encodeBleveQueryRequest(std.testing.allocator, bleve_openapi.DateRangeStringQuery{
+    const date_range_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.DateRangeStringQuery{
         .field = "created_at",
         .start = "2026-03-15T00:00:00Z",
         .end = "2026-03-25T00:00:00Z",

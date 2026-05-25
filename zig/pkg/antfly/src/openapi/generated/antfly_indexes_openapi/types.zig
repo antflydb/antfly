@@ -552,7 +552,7 @@ pub const PathEdge = struct {
 
 /// Filter nodes during graph traversal using existing query primitives
 pub const NodeFilter = struct {
-    /// Bleve query to filter nodes (same syntax as search filter_query)
+    /// Antfly query to filter nodes (same syntax as search filter_query)
     filter_query: ?std.json.Value = null,
     /// Filter by key prefix
     filter_prefix: ?[]const u8 = null,

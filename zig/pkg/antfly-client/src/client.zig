@@ -37,11 +37,10 @@ pub const AntflyClient = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) !AntflyClient {
-        // Append /api/v1 to base URL, stripping trailing slash.
+        // Append /api/v1 to server root URLs, stripping trailing slash.
         // The generated openapi.Client stores a pointer to this string,
         // so we must keep it alive until deinit.
-        const trimmed = trimRightSlash(base_url);
-        const url = try std.fmt.allocPrint(allocator, "{s}/api/v1", .{trimmed});
+        const url = try normalizeBaseUrl(allocator, base_url);
 
         const inner = openapi.Client.init(allocator, http, url);
         return .{
@@ -289,6 +288,14 @@ pub const AntflyClient = struct {
     }
 };
 
+pub fn normalizeBaseUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {
+    const trimmed = trimRightSlash(base_url);
+    if (std.mem.endsWith(u8, trimmed, "/api/v1")) {
+        return try allocator.dupe(u8, trimmed);
+    }
+    return try std.fmt.allocPrint(allocator, "{s}/api/v1", .{trimmed});
+}
+
 const BatchRequestWire = struct {
     inner: openapi.types.BatchRequest,
 
@@ -331,4 +338,24 @@ fn base64Encode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
 test "AntflyClient compiles" {
     _ = AntflyClient;
     _ = ApiError;
+}
+
+test "normalizeBaseUrl accepts local and CloudAF URLs" {
+    const alloc = std.testing.allocator;
+
+    const local_root = try normalizeBaseUrl(alloc, "http://localhost:8080");
+    defer alloc.free(local_root);
+    try std.testing.expectEqualStrings("http://localhost:8080/api/v1", local_root);
+
+    const local_api = try normalizeBaseUrl(alloc, "http://localhost:8080/api/v1/");
+    defer alloc.free(local_api);
+    try std.testing.expectEqualStrings("http://localhost:8080/api/v1", local_api);
+
+    const cloud_root = try normalizeBaseUrl(alloc, "https://platform.antfly.io/cloud/v1/instance");
+    defer alloc.free(cloud_root);
+    try std.testing.expectEqualStrings("https://platform.antfly.io/cloud/v1/instance/api/v1", cloud_root);
+
+    const cloud_api = try normalizeBaseUrl(alloc, "https://platform.antfly.io/cloud/v1/instance/api/v1");
+    defer alloc.free(cloud_api);
+    try std.testing.expectEqualStrings("https://platform.antfly.io/cloud/v1/instance/api/v1", cloud_api);
 }
