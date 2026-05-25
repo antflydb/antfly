@@ -17,7 +17,6 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const backends = @import("backends/backends.zig");
 const ops = @import("ops/ops.zig");
-const supports_onnx_models = !build_options.enable_wasm;
 
 pub const Choice = enum {
     auto,
@@ -42,30 +41,29 @@ pub fn parse(value: []const u8) ?Choice {
 
 pub fn validate(choice: Choice) !void {
     switch (choice) {
-        .onnx => if (!supports_onnx_models) return error.BackendUnavailable,
         .cuda => if (!build_options.enable_cuda) return error.BackendUnavailable,
         .xla => if (!build_options.enable_pjrt) return error.BackendUnavailable,
         .webgpu => if (!(build_options.enable_wasm and build_options.enable_webgpu)) return error.BackendUnavailable,
-        .auto, .native, .metal => {},
+        .auto, .onnx, .native, .metal => {},
     }
 }
 
 pub fn configureSessionPreference(session_manager: *backends.SessionManager, choice: Choice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => if (build_options.enable_metal)
+        .auto => if (build_options.enable_wasm)
+            &.{backends.BackendType.wasm}
+        else if (build_options.enable_metal)
             &.{ backends.BackendType.metal, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
-        .onnx => if (supports_onnx_models and build_options.enable_native)
+        .onnx => if (build_options.enable_native)
             &.{ backends.BackendType.onnx, backends.BackendType.native }
-        else if (supports_onnx_models and build_options.enable_metal)
-            &.{ backends.BackendType.onnx, backends.BackendType.metal }
-        else if (supports_onnx_models)
-            &.{backends.BackendType.onnx}
+        else if (build_options.enable_wasm)
+            &.{ backends.BackendType.onnx, backends.BackendType.wasm }
         else if (build_options.enable_metal)
-            &.{backends.BackendType.metal}
+            &.{ backends.BackendType.onnx, backends.BackendType.metal }
         else
-            &.{backends.BackendType.native},
+            &.{backends.BackendType.onnx},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
         .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},

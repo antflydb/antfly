@@ -4078,7 +4078,7 @@ pub const Node = struct {
             .runtime = "termite-zig",
             .backends = .{
                 .native = build_options.enable_native,
-                .onnx = !build_options.enable_wasm,
+                .onnx = true,
                 .onnx_runtime = build_options.enable_onnx,
                 .wasm = build_options.enable_wasm,
             },

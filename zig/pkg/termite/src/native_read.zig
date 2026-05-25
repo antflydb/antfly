@@ -25,7 +25,6 @@ const model_manager_mod = @import("server/model_manager.zig");
 const native_backend_guard = @import("native_backend_guard.zig");
 const readers_mod = @import("readers/reader.zig");
 const runtime = @import("runtime/root.zig");
-const supports_onnx_models = !build_options.enable_wasm;
 
 const print = std.debug.print;
 
@@ -258,12 +257,7 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
 fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
     switch (choice) {
         .auto, .native => return,
-        .onnx => {
-            if (!supports_onnx_models) {
-                print("error: ONNX model execution is not built into this termite binary\n", .{});
-                return error.OnnxUnavailable;
-            }
-        },
+        .onnx => return,
         .metal => {
             if (native_backend_guard.checkMetal(build_options.enable_metal, metal_runtime.metalDeviceAvailable())) |failure| {
                 native_backend_guard.printFailure(failure);

@@ -1186,6 +1186,12 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
             .single_threaded = true,
         });
+        const wasm_platform_mod = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/platform/src/root.zig", .{shared_lib_root})),
+            .target = wasm_target,
+            .optimize = .ReleaseSafe,
+            .single_threaded = true,
+        });
         const wasm_linalg_mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("{s}/lib/linalg/src/mod.zig", .{shared_lib_root})),
             .target = wasm_target,
@@ -1198,6 +1204,14 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
             .single_threaded = true,
         });
+        const wasm_onnx_graph_mod = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/onnx/src/root.zig", .{shared_lib_root})),
+            .target = wasm_target,
+            .optimize = .ReleaseSafe,
+            .single_threaded = true,
+        });
+        wasm_onnx_graph_mod.addImport("protobuf", protobuf_mod);
+        wasm_onnx_graph_mod.addImport("ml", wasm_ml_mod);
         wasm_tokenizer_mod.addImport("sentencepiece_proto", sentencepiece_proto_mod);
         wasm_hf_tokenizer_mod.addImport("termite_tokenizer", wasm_tokenizer_mod);
         wasm_lib.root_module.addImport("jinja", wasm_jinja_dep.module("jinja"));
@@ -1206,7 +1220,9 @@ pub fn build(b: *std.Build) void {
         wasm_lib.root_module.addImport("termite_hf_tokenizer", wasm_hf_tokenizer_mod);
         wasm_lib.root_module.addImport("termite_linalg", wasm_linalg_mod);
         wasm_lib.root_module.addImport("antfly_image", wasm_image_mod);
+        wasm_lib.root_module.addImport("antfly_platform", wasm_platform_mod);
         wasm_lib.root_module.addImport("ml", wasm_ml_mod);
+        wasm_lib.root_module.addImport("onnx_graph", wasm_onnx_graph_mod);
 
         const wasm_install = b.addInstallArtifact(wasm_lib, .{
             .dest_sub_path = wasm_install_name,
