@@ -3194,6 +3194,15 @@ pub const IndexManager = struct {
         return rebuilt;
     }
 
+    pub fn copyGraphSplitDestinationFrom(self: *IndexManager, src: *IndexManager, lower: []const u8, upper: []const u8) !usize {
+        var copied: usize = 0;
+        for (src.graph_indexes.items) |*src_entry| {
+            const dest_entry = self.graphIndex(src_entry.config.name) orelse return error.IndexNotFound;
+            copied += try src_entry.index.copyOwnedOutgoingEdgesTo(&dest_entry.index, self.alloc, lower, upper);
+        }
+        return copied;
+    }
+
     pub fn pruneTextSplitRange(self: *IndexManager, split_key: []const u8) !void {
         for (self.text_indexes.items) |*entry| {
             const plan = try entry.persistent.classifyActiveSegmentsForSplit(self.alloc, split_key);

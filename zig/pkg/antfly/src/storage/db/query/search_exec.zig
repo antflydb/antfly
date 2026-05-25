@@ -468,6 +468,12 @@ pub const SparseSearchExecutor = struct {
         req: types.SearchRequest,
         key: []const u8,
     ) anyerror![]u8,
+    load_projected_documents: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 = null,
     postprocess: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -2311,11 +2317,20 @@ fn resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(
     doc_nums: []const u32,
     executor: StructuredFilterResolverExecutor,
 ) !?doc_set.ResolvedDocSet {
-    _ = executor;
     const ordinals = (try snapshot.docOrdinalsForDocNumsAlloc(alloc, doc_nums)) orelse return null;
     defer alloc.free(ordinals);
     if (ordinals.len == 0) return null;
-    return try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+    var resolved = try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+    errdefer resolved.deinit(alloc);
+
+    var live_owned: ?doc_set.ResolvedDocSet = null;
+    defer if (live_owned) |*owned| owned.deinit(alloc);
+    const live_set = try maybeLiveFilterResolvedDocSetAlloc(alloc, &resolved, executor, &live_owned);
+    if (live_set != &resolved) {
+        resolved.deinit(alloc);
+        return try doc_set.cloneAlloc(alloc, live_set);
+    }
+    return resolved;
 }
 
 fn collectStructuredFilterResolvedDocSetCachedAlloc(
@@ -4931,10 +4946,7 @@ pub fn searchSparse(
             else
                 try sparseHitOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation),
             .score = hit.score,
-            .stored_data = if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents) and !unresolved_stored_filters)
-                try executor.load_projected_document(executor.ctx, alloc, postprocess_req, hit.doc_id)
-            else
-                null,
+            .stored_data = null,
         };
         initialized += 1;
     }
@@ -4955,6 +4967,11 @@ pub fn searchSparse(
         result = try pageSearchResultInPlace(alloc, result, paging);
         if (bench_query_profile) page_ns = platform_time.monotonicNs() - page_start_ns;
     }
+    if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
+        const load_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+        try loadMissingProjectedSparseHitDocuments(alloc, postprocess_req, executor, result.hits);
+        if (bench_query_profile) hit_build_ns += platform_time.monotonicNs() - load_start_ns;
+    }
     if (bench_query_profile) {
         std.log.info(
             "antfly_bench_sparse_query total_us={d} constraint_us={d} index_search_us={d} hit_build_us={d} postprocess_us={d} page_us={d} raw_hits={d} returned_hits={d} filter_doc_nums={d} exclude_doc_nums={d}",
@@ -4973,6 +4990,56 @@ pub fn searchSparse(
         );
     }
     return result;
+}
+
+fn loadMissingProjectedSparseHitDocuments(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: SparseSearchExecutor,
+    hits: []types.SearchHit,
+) !void {
+    var missing_count: usize = 0;
+    for (hits) |hit| {
+        if (hit.stored_data == null) missing_count += 1;
+    }
+    if (missing_count == 0) return;
+
+    if (executor.load_projected_documents) |load_many| {
+        const keys = try alloc.alloc([]const u8, missing_count);
+        defer alloc.free(keys);
+        var key_count: usize = 0;
+        for (hits) |hit| {
+            if (hit.stored_data != null) continue;
+            keys[key_count] = hit.id;
+            key_count += 1;
+        }
+
+        var loaded = try load_many(executor.ctx, alloc, req, keys);
+        defer freeOptionalOwnedBytes(alloc, loaded);
+        if (loaded.len != keys.len) return error.InvalidSearchResult;
+
+        var loaded_index: usize = 0;
+        for (hits) |*hit| {
+            if (hit.stored_data != null) continue;
+            const stored = loaded[loaded_index] orelse return error.StoredDocMissing;
+            hit.stored_data = stored;
+            loaded[loaded_index] = null;
+            loaded_index += 1;
+        }
+        return;
+    }
+
+    for (hits) |*hit| {
+        if (hit.stored_data != null) continue;
+        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+    }
+}
+
+fn freeOptionalOwnedBytes(alloc: Allocator, values: []?[]u8) void {
+    for (values) |value| {
+        if (value) |bytes| alloc.free(bytes);
+    }
+    alloc.free(values);
 }
 
 fn pageSearchResultInPlace(

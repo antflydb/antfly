@@ -9190,6 +9190,7 @@ pub const DB = struct {
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
+            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .postprocess = postprocessVectorSearchResultCallback,
         });
         if (bench_profile) {
@@ -10205,6 +10206,16 @@ pub const DB = struct {
             null;
     }
 
+    fn loadProjectedSearchDocumentManyCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.loadProjectedSearchDocumentMany(alloc, req, keys);
+    }
+
     fn loadStoredSearchDocumentProbe(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
         const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
         defer alloc.free(store_key);
@@ -10223,13 +10234,24 @@ pub const DB = struct {
         req: types.SearchRequest,
         keys: []const []const u8,
     ) ![]?[]u8 {
+        const bench_profile = benchQueryProfileEnabled();
+        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const loaded = try loadStoredSearchDocumentsMany(self, alloc, keys);
         errdefer freeOptionalOwnedBytes(alloc, loaded);
 
+        var project_ns: u64 = 0;
         for (loaded, 0..) |maybe_stored, i| {
             if (maybe_stored) |stored| {
+                const project_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
                 loaded[i] = try projectOwnedStoredBytesForSearch(self, alloc, req, keys[i], stored);
+                if (bench_profile) project_ns += platform_time.monotonicNs() - project_start_ns;
             }
+        }
+        if (bench_profile) {
+            std.log.info(
+                "antfly_bench_projected_many total_us={d} project_us={d} keys={d}",
+                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, project_ns / 1000, keys.len },
+            );
         }
         return loaded;
     }
@@ -10675,6 +10697,13 @@ fn projectOwnedStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.Sear
 }
 
 fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]?[]u8 {
+    const bench_profile = benchQueryProfileEnabled();
+    const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+    var key_ns: u64 = 0;
+    var sort_ns: u64 = 0;
+    var txn_ns: u64 = 0;
+    var get_many_ns: u64 = 0;
+    var dupe_ns: u64 = 0;
     const PendingStoredSearchLoad = struct {
         original_index: usize,
         store_key: []u8,
@@ -10693,18 +10722,22 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
 
     errdefer freeOptionalOwnedBytes(alloc, loaded);
 
+    const key_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     for (keys, 0..) |key, i| {
         try pending.append(alloc, .{
             .original_index = i,
             .store_key = try encodeStoreLookupKeyAlloc(alloc, key),
         });
     }
+    if (bench_profile) key_ns = platform_time.monotonicNs() - key_start_ns;
 
+    const sort_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     std.mem.sort(PendingStoredSearchLoad, pending.items, {}, struct {
         fn lessThan(_: void, lhs: PendingStoredSearchLoad, rhs: PendingStoredSearchLoad) bool {
             return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
         }
     }.lessThan);
+    if (bench_profile) sort_ns = platform_time.monotonicNs() - sort_start_ns;
 
     const read_keys = try alloc.alloc([]const u8, pending.items.len);
     defer alloc.free(read_keys);
@@ -10714,13 +10747,25 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
 
     for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
 
+    const txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     var txn = try self.core.store.beginProbeTxn();
     defer txn.abort();
+    if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
+    const get_many_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     try txn.getManySorted(read_keys, read_values);
+    if (bench_profile) get_many_ns = platform_time.monotonicNs() - get_many_start_ns;
 
+    const dupe_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
         loaded[item.original_index] = try alloc.dupe(u8, value);
+    }
+    if (bench_profile) dupe_ns = platform_time.monotonicNs() - dupe_start_ns;
+    if (bench_profile) {
+        std.log.info(
+            "antfly_bench_stored_many total_us={d} key_us={d} sort_us={d} txn_us={d} get_many_us={d} dupe_us={d} keys={d}",
+            .{ (platform_time.monotonicNs() - total_start_ns) / 1000, key_ns / 1000, sort_ns / 1000, txn_ns / 1000, get_many_ns / 1000, dupe_ns / 1000, keys.len },
+        );
     }
     return loaded;
 }
@@ -15735,7 +15780,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
         collect_skip_doc_keys,
     );
     defer split_handoffs.deinit(self.alloc);
-    try copyGraphEdgeRangeIntoSplitDestination(self.alloc, self, byte_range.start, byte_range.end, dest_store);
+    _ = try dest_indexes.copyGraphSplitDestinationFrom(self.core.index_manager, byte_range.start, byte_range.end);
     _ = try dest_indexes.rebuildGraphSplitDestination(byte_range.start, byte_range.end);
     if (page_split_built) {
         try applySplitEmbeddingArtifactsInRange(
