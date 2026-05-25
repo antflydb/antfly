@@ -25,6 +25,7 @@
 // runtime data via ExecuteOptions side channels.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ml = @import("ml");
 const ops_mod = @import("../ops/ops.zig");
@@ -3965,9 +3966,9 @@ test "MoE round-trip: trace grouped path → interpret with live routing" {
 
 // ── Lowered / primitive graph execution tests ────────────────────────
 
-const native_mod = @import("../ops/native_compute.zig");
-const NativeCompute = native_mod.NativeCompute;
-const WeightStore = native_mod.WeightStore;
+const native_mod = if (build_options.enable_native) @import("../ops/native_compute.zig") else struct {};
+const NativeCompute = if (build_options.enable_native) native_mod.NativeCompute else opaque {};
+const WeightStore = if (build_options.enable_native) native_mod.WeightStore else opaque {};
 
 test "execute lowered graph through native backend" {
     // Build: y = linear(x, w, b) = x @ w^T + b

@@ -25,27 +25,14 @@ const native_backend_choice = @import("native_backend_choice.zig");
 const ops = @import("ops/ops.zig");
 const export_source_mod = @import("models/export_source.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
-const supports_onnx_models = !build_options.enable_wasm;
 
 const print = std.debug.print;
 const BackendChoice = native_backend_choice.Choice;
 const Graph = @import("ml").graph.Graph;
 const NodeId = @import("ml").graph.NodeId;
 const max_debug_output_nodes = 32;
-const OnnxWeightExportMode = if (supports_onnx_models)
-    graph_mod.onnx_compiler.QuantExportMode
-else
-    enum {
-        dense,
-        q8_0_weight_only,
-    };
-const OnnxWeightExportRule = if (supports_onnx_models)
-    graph_mod.onnx_compiler.WeightExportRule
-else
-    struct {
-        substring: []const u8,
-        mode: OnnxWeightExportMode,
-    };
+const OnnxWeightExportMode = graph_mod.onnx_compiler.QuantExportMode;
+const OnnxWeightExportRule = graph_mod.onnx_compiler.WeightExportRule;
 const PjrtInputBinding = if (build_options.enable_pjrt)
     graph_mod.pjrt_compiler.InputBinding
 else
@@ -528,7 +515,6 @@ fn writeCompiledArtifact(
 
     switch (opts.backend) {
         .onnx => {
-            if (!supports_onnx_models) return error.BackendUnavailable;
             if (opts.node_closure and opts.onnx_reuse_initializers_from == null and !onnxExportEstimateOnlyEnabled()) {
                 std.log.err(
                     "ONNX node-closure exports duplicate large external weight blobs; use --onnx-reuse-initializers-from <existing.onnx> or --debug-output-node for lightweight probes",
