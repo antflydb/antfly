@@ -158,12 +158,11 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     }
 
     print("termite-zig v{s}\n", .{build_options.termite_version});
-    print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={}\n", .{
+    print("backends: native={} onnx={} onnx_runtime={} metal={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
         build_options.enable_onnx,
         build_options.enable_metal,
-        build_options.enable_mlx,
     });
     print("models: {s}\n", .{models_dir});
     print("listening on {s}:{d}\n", .{ host, port });
@@ -254,12 +253,11 @@ fn pullModel(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
 
 fn printVersion() void {
     print("termite-zig v{s}\n", .{build_options.termite_version});
-    print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={} cuda={}\n", .{
+    print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
         build_options.enable_onnx,
         build_options.enable_metal,
-        build_options.enable_mlx,
         build_options.enable_cuda,
     });
 }

@@ -317,8 +317,8 @@ pub const TokenTrainEvalOptions = struct {
     /// MLX distributed group for DDP gradient averaging.
     /// Obtain via mlx_mod.initDistributed() at process startup.
     /// null = single-device training (default).
-    mlx_dist_group: if (build_options.enable_mlx) ?@import("../backends/mlx.zig").DistributedGroup else void =
-        if (build_options.enable_mlx) null else {},
+    mlx_dist_group: void =
+        if (false) null else {},
     /// Number of DDP replicas (world size). Must equal 1 when mlx_dist_group is null.
     world_size: u32 = 1,
     /// DDP rank of this process. Rank 0 is responsible for checkpoint writes.
@@ -2775,7 +2775,7 @@ fn trainTokenEpoch(
     grad_accum_steps: u32,
     use_schedule_free: bool,
     provided_cb: ?*const ComputeBackend,
-    mlx_dist_group: if (build_options.enable_mlx) ?@import("../backends/mlx.zig").DistributedGroup else void,
+    mlx_dist_group: void,
     world_size: u32,
     pjrt_lora_steps: if (build_options.enable_pjrt) ?[]?graph_bridge.LoRAPjrtTrainStep else void,
     neftune_alpha: f32,
@@ -3094,9 +3094,9 @@ fn trainTokenEpoch(
         accum_doc_count += 1;
         if (accum_doc_count % grad_accum_steps == 0 or is_last_example) {
             // Distributed DDP: allReduce gradient buffers across all replicas.
-            if (comptime build_options.enable_mlx) {
+            if (comptime false) {
                 if (mlx_dist_group) |group| {
-                    const mlx_mod = @import("../backends/mlx.zig");
+                    const mlx_mod = struct {};
                     const stream_handle = mlx_mod.openDefaultStream();
                     defer stream_handle.deinit();
                     for (bundle.layers, 0..) |_, idx| {
@@ -3110,7 +3110,7 @@ fn trainTokenEpoch(
                 }
             }
             // Normalize accumulated grads by grad_accum_steps and world size, then apply optimizer
-            const eff_world_size: u32 = if (comptime build_options.enable_mlx) world_size else 1;
+            const eff_world_size: u32 = if (comptime false) world_size else 1;
             const inv_accum: f32 = 1.0 / (@as(f32, @floatFromInt(grad_accum_steps)) * @as(f32, @floatFromInt(eff_world_size)));
             for (bundle.layers, 0..) |*layer, idx| {
                 if (accum_grad_a[idx]) |acc| for (acc) |*g| {

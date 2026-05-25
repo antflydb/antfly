@@ -25,13 +25,13 @@ const build_options = @import("build_options");
 const run_contract = @import("../../run/contract.zig");
 const artifact_writer = @import("../../run/artifact_writer.zig");
 const ops_mod = @import("../../ops/ops.zig");
-const mlx_compute = @import("../../ops/mlx_compute.zig");
+const mlx_compute = struct {};
 const ComputeBackend = ops_mod.ComputeBackend;
-const mlx_compute_mod = if (build_options.enable_mlx) mlx_compute else struct {
+const mlx_compute_mod = if (false) mlx_compute else struct {
     pub const WeightStore = void;
     pub const MlxCompute = void;
 };
-const mlx_mod = if (build_options.enable_mlx) @import("../../backends/mlx.zig") else struct {};
+const mlx_mod = struct {};
 const pjrt_mod = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
         pub const Client = void;
@@ -61,7 +61,7 @@ const CliOptions = struct {
     grad_accum_steps: u32 = 1,
     llrd_decay: f32 = 1.0,
     use_schedule_free: bool = false,
-    use_mlx: bool = build_options.enable_mlx,
+    use_mlx: bool = false,
     trainer_mode: TrainerMode = .auto,
     gguf_projector_path: ?[]const u8 = null,
 
@@ -160,7 +160,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             } else if (std.mem.eql(u8, val, "blas")) {
                 opts.use_mlx = false;
             } else if (std.mem.eql(u8, val, "auto")) {
-                opts.use_mlx = build_options.enable_mlx;
+                opts.use_mlx = false;
             } else return usageError();
         } else if (std.mem.eql(u8, arg, "--trainer")) {
             i += 1;
@@ -189,7 +189,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
         }
     }
 
-    if (opts.use_mlx and !build_options.enable_mlx) {
+    if (opts.use_mlx and !false) {
         std.debug.print("error: MLX support not compiled in\n", .{});
         std.process.exit(1);
     }
@@ -563,15 +563,15 @@ fn runSurrogate(
 ) !void {
     if (prepared.examples_with_images > 0 or prepared.examples_with_audio > 0) return error.MultimodalRequiresAutodiffTrainer;
 
-    const MlxWeightStoreT = if (build_options.enable_mlx) mlx_compute_mod.WeightStore else void;
-    const MlxComputeT = if (build_options.enable_mlx) mlx_compute_mod.MlxCompute else void;
-    const MlxCbT = if (build_options.enable_mlx) ComputeBackend else void;
+    const MlxWeightStoreT = if (false) mlx_compute_mod.WeightStore else void;
+    const MlxComputeT = if (false) mlx_compute_mod.MlxCompute else void;
+    const MlxCbT = if (false) ComputeBackend else void;
     var mlx_weight_store: MlxWeightStoreT = undefined;
     var mlx_backend: MlxComputeT = undefined;
     var mlx_cb_storage: MlxCbT = undefined;
     var backend_ptr: ?*const ComputeBackend = null;
 
-    if (comptime build_options.enable_mlx) {
+    if (comptime false) {
         if (opts.use_mlx) {
             mlx_weight_store = mlx_compute_mod.WeightStore{
                 .allocator = allocator,
@@ -756,7 +756,7 @@ fn writeRunOutputs(
         },
         .backend_policy = .{
             .selected = if (ctx.use_mlx) "mlx" else "blas",
-            .preferred = if (build_options.enable_mlx) "mlx" else "blas",
+            .preferred = if (false) "mlx" else "blas",
         },
         .distributed = .{
             .enabled = false,
@@ -779,7 +779,7 @@ fn writeRunOutputs(
         .task = "gemma4_lora_train_eval",
         .backend_policy = .{
             .selected = if (ctx.use_mlx) "mlx" else "blas",
-            .preferred = if (build_options.enable_mlx) "mlx" else "blas",
+            .preferred = if (false) "mlx" else "blas",
         },
         .distributed = .{
             .enabled = false,

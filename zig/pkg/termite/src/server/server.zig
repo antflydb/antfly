@@ -2018,7 +2018,7 @@ pub const Node = struct {
             session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
         const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
             .native => .cpu,
-            .metal, .mlx, .cuda => .gpu,
+            .metal, .cuda => .gpu,
         };
         const budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
             model.session,
@@ -2153,7 +2153,7 @@ pub const Node = struct {
             const draft_kv_dtype: runtime.kv.pool.KvDType = switch (draft_backend_kind) {
                 .native => .f32,
                 .cuda => .f16,
-                .metal, .mlx => if (draft_cfg.family == .gemma) .f32 else .f16,
+                .metal => if (draft_cfg.family == .gemma) .f32 else .f16,
             };
             draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
             const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)

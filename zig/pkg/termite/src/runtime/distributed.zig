@@ -48,12 +48,12 @@ pub const Config = struct {
 };
 
 pub fn configFromEnv() Config {
-    const enabled = envVarBool("TERMITE_MLX_DISTRIBUTED_ENABLE");
-    const mode = envVarMode("TERMITE_MLX_DISTRIBUTED_MODE") orelse .none;
-    const backend = envVarBackend("TERMITE_MLX_DISTRIBUTED_BACKEND") orelse .ring;
-    const rank = envVarUnsigned("TERMITE_MLX_RANK") orelse envVarUnsigned("MLX_RANK") orelse 0;
-    const world_size = envVarUnsigned("TERMITE_MLX_WORLD_SIZE") orelse envVarUnsigned("MLX_WORLD_SIZE") orelse 1;
-    const local_rank = envVarUnsigned("TERMITE_MLX_LOCAL_RANK") orelse rank;
+    const enabled = envVarBool("TERMITE_DISTRIBUTED_ENABLE");
+    const mode = envVarMode("TERMITE_DISTRIBUTED_MODE") orelse .none;
+    const backend = envVarBackend("TERMITE_DISTRIBUTED_BACKEND") orelse .ring;
+    const rank = envVarUnsigned("TERMITE_DISTRIBUTED_RANK") orelse 0;
+    const world_size = envVarUnsigned("TERMITE_DISTRIBUTED_WORLD_SIZE") orelse 1;
+    const local_rank = envVarUnsigned("TERMITE_DISTRIBUTED_LOCAL_RANK") orelse rank;
     return .{
         .enabled = enabled and world_size > 1 and mode != .none,
         .mode = if (enabled) mode else .none,

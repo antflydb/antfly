@@ -19,8 +19,7 @@ const onnx_graph = @import("onnx_graph");
 const c_file = @import("../util/c_file.zig");
 const native_mod = if (build_options.enable_native) @import("../ops/native_compute.zig") else struct {};
 const wasm_compute_mod = if (build_options.enable_wasm) @import("../ops/wasm_compute.zig") else struct {};
-const gpu_store_mod = if (build_options.enable_mlx or build_options.enable_metal) @import("../ops/gpu_hosted_store.zig") else struct {};
-const mlx_compute_mod = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
+const gpu_store_mod = if (build_options.enable_metal) @import("../ops/gpu_hosted_store.zig") else struct {};
 const metal_compute_mod = if (build_options.enable_metal) @import("../ops/metal_compute.zig") else struct {};
 const graph_interpreter = @import("../graph/interpreter.zig");
 const graph_partition = @import("../graph/partition.zig");
@@ -49,8 +48,7 @@ const ConstFoldPass = ml.graph.passes.const_fold;
 const FusePass = ml.graph.passes.fuse;
 const CsePass = ml.graph.passes.cse;
 const max_onnx_model_bytes = 2 * 1024 * 1024 * 1024;
-const GpuWeightStore = if (build_options.enable_mlx or build_options.enable_metal) gpu_store_mod.WeightStore else opaque {};
-const MlxCompute = if (build_options.enable_mlx) mlx_compute_mod.MlxCompute else opaque {};
+const GpuWeightStore = if (build_options.enable_metal) gpu_store_mod.WeightStore else opaque {};
 const MetalCompute = if (build_options.enable_metal) metal_compute_mod.MetalCompute else opaque {};
 const WasmCompute = if (build_options.enable_wasm) wasm_compute_mod.WasmCompute else opaque {};
 const clipclap_audio_input_frames: i64 = 1001;
@@ -394,30 +392,18 @@ pub const SharedBackendContext = struct {
 };
 
 fn initGpuHostedWeightStore(allocator: std.mem.Allocator, requested: BackendType) GpuWeightStore {
-    if (comptime !(build_options.enable_mlx or build_options.enable_metal)) unreachable;
+    if (comptime !build_options.enable_metal) unreachable;
     std.debug.assert(requested == .metal);
-
-    if (comptime build_options.enable_mlx) {
-        return .{
-            .allocator = allocator,
-            .resident_weights = std.mem.zeroes(@FieldType(GpuWeightStore, "resident_weights")),
-            .stream = std.mem.zeroes(@FieldType(GpuWeightStore, "stream")),
-            .prefix = "",
-            .lazy_weights = .empty,
-        };
-    }
 
     return .{
         .allocator = allocator,
-        .resident_weights = {},
-        .stream = {},
         .prefix = "",
         .lazy_weights = .empty,
     };
 }
 
 fn deinitGpuHostedWeightStore(allocator: std.mem.Allocator, weight_store: *GpuWeightStore, hosted_backend: BackendType) void {
-    if (comptime !(build_options.enable_mlx or build_options.enable_metal)) {
+    if (comptime !build_options.enable_metal) {
         return;
     }
     std.debug.assert(hosted_backend == .metal);

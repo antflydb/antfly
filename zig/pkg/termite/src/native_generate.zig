@@ -641,8 +641,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .pjrt_client = if (pjrt_client) |*client| client else null,
     };
 
-    if ((build_options.enable_mlx or build_options.enable_metal) and opts.print_timing and model.session.backend().usesGpuHostedSession()) {
-        debug_timing.resetLiveMlxTimingStats(&cb);
+    if (build_options.enable_metal and opts.print_timing and model.session.backend().usesGpuHostedSession()) {
+        debug_timing.resetLiveGpuTimingStats(&cb);
         generation.resetDecoderRuntimeDebugStats();
     }
     gpt_arch.resetDebugTimingStats();
@@ -976,7 +976,7 @@ fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
     if (!build_options.enable_metal) {
         return;
     }
-    const backend_stats = if (cb_opt) |cb| cb.debugTimingSnapshot() else debug_timing.fallbackMlxTimingSnapshot();
+    const backend_stats = if (cb_opt) |cb| cb.debugTimingSnapshot() else debug_timing.fallbackGpuTimingSnapshot();
     const backend_kind: ops.BackendKind = if (cb_opt) |cb| cb.kind() else .metal;
     const decoder_runtime_runtime_ready = if (cb_opt) |cb| cb.decoderRuntimeReady() else false;
     const decoder_runtime_embeddings_prepared = if (cb_opt) |cb| cb.decoderRuntimeAbsoluteEmbeddingsPrepared() else false;

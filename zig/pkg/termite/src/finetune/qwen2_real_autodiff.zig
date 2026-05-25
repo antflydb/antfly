@@ -28,8 +28,8 @@ const weight_source_mod = @import("../models/weight_source.zig");
 const SafetensorsSource = weight_source_mod.SafetensorsSource;
 const ShardedSafetensorsSource = weight_source_mod.ShardedSafetensorsSource;
 const native_compute = @import("../ops/native_compute.zig");
-const mlx_backend = if (build_options.enable_mlx) @import("../backends/mlx.zig") else struct {};
-const mlx_compute = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
+const mlx_backend = struct {};
+const mlx_compute = struct {};
 const ops_mod = @import("../ops/ops.zig");
 const interpreter = @import("../graph/interpreter.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
@@ -98,10 +98,10 @@ pub const LoadedBackend = struct {
     native_engine: ?*native_compute.NativeCompute = null,
     safetensors_source: ?*SafetensorsSource = null,
     sharded_safetensors_source: ?*ShardedSafetensorsSource = null,
-    mlx_ws: if (build_options.enable_mlx) ?mlx_compute.WeightStore else void =
-        if (build_options.enable_mlx) null else {},
-    mlx_engine: if (build_options.enable_mlx) ?*mlx_compute.MlxCompute else void =
-        if (build_options.enable_mlx) null else {},
+    mlx_ws: if (false) ?mlx_compute.WeightStore else void =
+        if (false) null else {},
+    mlx_engine: if (false) ?*mlx_compute.MlxCompute else void =
+        if (false) null else {},
 
     pub fn backendPtr(self: *LoadedBackend) *const ComputeBackend {
         self.compute_backend = switch (self.kind) {
@@ -110,7 +110,7 @@ pub const LoadedBackend = struct {
                 engine.data = &self.native_ws.?;
                 break :blk engine.computeBackend();
             },
-            .mlx => if (comptime build_options.enable_mlx) blk: {
+            .mlx => if (comptime false) blk: {
                 const engine = self.mlx_engine.?;
                 engine.data = &self.mlx_ws.?;
                 break :blk engine.computeBackend();
@@ -130,7 +130,7 @@ pub const LoadedBackend = struct {
             ws.resident_weights.deinit(self.allocator);
             ws.lazy_weights.deinit(self.allocator);
         }
-        if (comptime build_options.enable_mlx) {
+        if (comptime false) {
             if (self.mlx_ws) |*ws| {
                 mlx_compute.deinitPrefetchQueue(ws);
                 mlx_compute.deinitPackedExpertViews(ws, self.allocator);
@@ -152,7 +152,7 @@ pub const LoadedBackend = struct {
                 var cb = engine.computeBackend();
                 cb.deinit();
             },
-            .mlx => if (comptime build_options.enable_mlx) {
+            .mlx => if (comptime false) {
                 if (self.mlx_engine) |engine| {
                     engine.data = &self.mlx_ws.?;
                     var cb = engine.computeBackend();
@@ -403,7 +403,7 @@ pub fn loadBackendForModelDir(
             };
         },
         .mlx => {
-            if (!build_options.enable_mlx) return error.MlxNotAvailable;
+            if (!false) return error.MlxNotAvailable;
             const stream = mlx_backend.openDefaultStream().stream;
             const raw_weights = if (manifest.safetensors_path) |st_path|
                 try mlx_backend.loadSafetensors(st_path, allocator, stream)
@@ -435,9 +435,9 @@ pub fn loadBackendForModelDir(
 fn loadShardedSafetensorsForMlx(
     allocator: std.mem.Allocator,
     index_path: []const u8,
-    stream: if (build_options.enable_mlx) mlx_backend.c.mlx_stream else void,
-) !(if (build_options.enable_mlx) mlx_backend.c.mlx_map_string_to_array else void) {
-    if (comptime !build_options.enable_mlx) {
+    stream: if (false) mlx_backend.c.mlx_stream else void,
+) !(if (false) mlx_backend.c.mlx_map_string_to_array else void) {
+    if (comptime !false) {
         return error.MlxNotAvailable;
     } else {
         var source = try ShardedSafetensorsSource.initAbsolute(allocator, index_path);

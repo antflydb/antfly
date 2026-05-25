@@ -29,23 +29,6 @@ const metal_native_provider_mod = if (supports_native_metal_provider) @import(".
     pub const MetalNativeProvider = void;
 };
 
-// MLX interop is only compiled under `-Dmlx=true`. Under `-Dmlx=false`, the
-// stub provides enough shape for optional MLX-typed fields to exist as `void`.
-const mlx = if (build_options.enable_mlx) @import("../backends/mlx.zig") else struct {
-    pub const c = struct {
-        pub const mlx_array = *anyopaque;
-        pub const mlx_map_string_to_array = void;
-        pub const mlx_stream = void;
-    };
-};
-const mlx_quant = if (build_options.enable_mlx) @import("../backends/mlx_quant.zig") else struct {
-    pub const Provider = void;
-    pub fn nullProvider() void {
-        return {};
-    }
-};
-
-const c = mlx.c;
 const QuantizedStorage = weight_source_mod.QuantizedStorage;
 const LoadedWeight = weight_source_mod.LoadedWeight;
 const Tensor = @import("../backends/tensor.zig").Tensor;
@@ -74,12 +57,6 @@ pub const LazyWeightEntry = struct {
     tensor_ref: tensor_store_mod.LazyTensorRef,
     quantized_storage: ?QuantizedStorage = null,
     host_loaded: ?@import("../models/weight_source.zig").LoadedWeight = null,
-    loaded: if (build_options.enable_mlx) ?c.mlx_array else void =
-        if (build_options.enable_mlx) null else {},
-    loaded_quantized: if (build_options.enable_mlx) ?c.mlx_array else void =
-        if (build_options.enable_mlx) null else {},
-    loaded_transposed: if (build_options.enable_mlx) ?c.mlx_array else void =
-        if (build_options.enable_mlx) null else {},
     expert_coord: ?ExpertCoord = null,
     projection_mask: u8 = 0,
     loaded_bytes: usize = 0,
@@ -222,13 +199,7 @@ fn mergeLoraPairIntoWeight(base_weight: *LoadedWeight, adapter_a: Tensor, adapte
 
 pub const WeightStore = struct {
     allocator: std.mem.Allocator,
-    resident_weights: if (build_options.enable_mlx) c.mlx_map_string_to_array else void,
-    resident_transposed_weights: if (build_options.enable_mlx)
-        std.StringHashMapUnmanaged(c.mlx_array)
-    else
-        void = if (build_options.enable_mlx) .empty else {},
     resident_weight_estimate_bytes: usize = 0,
-    stream: if (build_options.enable_mlx) c.mlx_stream else void,
     prefix: []const u8,
     lazy_weights: std.StringHashMapUnmanaged(LazyWeightEntry),
     prefetch: PrefetchQueue = undefined,
@@ -240,7 +211,6 @@ pub const WeightStore = struct {
     shared_prefetch: ?*tier_shared_mod.SharedPrefetchState = null,
     allow_direct_quant: bool = true,
     quant_execution_mode: QuantExecutionMode = .prefer_backend_dense,
-    native_quant: mlx_quant.Provider = mlx_quant.nullProvider(),
     prefer_f32_dense_tensors: bool = false,
     mirror_kv_to_manager: bool = true,
     access_epoch: u64 = 1,
@@ -259,8 +229,8 @@ pub fn touchLazyWeight(data: *WeightStore, entry: *LazyWeightEntry) void {
 }
 
 /// Simple prefetch callback suitable for backends that don't do their own
-/// background staging (e.g. the MLX-free Metal path). Just runs the
-/// synchronous host load and resets the pending flag.
+/// Simple prefetch callback for Metal-hosted weights. Runs the synchronous host
+/// load and resets the pending flag.
 pub fn simplePrefetchProcess(ctx: *anyopaque, entry: *LazyWeightEntry) void {
     const data: *WeightStore = @ptrCast(@alignCast(ctx));
     entry.pending_prefetch = false;
@@ -272,8 +242,6 @@ pub fn simplePrefetchPriority(entry: *LazyWeightEntry) u64 {
 }
 
 /// Install a prefetch queue on the store using caller-supplied callbacks.
-/// The existing MLX-coupled `initPrefetchQueue` in mlx_compute.zig delegates
-/// to this so the queue machinery itself stays MLX-agnostic.
 pub fn installPrefetchQueue(
     data: *WeightStore,
     allocator: std.mem.Allocator,

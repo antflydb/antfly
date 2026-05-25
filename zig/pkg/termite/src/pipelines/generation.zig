@@ -25,7 +25,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ortgenai = if (build_options.enable_onnx) @import("../backends/ortgenai.zig") else struct {};
-const decoder_bitnet_runtime = if (build_options.enable_mlx) @import("../backends/decoder_bitnet_runtime.zig") else struct {};
+const decoder_bitnet_runtime = if (false) @import("../backends/decoder_bitnet_runtime.zig") else struct {};
 const tokenizer_mod = @import("termite_tokenizer");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
@@ -301,15 +301,15 @@ fn disablePagedKvDebug() bool {
 }
 
 fn enableMlxGreedyDeviceDecodeDebug() bool {
-    return getenvBool("TERMITE_MLX_GREEDY_DEVICE_DECODE");
+    return getenvBool("TERMITE_METAL_GREEDY_DEVICE_DECODE");
 }
 
 fn enableMlxDeviceTokenHandoffDebug() bool {
-    return getenvBool("TERMITE_MLX_DEVICE_TOKEN_HANDOFF");
+    return getenvBool("TERMITE_METAL_DEVICE_TOKEN_HANDOFF");
 }
 
 fn enableMlxRawMetalWholeTokenDebug() bool {
-    return getenvBool("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN");
+    return getenvBool("TERMITE_METAL_WHOLE_TOKEN");
 }
 
 fn enableGenerationStageDebug() bool {
@@ -2282,7 +2282,7 @@ pub const NativeGenerationPipeline = struct {
     ) !?DeviceDecodeOutcome {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         decoder_runtime_debug_stats.forward_attempts += 1;
-        if (self.cb.kind() != .mlx) {
+        if (self.cb.kind() != .metal) {
             decoder_runtime_debug_stats.backend_not_mlx += 1;
             return null;
         }
@@ -2360,14 +2360,14 @@ pub const NativeGenerationPipeline = struct {
         self: *NativeGenerationPipeline,
         decode_state: *NativeDecodeState,
     ) !void {
-        if (comptime !build_options.enable_mlx) return;
+        if (comptime !false) return;
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         decoder_runtime_debug_stats.prepare_attempts += 1;
         if (!enableMlxRawMetalWholeTokenDebug()) {
             decoder_runtime_debug_stats.prepare_flag_disabled += 1;
             return;
         }
-        if (self.cb.kind() != .mlx) {
+        if (self.cb.kind() != .metal) {
             decoder_runtime_debug_stats.prepare_backend_not_mlx += 1;
             return;
         }
@@ -2398,7 +2398,7 @@ pub const NativeGenerationPipeline = struct {
             return;
         }
 
-        if (!build_options.enable_mlx) {
+        if (!false) {
             decoder_runtime_debug_stats.prepare_backend_not_mlx += 1;
             return;
         }
@@ -2432,10 +2432,10 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         decode_state: *NativeDecodeState,
     ) !?usize {
-        if (comptime !build_options.enable_mlx) return null;
+        if (comptime !false) return null;
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         decoder_runtime_debug_stats.input_attempts += 1;
-        if (!build_options.enable_mlx) {
+        if (!false) {
             decoder_runtime_debug_stats.input_backend_not_mlx += 1;
             return null;
         }
@@ -2443,7 +2443,7 @@ pub const NativeGenerationPipeline = struct {
             decoder_runtime_debug_stats.input_flag_disabled += 1;
             return null;
         }
-        if (self.cb.kind() != .mlx) {
+        if (self.cb.kind() != .metal) {
             decoder_runtime_debug_stats.input_backend_not_mlx += 1;
             return null;
         }
@@ -2496,7 +2496,7 @@ pub const NativeGenerationPipeline = struct {
     ) bool {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         _ = tokens_generated;
-        if (self.cb.kind() != .mlx) return false;
+        if (self.cb.kind() != .metal) return false;
         if (!enableMlxDeviceTokenHandoffDebug()) return false;
         if (self.scheduler != null) return false;
         if (self.graph_cache != null or self.compiled_partition_backend != null) return false;
@@ -4522,7 +4522,7 @@ test "native decode state paged kv grows in pages" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 4,
         .num_kv_heads = 8,
@@ -4548,7 +4548,7 @@ test "native decode state chunked prefill appends incrementally" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 4,
         .num_kv_heads = 8,
@@ -4572,7 +4572,7 @@ test "native decode state maps to gpt decode context" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 8,
         .num_kv_heads = 8,
@@ -4795,7 +4795,7 @@ test "native decode state deinit releases paged sequence" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 4,
         .num_kv_heads = 8,
@@ -4816,7 +4816,7 @@ test "native decode state reports retained kv window offsets after trim" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 2,
         .num_kv_heads = 8,

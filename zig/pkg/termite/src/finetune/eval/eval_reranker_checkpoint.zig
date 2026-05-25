@@ -98,8 +98,8 @@ pub fn main(init: std.process.Init) !void {
                 .metal => .metal,
             },
             .distributed = .{},
-            .uses_distributed_mlx = false,
-            .uses_tensor_parallel_mlx = false,
+            .uses_distributed_gpu_hosted = false,
+            .uses_tensor_parallel_gpu_hosted = false,
         };
     } else try reranker.evaluateExamplesRuntime(
         allocator,
@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
         .model_dir = opts.model_dir,
         .input_path = opts.input_path,
         .split = opts.split,
-        .build_enable_mlx = build_options.enable_mlx,
+        .build_enable_mlx = false,
         .requested_backend = @tagName(opts.backend),
         .selected_backend = @tagName(result.backend_selected),
         .dataset_root = loaded.dataset_root,
@@ -124,8 +124,8 @@ pub fn main(init: std.process.Init) !void {
         .dataset_stats = reranker_data.computeStats(limited),
         .pairwise_training_pairs = reranker_data.countPairwiseTrainingPairs(limited),
         .distributed = result.distributed,
-        .uses_distributed_mlx = result.uses_distributed_mlx,
-        .uses_tensor_parallel_mlx = result.uses_tensor_parallel_mlx,
+        .uses_distributed_gpu_hosted = result.uses_distributed_gpu_hosted,
+        .uses_tensor_parallel_gpu_hosted = result.uses_tensor_parallel_gpu_hosted,
         .summary = result.summary,
     }, .{ .whitespace = .indent_2 }, &writer.interface);
     try writer.interface.writeByte('\n');

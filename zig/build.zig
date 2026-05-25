@@ -1387,7 +1387,6 @@ pub fn build(b: *std.Build) void {
         .backend = .{
             .enable_onnx = termite_enable_onnx,
             .onnx_root = termite_onnx_root,
-            .enable_mlx = false,
             .enable_metal = termite_enable_metal,
             .enable_cuda = termite_enable_cuda,
             .cuda_artifacts = termite_cuda_artifacts,
@@ -1698,7 +1697,6 @@ pub fn build(b: *std.Build) void {
     // --- Termite WASM modules for unified antfly.wasm ---
     const termite_wasm_build_options = b.addOptions();
     termite_wasm_build_options.addOption(bool, "enable_onnx", false);
-    termite_wasm_build_options.addOption(bool, "enable_mlx", false);
     termite_wasm_build_options.addOption(bool, "enable_pjrt", false);
     termite_wasm_build_options.addOption(bool, "enable_cuda", false);
     termite_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");

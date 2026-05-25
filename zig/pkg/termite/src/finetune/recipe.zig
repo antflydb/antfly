@@ -2171,7 +2171,7 @@ fn collectStaticMetadata(allocator: std.mem.Allocator, io: std.Io, recipe: Recip
                 .termite_version = build_options.termite_version,
                 .enable_native = build_options.enable_native,
                 .enable_onnx = build_options.enable_onnx,
-                .enable_mlx = build_options.enable_mlx,
+                .enable_mlx = false,
                 .enable_pjrt = build_options.enable_pjrt,
                 .skip_openapi = build_options.skip_openapi,
             },

@@ -52,9 +52,9 @@ const Tensor = termite.backends.Tensor;
 
 // MLX backend (Apple Silicon GPU acceleration).
 const mlx_mod = termite.backends.mlx;
-const mlx = if (build_options.enable_mlx) mlx_mod else struct {};
-const mlx_compute = if (build_options.enable_mlx) termite.native_compute.mlx else struct {};
-const mlx_c = if (build_options.enable_mlx) mlx_mod.c else struct {};
+const mlx = if (false) mlx_mod else struct {};
+const mlx_compute = if (false) termite.native_compute.mlx else struct {};
+const mlx_c = if (false) mlx_mod.c else struct {};
 
 // Finetune module imports — accessed via the termite internal module tree.
 const gliner2_data = termite.finetune.gliner2_data;
@@ -261,8 +261,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
 
     // We need these variables to live for the whole function regardless
     // of which backend branch we take.
-    var mlx_ws: if (build_options.enable_mlx) mlx_compute.WeightStore else void = undefined;
-    var mlx_backend: if (build_options.enable_mlx) mlx_compute.MlxCompute else void = undefined;
+    var mlx_ws: if (false) mlx_compute.WeightStore else void = undefined;
+    var mlx_backend: if (false) mlx_compute.MlxCompute else void = undefined;
     var native_ws: native_compute.WeightStore = undefined;
     var native_backend: native_compute.NativeCompute = undefined;
 
@@ -270,7 +270,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     var safetensors_source: ?*SafetensorsSource = null;
     defer if (safetensors_source) |s| s.weightSource().deinit();
 
-    const use_mlx = build_options.enable_mlx;
+    const use_mlx = false;
     const cb = if (use_mlx) blk: {
         // ── MLX path: load weights directly into MLX arrays ──────────
         const raw_weights = try mlx.loadSafetensors(st_path, allocator, mlx.openDefaultStream().stream);

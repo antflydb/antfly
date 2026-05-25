@@ -318,8 +318,8 @@ pub const LoRATrainOptions = struct {
     /// MLX distributed group for DDP gradient averaging.
     /// Obtain via mlx_mod.initDistributed() at process startup.
     /// null = single-device training (default).
-    mlx_dist_group: if (build_options.enable_mlx) ?@import("../backends/mlx.zig").DistributedGroup else void =
-        if (build_options.enable_mlx) null else {},
+    mlx_dist_group: void =
+        if (false) null else {},
     /// Number of DDP replicas (world size). Must equal 1 when mlx_dist_group is null.
     world_size: u32 = 1,
     /// DDP rank of this process. Rank 0 is responsible for eval logging and checkpoint writes.
@@ -2061,9 +2061,9 @@ pub fn trainLoRABundleEpochCached(
         if (accum_steps >= options.grad_accum_steps) {
             // Distributed DDP: allReduce gradient buffers first so clipping
             // operates on globally averaged gradients, not per-replica sums.
-            if (comptime build_options.enable_mlx) {
+            if (comptime false) {
                 if (options.mlx_dist_group) |group| {
-                    const mlx_mod = @import("../backends/mlx.zig");
+                    const mlx_mod = struct {};
                     const stream_handle = mlx_mod.openDefaultStream();
                     defer stream_handle.deinit();
                     for (0..num_layers) |li| {
@@ -2090,7 +2090,7 @@ pub fn trainLoRABundleEpochCached(
             // Apply optimizer (AdamW or Schedule-Free AdamW) with LLRD per layer.
             for (bundle.layers, 0..) |*layer, li| {
                 if (!layerMatchesScope(layer.base_tensor_name, options.layer_name)) continue;
-                const eff_world_size: u32 = if (comptime build_options.enable_mlx) options.world_size else 1;
+                const eff_world_size: u32 = if (comptime false) options.world_size else 1;
                 const world_scale: f32 = if (eff_world_size > 1) 1.0 / @as(f32, @floatFromInt(eff_world_size)) else 1.0;
                 const accum_scale: f32 = 1.0 / @as(f32, @floatFromInt(accum_steps));
                 const final_scale = clip_scale * world_scale * accum_scale;
@@ -2124,9 +2124,9 @@ pub fn trainLoRABundleEpochCached(
 
     // Flush any remaining partial accumulation window at epoch end.
     if (accum_steps > 0) {
-        if (comptime build_options.enable_mlx) {
+        if (comptime false) {
             if (options.mlx_dist_group) |group| {
-                const mlx_mod = @import("../backends/mlx.zig");
+                const mlx_mod = struct {};
                 const stream_handle = mlx_mod.openDefaultStream();
                 defer stream_handle.deinit();
                 for (0..num_layers) |li| {
@@ -2149,7 +2149,7 @@ pub fn trainLoRABundleEpochCached(
             1.0;
         for (bundle.layers, 0..) |*layer, li| {
             if (!layerMatchesScope(layer.base_tensor_name, options.layer_name)) continue;
-            const eff_world_size: u32 = if (comptime build_options.enable_mlx) options.world_size else 1;
+            const eff_world_size: u32 = if (comptime false) options.world_size else 1;
             const world_scale: f32 = if (eff_world_size > 1) 1.0 / @as(f32, @floatFromInt(eff_world_size)) else 1.0;
             const accum_scale: f32 = 1.0 / @as(f32, @floatFromInt(accum_steps));
             const final_scale = clip_scale * world_scale * accum_scale;

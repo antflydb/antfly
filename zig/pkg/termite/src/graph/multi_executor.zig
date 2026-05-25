@@ -579,19 +579,8 @@ fn deinitEmptyNativeWeightStore(weight_store: *native_compute.WeightStore, alloc
 }
 
 fn initEmptyMetalWeightStore(allocator: std.mem.Allocator) gpu_hosted_store_mod.WeightStore {
-    if (comptime build_options.enable_mlx) {
-        return .{
-            .allocator = allocator,
-            .resident_weights = .{},
-            .stream = .{},
-            .prefix = "",
-            .lazy_weights = .empty,
-        };
-    }
     return .{
         .allocator = allocator,
-        .resident_weights = {},
-        .stream = {},
         .prefix = "",
         .lazy_weights = .empty,
     };
@@ -658,7 +647,7 @@ test "two-device partition plan structure" {
     }.f;
 
     const caps = [_]Capability{
-        .{ .backend = .mlx, .priority = 10, .supports = &onlyGelu },
+        .{ .backend = .metal, .priority = 10, .supports = &onlyGelu },
         .{ .backend = .native, .priority = 0, .supports = &partition_mod.supportsAll },
     };
     const base_plan = try partition_fn(allocator, &g, &caps);
@@ -666,7 +655,7 @@ test "two-device partition plan structure" {
     // Assign partitions to devices based on their backend.
     const dev_assign = try allocator.alloc(DeviceId, base_plan.partitions.len);
     for (base_plan.partitions, 0..) |part, i| {
-        dev_assign[i] = if (part.backend == .mlx) 1 else 0;
+        dev_assign[i] = if (part.backend == .metal) 1 else 0;
     }
 
     var dpp = DevicePartitionPlan{
@@ -676,13 +665,13 @@ test "two-device partition plan structure" {
     };
     defer dpp.deinit();
 
-    // Should have at least 3 partitions: native(param+decomposed), mlx(gelu), native(neg)
+    // Should have at least 3 partitions: native(param+decomposed), metal(gelu), native(neg)
     try std.testing.expect(dpp.base.partitions.len >= 3);
 
     // The gelu partition should be assigned to device 1.
     var found_mlx = false;
     for (dpp.base.partitions, 0..) |part, i| {
-        if (part.backend == .mlx) {
+        if (part.backend == .metal) {
             try std.testing.expectEqual(@as(DeviceId, 1), dpp.device_assignment[i]);
             found_mlx = true;
         }

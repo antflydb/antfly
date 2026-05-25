@@ -40,8 +40,8 @@ pub const RuntimeEvalResult = struct {
     summary: EvalSummary,
     backend_selected: backends.BackendType,
     distributed: runtime.distributed.Config,
-    uses_distributed_mlx: bool,
-    uses_tensor_parallel_mlx: bool,
+    uses_distributed_gpu_hosted: bool,
+    uses_tensor_parallel_gpu_hosted: bool,
 };
 
 const RankPair = struct {
@@ -139,8 +139,8 @@ pub fn evaluateExamplesRuntime(
         .summary = try computeEvalSummary(allocator, effective_examples, predicted),
         .backend_selected = model.session.backend(),
         .distributed = runtime.distributed.configFromEnv(),
-        .uses_distributed_mlx = pipeline.usesDistributedMlx(),
-        .uses_tensor_parallel_mlx = pipeline.usesTensorParallelMlx(),
+        .uses_distributed_gpu_hosted = pipeline.usesDistributedGpuHosted(),
+        .uses_tensor_parallel_gpu_hosted = pipeline.usesTensorParallelGpuHosted(),
     };
 }
 

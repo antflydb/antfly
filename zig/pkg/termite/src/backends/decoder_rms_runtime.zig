@@ -16,7 +16,6 @@ const std = @import("std");
 const build_options = @import("build_options");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
-const mlx_compute = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
 const metal_compute = @import("../ops/metal_compute.zig");
 const ops = @import("../ops/ops.zig");
 
@@ -59,10 +58,6 @@ fn dequantizeTensorToFloat32Generic(
     allocator: std.mem.Allocator,
 ) ![]f32 {
     return switch (cb.kind()) {
-        .mlx => if (comptime build_options.enable_mlx)
-            mlx_compute.dequantizeTensorToFloat32(cb, tensor, allocator)
-        else
-            unreachable,
         .metal => metal_compute.MetalCompute.dequantizeTensorToFloat32(cb, tensor, allocator),
         else => cb.toFloat32(tensor, allocator),
     };
@@ -73,10 +68,6 @@ fn getQuantizedStorageGeneric(
     tensor: ops.CT,
 ) ?*const @import("../models/weight_source.zig").QuantizedStorage {
     return switch (cb.kind()) {
-        .mlx => if (comptime build_options.enable_mlx)
-            mlx_compute.getQuantizedStorage(cb, tensor)
-        else
-            unreachable,
         .metal => metal_compute.MetalCompute.getQuantizedStorage(cb, tensor),
         else => null,
     };

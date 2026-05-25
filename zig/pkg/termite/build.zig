@@ -189,7 +189,6 @@ pub fn build(b: *std.Build) void {
         .backend = .{
             .enable_onnx = enable_onnx,
             .onnx_root = effective_onnx_root,
-            .enable_mlx = false,
             .enable_metal = enable_metal,
             .enable_cuda = enable_cuda,
             .cuda_artifacts = cuda_artifacts,

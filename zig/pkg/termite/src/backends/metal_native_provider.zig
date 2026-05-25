@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// MLX-free Metal provider for termite's decoder runtime.
+// JIT-free Metal provider for termite's decoder runtime.
 //
 // Mirrors the Metal-native portion of `MetalProvider` (metal_provider.zig)
-// without any MLX JIT kernel fields or `c.mlx_array`-typed methods. Used by
+// without any JIT JIT kernel fields or `c.backend_array`-typed methods. Used by
 // `MetalCompute` when the build has `-Dmetal=true -Dmlx=false`. The fields
 // are laid out to match what `metal_runtime.zig` duck-types on `self` so the
 // same helper functions work for both provider variants.

@@ -81,7 +81,7 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             metal_stats.ensure_prepared_fast_hits,
         },
     );
-    if (build_options.enable_mlx and has_runtime) {
+    if (false and has_runtime) {
         debug_timing.printBackendTimingDetails(
             .metal,
             metal_stats.backend,

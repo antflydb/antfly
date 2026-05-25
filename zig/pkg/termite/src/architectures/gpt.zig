@@ -4161,8 +4161,8 @@ fn disablePleDebug() bool {
 }
 
 fn disableDecoderRuntimeActivationDebug() bool {
-    return getenvBool("TERMITE_MLX_METAL_DECODER_RUNTIME_DISABLE_ACTIVATION") or
-        getenvBool("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN_DISABLE_ACTIVATION");
+    return getenvBool("TERMITE_METAL_DECODER_RUNTIME_DISABLE_ACTIVATION") or
+        getenvBool("TERMITE_METAL_WHOLE_TOKEN_DISABLE_ACTIVATION");
 }
 
 fn disableDenseBlockFastPathDebug() bool {
@@ -5016,7 +5016,7 @@ fn applyAttentionWithSink(
                     return deepSeekV4SinkAwareAttentionFallback(cb, Q_rope, K_rope, V, sink, batch, attention.query_sequence_len, attention.kv_sequence_len, num_heads, num_kv_heads, head_dim, attention.sliding_window);
                 }
             }
-            if ((cb.kind() == .native or cb.kind() == .metal or cb.kind() == .mlx) and (attention.kv_batch != null or attention.kv_cache != null or attention.kv_manager != null or attention.kv_storage != null)) {
+            if ((cb.kind() == .native or cb.kind() == .metal or cb.kind() == .metal) and (attention.kv_batch != null or attention.kv_cache != null or attention.kv_manager != null or attention.kv_storage != null)) {
                 const gqa_started_at = monotonicNowNs();
                 const result = try cb.gqaPagedAttention(Q_rope, K_rope, V, null, attention, batch, num_heads, num_kv_heads, head_dim);
                 debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);
@@ -5053,7 +5053,7 @@ fn applyAttentionWithSink(
                 return deepSeekV4SinkAwareAttentionFallback(cb, Q, K, V, sink, batch, attention.query_sequence_len, attention.kv_sequence_len, num_heads, num_kv_heads, head_dim, attention.sliding_window);
             }
         }
-        if ((cb.kind() == .native or cb.kind() == .metal or cb.kind() == .mlx) and (attention.kv_batch != null or attention.kv_cache != null or attention.kv_manager != null or attention.kv_storage != null)) {
+        if ((cb.kind() == .native or cb.kind() == .metal or cb.kind() == .metal) and (attention.kv_batch != null or attention.kv_cache != null or attention.kv_manager != null or attention.kv_storage != null)) {
             const gqa_started_at = monotonicNowNs();
             const result = try cb.gqaPagedAttention(Q, K, V, null, attention, batch, num_heads, num_kv_heads, head_dim);
             debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);

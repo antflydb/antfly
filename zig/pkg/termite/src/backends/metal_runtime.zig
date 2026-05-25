@@ -33,31 +33,28 @@ const turboquant = @import("../runtime/kv/turboquant.zig");
 pub const QuantizedStorage = weight_source_mod.QuantizedStorage;
 pub const MetalTensor = metal_tensor.MetalTensor;
 
-// MLX interop is only compiled under `-Dmlx=true`. Under `-Dmlx=false`, the
-// stub provides enough shape to satisfy the comptime-unreachable paths.
-const mlx = if (build_options.enable_mlx) @import("mlx.zig") else struct {
-    pub const c = struct {
-        pub const mlx_array = extern struct {
-            ctx: ?*anyopaque = null,
-        };
-        pub const MLX_UINT8: c_int = 0;
-        pub fn mlx_array_free(_: mlx_array) callconv(.c) c_int {
-            unreachable;
-        }
+const c = struct {
+    pub const backend_array = extern struct {
+        ctx: ?*anyopaque = null,
     };
-    pub fn arrayFromBorrowedBytes(_: anytype, _: anytype, _: anytype) !@This().c.mlx_array {
+    pub const BACKEND_UINT8: c_int = 0;
+    pub fn backend_array_free(_: backend_array) callconv(.c) c_int {
         unreachable;
     }
 };
-const mlx_metal_bridge = if (build_options.enable_mlx) @import("mlx_metal_bridge.zig") else struct {
-    pub fn borrowMetalTensorAsMlxArray(_: MetalTensor) c.mlx_array {
-        unreachable;
-    }
-    pub fn borrowMlxArrayAsMetalTensor(_: c.mlx_array, _: []i32) !MetalTensor {
+const backend = struct {
+    pub fn arrayFromBorrowedBytes(_: anytype, _: anytype, _: anytype) !c.backend_array {
         unreachable;
     }
 };
-const c = mlx.c;
+const metal_tensor_bridge = struct {
+    pub fn borrowMetalTensorAsBackendArray(_: MetalTensor) c.backend_array {
+        unreachable;
+    }
+    pub fn borrowBackendArrayAsMetalTensor(_: c.backend_array, _: []i32) !MetalTensor {
+        unreachable;
+    }
+};
 
 pub const RawMetalProvider = opaque {};
 pub const RawMetalDecodeRuntime = opaque {};
@@ -463,10 +460,10 @@ fn coerceBackendField(comptime func: anytype, comptime field_name: []const u8, v
     @compileError("unsupported backend input handle type");
 }
 
-fn coerceMlxArrayHandle(value: anytype) c.mlx_array {
-    if (@TypeOf(value) == c.mlx_array) return value;
-    if (@TypeOf(value) == *anyopaque) return @as(*const c.mlx_array, @ptrCast(@alignCast(value))).*;
-    @compileError("unsupported mlx array handle type");
+fn coerceExternalArrayHandle(value: anytype) c.backend_array {
+    if (@TypeOf(value) == c.backend_array) return value;
+    if (@TypeOf(value) == *anyopaque) return @as(*const c.backend_array, @ptrCast(@alignCast(value))).*;
+    @compileError("unsupported backend array handle type");
 }
 
 fn backendOptionalPayloadType(comptime func: anytype) type {
@@ -488,21 +485,21 @@ fn backendOptionalPayloadType(comptime func: anytype) type {
     };
 }
 
-fn backendUsesMlxArray(comptime func: anytype) bool {
-    return backendRequestInputType(func) == c.mlx_array and backendOptionalPayloadType(func) == c.mlx_array;
+fn backendUsesExternalArray(comptime func: anytype) bool {
+    return backendRequestInputType(func) == c.backend_array and backendOptionalPayloadType(func) == c.backend_array;
 }
 
-fn backendUsesMlxArrayPair(comptime func: anytype) bool {
+fn backendUsesExternalArrayPair(comptime func: anytype) bool {
     const Payload = backendOptionalPayloadType(func);
     return @hasField(Payload, "first") and @hasField(Payload, "second") and
-        @FieldType(Payload, "first") == c.mlx_array and
-        @FieldType(Payload, "second") == c.mlx_array;
+        @FieldType(Payload, "first") == c.backend_array and
+        @FieldType(Payload, "second") == c.backend_array;
 }
 
-fn backendUsesMlxInputResidual(comptime func: anytype) bool {
-    return backendRequestFieldType(func, "input") == c.mlx_array and
-        backendRequestFieldType(func, "residual") == c.mlx_array and
-        backendOptionalPayloadType(func) == c.mlx_array;
+fn backendUsesExternalInputResidual(comptime func: anytype) bool {
+    return backendRequestFieldType(func, "input") == c.backend_array and
+        backendRequestFieldType(func, "residual") == c.backend_array and
+        backendOptionalPayloadType(func) == c.backend_array;
 }
 
 pub const SamplePenaltyEntries = struct {
@@ -8688,7 +8685,7 @@ fn quantizedRuntimeLinearKindHasPairDeviceKernel(kind: RawQuantizedRuntimeLinear
     };
 }
 
-/// Formats the native Metal kernels (without MLX) can execute directly.
+/// Formats the native Metal kernels (without bridge fallback) can execute directly.
 /// Dense float formats pass through to the CPU f32 fallback in native_compute,
 /// so they are considered supported. Quantized formats must have a dedicated
 /// Metal kernel (TL1/TL2 via bitnet path; I2_S, Q4_K, Q5_K via dispatcher).
@@ -9099,10 +9096,10 @@ pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
     self.raw_linear_slots_prepared[slot] = false;
 }
 
-pub fn makeQuantizedWeightArray(storage: *const QuantizedStorage) !c.mlx_array {
+pub fn makeQuantizedWeightDeviceArray(storage: *const QuantizedStorage) !c.backend_array {
     const source_bytes = storage.preparedBytes(.row_major_blocks) orelse storage.raw_bytes;
     const weight_shape = [_]i32{@intCast(source_bytes.len)};
-    return mlx.arrayFromBorrowedBytes(source_bytes, &weight_shape, c.MLX_UINT8);
+    return backend.arrayFromBorrowedBytes(source_bytes, &weight_shape, c.BACKEND_UINT8);
 }
 
 pub fn dupQuantizedStorage(storage: *const QuantizedStorage) !*QuantizedStorage {
@@ -11212,7 +11209,7 @@ pub fn runCompressedAttentionGatedPostGateQuantizedFfn(
     } else null;
     if (direct) |arr| return arr;
 
-    if (comptime !build_options.enable_mlx) {
+    if (comptime !false) {
         const pair_started_at = monotonicNowNs();
         const gate_up = (try decoderRuntimeApplyLinearPair(self, .{
             .slot_a = request.gate_ffn_linear_slot,
@@ -11296,35 +11293,35 @@ pub fn runCompressedAttentionGatedPostGateQuantizedFfn(
         return result_tensor;
     }
 
-    if (comptime build_options.enable_mlx and
-        backendUsesMlxArrayPair(apply_pair_fn) and
-        backendUsesMlxArray(apply_linear_fn))
+    if (comptime false and
+        backendUsesExternalArrayPair(apply_pair_fn) and
+        backendUsesExternalArray(apply_linear_fn))
     {
-        const ffn_normed_mlx = mlx_metal_bridge.borrowMetalTensorAsMlxArray(ffn_normed);
-        defer _ = c.mlx_array_free(ffn_normed_mlx);
+        const ffn_normed_array = metal_tensor_bridge.borrowMetalTensorAsBackendArray(ffn_normed);
+        defer _ = c.backend_array_free(ffn_normed_array);
 
         const pair_started_at = monotonicNowNs();
         const gate_up = (try apply_pair_fn(ctx, &.{
             .slot_a = request.gate_ffn_linear_slot,
             .slot_b = request.up_ffn_linear_slot,
-            .input = coerceBackendInput(apply_pair_fn, ffn_normed_mlx),
+            .input = coerceBackendInput(apply_pair_fn, ffn_normed_array),
             .in_dim = request.hidden_size,
             .out_dim = request.intermediate_size,
         })) orelse return null;
         stats.quantized_gated_pair_nanos += @intCast(monotonicNowNs() - pair_started_at);
-        defer _ = c.mlx_array_free(gate_up.first);
-        defer _ = c.mlx_array_free(gate_up.second);
+        defer _ = c.backend_array_free(gate_up.first);
+        defer _ = c.backend_array_free(gate_up.second);
 
         const activation_started_at = monotonicNowNs();
         var gate_first_shape_buf: [metal_tensor.max_dims]i32 = undefined;
-        const gate_first_tensor = try mlx_metal_bridge.borrowMlxArrayAsMetalTensor(gate_up.first, &gate_first_shape_buf);
+        const gate_first_tensor = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(gate_up.first, &gate_first_shape_buf);
         const activated_tensor = (try decoderRuntimeApplyActivation(self, .{
             .input = gate_first_tensor,
             .kind = request.activation,
             .dim = request.intermediate_size,
         }, stats)) orelse return null;
         var gate_second_shape_buf: [metal_tensor.max_dims]i32 = undefined;
-        const gate_second_tensor = try mlx_metal_bridge.borrowMlxArrayAsMetalTensor(gate_up.second, &gate_second_shape_buf);
+        const gate_second_tensor = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(gate_up.second, &gate_second_shape_buf);
         var gated_tensor = (try decoderRuntimeApplyMultiply(
             self,
             activated_tensor,
@@ -11372,8 +11369,8 @@ pub fn runCompressedAttentionGatedPostGateQuantizedFfn(
         }, stats)) orelse return null;
         stats.quantized_gated_post_gate_norm_nanos += @intCast(monotonicNowNs() - post_gate_norm_started_at);
         defer normed_metal.deinit();
-        const normed_gated = mlx_metal_bridge.borrowMetalTensorAsMlxArray(normed_metal);
-        defer _ = c.mlx_array_free(normed_gated);
+        const normed_gated = metal_tensor_bridge.borrowMetalTensorAsBackendArray(normed_metal);
+        defer _ = c.backend_array_free(normed_gated);
 
         const down_started_at = monotonicNowNs();
         const projected = (try apply_linear_fn(ctx, &.{
@@ -11383,11 +11380,11 @@ pub fn runCompressedAttentionGatedPostGateQuantizedFfn(
             .out_dim = request.hidden_size,
         })) orelse return null;
         stats.quantized_gated_down_nanos += @intCast(monotonicNowNs() - down_started_at);
-        defer _ = c.mlx_array_free(projected);
+        defer _ = c.backend_array_free(projected);
 
         const add_started_at = monotonicNowNs();
         var projected_shape_buf: [metal_tensor.max_dims]i32 = undefined;
-        const projected_tensor = try mlx_metal_bridge.borrowMlxArrayAsMetalTensor(projected, &projected_shape_buf);
+        const projected_tensor = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(projected, &projected_shape_buf);
         const result_tensor = (try decoderRuntimeApplyAdd(self, .{
             .lhs = projected_tensor,
             .rhs = attn_res,
@@ -12381,7 +12378,7 @@ pub fn runCompressedAttentionGatedDecoderBlockQuantized(
             apply_linear_fn,
         ),
         .quantized_runtime => blk: {
-            if (comptime !build_options.enable_mlx) {
+            if (comptime !false) {
                 break :blk try runQuantizedGatedFfnResidualMetalTensor(
                     self,
                     request,
@@ -12393,16 +12390,16 @@ pub fn runCompressedAttentionGatedDecoderBlockQuantized(
                     logged_backend_unsupported_kind,
                 );
             }
-            if (comptime !backendUsesMlxInputResidual(run_gated_ffn_fn)) {
+            if (comptime !backendUsesExternalInputResidual(run_gated_ffn_fn)) {
                 break :blk null;
             }
-            const attn_res_mlx = mlx_metal_bridge.borrowMetalTensorAsMlxArray(attn_res_mt);
-            defer _ = c.mlx_array_free(attn_res_mlx);
-            const ffn_normed_mlx = mlx_metal_bridge.borrowMetalTensorAsMlxArray(ffn_normed_mt);
-            defer _ = c.mlx_array_free(ffn_normed_mlx);
+            const attn_res_array = metal_tensor_bridge.borrowMetalTensorAsBackendArray(attn_res_mt);
+            defer _ = c.backend_array_free(attn_res_array);
+            const ffn_normed_array = metal_tensor_bridge.borrowMetalTensorAsBackendArray(ffn_normed_mt);
+            defer _ = c.backend_array_free(ffn_normed_array);
             const arr = (try run_gated_ffn_fn(ctx, &.{
-                .input = coerceBackendInput(run_gated_ffn_fn, ffn_normed_mlx),
-                .residual = coerceBackendField(run_gated_ffn_fn, "residual", attn_res_mlx),
+                .input = coerceBackendInput(run_gated_ffn_fn, ffn_normed_array),
+                .residual = coerceBackendField(run_gated_ffn_fn, "residual", attn_res_array),
                 .gate_linear_slot = request.gate_ffn_linear_slot,
                 .up_linear_slot = request.up_ffn_linear_slot,
                 .down_linear_slot = request.down_ffn_linear_slot,
@@ -12412,10 +12409,10 @@ pub fn runCompressedAttentionGatedDecoderBlockQuantized(
                 .intermediate_size = request.intermediate_size,
                 .activation = request.activation,
             })) orelse break :blk null;
-            const arr_mlx = coerceMlxArrayHandle(arr);
-            defer _ = c.mlx_array_free(arr_mlx);
+            const arr_array = coerceExternalArrayHandle(arr);
+            defer _ = c.backend_array_free(arr_array);
             var arr_shape_buf: [metal_tensor.max_dims]i32 = undefined;
-            const arr_mt = try mlx_metal_bridge.borrowMlxArrayAsMetalTensor(arr_mlx, arr_shape_buf[0..]);
+            const arr_mt = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(arr_array, arr_shape_buf[0..]);
             var arr_mt_mut = arr_mt;
             break :blk try MetalTensor.ownedCloneFrom(try tensorHostSlice(&arr_mt_mut), arr_mt.shape());
         },
@@ -13831,7 +13828,7 @@ pub fn runCompressedAttentionResidual(self: anytype, request: anytype, stats: an
     }
     std.heap.c_allocator.free(result);
 
-    const encoded = gathered.encoded_key orelse return error.MlxDataNull;
+    const encoded = gathered.encoded_key orelse return error.DeviceDataNull;
 
     if (!decoderRuntimeReserveAttentionSpanScratch(
         self,
@@ -14294,7 +14291,7 @@ pub fn runCompressedAttentionDenseDecoderBlockDirect(self: anytype, request: any
         error.UnsupportedKvHeadDim => return null,
         else => return err,
     };
-    const encoded = gathered.encoded_key orelse return error.MlxDataNull;
+    const encoded = gathered.encoded_key orelse return error.DeviceDataNull;
     const q_ptr = try tensorHostConstPtr(&q_tensor);
     const residual_ptr = try tensorHostConstPtr(&residual_tensor);
 
@@ -14691,7 +14688,7 @@ pub fn selectCompressedAttentionGatedQkv(
     if (request.q == null and request.k_suffix != null and request.v_suffix != null and
         request.attention_input != null and request.q_linear_slot != null)
     {
-        if (comptime !build_options.enable_mlx) {
+        if (comptime !false) {
             const project_started_at = monotonicNowNs();
             const q_projected = (try decoderRuntimeApplyLinear(self, .{
                 .slot = request.q_linear_slot.?,
@@ -14714,20 +14711,20 @@ pub fn selectCompressedAttentionGatedQkv(
                 .v_suffix = v_suffix,
             };
         }
-        if (comptime build_options.enable_mlx and backendUsesMlxArray(apply_linear_fn)) {
-            const ai_mlx = mlx_metal_bridge.borrowMetalTensorAsMlxArray(request.attention_input.?);
-            defer _ = c.mlx_array_free(ai_mlx);
+        if (comptime false and backendUsesExternalArray(apply_linear_fn)) {
+            const ai_array = metal_tensor_bridge.borrowMetalTensorAsBackendArray(request.attention_input.?);
+            defer _ = c.backend_array_free(ai_array);
             const project_started_at = monotonicNowNs();
             const q_projected = (try apply_linear_fn(ctx, &.{
                 .slot = request.q_linear_slot.?,
-                .input = coerceBackendInput(apply_linear_fn, ai_mlx),
+                .input = coerceBackendInput(apply_linear_fn, ai_array),
                 .in_dim = request.hidden_size,
                 .out_dim = request.num_heads * request.head_dim,
             })) orelse return null;
-            defer _ = c.mlx_array_free(q_projected);
+            defer _ = c.backend_array_free(q_projected);
             stats.compressed_block_project_nanos += @intCast(monotonicNowNs() - project_started_at);
             var q_scratch: [metal_tensor.max_dims]i32 = undefined;
-            const q_borrowed = try mlx_metal_bridge.borrowMlxArrayAsMetalTensor(q_projected, q_scratch[0..]);
+            const q_borrowed = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(q_projected, q_scratch[0..]);
             var q_borrowed_mut = q_borrowed;
             const q_owned = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&q_borrowed_mut), q_borrowed.shape());
             errdefer {
@@ -14751,7 +14748,7 @@ pub fn selectCompressedAttentionGatedQkv(
     const q_linear_slot = request.q_linear_slot orelse return null;
     const k_linear_slot = request.k_linear_slot orelse return null;
     const v_linear_slot = request.v_linear_slot orelse return null;
-    if (comptime !build_options.enable_mlx) {
+    if (comptime !false) {
         const project_started_at = monotonicNowNs();
         const q_projected = (try decoderRuntimeApplyLinear(self, .{
             .slot = q_linear_slot,
@@ -14782,36 +14779,36 @@ pub fn selectCompressedAttentionGatedQkv(
             .v_suffix = kv_projected.second,
         };
     }
-    if (comptime build_options.enable_mlx and
-        backendUsesMlxArray(apply_linear_fn) and
-        backendUsesMlxArrayPair(apply_pair_fn))
+    if (comptime false and
+        backendUsesExternalArray(apply_linear_fn) and
+        backendUsesExternalArrayPair(apply_pair_fn))
     {
-        const ai_mlx = mlx_metal_bridge.borrowMetalTensorAsMlxArray(attention_input_mt);
-        defer _ = c.mlx_array_free(ai_mlx);
+        const ai_array = metal_tensor_bridge.borrowMetalTensorAsBackendArray(attention_input_mt);
+        defer _ = c.backend_array_free(ai_array);
         const project_started_at = monotonicNowNs();
         const q_projected = (try apply_linear_fn(ctx, &.{
             .slot = q_linear_slot,
-            .input = coerceBackendInput(apply_linear_fn, ai_mlx),
+            .input = coerceBackendInput(apply_linear_fn, ai_array),
             .in_dim = request.hidden_size,
             .out_dim = request.num_heads * request.head_dim,
         })) orelse return null;
-        defer _ = c.mlx_array_free(q_projected);
+        defer _ = c.backend_array_free(q_projected);
         const kv_projected = (try apply_pair_fn(ctx, &.{
             .slot_a = k_linear_slot,
             .slot_b = v_linear_slot,
-            .input = coerceBackendInput(apply_pair_fn, ai_mlx),
+            .input = coerceBackendInput(apply_pair_fn, ai_array),
             .in_dim = request.hidden_size,
             .out_dim = request.num_kv_heads * request.head_dim,
         })) orelse return null;
-        defer _ = c.mlx_array_free(kv_projected.first);
-        defer _ = c.mlx_array_free(kv_projected.second);
+        defer _ = c.backend_array_free(kv_projected.first);
+        defer _ = c.backend_array_free(kv_projected.second);
         stats.compressed_block_project_nanos += @intCast(monotonicNowNs() - project_started_at);
         var q_scratch: [metal_tensor.max_dims]i32 = undefined;
         var ks_scratch: [metal_tensor.max_dims]i32 = undefined;
         var vs_scratch: [metal_tensor.max_dims]i32 = undefined;
-        const q_borrowed = try mlx_metal_bridge.borrowMlxArrayAsMetalTensor(q_projected, q_scratch[0..]);
-        const k_borrowed = try mlx_metal_bridge.borrowMlxArrayAsMetalTensor(kv_projected.first, ks_scratch[0..]);
-        const v_borrowed = try mlx_metal_bridge.borrowMlxArrayAsMetalTensor(kv_projected.second, vs_scratch[0..]);
+        const q_borrowed = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(q_projected, q_scratch[0..]);
+        const k_borrowed = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(kv_projected.first, ks_scratch[0..]);
+        const v_borrowed = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(kv_projected.second, vs_scratch[0..]);
         var q_borrowed_mut = q_borrowed;
         const q_owned = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&q_borrowed_mut), q_borrowed.shape());
         errdefer {
@@ -14930,7 +14927,7 @@ pub fn tryRawAttentionResidualHost(
                     ) == 0;
                 },
                 .Q8_0 => blk: {
-                    if (comptime !build_options.enable_mlx) break :blk false;
+                    if (comptime !false) break :blk false;
                     if (attention_input_size % 32 != 0) break :blk false;
                     if (ensureQuantizedRuntimeLinearSlotPrepared(self, attention_linear_slot, attention_input_size, hidden_size) != .q8_0) break :blk false;
                     break :blk termite_metal_decode_runtime_apply_attention_residual_q8_0_slot(
@@ -15148,7 +15145,7 @@ pub fn tryRawCompressedAttentionResidualHost(
                 ) == 0;
             },
             .Q8_0 => blk: {
-                if (comptime !build_options.enable_mlx) break :blk false;
+                if (comptime !false) break :blk false;
                 if (attention_input_size % 32 != 0) break :blk false;
                 if (ensureQuantizedRuntimeLinearSlotPrepared(self, attention_linear_slot, attention_input_size, hidden_size) != .q8_0) break :blk false;
                 break :blk termite_metal_decode_runtime_apply_attention_f32_span_residual_q8_0_slot(

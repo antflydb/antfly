@@ -19,7 +19,6 @@ const decoder_rms_runtime = @import("decoder_rms_runtime.zig");
 const model_runtime = @import("../graph/model_runtime.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const decoder_tail_runtime = @import("decoder_tail_runtime.zig");
-const mlx_compute = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
 const metal_compute = @import("../ops/metal_compute.zig");
 const ops = @import("../ops/ops.zig");
 
@@ -31,10 +30,6 @@ fn dequantizeTensorToFloat32Generic(
     allocator: std.mem.Allocator,
 ) ![]f32 {
     return switch (cb.kind()) {
-        .mlx => if (comptime build_options.enable_mlx)
-            mlx_compute.dequantizeTensorToFloat32(cb, tensor, allocator)
-        else
-            unreachable,
         .metal => metal_compute.MetalCompute.dequantizeTensorToFloat32(cb, tensor, allocator),
         else => cb.toFloat32(tensor, allocator),
     };
@@ -201,13 +196,13 @@ fn forwardSampledFromNormalizedHidden(
 }
 
 pub fn preparedLayers(configured_layers: usize) usize {
-    const value = c_std.getenv("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN_GPT2_LAYERS") orelse return configured_layers;
+    const value = c_std.getenv("TERMITE_METAL_WHOLE_TOKEN_GPT2_LAYERS") orelse return configured_layers;
     const parsed = std.fmt.parseUnsigned(usize, std.mem.span(value), 10) catch return configured_layers;
     return @min(configured_layers, parsed);
 }
 
 pub fn overrideLevel() usize {
-    const value = c_std.getenv("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN_GPT2_OVERRIDE_LEVEL") orelse return 4;
+    const value = c_std.getenv("TERMITE_METAL_WHOLE_TOKEN_GPT2_OVERRIDE_LEVEL") orelse return 4;
     return std.fmt.parseUnsigned(usize, std.mem.span(value), 10) catch 4;
 }
 

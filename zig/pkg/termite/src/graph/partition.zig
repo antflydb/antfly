@@ -865,9 +865,8 @@ pub fn seedParameterQuantGgufTypeByName(
 pub fn tensorStorageForBackend(backend: BackendKind) contracts.TensorStorageClass {
     return switch (backend) {
         .native, .graph => .host_dense,
-        .metal => .metal_buffer,
         .webgpu => .webgpu_buffer,
-        .mlx => .mlx_array,
+        .metal => .metal_buffer,
         .onnx => .onnx_tensor,
         .pjrt => .pjrt_buffer,
         .cuda => .cuda_buffer,
@@ -947,9 +946,8 @@ fn inferComputeDesc(graph: *const Graph, descs: []const ?contracts.TensorDesc, n
     for (n.getInputs()) |input_id| {
         const desc = inputDesc(descs, input_id) orelse continue;
         const backend = desc.resident_backend orelse switch (desc.storage) {
-            .metal_buffer => BackendKind.metal,
             .webgpu_buffer => BackendKind.webgpu,
-            .mlx_array => BackendKind.mlx,
+            .metal_buffer => BackendKind.metal,
             .onnx_tensor => BackendKind.onnx,
             .pjrt_buffer => BackendKind.pjrt,
             .cuda_buffer => BackendKind.cuda,
@@ -1351,21 +1349,21 @@ test "two backends split on capability" {
     }.f;
 
     const caps = [_]Capability{
-        .{ .backend = .mlx, .priority = 10, .supports = &onlyActivations },
+        .{ .backend = .metal, .priority = 10, .supports = &onlyActivations },
         .{ .backend = .native, .priority = 0, .supports = &supportsAll },
     };
 
     var plan = try partition(allocator, &g, &caps);
     defer plan.deinit();
 
-    // Should have at least 2 partitions: native (param+rms_norm) and mlx (gelu).
+    // Should have at least 2 partitions: native (param+rms_norm) and metal (gelu).
     try std.testing.expect(plan.partitions.len >= 2);
 
-    // The gelu partition should be assigned to mlx.
+    // The gelu partition should be assigned to metal.
     const node_count = g.nodeCount();
     const gelu_id: NodeId = @intCast(node_count - 1);
     const gelu_partition = plan.node_assignment[gelu_id];
-    try std.testing.expectEqual(BackendKind.mlx, plan.partitions[gelu_partition].backend);
+    try std.testing.expectEqual(BackendKind.metal, plan.partitions[gelu_partition].backend);
 
     // The rms_norm partition should have external inputs from gelu's input.
     // The gelu partition should have external inputs from the norm partition.
@@ -1395,7 +1393,7 @@ test "rich capability decision can reject profitable placement" {
     }.f;
 
     const caps = [_]Capability{
-        .{ .backend = .mlx, .priority = 10, .decide = &acceleratorDecision },
+        .{ .backend = .metal, .priority = 10, .decide = &acceleratorDecision },
         .{ .backend = .native, .priority = 0, .supports = &supportsAll },
     };
 
@@ -1575,7 +1573,7 @@ test "partition passes inferred tensor descriptors to capability decisions" {
 
     var diagnostics = CapabilityDiagnostics{};
     const caps = [_]Capability{
-        .{ .backend = .mlx, .priority = 10, .decide = &descriptorAwareDecision },
+        .{ .backend = .metal, .priority = 10, .decide = &descriptorAwareDecision },
         .{ .backend = .native, .priority = 0, .decide = &decideNative },
     };
 
@@ -1583,7 +1581,7 @@ test "partition passes inferred tensor descriptors to capability decisions" {
     defer plan.deinit();
 
     const gelu_partition = plan.node_assignment[out];
-    try std.testing.expectEqual(BackendKind.mlx, plan.partitions[gelu_partition].backend);
+    try std.testing.expectEqual(BackendKind.metal, plan.partitions[gelu_partition].backend);
     try std.testing.expect(diagnostics.count(.wrong_storage) == 0);
 }
 
@@ -1654,7 +1652,7 @@ test "external inputs track cross-partition edges" {
     defer g.deinit();
     var b = Builder.init(&g);
 
-    // Build: param(native) -> gelu(mlx) -> neg(native)
+    // Build: param(native) -> gelu(metal) -> neg(native)
     // gelu should have external input from param.
     // neg should have external input from gelu.
     const x = try b.parameter("x", Shape.init(.f32, &.{4}));
@@ -1672,17 +1670,17 @@ test "external inputs track cross-partition edges" {
     }.f;
 
     const caps = [_]Capability{
-        .{ .backend = .mlx, .priority = 10, .supports = &onlyGelu },
+        .{ .backend = .metal, .priority = 10, .supports = &onlyGelu },
         .{ .backend = .native, .priority = 0, .supports = &supportsAll },
     };
 
     var plan = try partition(allocator, &g, &caps);
     defer plan.deinit();
 
-    // Should have 3 partitions: native(param), mlx(gelu), native(neg)
+    // Should have 3 partitions: native(param), metal(gelu), native(neg)
     try std.testing.expectEqual(@as(usize, 3), plan.partitions.len);
 
-    // Middle partition (mlx/gelu) should have 1 external input from param.
+    // Middle partition (metal/gelu) should have 1 external input from param.
     try std.testing.expectEqual(@as(usize, 1), plan.partitions[1].external_inputs.len);
 
     // Last partition (native/neg) should have 1 external input from gelu.

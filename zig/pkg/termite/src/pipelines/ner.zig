@@ -52,14 +52,14 @@ pub const NerPipeline = struct {
     tok: Tokenizer,
     config: NerConfig,
 
-    pub fn usesDistributedMlx(self: *const NerPipeline) bool {
+    pub fn usesDistributedGpuHosted(self: *const NerPipeline) bool {
         return self.config.distributed.enabled and
             self.config.distributed.world_size > 1 and
             self.session.backend().usesGpuHostedSession();
     }
 
-    pub fn usesTensorParallelMlx(self: *const NerPipeline) bool {
-        return self.usesDistributedMlx() and self.config.distributed.mode == .tensor_parallel;
+    pub fn usesTensorParallelGpuHosted(self: *const NerPipeline) bool {
+        return self.usesDistributedGpuHosted() and self.config.distributed.mode == .tensor_parallel;
     }
 
     pub fn init(

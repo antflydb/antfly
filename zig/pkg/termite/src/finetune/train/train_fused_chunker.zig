@@ -38,11 +38,11 @@ const build_options = @import("build_options");
 const native_compute = @import("../../ops/native_compute.zig");
 const ops_mod = @import("../../ops/ops.zig");
 const ComputeBackend = ops_mod.ComputeBackend;
-const mlx_compute_mod = if (build_options.enable_mlx) @import("../../ops/mlx_compute.zig") else struct {
+const mlx_compute_mod = struct {
     pub const MlxCompute = void;
     pub const WeightStore = void;
 };
-const mlx_mod = if (build_options.enable_mlx) @import("../../backends/mlx.zig") else struct {
+const mlx_mod = struct {
     pub const c = struct {
         pub fn mlx_map_string_to_array_new() void {}
         pub const mlx_array = void;
@@ -497,10 +497,10 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     const use_mlx = switch (opts.backend) {
         .mlx => true,
         .native => false,
-        .auto => build_options.enable_mlx,
+        .auto => false,
     };
 
-    if (use_mlx and !build_options.enable_mlx) {
+    if (use_mlx and !false) {
         print("error: MLX support not compiled in\n", .{});
         std.process.exit(1);
     }
@@ -515,12 +515,12 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
 
     // MLX backend and its WeightStore are conditionally compiled.
     // When enable_mlx = false these are void (zero size) and never used.
-    const MlxWeightStoreT = if (build_options.enable_mlx) mlx_compute_mod.WeightStore else void;
-    const MlxComputeT = if (build_options.enable_mlx) mlx_compute_mod.MlxCompute else void;
+    const MlxWeightStoreT = if (false) mlx_compute_mod.WeightStore else void;
+    const MlxComputeT = if (false) mlx_compute_mod.MlxCompute else void;
     var mlx_weight_store: MlxWeightStoreT = undefined;
     var mlx_backend: MlxComputeT = undefined;
 
-    const cb: ComputeBackend = if (build_options.enable_mlx) blk: {
+    const cb: ComputeBackend = if (false) blk: {
         if (use_mlx) {
             mlx_weight_store = mlx_compute_mod.WeightStore{
                 .allocator = allocator,
@@ -588,7 +588,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                                 };
                                 // Fix 1: When MLX is active, also insert each weight into
                                 // mlx_weight_store so cb.getWeight() finds it on the MLX path.
-                                if (comptime build_options.enable_mlx) {
+                                if (comptime false) {
                                     if (use_mlx) {
                                         const arr = mlx_mod.arrayFromTensor(allocator, &lw.tensor, false) catch {
                                             load_ok = false;
@@ -971,7 +971,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                             .{ layer_n, proj_name },
                         );
 
-                        if (comptime build_options.enable_mlx) {
+                        if (comptime false) {
                             if (use_mlx) {
                                 // MLX path: create mlx_array handles and insert into the map.
                                 // A: [rank, in_features]

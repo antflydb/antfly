@@ -25,8 +25,8 @@ const graph_input_binder = @import("graph_input_binder.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
 const SafetensorsSource = weight_source_mod.SafetensorsSource;
 const native_compute = @import("../ops/native_compute.zig");
-const mlx_backend = if (build_options.enable_mlx) @import("../backends/mlx.zig") else struct {};
-const mlx_compute = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
+const mlx_backend = struct {};
+const mlx_compute = struct {};
 const ops_mod = @import("../ops/ops.zig");
 const interpreter = @import("../graph/interpreter.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
@@ -89,10 +89,10 @@ pub const LoadedBackend = struct {
     native_ws: ?native_compute.WeightStore = null,
     native_engine: ?*native_compute.NativeCompute = null,
     safetensors_source: ?*SafetensorsSource = null,
-    mlx_ws: if (build_options.enable_mlx) ?mlx_compute.WeightStore else void =
-        if (build_options.enable_mlx) null else {},
-    mlx_engine: if (build_options.enable_mlx) ?*mlx_compute.MlxCompute else void =
-        if (build_options.enable_mlx) null else {},
+    mlx_ws: if (false) ?mlx_compute.WeightStore else void =
+        if (false) null else {},
+    mlx_engine: if (false) ?*mlx_compute.MlxCompute else void =
+        if (false) null else {},
 
     pub fn backendPtr(self: *LoadedBackend) *const ComputeBackend {
         self.compute_backend = switch (self.kind) {
@@ -101,7 +101,7 @@ pub const LoadedBackend = struct {
                 engine.data = &self.native_ws.?;
                 break :blk engine.computeBackend();
             },
-            .mlx => if (comptime build_options.enable_mlx) blk: {
+            .mlx => if (comptime false) blk: {
                 const engine = self.mlx_engine.?;
                 engine.data = &self.mlx_ws.?;
                 break :blk engine.computeBackend();
@@ -117,7 +117,7 @@ pub const LoadedBackend = struct {
                 var cb = engine.computeBackend();
                 cb.deinit();
             },
-            .mlx => if (comptime build_options.enable_mlx) {
+            .mlx => if (comptime false) {
                 if (self.mlx_engine) |engine| {
                     engine.data = &self.mlx_ws.?;
                     var cb = engine.computeBackend();
@@ -136,7 +136,7 @@ pub const LoadedBackend = struct {
             ws.resident_weights.deinit(self.allocator);
             ws.lazy_weights.deinit(self.allocator);
         }
-        if (comptime build_options.enable_mlx) {
+        if (comptime false) {
             if (self.mlx_ws) |*ws| {
                 mlx_compute.deinitPrefetchQueue(ws);
                 mlx_compute.deinitPackedExpertViews(ws, self.allocator);
@@ -302,7 +302,7 @@ pub fn loadBackendForModelDir(
             };
         },
         .mlx => {
-            if (!build_options.enable_mlx) return error.MlxNotAvailable;
+            if (!false) return error.MlxNotAvailable;
             const raw_weights = try mlx_backend.loadSafetensors(st_path, allocator, mlx_backend.openDefaultStream().stream);
             var ws = mlx_compute.WeightStore{
                 .allocator = allocator,

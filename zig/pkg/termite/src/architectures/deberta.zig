@@ -19,13 +19,11 @@
 // content-to-position, and position-to-content attention scores.
 
 const std = @import("std");
-const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ops = @import("../ops/ops.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const deberta_config = @import("../models/deberta.zig");
-const mlx_compute_mod = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
 
 pub const Config = deberta_config.Config;
 
@@ -593,10 +591,8 @@ fn getLayerWeight(cb: *const ComputeBackend, layer: usize, suffix: []const u8, b
 }
 
 fn tensorParallelWorldSize(cb: *const ComputeBackend) usize {
-    if (!build_options.enable_mlx) return 1;
-    const mlx_compute = mlx_compute_mod.MlxCompute.fromComputeBackend(cb) orelse return 1;
-    if (!mlx_compute.tensorParallelEnabled()) return 1;
-    return mlx_compute.tensorParallelWorldSize();
+    _ = cb;
+    return 1;
 }
 
 fn isDenseF32Tensor(cb: *const ComputeBackend, tensor: CT) bool {
@@ -613,13 +609,6 @@ fn linearReplicatedToMaybeSharded(
     input_dim: usize,
     output_dim: usize,
 ) !CT {
-    if (build_options.enable_mlx) {
-        if (mlx_compute_mod.MlxCompute.fromComputeBackend(cb)) |mlx_compute| {
-            if (mlx_compute.tensorParallelEnabled()) {
-                return mlx_compute.linearTensorParallelReplicatedToSharded(input, weight, bias, rows, input_dim, output_dim);
-            }
-        }
-    }
     return cb.linear(input, weight, bias, rows, input_dim, output_dim);
 }
 
@@ -632,12 +621,5 @@ fn linearMaybeShardedToReplicated(
     input_dim: usize,
     output_dim: usize,
 ) !CT {
-    if (build_options.enable_mlx) {
-        if (mlx_compute_mod.MlxCompute.fromComputeBackend(cb)) |mlx_compute| {
-            if (mlx_compute.tensorParallelEnabled()) {
-                return mlx_compute.linearTensorParallelShardedToReplicated(input, weight, bias, rows, input_dim, output_dim);
-            }
-        }
-    }
     return cb.linear(input, weight, bias, rows, input_dim, output_dim);
 }

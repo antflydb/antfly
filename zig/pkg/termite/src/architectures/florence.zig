@@ -303,7 +303,7 @@ fn visionEncoderForward(
 }
 
 fn useTensorNativeVision(cb: *const ComputeBackend) bool {
-    return cb.kind() == .mlx;
+    return cb.kind() == .metal;
 }
 
 fn daViTBlockData(

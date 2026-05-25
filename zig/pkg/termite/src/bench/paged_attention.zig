@@ -17,16 +17,11 @@ const build_options = @import("build_options");
 const ops = @import("../ops/ops.zig");
 const NativeCompute = @import("../ops/native_compute.zig").NativeCompute;
 const NativeWeightStore = @import("../ops/native_compute.zig").WeightStore;
-const MlxCompute = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig").MlxCompute else void;
-const MlxWeightStore = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig").WeightStore else void;
-const mlx = if (build_options.enable_mlx) @import("../backends/mlx.zig") else struct {};
-const mlx_quant = if (build_options.enable_mlx) @import("../backends/mlx_quant.zig") else struct {};
 const runtime = @import("../runtime/root.zig");
 const LoadedWeight = @import("../models/weight_source.zig").LoadedWeight;
 
 const BackendKind = enum {
     native,
-    mlx,
 };
 
 const BenchConfig = struct {
@@ -57,60 +52,27 @@ const BackendResources = union(BackendKind) {
         weights: *NativeWeightStore,
         compute: *NativeCompute,
     },
-    mlx: if (build_options.enable_mlx) struct {
-        weights: *MlxWeightStore,
-        stream: mlx.c.mlx_stream,
-        compute: *MlxCompute,
-    } else void,
 
     fn deinit(self: *BackendResources, allocator: std.mem.Allocator) void {
-        if (!build_options.enable_mlx) {
-            const native_backend = &self.native;
-            native_backend.compute.computeBackend().deinit();
-            native_backend.weights.resident_weights.deinit(allocator);
-            native_backend.weights.lazy_weights.deinit(allocator);
-            allocator.destroy(native_backend.weights);
-            return;
-        }
-        switch (self.*) {
-            .native => |*native_backend| {
-                native_backend.compute.computeBackend().deinit();
-                native_backend.weights.resident_weights.deinit(allocator);
-                native_backend.weights.lazy_weights.deinit(allocator);
-                allocator.destroy(native_backend.weights);
-            },
-            .mlx => |*mlx_backend| {
-                mlx_backend.compute.computeBackend().deinit();
-                mlx_backend.weights.native_quant.deinit();
-                _ = mlx.c.mlx_map_string_to_array_free(mlx_backend.weights.resident_weights);
-                allocator.destroy(mlx_backend.weights);
-                _ = mlx.c.mlx_stream_free(mlx_backend.stream);
-            },
-        }
+        const native_backend = &self.native;
+        native_backend.compute.computeBackend().deinit();
+        native_backend.weights.resident_weights.deinit(allocator);
+        native_backend.weights.lazy_weights.deinit(allocator);
+        allocator.destroy(native_backend.weights);
     }
 
     fn computeBackend(self: *BackendResources) ops.ComputeBackend {
-        if (!build_options.enable_mlx) return self.native.compute.computeBackend();
-        return switch (self.*) {
-            .native => |*native_backend| native_backend.compute.computeBackend(),
-            .mlx => |*mlx_backend| mlx_backend.compute.computeBackend(),
-        };
+        return self.native.compute.computeBackend();
     }
 
     fn kvBackendKind(self: *const BackendResources) runtime.kv.pool.BackendKind {
-        if (!build_options.enable_mlx) return .native;
-        return switch (self.*) {
-            .native => .native,
-            .mlx => .mlx,
-        };
+        _ = self;
+        return .native;
     }
 
     fn defaultKvDType(self: *const BackendResources) runtime.kv.pool.KvDType {
-        if (!build_options.enable_mlx) return .f32;
-        return switch (self.*) {
-            .native => .f32,
-            .mlx => .f16,
-        };
+        _ = self;
+        return .f32;
     }
 };
 
@@ -255,17 +217,13 @@ fn parseArgs(init: std.process.Init) !BenchConfig {
 
 fn parseBackend(arg: []const u8) !BackendKind {
     if (std.mem.eql(u8, arg, "native")) return .native;
-    if (std.mem.eql(u8, arg, "mlx")) {
-        if (!build_options.enable_mlx) return error.MlxNotEnabled;
-        return .mlx;
-    }
     return error.InvalidBackend;
 }
 
 fn printUsage() !void {
     std.debug.print(
         \\Usage: termite-paged-attention-bench [options]
-        \\  --backend native|mlx
+        \\  --backend native
         \\  --prompt-len N
         \\  --decode-steps N
         \\  --page-size N
@@ -292,22 +250,6 @@ fn initBackend(allocator: std.mem.Allocator, backend: BackendKind) !BackendResou
             const compute = try allocator.create(NativeCompute);
             compute.* = NativeCompute.init(allocator, weights, null);
             return .{ .native = .{ .weights = weights, .compute = compute } };
-        },
-        .mlx => {
-            if (!build_options.enable_mlx) return error.MlxNotEnabled;
-            const stream = mlx.gpuStream();
-            const weights = try allocator.create(MlxWeightStore);
-            weights.* = .{
-                .allocator = allocator,
-                .resident_weights = mlx.c.mlx_map_string_to_array_new(),
-                .stream = stream,
-                .prefix = "",
-                .lazy_weights = .empty,
-                .native_quant = mlx_quant.defaultProvider(),
-            };
-            const compute = try allocator.create(MlxCompute);
-            compute.* = try MlxCompute.init(allocator, weights, null);
-            return .{ .mlx = .{ .weights = weights, .stream = stream, .compute = compute } };
         },
     }
 }
@@ -589,11 +531,9 @@ fn kvCacheView(manager: *runtime.kv.manager.KvManager, sequence_id: runtime.kv.m
 }
 
 fn makeBenchTensor(backend: BackendKind, cb: *const ops.ComputeBackend, data: []const f32, rows: usize, cols: usize) !ops.CT {
-    if (backend == .mlx and build_options.enable_mlx) {
-        const mlx_compute: *MlxCompute = @ptrCast(@alignCast(cb.ptr));
-        const shape = [_]i32{ @intCast(rows), @intCast(cols) };
-        return mlx_compute.fromFloat32Shape(data, &shape);
-    }
+    _ = backend;
+    _ = rows;
+    _ = cols;
     return cb.fromFloat32(data);
 }
 

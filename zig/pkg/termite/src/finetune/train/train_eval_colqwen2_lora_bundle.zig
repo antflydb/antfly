@@ -20,13 +20,13 @@ const build_options = @import("build_options");
 const run_contract = @import("../../run/contract.zig");
 const artifact_writer = @import("../../run/artifact_writer.zig");
 const ops_mod = @import("../../ops/ops.zig");
-const mlx_compute = @import("../../ops/mlx_compute.zig");
+const mlx_compute = struct {};
 const ComputeBackend = ops_mod.ComputeBackend;
-const mlx_compute_mod = if (build_options.enable_mlx) mlx_compute else struct {
+const mlx_compute_mod = if (false) mlx_compute else struct {
     pub const WeightStore = void;
     pub const MlxCompute = void;
 };
-const mlx_mod = if (build_options.enable_mlx) @import("../../backends/mlx.zig") else struct {};
+const mlx_mod = struct {};
 const pjrt_mod = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
         pub const Client = void;
@@ -62,7 +62,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     var grad_accum_steps: u32 = 1;
     var llrd_decay: f32 = 1.0;
     var use_schedule_free: bool = false;
-    var use_mlx: bool = build_options.enable_mlx; // auto: use MLX if compiled in
+    var use_mlx: bool = false; // auto: use MLX if compiled in
 
     // Parse remaining positional args (legacy positional support) then flags.
     // We handle both: legacy positional order and new --flag style.
@@ -115,7 +115,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             } else if (std.mem.eql(u8, val, "blas")) {
                 use_mlx = false;
             } else if (std.mem.eql(u8, val, "auto")) {
-                use_mlx = build_options.enable_mlx;
+                use_mlx = false;
             } else return usageError();
         } else {
             // Legacy positional: lr, max_examples, epochs, layer_name
@@ -130,7 +130,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
         }
     }
 
-    if (use_mlx and !build_options.enable_mlx) {
+    if (use_mlx and !false) {
         std.debug.print("error: MLX support not compiled in\n", .{});
         std.process.exit(1);
     }
@@ -138,15 +138,15 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     // Set up compute backend for gradient computation.
     // MLX backend and its WeightStore are conditionally compiled.
     // When enable_mlx = false all three are void (zero size) and never used.
-    const MlxWeightStoreT = if (build_options.enable_mlx) mlx_compute_mod.WeightStore else void;
-    const MlxComputeT = if (build_options.enable_mlx) mlx_compute_mod.MlxCompute else void;
-    const MlxCbT = if (build_options.enable_mlx) ComputeBackend else void;
+    const MlxWeightStoreT = if (false) mlx_compute_mod.WeightStore else void;
+    const MlxComputeT = if (false) mlx_compute_mod.MlxCompute else void;
+    const MlxCbT = if (false) ComputeBackend else void;
     var mlx_weight_store: MlxWeightStoreT = undefined;
     var mlx_backend: MlxComputeT = undefined;
     var mlx_cb_storage: MlxCbT = undefined;
     var backend_ptr: ?*const ComputeBackend = null;
 
-    if (comptime build_options.enable_mlx) {
+    if (comptime false) {
         if (use_mlx) {
             mlx_weight_store = mlx_compute_mod.WeightStore{
                 .allocator = allocator,
@@ -163,12 +163,12 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     std.debug.print("backend: {s}\n", .{if (use_mlx) "mlx" else "blas"});
 
     // Initialize MLX distributed context if world_size > 1.
-    const MlxDistCtxT = if (build_options.enable_mlx) ?mlx_mod.DistributedContext else void;
-    var mlx_dist_ctx: MlxDistCtxT = if (comptime build_options.enable_mlx) null else {};
+    const MlxDistCtxT = if (false) ?mlx_mod.DistributedContext else void;
+    var mlx_dist_ctx: MlxDistCtxT = if (comptime false) null else {};
     var world_size: u32 = 1;
     var ddp_rank: u32 = 0;
 
-    if (comptime build_options.enable_mlx) {
+    if (comptime false) {
         if (platform.env.getenv("MLX_WORLD_SIZE")) |ws_str| {
             const ws = std.fmt.parseUnsigned(u32, ws_str, 10) catch 1;
             if (ws > 1) {
@@ -255,7 +255,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             .llrd_decay = llrd_decay,
             .use_schedule_free = use_schedule_free,
             .compute_backend = backend_ptr,
-            .mlx_dist_group = if (comptime build_options.enable_mlx)
+            .mlx_dist_group = if (comptime false)
                 (if (mlx_dist_ctx) |ctx| ctx.group else null)
             else {},
             .world_size = world_size,
@@ -297,7 +297,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
         },
         .backend_policy = .{
             .selected = if (use_mlx) "mlx" else "blas",
-            .preferred = if (build_options.enable_mlx) "mlx" else "blas",
+            .preferred = if (false) "mlx" else "blas",
         },
         .distributed = .{
             .enabled = world_size > 1,
@@ -335,7 +335,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
         .task = "colqwen2_lora_train_eval",
         .backend_policy = .{
             .selected = if (use_mlx) "mlx" else "blas",
-            .preferred = if (build_options.enable_mlx) "mlx" else "blas",
+            .preferred = if (false) "mlx" else "blas",
         },
         .distributed = .{
             .enabled = world_size > 1,
