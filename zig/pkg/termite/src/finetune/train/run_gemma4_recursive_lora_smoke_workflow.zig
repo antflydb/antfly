@@ -40,7 +40,7 @@ const Options = struct {
     recursive_init: []const u8 = "average_residual_svd",
     teacher_top_k: []const u8 = "8",
     teacher_temperature: []const u8 = "2.0",
-    backend: []const u8 = "mlx",
+    backend: []const u8 = "native",
     split: []const u8 = "train",
     dry_run: bool = false,
 };
@@ -500,7 +500,7 @@ fn usageError() error{InvalidArguments} {
         \\  --recursive-init NAME
         \\  --teacher-top-k N
         \\  --teacher-temperature F
-        \\  --backend auto|mlx|blas
+        \\  --backend auto|native
         \\  --split NAME
         \\  --dry-run
         \\

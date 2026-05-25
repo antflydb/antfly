@@ -16,7 +16,7 @@
 //
 // Two pathways:
 // 1. ortgenai (ONNX Runtime GenAI) — for models with genai_config.json
-// 2. Native autoregressive decoding — for native/MLX backends using GPT arch forward pass
+// 2. Native autoregressive decoding — for native backends using GPT arch forward pass
 //
 // The native path runs gpt_arch.forward() to get logits, samples the next token,
 // and loops until EOS or max_tokens. Matches Go termite's TextGenerationPipeline.

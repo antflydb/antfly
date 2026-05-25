@@ -124,7 +124,7 @@ fn profileElapsed(start_ns: u64) u64 {
 /// without a toFloat32 + fromFloat32Shape round-trip.  The internal
 /// f32-only helpers (extractWord/Label embeddings) materialise the
 /// hidden tensor once via `cb.toFloat32` -- on native that's a
-/// memcpy + free, on Metal/MLX one device->host transfer instead of
+/// memcpy + free, on Metal one device->host transfer instead of
 /// the prior device->host->device->host pattern.
 pub fn forwardCt(
     cb: *const ComputeBackend,
@@ -970,7 +970,7 @@ fn miniTransformerLayerCpu(
     // Use the backend's `splitLastDim3` op rather than round-tripping the
     // QKV tensor through f32.  On native compute it operates directly on
     // the underlying f32 view (zero extra alloc beyond the three split
-    // buffers); on Metal/MLX the split stays device-resident.
+    // buffers); on Metal the split stays device-resident.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();

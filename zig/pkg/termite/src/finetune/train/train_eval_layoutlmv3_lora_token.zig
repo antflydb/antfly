@@ -13,21 +13,12 @@
 // limitations under the License.
 
 const std = @import("std");
-const platform = @import("antfly_platform");
 const finetune = @import("../layoutlmv3.zig");
 const document_data = @import("../document_data.zig");
 const graph_bridge = @import("../graph_bridge.zig");
 const build_options = @import("build_options");
 const run_contract = @import("../../run/contract.zig");
 const artifact_writer = @import("../../run/artifact_writer.zig");
-const ops_mod = @import("../../ops/ops.zig");
-const mlx_compute = struct {};
-const ComputeBackend = ops_mod.ComputeBackend;
-const mlx_compute_mod = if (false) mlx_compute else struct {
-    pub const WeightStore = void;
-    pub const MlxCompute = void;
-};
-const mlx_mod = struct {};
 const pjrt_mod = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
         pub const Client = void;
@@ -54,7 +45,6 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     var llrd_decay: f32 = 1.0;
     var grad_accum_steps: u32 = 1;
     var use_schedule_free: bool = false;
-    var use_mlx: bool = false; // auto: use MLX if compiled in
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -80,13 +70,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             i += 1;
             if (i >= argv.len) return usageError();
             const val = argv[i];
-            if (std.mem.eql(u8, val, "mlx")) {
-                use_mlx = true;
-            } else if (std.mem.eql(u8, val, "blas")) {
-                use_mlx = false;
-            } else if (std.mem.eql(u8, val, "auto")) {
-                use_mlx = false;
-            } else return usageError();
+            if (!std.mem.eql(u8, val, "native") and !std.mem.eql(u8, val, "auto")) return usageError();
         } else {
             try positional.append(allocator, arg);
         }
@@ -109,55 +93,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     const max_val_examples = try std.fmt.parseUnsigned(usize, max_val_examples_arg, 10);
     const epochs = try std.fmt.parseUnsigned(usize, epochs_arg, 10);
 
-    if (use_mlx and !false) {
-        std.debug.print("error: MLX support not compiled in\n", .{});
-        std.process.exit(1);
-    }
-
-    // Set up compute backend for gradient computation.
-    // When enable_mlx = false all three MLX variables are void (zero size) and never used.
-    const MlxWeightStoreT = if (false) mlx_compute_mod.WeightStore else void;
-    const MlxComputeT = if (false) mlx_compute_mod.MlxCompute else void;
-    const MlxCbT = if (false) ComputeBackend else void;
-    var mlx_weight_store: MlxWeightStoreT = undefined;
-    var mlx_backend: MlxComputeT = undefined;
-    var mlx_cb_storage: MlxCbT = undefined;
-    var backend_ptr: ?*const ComputeBackend = null;
-
-    if (comptime false) {
-        if (use_mlx) {
-            mlx_weight_store = mlx_compute_mod.WeightStore{
-                .allocator = allocator,
-                .resident_weights = mlx_mod.c.mlx_map_string_to_array_new(),
-                .stream = mlx_mod.openDefaultStream().stream,
-                .prefix = "",
-                .lazy_weights = .{},
-            };
-            mlx_backend = try mlx_compute_mod.MlxCompute.init(allocator, &mlx_weight_store, null);
-            mlx_cb_storage = mlx_backend.computeBackend();
-            backend_ptr = &mlx_cb_storage;
-        }
-    }
-    std.debug.print("backend: {s}\n", .{if (use_mlx) "mlx" else "blas"});
-
-    // Initialize MLX distributed context if world_size > 1.
-    const MlxDistCtxT = if (false) ?mlx_mod.DistributedContext else void;
-    var mlx_dist_ctx: MlxDistCtxT = if (comptime false) null else {};
-    var world_size: u32 = 1;
-
-    if (comptime false) {
-        if (platform.env.getenv("MLX_WORLD_SIZE")) |ws_str| {
-            const ws = std.fmt.parseUnsigned(u32, ws_str, 10) catch 1;
-            if (ws > 1) {
-                world_size = ws;
-                mlx_dist_ctx = mlx_mod.initDistributed(false, null) catch |err| blk: {
-                    std.log.warn("MLX distributed init failed ({s}); running single-device", .{@errorName(err)});
-                    world_size = 1;
-                    break :blk null;
-                };
-            }
-        }
-    }
+    std.debug.print("backend: native\n", .{});
 
     var train_loaded = try document_data.loadExamples(allocator, train_input, "train");
     defer train_loaded.deinit();
@@ -184,7 +120,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     var pjrt_client_storage: PjrtClientT = if (comptime build_options.enable_pjrt) null else {};
     if (comptime build_options.enable_pjrt) {
         pjrt_client_storage = pjrt_mod.pjrt.Client.initFromEnv(allocator) catch |err| blk: {
-            std.log.warn("PJRT client init failed ({s}); LoRA gradients will use CPU/MLX", .{@errorName(err)});
+            std.log.warn("PJRT client init failed ({s}); LoRA gradients will use CPU", .{@errorName(err)});
             break :blk null;
         };
     }
@@ -239,11 +175,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
         .llrd_decay = llrd_decay,
         .grad_accum_steps = grad_accum_steps,
         .use_schedule_free = use_schedule_free,
-        .compute_backend = backend_ptr,
-        .mlx_dist_group = if (comptime false)
-            (if (mlx_dist_ctx) |ctx| ctx.group else null)
-        else {},
-        .world_size = world_size,
+        .compute_backend = null,
         .pjrt_lora_steps = if (comptime build_options.enable_pjrt) pjrt_lora_steps else {},
     });
     defer finetune.freeTokenTrainEvalSummary(allocator, &summary);
@@ -273,13 +205,13 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             .use_schedule_free = use_schedule_free,
         },
         .backend_policy = .{
-            .selected = if (use_mlx) "mlx" else "blas",
-            .preferred = if (false) "mlx" else "blas",
+            .selected = "native",
+            .preferred = "native",
         },
         .distributed = .{
-            .enabled = world_size > 1,
-            .backend = "mlx",
-            .world_size = world_size,
+            .enabled = false,
+            .backend = "native",
+            .world_size = 1,
         },
     });
 
@@ -300,13 +232,13 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
         .artifact_family_version = finetune.artifact_family_version,
         .task = "layoutlmv3_lora_token_train_eval",
         .backend_policy = .{
-            .selected = if (use_mlx) "mlx" else "blas",
-            .preferred = if (false) "mlx" else "blas",
+            .selected = "native",
+            .preferred = "native",
         },
         .distributed = .{
-            .enabled = world_size > 1,
-            .backend = "mlx",
-            .world_size = world_size,
+            .enabled = false,
+            .backend = "native",
+            .world_size = 1,
         },
         .report = report_payload,
     });
@@ -358,8 +290,8 @@ fn buildCombinedTokenLabelVocab(
 
 fn usageError() error{InvalidArguments} {
     std.debug.print(
-        \\usage: train-eval-layoutlmv3-lora-token <base_model_dir> <adapter_model_dir> <train_jsonl_or_dir> <val_jsonl_or_dir> <out_dir> [max_train_examples] [learning_rate] [max_val_examples] [epochs] [layer_name|@layoutlmv3_token_top1|@layoutlmv3_token_top3|@layoutlmv3_sequence_top3] [--max-grad-norm F] [--llrd-decay F] [--grad-accum N] [--schedule-free] [--backend auto|mlx|blas]
-        \\example: train-eval-layoutlmv3-lora-token /tmp/layoutlmv3_base /tmp/layoutlmv3_lora /tmp/train.jsonl /tmp/val.jsonl /tmp/layoutlmv3_tok 128 0.001 64 4 @layoutlmv3_token_top3 --max-grad-norm 1.0 --llrd-decay 0.9 --grad-accum 4 --schedule-free --backend mlx
+        \\usage: train-eval-layoutlmv3-lora-token <base_model_dir> <adapter_model_dir> <train_jsonl_or_dir> <val_jsonl_or_dir> <out_dir> [max_train_examples] [learning_rate] [max_val_examples] [epochs] [layer_name|@layoutlmv3_token_top1|@layoutlmv3_token_top3|@layoutlmv3_sequence_top3] [--max-grad-norm F] [--llrd-decay F] [--grad-accum N] [--schedule-free] [--backend auto|native]
+        \\example: train-eval-layoutlmv3-lora-token /tmp/layoutlmv3_base /tmp/layoutlmv3_lora /tmp/train.jsonl /tmp/val.jsonl /tmp/layoutlmv3_tok 128 0.001 64 4 @layoutlmv3_token_top3 --max-grad-norm 1.0 --llrd-decay 0.9 --grad-accum 4 --schedule-free --backend native
         \\
     , .{});
     return error.InvalidArguments;

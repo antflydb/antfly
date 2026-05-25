@@ -61,7 +61,7 @@ pub const RerankerTrainingMode = enum {
     /// by the autodiff system through every encoder layer — i.e., actual
     /// full LoRA training equivalent to HF PEFT / Unsloth semantics. Uses
     /// `real_autodiff_trainer.zig` as the harness. Runs ONE batch step per
-    /// call. MLX-capable via the ComputeBackend polymorphism.
+    /// call. Backend-agnostic via the ComputeBackend polymorphism.
     real_autodiff,
 };
 

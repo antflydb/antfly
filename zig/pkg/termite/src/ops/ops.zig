@@ -16,7 +16,7 @@
 //
 // Provides a backend-agnostic interface over tensor operations. Model
 // architectures (BERT, T5, GPT) call these ops without knowing whether
-// the underlying execution uses native CPU math, MLX, or anything else.
+// the underlying execution uses native CPU math or other execution backends.
 //
 // Inspired by llama.cpp's GGML: models build computation, backends execute.
 
@@ -30,7 +30,7 @@ const gpt_model = @import("../models/gpt.zig");
 const ml = @import("ml");
 
 /// Opaque tensor handle. The concrete type depends on the compute backend
-/// (native CPU uses f32 slices, MLX uses mlx_array handles). Tensors are always
+/// (native CPU uses f32 slices, device backends use opaque handles). Tensors are always
 /// freed via the ComputeBackend that created them.
 pub const CT = backend_contracts.CT;
 
@@ -1481,7 +1481,7 @@ pub const ComputeBackend = struct {
         logSoftmaxOp: ?*const fn (ctx: *anyopaque, input: CT, last_dim_size: u32) anyerror!CT = null,
 
         /// Download multiple tensors to f32 in a single backend round-trip.
-        /// Backends that support batched eval (e.g. MLX mlx_eval with a vector of
+        /// Backends that support batched eval (e.g. a backend eval with a vector of
         /// arrays) should implement this to reduce GPU sync overhead.
         /// Default (null): sequential toFloat32 calls used by the wrapper below.
         toFloat32Batch: ?*const fn (ctx: *anyopaque, cts: []const CT, allocator: std.mem.Allocator) anyerror![][]f32 = null,
@@ -2378,7 +2378,7 @@ pub const ComputeBackend = struct {
     }
 
     /// Download multiple tensors to f32 in a single backend round-trip.
-    /// When the backend provides a batched implementation (e.g. MLX single eval
+    /// When the backend provides a batched implementation (e.g. single backend eval
     /// of all arrays at once), this reduces GPU sync overhead significantly.
     /// Falls back to sequential toFloat32 calls when no batched path exists.
     /// Caller owns each element of the returned slice and must free them, along

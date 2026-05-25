@@ -175,9 +175,6 @@ pub const TrainEpochOptions = struct {
     use_schedule_free: bool = false,
     warmup_steps: u32 = 0,
     compute_backend: ?*const @import("../ops/ops.zig").ComputeBackend = null,
-    mlx_dist_group: void =
-        if (false) null else {},
-    world_size: u32 = 1,
     ddp_rank: u32 = 0,
     pjrt_lora_steps: if (build_options.enable_pjrt) ?[]?graph_bridge.LoRAPjrtTrainStep else void =
         if (build_options.enable_pjrt) null else {},

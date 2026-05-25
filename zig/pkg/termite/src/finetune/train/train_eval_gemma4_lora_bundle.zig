@@ -25,13 +25,7 @@ const build_options = @import("build_options");
 const run_contract = @import("../../run/contract.zig");
 const artifact_writer = @import("../../run/artifact_writer.zig");
 const ops_mod = @import("../../ops/ops.zig");
-const mlx_compute = struct {};
 const ComputeBackend = ops_mod.ComputeBackend;
-const mlx_compute_mod = if (false) mlx_compute else struct {
-    pub const WeightStore = void;
-    pub const MlxCompute = void;
-};
-const mlx_mod = struct {};
 const pjrt_mod = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
         pub const Client = void;
@@ -61,7 +55,6 @@ const CliOptions = struct {
     grad_accum_steps: u32 = 1,
     llrd_decay: f32 = 1.0,
     use_schedule_free: bool = false,
-    use_mlx: bool = false,
     trainer_mode: TrainerMode = .auto,
     gguf_projector_path: ?[]const u8 = null,
 
@@ -89,7 +82,6 @@ const ReportContext = struct {
     grad_accum_steps: u32,
     llrd_decay: f32,
     use_schedule_free: bool,
-    use_mlx: bool,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -155,13 +147,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             i += 1;
             if (i >= argv.len) return usageError();
             const val = argv[i];
-            if (std.mem.eql(u8, val, "mlx")) {
-                opts.use_mlx = true;
-            } else if (std.mem.eql(u8, val, "blas")) {
-                opts.use_mlx = false;
-            } else if (std.mem.eql(u8, val, "auto")) {
-                opts.use_mlx = false;
-            } else return usageError();
+            if (!std.mem.eql(u8, val, "native") and !std.mem.eql(u8, val, "native") and !std.mem.eql(u8, val, "auto")) return usageError();
         } else if (std.mem.eql(u8, arg, "--trainer")) {
             i += 1;
             if (i >= argv.len) return usageError();
@@ -187,11 +173,6 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             }
             positional_count += 1;
         }
-    }
-
-    if (opts.use_mlx and !false) {
-        std.debug.print("error: MLX support not compiled in\n", .{});
-        std.process.exit(1);
     }
 
     var prepared = try finetune.loadPreparedInputsSummary(allocator, prepared_inputs_path);
@@ -269,7 +250,7 @@ fn runAutodiff(
     }
     const mm_stats = summarizeMultimodalPrepared(prepared.examples);
     const graph_config = try gemma4_real.loadGraphConfig(allocator, base_model_dir);
-    const backend_kind: gemma4_real.BackendKind = if (opts.use_mlx) .mlx else .native;
+    const backend_kind: gemma4_real.BackendKind = .native;
     var adapter_inspect = try finetune.inspectCheckpoint(allocator, adapter_model_dir);
     defer finetune.freeInspectionSummary(allocator, &adapter_inspect);
     const recursive_shared_block_size = adapter_inspect.recursive_shared_block_size;
@@ -452,7 +433,6 @@ fn runAutodiff(
         .grad_accum_steps = opts.grad_accum_steps,
         .llrd_decay = opts.llrd_decay,
         .use_schedule_free = opts.use_schedule_free,
-        .use_mlx = opts.use_mlx,
     });
 }
 
@@ -563,28 +543,7 @@ fn runSurrogate(
 ) !void {
     if (prepared.examples_with_images > 0 or prepared.examples_with_audio > 0) return error.MultimodalRequiresAutodiffTrainer;
 
-    const MlxWeightStoreT = if (false) mlx_compute_mod.WeightStore else void;
-    const MlxComputeT = if (false) mlx_compute_mod.MlxCompute else void;
-    const MlxCbT = if (false) ComputeBackend else void;
-    var mlx_weight_store: MlxWeightStoreT = undefined;
-    var mlx_backend: MlxComputeT = undefined;
-    var mlx_cb_storage: MlxCbT = undefined;
-    var backend_ptr: ?*const ComputeBackend = null;
-
-    if (comptime false) {
-        if (opts.use_mlx) {
-            mlx_weight_store = mlx_compute_mod.WeightStore{
-                .allocator = allocator,
-                .resident_weights = mlx_mod.c.mlx_map_string_to_array_new(),
-                .stream = mlx_mod.openDefaultStream().stream,
-                .prefix = "",
-                .lazy_weights = .{},
-            };
-            mlx_backend = try mlx_compute_mod.MlxCompute.init(allocator, &mlx_weight_store, null);
-            mlx_cb_storage = mlx_backend.computeBackend();
-            backend_ptr = &mlx_cb_storage;
-        }
-    }
+    const backend_ptr: ?*const ComputeBackend = null;
 
     var bundle = try finetune.loadLoRABundleScoped(allocator, base_model_dir, adapter_model_dir, opts.layer_name);
     defer bundle.deinit();
@@ -593,7 +552,7 @@ fn runSurrogate(
     var pjrt_client_storage: PjrtClientT = if (comptime build_options.enable_pjrt) null else {};
     if (comptime build_options.enable_pjrt) {
         pjrt_client_storage = pjrt_mod.pjrt.Client.initFromEnv(allocator) catch |err| blk: {
-            std.log.warn("PJRT client init failed ({s}); LoRA gradients will use CPU/MLX", .{@errorName(err)});
+            std.log.warn("PJRT client init failed ({s}); LoRA gradients will use CPU", .{@errorName(err)});
             break :blk null;
         };
     }
@@ -654,7 +613,6 @@ fn runSurrogate(
             .llrd_decay = opts.llrd_decay,
             .use_schedule_free = opts.use_schedule_free,
             .compute_backend = backend_ptr,
-            .world_size = 1,
             .pjrt_lora_steps = if (comptime build_options.enable_pjrt) pjrt_lora_steps else {},
         });
     }
@@ -717,7 +675,6 @@ fn runSurrogate(
         .grad_accum_steps = opts.grad_accum_steps,
         .llrd_decay = opts.llrd_decay,
         .use_schedule_free = opts.use_schedule_free,
-        .use_mlx = opts.use_mlx,
     });
 }
 
@@ -755,12 +712,12 @@ fn writeRunOutputs(
             .use_schedule_free = ctx.use_schedule_free,
         },
         .backend_policy = .{
-            .selected = if (ctx.use_mlx) "mlx" else "blas",
-            .preferred = if (false) "mlx" else "blas",
+            .selected = "native",
+            .preferred = "native",
         },
         .distributed = .{
             .enabled = false,
-            .backend = if (ctx.use_mlx) "mlx" else "blas",
+            .backend = "native",
             .rank = 0,
             .world_size = 1,
             .primary_rank = 0,
@@ -778,12 +735,12 @@ fn writeRunOutputs(
         .artifact_family_version = finetune.artifact_family_version,
         .task = "gemma4_lora_train_eval",
         .backend_policy = .{
-            .selected = if (ctx.use_mlx) "mlx" else "blas",
-            .preferred = if (false) "mlx" else "blas",
+            .selected = "native",
+            .preferred = "native",
         },
         .distributed = .{
             .enabled = false,
-            .backend = if (ctx.use_mlx) "mlx" else "blas",
+            .backend = "native",
             .rank = 0,
             .world_size = 1,
             .primary_rank = 0,
@@ -821,7 +778,7 @@ fn usageError() error{InvalidArguments} {
         \\  --grad-accum <u32>                  Gradient accumulation steps (default: 1)
         \\  --llrd-decay <f32>                  Surrogate-only layer-wise LR decay (default: 1.0)
         \\  --schedule-free                     Surrogate-only schedule-free AdamW
-        \\  --backend auto|mlx|blas             Compute backend for gradient math (default: auto)
+        \\  --backend auto|native                 Compute backend for gradient math (default: auto)
         \\  --gguf-projector <path>             Required for multimodal autodiff examples; path to Gemma4 projector GGUF
         \\
         \\example: train-eval-gemma4-lora-bundle /tmp/gemma4-base /tmp/gemma4-lora /tmp/gemma4_inputs.json /tmp/out \

@@ -28,8 +28,6 @@ const weight_source_mod = @import("../models/weight_source.zig");
 const SafetensorsSource = weight_source_mod.SafetensorsSource;
 const ShardedSafetensorsSource = weight_source_mod.ShardedSafetensorsSource;
 const native_compute = @import("../ops/native_compute.zig");
-const mlx_backend = struct {};
-const mlx_compute = struct {};
 const ops_mod = @import("../ops/ops.zig");
 const interpreter = @import("../graph/interpreter.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
@@ -88,7 +86,7 @@ fn copyTensorFloat32(dst: []f32, tensor: *const Tensor) !void {
     }
 }
 
-pub const BackendKind = enum { native, mlx };
+pub const BackendKind = enum { native };
 
 pub const LoadedBackend = struct {
     allocator: std.mem.Allocator,
@@ -98,10 +96,6 @@ pub const LoadedBackend = struct {
     native_engine: ?*native_compute.NativeCompute = null,
     safetensors_source: ?*SafetensorsSource = null,
     sharded_safetensors_source: ?*ShardedSafetensorsSource = null,
-    mlx_ws: if (false) ?mlx_compute.WeightStore else void =
-        if (false) null else {},
-    mlx_engine: if (false) ?*mlx_compute.MlxCompute else void =
-        if (false) null else {},
 
     pub fn backendPtr(self: *LoadedBackend) *const ComputeBackend {
         self.compute_backend = switch (self.kind) {
@@ -110,11 +104,6 @@ pub const LoadedBackend = struct {
                 engine.data = &self.native_ws.?;
                 break :blk engine.computeBackend();
             },
-            .mlx => if (comptime false) blk: {
-                const engine = self.mlx_engine.?;
-                engine.data = &self.mlx_ws.?;
-                break :blk engine.computeBackend();
-            } else unreachable,
         };
         return &self.compute_backend;
     }
@@ -130,20 +119,6 @@ pub const LoadedBackend = struct {
             ws.resident_weights.deinit(self.allocator);
             ws.lazy_weights.deinit(self.allocator);
         }
-        if (comptime false) {
-            if (self.mlx_ws) |*ws| {
-                mlx_compute.deinitPrefetchQueue(ws);
-                mlx_compute.deinitPackedExpertViews(ws, self.allocator);
-                var transposed_it = ws.resident_transposed_weights.iterator();
-                while (transposed_it.next()) |entry| {
-                    self.allocator.free(entry.key_ptr.*);
-                    _ = mlx_backend.c.mlx_array_free(entry.value_ptr.*);
-                }
-                ws.resident_transposed_weights.deinit(self.allocator);
-                ws.lazy_weights.deinit(self.allocator);
-                _ = mlx_backend.c.mlx_map_string_to_array_free(ws.resident_weights);
-            }
-        }
         if (self.safetensors_source) |src| src.weightSource().deinit();
         if (self.sharded_safetensors_source) |src| src.weightSource().deinit();
         switch (self.kind) {
@@ -152,13 +127,6 @@ pub const LoadedBackend = struct {
                 var cb = engine.computeBackend();
                 cb.deinit();
             },
-            .mlx => if (comptime false) {
-                if (self.mlx_engine) |engine| {
-                    engine.data = &self.mlx_ws.?;
-                    var cb = engine.computeBackend();
-                    cb.deinit();
-                }
-            } else {},
         }
         self.* = undefined;
     }
@@ -349,142 +317,57 @@ pub fn loadBackendForModelDir(
     model_dir: []const u8,
     backend_kind: BackendKind,
 ) !LoadedBackend {
+    _ = backend_kind;
     var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
     defer manifest.deinit();
 
-    switch (backend_kind) {
-        .native => {
-            var native_ws = native_compute.WeightStore{
-                .allocator = allocator,
-                .resident_weights = .{},
-                .lazy_weights = .{},
-            };
+    var native_ws = native_compute.WeightStore{
+        .allocator = allocator,
+        .resident_weights = .{},
+        .lazy_weights = .{},
+    };
 
-            var single_source: ?*SafetensorsSource = null;
-            var sharded_source: ?*ShardedSafetensorsSource = null;
-            var source: weight_source_mod.WeightSource = undefined;
-            if (manifest.safetensors_path) |st_path| {
-                const src = try SafetensorsSource.initAbsolute(allocator, st_path);
-                single_source = src;
-                source = src.weightSource();
-            } else if (manifest.safetensors_index_path) |idx_path| {
-                const src = try ShardedSafetensorsSource.initAbsolute(allocator, idx_path);
-                sharded_source = src;
-                source = src.weightSource();
-            } else {
-                return error.MissingMergedCheckpoint;
-            }
-            errdefer {
-                if (single_source) |src| src.weightSource().deinit();
-                if (sharded_source) |src| src.weightSource().deinit();
-            }
-
-            const names = try source.listNames(allocator);
-            defer allocator.free(names);
-            for (names) |name| {
-                const lw = try source.getTensor(name);
-                errdefer {
-                    var doomed = lw;
-                    doomed.deinit();
-                }
-                try native_ws.resident_weights.put(allocator, try allocator.dupe(u8, name), lw);
-            }
-
-            const native_engine = try allocator.create(native_compute.NativeCompute);
-            native_engine.* = native_compute.NativeCompute.init(allocator, &native_ws, null);
-            return .{
-                .allocator = allocator,
-                .kind = .native,
-                .compute_backend = native_engine.computeBackend(),
-                .native_ws = native_ws,
-                .native_engine = native_engine,
-                .safetensors_source = single_source,
-                .sharded_safetensors_source = sharded_source,
-            };
-        },
-        .mlx => {
-            if (!false) return error.MlxNotAvailable;
-            const stream = mlx_backend.openDefaultStream().stream;
-            const raw_weights = if (manifest.safetensors_path) |st_path|
-                try mlx_backend.loadSafetensors(st_path, allocator, stream)
-            else if (manifest.safetensors_index_path) |idx_path|
-                try loadShardedSafetensorsForMlx(allocator, idx_path, stream)
-            else
-                return error.MissingMergedCheckpoint;
-            var ws = mlx_compute.WeightStore{
-                .allocator = allocator,
-                .resident_weights = raw_weights,
-                .stream = stream,
-                .prefix = "",
-                .lazy_weights = .{},
-            };
-            const engine = try allocator.create(mlx_compute.MlxCompute);
-            errdefer allocator.destroy(engine);
-            engine.* = try mlx_compute.MlxCompute.init(allocator, &ws, null);
-            return .{
-                .allocator = allocator,
-                .kind = .mlx,
-                .compute_backend = engine.computeBackend(),
-                .mlx_ws = ws,
-                .mlx_engine = engine,
-            };
-        },
-    }
-}
-
-fn loadShardedSafetensorsForMlx(
-    allocator: std.mem.Allocator,
-    index_path: []const u8,
-    stream: if (false) mlx_backend.c.mlx_stream else void,
-) !(if (false) mlx_backend.c.mlx_map_string_to_array else void) {
-    if (comptime !false) {
-        return error.MlxNotAvailable;
+    var single_source: ?*SafetensorsSource = null;
+    var sharded_source: ?*ShardedSafetensorsSource = null;
+    var source: weight_source_mod.WeightSource = undefined;
+    if (manifest.safetensors_path) |st_path| {
+        const src = try SafetensorsSource.initAbsolute(allocator, st_path);
+        single_source = src;
+        source = src.weightSource();
+    } else if (manifest.safetensors_index_path) |idx_path| {
+        const src = try ShardedSafetensorsSource.initAbsolute(allocator, idx_path);
+        sharded_source = src;
+        source = src.weightSource();
     } else {
-        var source = try ShardedSafetensorsSource.initAbsolute(allocator, index_path);
-        defer source.weightSource().deinit();
-
-        const merged = mlx_backend.c.mlx_map_string_to_array_new();
-        errdefer _ = mlx_backend.c.mlx_map_string_to_array_free(merged);
-
-        var seen_shards = std.StringHashMapUnmanaged(void){};
-        defer seen_shards.deinit(allocator);
-
-        var shard_it = source.index.weight_map.iterator();
-        while (shard_it.next()) |entry| {
-            const shard_name = entry.value_ptr.*;
-            if (seen_shards.contains(shard_name)) continue;
-            try seen_shards.put(allocator, shard_name, {});
-
-            const shard_path = try std.fs.path.join(allocator, &.{ source.model_dir, shard_name });
-            defer allocator.free(shard_path);
-
-            const shard_weights = try mlx_backend.loadSafetensors(shard_path, allocator, stream);
-            defer _ = mlx_backend.c.mlx_map_string_to_array_free(shard_weights);
-
-            const it = mlx_backend.c.mlx_map_string_to_array_iterator_new(shard_weights);
-            defer _ = mlx_backend.c.mlx_map_string_to_array_iterator_free(it);
-
-            while (true) {
-                var key: [*c]const u8 = null;
-                var val = mlx_backend.c.mlx_array_new();
-                if (mlx_backend.c.mlx_map_string_to_array_iterator_next(&key, &val, it) != 0) {
-                    _ = mlx_backend.c.mlx_array_free(val);
-                    break;
-                }
-                if (key == null) {
-                    _ = mlx_backend.c.mlx_array_free(val);
-                    break;
-                }
-                if (mlx_backend.c.mlx_map_string_to_array_insert(merged, key, val) != 0) {
-                    _ = mlx_backend.c.mlx_array_free(val);
-                    return error.MlxMapInsertFailed;
-                }
-                _ = mlx_backend.c.mlx_array_free(val);
-            }
-        }
-
-        return merged;
+        return error.MissingMergedCheckpoint;
     }
+    errdefer {
+        if (single_source) |src| src.weightSource().deinit();
+        if (sharded_source) |src| src.weightSource().deinit();
+    }
+
+    const names = try source.listNames(allocator);
+    defer allocator.free(names);
+    for (names) |name| {
+        const lw = try source.getTensor(name);
+        errdefer {
+            var doomed = lw;
+            doomed.deinit();
+        }
+        try native_ws.resident_weights.put(allocator, try allocator.dupe(u8, name), lw);
+    }
+
+    const native_engine = try allocator.create(native_compute.NativeCompute);
+    native_engine.* = native_compute.NativeCompute.init(allocator, &native_ws, null);
+    return .{
+        .allocator = allocator,
+        .kind = .native,
+        .compute_backend = native_engine.computeBackend(),
+        .native_ws = native_ws,
+        .native_engine = native_engine,
+        .safetensors_source = single_source,
+        .sharded_safetensors_source = sharded_source,
+    };
 }
 
 pub fn makeTrainerInputForExample(

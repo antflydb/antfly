@@ -16,7 +16,7 @@
 //
 // Accepts a batch of text strings and returns [batch][hidden_dim] f32 embeddings.
 // Uses the unified Tokenizer interface (HuggingFace or SentencePiece) and any
-// backend Session (ONNX, native, MLX).
+// backend Session (ONNX, native).
 
 const std = @import("std");
 const platform = @import("antfly_platform");

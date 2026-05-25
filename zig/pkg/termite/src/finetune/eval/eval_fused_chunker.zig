@@ -25,23 +25,11 @@
 //   --hidden-size <n>    Hidden size (default: 768)
 //   --max-seq-len <n>    Max seq len (default: 384)
 //   --max-chunks <n>     Max chunks per sample (default: 32)
-//   --backend blas|mlx|auto  Compute backend (default: auto)
+//   --backend native|auto  Compute backend (default: auto)
 
 const std = @import("std");
 const build_options = @import("build_options");
 const blas_compute = @import("../../ops/blas_compute.zig");
-const mlx_compute_mod = struct {
-    pub const MlxCompute = void;
-    pub const WeightStore = void;
-};
-const mlx_mod = struct {
-    pub const c = struct {
-        pub fn mlx_map_string_to_array_new() void {}
-    };
-    pub fn openDefaultStream() struct { stream: void } {
-        return .{ .stream = {} };
-    }
-};
 const ops_mod = @import("../../ops/ops.zig");
 const ComputeBackend = ops_mod.ComputeBackend;
 const fused_chunker_data = @import("../fused_chunker_data.zig");
@@ -238,7 +226,7 @@ const Options = struct {
     hidden_size: u32 = 768,
     max_seq_len: u32 = 384,
     max_chunks: u32 = 32,
-    backend: enum { native, mlx, auto } = .auto,
+    backend: enum { native, auto } = .auto,
 };
 
 fn printUsage() void {
@@ -253,7 +241,7 @@ fn printUsage() void {
         \\  --hidden-size <n>        Hidden size (default: 768)
         \\  --max-seq-len <n>        Max seq len (default: 384)
         \\  --max-chunks <n>         Max chunks per sample (default: 32)
-        \\  --backend blas|mlx|auto  Compute backend (default: auto)
+        \\  --backend native|auto  Compute backend (default: auto)
         \\
     , .{});
 }
@@ -333,14 +321,12 @@ pub fn main(init: std.process.Init) !void {
                 print("error: --backend requires a value\n", .{});
                 std.process.exit(1);
             };
-            if (std.mem.eql(u8, value, "blas")) {
+            if (std.mem.eql(u8, value, "native")) {
                 backend = .native;
-            } else if (std.mem.eql(u8, value, "mlx")) {
-                backend = .mlx;
             } else if (std.mem.eql(u8, value, "auto")) {
                 backend = .auto;
             } else {
-                print("error: unknown backend '{s}': expected blas, mlx, or auto\n", .{value});
+                print("error: unknown backend '{s}': expected native or auto\n", .{value});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -372,17 +358,6 @@ pub fn main(init: std.process.Init) !void {
         .backend = backend,
     };
 
-    const use_mlx = switch (opts.backend) {
-        .mlx => true,
-        .native => false,
-        .auto => false,
-    };
-
-    if (use_mlx and !false) {
-        print("error: MLX support not compiled in\n", .{});
-        std.process.exit(1);
-    }
-
     // Set up compute backend (WeightStore is empty for eval — features are zero-filled)
     var weight_store = blas_compute.WeightStore{
         .allocator = allocator,
@@ -390,32 +365,10 @@ pub fn main(init: std.process.Init) !void {
         .lazy_weights = .{},
     };
 
-    var blas_backend = blas_compute.BlasCompute.init(allocator, &weight_store, null);
+    var native_backend = blas_compute.BlasCompute.init(allocator, &weight_store, null);
+    const cb: ComputeBackend = native_backend.computeBackend();
 
-    // MLX backend and its WeightStore are conditionally compiled.
-    // When enable_mlx = false these are void (zero size) and never used.
-    const MlxWeightStoreT = if (false) mlx_compute_mod.WeightStore else void;
-    const MlxComputeT = if (false) mlx_compute_mod.MlxCompute else void;
-    var mlx_weight_store: MlxWeightStoreT = undefined;
-    var mlx_backend: MlxComputeT = undefined;
-
-    const cb: ComputeBackend = if (false) blk: {
-        if (use_mlx) {
-            mlx_weight_store = mlx_compute_mod.WeightStore{
-                .allocator = allocator,
-                .resident_weights = mlx_mod.c.mlx_map_string_to_array_new(),
-                .stream = mlx_mod.openDefaultStream().stream,
-                .prefix = "",
-                .lazy_weights = .{},
-            };
-            mlx_backend = try mlx_compute_mod.MlxCompute.init(allocator, &mlx_weight_store, null);
-            break :blk mlx_backend.computeBackend();
-        } else {
-            break :blk blas_backend.computeBackend();
-        }
-    } else blas_backend.computeBackend();
-
-    print("backend: {s}\n", .{if (use_mlx) "mlx" else "blas"});
+    print("backend: native\n", .{});
 
     // Set up trainer (owns the boundary head weights)
     const config = FusedTrainingConfig{

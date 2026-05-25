@@ -674,7 +674,7 @@ fn monotonicNowNs() u64 {
 
 /// Metal-backed whole-model executor.
 ///
-/// The first slice keeps prefill on the existing MLX runtime but routes
+/// The first slice keeps prefill on the existing Metal runtime but routes
 /// qLen=1 supported decoder-family decode through the raw whole-token
 /// Metal-owned input/override path that was previously only reachable from
 /// `generation.zig`.

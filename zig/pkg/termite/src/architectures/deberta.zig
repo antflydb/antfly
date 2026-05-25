@@ -90,7 +90,7 @@ fn uniqueRelativePositionProjectionEnabled() bool {
 /// the backend (a CT).  Callers that consume the encoder output through
 /// CT ops (gliner_head, future graph-resident pipelines) should use this
 /// variant -- it skips the toFloat32 the legacy `forward` does at the
-/// boundary, so on Metal/MLX the hidden state stays device-resident
+/// boundary, so on Metal the hidden state stays device-resident
 /// across the encoder/head split, and on native it skips one allocation
 /// + memcpy.
 pub fn forwardCt(

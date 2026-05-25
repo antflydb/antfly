@@ -40,21 +40,13 @@
 //   --seed <n>                   RNG seed (default: 42)
 
 const std = @import("std");
-const build_options = @import("build_options");
 const termite = @import("termite_internal");
 const ml = @import("ml");
 const native_compute = termite.native_compute.native;
 const compat = termite.io.compat;
 const weight_source_mod = termite.models.weight_source;
 const SafetensorsSource = weight_source_mod.SafetensorsSource;
-const LoadedWeight = weight_source_mod.LoadedWeight;
 const Tensor = termite.backends.Tensor;
-
-// MLX backend (Apple Silicon GPU acceleration).
-const mlx_mod = termite.backends.mlx;
-const mlx = if (false) mlx_mod else struct {};
-const mlx_compute = if (false) termite.native_compute.mlx else struct {};
-const mlx_c = if (false) mlx_mod.c else struct {};
 
 // Finetune module imports — accessed via the termite internal module tree.
 const gliner2_data = termite.finetune.gliner2_data;
@@ -251,18 +243,11 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     });
 
     // ------------------------------------------------------------------
-    // 3. Set up compute backend + load weights
-    //
-    // Use MLX (Apple Silicon GPU) when available, falling back to
-    // native CPU BLAS.
+    // 3. Set up compute backend + load weights.
     // ------------------------------------------------------------------
     var st_path_buf: [512]u8 = undefined;
     const st_path = try std.fmt.bufPrint(&st_path_buf, "{s}/model.safetensors", .{opts.model_dir});
 
-    // We need these variables to live for the whole function regardless
-    // of which backend branch we take.
-    var mlx_ws: if (false) mlx_compute.WeightStore else void = undefined;
-    var mlx_backend: if (false) mlx_compute.MlxCompute else void = undefined;
     var native_ws: native_compute.WeightStore = undefined;
     var native_backend: native_compute.NativeCompute = undefined;
 
@@ -270,72 +255,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     var safetensors_source: ?*SafetensorsSource = null;
     defer if (safetensors_source) |s| s.weightSource().deinit();
 
-    const use_mlx = false;
-    const cb = if (use_mlx) blk: {
-        // ── MLX path: load weights directly into MLX arrays ──────────
-        const raw_weights = try mlx.loadSafetensors(st_path, allocator, mlx.openDefaultStream().stream);
-        // Build a new map with "encoder." prefix stripped.
-        const stripped_weights = mlx_c.mlx_map_string_to_array_new();
-        const it = mlx_c.mlx_map_string_to_array_iterator_new(raw_weights);
-        defer _ = mlx_c.mlx_map_string_to_array_iterator_free(it);
-        var loaded_count: usize = 0;
-        while (true) {
-            var key: [*c]const u8 = null;
-            var val = mlx_c.mlx_array_new();
-            if (mlx_c.mlx_map_string_to_array_iterator_next(&key, &val, it) != 0) {
-                _ = mlx_c.mlx_array_free(val);
-                break;
-            }
-            if (key == null) {
-                _ = mlx_c.mlx_array_free(val);
-                break;
-            }
-            const name = std.mem.span(key);
-            const stripped = stripEncoderPrefix(name);
-            const stripped_z = try allocator.dupeZ(u8, stripped);
-            defer allocator.free(stripped_z);
-            _ = mlx_c.mlx_map_string_to_array_insert(stripped_weights, stripped_z.ptr, val);
-            _ = mlx_c.mlx_array_free(val);
-            loaded_count += 1;
-        }
-        _ = mlx_c.mlx_map_string_to_array_free(raw_weights);
-        print("  loaded {d} weights via MLX from {s}\n", .{ loaded_count, st_path });
-
-        // Initialize classifier head as MLX arrays.
-        {
-            var rng_init = std.Random.DefaultPrng.init(opts.seed);
-            var prng_init = rng_init.random();
-            const H = deberta_config.hidden_size;
-            const C = opts.num_classes;
-
-            const w_data = try allocator.alloc(f32, C * H);
-            defer allocator.free(w_data);
-            const sd: f32 = 0.02;
-            for (w_data) |*v| v.* = prng_init.floatNorm(f32) * sd;
-            const w_shape = [_]i32{ @intCast(C), @intCast(H) };
-            const w_arr = mlx.arrayFromFloat32(w_data, &w_shape);
-            try mlx.insertWeight(stripped_weights, allocator, "classifier.weight", w_arr);
-
-            const b_data = try allocator.alloc(f32, C);
-            defer allocator.free(b_data);
-            @memset(b_data, 0.0);
-            const b_shape = [_]i32{@intCast(C)};
-            const b_arr = mlx.arrayFromFloat32(b_data, &b_shape);
-            try mlx.insertWeight(stripped_weights, allocator, "classifier.bias", b_arr);
-            print("  initialized classifier head (MLX): [{d}, {d}] + [{d}]\n", .{ C, H, C });
-        }
-
-        mlx_ws = .{
-            .allocator = allocator,
-            .resident_weights = stripped_weights,
-            .stream = mlx.openDefaultStream().stream,
-            .prefix = "",
-            .lazy_weights = .{},
-        };
-        mlx_backend = try mlx_compute.MlxCompute.init(allocator, &mlx_ws, null);
-        break :blk mlx_backend.computeBackend();
-    } else blk: {
-        // ── Native CPU/BLAS fallback ─────────────────────────────────
+    const cb = blk: {
         native_ws = .{
             .allocator = allocator,
             .resident_weights = .{},
@@ -391,7 +311,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         break :blk native_backend.computeBackend();
     };
 
-    print("  backend: {s}\n", .{if (use_mlx) "MLX (Apple Silicon)" else "native CPU/BLAS"});
+    print("  backend: native CPU/BLAS\n", .{});
 
     // ------------------------------------------------------------------
     // 5. Load training data (JSONL with text + entities)

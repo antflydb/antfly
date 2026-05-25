@@ -313,15 +313,8 @@ pub const LoRATrainOptions = struct {
     llrd_decay: f32 = 1.0,
     use_schedule_free: bool = false,
     /// Optional compute backend for gradient computation.
-    /// If null, defaults to CPU (pure-Zig) math. Pass an MLX backend for Metal GPU acceleration.
+    /// If null, defaults to native CPU math.
     compute_backend: ?*const ComputeBackend = null,
-    /// MLX distributed group for DDP gradient averaging.
-    /// Obtain via mlx_mod.initDistributed() at process startup.
-    /// null = single-device training (default).
-    mlx_dist_group: void =
-        if (false) null else {},
-    /// Number of DDP replicas (world size). Must equal 1 when mlx_dist_group is null.
-    world_size: u32 = 1,
     /// DDP rank of this process. Rank 0 is responsible for eval logging and checkpoint writes.
     /// Set to 0 for single-device training (default).
     ddp_rank: u32 = 0,
@@ -335,9 +328,8 @@ pub const LoRATrainOptions = struct {
     /// Stop training early if eval MSE has not improved for this many consecutive checkpoint
     /// evaluations. Requires checkpoint_interval > 0 or implicitly sets it to 1. 0 = disabled.
     early_stopping_patience: usize = 0,
-    /// Pre-compiled PJRT gradient executors, one per LoRA layer (null = use CPU/MLX path).
+    /// Pre-compiled PJRT gradient executors, one per LoRA layer.
     /// Length must equal bundle.layers.len if non-null.
-    /// Note: PJRT is automatically disabled when world_size > 1 (no collective ops in PJRT path).
     pjrt_lora_steps: if (build_options.enable_pjrt) ?[]?graph_bridge.LoRAPjrtTrainStep else void =
         if (build_options.enable_pjrt) null else {},
     /// NEFTune embedding-noise alpha (Jain et al., NeurIPS 2023). 0 = disabled;
@@ -2004,9 +1996,9 @@ pub fn trainLoRABundleEpochCached(
                     }
                     defer if (padded) |p| allocator.free(p);
 
-                    // Try PJRT path first; fall back to CPU/MLX on error or when disabled.
+                    // Try PJRT path first; fall back to CPU on error or when disabled.
                     // PJRT is skipped in distributed mode (world_size > 1) because the PJRT
-                    // gradient path has no collective ops and cannot participate in MLX DDP allReduce.
+                    // gradient path has no collective ops.
                     var used_pjrt = false;
                     if (comptime build_options.enable_pjrt) {
                         // world_size > 1 means distributed training regardless of backend.

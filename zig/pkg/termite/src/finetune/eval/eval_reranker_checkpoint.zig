@@ -116,7 +116,6 @@ pub fn main(init: std.process.Init) !void {
         .model_dir = opts.model_dir,
         .input_path = opts.input_path,
         .split = opts.split,
-        .build_enable_mlx = false,
         .requested_backend = @tagName(opts.backend),
         .selected_backend = @tagName(result.backend_selected),
         .dataset_root = loaded.dataset_root,
@@ -134,15 +133,15 @@ pub fn main(init: std.process.Init) !void {
 
 fn parseBackendChoice(value: []const u8) ?reranker.BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "blas") or std.mem.eql(u8, value, "native")) return .native;
+    if (std.mem.eql(u8, value, "native") or std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     return null;
 }
 
 fn printUsage() void {
     print(
-        \\usage: eval-reranker-checkpoint <model-dir> <jsonl_or_dir> [split] [--head-dir DIR|--head FILE] [--backend auto|blas|mlx] [--max-examples N]
-        \\example: eval-reranker-checkpoint /tmp/bge-reranker /tmp/rerank train --head-dir /tmp/out --backend mlx --max-examples 128
+        \\usage: eval-reranker-checkpoint <model-dir> <jsonl_or_dir> [split] [--head-dir DIR|--head FILE] [--backend auto|native] [--max-examples N]
+        \\example: eval-reranker-checkpoint /tmp/bge-reranker /tmp/rerank train --head-dir /tmp/out --backend native --max-examples 128
         \\
     , .{});
 }

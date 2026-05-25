@@ -226,7 +226,7 @@ fn transpose2DLora(dst: []f32, src: []const f32, rows: usize, cols: usize) void 
 /// (for GPU acceleration), falling back to pure-Zig CPU otherwise.
 ///
 /// Layout conversion: the CPU convention uses adapter_a [in_features, rank]
-/// and adapter_b [rank, out_features], while the MLX vtable expects
+/// and adapter_b [rank, out_features], while backend vtables expect
 /// lora_a [rank, in_features] and lora_b [out_features, rank].  This
 /// function handles the transpositions and accumulates the results.
 pub fn accumulateLinearLoRAGradsBackend(

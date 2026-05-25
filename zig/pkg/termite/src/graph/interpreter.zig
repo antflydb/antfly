@@ -110,7 +110,7 @@ pub const ExecuteOptions = struct {
     /// caller afterward.  Donated buffers that are not consumed as
     /// outputs are freed by the interpreter at cleanup.
     ///
-    /// This follows the GoMLX pattern: in the decode loop the same-
+    /// This follows the decode-loop pattern: in the decode loop the same-
     /// shaped KV tensors are passed every step, and donation lets
     /// backends reuse them without allocating.
     donate: ?[]const bool = null,
@@ -980,7 +980,7 @@ fn positiveResolvedDim(actual: ?[]const i64, shape: Shape, axis: usize) !usize {
     return positiveShapeDim(shape, axis);
 }
 
-/// For shape-tracking backends (MLX), reshape a tensor to its declared
+/// For shape-tracking backends, reshape a tensor to its declared
 /// shape when the declared shape is fully concrete, the actual rank differs,
 /// and element counts match. Returns
 /// the reshaped tensor (owned, caller must free) or null (no reshape
@@ -1931,9 +1931,9 @@ pub fn executeNode(
             return cb.primAbs(V.get(ins[0]));
         },
         .add, .mul, .sub, .div, .less_than => {
-            // For backends that track tensor shapes (MLX), ensure inputs
+            // For backends that track tensor shapes, ensure inputs
             // match their declared shapes before the binary op. The native
-            // backend uses flat arrays and ignores shapes, but MLX uses
+            // backend uses flat arrays and ignores shapes, but shape-tracking backends use
             // numpy-style broadcasting which requires correct shapes.
             const a_val = V.get(ins[0]);
             const b_val = V.get(ins[1]);

@@ -89,7 +89,6 @@ pub const models = struct {
 };
 pub const native_compute = struct {
     pub const native = @import("ops/native_compute.zig");
-    pub const blas = @import("ops/blas_compute.zig");
     pub const cuda = if (build_options.enable_cuda) @import("ops/cuda/cuda_compute.zig") else struct {};
     pub const wasm = if (build_options.enable_wasm) @import("ops/wasm_compute.zig") else struct {};
 };

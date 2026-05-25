@@ -1037,7 +1037,7 @@ fn shouldForcePartitionBoundary(
     return false;
 }
 
-/// Standard capability: supports all fused ops (for native/MLX backends
+/// Standard capability: supports all fused ops (for native backends
 /// that implement the full VTable).
 pub fn supportsAll(_: OpCode) bool {
     return true;
@@ -1132,7 +1132,7 @@ pub fn supportsPjrt(op: OpCode) bool {
 }
 
 /// Capability filter: supports attention ops.
-/// Typical for MLX which has efficient paged KV attention.
+/// Typical for Metal with efficient paged KV attention.
 pub fn supportsAttention(op: OpCode) bool {
     return switch (op) {
         .fused_causal_self_attention,

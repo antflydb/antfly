@@ -31,30 +31,13 @@
 //   --seed <n>              Random seed (default: 42)
 //   --lora-rank <n>         LoRA rank (default: 0 = disabled)
 //   --intermediate-size <n> ModernBERT intermediate_size (default: 1152)
-//   --backend blas|mlx|auto Select compute backend (default: auto)
+//   --backend native|auto Select compute backend (default: auto)
 
 const std = @import("std");
 const build_options = @import("build_options");
 const native_compute = @import("../../ops/native_compute.zig");
 const ops_mod = @import("../../ops/ops.zig");
 const ComputeBackend = ops_mod.ComputeBackend;
-const mlx_compute_mod = struct {
-    pub const MlxCompute = void;
-    pub const WeightStore = void;
-};
-const mlx_mod = struct {
-    pub const c = struct {
-        pub fn mlx_map_string_to_array_new() void {}
-        pub const mlx_array = void;
-        pub const mlx_map_string_to_array = void;
-    };
-    pub fn openDefaultStream() struct { stream: void } {
-        return .{ .stream = {} };
-    }
-    pub fn arrayFromFloat32(_: []const f32, _: []const i32) void {}
-    pub fn arrayFromTensor(_: std.mem.Allocator, _: anytype, _: bool) error{}!void {}
-    pub fn insertWeight(_: void, _: std.mem.Allocator, _: []const u8, _: void) error{}!void {}
-};
 const fused_chunker_train = @import("../fused_chunker_train.zig");
 const fused_chunker_data = @import("../fused_chunker_data.zig");
 const fused_chunker_mod = @import("../fused_chunker.zig");
@@ -99,7 +82,7 @@ const Options = struct {
     seed: u64 = 42,
     lora_rank: u32 = 0,
     intermediate_size: u32 = 1152,
-    backend: enum { native, mlx, auto } = .auto,
+    backend: enum { native, auto } = .auto,
     // Feature 2: gradient accumulation
     grad_accum: u32 = 1,
     // Feature 3: schedule-free AdamW
@@ -115,8 +98,6 @@ const Options = struct {
     // Feature 8: length bucketing
     length_bucketing: bool = false,
     bucket_size: usize = 256,
-    // mixed precision flag (stored for downstream use)
-    mixed_precision: bool = false,
     // SPLADE sparse embedding head
     splade: bool = false,
     lambda_splade: f32 = 0.15,
@@ -181,7 +162,6 @@ pub fn main(init: std.process.Init) !void {
     var lora_plus_ratio: f32 = 1.0;
     var length_bucketing: bool = false;
     var bucket_size: usize = 256;
-    var mixed_precision: bool = false;
     var splade: bool = false;
     var lambda_splade: f32 = 0.15;
     var lambda_flops: f32 = 3e-5;
@@ -229,14 +209,12 @@ pub fn main(init: std.process.Init) !void {
             intermediate_size = try std.fmt.parseUnsigned(u32, val, 10);
         } else if (std.mem.eql(u8, arg, "--backend")) {
             const val = args.next() orelse return error.MissingBackend;
-            if (std.mem.eql(u8, val, "native") or std.mem.eql(u8, val, "blas")) {
+            if (std.mem.eql(u8, val, "native")) {
                 backend = .native;
-            } else if (std.mem.eql(u8, val, "mlx")) {
-                backend = .mlx;
             } else if (std.mem.eql(u8, val, "auto")) {
                 backend = .auto;
             } else {
-                print("error: unknown backend '{s}': expected blas, mlx, or auto\n", .{val});
+                print("error: unknown backend '{s}': expected native or auto\n", .{val});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, arg, "--grad-accum")) {
@@ -262,7 +240,8 @@ pub fn main(init: std.process.Init) !void {
             const val = args.next() orelse return error.MissingBucketSize;
             bucket_size = try std.fmt.parseUnsigned(usize, val, 10);
         } else if (std.mem.eql(u8, arg, "--mixed-precision")) {
-            mixed_precision = true;
+            print("error: --mixed-precision is no longer supported\n", .{});
+            std.process.exit(1);
         } else if (std.mem.eql(u8, arg, "--splade")) {
             splade = true;
         } else if (std.mem.eql(u8, arg, "--lambda-splade")) {
@@ -320,7 +299,6 @@ pub fn main(init: std.process.Init) !void {
         .lora_plus_ratio = lora_plus_ratio,
         .length_bucketing = length_bucketing,
         .bucket_size = bucket_size,
-        .mixed_precision = mixed_precision,
         .splade = splade,
         .lambda_splade = lambda_splade,
         .lambda_flops = lambda_flops,
@@ -419,11 +397,11 @@ fn restoreLoRAWeights(
     originals.deinit(allocator);
 }
 
-/// Insert (or update) a LoRA matrix in the BLAS WeightStore under `key`.
+/// Insert or update a LoRA matrix in the native WeightStore under `key`.
 /// The tensor is a 2-D f32 matrix of shape [rows, cols].
 /// If a weight already exists under `key` its data is replaced with a fresh
 /// copy of `data` so that optimizer updates are visible each step.
-fn insertLoRAIntoBlasStore(
+fn insertLoRAIntoNativeStore(
     allocator: std.mem.Allocator,
     weight_store: *native_compute.WeightStore,
     key: []const u8,
@@ -494,52 +472,12 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         weight_store.resident_weights.deinit(allocator);
     }
 
-    const use_mlx = switch (opts.backend) {
-        .mlx => true,
-        .native => false,
-        .auto => false,
-    };
-
-    if (use_mlx and !false) {
-        print("error: MLX support not compiled in\n", .{});
-        std.process.exit(1);
-    }
-
-    if (opts.mixed_precision and !use_mlx) {
-        std.debug.print("Warning: --mixed-precision requires MLX backend, ignoring.\n", .{});
-    }
-
     // Declare both backends at outer scope so their addresses are stable for
     // the ComputeBackend vtable pointer that FusedTrainer holds.
-    var blas_backend = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var native_backend = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    const cb: ComputeBackend = native_backend.computeBackend();
 
-    // MLX backend and its WeightStore are conditionally compiled.
-    // When enable_mlx = false these are void (zero size) and never used.
-    const MlxWeightStoreT = if (false) mlx_compute_mod.WeightStore else void;
-    const MlxComputeT = if (false) mlx_compute_mod.MlxCompute else void;
-    var mlx_weight_store: MlxWeightStoreT = undefined;
-    var mlx_backend: MlxComputeT = undefined;
-
-    const cb: ComputeBackend = if (false) blk: {
-        if (use_mlx) {
-            mlx_weight_store = mlx_compute_mod.WeightStore{
-                .allocator = allocator,
-                .resident_weights = mlx_mod.c.mlx_map_string_to_array_new(),
-                .stream = mlx_mod.openDefaultStream().stream,
-                .prefix = "",
-                .lazy_weights = .{},
-            };
-            mlx_backend = if (opts.mixed_precision)
-                try mlx_compute_mod.MlxCompute.initMixedPrecision(allocator, &mlx_weight_store, null)
-            else
-                try mlx_compute_mod.MlxCompute.init(allocator, &mlx_weight_store, null);
-            break :blk mlx_backend.computeBackend();
-        } else {
-            break :blk blas_backend.computeBackend();
-        }
-    } else blas_backend.computeBackend();
-
-    print("backend: {s}\n", .{if (use_mlx) "mlx" else "blas"});
+    print("backend: native\n", .{});
 
     // ------------------------------------------------------------------
     // 2a. Tokenizer loading
@@ -586,25 +524,6 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                                     load_ok = false;
                                     break;
                                 };
-                                // Fix 1: When MLX is active, also insert each weight into
-                                // mlx_weight_store so cb.getWeight() finds it on the MLX path.
-                                if (comptime false) {
-                                    if (use_mlx) {
-                                        const arr = mlx_mod.arrayFromTensor(allocator, &lw.tensor, false) catch {
-                                            load_ok = false;
-                                            break;
-                                        };
-                                        mlx_mod.insertWeight(
-                                            mlx_weight_store.resident_weights,
-                                            allocator,
-                                            name,
-                                            arr,
-                                        ) catch {
-                                            load_ok = false;
-                                            break;
-                                        };
-                                    }
-                                }
                             } else |_| {}
                         }
                         if (load_ok) {
@@ -771,7 +690,6 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         .length_bucketing = opts.length_bucketing,
         .bucket_size = opts.bucket_size,
         // mixed precision
-        .mixed_precision = opts.mixed_precision,
         // SPLADE
         .enable_splade = loss_config.enable_splade,
         .lambda_splade = loss_config.lambda_splade,
@@ -971,25 +889,8 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
                             .{ layer_n, proj_name },
                         );
 
-                        if (comptime false) {
-                            if (use_mlx) {
-                                // MLX path: create mlx_array handles and insert into the map.
-                                // A: [rank, in_features]
-                                const shape_a = [2]i32{ @intCast(rank), @intCast(ll.in_features) };
-                                const arr_a = mlx_mod.arrayFromFloat32(ll.A, &shape_a);
-                                try mlx_mod.insertWeight(mlx_weight_store.resident_weights, allocator, key_a, arr_a);
-                                // B: [out_features, rank]
-                                const shape_b = [2]i32{ @intCast(ll.out_features), @intCast(rank) };
-                                const arr_b = mlx_mod.arrayFromFloat32(ll.B, &shape_b);
-                                try mlx_mod.insertWeight(mlx_weight_store.resident_weights, allocator, key_b, arr_b);
-                            } else {
-                                try insertLoRAIntoBlasStore(allocator, &weight_store, key_a, ll.A, rank, ll.in_features);
-                                try insertLoRAIntoBlasStore(allocator, &weight_store, key_b, ll.B, ll.out_features, rank);
-                            }
-                        } else {
-                            try insertLoRAIntoBlasStore(allocator, &weight_store, key_a, ll.A, rank, ll.in_features);
-                            try insertLoRAIntoBlasStore(allocator, &weight_store, key_b, ll.B, ll.out_features, rank);
-                        }
+                        try insertLoRAIntoNativeStore(allocator, &weight_store, key_a, ll.A, rank, ll.in_features);
+                        try insertLoRAIntoNativeStore(allocator, &weight_store, key_b, ll.B, ll.out_features, rank);
                     }
                 }
             }
@@ -1497,7 +1398,7 @@ fn printUsage() void {
         \\  --seed <n>                Random seed (default: 42)
         \\  --lora-rank <n>           LoRA rank (default: 0 = disabled)
         \\  --intermediate-size <n>   ModernBERT intermediate_size (default: 1152)
-        \\  --backend blas|mlx|auto   Compute backend (default: auto)
+        \\  --backend native|auto   Compute backend (default: auto)
         \\  --grad-accum <n>          Gradient accumulation steps (default: 1)
         \\  --schedule-free           Use Schedule-Free AdamW
         \\  --neftune-alpha <f>       NEFTune noise magnitude (default: 0.0=disabled)
@@ -1506,7 +1407,6 @@ fn printUsage() void {
         \\  --lora-plus-ratio <f>     LoRA+ B/A LR ratio (default: 1.0=disabled)
         \\  --length-bucketing        Enable length bucketing
         \\  --bucket-size <n>         Bucket window size (default: 256)
-        \\  --mixed-precision         Enable bf16 mixed precision (MLX only)
         \\  --splade                  Enable SPLADE sparse embedding head
         \\  --lambda-splade <f>       SPLADE contrastive loss weight (default: 0.15)
         \\  --lambda-flops <f>        SPLADE FLOPS regularization weight (default: 3e-5)

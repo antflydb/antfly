@@ -24,7 +24,7 @@ const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const model_runtime = @import("model_runtime.zig");
 
-/// Live whole-model executor for native and MLX sessions.
+/// Live whole-model executor for native sessions.
 ///
 /// This is the first step toward treating live sessions and offline artifact
 /// packages as the same model-level runtime concept. Unlike the older native

@@ -146,24 +146,16 @@ pub const TrainEpochOptions = struct {
     use_schedule_free: bool = false,
     neftune_alpha: f32 = 0.0,
     /// Optional compute backend for gradient computation.
-    /// If null, defaults to CPU (pure-Zig) math. Pass an MLX backend for Metal GPU acceleration.
+    /// If null, defaults to native CPU math.
     compute_backend: ?*const @import("../ops/ops.zig").ComputeBackend = null,
-    /// MLX distributed group for DDP gradient averaging.
-    /// Obtain via mlx_mod.initDistributed() at process startup.
-    /// null = single-device training (default).
-    mlx_dist_group: void =
-        if (false) null else {},
-    /// Number of DDP replicas (world size). Must equal 1 when mlx_dist_group is null.
-    world_size: u32 = 1,
     /// DDP rank of this process. Rank 0 is responsible for checkpoint writes.
     /// Set to 0 for single-device training (default).
     ddp_rank: u32 = 0,
     /// Linear LR warmup steps. LR ramps from 0 → learning_rate over the first warmup_steps
     /// optimizer updates. 0 = no warmup.
     warmup_steps: u32 = 0,
-    /// Pre-compiled PJRT gradient executors, one per LoRA layer (null = use CPU/MLX path).
+    /// Pre-compiled PJRT gradient executors, one per LoRA layer.
     /// Length must equal bundle.layers.len if non-null.
-    /// Note: PJRT is automatically disabled when world_size > 1 (no collective ops in PJRT path).
     pjrt_lora_steps: if (build_options.enable_pjrt) ?[]?graph_bridge.LoRAPjrtTrainStep else void =
         if (build_options.enable_pjrt) null else {},
 };
@@ -1426,7 +1418,7 @@ pub fn trainPreparedExamplesEpoch(
                 }
             }
 
-            // Try PJRT path first; fall back to CPU/MLX on error or when disabled.
+            // Try PJRT path first; fall back to CPU on error or when disabled.
             // PJRT is skipped when world_size > 1: no collective ops in PJRT gradient path.
             var used_pjrt = false;
             if (comptime build_options.enable_pjrt) {
@@ -1453,7 +1445,7 @@ pub fn trainPreparedExamplesEpoch(
                 }
             }
             if (!used_pjrt) {
-                // CPU/MLX fallback.
+                // CPU fallback.
                 const a_mat = lora.Matrix{ .rows = layer.input_dim, .cols = layer.rank, .data = layer.adapter_a };
                 const b_mat = lora.Matrix{ .rows = layer.rank, .cols = layer.output_dim, .data = layer.adapter_b };
                 lora.accumulateLinearLoRAGradsBackend(

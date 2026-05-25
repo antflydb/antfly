@@ -61,7 +61,7 @@ pub fn main(init: std.process.Init) !void {
     const output_root = args.next() orelse return usageError();
     const train_split_arg = args.next() orelse "none";
     const eval_split_arg = args.next() orelse "none";
-    const backend = parseBackend(args.next() orelse "blas") orelse return error.InvalidBackend;
+    const backend = parseBackend(args.next() orelse "native") orelse return error.InvalidBackend;
     const max_train_examples = try std.fmt.parseUnsigned(usize, args.next() orelse "64", 10);
     const max_eval_examples = try std.fmt.parseUnsigned(usize, args.next() orelse "32", 10);
     const max_length = try std.fmt.parseUnsigned(usize, args.next() orelse "256", 10);
@@ -299,7 +299,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn parseBackend(value: []const u8) ?text_encoder_boundary.BackendChoice {
-    if (std.mem.eql(u8, value, "blas")) return .native;
+    if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "auto")) return .auto;
     return null;
@@ -368,7 +368,7 @@ fn freeWorkflowSummary(allocator: std.mem.Allocator, summary: *WorkflowSummary) 
 fn usageError() error{InvalidArguments} {
     std.debug.print(
         \\usage: run-gliner2-boundary-task-head-smoke-workflow <model_dir> <adapter_dir> <train_jsonl_or_dir> <eval_jsonl_or_dir> <entity_types_csv> <output_root> [train_split] [eval_split] [backend] [max_train_examples] [max_eval_examples] [max_length] [max_span_width] [top_layer_count] [learning_rate] [epochs]
-        \\example: run-gliner2-boundary-task-head-smoke-workflow /tmp/gliner2_base /tmp/gliner2_adapter /tmp/train /tmp/eval person,organization,location /tmp/out train eval blas 64 32 256 8 1 0.001 2
+        \\example: run-gliner2-boundary-task-head-smoke-workflow /tmp/gliner2_base /tmp/gliner2_adapter /tmp/train /tmp/eval person,organization,location /tmp/out train eval native 64 32 256 8 1 0.001 2
         \\
     , .{});
     return error.InvalidArguments;

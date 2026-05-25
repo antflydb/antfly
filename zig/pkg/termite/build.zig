@@ -82,7 +82,7 @@ fn configureSystemBlas(
 }
 
 /// Link the Metal framework and compile the standalone Metal kernels.
-/// No MLX dependency — the `.m` file uses only Foundation + Metal.
+/// No extra backend dependency — the `.m` file uses only Foundation + Metal.
 fn configureMetal(
     b: *std.Build,
     module: *std.Build.Module,

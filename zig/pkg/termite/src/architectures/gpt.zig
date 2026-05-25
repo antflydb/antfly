@@ -5723,7 +5723,7 @@ fn moeFeedForwardInner(
     defer cb.free(router_logits_ct);
     debug_timing_stats.moe_router_proj_nanos += @intCast(monotonicNowNs() - router_proj_started_at);
 
-    // The fused MLX MoE kernel is SiLU-only. Models with other expert
+    // The fused Metal MoE kernel is SiLU-only. Models with other expert
     // activations must use the generic path for correctness.
     if (cb.kind() != .graph and config.activation == .silu) {
         const w1 = getMoeExpertWeight(cb, config, layer, 0, "w1", name_buf) catch null;
@@ -7294,7 +7294,7 @@ pub fn computePleVectors(
     const model_proj_raw = try cb.linearNoBias(hidden, proj_w, total, config.hidden_size, ple_total_dim);
 
     // RMSNorm the projection on ple_dim-sized chunks (before combining with token path).
-    // MLX's fused rms_norm requires weight size == last dim. Reshape
+    // Metal fused rms_norm requires weight size == last dim. Reshape
     // [total, ple_total_dim] → [total*num_layers, ple_dim] so weight [ple_dim] matches,
     // then reshape back after normalization.
     const proj_norm_base_w = getModelWeight(cb, config, "model.per_layer_input.per_layer_proj_norm.weight") catch |err| switch (err) {
