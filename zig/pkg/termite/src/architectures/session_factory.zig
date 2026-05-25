@@ -631,14 +631,14 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
 
 /// Create a PJRT-backed session from a model directory.
 ///
-/// Weights are loaded via BLAS (the host backend). A PJRT client is
+/// Weights are loaded via the native CPU host backend. A PJRT client is
 /// initialized via `Client.initFromEnv` which searches for the plugin in:
 ///   1. `PJRT_PLUGIN_PATH` env var
 ///   2. `~/Library/Application Support/go-xla/pjrt_c_api_cpu_plugin.dylib`
 ///   3. `~/.termite/pjrt/darwin-arm64/pjrt_c_api_cpu_plugin.dylib`
 ///
 /// If the plugin is not found, the session is created anyway but without a
-/// PJRT client (falls back to pure BLAS execution — no XLA-compiled
+/// PJRT client (falls back to pure native CPU execution — no XLA-compiled
 /// partitions). Callers can check `getPjrtClientPtr` to see whether a client
 /// is actually available.
 ///
@@ -650,7 +650,7 @@ pub fn createPjrtSession(allocator: std.mem.Allocator, model_path: []const u8) !
 }
 
 pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
-    // PJRT weights are served through BLAS — re-use the full BLAS load path.
+    // PJRT weights are served through native CPU — re-use the full native CPU load path.
     const direct_quant_enabled = directQuantEnabled();
     const cpu_plan_context = defaultPlanContextForBackend(.cpu);
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
@@ -853,12 +853,12 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     }
 
     // Attempt to initialize the PJRT client. On failure (plugin not found,
-    // etc.) we log a warning and proceed with pure-BLAS execution. The
+    // etc.) we log a warning and proceed with pure native CPU execution. The
     // compiled-partition path in generation.zig simply won't be activated.
     const pjrt_client: if (build_options.enable_pjrt) ?pjrt_lib.pjrt.Client else void = blk: {
         if (!build_options.enable_pjrt) break :blk {};
         const client = pjrt_lib.pjrt.Client.initFromEnv(allocator) catch |err| {
-            std.log.warn("PJRT plugin not found ({s}); PJRT session will use BLAS fallback", .{@errorName(err)});
+            std.log.warn("PJRT plugin not found ({s}); PJRT session will use native CPU fallback", .{@errorName(err)});
             break :blk null;
         };
         std.log.info("PJRT client initialized via session factory", .{});
@@ -1165,7 +1165,7 @@ fn createGpuHostedSessionWithTaskOverride(
         eager_dense = shouldUseGpuHostedEagerDenseLoad(backend_type, allocator, mf, arch_config);
         if (eager_dense) {
             if (comptime !false) {
-                std.log.err("metal-native build cannot eager-load dense weights without -Dmlx=true", .{});
+                std.log.err("metal backend no longer supports eager dense resident loading", .{});
                 return error.EagerDenseLoadRequiresGpuHosted;
             }
             std.log.err("metal backend no longer supports eager dense resident loading", .{});
@@ -3924,7 +3924,7 @@ const PjrtData = struct {
     /// conversion (host CTs ↔ PJRT buffers).
     native: NativeData,
     /// Initialized PJRT client. null when the plugin was not found and we
-    /// fell back to pure-BLAS execution.
+    /// fell back to pure native CPU execution.
     client: if (build_options.enable_pjrt) ?pjrt_lib.pjrt.Client else void =
         if (build_options.enable_pjrt) null else {},
 };
@@ -4045,7 +4045,7 @@ fn makeComputeBackend(
                 });
             },
             .metal => if (build_options.enable_metal) widenGpuHostedTierCache(self, budget),
-            // PJRT: widen the BLAS host-backend tier cache if present.
+            // PJRT: widen the native CPU host-backend tier cache if present.
             .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*tier_cache| {
                 tier_cache.widenToAtLeast(.{
                     .host_limit_bytes = @max(budget.limits.host_limit_bytes, self.shared_cache_budget_floor.host_limit_bytes),
@@ -4068,7 +4068,7 @@ fn makeComputeBackend(
         },
         .metal => try makeGpuHostedComputeBackend(self, allocator, run_budget),
         // PJRT does not have a generic ComputeBackend VTable of its own.
-        // Non-partitioned ops (weight loads, sampling, etc.) run on BLAS.
+        // Non-partitioned ops (weight loads, sampling, etc.) run on native CPU.
         // Compiled partitions are executed via PjrtExecutor through the
         // multi_executor pipeline; see generation.zig attachPjrtExecutors.
         .pjrt => blk: {
@@ -5215,7 +5215,7 @@ fn archClose(ptr: *anyopaque) void {
                     client.deinit();
                 }
             }
-            // Clean up the BLAS host-backend weight store.
+            // Clean up the native CPU host-backend weight store.
             native_mod.stopPrefetchWorker(&self.backend_data.pjrt.native);
             var it = self.backend_data.pjrt.native.resident_weights.iterator();
             while (it.next()) |entry| {

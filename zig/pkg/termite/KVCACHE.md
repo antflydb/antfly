@@ -153,7 +153,7 @@ dimensions are rejected so callers can fall back to a stable dtype.
 
 `turbo3` is the lower-bit shared codec path for the TurboQuant work. It uses
 3-bit packed key codes, a deterministic one-bit QJL-style residual sketch, and
-the same int8 per-head value codec as `polar4`. Native, WebGPU, and MLX
+the same int8 per-head value codec as `polar4`. Native, WebGPU, and Metal
 paged-attention paths score queries directly against the encoded 3-bit key bytes
 plus a calibrated residual estimate, then decode only V rows for accumulation.
 

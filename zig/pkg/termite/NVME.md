@@ -15,15 +15,15 @@ The desired end state is closer to "Hypura-style" execution:
 
 ### Implemented on 2026-04-09
 
-- Phase 3.1 now has an MLX packed-MoE staging path for Mixtral-style GGUF packed experts:
+- Phase 3.1 now has an Metal packed-MoE staging path for Mixtral-style GGUF packed experts:
   - packed expert direct-quant refs remain mmap-backed and are no longer charged as host-resident cache copies
-  - grouped MLX MoE execution stages only the selected expert byte ranges when CPU router IDs are available
-  - fused MLX MoE execution reads selected expert IDs back from MLX and stages compact selected-expert buffers before launching the native quant kernels
-  - staged owned buffers use MLX-owned arrays instead of borrowed mmap arrays
+  - grouped Metal MoE execution stages only the selected expert byte ranges when CPU router IDs are available
+  - fused Metal MoE execution reads selected expert IDs back from Metal and stages compact selected-expert buffers before launching the native quant kernels
+  - staged owned buffers use Metal-owned arrays instead of borrowed mmap arrays
 - Verified in `pkg/termite` with:
   - `zig build`
   - `zig build test`
-- Runtime validation completed for `mistralai/Mixtral-8x7B-Instruct-v0.1-Q5_K_M` on MLX with a low host budget:
+- Runtime validation completed for `mistralai/Mixtral-8x7B-Instruct-v0.1-Q5_K_M` on Metal with a low host budget:
   - `--max-tokens 1 --host-budget-mb 1024 --combined-budget-mb 6144 --backend-budget-mb 4096` completed with `finish_reason=length tokens=1`
   - `--max-tokens 4 --host-budget-mb 1024 --combined-budget-mb 6144 --backend-budget-mb 4096` completed with `finish_reason=length tokens=4`
 - This is still selected-expert staging for packed MoE tensors, not a complete general tensor tile executor.
@@ -45,28 +45,28 @@ The desired end state is closer to "Hypura-style" execution:
   - `--termite-scratch-budget-mb`
 - The live swarm e2e fixture now passes these via environment-backed defaults for the pulled `ggml-org/gemma-4-e2b-it-gguf` path:
   - [test_swarm.py](../../e2e/antfly/test_swarm.py)
-- MLX eager resident-weight reservation is now capped to a bounded hot set instead of reserving the full eager estimate up front:
-  - [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
-- MLX quantized linear execution now degrades on backend budget pressure for non-expert weights by falling back to the existing wrapper path instead of surfacing an immediate `MemoryBudgetExceeded`:
-  - [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
-- MLX quantized pair execution now falls back to per-weight execution when the device-native pair path hits memory budget pressure for degradable weights:
-  - [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
+- Metal eager resident-weight reservation is now capped to a bounded hot set instead of reserving the full eager estimate up front:
+  - [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
+- Metal quantized linear execution now degrades on backend budget pressure for non-expert weights by falling back to the existing wrapper path instead of surfacing an immediate `MemoryBudgetExceeded`:
+  - [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
+- Metal quantized pair execution now falls back to per-weight execution when the device-native pair path hits memory budget pressure for degradable weights:
+  - [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
 - Host-tier cache denial for non-expert quantized GGUF weights now has an ephemeral mmap-backed fallback path instead of failing before quant execution can run:
-  - [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
+  - [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
 - Dense linear non-expert weights now fall back to the existing CPU chunked source-tensor execution path when host/backend temporary reservations or host-cache admission fail:
-  - [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
+  - [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
 - BLAS now mirrors the same non-expert fallback policy:
   - host-tier cache denial for non-expert quantized GGUF weights can return an ephemeral mmap-backed quantized placeholder instead of failing immediately
   - dense linear non-expert weights can route into the existing CPU chunked source-tensor path when host-cache admission fails
-  - [blas_compute.zig](pkg/termite/src/ops/blas_compute.zig)
-- Host shared-cache denials are now recorded into the run-budget telemetry for both MLX and BLAS, and shared-cache fallback logs now identify the denial stage and weight name:
-  - [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
-  - [blas_compute.zig](pkg/termite/src/ops/blas_compute.zig)
+  - [native_compute.zig](pkg/termite/src/ops/native_compute.zig)
+- Host shared-cache denials are now recorded into the run-budget telemetry for both Metal and BLAS, and shared-cache fallback logs now identify the denial stage and weight name:
+  - [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
+  - [native_compute.zig](pkg/termite/src/ops/native_compute.zig)
 - Host-tier lazy-load admission now tries to evict cold non-expert host residents before degrading to ephemeral execution:
-  - [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
-  - [blas_compute.zig](pkg/termite/src/ops/blas_compute.zig)
-- MLX quantized placeholder caching on first access now honors backend shared-cache admission and degrades to a non-cached placeholder when backend cache admission still fails after eviction:
-  - [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
+  - [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
+  - [native_compute.zig](pkg/termite/src/ops/native_compute.zig)
+- Metal quantized placeholder caching on first access now honors backend shared-cache admission and degrades to a non-cached placeholder when backend cache admission still fails after eviction:
+  - [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
 - `pkg/termite` currently verifies with both:
   - `zig build test`
 
@@ -85,9 +85,9 @@ The codebase already has several pieces of the design:
   - `disk`
   - `host`
   - `backend`
-- MLX and BLAS both have lazy-weight promotion and eviction paths:
-  - [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
-  - [blas_compute.zig](pkg/termite/src/ops/blas_compute.zig)
+- Metal and BLAS both have lazy-weight promotion and eviction paths:
+  - [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
+  - [native_compute.zig](pkg/termite/src/ops/native_compute.zig)
 - Dynamic system-memory-based budget derivation exists in [memory.zig](pkg/termite/src/runtime/tier/memory.zig).
 
 ## What Is Not Finished
@@ -96,10 +96,10 @@ The runtime is not yet fully NVMe-first for large generator models.
 
 ### 1. Upfront reservations are still too coarse
 
-MLX still reserves a large resident-weight estimate up front in:
+Metal still reserves a large resident-weight estimate up front in:
 
 - [session_factory.zig](pkg/termite/src/architectures/session_factory.zig)
-- [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
+- [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
 
 That means we can fail before the runtime has a chance to behave like a bounded working set.
 
@@ -111,7 +111,7 @@ For the NVMe path to be real, large generator models should default to:
 - build lazy refs
 - promote only what is touched
 
-Today some MLX setup paths still materialize too much too early in [session_factory.zig](pkg/termite/src/architectures/session_factory.zig).
+Today some Metal setup paths still materialize too much too early in [session_factory.zig](pkg/termite/src/architectures/session_factory.zig).
 
 ### 3. Promotion is still too tensor-oriented
 
@@ -119,8 +119,8 @@ The biggest missing piece is granularity.
 
 Today large weights are still often promoted as whole tensors or whole packed buffers in:
 
-- [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
-- [blas_compute.zig](pkg/termite/src/ops/blas_compute.zig)
+- [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
+- [native_compute.zig](pkg/termite/src/ops/native_compute.zig)
 
 That is not the same as tiled execution from disk-backed storage.
 
@@ -186,7 +186,7 @@ Audit and narrow:
 Targets:
 
 - [session_factory.zig](pkg/termite/src/architectures/session_factory.zig)
-- [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
+- [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
 
 Outcome:
 
@@ -194,7 +194,7 @@ Outcome:
 
 ### 1.3 Prefer lazy loading for large generator models by default
 
-Tighten MLX generator setup so large GPT-family GGUF models do not take eager-dense paths unless explicitly needed.
+Tighten Metal generator setup so large GPT-family GGUF models do not take eager-dense paths unless explicitly needed.
 
 Target:
 
@@ -217,8 +217,8 @@ When backend promotion cannot fit:
 
 Targets:
 
-- [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
-- [blas_compute.zig](pkg/termite/src/ops/blas_compute.zig)
+- [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
+- [native_compute.zig](pkg/termite/src/ops/native_compute.zig)
 
 Outcome:
 
@@ -275,16 +275,16 @@ Instead of promoting full large tensors, introduce:
 Targets:
 
 - [tensor_store.zig](pkg/termite/src/models/tensor_store.zig)
-- [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
-- [blas_compute.zig](pkg/termite/src/ops/blas_compute.zig)
+- [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
+- [native_compute.zig](pkg/termite/src/ops/native_compute.zig)
 
 Outcome:
 
 - runtime no longer needs full tensor residency to use large weights
 
-### 3.2 Add MLX quant kernels that consume staged tiles
+### 3.2 Add Metal quant kernels that consume staged tiles
 
-The MLX path currently uploads larger prepared buffers than we want under tight budgets.
+The Metal path currently uploads larger prepared buffers than we want under tight budgets.
 
 We need:
 
@@ -294,8 +294,8 @@ We need:
 
 Targets:
 
-- [mlx_quant.zig](pkg/termite/src/backends/mlx_quant.zig) or adjacent MLX quant code
-- [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
+- [metal_native_provider.zig](pkg/termite/src/backends/metal_native_provider.zig) or adjacent Metal quant code
+- [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
 
 Outcome:
 
@@ -313,8 +313,8 @@ That means:
 
 Targets:
 
-- [mlx_compute.zig](pkg/termite/src/ops/mlx_compute.zig)
-- [blas_compute.zig](pkg/termite/src/ops/blas_compute.zig)
+- [metal_compute.zig](pkg/termite/src/ops/metal_compute.zig)
+- [native_compute.zig](pkg/termite/src/ops/native_compute.zig)
 - tier cache / residency helpers
 
 Outcome:
@@ -347,7 +347,7 @@ Create repeatable runs for:
 - small host budget
 - large prompt prefill
 - multi-request concurrency
-- MLX and BLAS
+- Metal and BLAS
 
 Outcome:
 
@@ -359,7 +359,7 @@ Outcome:
 2. Stop reserving oversized resident-weight estimates.
 3. Force large GGUF generators down the lazy path by default.
 4. Add non-fatal fallback on backend promotion denial.
-5. Add tile-level promotion design and prototype it on MLX quantized linear.
+5. Add tile-level promotion design and prototype it on Metal quantized linear.
 
 ## Concrete Questions To Resolve
 
@@ -374,11 +374,11 @@ Likely candidates:
 
 Everything else should be justified, not assumed.
 
-### 2. Should the first tiled implementation be MLX-only?
+### 2. Should the first tiled implementation be Metal-only?
 
 Probably yes.
 
-The MLX path is where the pain is most visible right now, and BLAS can follow after the tile interfaces stabilize.
+The Metal path is where the pain is most visible right now, and BLAS can follow after the tile interfaces stabilize.
 
 ### 3. What is the minimum acceptable fallback?
 

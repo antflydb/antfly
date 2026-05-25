@@ -1,20 +1,20 @@
 # Native Model Runtimes
 
-This document covers the native (non-ONNX) model runtime implementations in termite-zig: the GLiNER2 distributed MLX path and the LayoutDoc runtime for document classification.
+This document covers the native (non-ONNX) model runtime implementations in termite-zig: the GLiNER2 distributed Metal path and the LayoutDoc runtime for document classification.
 
 ---
 
-## GLiNER2 Distributed MLX
+## GLiNER2 Distributed Metal
 
-GLiNER2 has a native distributed-MLX tensor-parallel path built on the shared DeBERTa encoder.
+GLiNER2 has a native distributed-Metal tensor-parallel path built on the shared DeBERTa encoder.
 
 ### What Is Implemented
 
 - `runtime.distributed.Config` is threaded into the GLiNER2 pipeline config
-- `LoadedModel.glinerPipeline()` reads distributed MLX settings from the runtime env
+- `LoadedModel.glinerPipeline()` reads distributed Metal settings from the runtime env
 - `GlinerPipeline` exposes `usesDistributedMlx()` and `usesTensorParallelMlx()` for probes and server/reporting surfaces
-- The shared native DeBERTa encoder reuses the same MLX TP linear seams as the native BERT reranker path
-- Native DeBERTa `Q/K/V`, relative `Q_r/K_r`, attention output, and FFN linears are routed through MLX tensor-parallel helpers
+- The shared native DeBERTa encoder reuses the same Metal TP linear seams as the native BERT reranker path
+- Native DeBERTa `Q/K/V`, relative `Q_r/K_r`, attention output, and FFN linears are routed through Metal tensor-parallel helpers
 - A dedicated probe exists at `probe-gliner2-recognize`
 
 ### Probe
@@ -34,7 +34,7 @@ Run:
   --label person \
   --label organization \
   --label location \
-  --backend mlx
+  --backend metal
 ```
 
 ### Smoke Script
@@ -46,15 +46,12 @@ bash ./scripts/verify_gliner2_mlx_distributed_smoke.sh
 ### Environment
 
 ```
-TERMITE_MLX_DISTRIBUTED_ENABLE=1
-TERMITE_MLX_DISTRIBUTED_MODE=tensor_parallel
-TERMITE_MLX_DISTRIBUTED_BACKEND=ring
-TERMITE_MLX_WORLD_SIZE=<n>
-TERMITE_MLX_RANK=<rank>
-TERMITE_MLX_LOCAL_RANK=<rank>
-MLX_WORLD_SIZE=<n>
-MLX_RANK=<rank>
-MLX_HOSTFILE=<path>
+TERMITE_DISTRIBUTED_ENABLE=1
+TERMITE_DISTRIBUTED_MODE=tensor_parallel
+TERMITE_DISTRIBUTED_BACKEND=ring
+TERMITE_DISTRIBUTED_WORLD_SIZE=<n>
+TERMITE_DISTRIBUTED_RANK=<rank>
+TERMITE_DISTRIBUTED_LOCAL_RANK=<rank>
 ```
 
 ### Remaining Work

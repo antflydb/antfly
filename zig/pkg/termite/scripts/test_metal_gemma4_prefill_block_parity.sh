@@ -28,7 +28,7 @@ OUT_DIR="${OUT_DIR:-/tmp/termite-metal-gemma4-prefill-block-parity}"
 
 if [[ ! -x "$TERMITE_BIN" ]]; then
   echo "termite binary not executable: $TERMITE_BIN" >&2
-  echo "build it first, for example: cd pkg/termite && zig build -Doptimize=ReleaseFast -Dmetal=true -Dmlx=false -Donnx=false -Dpjrt=false" >&2
+  echo "build it first, for example: cd pkg/termite && zig build -Doptimize=ReleaseFast -Dmetal=true -Donnx=false -Dpjrt=false" >&2
   exit 2
 fi
 

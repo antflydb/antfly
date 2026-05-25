@@ -16,7 +16,7 @@
 //
 // Mirrors the Metal-native portion of `MetalProvider` (metal_provider.zig)
 // without any JIT JIT kernel fields or `c.backend_array`-typed methods. Used by
-// `MetalCompute` when the build has `-Dmetal=true -Dmlx=false`. The fields
+// `MetalCompute` when the build has `-Dmetal=true`. The fields
 // are laid out to match what `metal_runtime.zig` duck-types on `self` so the
 // same helper functions work for both provider variants.
 

@@ -8,13 +8,13 @@ Add first-class local LLM support to termite with:
 - native Zig execution, not a llama.cpp wrapper
 - Hypura-like storage-tier-aware inference
 - compute backends remaining separate from model format:
-  - `mlx`
+  - `metal`
   - `native`
   - future `cuda`
 
 The intended end state is:
 
-`GGUF on disk -> tiered tensor store -> staged/dequantized working set -> MLX/BLAS/CUDA compute`
+`GGUF on disk -> tiered tensor store -> staged/dequantized working set -> Metal/BLAS/CUDA compute`
 
 Not:
 
@@ -30,11 +30,11 @@ Implemented now:
 - GGUF-backed BLAS weight loading for native sessions, including LLaMA-style weight-name normalization
 - storage-agnostic tensor access for SafeTensors and GGUF
 - backend-agnostic paged KV manager and block tables
-- request-scoped paged native decode wired into the live BLAS/MLX generation path
+- request-scoped paged native decode wired into the live BLAS/Metal generation path
 - query-only incremental decode with absolute-position-aware RoPE offsets
 - sliding-window KV trimming with retained-window position tracking
 - direct page-table attention for BLAS
-- direct page-table attention for MLX using online blockwise softmax reduction
+- direct page-table attention for Metal using online blockwise softmax reduction
 
 Still missing on the critical path:
 
@@ -53,7 +53,7 @@ GGUF is:
 - a tensor catalog
 - a set of ggml tensor encodings / quantization layouts
 
-GGUF is not the compute backend. Termite backends remain `mlx`, `native`, and later `cuda`.
+GGUF is not the compute backend. Termite backends remain `metal`, `native`, and later `cuda`.
 
 ### 2. Single Stored Model Artifact
 
@@ -76,11 +76,11 @@ The runtime should be split into:
    - prefetch
    - cache
 2. compute layer
-   - MLX execution
+   - Metal execution
    - BLAS execution
    - future CUDA execution
 
-This avoids baking GGUF assumptions into MLX or BLAS directly.
+This avoids baking GGUF assumptions into Metal or BLAS directly.
 
 ### 4. Stage And Dequantize First, Fuse Later
 
@@ -88,9 +88,9 @@ The first working native implementation should:
 
 - stage selected tensor blocks from disk/RAM
 - dequantize active blocks into temporary `f16` or `f32` backend-native buffers
-- execute attention/MLP/MoE math in MLX or BLAS
+- execute attention/MLP/MoE math in Metal or BLAS
 
-Do not block the project on custom MLX kernels for `Q5_K`, `Q6_K`, etc.
+Do not block the project on custom Metal kernels for `Q5_K`, `Q6_K`, etc.
 
 Later optimization phases can add:
 
@@ -278,7 +278,7 @@ Introduce explicit layers:
 
 Keep backend-specific math here:
 
-- `mlx.zig`
+- `metal_runtime.zig`
 - `native.zig`
 - future `cuda.zig`
 
@@ -591,7 +591,7 @@ Where `kv_view` is a logical descriptor:
 
 Backends then choose how to execute:
 
-- MLX:
+- Metal:
   - direct block-table paged attention is now implemented for the native path
   - gathered contiguous fallback still exists for unsupported cases and debugging
 - BLAS:
@@ -689,13 +689,13 @@ Current state:
 - sliding-window retirement: done
 - backend-native page-table attention:
   - BLAS: done
-  - MLX: done for the current native path
+  - Metal: done for the current native path
 - full-block shared-prefix reuse:
   - runtime support exists in `KvManager`
   - request-level/server integration is still TODO
 - continuous batching: done (`claimStep`/`completeStep` in `scheduler/native_generate.zig`, wired in `generation.zig`; one fused forward pass per step packs decode tokens and prefill chunks against a step admission budget)
 - chunked prefill:
-  - native BLAS/MLX generation now supports chunked prompt prefill against the paged KV path
+  - native BLAS/Metal generation now supports chunked prompt prefill against the paged KV path
   - the server now turns it on with a fixed prefill chunk size for `/generate`
   - microbatching across multiple requests is still TODO
 - speculative decoding: done (draft model loading, K-step draft, verify, KV rollback in `generation.zig`)
@@ -733,7 +733,7 @@ Status:
 - benchmark harness:
   - initial native paged-attention benchmark executable is landed
   - BLAS path is usable
-  - MLX path is usable for native paged-attention measurement too
+  - Metal path is usable for native paged-attention measurement too
   - broader scheduler/prefill/expert benchmarks are still TODO
 
 ## Phase 1: GGUF Read-Only Infrastructure
@@ -767,7 +767,7 @@ Deliverables:
 
 - dense codecs
 - tensor store backed by direct file access
-- staging into MLX/BLAS temporary buffers
+- staging into Metal/BLAS temporary buffers
 - native generation path using GGUF metadata
 - fix native generation parity gaps:
   - chat template usage
@@ -798,7 +798,7 @@ Deliverables:
 Status:
 
 - backend-agnostic paged KV cache: done
-- per-layer incremental attention path: done for the native BLAS/MLX path
+- per-layer incremental attention path: done for the native BLAS/Metal path
 - logical-to-physical block tables: done
 - prefix cache for full blocks: runtime support exists, request-level reuse still TODO
 - continuous batching scheduler: done (`claimStep`/`completeStep` in `scheduler/native_generate.zig`)
@@ -881,7 +881,7 @@ Current status:
     - expert output merge
   - grouped backend-native expert execution
     - tokens are batched per selected expert
-    - expert gated MLP matmuls run through the active BLAS/MLX backend
+    - expert gated MLP matmuls run through the active BLAS/Metal backend
   - request-local MoE runtime cache/staging substrate
     - reusable per-layer expert batch buffers across decode steps
     - hot-expert tracking
@@ -890,46 +890,46 @@ Current status:
     - dense/core weights stay resident
     - MoE expert tensors can remain non-resident until first touch
     - predicted experts are prefetched through the lazy cache path
-  - MLX GGUF lazy weight loading
-    - GGUF-native MLX sessions can materialize tensors on demand
+  - Metal GGUF lazy weight loading
+    - GGUF-native Metal sessions can materialize tensors on demand
     - predicted experts reuse the same lazy cache/prefetch path
-    - eager full-model MLX upload is no longer required for GGUF models
+    - eager full-model Metal upload is no longer required for GGUF models
   - model-scoped shared expert cache policy
     - hot-expert and co-activation state now survives across requests
     - new requests seed their predicted experts from the shared model profile
   - bounded shared expert residency policy
-    - BLAS and MLX GGUF expert caches now track model-scoped hotness
+    - BLAS and Metal GGUF expert caches now track model-scoped hotness
     - per-layer resident expert capacity is bounded instead of unbounded
     - cold unpinned experts are evicted first, hot experts stay resident longer
   - first explicit tier planner and tier state
     - lazy GGUF weights now carry a placement plan instead of only loaded/not-loaded state
-    - MLX lazy experts now transition through `disk -> host -> backend`
+    - Metal lazy experts now transition through `disk -> host -> backend`
     - BLAS lazy experts now expose explicit `disk -> host` state using the same planner metadata
   - first byte-budgeted shared tier pools
     - host and backend bytes are now tracked separately
     - BLAS lazy expert eviction can trigger on host-byte pressure, not only resident expert count
-    - MLX lazy expert eviction can trigger on either host-byte or backend-byte pressure
+    - Metal lazy expert eviction can trigger on either host-byte or backend-byte pressure
   - tensor-store-owned lazy tensor refs
     - lazy GGUF entries are now registered through `tensor_store.describeTensor(...)`
     - backend lazy promotion now reloads through `tensor_store.loadTensorRef(...)`
-    - BLAS/MLX no longer reach back into `weightSource()` directly for lazy GGUF promotion
+    - BLAS/Metal no longer reach back into `weightSource()` directly for lazy GGUF promotion
   - explicit backend prefetch API for lazy weights
     - predicted expert prefetch no longer uses `getWeight()+free` as a proxy
     - BLAS prefetch warms host-resident lazy tensors
-    - MLX prefetch promotes lazy tensors to their planned preferred tier
+    - Metal prefetch promotes lazy tensors to their planned preferred tier
   - queued lazy-weight prefetch requests
     - prefetch requests are now enqueued on the persistent weight store
     - native generation now drains queued requests with a small per-iteration budget instead of flushing the full queue at once
     - predicted expert selection and actual staging are now separate steps
   - first async prefetch workers for lazy GGUF weights
     - queue ownership and worker lifecycle now live in `src/runtime/tier/prefetch.zig`
-    - BLAS and MLX now plug backend-specific lazy-tensor staging callbacks into that shared runtime queue
+    - BLAS and Metal now plug backend-specific lazy-tensor staging callbacks into that shared runtime queue
     - BLAS lazy stores now have a background worker that services the queued prefetch list off the decode thread
-    - MLX lazy stores now do the same for `disk -> host` staging
-    - MLX `host -> backend` promotion still happens on demand on the request thread
+    - Metal lazy stores now do the same for `disk -> host` staging
+    - Metal `host -> backend` promotion still happens on demand on the request thread
   - model-scoped shared prefetch state
     - `LoadedModel` now owns a `runtime/tier/shared.zig` prefetch state object alongside the shared MoE routing cache
-    - native BLAS/MLX sessions now attach to that shared state explicitly after session creation
+    - native BLAS/Metal sessions now attach to that shared state explicitly after session creation
     - request/completion counts for lazy tensor prefetches now survive across requests at the model level
     - queue servicing can now prioritize repeated pending tensor requests using that shared state instead of strict FIFO
     - priority is now recency-windowed rather than purely cumulative, so near-term repeated expert requests win over stale historical hotness
@@ -937,7 +937,7 @@ Current status:
     - MoE prediction strength is now carried through runtime/shared-cache prediction paths and folded into those prefetch hints instead of using rank alone
   - server KV runtime now honors model `sliding_window` when present
   - first serving-side scheduler substrate for native generation
-    - native BLAS/MLX generation now supports chunked prompt prefill over the paged KV runtime
+    - native BLAS/Metal generation now supports chunked prompt prefill over the paged KV runtime
     - the first decode step can reuse the final prefill chunk logits instead of rerunning the full prompt
     - `/generate` admission is now weighted by estimated prompt/decode cost rather than always consuming one flat queue slot
   - first model-scoped native generate coordinator
@@ -950,13 +950,13 @@ Current status:
     - native generation reports prefill/decode progress back into that coordinator during execution
     - prefill chunk recommendations are now phase-aware, so decode activity forces smaller prefill chunks for later requests on the same model
   - first cooperative cross-request native turn scheduler
-    - native BLAS/MLX generation now requests explicit prefill and decode turns from the model-scoped coordinator
+    - native BLAS/Metal generation now requests explicit prefill and decode turns from the model-scoped coordinator
     - waiting requests yield cooperatively through the request `io` until their model turn is available
     - decode turns are prioritized over prefill turns, with bounded prefill re-entry to avoid starvation
     - this gives real cross-request interleaving on the current fiber runtime, but still does not fuse multiple requests into one shared forward pass
   - first batch-capable paged-attention substrate for native microbatching
     - decode contexts can now carry per-item KV-manager/cache bindings for batched native requests
-    - BLAS and MLX paged attention now accept `batch > 1` with per-item paged KV bindings instead of immediately falling back to dense attention
+    - BLAS and Metal paged attention now accept `batch > 1` with per-item paged KV bindings instead of immediately falling back to dense attention
     - current backend behavior still resolves paged attention per item inside the batched call, so the main near-term win is shared upper-layer linear/FFN work rather than a fully fused paged-attention kernel
   - first fused native decode microbatch path
     - compatible decode waiters on the same model can now be claimed as one scheduled decode batch
@@ -978,18 +978,18 @@ Current status:
   - backend-native quantized execution kernels
     - current GGUF path now has direct BLAS quant matmul for `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_K`
     - packed MoE expert views can now preserve GGUF quant storage and use the direct BLAS path without dense expert slices first
-    - MLX now has a direct quantized execution path for those same stored formats, including packed expert views, through the MLX backend wrapper
-    - MLX now prefers backend-dense staged execution once a quantized GGUF weight has already been materialized as an MLX array, so hot quantized weights stay on-device instead of bouncing back through the CPU wrapper path
-    - the wrapper-direct-quant path remains as a fallback mode, but the current default is to keep staged MLX weights on the MLX matmul path
-    - the MLX quantized linear path is now isolated behind an explicit executor seam with `backend_dense`, `wrapper_direct_quant`, and future `device_native` modes, so a lower-level MLX/Metal kernel can slot in without rewriting `linearNoBias`
-    - lazy quantized MLX weights now cache their transposed staged array on the backend-dense path, reducing repeated transpose overhead while the native device-side kernel path is still open
-    - there is now an explicit MLX native-quant provider boundary under `src/backends/mlx_quant.zig`
-    - `device_native` no longer hardcodes an inline stub in the MLX compute path; it dispatches through that provider interface, which currently defaults to a no-op implementation until a lower-level MLX/Metal kernel backend is added
-    - first real MLX/Metal provider support is now landed for `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_K` linear, including packed expert views after Zig-side contiguous row extraction
-    - the Metal path now borrows MLX input data directly and uses no-copy Metal buffers for input/weight staging where the current MLX C surface allows it
-    - output still re-enters MLX through array creation, so this is reduced-copy interop rather than full zero-copy MLX/Metal tensor sharing
-    - this still is not a true device-side MLX block-quant kernel; the remaining gap is native MLX/Metal execution over packed GGUF blocks without dense staging
-    - true MLX-native block-quant kernels / packed-expert kernels are still open if we want llama.cpp-class efficiency on the MLX path
+    - Metal now has a direct quantized execution path for those same stored formats, including packed expert views, through the Metal backend wrapper
+    - Metal now prefers backend-dense staged execution once a quantized GGUF weight has already been materialized as an Metal array, so hot quantized weights stay on-device instead of bouncing back through the CPU wrapper path
+    - the wrapper-direct-quant path remains as a fallback mode, but the current default is to keep staged Metal weights on the Metal matmul path
+    - the Metal quantized linear path is now isolated behind an explicit executor seam with `backend_dense`, `wrapper_direct_quant`, and future `device_native` modes, so a lower-level Metal kernel can slot in without rewriting `linearNoBias`
+    - lazy quantized Metal weights now cache their transposed staged array on the backend-dense path, reducing repeated transpose overhead while the native device-side kernel path is still open
+    - there is now an explicit Metal native-quant provider boundary under `src/backends/metal_native_provider.zig`
+    - `device_native` no longer hardcodes an inline stub in the Metal compute path; it dispatches through that provider interface, which currently defaults to a no-op implementation until a lower-level Metal kernel backend is added
+    - first real Metal provider support is now landed for `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_K` linear, including packed expert views after Zig-side contiguous row extraction
+    - the Metal path now borrows Metal input data directly and uses no-copy Metal buffers for input/weight staging where the current Metal C surface allows it
+    - output still re-enters Metal through array creation, so this is reduced-copy interop rather than full zero-copy Metal tensor sharing
+    - this still is not a true device-side Metal block-quant kernel; the remaining gap is native Metal execution over packed GGUF blocks without dense staging
+    - true Metal-native block-quant kernels / packed-expert kernels are still open if we want llama.cpp-class efficiency on the Metal path
     - dequantize-on-demand remains the bring-up path, but quantized kernels are the long-term performance target
 
 E2E bring-up checklist:
@@ -997,26 +997,26 @@ E2E bring-up checklist:
 - landed now:
   - `termite smoke <model-dir> <prompt>`
     - prints GGUF tensor-type coverage for the chosen artifact
-    - loads the model through the native BLAS/MLX path
+    - loads the model through the native BLAS/Metal path
     - runs one real native generation pass with paged KV enabled
   - `termite generate <model-dir> <prompt>`
     - is now the primary user-facing bring-up command once inspection is clean
     - supports `--print-chat-template-status`, `--print-prompt`, `--print-token-ids`, and `--print-finish-reason`
 - next:
-  - first, bring up a smaller GGUF on the exact MLX generate path before using Mixtral
+  - first, bring up a smaller GGUF on the exact Metal generate path before using Mixtral
     - recommended shape: Gemma-family or Qwen/LLaMA-family text-only GGUF in a single model directory
     - current GGUF inspection accepts `F16`, `F32`, `Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_K`
-    - native MLX/Metal quant linear now covers `Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_K`
+    - native Metal quant linear now covers `Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_K`
     - both `termite smoke` and `termite generate` expect a model directory with the `.gguf` plus tokenizer files, not an Ollama tag like `gemma3:4b-it-qat`
     - Gemma GGUF metadata with `general.architecture = gemma`, `gemma2`, or `gemma3` currently maps onto the native Gemma family path here
     - preferred first command for inspection:
-      - `ulimit -n 65536 && ./zig-out/bin/termite smoke <gemma-gguf-dir> 'hi' --backend mlx --inspect-only`
+      - `ulimit -n 65536 && ./zig-out/bin/termite smoke <gemma-gguf-dir> 'hi' --backend metal --inspect-only`
     - first real-token check after inspection is clean:
-      - `ulimit -n 65536 && ./zig-out/bin/termite generate <gemma-gguf-dir> 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
-    - validated MLX command for the small bring-up target:
-      - `ulimit -n 65536 && ./zig-out/bin/termite generate /Users/ajroetker/go/src/github.com/antflydb/termite-zig/termite-models/gemma-3-270m-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
-    - validated MLX command for the 4B QAT target:
-      - `ulimit -n 65536 && ./zig-out/bin/termite generate /Users/ajroetker/go/src/github.com/antflydb/termite-zig/termite-models/gemma-3-4b-it-qat-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
+      - `ulimit -n 65536 && ./zig-out/bin/termite generate <gemma-gguf-dir> 'hi' --backend metal --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
+    - validated Metal command for the small bring-up target:
+      - `ulimit -n 65536 && ./zig-out/bin/termite generate /Users/ajroetker/go/src/github.com/antflydb/termite-zig/termite-models/gemma-3-270m-gguf 'hi' --backend metal --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
+    - validated Metal command for the 4B QAT target:
+      - `ulimit -n 65536 && ./zig-out/bin/termite generate /Users/ajroetker/go/src/github.com/antflydb/termite-zig/termite-models/gemma-3-4b-it-qat-gguf 'hi' --backend metal --max-tokens 1 --prefill-chunk-size 64 --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
     - if the candidate Gemma export reports unsupported tensor types, pick a smaller dense GGUF that stays inside the current coverage set rather than debugging Mixtral first
   - then run the smoke path against the exact target Mixtral GGUF artifact
   - compare the reported GGUF tensor-type set with native quant coverage
@@ -1028,8 +1028,8 @@ E2E bring-up checklist:
     - BLAS `Q2_K` / `Q3_K`
     - BLAS `Q4_K` / `Q5_K` / `Q6_K` / `Q8_K`
     - BLAS packed-expert direct-quant execution
-    - MLX packed-expert / direct-quant execution path through the backend wrapper
-    - MLX device-side quant kernels
+    - Metal packed-expert / direct-quant execution path through the backend wrapper
+    - Metal device-side quant kernels
 
 Implementation note:
 
@@ -1041,7 +1041,7 @@ Implementation note:
 - expert caching/staging is currently request-local only:
   - request-local buffers still own per-request batching state
   - BLAS GGUF sessions now lazy-load expert tensors on first touch, can prefetch predicted experts, and now evict cold unpinned experts under a bounded model-scoped cache
-  - MLX GGUF sessions now do the same through a two-stage lazy cache:
+  - Metal GGUF sessions now do the same through a two-stage lazy cache:
     - host `LoadedWeight` staging in RAM
     - backend `mlx_array` promotion on demand
     - backend eviction can now demote back to host instead of always dropping to disk
@@ -1049,7 +1049,7 @@ Implementation note:
     - current budgets are heuristic defaults, not tuned per machine yet
   - native memory-safety guardrails now exist for `termite generate`, `termite smoke`, and the native `/generate` server path
     - each run estimates and reserves `kv` and `scratch` bytes up front
-    - BLAS/MLX lazy weight promotion now checks tier budgets before allocating and fails with `MemoryBudgetExceeded` instead of allocating first
+    - BLAS/Metal lazy weight promotion now checks tier budgets before allocating and fails with `MemoryBudgetExceeded` instead of allocating first
     - the tier planner now demotes large cold tensors toward disk more aggressively when budgets are tight
     - CLI native generation/smoke now expose explicit `--host-budget-mb`, `--backend-budget-mb`, `--kv-budget-mb`, and `--scratch-budget-mb` overrides
   - lazy tensor metadata is now owned by the tensor store layer rather than ad hoc backend strings
@@ -1066,7 +1066,7 @@ Implementation note:
       - explicit MoE prediction-rank hints from the current decode step
       - predicted expert score/co-activation strength when the predictor can supply it
     - BLAS now has an off-thread worker for queued lazy loads
-    - MLX now has an off-thread worker for host staging, but not for backend promotion
+    - Metal now has an off-thread worker for host staging, but not for backend promotion
   - model-scoped routing hotness/co-activation state now survives across requests
   - the new planner is still heuristic and name-based
   - there is not yet a full NVMe placement planner
@@ -1103,7 +1103,7 @@ Status:
 - mmap / file-backed random access: done (`MmapRegion` in `util/c_file.zig`, wired in `models/safetensors.zig` and `models/tensor_store.zig`)
 - placement planner: done (`runtime/tier/planner.zig`)
 - paging runtime: partial (mmap paging works, full NVMe tiering TODO)
-- async prefetch queue: done (MLX prefetch worker in `session_factory.zig`)
+- async prefetch queue: done (Metal prefetch worker in `session_factory.zig`)
 - hot tensor cache: partial (lazy weight loading with guard mutexes)
 
 Acceptance:
@@ -1170,7 +1170,7 @@ Goal:
 
 Deliverables:
 
-- MLX-specific staging optimizations
+- Metal-specific staging optimizations
 - BLAS prepared-weight paths
 - future CUDA backend
 - fused quantized matmul for hot formats
@@ -1178,17 +1178,17 @@ Deliverables:
 
 Status:
 
-- flash attention: done (tiled online softmax for BLAS, native SDPA for MLX)
+- flash attention: done (tiled online softmax for BLAS, native SDPA for Metal)
 - advanced sampling: done (min-p, repetition/frequency/presence penalties)
 - RoPE optimization: done (shared `ropeCore()` with flat position arrays for both `ropeOp` and `ropePerItemOp`)
 - grammar constraint mask optimization: done (`TokenByteTable` for zero-alloc per-token lookup, `allowedTokenMaskFast()`)
-- fused quantized matmul: done (SIMD vectorized dot product kernels for Q4_0/Q5_K/Q8_0, MLX Metal quantized kernels)
+- fused quantized matmul: done (SIMD vectorized dot product kernels for Q4_0/Q5_K/Q8_0, Metal Metal quantized kernels)
 - paged-attention benchmark: done (`src/bench/paged_attention.zig`)
 
 Remaining TODOs:
 
 - extend benchmark into broader prompt/decode harness
-- reduce per-step reshape and transpose churn in MLX paged attention
+- reduce per-step reshape and transpose churn in Metal paged attention
 - per-backend benchmark dashboards
 - future CUDA backend
 
@@ -1282,7 +1282,7 @@ Comparisons:
 - implementing all quant types before the runtime abstractions settle will waste effort
 - dequantize-into-temp approach may be too slow without careful caching
 - MoE support without route-aware prefetch will be correct but disappointing
-- MLX may need careful memory pressure controls on Apple Silicon
+- Metal may need careful memory pressure controls on Apple Silicon
 - GGUF metadata compatibility drifts over time, so parser/tests must be versioned and defensive
 
 ## Recommended Implementation Order
@@ -1303,7 +1303,7 @@ Comparisons:
 Termite should eventually be able to:
 
 - load GGUF directly with no mandatory duplicate runtime copy
-- run small dense GGUF models natively on MLX/BLAS
+- run small dense GGUF models natively on Metal/BLAS
 - run quantized GGUF models including `Q5_K_M`
 - run Mixtral natively with MoE-aware scheduling
 - use GPU/RAM/NVMe tiers intentionally rather than relying on OS swap

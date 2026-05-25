@@ -28,7 +28,7 @@ const weight_source = @import("../models/weight_source.zig");
 const image_pipeline = @import("../pipelines/image.zig");
 const multimodal_qwen_adapter = @import("../pipelines/multimodal_qwen_adapter.zig");
 const hf_tokenizer = @import("termite_hf_tokenizer");
-const blas_mod = @import("../ops/blas_compute.zig");
+const native_compute = @import("../ops/native_compute.zig");
 const ml = @import("ml");
 const optimizers = ml.graph.optimizers;
 
@@ -1066,12 +1066,12 @@ pub fn trainLoRABundleOneStep(
 
     const adapter_a_before = l2Norm(layer.adapter_a);
     const adapter_b_before = l2Norm(layer.adapter_b);
-    var weight_store = blas_mod.WeightStore{
+    var weight_store = native_compute.WeightStore{
         .allocator = allocator,
         .resident_weights = .{},
         .lazy_weights = .{},
     };
-    var compute = blas_mod.BlasCompute.init(allocator, &weight_store, null);
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
     var cb = compute.computeBackend();
     var optimizer_state = optimizers.OptimizerState.init(allocator);
     defer optimizer_state.deinit();

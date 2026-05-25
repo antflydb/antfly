@@ -2,7 +2,7 @@
 
 ## Context
 
-Termite-zig is a Zig ML inference engine with a clean backend abstraction: `ComputeBackend` VTable in `src/ops/ops.zig` (~35 required ops) and `Session` VTable in `src/backends/session.zig`. Model architectures (BERT, T5, GPT) call ops through the VTable without knowing the backend. Currently three backends exist: BLAS (CPU), MLX (Metal/Apple Silicon), ONNX (runtime).
+Termite-zig is a Zig ML inference engine with a clean backend abstraction: `ComputeBackend` VTable in `src/ops/ops.zig` (~35 required ops) and `Session` VTable in `src/backends/session.zig`. Model architectures (BERT, T5, GPT) call ops through the VTable without knowing the backend. Currently three backends exist: BLAS (CPU), Metal (Metal/Apple Silicon), ONNX (runtime).
 
 Goal: enable termite to run in the browser via WASM, with WASM SIMD as the foundation and WebGPU compute shaders as an acceleration layer. Client-side embedding, reranking, and eventually generation without a server.
 

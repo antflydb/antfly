@@ -529,6 +529,6 @@ CUDA is minimally useful when:
   cubins once CI can generate them?
 - How aggressive should per-op fallback be before the cost of CPU/GPU transfers
   makes whole-layer fallback preferable?
-- Should CUDA direct sessions load before or after MLX/Metal in `auto` when
+- Should CUDA direct sessions load before or after Metal in `auto` when
   running on multi-platform developer machines?
 - When should CUDA graph launch be introduced for decoder token loops?

@@ -399,7 +399,7 @@ zig build train-eval-entity-cleanup-head -- <train_cache.json> <eval_cache.json>
 ```
 
 Current `prepare-gliner2-entity-cleanup-cache` defaults:
-- `backend=blas`
+- `backend=native`
 - `max_examples=128`
 - `max_length=256`
 - `max_span_width=8`

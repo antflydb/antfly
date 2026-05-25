@@ -254,8 +254,8 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         weight_store.resident_weights.deinit(allocator);
     }
 
-    var blas_backend = native_compute.NativeCompute.init(allocator, &weight_store, null);
-    const cb = blas_backend.computeBackend();
+    var native_backend = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    const cb = native_backend.computeBackend();
 
     // ------------------------------------------------------------------
     // 4. Load safetensors weights into the weight store

@@ -24,7 +24,7 @@ preparation.
 ## MoE Packed Expert Alignment
 
 Status: packed MoE now uses an explicit `mul_mat_id`-style contract across the
-generic compute API, native reference path, MLX native-quant provider, and
+generic compute API, native reference path, Metal native-quant provider, and
 Metal grouped kernels.
 
 `llama.cpp` keeps Gemma4 MoE weights as 3D packed tensors and applies selected
@@ -36,7 +36,7 @@ expert IDs through `ggml_mul_mat_id`. The important layouts are:
 The production target is a Termite `mul_mat_id`-style primitive where routed
 MoE execution receives the full packed tensor and selected expert IDs. The
 current grouped MoE path follows that contract for packed GGUF weights at the
-weight-registration, graph dispatch, native reference, MLX provider, and Metal
+weight-registration, graph dispatch, native reference, Metal provider, and Metal
 kernel-selection levels.
 
 Implemented slice:
@@ -47,18 +47,18 @@ Implemented slice:
   is the first GGUF dimension
 - dense packed-expert materialization supports the same layout, including
   fused gate/up row offsets
-- MLX packed-weight slicing uses the shared offset calculation
+- Metal packed-weight slicing uses the shared offset calculation
 - Gemma4 packed GGUF MoE registers one lazy weight per layer/projection
   (`packed.w1`, `packed.w2`, `packed.w3`) instead of one per expert/projection
 - grouped MoE lookup prefers the packed projection weights and keeps legacy
   per-expert names as fallback
 - GGUF inspection treats the synthetic packed projection names as required
   weights, so packed models report complete required tensor coverage
-- MLX/Metal grouped dispatch can index full packed storage directly for
+- Metal grouped dispatch can index full packed storage directly for
   `expert_axis == 2` instead of staging selected expert slabs
 - generic `ComputeBackend` exposes `mulMatId`, with `moeLinearNoBias` retained
   as a compatibility wrapper
-- MLX native-quant providers expose `mulMatId`, and the Metal provider routes
+- Metal native-quant providers expose `mulMatId`, and the Metal provider routes
   grouped kernels through that contract
 - native CPU has a `mulMatId` path covering legacy 2D packed expert weights and
   ggml expert-last 3D weights; quantized GGUF weights stay packed and execute

@@ -29,7 +29,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const blas_compute = @import("../../ops/blas_compute.zig");
+const native_compute = @import("../../ops/native_compute.zig");
 const ops_mod = @import("../../ops/ops.zig");
 const ComputeBackend = ops_mod.ComputeBackend;
 const fused_chunker_data = @import("../fused_chunker_data.zig");
@@ -359,13 +359,13 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // Set up compute backend (WeightStore is empty for eval — features are zero-filled)
-    var weight_store = blas_compute.WeightStore{
+    var weight_store = native_compute.WeightStore{
         .allocator = allocator,
         .resident_weights = .{},
         .lazy_weights = .{},
     };
 
-    var native_backend = blas_compute.BlasCompute.init(allocator, &weight_store, null);
+    var native_backend = native_compute.NativeCompute.init(allocator, &weight_store, null);
     const cb: ComputeBackend = native_backend.computeBackend();
 
     print("backend: native\n", .{});

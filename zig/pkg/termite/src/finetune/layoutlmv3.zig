@@ -29,7 +29,7 @@ const document_data = @import("document_data.zig");
 const lora = @import("lora.zig");
 const neftune = @import("neftune.zig");
 const graph_bridge = @import("graph_bridge.zig");
-const blas_mod = @import("../ops/blas_compute.zig");
+const native_compute = @import("../ops/native_compute.zig");
 const ml = @import("ml");
 const optimizers = ml.graph.optimizers;
 
@@ -881,8 +881,8 @@ pub fn trainLoRABundleOneStep(
 
     const a_before = l2Norm(layer.adapter_a);
     const b_before = l2Norm(layer.adapter_b);
-    var graph_weight_store = blas_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    var graph_compute = blas_mod.BlasCompute.init(allocator, &graph_weight_store, null);
+    var graph_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var graph_compute = native_compute.NativeCompute.init(allocator, &graph_weight_store, null);
     const graph_cb = graph_compute.computeBackend();
     var graph_optimizer_state = optimizers.OptimizerState.init(allocator);
     defer graph_optimizer_state.deinit();
@@ -2622,11 +2622,11 @@ fn trainSequenceEpoch(
         .{ .adamw = .{} };
     if (limit == 0 or head.num_labels < 2) return metrics;
 
-    // Use provided backend, or fall back to internal BlasCompute.
-    var blas_weight_store = blas_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    var blas_compute = blas_mod.BlasCompute.init(allocator, &blas_weight_store, null);
-    var blas_cb = blas_compute.computeBackend();
-    const graph_cb: *const ComputeBackend = provided_cb orelse &blas_cb;
+    // Use provided backend, or fall back to internal native compute.
+    var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var fallback_native = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    var native_cb = fallback_native.computeBackend();
+    const graph_cb: *const ComputeBackend = provided_cb orelse &native_cb;
     var graph_optimizer_state = optimizers.OptimizerState.init(allocator);
     defer graph_optimizer_state.deinit();
 
@@ -2774,11 +2774,11 @@ fn trainTokenEpoch(
     const max_inner_steps: usize = 6;
     if (limit == 0 or head.num_labels < 2) return metrics;
 
-    // Use provided backend, or fall back to internal BlasCompute.
-    var blas_weight_store = blas_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    var blas_compute = blas_mod.BlasCompute.init(allocator, &blas_weight_store, null);
-    var blas_cb = blas_compute.computeBackend();
-    const graph_cb: *const ComputeBackend = provided_cb orelse &blas_cb;
+    // Use provided backend, or fall back to internal native compute.
+    var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var fallback_native = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    var native_cb = fallback_native.computeBackend();
+    const graph_cb: *const ComputeBackend = provided_cb orelse &native_cb;
     var graph_optimizer_state = optimizers.OptimizerState.init(allocator);
     defer graph_optimizer_state.deinit();
 

@@ -80,10 +80,10 @@ termite finetune dataset generate gemma4-pilot /tmp/pilot.jsonl --count 1000 --s
 termite finetune dataset prepare gemma4-lora /models/gemma4 /tmp/pilot.jsonl train /tmp/prepared.json
 
 termite finetune adapter bootstrap gemma4 /models/gemma4 /tmp/adapter --rank 16 --alpha 32 --target-preset all-linear
-termite finetune train gemma4-lora /models/gemma4 /tmp/adapter /tmp/prepared.json /tmp/out --trainer autodiff --backend mlx
+termite finetune train gemma4-lora /models/gemma4 /tmp/adapter /tmp/prepared.json /tmp/out --trainer autodiff --backend metal
 termite finetune adapter materialize gemma4 /models/gemma4 /tmp/out /tmp/merged
 
-termite finetune workflow gemma4-pilot text /models/gemma4 /tmp/pilot-run --count 1000 --backend mlx
+termite finetune workflow gemma4-pilot text /models/gemma4 /tmp/pilot-run --count 1000 --backend metal
 termite finetune workflow recursive-lora-smoke /models/gemma4 /tmp/recursive-smoke --count 16
 termite finetune workflow gliner2-entity-cleanup-smoke /models/gliner2 /tmp/adapter train.jsonl eval.jsonl /tmp/out
 ```
@@ -94,16 +94,16 @@ Use this matrix as the PR gate for declaring the unified CLI production ready.
 
 | Family / Task | Dataset | Adapter | Train/Eval | Materialize | Required Backend Lane |
 | --- | --- | --- | --- | --- | --- |
-| Gemma4 text LoRA | prepare + teacher top-k | bootstrap/inspect | supervised, autodiff, recursive preference paths | LoRA merge + recursive base | native/BLAS CPU smoke, MLX optional |
-| Gemma4 multimodal LoRA | multimodal prepare + pilot generation | bootstrap/inspect | autodiff with image/audio embeddings | LoRA merge | native/BLAS CPU smoke, MLX optional |
+| Gemma4 text LoRA | prepare + teacher top-k | bootstrap/inspect | supervised, autodiff, recursive preference paths | LoRA merge + recursive base | native/BLAS CPU smoke, Metal optional |
+| Gemma4 multimodal LoRA | multimodal prepare + pilot generation | bootstrap/inspect | autodiff with image/audio embeddings | LoRA merge | native/BLAS CPU smoke, Metal optional |
 | ColQwen2 / Qwen2VL | multimodal prepared inputs | bootstrap/inspect | LoRA train/eval bundle | LoRA merge | native/BLAS CPU smoke |
-| Qwen3.5 / Chandra OCR text-only | text SFT/DPO/GRPO JSONL; dynamic image preparation pending | bootstrap/inspect | Qwen autodiff trainer for text SFT/DPO/GRPO | adapter save; merged materialization pending | native/BLAS CPU smoke required, MLX/Metal smoke pending |
+| Qwen3.5 / Chandra OCR text-only | text SFT/DPO/GRPO JSONL; dynamic image preparation pending | bootstrap/inspect | Qwen autodiff trainer for text SFT/DPO/GRPO | adapter save; merged materialization pending | native/BLAS CPU smoke required, Metal smoke pending |
 | GLiNER2 | dataset inspect + boundary caches | bootstrap/inspect | LoRA, autodiff, boundary heads | LoRA merge | native/BLAS CPU smoke |
 | LayoutLMv3 | document token/sequence data | bootstrap/inspect | token and sequence train/eval | checkpoint materialize | native/BLAS CPU smoke |
 | Reranker | dataset inspect + pooled/top-layer caches | bootstrap/inspect | head and LoRA surrogate paths | head and LoRA materialize | native/BLAS CPU smoke |
 | Fused chunker | dataset fixtures | n/a | train/eval roots | checkpoint output | native/BLAS CPU smoke |
 
-Optional lanes should prove MLX, Metal, PJRT, ONNX, and quantized export where
+Optional lanes should prove Metal, Metal, PJRT, ONNX, and quantized export where
 the model family actually supports them. Unsupported combinations must fail
 with explicit errors rather than falling back silently.
 
