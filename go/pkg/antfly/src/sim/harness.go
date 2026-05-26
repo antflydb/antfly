@@ -1208,29 +1208,48 @@ func (h *Harness) checkMetadataErrors() error {
 }
 
 func (h *Harness) runWithProgress(timeout time.Duration, fn func() error) error {
-	done := make(chan error, 1)
-	go func() {
-		done <- fn()
-	}()
-
 	deadline := h.clock.Now().Add(timeout)
 	for !h.clock.Now().After(deadline) {
+		done := make(chan error, 1)
+		go func() {
+			done <- fn()
+		}()
+
+		retry := false
+	attempt:
+		for !h.clock.Now().After(deadline) {
+			select {
+			case err := <-done:
+				if isTransientMetadataUnavailable(err) {
+					h.recordMetadataLeaderTransition()
+					if advanceErr := h.Advance(100 * time.Millisecond); advanceErr != nil {
+						return advanceErr
+					}
+					retry = true
+					break attempt
+				}
+				return err
+			default:
+			}
+			if err := h.Advance(100 * time.Millisecond); err != nil {
+				return err
+			}
+		}
+		if retry {
+			continue
+		}
+
 		select {
 		case err := <-done:
+			if isTransientMetadataUnavailable(err) {
+				return fmt.Errorf("operation did not complete within %s", timeout)
+			}
 			return err
 		default:
-		}
-		if err := h.Advance(100 * time.Millisecond); err != nil {
-			return err
+			return fmt.Errorf("operation did not complete within %s", timeout)
 		}
 	}
-
-	select {
-	case err := <-done:
-		return err
-	default:
-		return fmt.Errorf("operation did not complete within %s", timeout)
-	}
+	return fmt.Errorf("operation did not complete within %s", timeout)
 }
 
 func (h *Harness) storePeers() common.Peers {

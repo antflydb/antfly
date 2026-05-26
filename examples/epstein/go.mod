@@ -4,10 +4,10 @@ go 1.26.0
 
 require (
 	github.com/ajroetker/pdf v0.0.1-antfly001
-	github.com/antflydb/antfly/go/pkg/sdk v0.0.0-20260207183149-045031239f8a
 	github.com/antflydb/antfly/go/pkg/docsaf v0.0.0-20260207183149-045031239f8a
 	github.com/antflydb/antfly/go/pkg/generating v0.0.0
 	github.com/antflydb/antfly/go/pkg/libaf v0.0.1
+	github.com/antflydb/antfly/go/pkg/sdk v0.0.0
 	github.com/pdfcpu/pdfcpu v0.11.1
 )
 
@@ -79,7 +79,7 @@ require (
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/saintfish/chardet v0.0.0-20230101081208-5e3ef4b5456d // indirect
 	github.com/temoto/robotstxt v1.1.2 // indirect
-	github.com/tinygo/pkg/antfly/lib/msgp v1.6.3 // indirect
+	github.com/tinylib/msgp v1.6.3 // indirect
 	github.com/woodsbury/decimal128 v1.4.0 // indirect
 	github.com/yuin/goldmark v1.7.17 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
@@ -87,8 +87,6 @@ require (
 	go.opentelemetry.io/otel v1.43.0 // indirect
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
-	go.uber.org/multierr v1.11.0 // indirect
-	go.uber.org/zap v1.27.1 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.4 // indirect
 	golang.org/x/crypto v0.51.0 // indirect
@@ -109,8 +107,8 @@ require (
 )
 
 replace (
-	github.com/antflydb/antfly/go/pkg/sdk => ../../go/pkg/sdk
 	github.com/antflydb/antfly/go/pkg/docsaf => ../../go/pkg/docsaf
 	github.com/antflydb/antfly/go/pkg/generating => ../../go/pkg/generating
 	github.com/antflydb/antfly/go/pkg/libaf => ../../go/pkg/libaf
+	github.com/antflydb/antfly/go/pkg/sdk => ../../go/pkg/sdk
 )

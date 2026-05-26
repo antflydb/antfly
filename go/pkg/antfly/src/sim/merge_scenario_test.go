@@ -153,8 +153,8 @@ func TestHarness_MetadataLeaderFailover_ThenEmptyShardMergeConverges(t *testing.
 	h, err := NewHarness(HarnessConfig{
 		BaseDir:           t.TempDir(),
 		Start:             time.Unix(1_700_330_000, 0).UTC(),
-		MetadataIDs:       []types.ID{110, 111, 112},
-		StoreIDs:          []types.ID{11, 12, 13},
+		MetadataIDs:       []types.ID{100, 101, 102},
+		StoreIDs:          []types.ID{1, 2, 3},
 		ReplicationFactor: 3,
 		MaxShardSizeBytes: 64 * 1024 * 1024,
 		MinShardSizeBytes: 32 * 1024 * 1024,
@@ -452,8 +452,8 @@ func TestHarness_MetadataLeaderFailover_DuringNonEmptyMergeConverges(t *testing.
 	h, err := NewHarness(HarnessConfig{
 		BaseDir:           t.TempDir(),
 		Start:             time.Unix(1_700_360_000, 0).UTC(),
-		MetadataIDs:       []types.ID{140, 141, 142},
-		StoreIDs:          []types.ID{41, 42, 43},
+		MetadataIDs:       []types.ID{100, 101, 102},
+		StoreIDs:          []types.ID{1, 2, 3},
 		ReplicationFactor: 3,
 		MaxShardSizeBytes: 64 * 1024 * 1024,
 		MinShardSizeBytes: 32 * 1024 * 1024,

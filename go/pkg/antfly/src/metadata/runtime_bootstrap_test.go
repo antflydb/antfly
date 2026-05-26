@@ -15,6 +15,7 @@
 package metadata
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/usermgr"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
@@ -75,12 +77,17 @@ func TestNewRuntimeDoesNotSeedAdminBeforeRaftStart(t *testing.T) {
 		done <- result{runtime: runtime, err: err}
 	}()
 
+	// Keep this below defaultAdminSeedAttemptTimeout so a regression that
+	// synchronously seeds the default admin before Raft starts still fails, while
+	// allowing loaded CI runners enough time for Pebble/Raft construction.
 	select {
 	case res := <-done:
 		require.NoError(t, res.err)
 		require.NotNil(t, res.runtime)
+		_, err := res.runtime.userManager.GetUser("admin")
+		require.True(t, errors.Is(err, usermgr.ErrUserNotFound), "default admin must not be seeded during runtime construction")
 		require.NoError(t, res.runtime.Close())
-	case <-time.After(2 * time.Second):
+	case <-time.After(defaultAdminSeedAttemptTimeout - 2*time.Second):
 		t.Fatal("NewRuntime blocked before Raft start; default admin seed must not run during runtime construction")
 	}
 }

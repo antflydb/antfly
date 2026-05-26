@@ -196,10 +196,10 @@ func (b termiteBase) readSingle(ctx context.Context, dataURI string, opts *libre
 	var lastErr error
 
 	for _, model := range b.models {
-		resp, err := b.client.Client().ReadImagesWithResponse(ctx, oapi.ReadRequest{
+		resp, err := b.client.Client().ReadImagesWithResponse(ctx, oapi.TermiteReadRequest{
 			Model:     model,
 			Prompt:    prompt,
-			Images:    []oapi.ImageURL{{Url: dataURI}},
+			Images:    []oapi.TermiteImageURL{{Url: dataURI}},
 			MaxTokens: maxTokens,
 		})
 		if err != nil {
@@ -222,11 +222,11 @@ func (b termiteBase) readSingle(ctx context.Context, dataURI string, opts *libre
 			lastErr = fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
 			continue
 		}
-		if resp.JSON200 == nil || len(resp.JSON200.Results) == 0 {
+		if resp.JSON200 == nil || len(resp.JSON200.Data) == 0 {
 			continue
 		}
 
-		text := strings.TrimSpace(resp.JSON200.Results[0].Text)
+		text := strings.TrimSpace(resp.JSON200.Data[0].Text)
 		if text == "" {
 			continue
 		}
@@ -248,7 +248,7 @@ func (b termiteBase) generateSingle(ctx context.Context, dataURI string, opts *l
 
 	var lastErr error
 	for _, model := range b.models {
-		resp, err := b.client.Generate(ctx, model, []oapi.ChatMessage{message}, &termiteclient.GenerateConfig{
+		resp, err := b.client.Generate(ctx, model, []oapi.TermiteChatMessage{message}, &termiteclient.GenerateConfig{
 			MaxTokens: maxTokens,
 		})
 		if err != nil {

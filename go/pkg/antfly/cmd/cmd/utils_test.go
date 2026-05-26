@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/ai"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/scraping"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/libaf/logging"
 	"github.com/go-viper/mapstructure/v2"
@@ -399,6 +400,113 @@ termite:
 	require.NoError(t, err)
 
 	require.Equal(t, "http://localhost:8082", config.Termite.ApiUrl)
+}
+
+func TestParseConfigRemoteContentSecurityExplicitFalse(t *testing.T) {
+	t.Run("config_file_parent_object", func(t *testing.T) {
+		configYAML := `
+metadata:
+  orchestration_urls:
+    "1": "http://localhost:5001"
+remote_content:
+  security:
+    block_private_ips: false
+`
+		v := viper.New()
+		v.SetConfigType("yaml")
+		require.NoError(t, v.ReadConfig(strings.NewReader(configYAML)))
+
+		_, err := parseConfig(v)
+		require.NoError(t, err)
+		defer scraping.InitRemoteContentConfig(nil)
+
+		security := scraping.GetEffectiveSecurity()
+		require.False(t, security.BlockPrivateIps)
+		require.Equal(t, int64(100*1024*1024), security.MaxDownloadSizeBytes)
+		require.Equal(t, 30, security.DownloadTimeoutSeconds)
+		require.Equal(t, 2048, security.MaxImageDimension)
+	})
+
+	t.Run("leaf_only_override", func(t *testing.T) {
+		configYAML := `
+metadata:
+  orchestration_urls:
+    "1": "http://localhost:5001"
+`
+		v := viper.New()
+		v.SetConfigType("yaml")
+		require.NoError(t, v.ReadConfig(strings.NewReader(configYAML)))
+		v.Set("remote_content.security.block_private_ips", false)
+
+		_, err := parseConfig(v)
+		require.NoError(t, err)
+		defer scraping.InitRemoteContentConfig(nil)
+
+		security := scraping.GetEffectiveSecurity()
+		require.False(t, security.BlockPrivateIps)
+		require.Equal(t, int64(100*1024*1024), security.MaxDownloadSizeBytes)
+		require.Equal(t, 30, security.DownloadTimeoutSeconds)
+		require.Equal(t, 2048, security.MaxImageDimension)
+	})
+}
+
+func TestParseConfigRemoteContentCredentialSecurityExplicitFalse(t *testing.T) {
+	t.Run("config_file_parent_object", func(t *testing.T) {
+		configYAML := `
+metadata:
+  orchestration_urls:
+    "1": "http://localhost:5001"
+remote_content:
+  security:
+    block_private_ips: true
+  s3:
+    local:
+      endpoint: "localhost:9000"
+      access_key_id: "local-key"
+      secret_access_key: "local-secret"
+      security:
+        block_private_ips: false
+`
+		v := viper.New()
+		v.SetConfigType("yaml")
+		require.NoError(t, v.ReadConfig(strings.NewReader(configYAML)))
+
+		_, err := parseConfig(v)
+		require.NoError(t, err)
+		defer scraping.InitRemoteContentConfig(nil)
+
+		_, security, err := scraping.ResolveS3Credentials("s3://any-bucket/doc.pdf", "local")
+		require.NoError(t, err)
+		require.False(t, security.BlockPrivateIps)
+	})
+
+	t.Run("leaf_only_override", func(t *testing.T) {
+		configYAML := `
+metadata:
+  orchestration_urls:
+    "1": "http://localhost:5001"
+remote_content:
+  security:
+    block_private_ips: true
+  s3:
+    local:
+      endpoint: "localhost:9000"
+      access_key_id: "local-key"
+      secret_access_key: "local-secret"
+`
+		v := viper.New()
+		v.SetConfigType("yaml")
+		require.NoError(t, v.ReadConfig(strings.NewReader(configYAML)))
+		v.Set("remote_content.s3.local.security.block_private_ips", false)
+
+		_, err := parseConfig(v)
+		require.NoError(t, err)
+		defer scraping.InitRemoteContentConfig(nil)
+
+		_, security, err := scraping.ResolveS3Credentials("s3://any-bucket/doc.pdf", "local")
+		require.NoError(t, err)
+		require.False(t, security.BlockPrivateIps)
+	})
 }
 
 func TestParseConfigVersion(t *testing.T) {

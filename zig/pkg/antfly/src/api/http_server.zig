@@ -113,7 +113,11 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         query_request: metadata_openapi.QueryRequest,
     ) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        var semantic_resolver = SemanticStatusResolver{ .source = self.server.source, .local_termite_provider = self.server.local_termite_provider };
+        var semantic_resolver = SemanticStatusResolver{
+            .source = self.server.source,
+            .local_termite_provider = self.server.local_termite_provider,
+            .remote_content = self.server.cfg.remote_content,
+        };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
         var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
@@ -143,7 +147,11 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         query_request: metadata_openapi.QueryRequest,
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
-        var semantic_resolver = SemanticStatusResolver{ .source = self.server.source, .local_termite_provider = self.server.local_termite_provider };
+        var semantic_resolver = SemanticStatusResolver{
+            .source = self.server.source,
+            .local_termite_provider = self.server.local_termite_provider,
+            .remote_content = self.server.cfg.remote_content,
+        };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
         var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
@@ -220,6 +228,7 @@ pub const ApiHttpServerConfig = struct {
 pub const SemanticStatusResolver = struct {
     source: StatusSource,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
 
     pub fn iface(self: *SemanticStatusResolver) query_contract.SemanticResolver {
         return .{
@@ -245,6 +254,7 @@ pub const SemanticStatusResolver = struct {
             .admin_snapshot = self.source.vtable.admin_snapshot orelse return error.UnsupportedQueryRequest,
             .free_admin_snapshot = self.source.vtable.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
             .local_termite_provider = self.local_termite_provider,
+            .remote_content = self.remote_content,
         }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
     }
 };
@@ -2522,7 +2532,11 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                var semantic_resolver = SemanticStatusResolver{ .source = runner.server.source, .local_termite_provider = runner.server.local_termite_provider };
+                var semantic_resolver = SemanticStatusResolver{
+                    .source = runner.server.source,
+                    .local_termite_provider = runner.server.local_termite_provider,
+                    .remote_content = runner.server.cfg.remote_content,
+                };
                 var query_req = query_api.parsePublicQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
@@ -2693,7 +2707,11 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                var semantic_resolver = SemanticStatusResolver{ .source = runner.server.source, .local_termite_provider = runner.server.local_termite_provider };
+                var semantic_resolver = SemanticStatusResolver{
+                    .source = runner.server.source,
+                    .local_termite_provider = runner.server.local_termite_provider,
+                    .remote_content = runner.server.cfg.remote_content,
+                };
                 var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
@@ -2875,6 +2893,20 @@ pub const ApiHttpServer = struct {
                     return try textResponse(self.alloc, 400, "invalid create table request");
                 };
                 defer create_req.deinit(self.alloc);
+                const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+                    self.alloc,
+                    create_req.indexes_json orelse tables_api.default_indexes_json,
+                    .{
+                        .local_termite_provider = self.local_termite_provider,
+                        .secret_store = self.cfg.secret_store,
+                        .remote_content = self.cfg.remote_content,
+                    },
+                ) catch |err| switch (err) {
+                    error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
+                    else => return err,
+                };
+                if (create_req.indexes_json) |old_indexes_json| self.alloc.free(old_indexes_json);
+                create_req.indexes_json = normalized_indexes_json;
                 tables_api.validatePublicAlgebraicIndexesJson(self.alloc, create_req.indexes_json orelse tables_api.default_indexes_json) catch {
                     return try textResponse(self.alloc, 400, "unsupported table index configuration");
                 };
@@ -4661,7 +4693,11 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
     ) !query_api.QueryResponse {
-        var semantic_resolver = SemanticStatusResolver{ .source = self.source, .local_termite_provider = self.local_termite_provider };
+        var semantic_resolver = SemanticStatusResolver{
+            .source = self.source,
+            .local_termite_provider = self.local_termite_provider,
+            .remote_content = self.cfg.remote_content,
+        };
         var query_req = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, body) catch |err| {
             std.log.warn("public table query parse failed table={s} err={}", .{ table_name, err });
             return error.InvalidQueryRequest;
@@ -4705,7 +4741,11 @@ pub const ApiHttpServer = struct {
     ) !query_api.OwnedQueryRequest {
         const query_body = try stringifyJsonValueAlloc(alloc, query_value);
         defer alloc.free(query_body);
-        var semantic_resolver = SemanticStatusResolver{ .source = self.source, .local_termite_provider = self.local_termite_provider };
+        var semantic_resolver = SemanticStatusResolver{
+            .source = self.source,
+            .local_termite_provider = self.local_termite_provider,
+            .remote_content = self.cfg.remote_content,
+        };
         var owned = try query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, query_body);
         errdefer owned.deinit(alloc);
         try self.maybeRouteQueryToReadSchema(table_name, &owned.req);
@@ -4840,13 +4880,31 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(expanded_index_json);
+        const normalized_index_json = table_writes.normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
+            alloc,
+            index_name,
+            expanded_index_json,
+            .{
+                .local_termite_provider = self.local_termite_provider,
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+            },
+        ) catch |err| switch (err) {
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
+            else => return error.InternalFailure,
+        };
+        defer alloc.free(normalized_index_json);
 
-        table_writes.validateIndexConfig(alloc, index_name, expanded_index_json) catch |err| switch (err) {
+        table_writes.validateIndexConfigWithOptions(alloc, index_name, normalized_index_json, .{
+            .local_termite_provider = self.local_termite_provider,
+            .secret_store = self.cfg.secret_store,
+            .remote_content = self.cfg.remote_content,
+        }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
 
-        self.source.createIndex(alloc, table_name, index_name, expanded_index_json) catch |err| switch (err) {
+        self.source.createIndex(alloc, table_name, index_name, normalized_index_json) catch |err| switch (err) {
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
@@ -4855,7 +4913,7 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
-        const expected_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table_before.indexes_json, index_name, expanded_index_json) catch |err| switch (err) {
+        const expected_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table_before.indexes_json, index_name, normalized_index_json) catch |err| switch (err) {
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
@@ -4865,7 +4923,7 @@ pub const ApiHttpServer = struct {
             return error.InternalFailure;
         };
         if (self.table_writes) |table_writes_source| {
-            _ = table_writes_source.createIndex(alloc, table_name, index_name, expanded_index_json) catch |err| switch (err) {
+            _ = table_writes_source.createIndex(alloc, table_name, index_name, normalized_index_json) catch |err| switch (err) {
                 error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
                 else => {
                     std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });

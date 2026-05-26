@@ -543,19 +543,6 @@ func (im *IndexManager) Close(ctx context.Context) error {
 		return nil
 	}
 
-	eg, _ := errgroup.WithContext(ctx)
-	im.indexes.Range(func(key string, index Index) bool {
-		eg.Go(func() error {
-			if err := index.Close(); err != nil {
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
-				return fmt.Errorf("closing index %s: %w", index.Name(), err)
-			}
-			return nil
-		})
-		return true
-	})
 	im.logger.Debug("IndexManager.Close() called, cancelling plexer context")
 	im.plexerEgCancel()
 	if err := im.CloseLeaderFactory(); err != nil && !errors.Is(err, context.Canceled) {
@@ -576,6 +563,20 @@ func (im *IndexManager) Close(ctx context.Context) error {
 		// Clear the plexerEg so Start() can be called again
 		im.plexerEg = nil
 	}
+
+	eg, _ := errgroup.WithContext(ctx)
+	im.indexes.Range(func(key string, index Index) bool {
+		eg.Go(func() error {
+			if err := index.Close(); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return nil
+				}
+				return fmt.Errorf("closing index %s: %w", index.Name(), err)
+			}
+			return nil
+		})
+		return true
+	})
 	if err := eg.Wait(); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, inflight.ErrBufferClosed) {
 		im.logger.Error("failed to close all indexes", zap.Error(err))

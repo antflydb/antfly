@@ -170,6 +170,34 @@
             margin-right: 15px;
         }
 
+        .entity-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+
+        .entity-chip {
+            display: inline-flex;
+            gap: 5px;
+            align-items: center;
+            max-width: 100%;
+            padding: 3px 7px;
+            border: 1px solid #d8dee8;
+            border-radius: 4px;
+            background: #f7f9fc;
+            color: #333;
+            font-size: 0.78rem;
+            line-height: 1.2;
+        }
+
+        .entity-label {
+            color: #617089;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.68rem;
+        }
+
         .result-content {
             color: #555;
             font-size: 0.9rem;
@@ -320,6 +348,13 @@
                     {{if .PageNum}}<span>Page: {{.PageNum}}</span>{{end}}
                     {{if .URL}}<a href="{{.URL}}" target="_blank" class="view-pdf-link">View PDF</a>{{end}}
                 </div>
+                {{if .Entities}}
+                <div class="entity-list">
+                    {{range .Entities}}
+                    <span class="entity-chip"><span class="entity-label">{{.Label}}</span>{{.Text}}</span>
+                    {{end}}
+                </div>
+                {{end}}
                 <div class="result-content">
                     {{.Content}}
                 </div>

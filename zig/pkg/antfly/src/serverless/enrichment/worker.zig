@@ -312,7 +312,9 @@ fn buildDerivedSparseBodyAlloc(
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try appendJSONString(alloc, &out, "{");
-    try appendJSONString(alloc, &out, "\"text\":");
+    var wrote_field = false;
+    try appendPreservedDocumentFieldsJSON(alloc, &out, body, &wrote_field);
+    try appendJSONFieldName(alloc, &out, &wrote_field, "text");
     try appendJSONStringValue(alloc, &out, projection.text);
     if (projection.embedding) |embedding| {
         try appendEmbeddingJSON(alloc, &out, "embedding", embedding);
@@ -447,7 +449,9 @@ fn buildDerivedChunkPreviewBodyAlloc(alloc: Allocator, body: []const u8, pipelin
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try appendJSONString(alloc, &out, "{");
-    try appendJSONString(alloc, &out, "\"text\":");
+    var wrote_field = false;
+    try appendPreservedDocumentFieldsJSON(alloc, &out, body, &wrote_field);
+    try appendJSONFieldName(alloc, &out, &wrote_field, "text");
     try appendJSONStringValue(alloc, &out, projection.text);
     if (projection.embedding) |embedding| {
         try appendJSONString(alloc, &out, ",\"embedding\":[");
@@ -535,7 +539,9 @@ fn buildDerivedChunkEmbeddingsBodyAlloc(
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try appendJSONString(alloc, &out, "{");
-    try appendJSONString(alloc, &out, "\"text\":");
+    var wrote_field = false;
+    try appendPreservedDocumentFieldsJSON(alloc, &out, body, &wrote_field);
+    try appendJSONFieldName(alloc, &out, &wrote_field, "text");
     try appendJSONStringValue(alloc, &out, projection.text);
     if (projection.embedding) |embedding| {
         try appendEmbeddingJSON(alloc, &out, "embedding", embedding);
@@ -596,7 +602,9 @@ fn buildDerivedRerankTermsBodyAlloc(alloc: Allocator, body: []const u8, pipeline
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try appendJSONString(alloc, &out, "{");
-    try appendJSONString(alloc, &out, "\"text\":");
+    var wrote_field = false;
+    try appendPreservedDocumentFieldsJSON(alloc, &out, body, &wrote_field);
+    try appendJSONFieldName(alloc, &out, &wrote_field, "text");
     try appendJSONStringValue(alloc, &out, projection.text);
     if (projection.embedding) |embedding| {
         try appendJSONString(alloc, &out, ",\"embedding\":[");
@@ -918,11 +926,59 @@ fn appendJSONString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: [
     try out.appendSlice(alloc, value);
 }
 
+fn appendJSONFieldName(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    wrote_field: *bool,
+    key: []const u8,
+) !void {
+    if (wrote_field.*) try appendJSONString(alloc, out, ",");
+    try appendJSONStringValue(alloc, out, key);
+    try appendJSONString(alloc, out, ":");
+    wrote_field.* = true;
+}
+
 fn appendJSONStringValue(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     defer writer.deinit();
     try std.json.Stringify.value(value, .{}, &writer.writer);
     try out.appendSlice(alloc, writer.written());
+}
+
+fn appendJSONValue(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value) !void {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    defer writer.deinit();
+    try std.json.Stringify.value(value, .{}, &writer.writer);
+    try out.appendSlice(alloc, writer.written());
+}
+
+fn appendPreservedDocumentFieldsJSON(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    body: []const u8,
+    wrote_field: *bool,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (isDerivedEnrichmentField(entry.key_ptr.*)) continue;
+        try appendJSONFieldName(alloc, out, wrote_field, entry.key_ptr.*);
+        try appendJSONValue(alloc, out, entry.value_ptr.*);
+    }
+}
+
+fn isDerivedEnrichmentField(key: []const u8) bool {
+    return std.mem.eql(u8, key, "text") or
+        std.mem.eql(u8, key, "embedding") or
+        std.mem.eql(u8, key, "sparse_embedding") or
+        std.mem.eql(u8, key, "graph_edges") or
+        std.mem.eql(u8, key, "chunk_preview") or
+        std.mem.eql(u8, key, "chunk_embeddings") or
+        std.mem.eql(u8, key, "rerank_terms") or
+        std.mem.eql(u8, key, "_enrichment");
 }
 
 fn appendEmbeddingJSON(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), key: []const u8, embedding: []const f32) !void {

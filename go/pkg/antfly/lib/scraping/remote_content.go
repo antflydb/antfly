@@ -30,22 +30,38 @@ import (
 // for auto-selection.
 type RemoteContentManager struct {
 	mu             sync.RWMutex
-	globalSecurity *ContentSecurityConfig
+	globalSecurity *securityConfigOverride
 	s3Creds        map[string]*s3CredentialEntry
 	httpCreds      map[string]*httpCredentialEntry
 	defaultS3      string
 }
 
+// RemoteContentInitOptions carries field-presence information that generated
+// config structs cannot represent, such as an explicit block_private_ips: false.
+type RemoteContentInitOptions struct {
+	GlobalSecurityConfigured        bool
+	GlobalBlockPrivateIpsConfigured bool
+	S3SecurityConfigured            map[string]bool
+	S3BlockPrivateIpsConfigured     map[string]bool
+	HTTPSecurityConfigured          map[string]bool
+	HTTPBlockPrivateIpsConfigured   map[string]bool
+}
+
+type securityConfigOverride struct {
+	config             ContentSecurityConfig
+	blockPrivateIPsSet bool
+}
+
 type s3CredentialEntry struct {
 	creds    *S3Credentials
 	buckets  []string
-	security *ContentSecurityConfig
+	security *securityConfigOverride
 }
 
 type httpCredentialEntry struct {
 	baseURL  string
 	headers  map[string]string
-	security *ContentSecurityConfig
+	security *securityConfigOverride
 }
 
 var (
@@ -59,6 +75,12 @@ var (
 // Parameters:
 //   - cfg: The remote_content config section (may be nil if not configured)
 func InitRemoteContentConfig(cfg *RemoteContentConfig) {
+	InitRemoteContentConfigWithOptions(cfg, RemoteContentInitOptions{})
+}
+
+// InitRemoteContentConfigWithOptions initializes remote content configuration
+// with field-presence metadata from the config loader.
+func InitRemoteContentConfigWithOptions(cfg *RemoteContentConfig, opts RemoteContentInitOptions) {
 	managerMu.Lock()
 	defer managerMu.Unlock()
 
@@ -73,19 +95,29 @@ func InitRemoteContentConfig(cfg *RemoteContentConfig) {
 	}
 
 	// Set global security defaults
-	if !IsSecurityConfigEmpty(cfg.Security) {
-		sec := cfg.Security
-		m.globalSecurity = &sec
+	if !IsSecurityConfigEmpty(cfg.Security) ||
+		opts.GlobalSecurityConfigured ||
+		opts.GlobalBlockPrivateIpsConfigured {
+		m.globalSecurity = &securityConfigOverride{
+			config:             cfg.Security,
+			blockPrivateIPsSet: cfg.Security.BlockPrivateIps || opts.GlobalBlockPrivateIpsConfigured,
+		}
 	}
 
 	m.defaultS3 = cfg.DefaultS3
 
 	// Load S3 credentials
 	for name, s3cfg := range cfg.S3 {
-		var sec *ContentSecurityConfig
-		if !IsSecurityConfigEmpty(s3cfg.Security) {
-			s := s3cfg.Security
-			sec = &s
+		var sec *securityConfigOverride
+		s3SecurityConfigured := opts.S3SecurityConfigured[name]
+		s3BlockPrivateIpsConfigured := opts.S3BlockPrivateIpsConfigured[name]
+		if !IsSecurityConfigEmpty(s3cfg.Security) ||
+			s3SecurityConfigured ||
+			s3BlockPrivateIpsConfigured {
+			sec = &securityConfigOverride{
+				config:             s3cfg.Security,
+				blockPrivateIPsSet: s3cfg.Security.BlockPrivateIps || s3BlockPrivateIpsConfigured,
+			}
 		}
 
 		m.s3Creds[name] = &s3CredentialEntry{
@@ -103,10 +135,16 @@ func InitRemoteContentConfig(cfg *RemoteContentConfig) {
 
 	// Load HTTP credentials
 	for name, httpcfg := range cfg.Http {
-		var sec *ContentSecurityConfig
-		if !IsSecurityConfigEmpty(httpcfg.Security) {
-			s := httpcfg.Security
-			sec = &s
+		var sec *securityConfigOverride
+		httpSecurityConfigured := opts.HTTPSecurityConfigured[name]
+		httpBlockPrivateIpsConfigured := opts.HTTPBlockPrivateIpsConfigured[name]
+		if !IsSecurityConfigEmpty(httpcfg.Security) ||
+			httpSecurityConfigured ||
+			httpBlockPrivateIpsConfigured {
+			sec = &securityConfigOverride{
+				config:             httpcfg.Security,
+				blockPrivateIPsSet: httpcfg.Security.BlockPrivateIps || httpBlockPrivateIpsConfigured,
+			}
 		}
 
 		m.httpCreds[name] = &httpCredentialEntry{
@@ -172,7 +210,7 @@ func ResolveS3Credentials(s3URL, explicitCred string) (*S3Credentials, *ContentS
 	if creds == nil {
 		return nil, nil, fmt.Errorf("no S3 credentials configured for: %s", s3URL)
 	}
-	return creds, GetDefaultSecurityConfig(), nil
+	return creds, m.getEffectiveSecurity(), nil
 }
 
 // GetEffectiveSecurity returns the effective security config for remote content.
@@ -192,44 +230,43 @@ func GetEffectiveSecurity() *ContentSecurityConfig {
 
 // getEffectiveSecurity returns the security config to use (caller must hold lock).
 func (m *RemoteContentManager) getEffectiveSecurity() *ContentSecurityConfig {
-	if m.globalSecurity != nil {
-		return m.globalSecurity
-	}
-	return GetDefaultSecurityConfig()
+	return m.mergeSecurity(nil)
 }
 
 // mergeSecurity merges a per-credential security override with the global security config.
-func (m *RemoteContentManager) mergeSecurity(override *ContentSecurityConfig) *ContentSecurityConfig {
-	base := m.getEffectiveSecurity()
-	if override == nil {
-		return base
-	}
-	if base == nil {
-		return override
-	}
-
-	// Start with base and apply overrides
-	merged := *base
-
-	if override.MaxDownloadSizeBytes > 0 {
-		merged.MaxDownloadSizeBytes = override.MaxDownloadSizeBytes
-	}
-	if override.DownloadTimeoutSeconds > 0 {
-		merged.DownloadTimeoutSeconds = override.DownloadTimeoutSeconds
-	}
-	if override.MaxImageDimension > 0 {
-		merged.MaxImageDimension = override.MaxImageDimension
-	}
-	if len(override.AllowedPaths) > 0 {
-		merged.AllowedPaths = override.AllowedPaths
-	}
-	if len(override.AllowedHosts) > 0 {
-		merged.AllowedHosts = override.AllowedHosts
-	}
-	// BlockPrivateIps: only override if explicitly set to false (can't detect "not set" with bool)
-	// For safety, we don't override this - the base config's setting is preserved
-
+func (m *RemoteContentManager) mergeSecurity(override *securityConfigOverride) *ContentSecurityConfig {
+	merged := *GetDefaultSecurityConfig()
+	applySecurityOverride(&merged, m.globalSecurity)
+	applySecurityOverride(&merged, override)
 	return &merged
+}
+
+func applySecurityOverride(base *ContentSecurityConfig, override *securityConfigOverride) {
+	if override == nil {
+		return
+	}
+	cfg := override.config
+	if cfg.MaxDownloadSizeBytes > 0 {
+		base.MaxDownloadSizeBytes = cfg.MaxDownloadSizeBytes
+	}
+	if cfg.DownloadTimeoutSeconds > 0 {
+		base.DownloadTimeoutSeconds = cfg.DownloadTimeoutSeconds
+	}
+	if cfg.MaxImageDimension > 0 {
+		base.MaxImageDimension = cfg.MaxImageDimension
+	}
+	if len(cfg.AllowedPaths) > 0 {
+		base.AllowedPaths = cfg.AllowedPaths
+	}
+	if len(cfg.AllowedHosts) > 0 {
+		base.AllowedHosts = cfg.AllowedHosts
+	}
+	if cfg.UserAgent != "" {
+		base.UserAgent = cfg.UserAgent
+	}
+	if override.blockPrivateIPsSet {
+		base.BlockPrivateIps = cfg.BlockPrivateIps
+	}
 }
 
 // extractBucket extracts the bucket name from an S3 URL.

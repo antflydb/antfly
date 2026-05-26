@@ -51,7 +51,6 @@ const ChatTemplate = generation.ChatTemplate;
 const session_factory = @import("../architectures/session_factory.zig");
 const graph_mod = @import("../graph/root.zig");
 const runtime = @import("../runtime/root.zig");
-const supports_onnx_models = !build_options.enable_wasm;
 
 fn shouldPreferNativeSession(man: manifest_mod.ModelManifest) bool {
     // GLiNER has a native DeBERTa + span-head path. When native weights are
@@ -624,13 +623,12 @@ pub fn isManifestPotentiallyLoadableInCurrentBuild(man: manifest_mod.ModelManife
     if (man.hasIncompleteGlinerBundle()) return false;
     if (man.hasIncompleteColqwenBundle()) return false;
     if (man.hasIncompleteClipclapGgufBundle()) return false;
-    if (supports_onnx_models and
-        (man.onnx_path != null or
-            man.visual_model_path != null or
-            man.audio_model_path != null or
-            man.text_projection_path != null or
-            man.visual_projection_path != null or
-            man.audio_projection_path != null))
+    if (man.onnx_path != null or
+        man.visual_model_path != null or
+        man.audio_model_path != null or
+        man.text_projection_path != null or
+        man.visual_projection_path != null or
+        man.audio_projection_path != null)
     {
         return true;
     }
@@ -693,10 +691,7 @@ pub const LoadedModel = struct {
     fn ensureOptionalSession(self: *LoadedModel, slot: *?backends.Session, path: ?[]const u8) !void {
         if (slot.* != null) return;
         const session_path = path orelse return;
-        const shared_ctx = if (supports_onnx_models)
-            backends.imported_onnx_session.sharedBackendContext(self.session)
-        else
-            null;
+        const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
         slot.* = try self.session_manager.loadModelWithImportedOnnxContext(session_path, shared_ctx);
     }
 
@@ -1111,11 +1106,11 @@ fn preferredModelPathForBackend(
 ) ?[]const u8 {
     return switch (backend) {
         .onnx => man.onnx_path orelse model_dir,
-        .native, .metal, .mlx, .cuda => if (!manifestHasNativeAssets(man) and man.onnx_path != null)
+        .native, .metal, .mlx, .cuda, .wasm => if (!manifestHasNativeAssets(man) and man.onnx_path != null)
             man.onnx_path.?
         else
             model_dir,
-        .pjrt, .wasm => null,
+        .pjrt => null,
     };
 }
 
@@ -1330,11 +1325,7 @@ test "isManifestPotentiallyLoadableInCurrentBuild accepts onnx-only models when 
     defer onnx_only.deinit();
     onnx_only.onnx_path = try allocator.dupe(u8, "model.onnx");
 
-    if (supports_onnx_models) {
-        try std.testing.expect(isManifestPotentiallyLoadableInCurrentBuild(onnx_only));
-    } else {
-        try std.testing.expect(!isManifestPotentiallyLoadableInCurrentBuild(onnx_only));
-    }
+    try std.testing.expect(isManifestPotentiallyLoadableInCurrentBuild(onnx_only));
 
     var native_model = manifest_mod.ModelManifest{ .allocator = allocator };
     defer native_model.deinit();

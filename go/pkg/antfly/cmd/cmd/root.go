@@ -98,12 +98,6 @@ func init() {
 		viper.SetDefault("log_style", "logfmt")
 	}
 
-	// Content security defaults
-	viper.SetDefault("content_security.block_private_ips", true)
-	viper.SetDefault("content_security.max_download_size_bytes", 100*1024*1024) // 100MB
-	viper.SetDefault("content_security.download_timeout_seconds", 30)
-	viper.SetDefault("content_security.max_image_dimension", 2048)
-
 	// Termite defaults
 	viper.SetDefault("termite.models_dir", common.DefaultModelsDir())
 }
