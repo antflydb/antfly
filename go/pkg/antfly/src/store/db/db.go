@@ -2841,6 +2841,73 @@ func shouldWriteTimestamp(key []byte) bool {
 	return true
 }
 
+func (db *DBImpl) defaultWriteTimestamp(timestamp uint64) uint64 {
+	if timestamp != 0 {
+		return timestamp
+	}
+	if db.cachedTTLDuration == 0 {
+		return 0
+	}
+	return uint64(time.Now().UTC().UnixNano()) //nolint:gosec // UnixNano is positive for supported wall-clock dates.
+}
+
+func (db *DBImpl) resolveWriteTimestamp(docJSON []byte, fallback uint64) uint64 {
+	if db.schema == nil || db.cachedTTLDuration == 0 {
+		return fallback
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(docJSON, &doc); err != nil {
+		db.logger.Warn("could not parse document for TTL timestamp",
+			zap.Error(err))
+		return fallback
+	}
+
+	value, ok := doc[db.schema.GetTTLField()]
+	if !ok {
+		return fallback
+	}
+
+	timestamp, ok := ttlTimestampFromValue(value)
+	if !ok {
+		db.logger.Warn("could not parse TTL field timestamp",
+			zap.String("ttl_field", db.schema.GetTTLField()))
+		return fallback
+	}
+	return timestamp
+}
+
+func ttlTimestampFromValue(value any) (uint64, bool) {
+	switch v := value.(type) {
+	case string:
+		if ts, err := time.Parse(time.RFC3339Nano, v); err == nil {
+			return unixNanoToUint64(ts)
+		}
+		if ts, err := time.Parse(time.RFC3339, v); err == nil {
+			return unixNanoToUint64(ts)
+		}
+	case float64:
+		if v >= 0 {
+			return uint64(v), true
+		}
+	case int64:
+		if v >= 0 {
+			return uint64(v), true
+		}
+	case uint64:
+		return v, true
+	}
+	return 0, false
+}
+
+func unixNanoToUint64(ts time.Time) (uint64, bool) {
+	nanos := ts.UnixNano()
+	if nanos < 0 {
+		return 0, false
+	}
+	return uint64(nanos), true //nolint:gosec // negative values are handled above.
+}
+
 func (db *DBImpl) Batch(
 	ctx context.Context,
 	writes [][2][]byte,
@@ -2859,8 +2926,10 @@ func (db *DBImpl) Batch(
 		return pebble.ErrClosed
 	}
 
-	// Get HLC timestamp from context (set by metadata layer for consistent timestamps)
-	timestamp := storeutils.GetTimestampFromContext(ctx)
+	// Get HLC timestamp from context (set by metadata layer for consistent timestamps).
+	// Single-node/local apply paths may not carry one; TTL still needs a side-key
+	// timestamp so query-time filtering and cleanup can see new writes.
+	timestamp := db.defaultWriteTimestamp(storeutils.GetTimestampFromContext(ctx))
 	splitState := db.splitState
 	mergeState := db.mergeState
 
@@ -3019,7 +3088,9 @@ func (db *DBImpl) Batch(
 		valueToCompress := kv[1]
 		shouldWriteDocument := true
 
-		sfResult, err := db.extractAndWriteSpecialFields(batch, kv[1], kv[0], timestamp)
+		writeTimestamp := db.resolveWriteTimestamp(kv[1], timestamp)
+
+		sfResult, err := db.extractAndWriteSpecialFields(batch, kv[1], kv[0], writeTimestamp)
 		if err != nil {
 			return fmt.Errorf("extracting special fields for key %s: %w", kv[0], err)
 		}
@@ -3047,9 +3118,9 @@ func (db *DBImpl) Batch(
 			}
 
 			// Write timestamp for document if timestamp is available
-			if timestamp > 0 && shouldWriteTimestamp(key) {
+			if writeTimestamp > 0 && shouldWriteTimestamp(key) {
 				txnKey := slices.Concat(key, storeutils.TransactionSuffix)
-				timestampBytes := encoding.EncodeUint64Ascending(nil, timestamp)
+				timestampBytes := encoding.EncodeUint64Ascending(nil, writeTimestamp)
 				if err := batch.Set(txnKey, timestampBytes, nil); err != nil {
 					db.logger.Warn("could not write timestamp for document",
 						zap.String("key", types.FormatKey(key)),
