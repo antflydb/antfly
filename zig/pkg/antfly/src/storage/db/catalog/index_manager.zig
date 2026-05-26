@@ -960,6 +960,7 @@ pub const IndexManager = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         edge_type_configs: []graph_mod.EdgeTypeConfig,
+        artifact_source: ?GraphArtifactSource = null,
         rebuild_root_path: []u8,
         index: graph_mod.GraphIndex,
     };
@@ -1303,6 +1304,7 @@ pub const IndexManager = struct {
             if (cfg.field_name) |field_name| self.alloc.free(field_name);
         }
         self.alloc.free(entry.edge_type_configs);
+        if (entry.artifact_source) |*source| source.deinit(self.alloc);
         self.alloc.free(entry.rebuild_root_path);
         entry.config.deinit(self.alloc);
     }
@@ -3050,10 +3052,12 @@ pub const IndexManager = struct {
     const ArtifactRefs = struct {
         chunk_name: ?[]u8 = null,
         embedding_name: ?[]u8 = null,
+        asset_name: ?[]u8 = null,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.chunk_name) |value| alloc.free(value);
             if (self.embedding_name) |value| alloc.free(value);
+            if (self.asset_name) |value| alloc.free(value);
             self.* = undefined;
         }
     };
@@ -3105,7 +3109,14 @@ pub const IndexManager = struct {
                         try self.alloc.dupe(u8, cfg.name),
                 };
             },
-            .graph, .algebraic => return .{},
+            .graph => {
+                var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
+                defer graph_cfg.deinit(self.alloc);
+                return .{
+                    .asset_name = if (graph_cfg.artifact_source) |source| try self.alloc.dupe(u8, source.artifact_name) else null,
+                };
+            },
+            .algebraic => return .{},
         }
     }
 
@@ -3680,6 +3691,19 @@ pub const IndexManager = struct {
         }
         if (self.graph_indexes.items.len == 1) return &self.graph_indexes.items[0];
         return null;
+    }
+
+    pub fn graphArtifactSource(self: *const IndexManager, name: []const u8) ?GraphArtifactSource {
+        for (self.graph_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            return entry.artifact_source;
+        }
+        return null;
+    }
+
+    pub fn graphIndexConsumesAssetArtifact(self: *const IndexManager, index_name: []const u8, artifact_name: []const u8) bool {
+        const source = self.graphArtifactSource(index_name) orelse return false;
+        return std.mem.eql(u8, source.artifact_name, artifact_name);
     }
 
     pub fn graphTraversalAccessPath(self: *IndexManager, name: ?[]const u8) ?algebraic_mod.ir.PhysicalAccessPath {
@@ -4993,8 +5017,16 @@ pub const IndexManager = struct {
             .graph => {
                 const started_ns = nowNs();
                 var backfill_ns: u64 = 0;
-                const graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
-                errdefer graph_cfg.deinit(self.alloc);
+                var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
+                var graph_cfg_moved = false;
+                errdefer if (!graph_cfg_moved) graph_cfg.deinit(self.alloc);
+                if (graph_cfg.artifact_source) |source| {
+                    if (self.getEnrichment(.asset, source.artifact_name) == null) return error.InvalidIndexConfig;
+                }
+                if (graph_cfg.shorthand_asset) |*asset| {
+                    asset.deinit(self.alloc);
+                    graph_cfg.shorthand_asset = null;
+                }
 
                 const path = try self.indexPath(cfg.name);
                 defer self.alloc.free(path);
@@ -5044,12 +5076,14 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = cloned_cfg,
                     .edge_type_configs = graph_cfg.edge_type_configs,
+                    .artifact_source = graph_cfg.artifact_source,
                     .rebuild_root_path = try self.alloc.dupe(u8, path),
                     .index = index,
                 };
                 apply_mutex_owned = false;
                 cloned_cfg_moved = true;
                 index_moved = true;
+                graph_cfg_moved = true;
                 errdefer self.freeGraphIndexEntry(&entry);
 
                 const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
@@ -5198,6 +5232,19 @@ pub const IndexManager = struct {
                     }
                 }
             },
+            .graph => {
+                var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
+                defer graph_cfg.deinit(self.alloc);
+                if (graph_cfg.shorthand_asset) |asset| {
+                    changed = (try self.ensureAssetEnrichment(asset)) or changed;
+                }
+                if (graph_cfg.artifact_source) |source| {
+                    if (graph_cfg.shorthand_asset) |asset| {
+                        if (!std.mem.eql(u8, asset.name, source.artifact_name)) return error.InvalidIndexConfig;
+                    }
+                    if (self.getEnrichment(.asset, source.artifact_name) == null) return error.InvalidIndexConfig;
+                }
+            },
             else => {},
         }
         return changed;
@@ -5220,6 +5267,22 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.expected_dims != cfg.expected_dims)
+            {
+                return error.ConflictingEnrichmentConfig;
+            }
+            return false;
+        }
+
+        try self.enrichments.append(self.alloc, try enrichment_catalog.EnrichmentConfig.clone(self.alloc, cfg));
+        return true;
+    }
+
+    fn ensureAssetEnrichment(self: *IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !bool {
+        if (self.getEnrichment(.asset, cfg.name)) |existing| {
+            if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
+                !std.mem.eql(u8, existing.source_template, cfg.source_template) or
+                !std.mem.eql(u8, existing.content_type, cfg.content_type) or
+                !std.mem.eql(u8, existing.producer_json, cfg.producer_json))
             {
                 return error.ConflictingEnrichmentConfig;
             }
@@ -5278,7 +5341,13 @@ pub const IndexManager = struct {
                     }
                 }
             },
-            .asset => {},
+            .asset => {
+                for (self.graph_indexes.items) |entry| {
+                    if (entry.artifact_source) |source| {
+                        if (std.mem.eql(u8, source.artifact_name, name)) return true;
+                    }
+                }
+            },
         }
         return false;
     }
@@ -9711,16 +9780,45 @@ const SparseConfig = struct {
     }
 };
 
+pub const GraphArtifactFormat = enum {
+    extraction_relation,
+    extraction_graph,
+};
+
+pub const GraphArtifactSource = struct {
+    artifact_name: []u8,
+    path: []u8 = "",
+    format: GraphArtifactFormat = .extraction_relation,
+
+    pub fn clone(alloc: Allocator, source: GraphArtifactSource) !GraphArtifactSource {
+        return .{
+            .artifact_name = try alloc.dupe(u8, source.artifact_name),
+            .path = if (source.path.len > 0) try alloc.dupe(u8, source.path) else "",
+            .format = source.format,
+        };
+    }
+
+    pub fn deinit(self: *GraphArtifactSource, alloc: Allocator) void {
+        alloc.free(self.artifact_name);
+        if (self.path.len > 0) alloc.free(self.path);
+        self.* = undefined;
+    }
+};
+
 const GraphConfig = struct {
     edge_type_configs: []graph_mod.EdgeTypeConfig,
+    artifact_source: ?GraphArtifactSource = null,
+    shorthand_asset: ?enrichment_catalog.EnrichmentConfig = null,
     algebraic_semiring_traversal: bool = false,
 
-    fn deinit(self: *const GraphConfig, alloc: Allocator) void {
+    fn deinit(self: *GraphConfig, alloc: Allocator) void {
         for (self.edge_type_configs) |cfg| {
             alloc.free(cfg.name);
             if (cfg.field_name) |field_name| alloc.free(field_name);
         }
         alloc.free(self.edge_type_configs);
+        if (self.artifact_source) |*source| source.deinit(alloc);
+        if (self.shorthand_asset) |*asset| asset.deinit(alloc);
     }
 };
 
@@ -10332,10 +10430,20 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
+    var artifact_source = try parseGraphArtifactSource(alloc, root);
+    errdefer if (artifact_source) |*source| {
+        source.deinit(alloc);
+    };
+    var shorthand_asset = try parseGraphShorthandAsset(alloc, root);
+    errdefer if (shorthand_asset) |*asset| {
+        asset.deinit(alloc);
+    };
 
     const edge_types = root.object.get("edge_types") orelse {
         return .{
             .edge_type_configs = try alloc.alloc(graph_mod.EdgeTypeConfig, 0),
+            .artifact_source = artifact_source,
+            .shorthand_asset = shorthand_asset,
             .algebraic_semiring_traversal = algebraic_semiring_traversal,
         };
     };
@@ -10364,6 +10472,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
         } else graph_mod.TopologyMode.graph;
 
         const field_name = if (item.object.get("field")) |value| blk: {
+            if (artifact_source != null) return error.InvalidIndexConfig;
             if (value != .string) return error.InvalidIndexConfig;
             break :blk try alloc.dupe(u8, value.string);
         } else null;
@@ -10378,7 +10487,75 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
 
     return .{
         .edge_type_configs = configs,
+        .artifact_source = artifact_source,
+        .shorthand_asset = shorthand_asset,
         .algebraic_semiring_traversal = algebraic_semiring_traversal,
+    };
+}
+
+fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtifactSource {
+    const source = root.object.get("source") orelse return null;
+    if (source != .object) return error.InvalidIndexConfig;
+    const kind = source.object.get("kind") orelse return error.InvalidIndexConfig;
+    if (kind != .string) return error.InvalidIndexConfig;
+    if (std.mem.eql(u8, kind.string, "document_field")) return null;
+    if (!std.mem.eql(u8, kind.string, "artifact")) return error.InvalidIndexConfig;
+
+    const artifact = source.object.get("artifact") orelse return error.InvalidIndexConfig;
+    if (artifact != .string or artifact.string.len == 0) return error.InvalidIndexConfig;
+    const path = if (source.object.get("path")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        break :blk value.string;
+    } else "";
+    const format = if (source.object.get("format")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        if (std.mem.eql(u8, value.string, "extraction_relation")) break :blk GraphArtifactFormat.extraction_relation;
+        if (std.mem.eql(u8, value.string, "extraction_graph")) break :blk GraphArtifactFormat.extraction_graph;
+        return error.InvalidIndexConfig;
+    } else GraphArtifactFormat.extraction_relation;
+
+    return .{
+        .artifact_name = try alloc.dupe(u8, artifact.string),
+        .path = if (path.len > 0) try alloc.dupe(u8, path) else "",
+        .format = format,
+    };
+}
+
+fn parseGraphShorthandAsset(alloc: Allocator, root: std.json.Value) !?enrichment_catalog.EnrichmentConfig {
+    const artifact = root.object.get("artifact") orelse return null;
+    if (artifact != .object) return error.InvalidIndexConfig;
+
+    const name = artifact.object.get("name") orelse return error.InvalidIndexConfig;
+    if (name != .string or name.string.len == 0) return error.InvalidIndexConfig;
+    const kind = artifact.object.get("kind") orelse return error.InvalidIndexConfig;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "asset")) return error.InvalidIndexConfig;
+
+    const field = if (artifact.object.get("field")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        break :blk value.string;
+    } else "";
+    const template = if (artifact.object.get("template")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        break :blk value.string;
+    } else "";
+    if (field.len == 0 and template.len == 0) return error.InvalidIndexConfig;
+    const content_type = if (artifact.object.get("content_type")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        break :blk value.string;
+    } else "";
+    const producer_json = if (artifact.object.get("producer_json")) |value|
+        try std.json.Stringify.valueAlloc(alloc, value, .{})
+    else
+        "";
+    errdefer if (producer_json.len > 0) alloc.free(producer_json);
+
+    return .{
+        .name = try alloc.dupe(u8, name.string),
+        .kind = .asset,
+        .source_field = if (field.len > 0) try alloc.dupe(u8, field) else "",
+        .source_template = if (template.len > 0) try alloc.dupe(u8, template) else "",
+        .content_type = if (content_type.len > 0) try alloc.dupe(u8, content_type) else "",
+        .producer_json = producer_json,
     };
 }
 
@@ -10413,6 +10590,35 @@ test "graph config declares algebraic provenance semiring traversal law" {
 
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"algebraic_planning":{"bounded_traversal":{"law":"min_plus_semiring"}}}
+    ));
+}
+
+test "graph config parses artifact source and shorthand asset enrichment" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly"}}}
+        \\}
+    );
+    defer cfg.deinit(alloc);
+
+    try std.testing.expect(cfg.artifact_source != null);
+    try std.testing.expectEqualStrings("relations_v1", cfg.artifact_source.?.artifact_name);
+    try std.testing.expectEqualStrings("$.relations[*]", cfg.artifact_source.?.path);
+    try std.testing.expectEqual(GraphArtifactFormat.extraction_relation, cfg.artifact_source.?.format);
+    try std.testing.expect(cfg.shorthand_asset != null);
+    try std.testing.expectEqualStrings("relations_v1", cfg.shorthand_asset.?.name);
+    try std.testing.expectEqual(enrichment_catalog.EnrichmentType.asset, cfg.shorthand_asset.?.kind);
+    try std.testing.expectEqualStrings("body", cfg.shorthand_asset.?.source_field);
+    try std.testing.expectEqualStrings("application/json", cfg.shorthand_asset.?.content_type);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.producer_json, "\"type\":\"extractor\"") != null);
+}
+
+test "graph config rejects artifact source combined with document field edge types" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"edge_types":[{"name":"mentions","field":"edges"}]}
     ));
 }
 

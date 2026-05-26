@@ -100,12 +100,14 @@ const GeneratedReplayWindow = struct {
     alloc: Allocator,
     documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
     deleted_keys: std.ArrayListUnmanaged([]u8) = .empty,
+    changed_artifact_keys: std.ArrayListUnmanaged([]u8) = .empty,
     dense_embeddings: std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite) = .empty,
     sparse_embeddings: std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite) = .empty,
 
     fn isEmpty(self: *const @This()) bool {
         return self.documents.items.len == 0 and
             self.deleted_keys.items.len == 0 and
+            self.changed_artifact_keys.items.len == 0 and
             self.dense_embeddings.items.len == 0 and
             self.sparse_embeddings.items.len == 0;
     }
@@ -113,6 +115,7 @@ const GeneratedReplayWindow = struct {
     fn itemCount(self: *const @This()) usize {
         return self.documents.items.len +
             self.deleted_keys.items.len +
+            self.changed_artifact_keys.items.len +
             self.dense_embeddings.items.len +
             self.sparse_embeddings.items.len;
     }
@@ -123,6 +126,7 @@ const GeneratedReplayWindow = struct {
         };
         errdefer derived_types.deinitDerivedBatch(self.alloc, &batch);
         batch.deleted_keys = try self.deleted_keys.toOwnedSlice(self.alloc);
+        batch.changed_artifact_keys = try self.changed_artifact_keys.toOwnedSlice(self.alloc);
         batch.dense_embeddings = try self.dense_embeddings.toOwnedSlice(self.alloc);
         batch.sparse_embeddings = try self.sparse_embeddings.toOwnedSlice(self.alloc);
         return batch;
@@ -139,6 +143,9 @@ const GeneratedReplayWindow = struct {
 
         for (self.deleted_keys.items) |key| self.alloc.free(key);
         self.deleted_keys.deinit(self.alloc);
+
+        for (self.changed_artifact_keys.items) |key| self.alloc.free(key);
+        self.changed_artifact_keys.deinit(self.alloc);
 
         for (self.dense_embeddings.items) |embedding| freeDerivedDenseEmbedding(self.alloc, embedding);
         self.dense_embeddings.deinit(self.alloc);
@@ -1376,7 +1383,7 @@ fn processPendingDocumentGroup(
             continue;
         }
         switch (request.kind) {
-            .asset => try processAsset(runtime, request),
+            .asset => try processAsset(runtime, request, window),
             .chunk_text => try processChunkText(runtime, request, chunk_cache, window),
             .dense_embedding => try processDenseEmbedding(runtime, request, chunk_cache, window),
             .sparse_embedding => try processSparseEmbedding(runtime, request, chunk_cache, window),
@@ -1387,6 +1394,7 @@ fn processPendingDocumentGroup(
 fn processAsset(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
+    window: *GeneratedReplayWindow,
 ) !void {
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
@@ -1415,6 +1423,7 @@ fn processAsset(
     if (producer_cfg.type == .copy) {
         if (try shouldSkipAssetArtifact(runtime, key, source_text)) return;
         try storePutWithRetry(runtime, key, source_text);
+        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
         recordArtifactBytes(runtime, .asset, source_text.len);
         return;
     }
@@ -1440,6 +1449,7 @@ fn processAsset(
         .{ .key = state_key, .value = state_value },
     };
     try storePutBatch(runtime, &writes, &.{});
+    try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
     recordArtifactBytes(runtime, .asset, produced.len);
 }
 
