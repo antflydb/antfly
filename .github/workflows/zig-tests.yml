@@ -279,13 +279,22 @@ jobs:
           printf '%s\n' '#!/usr/bin/env sh' 'exec "$(dirname "$0")/antfly" termite "$@"' > zig-out/bin/termite
           chmod +x zig-out/bin/antfly zig-out/bin/termite
 
+      - name: Run Antfly stateful auth smoke E2E
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+        run: |
+          chmod +x ./zig-out/bin/antfly ./zig-out/bin/termite
+          uv run --project e2e/antfly pytest -q -x -s \
+            e2e/antfly/test_auth.py -k stateful_auth
+
       - name: Run Antfly base E2E
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
         run: |
           chmod +x ./zig-out/bin/antfly ./zig-out/bin/termite
-          uv run --project e2e/antfly pytest -q \
+          uv run --project e2e/antfly pytest -q -x \
             -m "not objectstore_integration and not swarm_integration and not real_model and not postgres_integration and not slow" \
             e2e/antfly
 
@@ -348,7 +357,7 @@ jobs:
           ANTFLY_BIN: ./zig-out/bin/antfly
         run: |
           chmod +x ./zig-out/bin/antfly ./zig-out/bin/termite
-          uv run --project e2e/antfly pytest -q e2e/antfly
+          uv run --project e2e/antfly pytest -q -x e2e/antfly
 
       - name: Run Termite full E2E
         working-directory: zig
