@@ -512,7 +512,7 @@ fn countEmbeddingArtifactKeys(keys: []const []const u8) usize {
 fn countGraphArtifactKeys(keys: []const []const u8) usize {
     var count: usize = 0;
     for (keys) |key| {
-        if (internal_keys.isGraphEdgeArtifactKey(key)) count += 1;
+        if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key)) count += 1;
     }
     return count;
 }

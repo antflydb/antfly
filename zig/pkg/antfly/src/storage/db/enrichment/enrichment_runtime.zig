@@ -1424,6 +1424,7 @@ fn processAsset(
         if (try shouldSkipAssetArtifact(runtime, key, source_text)) return;
         try storePutWithRetry(runtime, key, source_text);
         try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        try materializeGraphAssetForRuntime(runtime, request, source_text, window);
         recordArtifactBytes(runtime, .asset, source_text.len);
         return;
     }
@@ -1450,7 +1451,209 @@ fn processAsset(
     };
     try storePutBatch(runtime, &writes, &.{});
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+    try materializeGraphAssetForRuntime(runtime, request, produced, window);
     recordArtifactBytes(runtime, .asset, produced.len);
+}
+
+fn materializeGraphAssetForRuntime(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    value: []const u8,
+    window: *GeneratedReplayWindow,
+) !void {
+    if (!runtime.index_manager.hasGraphIndexes()) return;
+    const artifact_name = requestArtifactName(request);
+
+    for (runtime.index_manager.graphIndexes()) |graph_entry| {
+        const source = graph_entry.artifact_source orelse continue;
+        if (!std.mem.eql(u8, source.artifact_name, artifact_name)) continue;
+
+        const graph_writes = try runtimeGraphWritesFromArtifactValueAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source);
+        defer runtimeFreeGraphWrites(runtime.alloc, graph_writes);
+
+        var writes = std.ArrayListUnmanaged(KVPair).empty;
+        defer {
+            for (writes.items) |write| {
+                runtime.alloc.free(@constCast(write.key));
+                runtime.alloc.free(@constCast(write.value));
+            }
+            writes.deinit(runtime.alloc);
+        }
+        for (graph_writes) |write| {
+            const key = try internal_keys.graphEdgeArtifactKeyAlloc(runtime.alloc, write.source, write.index_name, write.edge_type, write.target);
+            var key_owned = true;
+            errdefer if (key_owned) runtime.alloc.free(key);
+            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(runtime.alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+            var payload_owned = true;
+            errdefer if (payload_owned) runtime.alloc.free(payload);
+            try writes.append(runtime.alloc, .{ .key = key, .value = payload });
+            key_owned = false;
+            payload_owned = false;
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        }
+
+        const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
+        defer runtime.alloc.free(prefix);
+        const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
+        defer backend_scan.freeResults(runtime.alloc, existing);
+
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (deletes.items) |key| runtime.alloc.free(@constCast(key));
+            deletes.deinit(runtime.alloc);
+        }
+        for (existing) |entry| {
+            if (runtimeContainsKVKey(writes.items, entry.key)) continue;
+            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, entry.key);
+        }
+
+        if (writes.items.len > 0 or deletes.items.len > 0) {
+            try storePutBatchWithRetry(runtime, writes.items, deletes.items);
+        }
+    }
+}
+
+fn runtimeContainsKVKey(items: []const KVPair, key: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.key, key)) return true;
+    }
+    return false;
+}
+
+fn runtimeGraphWritesFromArtifactValueAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    doc_key: []const u8,
+    raw: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+) ![]types.GraphEdgeWrite {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+
+    var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
+    errdefer runtimeFreeGraphWrites(alloc, writes.items);
+
+    switch (source.format) {
+        .extraction_relation => try runtimeAppendRelationItemsFromPath(alloc, &writes, index_name, doc_key, parsed.value, source.path),
+        .extraction_graph => {
+            if (source.path.len > 0) {
+                try runtimeAppendRelationItemsFromPath(alloc, &writes, index_name, doc_key, parsed.value, source.path);
+            } else if (parsed.value == .object) {
+                if (parsed.value.object.get("relations")) |relations| try runtimeAppendRelationValueItems(alloc, &writes, index_name, doc_key, relations);
+                if (parsed.value.object.get("edges")) |edges| try runtimeAppendRelationValueItems(alloc, &writes, index_name, doc_key, edges);
+            }
+        },
+    }
+
+    return try writes.toOwnedSlice(alloc);
+}
+
+fn runtimeFreeGraphWrites(alloc: Allocator, writes: []types.GraphEdgeWrite) void {
+    for (writes) |write| {
+        alloc.free(@constCast(write.index_name));
+        alloc.free(@constCast(write.source));
+        alloc.free(@constCast(write.target));
+        alloc.free(@constCast(write.edge_type));
+        if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+    }
+    if (writes.len > 0) alloc.free(writes);
+}
+
+fn runtimeAppendRelationItemsFromPath(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
+    index_name: []const u8,
+    doc_key: []const u8,
+    root: std.json.Value,
+    path: []const u8,
+) !void {
+    if (path.len == 0 or std.mem.eql(u8, path, "$")) return runtimeAppendRelationValueItems(alloc, writes, index_name, doc_key, root);
+    const selected = runtimeSelectGraphArtifactPath(root, path) orelse return;
+    try runtimeAppendRelationValueItems(alloc, writes, index_name, doc_key, selected);
+}
+
+fn runtimeSelectGraphArtifactPath(root: std.json.Value, path: []const u8) ?std.json.Value {
+    var trimmed = path;
+    if (std.mem.startsWith(u8, trimmed, "$.")) trimmed = trimmed[2..];
+    if (std.mem.endsWith(u8, trimmed, "[*]")) trimmed = trimmed[0 .. trimmed.len - 3];
+    if (trimmed.len == 0) return root;
+
+    var current = root;
+    var parts = std.mem.splitScalar(u8, trimmed, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0) return null;
+        if (current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    return current;
+}
+
+fn runtimeAppendRelationValueItems(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
+    index_name: []const u8,
+    doc_key: []const u8,
+    value: std.json.Value,
+) !void {
+    if (value == .array) {
+        for (value.array.items) |item| try runtimeAppendRelationItem(alloc, writes, index_name, doc_key, item);
+    } else {
+        try runtimeAppendRelationItem(alloc, writes, index_name, doc_key, value);
+    }
+}
+
+fn runtimeAppendRelationItem(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
+    index_name: []const u8,
+    doc_key: []const u8,
+    item: std.json.Value,
+) !void {
+    if (item != .object) return;
+    const edge_type = runtimeJsonStringField(item, "type") orelse runtimeJsonStringField(item, "edge_type") orelse runtimeJsonStringField(item, "relation") orelse return;
+    const source_doc = if (item.object.get("source")) |source_value|
+        runtimeJsonEndpointDocumentId(source_value) orelse doc_key
+    else
+        doc_key;
+    const target_value = item.object.get("target") orelse return;
+    const target_doc = runtimeJsonEndpointDocumentId(target_value) orelse return;
+    const weight = runtimeJsonFloatField(item, "weight") orelse runtimeJsonFloatField(item, "confidence") orelse 1.0;
+    const metadata_json = try std.json.Stringify.valueAlloc(alloc, item, .{});
+    errdefer alloc.free(metadata_json);
+
+    try writes.append(alloc, .{
+        .index_name = try alloc.dupe(u8, index_name),
+        .source = try alloc.dupe(u8, source_doc),
+        .target = try alloc.dupe(u8, target_doc),
+        .edge_type = try alloc.dupe(u8, edge_type),
+        .weight = weight,
+        .metadata_json = metadata_json,
+    });
+}
+
+fn runtimeJsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => value.string,
+        .object => runtimeJsonStringField(value, "document_id") orelse runtimeJsonStringField(value, "doc_key") orelse runtimeJsonStringField(value, "key"),
+        else => null,
+    };
+}
+
+fn runtimeJsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return if (found == .string) found.string else null;
+}
+
+fn runtimeJsonFloatField(value: std.json.Value, field: []const u8) ?f64 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return switch (found) {
+        .float => found.float,
+        .integer => @floatFromInt(found.integer),
+        else => null,
+    };
 }
 
 fn sameChunkedDenseBatchKey(
