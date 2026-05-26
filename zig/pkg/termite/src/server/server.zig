@@ -312,6 +312,73 @@ fn appendOpenAiModelEntry(
     try buf.appendSlice(allocator, metadata);
 }
 
+const model_listing_tasks = [_][]const u8{
+    "embedders",  "rerankers",   "chunkers",
+    "generators", "recognizers", "classifiers",
+    "rewriters",  "readers",     "transcribers",
+    "extractors",
+};
+
+const DiscoveredModelListing = struct {
+    entry: registry_mod.ModelEntry,
+    manifest: manifest_mod.ModelManifest,
+    reader_supported: bool,
+
+    fn deinit(self: *@This()) void {
+        self.manifest.deinit();
+    }
+
+    fn kindName(self: @This()) []const u8 {
+        return @tagName(self.entry.kind);
+    }
+};
+
+fn buildDiscoveredModelListings(
+    allocator: std.mem.Allocator,
+    discovered: []const registry_mod.ModelEntry,
+) ![]DiscoveredModelListing {
+    var listings = std.ArrayListUnmanaged(DiscoveredModelListing).empty;
+    errdefer {
+        for (listings.items) |*listing| listing.deinit();
+        listings.deinit(allocator);
+    }
+
+    for (discovered) |entry| {
+        var manifest = manifest_mod.loadFromDir(allocator, entry.path) catch continue;
+
+        if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) {
+            manifest.deinit();
+            continue;
+        }
+
+        const kind_name = @tagName(entry.kind);
+        const reader_candidate = taskMatchesModelListing(
+            "readers",
+            kind_name,
+            manifest.gliner_model_type,
+            manifest.tasks,
+            manifest.capabilities,
+        );
+        const reader_supported = !reader_candidate or readers_mod.isSupportedModelDir(allocator, entry.path);
+
+        listings.append(allocator, .{
+            .entry = entry,
+            .manifest = manifest,
+            .reader_supported = reader_supported,
+        }) catch |err| {
+            manifest.deinit();
+            return err;
+        };
+    }
+
+    return try listings.toOwnedSlice(allocator);
+}
+
+fn deinitDiscoveredModelListings(allocator: std.mem.Allocator, listings: []DiscoveredModelListing) void {
+    for (listings) |*listing| listing.deinit();
+    allocator.free(listings);
+}
+
 const ModelCounts = struct {
     embedders: usize = 0,
     rerankers: usize = 0,
@@ -343,12 +410,6 @@ fn incrementModelCount(counts: *ModelCounts, task: []const u8) void {
 }
 
 fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) ModelCounts {
-    const task_names = [_][]const u8{
-        "embedders",  "rerankers",   "chunkers",
-        "generators", "recognizers", "classifiers",
-        "rewriters",  "readers",     "transcribers",
-        "extractors",
-    };
     var counts = ModelCounts{};
 
     const ra = node.registry.allocator;
@@ -361,20 +422,14 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         if (discovered.len > 0) ra.free(discovered);
     }
 
-    for (discovered) |entry| {
-        if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(allocator, entry.path)) continue;
+    const listings = buildDiscoveredModelListings(allocator, discovered) catch return counts;
+    defer deinitDiscoveredModelListings(allocator, listings);
 
-        var maybe_manifest: ?manifest_mod.ModelManifest = manifest_mod.loadFromDir(allocator, entry.path) catch null;
-        defer if (maybe_manifest) |*man| man.deinit();
-
-        const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
-        const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
-        const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
-
-        for (task_names) |task| {
+    for (listings) |listing| {
+        for (model_listing_tasks) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
-            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) {
+            if (std.mem.eql(u8, task, "readers") and !listing.reader_supported) continue;
+            if (taskMatchesModelListing(task, listing.kindName(), listing.manifest.gliner_model_type, listing.manifest.tasks, listing.manifest.capabilities)) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -393,7 +448,7 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
 
         const model = entry.value_ptr.*;
         const model_task = @tagName(model.manifest.model_type);
-        for (task_names) |task| {
+        for (model_listing_tasks) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
             if (taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) {
                 incrementModelCount(&counts, task);
@@ -405,12 +460,6 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
 }
 
 fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) ModelCounts {
-    const task_names = [_][]const u8{
-        "embedders",  "rerankers",   "chunkers",
-        "generators", "recognizers", "classifiers",
-        "rewriters",  "readers",     "transcribers",
-        "extractors",
-    };
     var counts = ModelCounts{};
 
     var registry = registry_mod.ModelRegistry.init(allocator, models_dir);
@@ -424,20 +473,14 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
         if (discovered.len > 0) allocator.free(discovered);
     }
 
-    for (discovered) |entry| {
-        if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(allocator, entry.path)) continue;
+    const listings = buildDiscoveredModelListings(allocator, discovered) catch return counts;
+    defer deinitDiscoveredModelListings(allocator, listings);
 
-        var maybe_manifest: ?manifest_mod.ModelManifest = manifest_mod.loadFromDir(allocator, entry.path) catch null;
-        defer if (maybe_manifest) |*man| man.deinit();
-
-        const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
-        const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
-        const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
-
-        for (task_names) |task| {
+    for (listings) |listing| {
+        for (model_listing_tasks) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
-            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) {
+            if (std.mem.eql(u8, task, "readers") and !listing.reader_supported) continue;
+            if (taskMatchesModelListing(task, listing.kindName(), listing.manifest.gliner_model_type, listing.manifest.tasks, listing.manifest.capabilities)) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -3970,14 +4013,10 @@ pub const Node = struct {
             if (discovered.len > 0) ra.free(discovered);
         }
 
-        const task_names = [_][]const u8{
-            "embedders",  "rerankers",   "chunkers",
-            "generators", "recognizers", "classifiers",
-            "rewriters",  "readers",     "transcribers",
-            "extractors",
-        };
+        const listings = try buildDiscoveredModelListings(a, discovered);
+        defer deinitDiscoveredModelListings(a, listings);
 
-        for (task_names, 0..) |task, task_idx| {
+        for (model_listing_tasks, 0..) |task, task_idx| {
             if (task_idx > 0) try body.append(a, ',');
             try body.append(a, '"');
             try body.appendSlice(a, task);
@@ -3992,28 +4031,26 @@ pub const Node = struct {
             }
 
             // Add discovered models matching this task
-            for (discovered) |entry| {
-                if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(a, entry.path)) continue;
-                if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(a, entry.path)) continue;
-
-                var maybe_manifest: ?manifest_mod.ModelManifest = manifest_mod.loadFromDir(a, entry.path) catch null;
-                defer if (maybe_manifest) |*man| man.deinit();
-
-                const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
-                const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
-                const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
-                const inputs = if (maybe_manifest) |*man| man.inputs else &.{};
-                const has_visual = if (maybe_manifest) |*man| man.visual_model_path != null or man.visual_projection_path != null else false;
-                const has_audio = if (maybe_manifest) |*man| man.audio_model_path != null or man.audio_projection_path != null else false;
-                if (!taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) continue;
+            for (listings) |listing| {
+                if (std.mem.eql(u8, task, "readers") and !listing.reader_supported) continue;
+                if (!taskMatchesModelListing(task, listing.kindName(), listing.manifest.gliner_model_type, listing.manifest.tasks, listing.manifest.capabilities)) continue;
 
                 if (model_count > 0) try body.append(a, ',');
-                try jsonEncodeString(&body, a, entry.name);
+                try jsonEncodeString(&body, a, listing.entry.name);
                 try body.append(a, ':');
-                try appendModelInfo(&body, a, @tagName(entry.kind), gliner_model_type, capabilities, inputs, has_visual, has_audio);
+                try appendModelInfo(
+                    &body,
+                    a,
+                    listing.kindName(),
+                    listing.manifest.gliner_model_type,
+                    listing.manifest.capabilities,
+                    listing.manifest.inputs,
+                    listing.manifest.visual_model_path != null or listing.manifest.visual_projection_path != null,
+                    listing.manifest.audio_model_path != null or listing.manifest.audio_projection_path != null,
+                );
                 if (isOpenAiListTask(task)) {
                     if (openai_data_count > 0) try openai_data.append(a, ',');
-                    try appendOpenAiModelEntry(&openai_data, a, entry.name, list_created);
+                    try appendOpenAiModelEntry(&openai_data, a, listing.entry.name, list_created);
                     openai_data_count += 1;
                 }
                 model_count += 1;
@@ -4913,6 +4950,61 @@ test "taskMatchesModelListing prefers explicit tasks when present" {
     try std.testing.expect(taskMatchesModelListing("generators", "generator", "", &.{"generate"}, &.{}));
     try std.testing.expect(taskMatchesModelListing("extractors", "generator", "", &.{"extract"}, &.{}));
     try std.testing.expect(!taskMatchesModelListing("recognizers", "generator", "", &.{"generate"}, &.{"extraction"}));
+}
+
+test "buildDiscoveredModelListings parses reusable model listing metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/owner/embedder/onnx");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/embedder/model_manifest.json",
+        .data =
+        \\{"type":"embedder","tasks":["embed"],"capabilities":["sparse"],"inputs":["text"]}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/embedder/onnx/model.onnx",
+        .data = "",
+    });
+    try tmp.dir.createDirPath(io, "models/owner/not-loadable");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/not-loadable/model_manifest.json",
+        .data =
+        \\{"type":"generator","tasks":["generate"]}
+        ,
+    });
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
+    defer allocator.free(models_dir);
+    const embedder_path = try std.fs.path.join(allocator, &.{ models_dir, "owner", "embedder" });
+    defer allocator.free(embedder_path);
+    const not_loadable_path = try std.fs.path.join(allocator, &.{ models_dir, "owner", "not-loadable" });
+    defer allocator.free(not_loadable_path);
+
+    const discovered = [_]registry_mod.ModelEntry{
+        .{ .name = "owner/embedder", .kind = .embedder, .path = embedder_path, .variant = "f32" },
+        .{ .name = "owner/not-loadable", .kind = .generator, .path = not_loadable_path, .variant = "f32" },
+    };
+
+    const listings = try buildDiscoveredModelListings(allocator, &discovered);
+    defer deinitDiscoveredModelListings(allocator, listings);
+
+    try std.testing.expectEqual(@as(usize, 1), listings.len);
+    try std.testing.expectEqualStrings("owner/embedder", listings[0].entry.name);
+    try std.testing.expect(listings[0].manifest.hasTask("embed"));
+    try std.testing.expect(listings[0].manifest.hasCapability("sparse"));
+    try std.testing.expect(listings[0].manifest.hasInput("text"));
+    try std.testing.expect(taskMatchesModelListing(
+        "embedders",
+        listings[0].kindName(),
+        listings[0].manifest.gliner_model_type,
+        listings[0].manifest.tasks,
+        listings[0].manifest.capabilities,
+    ));
 }
 
 test "modelSupportsCapability infers gliner2 extraction and classification" {
