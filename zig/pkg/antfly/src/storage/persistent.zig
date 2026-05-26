@@ -93,6 +93,28 @@ const introducer_mod = @import("../introducer.zig");
 const roaring = @import("../encoding/roaring.zig");
 const storage_sim_soak = zig_lmdb.storage_sim_soak;
 
+var bench_persistent_publish_cache: std.atomic.Value(u8) = .init(0);
+
+fn getenv(name: [*:0]const u8) ?[*:0]u8 {
+    if (!builtin.link_libc) return null;
+    return std.c.getenv(name);
+}
+
+fn benchPersistentPublishEnabled() bool {
+    switch (bench_persistent_publish_cache.load(.monotonic)) {
+        1 => return false,
+        2 => return true,
+        else => {},
+    }
+    const enabled = getenv("ANTFLY_BENCH_PERSISTENT_PUBLISH") != null or getenv("ANTFLY_BENCH_METRICS") != null;
+    bench_persistent_publish_cache.store(if (enabled) 2 else 1, .monotonic);
+    return enabled;
+}
+
+fn nsToMs(ns: u64) u64 {
+    return ns / std.time.ns_per_ms;
+}
+
 pub const PersistentIndexOptions = struct {
     path: [*:0]const u8,
     main_backend: MainBackend = .lsm,
@@ -927,34 +949,90 @@ pub const PersistentIndex = struct {
         self.lockStorage();
         defer self.unlockStorage();
 
-        const owned = segment_bytes;
-        defer self.alloc.free(owned);
+        var owned: ?[]u8 = segment_bytes;
+        defer if (owned) |buf| self.alloc.free(buf);
 
-        // 1. Write to WAL
-        const lsn = try self.wal.append(owned);
+        const profile_enabled = benchPersistentPublishEnabled();
+        const total_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        var wal_append_ns: u64 = 0;
+        var reserve_id_ns: u64 = 0;
+        var materialize_ns: u64 = 0;
+        var persist_ns: u64 = 0;
+        var writer_publish_ns: u64 = 0;
+        var wal_truncate_ns: u64 = 0;
+        const uses_segment_wal = self.segment_files == null;
+
+        // 1. Write inline segment bytes to WAL. File-backed segments are
+        // atomically published before the active metadata commit, so replay can
+        // recover from metadata alone and orphan pre-commit files are harmless.
+        const lsn = if (uses_segment_wal) blk: {
+            const wal_append_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            const appended_lsn = try self.wal.append(owned.?);
+            if (profile_enabled) wal_append_ns = platform_time.monotonicNs() - wal_append_start_ns;
+            break :blk appended_lsn;
+        } else self.committed_lsn;
 
         // 2. Allocate segment ID under writer lock to prevent races
+        const reserve_id_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         self.writer.lockMutex();
         const seg_id = self.writer.next_segment_id;
         self.writer.next_segment_id += 1;
         self.writer.mu.unlock();
+        if (profile_enabled) reserve_id_ns = platform_time.monotonicNs() - reserve_id_start_ns;
 
-        // 3. Publish immutable segment bytes before metadata becomes visible.
-        var segment_data: ?index_mod.SegmentData = try self.materializeSegmentData(seg_id, owned);
+        // 3. Publish immutable file-backed segment bytes before metadata becomes visible.
+        var segment_data: ?index_mod.SegmentData = null;
+        if (self.segment_files != null) {
+            const materialize_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            segment_data = try self.materializeSegmentData(seg_id, owned.?);
+            if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
+        }
         errdefer {
             if (segment_data) |*data| data.deinit(self.alloc);
-            self.deleteSegmentFile(seg_id);
+            if (self.segment_files != null) self.deleteSegmentFile(seg_id);
         }
 
         // 4. Persist metadata.
-        try self.persistSegment(seg_id, owned, lsn);
+        const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        try self.persistSegment(seg_id, owned.?, lsn);
+        if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
+
+        if (self.segment_files == null) {
+            segment_data = index_mod.SegmentData.fromOwnedHeap(owned.?);
+            owned = null;
+        }
 
         // 5. Add to in-memory writer (addSegmentWithIdData will acquire the lock itself)
+        const writer_publish_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         try self.writer.addSegmentWithIdData(seg_id, segment_data.?);
         segment_data = null;
+        if (profile_enabled) writer_publish_ns = platform_time.monotonicNs() - writer_publish_start_ns;
 
         // 6. Truncate WAL
-        try self.wal.truncate(lsn);
+        if (uses_segment_wal) {
+            const wal_truncate_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            try self.wal.truncate(lsn);
+            if (profile_enabled) wal_truncate_ns = platform_time.monotonicNs() - wal_truncate_start_ns;
+        }
+
+        if (profile_enabled) {
+            std.log.info(
+                "antfly_bench_text_publish seg_id={d} bytes={d} total_ms={d} wal_append_ms={d} reserve_id_ms={d} materialize_ms={d} persist_ms={d} writer_publish_ms={d} wal_truncate_ms={d} file_backed={} uses_segment_wal={}",
+                .{
+                    seg_id,
+                    segment_bytes.len,
+                    nsToMs(platform_time.monotonicNs() - total_start_ns),
+                    nsToMs(wal_append_ns),
+                    nsToMs(reserve_id_ns),
+                    nsToMs(materialize_ns),
+                    nsToMs(persist_ns),
+                    nsToMs(writer_publish_ns),
+                    nsToMs(wal_truncate_ns),
+                    self.segment_files != null,
+                    uses_segment_wal,
+                },
+            );
+        }
     }
 
     /// Get current snapshot (lock-free, delegates to IndexWriter).
@@ -2063,8 +2141,12 @@ test "persistent index exposes wal and lmdb commit stats" {
     try pi.indexSegment(seg);
 
     const stats = pi.statsSnapshot();
-    try std.testing.expectEqual(@as(u64, 1), stats.wal.append_calls);
-    try std.testing.expect(stats.wal.physical_commits >= 1);
+    if (supports_main_lmdb) {
+        try std.testing.expectEqual(@as(u64, 0), stats.wal.append_calls);
+    } else {
+        try std.testing.expectEqual(@as(u64, 1), stats.wal.append_calls);
+        try std.testing.expect(stats.wal.physical_commits >= 1);
+    }
     if (stats.main_commit) |commit| {
         try std.testing.expect(commit.publish_calls >= 1);
         try std.testing.expect(commit.full_publish_calls >= 1);

@@ -221,11 +221,25 @@ duplicating the temporary token array. The lowercase filter also skips allocatio
 for tokens that contain no ASCII uppercase bytes, and the stop-word filter
 passes through the original token slice when it removes nothing.
 
+The default English analyzer has a fused `unicode_words -> lowercase ->
+stop_words -> Porter2` path. It tokenizes once, drops stop words before owning
+term bytes, and only allocates the output terms that survive analysis. Porter2
+also has a conservative final-byte precheck so generated terms whose suffix
+cannot be modified skip the stemmer's region scans.
+
 `IndexWriter.addSegmentWithIdData` updates append-only BM25 field-length stats
 incrementally by cloning the previous snapshot stats and reading only the new
 segment's inverted-section headers. Segment replacement and merge paths still
 rebuild stats from the replacement segment list because those operations remove
 or reorder existing segment entries.
+
+File-backed persistent text segments no longer write the full segment bytes to
+the segment WAL. The segment file is atomically published before active metadata
+is committed, so crash recovery can treat pre-commit files as harmless orphans
+and post-commit metadata as authoritative. Inline segment storage still uses the
+WAL because the segment bytes live inside the metadata store transaction. The
+`ANTFLY_BENCH_METRICS=1` path now logs `antfly_bench_text_publish` with WAL,
+metadata, writer-publish, and truncate timings to keep this boundary visible.
 
 The same benchmark log now separates section attachment, stored-doc attachment,
 stored-doc compression, and final segment assembly from the broader

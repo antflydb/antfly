@@ -358,10 +358,11 @@ pub fn buildTextProjectionBatchFromSource(
     defer text_docs.deinit(arena);
 
     for (source_docs) |doc| {
+        const extraction_root = doc.typed_source orelse doc.root;
         const extracted = if (schema == null and doc.schema_less_fast_projection)
             ExtractedTextFields{ .fields = doc.schema_less_text_fields }
         else
-            try extractTextFieldsFromValue(arena, doc.root, text_analysis, schema, observed_field_analyzers);
+            try extractTextFieldsFromValue(arena, extraction_root, text_analysis, schema, observed_field_analyzers);
         if (extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0) continue;
 
         try text_docs.append(arena, .{

@@ -6411,7 +6411,6 @@ pub const Index = struct {
                 legacy_count += 1;
             }
         }
-
         const ordinal_prefix = try self.docFactScalarOrdinalFieldPrefixAlloc(role, field);
         defer self.alloc.free(ordinal_prefix);
         var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
@@ -6492,7 +6491,6 @@ pub const Index = struct {
                 try legacy_docs.append(self.alloc, try self.alloc.dupe(u8, doc_component.payload));
             }
         }
-
         const ordinal_prefix = try self.docFactScalarOrdinalFieldPrefixAlloc(role, field);
         defer self.alloc.free(ordinal_prefix);
         var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
@@ -6514,8 +6512,7 @@ pub const Index = struct {
             if (containsOrdinal(ordinals.items, ordinal)) continue;
             try ordinals.append(self.alloc, ordinal);
         }
-        if (ordinals.items.len == 0 and legacy_docs.items.len > 0) return null;
-        if (ordinals.items.len != legacy_docs.items.len) return null;
+        if (ordinals.items.len == 0 and legacy_docs.items.len > 0) return try doc_set.cloneDocKeysAlloc(self.alloc, legacy_docs.items);
         return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals.items);
     }
 

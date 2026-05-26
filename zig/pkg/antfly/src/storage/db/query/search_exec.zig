@@ -2186,6 +2186,7 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
     const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
+    if (patternFilterValueHasRole(parsed.value)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
     return try collectSearchQueryResolvedDocSetAlloc(alloc, arena_alloc, executor, text_entry, search_query);
@@ -2279,6 +2280,7 @@ fn collectStructuredFilterTextDocNumsAlloc(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
     const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
+    if (patternFilterValueHasRole(parsed.value)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
     const snapshot = text_entry.persistent.snapshot();
@@ -2661,9 +2663,16 @@ fn patternBoolFilterToSearchQuery(
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !search_mod.SearchQuery {
     if (value != .object) return error.InvalidArgument;
+    const has_must = value.object.get("must") != null or value.object.get("filter") != null;
+    const has_should = value.object.get("should") != null;
+    const only_must_not = !has_must and !has_should and value.object.get("must_not") != null;
     return .{ .bool_query = .{
         .must = if (value.object.get("must")) |must|
             try patternFilterArrayToSearchQueries(alloc, must, text_analysis, runtime_schema)
+        else if (value.object.get("filter")) |filter|
+            try patternFilterArrayToSearchQueries(alloc, filter, text_analysis, runtime_schema)
+        else if (only_must_not)
+            &.{.{ .match_all = {} }}
         else
             &.{},
         .should = if (value.object.get("should")) |should|
@@ -2674,7 +2683,7 @@ fn patternBoolFilterToSearchQuery(
             try patternFilterArrayToSearchQueries(alloc, must_not, text_analysis, runtime_schema)
         else
             &.{},
-        .min_should = if (value.object.get("should") != null) 1 else 0,
+        .min_should = if (!has_must and has_should) 1 else 0,
     } };
 }
 
@@ -2738,6 +2747,26 @@ fn singleFieldString(value: std.json.Value, value_key: []const u8) !FieldString 
     const entry = it.next() orelse return error.InvalidArgument;
     if (entry.value_ptr.* != .string) return error.InvalidArgument;
     return .{ .field = entry.key_ptr.*, .value = entry.value_ptr.string };
+}
+
+fn patternFilterValueHasRole(value: std.json.Value) bool {
+    return switch (value) {
+        .object => |object| {
+            if (object.get("role") != null) return true;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (patternFilterValueHasRole(entry.value_ptr.*)) return true;
+            }
+            return false;
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (patternFilterValueHasRole(item)) return true;
+            }
+            return false;
+        },
+        else => false,
+    };
 }
 
 fn exactTermFilterFieldAlloc(

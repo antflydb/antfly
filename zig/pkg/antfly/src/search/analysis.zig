@@ -963,6 +963,7 @@ fn applyStemmerLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Token 
 /// the word was modified, otherwise returns the original slice.
 pub fn porter2Stem(alloc: Allocator, word: []const u8) ![]const u8 {
     if (word.len <= 2) return word;
+    if (!porter2MayChange(word)) return word;
 
     // Work on a mutable copy. Most indexed terms are short and many do not
     // stem; keep that common path off the allocator and only allocate the final
@@ -1007,6 +1008,18 @@ pub fn porter2Stem(alloc: Allocator, word: []const u8) ![]const u8 {
     }
 
     return try alloc.dupe(u8, buf[0..len]);
+}
+
+fn porter2MayChange(word: []const u8) bool {
+    const last = word[word.len - 1];
+    // Conservative final-byte filter for the Porter2 suffix table. If the word
+    // does not end in one of these bytes, no step can remove or replace a
+    // suffix. This keeps generated identifier-like terms off the stemmer's
+    // region scans without changing stemming semantics.
+    return switch (last) {
+        's', 'd', 'g', 'y', 'Y', 'l', 'i', 'n', 'r', 'm', 'e', 't', 'c' => true,
+        else => false,
+    };
 }
 
 pub fn isVowel(c: u8) bool {
@@ -1270,6 +1283,8 @@ pub const Analyzer = struct {
 
     /// Analyze text into tokens. Caller owns the returned slice and all token terms.
     pub fn analyze(self: *const Analyzer, alloc: Allocator, text: []const u8) ![]Token {
+        if (self.isDefaultEnglishNoCharFilters()) return analyzeDefaultEnglish(alloc, text);
+
         // Apply character filters
         var processed: []const u8 = text;
         var owned = false;
@@ -1288,6 +1303,15 @@ pub const Analyzer = struct {
         return tokens;
     }
 
+    fn isDefaultEnglishNoCharFilters(self: *const Analyzer) bool {
+        if (self.char_filters.len != 0) return false;
+        if (self.tokenizer != .unicode_words) return false;
+        if (self.filters.len != 3) return false;
+        return self.filters[0] == .lowercase and
+            self.filters[1] == .stop_words and
+            self.filters[2] == .stemmer;
+    }
+
     /// Free tokens returned by analyze().
     pub fn freeTokens(alloc: Allocator, tokens: []Token) void {
         for (tokens) |tok| {
@@ -1296,6 +1320,72 @@ pub const Analyzer = struct {
         alloc.free(tokens);
     }
 };
+
+fn analyzeDefaultEnglish(alloc: Allocator, text: []const u8) ![]Token {
+    const stops = stopwords_mod.getStopWords(.english);
+    var tokens = std.ArrayListUnmanaged(Token).empty;
+    defer tokens.deinit(alloc);
+
+    var pos: u32 = 0;
+    var position: u32 = 0;
+    const len: u32 = @intCast(text.len);
+
+    while (pos < len) {
+        while (pos < len and !isAlphanumeric(text[pos])) {
+            pos += utf8ByteLen(text[pos]);
+        }
+        if (pos >= len) break;
+
+        const start = pos;
+        while (pos < len and isAlphanumeric(text[pos])) {
+            pos += utf8ByteLen(text[pos]);
+        }
+
+        const raw = text[start..pos];
+        var stack_lower: [256]u8 = undefined;
+        var heap_lower: ?[]u8 = null;
+        const normalized = try lowercaseScratch(alloc, raw, &stack_lower, &heap_lower);
+        defer if (heap_lower) |owned| alloc.free(owned);
+
+        if (stops.has(normalized)) continue;
+
+        var owned_term = try alloc.dupe(u8, normalized);
+        errdefer alloc.free(owned_term);
+        const stemmed = try porter2Stem(alloc, owned_term);
+        if (stemmed.ptr != owned_term.ptr) {
+            alloc.free(owned_term);
+            owned_term = @constCast(stemmed);
+        }
+
+        try tokens.append(alloc, .{
+            .term = owned_term,
+            .position = position,
+            .start_byte = start,
+            .end_byte = pos,
+        });
+        position += 1;
+    }
+
+    return try tokens.toOwnedSlice(alloc);
+}
+
+fn lowercaseScratch(
+    alloc: Allocator,
+    text: []const u8,
+    stack: *[256]u8,
+    heap: *?[]u8,
+) ![]const u8 {
+    if (!containsAsciiUpper(text)) return text;
+    const out: []u8 = if (text.len <= stack.len) stack[0..text.len] else blk: {
+        const owned = try alloc.alloc(u8, text.len);
+        heap.* = owned;
+        break :blk owned;
+    };
+    for (text, 0..) |c, i| {
+        out[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+    }
+    return out;
+}
 
 /// Default English analyzer: unicode_words → lowercase → stop_words → stemmer
 pub const default_analyzer = Analyzer{
