@@ -105,11 +105,17 @@ pub const SearchAggregationResult = struct {
     name: []const u8,
     field: []const u8,
     type: []const u8,
+    owns_labels: bool = false,
     value_json: ?[]const u8 = null,
     metadata_json: ?[]const u8 = null,
     buckets: []SearchAggregationBucket = &.{},
 
     pub fn deinit(self: *SearchAggregationResult, alloc: Allocator) void {
+        if (self.owns_labels) {
+            if (self.name.len > 0) alloc.free(self.name);
+            if (self.field.len > 0) alloc.free(self.field);
+            if (self.type.len > 0) alloc.free(self.type);
+        }
         if (self.value_json) |value_json| alloc.free(value_json);
         if (self.metadata_json) |metadata_json| alloc.free(metadata_json);
         for (self.buckets) |*bucket| bucket.deinit(alloc);
@@ -149,6 +155,25 @@ pub fn deinitDistributedBackgroundTextStats(
 pub fn deinitResults(alloc: Allocator, results: []SearchAggregationResult) void {
     for (results) |*result| result.deinit(alloc);
     if (results.len > 0) alloc.free(results);
+}
+
+pub fn cloneSearchAggregationResultLabelsDeep(alloc: Allocator, result: *SearchAggregationResult) !void {
+    if (!result.owns_labels) {
+        const name = try alloc.dupe(u8, result.name);
+        errdefer alloc.free(name);
+        const field = try alloc.dupe(u8, result.field);
+        errdefer alloc.free(field);
+        const agg_type = try alloc.dupe(u8, result.type);
+        errdefer alloc.free(agg_type);
+
+        result.name = name;
+        result.field = field;
+        result.type = agg_type;
+        result.owns_labels = true;
+    }
+    for (result.buckets) |*bucket| {
+        for (bucket.aggregations) |*child| try cloneSearchAggregationResultLabelsDeep(alloc, child);
+    }
 }
 
 pub const Context = struct {

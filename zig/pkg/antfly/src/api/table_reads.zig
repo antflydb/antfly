@@ -7865,7 +7865,12 @@ fn applyAggregationResults(
         aggregation_ctx.algebraic_scope = .root;
         aggregation_ctx.algebraic_constraints = items;
     };
-    meta.aggregation_results = try db_mod.aggregations.computeSearchAggregations(alloc, requests, result, aggregation_ctx);
+    const aggregation_results = try db_mod.aggregations.computeSearchAggregations(alloc, requests, result, aggregation_ctx);
+    errdefer db_mod.aggregations.deinitResults(alloc, aggregation_results);
+    for (aggregation_results) |*aggregation| {
+        try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, aggregation);
+    }
+    meta.aggregation_results = aggregation_results;
 }
 
 fn applyBoundQueryAggregations(

@@ -8352,6 +8352,82 @@ test "api http server serves table query response envelope" {
     try std.testing.expectEqualStrings("doc:a", parsed.value.responses.?[0].hits.?.hits.?[0]._id);
 }
 
+test "api http server serves table query with SearchAF-shaped terms aggregations" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-http-searchaf-aggregations";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"filename\":\"main.go\",\"content\":\"hello alpha\",\"extension\":\".go\",\"file_type\":\"source\"}" },
+            .{ .key = "doc:b", .value = "{\"filename\":\"notes.txt\",\"content\":\"hello beta\",\"extension\":\".txt\",\"file_type\":\"text\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var table_source = table_reads.BoundTableReadSource.init("files", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/files/query",
+        .content_type = "application/json",
+        .body =
+        \\{
+        \\  "full_text_search": {
+        \\    "disjuncts": [
+        \\      {"match": "hello", "field": "content"},
+        \\      {"match": "hello", "field": "filename", "boost": 3}
+        \\    ],
+        \\    "min": 1
+        \\  },
+        \\  "filter_query": {"term": ".go", "field": "extension"},
+        \\  "fields": ["path", "directory", "extension", "file_type", "filename", "content"],
+        \\  "limit": 5,
+        \\  "aggregations": {
+        \\    "file_types": {"type": "terms", "field": "file_type", "size": 10},
+        \\    "extensions": {"type": "terms", "field": "extension", "size": 20}
+        \\  }
+        \\}
+        ,
+    });
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    const aggregations = parsed.value.responses.?[0].aggregations.?;
+    try std.testing.expectEqual(@as(usize, 2), aggregations.map.count());
+    try std.testing.expectEqualStrings("source", aggregations.map.get("file_types").?.buckets.?[0].key);
+    try std.testing.expectEqual(@as(i64, 1), aggregations.map.get("file_types").?.buckets.?[0].doc_count);
+    try std.testing.expectEqualStrings(".go", aggregations.map.get("extensions").?.buckets.?[0].key);
+    try std.testing.expectEqual(@as(i64, 1), aggregations.map.get("extensions").?.buckets.?[0].doc_count);
+}
+
 test "api http server serves retrieval agent response envelope" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-http-retrieval";
