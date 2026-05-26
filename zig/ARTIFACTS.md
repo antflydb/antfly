@@ -34,6 +34,64 @@ The rule is:
 
 > Enrichment APIs manage producers. Artifact APIs expose outputs.
 
+## Catalog Ownership And References
+
+Enrichments are catalog resources. Indexes depend on enrichments; they do not
+own artifact rows directly.
+
+Inline index configuration is shorthand for creating or reusing a normal
+enrichment catalog entry. This is the long-term model for dense/sparse AKNN
+indexes, graph indexes, and future artifact-consuming indexes:
+
+```text
+index config
+  -> declares enrichment dependency
+  -> optional shorthand creates the enrichment if missing
+  -> enrichment writes artifacts
+  -> index replay consumes artifacts
+```
+
+The catalog should track ownership/provenance separately from lifecycle
+authority:
+
+```json
+{
+  "name": "relations_v1",
+  "kind": "asset",
+  "created_by": "index_shorthand",
+  "owner": {
+    "kind": "index",
+    "name": "relations_graph"
+  },
+  "config_hash": "sha256:..."
+}
+```
+
+`owner` and `created_by` explain where the enrichment came from. They do not
+grant unilateral delete/update rights once another index depends on the same
+enrichment.
+
+Reference rules:
+
+- Referrers are derived from current index configs on catalog load/update.
+- Cached referrer lists may be stored or exposed for status/UI, but they are not
+  the source of truth.
+- Deleting an enrichment is rejected while any index depends on it.
+- Deleting an index may delete a shorthand-created enrichment only when no other
+  index references it and the enrichment was not user-defined.
+- Updating an enrichment config is rejected while dependent indexes require the
+  old config, unless the update is a compatible no-op or an explicit rebuild plan
+  updates the dependents.
+- Renaming an enrichment is remove-and-create unless dependent indexes are
+  updated in the same catalog operation.
+- Two inline shorthand enrichments with the same name must normalize to the same
+  config hash, otherwise catalog validation fails.
+
+This means a graph index follows the same model as an AKNN index: it either
+references a user-defined enrichment or includes shorthand that materializes into
+a normal enrichment. The graph index consumes the resulting artifacts; it does
+not create a private artifact namespace.
+
 ## Document Lookup Projection
 
 Artifacts are document-adjacent and should be returned through ordinary document
@@ -264,7 +322,10 @@ published artifact/index state.
 
 Indexes should depend on artifact families, not own enrichment output. Creating
 an index may create a managed enrichment for convenience, but the output should
-still be a normal artifact family visible through `_artifacts`.
+still be a normal artifact family visible through `_artifacts`. Once created,
+that enrichment follows catalog reference rules: it cannot be deleted or
+incompatibly changed while any index depends on it, even if one index originally
+created it through shorthand config.
 
 Example:
 
