@@ -715,13 +715,13 @@ const NativeStorageState = struct {
         if (kind != .threaded) return error.UnsupportedEventedIoRuntime;
         const state = try allocator.create(NativeStorageState);
         errdefer allocator.destroy(state);
-        var threaded = std.Io.Threaded.init(allocator, .{});
-        errdefer threaded.deinit();
-        state.* = .{
-            .allocator = allocator,
-            .threaded = threaded,
-            .fd_cache = FdCache.init(allocator),
-        };
+        state.* = undefined;
+        state.allocator = allocator;
+        state.refs = .init(1);
+        state.closing = .init(false);
+        state.threaded = std.Io.Threaded.init(allocator, .{});
+        errdefer state.threaded.deinit();
+        state.fd_cache = FdCache.init(allocator);
         return state;
     }
 
