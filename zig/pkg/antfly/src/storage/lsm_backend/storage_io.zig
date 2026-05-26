@@ -1513,28 +1513,13 @@ fn closeFd(fd: std.posix.fd_t) void {
 }
 
 fn fileSizeFromFd(fd: std.posix.fd_t) !u64 {
-    if (builtin.os.tag == .linux) {
-        const linux = std.os.linux;
-        while (true) {
-            var statx = std.mem.zeroes(linux.Statx);
-            switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &statx))) {
-                .SUCCESS => {
-                    if (!statx.mask.SIZE) return error.Unexpected;
-                    return statx.size;
-                },
-                .INTR => continue,
-                else => |err| return posixStatError(err),
-            }
-        }
-    } else {
-        var stat: std.posix.Stat = undefined;
-        while (true) {
-            const rc = std.posix.system.fstat(fd, &stat);
-            switch (std.posix.errno(rc)) {
-                .SUCCESS => return @bitCast(stat.size),
-                .INTR => continue,
-                else => |err| return posixStatError(err),
-            }
+    var stat: std.posix.Stat = undefined;
+    while (true) {
+        const rc = std.posix.system.fstat(fd, &stat);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @bitCast(stat.size),
+            .INTR => continue,
+            else => |err| return posixStatError(err),
         }
     }
 }
