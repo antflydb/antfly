@@ -1514,6 +1514,17 @@ Status as of 2026-05-19:
   `bench/results/docid-operational-hardening/20260525T173023Z/` completed all
   four buckets: focused DOCID lifecycle, metadata split/merge transition chaos,
   public split/merge traffic chaos, and LSM backend compaction chaos.
+  `scripts/run_docid_production_readiness_matrix.sh` is the release-evidence
+  wrapper for the remaining production-readiness questions. It always runs the
+  focused lifecycle and operational hardening gates, can add a 300k-scale DOCID
+  performance matrix with `DOCID_PRODUCTION_MATRIX_RUN_SCALE=1`, can run the
+  current auth e2e guard with `DOCID_PRODUCTION_MATRIX_RUN_E2E=1`, and can run
+  old/new binary compatibility smoke checks with
+  `DOCID_PRODUCTION_MATRIX_RUN_OLD_NEW=1` plus explicit
+  `DOCID_PRODUCTION_MATRIX_OLD_ANTFLY_BIN` and
+  `DOCID_PRODUCTION_MATRIX_NEW_ANTFLY_BIN` paths. It records environment,
+  commands, status, and per-case logs under
+  `bench/results/docid-production-readiness/`.
   The scripted cases cover the existing medium baseline, a selective
   small-filter shape, and a broad large-filter shape so future evidence is not
   limited to one favorable filter size. A local smoke matrix passed all three
@@ -2385,9 +2396,20 @@ Status as of 2026-05-19:
   ordinal rows; shared cache prefix invalidation for ownership moves with
   pinned old generations; and near-`u32` ordinal pressure simulation that
   reassigns the final allocatable ordinal without allocating a production-scale
-  shard. The remaining DOCID work is broader production-scale and real
-  rolling-upgrade validation rather than a known internal public-document-ID
-  exchange path.
+  shard. The provisioned read cache now also covers repeated ownership moves
+  while old leases remain pinned, proving old namespace handles are not revived
+  after table-level invalidation. The remaining DOCID work is broader
+  production-scale and real rolling-upgrade validation rather than a known
+  internal public-document-ID exchange path.
+
+The ordinal is intentionally `u32` and shard-local. That keeps native filter
+bitmaps, dense/sparse/text sidecars, and internal wire forms compact, and it
+matches the 32-bit doc-number model used by common segment/bitmap layouts. A
+single physical range should split before the final allocatable ordinal is
+exhausted; if we ever need more than roughly 4.29B addressable slots in one
+logical index without splitting, the extension point should be a segmented
+ordinal space such as `(range/segment identity, u32 local ordinal)`, not a
+blanket `u64` ordinal in every hot path.
 
 ## Open Problems
 
@@ -2395,7 +2417,7 @@ The hard parts are operational rather than syntactic:
 
 - production-scale ordinal stability coverage across async/background
   compaction beyond the explicit LSM/full-text chaos gates and deterministic
-  cache invalidation fixtures
+  cache invalidation fixtures and the opt-in production readiness matrix
 - production multi-node split/merge/reassignment chaos with sustained
   concurrent query/write pressure beyond deterministic split handoff,
   metadata restart/partition, and public traffic simulations
@@ -2406,7 +2428,8 @@ The hard parts are operational rather than syntactic:
   filter cache's namespace-and-generation key primitive and LSM cache
   ownership-prefix invalidation coverage
 - very large shards that approach `u32` ordinal limits under production-scale
-  data volumes, beyond the final-ordinal simulation
+  data volumes, beyond the final-ordinal simulation and split-before-cap
+  invariant
 - real old/new binary mixed-version rolling upgrades beyond doc-identity
   lifecycle fail-closed fixtures and internal wire/status compatibility
   fixtures
