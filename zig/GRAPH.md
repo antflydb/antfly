@@ -293,6 +293,228 @@ Deferred modes:
 - `mention` nodes with span-aware traversal.
 - `mixed` node models that require query-time hydration decisions.
 
+## Entity Documents And Resolution
+
+The long-term product shape for cross-document entity graphs is to make
+canonical entities normal Antfly documents, usually in a dedicated entity table:
+
+```text
+entities/person/ada_lovelace
+entities/org/antfly
+```
+
+Then extracted relationships point at real document refs:
+
+```text
+doc:article-123 --mentions--> entities/person/ada_lovelace
+doc:article-456 --mentions--> entities/person/ada_lovelace
+entities/person/ada_lovelace --works_at--> entities/org/antfly
+```
+
+This keeps hydration, visibility, indexing, backup/restore, document identity,
+split, merge, and distributed transactions inside the normal Antfly model. The
+graph index should not directly invent canonical entities. Instead, it should
+declare the extraction and resolution dependencies it needs, then consume
+resolved entity document refs.
+
+The durable pipeline is:
+
+```text
+source document
+  -> extraction artifact: mentions, local entities, relations, evidence
+  -> resolution artifact: local entity ids mapped to canonical entity docs
+  -> graph edge artifacts: document/entity relationship edges
+  -> graph index replay
+```
+
+This does not have to land all at once. V1 can keep the existing graph plan:
+
+```text
+source document
+  -> extraction artifact
+  -> graph materializer
+  -> graph edge artifacts
+  -> graph index replay
+```
+
+The V1 artifact contract should preserve the structure needed for later entity
+resolution:
+
+- local entity ids
+- relation endpoints by local entity id
+- mention spans and evidence
+- optional canonical identity hints
+
+Entity resolution and promotion can then be added as separate layers:
+
+```text
+resolver:
+  extraction artifact -> resolution artifact
+
+promoter:
+  resolution artifact -> entity document upserts
+
+graph materializer:
+  extraction artifact + optional resolution artifact -> graph edge artifacts
+```
+
+The resolver decides identity, such as mapping local `e0` to
+`entities/person/ada_lovelace`. The promoter performs the durable entity
+document writes and provenance updates. The graph materializer remains
+responsible only for rendering resolved or unresolved endpoints into graph edge
+artifact rows.
+
+Extraction artifacts remain source-document local:
+
+```json
+{
+  "entities": [
+    {
+      "id": "e0",
+      "label": "person",
+      "text": "Ada Lovelace",
+      "spans": [{ "start": 10, "end": 22 }]
+    },
+    {
+      "id": "e1",
+      "label": "org",
+      "text": "Antfly"
+    }
+  ],
+  "relations": [
+    {
+      "type": "works_at",
+      "source": { "entity_id": "e0" },
+      "target": { "entity_id": "e1" },
+      "evidence": { "text": "Ada Lovelace works at Antfly" }
+    }
+  ]
+}
+```
+
+Resolution artifacts map local extraction ids to canonical entity documents:
+
+```json
+{
+  "entities": [
+    {
+      "local_id": "e0",
+      "doc_ref": {
+        "table": "entities",
+        "key": "person/ada_lovelace"
+      },
+      "confidence": 0.98
+    }
+  ]
+}
+```
+
+Entity records are ordinary Antfly documents:
+
+```json
+{
+  "entity_type": "person",
+  "canonical_name": "Ada Lovelace",
+  "aliases": ["Ada", "A. Lovelace"],
+  "provenance": [
+    {
+      "table": "articles",
+      "key": "article-123",
+      "artifact": "relations_v1",
+      "local_id": "e0"
+    }
+  ]
+}
+```
+
+Graph index shorthand may declare this dependency chain:
+
+```json
+{
+  "name": "knowledge_graph",
+  "type": "graph",
+  "source": {
+    "kind": "artifact",
+    "artifact": "relations_v1",
+    "format": "extraction_graph"
+  },
+  "artifact": {
+    "name": "relations_v1",
+    "kind": "asset",
+    "field": "body",
+    "content_type": "application/json",
+    "producer_json": {
+      "type": "extractor",
+      "config": {
+        "provider": "antfly",
+        "model": "relations"
+      }
+    }
+  },
+  "entities": {
+    "table": "entities",
+    "key_template": "{{ lower _entity.label }}/{{ slug _entity.canonical_text }}",
+    "resolver": {
+      "type": "deterministic"
+    }
+  },
+  "edges": {
+    "mentions": true,
+    "relations": true
+  }
+}
+```
+
+The first resolver should be deterministic: render a canonical entity key from
+the extracted entity label/text and upsert that entity document. Later resolver
+configs can be model-backed:
+
+```json
+{
+  "resolver": {
+    "type": "model",
+    "provider": "antfly",
+    "model": "entity-resolver",
+    "candidate_search": {
+      "table": "entities",
+      "index": "entity_name_embedding"
+    }
+  }
+}
+```
+
+Entity resolution should run outside Raft in enrichment/materializer workers.
+Only durable writes go through Antfly's normal write paths:
+
+1. Extractor produces a relation artifact on the source document shard.
+2. Resolver reads the extraction artifact and computes canonical entity refs.
+3. Resolver uses normal writes or distributed transactions to upsert entity docs
+   and store a resolution artifact.
+4. Graph materializer reads extraction plus resolution artifacts and writes graph
+   edge artifacts.
+5. Existing graph replay indexes those graph edge artifacts.
+
+Internally, resolved entity endpoints should use a document reference shape even
+if the first implementation only supports same-table graph hydration:
+
+```json
+{ "table": "entities", "key": "person/ada_lovelace" }
+```
+
+Using `DocRef` rather than raw string ids keeps cross-table entity graphs
+possible without redesigning extraction, resolution, or graph materialization.
+
+Recommended phases:
+
+1. Deterministic entity documents: extract entities/relations, render canonical
+   keys, upsert entity docs, and write document-to-entity mention edges plus
+   entity-to-entity relation edges.
+2. Resolver-backed entity documents: candidate search over existing entities,
+   resolver chooses an entity or creates one, and the resolution artifact records
+   the choice.
+3. Entity merge/split: entity docs can carry `merged_into`, resolution artifacts
+   can be replayed, and graph materialization rewrites stale entity edges.
+
 ## Replacement Semantics
 
 For V1, replacement should happen at the graph edge artifact layer.
