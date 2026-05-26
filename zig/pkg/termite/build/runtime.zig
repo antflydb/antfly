@@ -655,6 +655,8 @@ pub fn configureMetal(
     if (!enable_metal or target.result.os.tag != .macos) return;
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
+    module.linkFramework("MetalPerformanceShaders", .{});
+    module.linkFramework("MetalPerformanceShadersGraph", .{});
     module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.termite_root, "src/backends/metal_kernels.m")), .flags = &.{"-fobjc-arc"} });
 }
 
