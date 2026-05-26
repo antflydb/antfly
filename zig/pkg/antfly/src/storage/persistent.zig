@@ -1986,9 +1986,10 @@ fn mapSegmentFile(path: []const u8) anyerror![]align(std.heap.page_size_min) u8 
 fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
+        const empty_path: [*:0]const u8 = "";
         while (true) {
             var statx = std.mem.zeroes(linux.Statx);
-            switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &statx))) {
+            switch (linux.errno(linux.statx(fd, empty_path, linux.AT.EMPTY_PATH, .{ .SIZE = true }, &statx))) {
                 .SUCCESS => {
                     if (!statx.mask.SIZE) return error.Unexpected;
                     return @intCast(statx.size);

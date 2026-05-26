@@ -1501,16 +1501,17 @@ fn fileSizeFromFd(fd: std.posix.fd_t) !u64 {
                 else => |err| return posixStatError(err),
             }
         }
+    } else {
+        var stat: std.posix.Stat = undefined;
+        while (true) {
+            const rc = std.posix.system.fstat(fd, &stat);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => return @intCast(stat.size),
+                .INTR => continue,
+                else => |err| return posixStatError(err),
+            }
+        }
     }
-
-    const current = try seekFd(fd, 0, std.posix.SEEK.CUR);
-    errdefer {
-        _ = seekFd(fd, @intCast(current), std.posix.SEEK.SET) catch {};
-    }
-
-    const size = try seekFd(fd, 0, std.posix.SEEK.END);
-    _ = try seekFd(fd, @intCast(current), std.posix.SEEK.SET);
-    return size;
 }
 
 fn seekFd(fd: std.posix.fd_t, offset: i64, whence: usize) !u64 {
