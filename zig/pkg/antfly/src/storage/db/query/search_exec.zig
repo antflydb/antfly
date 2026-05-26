@@ -2305,11 +2305,16 @@ fn resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(
     doc_nums: []const u32,
     executor: StructuredFilterResolverExecutor,
 ) !?doc_set.ResolvedDocSet {
-    _ = executor;
     const ordinals = (try snapshot.docOrdinalsForDocNumsAlloc(alloc, doc_nums)) orelse return null;
     defer alloc.free(ordinals);
     if (ordinals.len == 0) return null;
-    return try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+    var resolved = try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+    errdefer resolved.deinit(alloc);
+
+    const live_filter = executor.live_filter_doc_set orelse return resolved;
+    const filtered = try live_filter(executor.ctx, alloc, &resolved, executor.identity_read_generation);
+    resolved.deinit(alloc);
+    return filtered;
 }
 
 fn collectStructuredFilterResolvedDocSetCachedAlloc(
