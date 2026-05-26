@@ -115,8 +115,7 @@ pub fn initDistributed(strict: bool, backend_name: ?[]const u8) !DistributedCont
     const name_z = if (backend_name) |name| try std.heap.page_allocator.dupeZ(u8, name) else null;
     defer if (name_z) |buf| std.heap.page_allocator.free(buf);
 
-    var group = c.mlx_distributed_group_new();
-    errdefer _ = c.mlx_distributed_group_free(group);
+    var group = c.mlx_distributed_group{ .ctx = null };
     if (c.mlx_distributed_init(&group, strict, if (name_z) |buf| buf.ptr else null) != 0) {
         return error.MlxDistributedInitFailed;
     }

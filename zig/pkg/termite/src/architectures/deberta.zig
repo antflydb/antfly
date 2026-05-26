@@ -88,6 +88,171 @@ fn uniqueRelativePositionProjectionEnabled() bool {
     return platform.env.getenvBool("TERMITE_DEBERTA_UNIQUE_REL_POS");
 }
 
+fn metalEncoderFrameEnabled() bool {
+    if (@import("builtin").target.cpu.arch.isWasm()) return false;
+    if (platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_ENCODER_FRAME")) return false;
+    return true;
+}
+
+fn metalEncoderLayerExecutionEnabled() bool {
+    if (@import("builtin").target.cpu.arch.isWasm()) return false;
+    if (platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_DEBERTA_LAYER_EXECUTION")) return false;
+    return true;
+}
+
+const DebertaLinearSlotKind = enum(usize) {
+    q = 0,
+    k = 1,
+    v = 2,
+    attention_output = 3,
+    intermediate = 4,
+    output = 5,
+};
+
+const DebertaLayerNormSlotKind = enum(usize) {
+    attention_output = 0,
+    output = 1,
+};
+
+fn debertaLinearSlot(layer: usize, kind: DebertaLinearSlotKind) usize {
+    return layer * 6 + @intFromEnum(kind);
+}
+
+fn debertaLayerNormSlot(layer: usize, kind: DebertaLayerNormSlotKind) usize {
+    return layer * 2 + @intFromEnum(kind);
+}
+
+fn allAttentionMaskOnes(mask: []const i64, total: usize) bool {
+    if (mask.len < total) return false;
+    for (mask[0..total]) |value| {
+        if (value == 0) return false;
+    }
+    return true;
+}
+
+pub fn preplanMetalDebertaEncoderFrame(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    batch: usize,
+    seq_len: usize,
+) !bool {
+    if (cb.kind() != .metal) return false;
+    if (!metalEncoderFrameEnabled()) return false;
+    if (cb.decoderRuntimeHasActiveFrame()) return false;
+    if (tensorParallelWorldSize(cb) > 1) return false;
+
+    const layer_count: usize = @intCast(config.num_hidden_layers);
+    const H: usize = @intCast(config.hidden_size);
+    const I: usize = @intCast(config.intermediate_size);
+    const heads: usize = @intCast(config.num_attention_heads);
+    if (layer_count == 0 or batch == 0 or seq_len == 0 or H == 0 or I == 0 or heads == 0) return false;
+    if (H % heads != 0) return false;
+
+    const layers = try allocator.alloc(ops.DebertaEncoderLayerSpec, layer_count);
+    defer allocator.free(layers);
+
+    for (0..layer_count) |layer| {
+        var q_w_buf: [256]u8 = undefined;
+        var q_b_buf: [256]u8 = undefined;
+        const q_w = try getLayerWeight(cb, layer, "attention.self.query_proj.weight", &q_w_buf);
+        defer cb.free(q_w);
+        const q_b = try getLayerWeight(cb, layer, "attention.self.query_proj.bias", &q_b_buf);
+        defer cb.free(q_b);
+
+        var k_w_buf: [256]u8 = undefined;
+        var k_b_buf: [256]u8 = undefined;
+        const k_w = try getLayerWeight(cb, layer, "attention.self.key_proj.weight", &k_w_buf);
+        defer cb.free(k_w);
+        const k_b = try getLayerWeight(cb, layer, "attention.self.key_proj.bias", &k_b_buf);
+        defer cb.free(k_b);
+
+        var v_w_buf: [256]u8 = undefined;
+        var v_b_buf: [256]u8 = undefined;
+        const v_w = try getLayerWeight(cb, layer, "attention.self.value_proj.weight", &v_w_buf);
+        defer cb.free(v_w);
+        const v_b = try getLayerWeight(cb, layer, "attention.self.value_proj.bias", &v_b_buf);
+        defer cb.free(v_b);
+
+        var attn_o_w_buf: [256]u8 = undefined;
+        var attn_o_b_buf: [256]u8 = undefined;
+        const attn_o_w = try getLayerWeight(cb, layer, "attention.output.dense.weight", &attn_o_w_buf);
+        defer cb.free(attn_o_w);
+        const attn_o_b = try getLayerWeight(cb, layer, "attention.output.dense.bias", &attn_o_b_buf);
+        defer cb.free(attn_o_b);
+
+        var ffn_i_w_buf: [256]u8 = undefined;
+        var ffn_i_b_buf: [256]u8 = undefined;
+        const ffn_i_w = try getLayerWeight(cb, layer, "intermediate.dense.weight", &ffn_i_w_buf);
+        defer cb.free(ffn_i_w);
+        const ffn_i_b = try getLayerWeight(cb, layer, "intermediate.dense.bias", &ffn_i_b_buf);
+        defer cb.free(ffn_i_b);
+
+        var ffn_o_w_buf: [256]u8 = undefined;
+        var ffn_o_b_buf: [256]u8 = undefined;
+        const ffn_o_w = try getLayerWeight(cb, layer, "output.dense.weight", &ffn_o_w_buf);
+        defer cb.free(ffn_o_w);
+        const ffn_o_b = try getLayerWeight(cb, layer, "output.dense.bias", &ffn_o_b_buf);
+        defer cb.free(ffn_o_b);
+
+        var attn_ln_w_buf: [256]u8 = undefined;
+        var attn_ln_b_buf: [256]u8 = undefined;
+        const attn_ln_w = try getLayerWeight(cb, layer, "attention.output.LayerNorm.weight", &attn_ln_w_buf);
+        defer cb.free(attn_ln_w);
+        const attn_ln_b = try getLayerWeight(cb, layer, "attention.output.LayerNorm.bias", &attn_ln_b_buf);
+        defer cb.free(attn_ln_b);
+
+        var ffn_ln_w_buf: [256]u8 = undefined;
+        var ffn_ln_b_buf: [256]u8 = undefined;
+        const ffn_ln_w = try getLayerWeight(cb, layer, "output.LayerNorm.weight", &ffn_ln_w_buf);
+        defer cb.free(ffn_ln_w);
+        const ffn_ln_b = try getLayerWeight(cb, layer, "output.LayerNorm.bias", &ffn_ln_b_buf);
+        defer cb.free(ffn_ln_b);
+
+        const q_slot = debertaLinearSlot(layer, .q);
+        const k_slot = debertaLinearSlot(layer, .k);
+        const v_slot = debertaLinearSlot(layer, .v);
+        const attn_o_slot = debertaLinearSlot(layer, .attention_output);
+        const ffn_i_slot = debertaLinearSlot(layer, .intermediate);
+        const ffn_o_slot = debertaLinearSlot(layer, .output);
+        const attn_ln_slot = debertaLayerNormSlot(layer, .attention_output);
+        const ffn_ln_slot = debertaLayerNormSlot(layer, .output);
+
+        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = q_slot, .weight = q_w, .bias = q_b, .in_dim = H, .out_dim = H }))) return false;
+        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = k_slot, .weight = k_w, .bias = k_b, .in_dim = H, .out_dim = H }))) return false;
+        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = v_slot, .weight = v_w, .bias = v_b, .in_dim = H, .out_dim = H }))) return false;
+        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = attn_o_slot, .weight = attn_o_w, .bias = attn_o_b, .in_dim = H, .out_dim = H }))) return false;
+        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = ffn_i_slot, .weight = ffn_i_w, .bias = ffn_i_b, .in_dim = H, .out_dim = I }))) return false;
+        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = ffn_o_slot, .weight = ffn_o_w, .bias = ffn_o_b, .in_dim = I, .out_dim = H }))) return false;
+        if (!(try cb.decoderRuntimePrepareLayerNorm(&.{ .slot = attn_ln_slot, .weight = attn_ln_w, .bias = attn_ln_b, .hidden_size = H }))) return false;
+        if (!(try cb.decoderRuntimePrepareLayerNorm(&.{ .slot = ffn_ln_slot, .weight = ffn_ln_w, .bias = ffn_ln_b, .hidden_size = H }))) return false;
+
+        layers[layer] = .{
+            .q_linear_slot = q_slot,
+            .k_linear_slot = k_slot,
+            .v_linear_slot = v_slot,
+            .attention_output_linear_slot = attn_o_slot,
+            .intermediate_linear_slot = ffn_i_slot,
+            .output_linear_slot = ffn_o_slot,
+            .attention_layer_norm_slot = attn_ln_slot,
+            .output_layer_norm_slot = ffn_ln_slot,
+        };
+    }
+
+    return cb.debertaEncoderPlanFrame(&.{
+        .layer_count = layer_count,
+        .batch = batch,
+        .seq_len = seq_len,
+        .hidden_size = H,
+        .intermediate_size = I,
+        .num_attention_heads = heads,
+        .position_buckets = @intCast(config.position_buckets),
+        .max_position_embeddings = @intCast(config.max_position_embeddings),
+        .norm_eps = config.layer_norm_eps,
+        .layers = layers,
+    });
+}
+
 /// Run the full DeBERTa encoder forward pass and return the result on
 /// the backend (a CT).  Callers that consume the encoder output through
 /// CT ops (gliner_head, future graph-resident pipelines) should use this
@@ -120,6 +285,14 @@ pub fn forwardCtProfiled(
     const H = config.hidden_size;
     const total = batch * seq_len;
 
+    _ = try preplanMetalDebertaEncoderFrame(cb, allocator, config, batch, seq_len);
+
+    var encoder_frame_active = false;
+    if (cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
+        encoder_frame_active = try cb.decoderRuntimeBeginFrame();
+    }
+    errdefer if (encoder_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+
     var timer = profileStart(profile);
     var hidden = try embeddings(cb, allocator, config, input_ids, attention_mask, total, H);
     if (profile) |p| p.embeddings_ns += profileElapsed(timer);
@@ -137,6 +310,10 @@ pub fn forwardCtProfiled(
         if (profile) |p| p.layer_total_ns += profileElapsed(timer);
     }
     // No post-encoder LayerNorm in DeBERTa-v3 (encoder.LayerNorm is norm_rel_ebd).
+    if (encoder_frame_active) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        encoder_frame_active = false;
+    }
     return hidden;
 }
 
@@ -257,17 +434,33 @@ fn embeddings(
     // Word embeddings only (no position embeddings in DeBERTa-v3)
     const word_emb = try cb.getWeight("embeddings.word_embeddings.weight");
     defer cb.free(word_emb);
-    const result = try cb.embeddingLookup(word_emb, input_ids, total, H);
-
-    // LayerNorm
     const ln_w = try cb.getWeight("embeddings.LayerNorm.weight");
     defer cb.free(ln_w);
     const ln_b = try cb.getWeight("embeddings.LayerNorm.bias");
     defer cb.free(ln_b);
+
+    if (try cb.debertaEmbeddings(.{
+        .word_embeddings = word_emb,
+        .layer_norm_weight = ln_w,
+        .layer_norm_bias = ln_b,
+        .input_ids = input_ids,
+        .attention_mask = attention_mask,
+        .total = total,
+        .hidden_size = H,
+        .eps = config.layer_norm_eps,
+    })) |fused| {
+        return fused;
+    }
+
+    const result = try cb.embeddingLookup(word_emb, input_ids, total, H);
+
+    // LayerNorm
     const normed = try cb.layerNorm(result, ln_w, ln_b, H, config.layer_norm_eps);
     cb.free(result);
 
     // Multiply by attention mask (DeBERTa-v3 zeros out padding embeddings).
+    if (allAttentionMaskOnes(attention_mask, total)) return normed;
+
     // Keep the normalized activations on the backend and only upload the mask.
     const mask_data = try allocator.alloc(f32, total * H);
     defer allocator.free(mask_data);
@@ -409,6 +602,36 @@ fn encoderLayer(
     const local_hidden = if (use_tp) H / tp_world_size else H;
     const local_intermediate = if (use_tp) I / tp_world_size else I;
 
+    if (!use_tp and metalEncoderFrameEnabled() and metalEncoderLayerExecutionEnabled()) {
+        if (try cb.debertaEncoderLayer(&.{
+            .layer = .{
+                .q_linear_slot = debertaLinearSlot(layer, .q),
+                .k_linear_slot = debertaLinearSlot(layer, .k),
+                .v_linear_slot = debertaLinearSlot(layer, .v),
+                .attention_output_linear_slot = debertaLinearSlot(layer, .attention_output),
+                .intermediate_linear_slot = debertaLinearSlot(layer, .intermediate),
+                .output_linear_slot = debertaLinearSlot(layer, .output),
+                .attention_layer_norm_slot = debertaLayerNormSlot(layer, .attention_output),
+                .output_layer_norm_slot = debertaLayerNormSlot(layer, .output),
+            },
+            .hidden = hidden,
+            .relative_embeddings = rel_emb.embeddings,
+            .relative_full_to_unique = rel_emb.full_to_unique,
+            .relative_unique_count = rel_emb.unique_count,
+            .relative_full_count = rel_emb.full_count,
+            .attention_mask = attention_mask,
+            .batch = batch,
+            .seq_len = seq_len,
+            .hidden_size = H,
+            .intermediate_size = I,
+            .num_attention_heads = num_heads,
+            .head_dim = head_dim,
+            .norm_eps = eps,
+        })) |planned| {
+            return planned;
+        }
+    }
+
     // Self-attention: Q, K, V projections (DeBERTa uses query_proj, key_proj, value_proj)
     var q_w_buf: [256]u8 = undefined;
     var q_b_buf: [256]u8 = undefined;
@@ -488,28 +711,59 @@ fn encoderLayer(
     defer cb.free(attn_proj_w);
     const attn_proj_b = try getLayerWeight(cb, layer, "attention.output.dense.bias", &attn_proj_b_buf);
     defer cb.free(attn_proj_b);
-    const attn_proj = if (use_tp)
-        try linearMaybeShardedToReplicated(cb, attn_out, attn_proj_w, attn_proj_b, total, H, H)
-    else
-        try cb.linear(attn_out, attn_proj_w, attn_proj_b, total, local_hidden, H);
-    defer cb.free(attn_proj);
-    if (profile) |p| p.attention_output_ns += profileElapsed(timer);
-
-    timer = profileStart(profile);
     var attn_ln_w_buf: [256]u8 = undefined;
     var attn_ln_b_buf: [256]u8 = undefined;
     const attn_ln_w = try getLayerWeight(cb, layer, "attention.output.LayerNorm.weight", &attn_ln_w_buf);
     defer cb.free(attn_ln_w);
     const attn_ln_b = try getLayerWeight(cb, layer, "attention.output.LayerNorm.bias", &attn_ln_b_buf);
     defer cb.free(attn_ln_b);
-    const attn_normed = if (try cb.addLayerNorm(attn_proj, hidden, attn_ln_w, attn_ln_b, H, eps)) |fused|
-        fused
-    else blk: {
-        const attn_res = try cb.add(attn_proj, hidden);
-        defer cb.free(attn_res);
-        break :blk try cb.layerNorm(attn_res, attn_ln_w, attn_ln_b, H, eps);
+    const attn_normed = if (!use_tp) blk: {
+        if (try cb.denseLinearLayerNorm(&.{
+            .input = attn_out,
+            .residual = hidden,
+            .weight = attn_proj_w,
+            .bias = attn_proj_b,
+            .layer_norm_weight = attn_ln_w,
+            .layer_norm_bias = attn_ln_b,
+            .rows = total,
+            .in_dim = H,
+            .hidden_size = H,
+            .eps = eps,
+        })) |fused| {
+            if (profile) |p| p.attention_output_ns += profileElapsed(timer);
+            break :blk fused;
+        }
+        const attn_proj = try cb.linear(attn_out, attn_proj_w, attn_proj_b, total, local_hidden, H);
+        errdefer cb.free(attn_proj);
+        if (profile) |p| p.attention_output_ns += profileElapsed(timer);
+
+        timer = profileStart(profile);
+        const normed = if (try cb.addLayerNorm(attn_proj, hidden, attn_ln_w, attn_ln_b, H, eps)) |fused|
+            fused
+        else norm_blk: {
+            const attn_res = try cb.add(attn_proj, hidden);
+            defer cb.free(attn_res);
+            break :norm_blk try cb.layerNorm(attn_res, attn_ln_w, attn_ln_b, H, eps);
+        };
+        cb.free(attn_proj);
+        if (profile) |p| p.layernorm_residual_ns += profileElapsed(timer);
+        break :blk normed;
+    } else blk: {
+        const attn_proj = try linearMaybeShardedToReplicated(cb, attn_out, attn_proj_w, attn_proj_b, total, H, H);
+        defer cb.free(attn_proj);
+        if (profile) |p| p.attention_output_ns += profileElapsed(timer);
+
+        timer = profileStart(profile);
+        const normed = if (try cb.addLayerNorm(attn_proj, hidden, attn_ln_w, attn_ln_b, H, eps)) |fused|
+            fused
+        else norm_blk: {
+            const attn_res = try cb.add(attn_proj, hidden);
+            defer cb.free(attn_res);
+            break :norm_blk try cb.layerNorm(attn_res, attn_ln_w, attn_ln_b, H, eps);
+        };
+        if (profile) |p| p.layernorm_residual_ns += profileElapsed(timer);
+        break :blk normed;
     };
-    if (profile) |p| p.layernorm_residual_ns += profileElapsed(timer);
 
     // FFN
     timer = profileStart(profile);
@@ -519,6 +773,41 @@ fn encoderLayer(
     defer cb.free(ffn_i_w);
     const ffn_i_b = try getLayerWeight(cb, layer, "intermediate.dense.bias", &ffn_i_b_buf);
     defer cb.free(ffn_i_b);
+    var ffn_o_w_buf: [256]u8 = undefined;
+    var ffn_o_b_buf: [256]u8 = undefined;
+    const ffn_o_w = try getLayerWeight(cb, layer, "output.dense.weight", &ffn_o_w_buf);
+    defer cb.free(ffn_o_w);
+    const ffn_o_b = try getLayerWeight(cb, layer, "output.dense.bias", &ffn_o_b_buf);
+    defer cb.free(ffn_o_b);
+    var ffn_ln_w_buf: [256]u8 = undefined;
+    var ffn_ln_b_buf: [256]u8 = undefined;
+    const ffn_ln_w = try getLayerWeight(cb, layer, "output.LayerNorm.weight", &ffn_ln_w_buf);
+    defer cb.free(ffn_ln_w);
+    const ffn_ln_b = try getLayerWeight(cb, layer, "output.LayerNorm.bias", &ffn_ln_b_buf);
+    defer cb.free(ffn_ln_b);
+
+    if (!use_tp) {
+        if (try cb.denseFfnLayerNorm(&.{
+            .input = attn_normed,
+            .residual = attn_normed,
+            .first_weight = ffn_i_w,
+            .first_bias = ffn_i_b,
+            .second_weight = ffn_o_w,
+            .second_bias = ffn_o_b,
+            .layer_norm_weight = ffn_ln_w,
+            .layer_norm_bias = ffn_ln_b,
+            .rows = total,
+            .hidden_size = H,
+            .intermediate_size = I,
+            .eps = eps,
+            .activation = .gelu,
+        })) |fused| {
+            cb.free(attn_normed);
+            if (profile) |p| p.ffn_output_ns += profileElapsed(timer);
+            return fused;
+        }
+    }
+
     var ffn_inter_is_gelu = false;
     const ffn_inter = if (use_tp)
         try linearReplicatedToMaybeSharded(cb, attn_normed, ffn_i_w, ffn_i_b, total, H, I)
@@ -541,12 +830,6 @@ fn encoderLayer(
     };
     defer cb.free(ffn_gelu);
 
-    var ffn_o_w_buf: [256]u8 = undefined;
-    var ffn_o_b_buf: [256]u8 = undefined;
-    const ffn_o_w = try getLayerWeight(cb, layer, "output.dense.weight", &ffn_o_w_buf);
-    defer cb.free(ffn_o_w);
-    const ffn_o_b = try getLayerWeight(cb, layer, "output.dense.bias", &ffn_o_b_buf);
-    defer cb.free(ffn_o_b);
     var ffn_out_has_residual = false;
     const ffn_out = if (use_tp)
         try linearMaybeShardedToReplicated(cb, ffn_gelu, ffn_o_w, ffn_o_b, total, I, H)
@@ -562,12 +845,6 @@ fn encoderLayer(
     if (profile) |p| p.ffn_output_ns += profileElapsed(timer);
 
     timer = profileStart(profile);
-    var ffn_ln_w_buf: [256]u8 = undefined;
-    var ffn_ln_b_buf: [256]u8 = undefined;
-    const ffn_ln_w = try getLayerWeight(cb, layer, "output.LayerNorm.weight", &ffn_ln_w_buf);
-    defer cb.free(ffn_ln_w);
-    const ffn_ln_b = try getLayerWeight(cb, layer, "output.LayerNorm.bias", &ffn_ln_b_buf);
-    defer cb.free(ffn_ln_b);
     const out = if (ffn_out_has_residual) blk: {
         cb.free(attn_normed);
         defer cb.free(ffn_out);
@@ -640,4 +917,11 @@ fn linearMaybeShardedToReplicated(
         }
     }
     return cb.linear(input, weight, bias, rows, input_dim, output_dim);
+}
+
+test "allAttentionMaskOnes recognizes all-one prefix" {
+    try std.testing.expect(allAttentionMaskOnes(&.{ 1, 1, 1 }, 3));
+    try std.testing.expect(allAttentionMaskOnes(&.{ 1, 1, 0 }, 2));
+    try std.testing.expect(!allAttentionMaskOnes(&.{ 1, 0, 1 }, 3));
+    try std.testing.expect(!allAttentionMaskOnes(&.{ 1, 1 }, 3));
 }

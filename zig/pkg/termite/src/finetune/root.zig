@@ -21,6 +21,7 @@ pub const graph_input_binder = @import("graph_input_binder.zig");
 pub const colqwen2 = @import("colqwen2.zig");
 pub const gliner2 = @import("gliner2.zig");
 pub const gliner2_data = @import("gliner2_data.zig");
+pub const gliner2_run_validation = @import("gliner2_run_validation.zig");
 pub const gliner2_boundary = @import("gliner2_boundary.zig");
 pub const entity_cleanup_data = @import("entity_cleanup_data.zig");
 pub const entity_cleanup_gliner_cache = @import("entity_cleanup_gliner_cache.zig");
@@ -66,6 +67,7 @@ test {
     _ = colqwen2;
     _ = gliner2;
     _ = gliner2_data;
+    _ = gliner2_run_validation;
     _ = gliner2_boundary;
     _ = entity_cleanup_data;
     _ = entity_cleanup_gliner_cache;

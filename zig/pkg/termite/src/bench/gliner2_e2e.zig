@@ -49,12 +49,15 @@ const BenchTask = enum {
 const Options = struct {
     model_dir: []const u8 = "",
     text: []const u8 = "John Smith works for Apple Inc. and lives in San Francisco. Apple Inc. is located in Cupertino.",
+    text_repeat: usize = 1,
     backend: BackendChoice = .native,
     graph_runtime_strategy: ?graph_runtime.Strategy = null,
     warmup_iters: usize = 1,
     measure_iters: usize = 5,
+    batch_size: usize = 1,
     format: OutputFormat = .text,
     task: BenchTask = .entities,
+    dump_entities: bool = false,
     labels: std.ArrayListUnmanaged([]const u8) = .empty,
     relation_labels: std.ArrayListUnmanaged([]const u8) = .empty,
 
@@ -129,7 +132,12 @@ pub fn main(init: std.process.Init) !void {
     const load_elapsed_ns = nowNs() - load_start;
     if (!model.isGlinerModel()) return error.NotGlinerModel;
 
-    const texts = [_][]const u8{opts.text};
+    if (opts.batch_size == 0) return error.InvalidBatchSize;
+    const bench_text = try repeatedText(allocator, opts.text, opts.text_repeat);
+    defer allocator.free(bench_text);
+    const texts = try allocator.alloc([]const u8, opts.batch_size);
+    defer allocator.free(texts);
+    @memset(texts, bench_text);
     const labels: ?[]const []const u8 = if (opts.labels.items.len > 0) opts.labels.items else null;
     const relation_labels: ?[]const []const u8 = if (opts.relation_labels.items.len > 0) opts.relation_labels.items else null;
 
@@ -139,13 +147,13 @@ pub fn main(init: std.process.Init) !void {
     defer rows.deinit(allocator);
 
     if (opts.task == .entities or opts.task == .both) {
-        const task_result = try runBenchmarkTask(allocator, &pipeline, &texts, labels, relation_labels, .entities, load_elapsed_ns, opts.warmup_iters, opts.measure_iters);
+        const task_result = try runBenchmarkTask(allocator, &pipeline, texts, labels, relation_labels, .entities, load_elapsed_ns, opts.warmup_iters, opts.measure_iters, opts.dump_entities);
         try rows.append(allocator, task_result.first);
         try rows.append(allocator, task_result.warm);
     }
 
     if (opts.task == .relations or opts.task == .both) {
-        const task_result = try runBenchmarkTask(allocator, &pipeline, &texts, labels, relation_labels, .relations, load_elapsed_ns, opts.warmup_iters, opts.measure_iters);
+        const task_result = try runBenchmarkTask(allocator, &pipeline, texts, labels, relation_labels, .relations, load_elapsed_ns, opts.warmup_iters, opts.measure_iters, opts.dump_entities);
         try rows.append(allocator, task_result.first);
         try rows.append(allocator, task_result.warm);
     }
@@ -171,8 +179,9 @@ fn runBenchmarkTask(
     load_elapsed_ns: u64,
     warmup_iters: usize,
     measure_iters: usize,
+    dump_entities: bool,
 ) !TaskResult {
-    const first = try runTask(pipeline, texts, labels, relation_labels, task);
+    const first = try runTask(pipeline, texts, labels, relation_labels, task, dump_entities);
     const first_run = Result{
         .task = task,
         .mode = "first_run",
@@ -190,13 +199,13 @@ fn runBenchmarkTask(
     };
 
     for (0..warmup_iters) |_| {
-        _ = try runTask(pipeline, texts, labels, relation_labels, task);
+        _ = try runTask(pipeline, texts, labels, relation_labels, task, false);
     }
 
     const samples = try allocator.alloc(Sample, measure_iters);
     defer allocator.free(samples);
     for (samples) |*sample| {
-        sample.* = try runTask(pipeline, texts, labels, relation_labels, task);
+        sample.* = try runTask(pipeline, texts, labels, relation_labels, task, false);
     }
     const warm = try resultFromSamples(allocator, task, "warm_loaded_session", samples);
 
@@ -209,6 +218,7 @@ fn runTask(
     labels: ?[]const []const u8,
     relation_labels: ?[]const []const u8,
     task: BenchTask,
+    dump_entities: bool,
 ) !Sample {
     native_compute.resetNativeQuantDispatchStats();
     const start = nowNs();
@@ -225,6 +235,7 @@ fn runTask(
                 entity_count += row.len;
                 for (row) |entity| score_sum += entity.score;
             }
+            if (dump_entities) dumpEntityRows("entities", entities);
             return .{
                 .elapsed_ns = elapsed_ns,
                 .entity_count = entity_count,
@@ -250,6 +261,10 @@ fn runTask(
             for (extracted.relations) |row| {
                 relation_count += row.len;
                 for (row) |relation| relation_score_sum += relation.score;
+            }
+            if (dump_entities) {
+                dumpEntityRows("relations.entities", extracted.entities);
+                dumpRelationRows(extracted.relations);
             }
             return .{
                 .elapsed_ns = elapsed_ns,
@@ -314,6 +329,39 @@ fn freeRelations(allocator: std.mem.Allocator, all_relations: anytype) void {
     allocator.free(all_relations);
 }
 
+fn dumpEntityRows(prefix: []const u8, all_entities: anytype) void {
+    for (all_entities, 0..) |entities, row_idx| {
+        for (entities, 0..) |entity, entity_idx| {
+            std.debug.print(
+                "{s}[{}][{}]: label={s} span={}..{} score={d:.8} text=\"{s}\"\n",
+                .{ prefix, row_idx, entity_idx, entity.label, entity.start, entity.end, entity.score, entity.text },
+            );
+        }
+    }
+}
+
+fn dumpRelationRows(all_relations: anytype) void {
+    for (all_relations, 0..) |relations, row_idx| {
+        for (relations, 0..) |relation, relation_idx| {
+            std.debug.print(
+                "relations[{}][{}]: label={s} score={d:.8} head={s}@{}..{} tail={s}@{}..{}\n",
+                .{
+                    row_idx,
+                    relation_idx,
+                    relation.label,
+                    relation.score,
+                    relation.head.text,
+                    relation.head.start,
+                    relation.head.end,
+                    relation.tail.text,
+                    relation.tail.start,
+                    relation.tail.end,
+                },
+            );
+        }
+    }
+}
+
 fn quantCountersFromStats(stats: native_compute.NativeQuantDispatchStats) QuantCounters {
     return .{
         .q4q5 = stats.q4_q5_k_q8k_activation,
@@ -348,6 +396,9 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
             opts.model_dir = args.next() orelse return error.MissingModelDir;
         } else if (std.mem.eql(u8, arg, "--text")) {
             opts.text = args.next() orelse return error.MissingText;
+        } else if (std.mem.eql(u8, arg, "--text-repeat")) {
+            opts.text_repeat = try std.fmt.parseInt(usize, args.next() orelse return error.MissingTextRepeat, 10);
+            if (opts.text_repeat == 0) return error.InvalidTextRepeat;
         } else if (std.mem.eql(u8, arg, "--task")) {
             opts.task = parseTask(args.next() orelse return error.MissingTask) orelse return error.InvalidTask;
         } else if (std.mem.eql(u8, arg, "--label")) {
@@ -362,8 +413,12 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
             opts.warmup_iters = try std.fmt.parseInt(usize, args.next() orelse return error.MissingWarmupIters, 10);
         } else if (std.mem.eql(u8, arg, "--measure-iters")) {
             opts.measure_iters = try std.fmt.parseInt(usize, args.next() orelse return error.MissingMeasureIters, 10);
+        } else if (std.mem.eql(u8, arg, "--batch-size")) {
+            opts.batch_size = try std.fmt.parseInt(usize, args.next() orelse return error.MissingBatchSize, 10);
         } else if (std.mem.eql(u8, arg, "--format")) {
             opts.format = parseFormat(args.next() orelse return error.MissingFormat) orelse return error.InvalidFormat;
+        } else if (std.mem.eql(u8, arg, "--dump-entities")) {
+            opts.dump_entities = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             std.process.exit(0);
@@ -398,12 +453,13 @@ fn parseFormat(value: []const u8) ?OutputFormat {
 
 fn printText(opts: Options, result: Result) void {
     std.debug.print(
-        "{s}/{s}: model_dir={s} backend={s} avg_ms={d:.3} p50_ms={d:.3} p95_ms={d:.3} min_ms={d:.3} max_ms={d:.3} entity_count={} relation_count={} score_sum={d:.6} relation_score_sum={d:.6} native_quant_stats={s} q4q5={} q4q5_pair={} q4q5_triple={} q4q5_panel={} dequant={} dequant_pair={} dequant_triple={} q8_0={} q8_0_pair={} q8_0_triple={}\n",
+        "{s}/{s}: model_dir={s} backend={s} batch_size={} avg_ms={d:.3} p50_ms={d:.3} p95_ms={d:.3} min_ms={d:.3} max_ms={d:.3} entity_count={} relation_count={} score_sum={d:.6} relation_score_sum={d:.6} native_quant_stats={s} q4q5={} q4q5_pair={} q4q5_triple={} q4q5_panel={} dequant={} dequant_pair={} dequant_triple={} q8_0={} q8_0_pair={} q8_0_triple={}\n",
         .{
             @tagName(result.task),
             result.mode,
             opts.model_dir,
             @tagName(opts.backend),
+            opts.batch_size,
             result.avg_ms,
             result.p50_ms,
             result.p95_ms,
@@ -429,17 +485,18 @@ fn printText(opts: Options, result: Result) void {
 }
 
 fn printCsvHeader() void {
-    std.debug.print("task,mode,model_dir,backend,avg_ms,p50_ms,p95_ms,min_ms,max_ms,entity_count,relation_count,score_sum,relation_score_sum,native_quant_stats_enabled,q4q5,q4q5_pair,q4q5_triple,q4q5_panel,dequant,dequant_pair,dequant_triple,q8_0,q8_0_pair,q8_0_triple\n", .{});
+    std.debug.print("task,mode,model_dir,backend,batch_size,avg_ms,p50_ms,p95_ms,min_ms,max_ms,entity_count,relation_count,score_sum,relation_score_sum,native_quant_stats_enabled,q4q5,q4q5_pair,q4q5_triple,q4q5_panel,dequant,dequant_pair,dequant_triple,q8_0,q8_0_pair,q8_0_triple\n", .{});
 }
 
 fn printCsv(opts: Options, result: Result) void {
     std.debug.print(
-        "{s},{s},{s},{s},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{},{},{d:.6},{d:.6},{},{},{},{},{},{},{},{},{},{},{}\n",
+        "{s},{s},{s},{s},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{},{},{d:.6},{d:.6},{},{},{},{},{},{},{},{},{},{},{}\n",
         .{
             @tagName(result.task),
             result.mode,
             opts.model_dir,
             @tagName(opts.backend),
+            opts.batch_size,
             result.avg_ms,
             result.p50_ms,
             result.p95_ms,
@@ -466,9 +523,27 @@ fn printCsv(opts: Options, result: Result) void {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|mlx] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv]
+        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT] [--text-repeat N] [--batch-size N] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|mlx] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
         \\
     , .{});
+}
+
+fn repeatedText(allocator: std.mem.Allocator, text: []const u8, repeat: usize) ![]const u8 {
+    if (repeat == 0) return error.InvalidTextRepeat;
+    if (repeat == 1) return allocator.dupe(u8, text);
+    const repeated_len = try std.math.mul(usize, text.len, repeat);
+    const spaces = repeat - 1;
+    const out = try allocator.alloc(u8, try std.math.add(usize, repeated_len, spaces));
+    var offset: usize = 0;
+    for (0..repeat) |i| {
+        if (i != 0) {
+            out[offset] = ' ';
+            offset += 1;
+        }
+        @memcpy(out[offset..][0..text.len], text);
+        offset += text.len;
+    }
+    return out;
 }
 
 fn nsToMs(ns: u64) f64 {

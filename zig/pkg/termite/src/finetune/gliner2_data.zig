@@ -61,6 +61,40 @@ pub const BatchShapeSummary = struct {
     positive_rate_per_label: f64,
 };
 
+pub const DatasetSpanTargetSummary = struct {
+    num_examples: usize,
+    max_length: usize,
+    max_span_width: usize,
+    num_entity_types: usize,
+    max_words_per_sample: usize,
+    max_spans_per_sample: usize,
+    valid_spans: usize,
+    positive_labels: usize,
+    positive_rate_per_label: f64,
+};
+
+pub const DatasetReadinessOptions = struct {
+    min_examples: usize = 1,
+    min_total_entities: usize = 1,
+    min_unique_labels: usize = 1,
+    min_target_entities: usize = 1,
+    min_target_coverage_ratio: f64 = 0.0,
+    require_all_examples_with_target: bool = false,
+    min_positive_span_labels: usize = 1,
+    min_positive_rate_per_label: f64 = 0.0,
+};
+
+pub const DatasetReadinessSummary = struct {
+    stats: DatasetStats,
+    coverage: TargetCoverageStats,
+    batch_shape: BatchShapeSummary,
+    span_targets: DatasetSpanTargetSummary,
+    filtered_examples: usize,
+    target_coverage_ratio: f64,
+    passed: bool,
+    failed_reasons: []const []const u8,
+};
+
 pub const LoadedExamples = struct {
     arena: std.heap.ArenaAllocator,
     dataset_root: []const u8,
@@ -552,6 +586,194 @@ pub const EncodedBatch = struct {
     }
 };
 
+pub const SpanPrediction = struct {
+    sample_index: usize,
+    span_index: usize,
+    word_start: usize,
+    word_end: usize,
+    entity_type_index: usize,
+    label: []const u8,
+    score: f32,
+};
+
+pub const EntityPrediction = struct {
+    sample_index: usize,
+    span_index: usize,
+    word_start: usize,
+    word_end: usize,
+    start: usize,
+    end: usize,
+    text: []const u8,
+    entity_type_index: usize,
+    label: []const u8,
+    score: f32,
+};
+
+pub fn decodeSpanPredictionsAlloc(
+    allocator: std.mem.Allocator,
+    batch: *const EncodedBatch,
+    entity_types: []const []const u8,
+    span_scores: []const f32,
+    threshold: f32,
+) ![]SpanPrediction {
+    if (entity_types.len != batch.num_entity_types) return error.EntityTypeCountMismatch;
+    if (!std.math.isFinite(threshold)) return error.InvalidThreshold;
+    const expected_scores = batch.batch_size * batch.max_spans * batch.num_entity_types;
+    if (span_scores.len != expected_scores) return error.SpanScoreShapeMismatch;
+
+    var out = std.ArrayListUnmanaged(SpanPrediction).empty;
+    errdefer out.deinit(allocator);
+
+    for (0..batch.batch_size) |sample_idx| {
+        for (0..batch.max_spans) |span_idx| {
+            const flat_span_idx = sample_idx * batch.max_spans + span_idx;
+            if (batch.span_mask[flat_span_idx] <= 0.0) continue;
+
+            const start_raw = batch.span_indices[flat_span_idx * 2];
+            const end_raw = batch.span_indices[flat_span_idx * 2 + 1];
+            if (start_raw < 0 or end_raw < 0) continue;
+
+            for (0..batch.num_entity_types) |entity_type_idx| {
+                const score_idx = flat_span_idx * batch.num_entity_types + entity_type_idx;
+                const score = span_scores[score_idx];
+                if (!std.math.isFinite(score) or score < threshold) continue;
+                try out.append(allocator, .{
+                    .sample_index = sample_idx,
+                    .span_index = span_idx,
+                    .word_start = @intCast(start_raw),
+                    .word_end = @intCast(end_raw),
+                    .entity_type_index = entity_type_idx,
+                    .label = entity_types[entity_type_idx],
+                    .score = score,
+                });
+            }
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn tokenLogitsToSpanScoresAlloc(
+    allocator: std.mem.Allocator,
+    batch: *const EncodedBatch,
+    token_logits: []const f32,
+    num_classes: usize,
+) ![]f32 {
+    if (num_classes < batch.num_entity_types + 1) return error.EntityClassCountMismatch;
+    const expected_logits = batch.batch_size * batch.max_length * num_classes;
+    if (token_logits.len != expected_logits) return error.TokenLogitShapeMismatch;
+
+    const span_scores = try allocator.alloc(f32, batch.batch_size * batch.max_spans * batch.num_entity_types);
+    errdefer allocator.free(span_scores);
+    @memset(span_scores, 0.0);
+
+    for (0..batch.batch_size) |sample_idx| {
+        const word_pos_offset = sample_idx * batch.max_words_per_sample;
+        for (0..batch.max_spans) |span_idx| {
+            const flat_span_idx = sample_idx * batch.max_spans + span_idx;
+            if (batch.span_mask[flat_span_idx] <= 0.0) continue;
+
+            const start_raw = batch.span_indices[flat_span_idx * 2];
+            const end_raw = batch.span_indices[flat_span_idx * 2 + 1];
+            if (start_raw < 0 or end_raw < 0) continue;
+            const word_start: usize = @intCast(start_raw);
+            const word_end: usize = @intCast(end_raw);
+            if (word_start > word_end or word_end >= batch.max_words_per_sample) return error.InvalidSpanWordIndex;
+
+            const word_count = word_end - word_start + 1;
+            for (0..batch.num_entity_types) |entity_type_idx| {
+                const class_idx = entity_type_idx + 1;
+                var sum: f32 = 0.0;
+                for (word_start..word_end + 1) |word_idx| {
+                    const token_pos_raw = batch.first_token_positions[word_pos_offset + word_idx];
+                    if (token_pos_raw < 0) return error.InvalidTokenPosition;
+                    const token_pos: usize = @intCast(token_pos_raw);
+                    if (token_pos >= batch.max_length) return error.InvalidTokenPosition;
+                    const row = token_logits[(sample_idx * batch.max_length + token_pos) * num_classes ..][0..num_classes];
+                    sum += softmaxClassProbability(row, class_idx);
+                }
+                span_scores[flat_span_idx * batch.num_entity_types + entity_type_idx] =
+                    sum / @as(f32, @floatFromInt(word_count));
+            }
+        }
+    }
+
+    return span_scores;
+}
+
+pub fn decodeEntityPredictionsAlloc(
+    allocator: std.mem.Allocator,
+    batch: *const EncodedBatch,
+    examples: []const Example,
+    entity_types: []const []const u8,
+    span_scores: []const f32,
+    threshold: f32,
+) ![]EntityPrediction {
+    if (examples.len < batch.batch_size) return error.ExampleCountMismatch;
+    if (entity_types.len != batch.num_entity_types) return error.EntityTypeCountMismatch;
+    if (!std.math.isFinite(threshold)) return error.InvalidThreshold;
+    const expected_scores = batch.batch_size * batch.max_spans * batch.num_entity_types;
+    if (span_scores.len != expected_scores) return error.SpanScoreShapeMismatch;
+
+    var out = std.ArrayListUnmanaged(EntityPrediction).empty;
+    errdefer out.deinit(allocator);
+
+    for (0..batch.batch_size) |sample_idx| {
+        const word_boundaries = try getWordBoundaries(allocator, examples[sample_idx].text);
+        defer allocator.free(word_boundaries);
+
+        for (0..batch.max_spans) |span_idx| {
+            const flat_span_idx = sample_idx * batch.max_spans + span_idx;
+            if (batch.span_mask[flat_span_idx] <= 0.0) continue;
+
+            const start_raw = batch.span_indices[flat_span_idx * 2];
+            const end_raw = batch.span_indices[flat_span_idx * 2 + 1];
+            if (start_raw < 0 or end_raw < 0) continue;
+
+            const word_start: usize = @intCast(start_raw);
+            const word_end: usize = @intCast(end_raw);
+            if (word_start >= word_boundaries.len or word_end >= word_boundaries.len) continue;
+            const char_start = word_boundaries[word_start][0];
+            const char_end = word_boundaries[word_end][1];
+            if (char_start > char_end or char_end > examples[sample_idx].text.len) continue;
+
+            for (0..batch.num_entity_types) |entity_type_idx| {
+                const score_idx = flat_span_idx * batch.num_entity_types + entity_type_idx;
+                const score = span_scores[score_idx];
+                if (!std.math.isFinite(score) or score < threshold) continue;
+                try out.append(allocator, .{
+                    .sample_index = sample_idx,
+                    .span_index = span_idx,
+                    .word_start = word_start,
+                    .word_end = word_end,
+                    .start = char_start,
+                    .end = char_end,
+                    .text = examples[sample_idx].text[char_start..char_end],
+                    .entity_type_index = entity_type_idx,
+                    .label = entity_types[entity_type_idx],
+                    .score = score,
+                });
+            }
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn softmaxClassProbability(logits: []const f32, class_idx: usize) f32 {
+    std.debug.assert(class_idx < logits.len);
+    var max_logit: f32 = -std.math.inf(f32);
+    for (logits) |value| {
+        if (value > max_logit) max_logit = value;
+    }
+    var denom: f32 = 0.0;
+    for (logits) |value| {
+        denom += @exp(value - max_logit);
+    }
+    if (denom <= 0 or !std.math.isFinite(denom)) return 0;
+    return @exp(logits[class_idx] - max_logit) / denom;
+}
+
 pub const ReusableBatch = struct {
     allocator: std.mem.Allocator,
     input_ids: []i32,
@@ -689,6 +911,21 @@ pub fn buildLabelVocab(allocator: std.mem.Allocator, examples: []const Example, 
     return out;
 }
 
+pub fn validateLabelClassCapacity(
+    allocator: std.mem.Allocator,
+    examples: []const Example,
+    num_classes: usize,
+) !usize {
+    if (num_classes < 2) return error.InvalidNumClasses;
+    const labels = try buildLabelVocab(allocator, examples, null);
+    defer {
+        for (labels) |label| allocator.free(label);
+        allocator.free(labels);
+    }
+    if (labels.len + 1 > num_classes) return error.TooManyEntityTypes;
+    return labels.len;
+}
+
 pub fn computeTargetCoverageStats(examples: []const Example, entity_types: []const []const u8) TargetCoverageStats {
     var stats = std.mem.zeroInit(TargetCoverageStats, .{ .num_samples = examples.len });
     for (examples) |ex| {
@@ -703,6 +940,87 @@ pub fn computeTargetCoverageStats(examples: []const Example, entity_types: []con
         if (has_target) stats.samples_with_target += 1 else stats.samples_without_target += 1;
     }
     return stats;
+}
+
+pub fn evaluateDatasetReadiness(
+    allocator: std.mem.Allocator,
+    examples: []const Example,
+    entity_types: []const []const u8,
+    max_length: usize,
+    max_span_width: usize,
+    batch_size: usize,
+    options: DatasetReadinessOptions,
+) !DatasetReadinessSummary {
+    const stats = try computeStats(allocator, examples);
+    const coverage = computeTargetCoverageStats(examples, entity_types);
+    const filtered = try filterExamplesForEntityTypes(allocator, examples, entity_types, false);
+    defer freeExamples(allocator, filtered);
+    const batch_shape = try buildSimpleBatchShapeSummary(allocator, filtered, entity_types, max_length, max_span_width, batch_size);
+    const span_targets = try summarizeSpanTargetsForExamples(allocator, filtered, entity_types, max_length, max_span_width);
+    const target_coverage_ratio = if (coverage.total_entities == 0)
+        0.0
+    else
+        @as(f64, @floatFromInt(coverage.target_entities)) / @as(f64, @floatFromInt(coverage.total_entities));
+
+    var reasons = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer reasons.deinit(allocator);
+
+    if (stats.num_examples < options.min_examples) try reasons.append(allocator, "min_examples");
+    if (coverage.total_entities < options.min_total_entities) try reasons.append(allocator, "min_total_entities");
+    if (stats.unique_labels < options.min_unique_labels) try reasons.append(allocator, "min_unique_labels");
+    if (coverage.target_entities < options.min_target_entities) try reasons.append(allocator, "min_target_entities");
+    if (target_coverage_ratio < options.min_target_coverage_ratio) try reasons.append(allocator, "min_target_coverage_ratio");
+    if (options.require_all_examples_with_target and coverage.samples_without_target != 0) try reasons.append(allocator, "require_all_examples_with_target");
+    if (span_targets.positive_labels < options.min_positive_span_labels) try reasons.append(allocator, "min_positive_span_labels");
+    if (span_targets.positive_rate_per_label < options.min_positive_rate_per_label) try reasons.append(allocator, "min_positive_rate_per_label");
+
+    return .{
+        .stats = stats,
+        .coverage = coverage,
+        .batch_shape = batch_shape,
+        .span_targets = span_targets,
+        .filtered_examples = filtered.len,
+        .target_coverage_ratio = target_coverage_ratio,
+        .passed = reasons.items.len == 0,
+        .failed_reasons = try reasons.toOwnedSlice(allocator),
+    };
+}
+
+pub fn summarizeSpanTargetsForExamples(
+    allocator: std.mem.Allocator,
+    examples: []const Example,
+    entity_types: []const []const u8,
+    max_length: usize,
+    max_span_width: usize,
+) !DatasetSpanTargetSummary {
+    const max_words_per_sample = computeMaxWordsPerSample(max_length, entity_types.len);
+    const max_spans_per_sample = max_words_per_sample * max_span_width;
+    var valid_spans: usize = 0;
+    var positive_labels: usize = 0;
+
+    for (examples) |ex| {
+        const summary = try summarizeSpanTargets(allocator, ex, entity_types, max_span_width);
+        valid_spans += summary.valid_spans;
+        positive_labels += summary.positive_labels;
+    }
+
+    const denom = @as(f64, @floatFromInt(@max(@as(usize, 1), examples.len * max_spans_per_sample * entity_types.len)));
+    return .{
+        .num_examples = examples.len,
+        .max_length = max_length,
+        .max_span_width = max_span_width,
+        .num_entity_types = entity_types.len,
+        .max_words_per_sample = max_words_per_sample,
+        .max_spans_per_sample = max_spans_per_sample,
+        .valid_spans = valid_spans,
+        .positive_labels = positive_labels,
+        .positive_rate_per_label = @as(f64, @floatFromInt(positive_labels)) / denom,
+    };
+}
+
+pub fn freeDatasetReadinessSummary(allocator: std.mem.Allocator, summary: *DatasetReadinessSummary) void {
+    allocator.free(summary.failed_reasons);
+    summary.* = undefined;
 }
 
 pub fn filterExamplesForEntityTypes(
@@ -814,7 +1132,8 @@ pub fn buildSimpleBatch(
     max_span_width: usize,
     batch_size: usize,
 ) !EncodedBatch {
-    var workspace = try ReusableBatch.init(allocator, batch_size, max_length, max_span_width, entity_types.len);
+    const effective_batch = @min(batch_size, examples.len);
+    var workspace = try ReusableBatch.init(allocator, effective_batch, max_length, max_span_width, entity_types.len);
     errdefer workspace.deinit();
     var batch = try buildSimpleBatchInto(&workspace, tokenizer, examples, entity_types, max_span_width);
     batch.owns_memory = true;
@@ -1193,6 +1512,93 @@ test "build simple gliner2 batch" {
     var entities = [_]Entity{
         .{ .text = "john", .label = "person", .start = 0, .end = 4 },
         .{ .text = "acme", .label = "organization", .start = 14, .end = 18 },
+        .{ .text = "paris", .label = "location", .start = 22, .end = 27 },
+    };
+    const examples = [_]Example{
+        .{
+            .text = "john works at acme in paris",
+            .entities = entities[0..],
+        },
+    };
+    var batch = try buildSimpleBatch(allocator, &tokenizer, examples[0..], entity_types[0..], 64, 4, 1);
+    defer batch.deinit();
+    try std.testing.expectEqual(@as(usize, 1), batch.batch_size);
+    try std.testing.expect(batch.input_ids.len == 64);
+    try std.testing.expect(batch.span_labels.len == batch.max_spans * entity_types.len);
+}
+
+test "decode gliner2 span predictions from score grid" {
+    const allocator = std.testing.allocator;
+    var tokenizer = try Tokenizer.initDefault(allocator);
+    defer tokenizer.deinit(allocator);
+    const entity_types = [_][]const u8{ "person", "organization", "location" };
+    var entities = [_]Entity{
+        .{ .text = "john", .label = "person", .start = 0, .end = 4 },
+        .{ .text = "acme", .label = "organization", .start = 14, .end = 18 },
+        .{ .text = "paris", .label = "location", .start = 22, .end = 27 },
+    };
+    const examples = [_]Example{
+        .{
+            .text = "john works at acme in paris",
+            .entities = entities[0..],
+        },
+    };
+    var batch = try buildSimpleBatch(allocator, &tokenizer, examples[0..], entity_types[0..], 64, 4, 1);
+    defer batch.deinit();
+
+    const predictions = try decodeSpanPredictionsAlloc(allocator, &batch, entity_types[0..], batch.span_labels, 0.5);
+    defer allocator.free(predictions);
+    try std.testing.expectEqual(@as(usize, 3), predictions.len);
+    try std.testing.expectEqual(@as(usize, 0), predictions[0].sample_index);
+    try std.testing.expectEqual(@as(usize, 0), predictions[0].word_start);
+    try std.testing.expectEqual(@as(usize, 0), predictions[0].word_end);
+    try std.testing.expectEqual(@as(usize, 0), predictions[0].entity_type_index);
+    try std.testing.expectEqualStrings("person", predictions[0].label);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), predictions[0].score, 1e-6);
+
+    try std.testing.expectEqual(@as(usize, 3), predictions[1].word_start);
+    try std.testing.expectEqual(@as(usize, 3), predictions[1].word_end);
+    try std.testing.expectEqual(@as(usize, 1), predictions[1].entity_type_index);
+    try std.testing.expectEqualStrings("organization", predictions[1].label);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), predictions[1].score, 1e-6);
+
+    try std.testing.expectEqual(@as(usize, 5), predictions[2].word_start);
+    try std.testing.expectEqual(@as(usize, 5), predictions[2].word_end);
+    try std.testing.expectEqual(@as(usize, 2), predictions[2].entity_type_index);
+    try std.testing.expectEqualStrings("location", predictions[2].label);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), predictions[2].score, 1e-6);
+
+    const entity_predictions = try decodeEntityPredictionsAlloc(allocator, &batch, examples[0..], entity_types[0..], batch.span_labels, 0.5);
+    defer allocator.free(entity_predictions);
+    try std.testing.expectEqual(@as(usize, 3), entity_predictions.len);
+
+    try std.testing.expectEqual(@as(usize, 0), entity_predictions[0].start);
+    try std.testing.expectEqual(@as(usize, 4), entity_predictions[0].end);
+    try std.testing.expectEqualStrings("john", entity_predictions[0].text);
+    try std.testing.expectEqualStrings("person", entity_predictions[0].label);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), entity_predictions[0].score, 1e-6);
+
+    try std.testing.expectEqual(@as(usize, 14), entity_predictions[1].start);
+    try std.testing.expectEqual(@as(usize, 18), entity_predictions[1].end);
+    try std.testing.expectEqualStrings("acme", entity_predictions[1].text);
+    try std.testing.expectEqualStrings("organization", entity_predictions[1].label);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), entity_predictions[1].score, 1e-6);
+
+    try std.testing.expectEqual(@as(usize, 22), entity_predictions[2].start);
+    try std.testing.expectEqual(@as(usize, 27), entity_predictions[2].end);
+    try std.testing.expectEqualStrings("paris", entity_predictions[2].text);
+    try std.testing.expectEqualStrings("location", entity_predictions[2].label);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), entity_predictions[2].score, 1e-6);
+}
+
+test "decode gliner2 entity predictions from token logits" {
+    const allocator = std.testing.allocator;
+    var tokenizer = try Tokenizer.initDefault(allocator);
+    defer tokenizer.deinit(allocator);
+    const entity_types = [_][]const u8{ "person", "organization", "location" };
+    var entities = [_]Entity{
+        .{ .text = "john", .label = "person", .start = 0, .end = 4 },
+        .{ .text = "acme", .label = "organization", .start = 14, .end = 18 },
     };
     const examples = [_]Example{
         .{
@@ -1202,7 +1608,36 @@ test "build simple gliner2 batch" {
     };
     var batch = try buildSimpleBatch(allocator, &tokenizer, examples[0..], entity_types[0..], 64, 4, 1);
     defer batch.deinit();
-    try std.testing.expectEqual(@as(usize, 1), batch.batch_size);
-    try std.testing.expect(batch.input_ids.len == 64);
-    try std.testing.expect(batch.span_labels.len == batch.max_spans * entity_types.len);
+
+    const num_classes = entity_types.len + 1;
+    const token_logits = try allocator.alloc(f32, batch.batch_size * batch.max_length * num_classes);
+    defer allocator.free(token_logits);
+    @memset(token_logits, -8.0);
+    for (0..batch.batch_size * batch.max_length) |row_idx| {
+        token_logits[row_idx * num_classes] = 8.0;
+    }
+
+    const john_token: usize = @intCast(batch.first_token_positions[0]);
+    const acme_token: usize = @intCast(batch.first_token_positions[3]);
+    token_logits[john_token * num_classes + 0] = -8.0;
+    token_logits[john_token * num_classes + 1] = 8.0;
+    token_logits[acme_token * num_classes + 0] = -8.0;
+    token_logits[acme_token * num_classes + 2] = 8.0;
+
+    const span_scores = try tokenLogitsToSpanScoresAlloc(allocator, &batch, token_logits, num_classes);
+    defer allocator.free(span_scores);
+    const entity_predictions = try decodeEntityPredictionsAlloc(allocator, &batch, examples[0..], entity_types[0..], span_scores, 0.99);
+    defer allocator.free(entity_predictions);
+    try std.testing.expectEqual(@as(usize, 2), entity_predictions.len);
+    try std.testing.expectEqual(@as(usize, 0), entity_predictions[0].start);
+    try std.testing.expectEqual(@as(usize, 4), entity_predictions[0].end);
+    try std.testing.expectEqualStrings("john", entity_predictions[0].text);
+    try std.testing.expectEqualStrings("person", entity_predictions[0].label);
+    try std.testing.expect(entity_predictions[0].score > 0.99);
+
+    try std.testing.expectEqual(@as(usize, 14), entity_predictions[1].start);
+    try std.testing.expectEqual(@as(usize, 18), entity_predictions[1].end);
+    try std.testing.expectEqualStrings("acme", entity_predictions[1].text);
+    try std.testing.expectEqualStrings("organization", entity_predictions[1].label);
+    try std.testing.expect(entity_predictions[1].score > 0.99);
 }

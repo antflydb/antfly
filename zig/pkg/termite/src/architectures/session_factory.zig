@@ -124,6 +124,349 @@ fn graphRuntimeStrategyEnabled(strategy: ?graph_runtime.Strategy) bool {
     return if (strategy) |s| s != .interpreter else false;
 }
 
+fn glinerProfileEnabled() bool {
+    return platform.env.getenvBool("TERMITE_GLINER_PROFILE");
+}
+
+fn glinerArchitectureAuditEnabled() bool {
+    return platform.env.getenvBool("TERMITE_GLINER_ARCH_AUDIT");
+}
+
+fn glinerSessionFrameEnabled() bool {
+    if (platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_SESSION_FRAME")) return false;
+    return true;
+}
+
+fn glinerDenseQkvScratchEnabled() bool {
+    return !platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED");
+}
+
+fn glinerHeadCustomMlp2Enabled() bool {
+    if (platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_HEAD_CUSTOM_MLP2")) return false;
+    return true;
+}
+
+const metal_graph_plan_hot_hidden_slot_base: usize = 17;
+const metal_graph_plan_hot_intermediate_slot_base: usize = 21;
+
+fn glinerSessionScratchBytes(batch: usize, seq_len: usize, span_idx: []const i64, hidden_size: usize, intermediate_size: usize) ?struct {
+    encoder_hidden: usize,
+    projection_hidden: usize,
+    hot_hidden: usize,
+    hot_intermediate: usize,
+} {
+    const encoder_rows = std.math.mul(usize, batch, seq_len) catch return null;
+    const span_rows = span_idx.len / 2;
+    const projection_rows = @max(encoder_rows, span_rows);
+    const hot_rows = if (glinerHeadCustomMlp2Enabled()) projection_rows else encoder_rows;
+    const encoder_hidden_elems = std.math.mul(usize, encoder_rows, hidden_size) catch return null;
+    const projection_hidden_elems = std.math.mul(usize, projection_rows, hidden_size) catch return null;
+    const hot_hidden_elems = std.math.mul(usize, hot_rows, hidden_size) catch return null;
+    const hot_intermediate_elems = std.math.mul(usize, hot_rows, intermediate_size) catch return null;
+    return .{
+        .encoder_hidden = std.math.mul(usize, encoder_hidden_elems, @sizeOf(f32)) catch return null,
+        .projection_hidden = std.math.mul(usize, projection_hidden_elems, @sizeOf(f32)) catch return null,
+        .hot_hidden = std.math.mul(usize, hot_hidden_elems, @sizeOf(f32)) catch return null,
+        .hot_intermediate = std.math.mul(usize, hot_intermediate_elems, @sizeOf(f32)) catch return null,
+    };
+}
+
+fn reserveGlinerSessionScratch(cb: *const ops.ComputeBackend, batch: usize, seq_len: usize, span_idx: []const i64, cfg: deberta_mod.Config) bool {
+    const bytes = glinerSessionScratchBytes(batch, seq_len, span_idx, cfg.hidden_size, cfg.intermediate_size) orelse return false;
+    if (glinerDenseQkvScratchEnabled()) {
+        var slots: [15]ops.GraphPlanSlot = undefined;
+        for (0..3) |i| {
+            slots[i] = .{
+                .slot = i,
+                .bytes = bytes.projection_hidden,
+            };
+        }
+        slots[3] = .{
+            .slot = 3,
+            .bytes = bytes.projection_hidden * 3,
+        };
+        for (0..2) |i| {
+            slots[4 + i] = .{
+                .slot = 4 + i,
+                .bytes = bytes.projection_hidden,
+            };
+        }
+        for (0..4) |i| {
+            slots[6 + i] = .{
+                .slot = metal_graph_plan_hot_hidden_slot_base + i,
+                .bytes = bytes.hot_hidden,
+            };
+        }
+        for (0..5) |i| {
+            slots[10 + i] = .{
+                .slot = metal_graph_plan_hot_intermediate_slot_base + i,
+                .bytes = bytes.hot_intermediate,
+            };
+        }
+        return cb.reserveGraphPlanSlots(&slots) catch false;
+    }
+
+    var slots: [9]ops.GraphPlanSlot = undefined;
+    for (0..4) |i| {
+        slots[i] = .{
+            .slot = metal_graph_plan_hot_hidden_slot_base + i,
+            .bytes = bytes.hot_hidden,
+        };
+    }
+    for (0..5) |i| {
+        slots[4 + i] = .{
+            .slot = metal_graph_plan_hot_intermediate_slot_base + i,
+            .bytes = bytes.hot_intermediate,
+        };
+    }
+    return cb.reserveGraphPlanSlots(&slots) catch false;
+}
+
+fn glinerProfileNowNs() u64 {
+    if (!glinerProfileEnabled()) return 0;
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
+}
+
+fn glinerProfileElapsedMs(start_ns: u64) f64 {
+    if (start_ns == 0) return 0.0;
+    const now = glinerProfileNowNs();
+    if (now <= start_ns) return 0.0;
+    return @as(f64, @floatFromInt(now - start_ns)) / @as(f64, @floatFromInt(std.time.ns_per_ms));
+}
+
+fn nsToProfileMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_ms));
+}
+
+fn ns128ToProfileMs(ns: u128) f64 {
+    return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_ms));
+}
+
+fn deltaU64(after: u64, before: u64) u64 {
+    return if (after >= before) after - before else 0;
+}
+
+fn deltaU128(after: u128, before: u128) u128 {
+    return if (after >= before) after - before else 0;
+}
+
+fn yesNo(value: bool) []const u8 {
+    return if (value) "yes" else "no";
+}
+
+fn printGlinerHeadProfile(profile: gliner_head.ForwardProfile) void {
+    if (!glinerProfileEnabled()) return;
+    std.debug.print(
+        "gliner_head_profile: materialize_hidden_ms={d:.3} extract_words_ms={d:.3} extract_labels_ms={d:.3} span_info_ms={d:.3} span_marker_ms={d:.3} span_word_to_ct_ms={d:.3} span_start_end_mlp_ms={d:.3} span_start_end_first_linear_ms={d:.3} span_start_end_relu_ms={d:.3} span_start_end_second_linear_ms={d:.3} span_gather_concat_relu_ms={d:.3} span_out_project_ms={d:.3} span_out_project_first_linear_ms={d:.3} span_out_project_second_linear_ms={d:.3} label_projection_ms={d:.3} logits_ms={d:.3}\n",
+        .{
+            nsToProfileMs(profile.materialize_hidden_ns),
+            nsToProfileMs(profile.extract_words_ns),
+            nsToProfileMs(profile.extract_labels_ns),
+            nsToProfileMs(profile.span_info_ns),
+            nsToProfileMs(profile.span_marker_ns),
+            nsToProfileMs(profile.span_word_to_ct_ns),
+            nsToProfileMs(profile.span_start_end_mlp_ns),
+            nsToProfileMs(profile.span_start_end_first_linear_ns),
+            nsToProfileMs(profile.span_start_end_relu_ns),
+            nsToProfileMs(profile.span_start_end_second_linear_ns),
+            nsToProfileMs(profile.span_gather_concat_relu_ns),
+            nsToProfileMs(profile.span_out_project_ns),
+            nsToProfileMs(profile.span_out_project_first_linear_ns),
+            nsToProfileMs(profile.span_out_project_second_linear_ns),
+            nsToProfileMs(profile.label_projection_ns),
+            nsToProfileMs(profile.logits_ns),
+        },
+    );
+}
+
+fn printDebertaEncoderProfile(profile: deberta_arch.EncoderProfile) void {
+    if (!glinerProfileEnabled()) return;
+    std.debug.print(
+        "gliner_encoder_profile: embeddings_ms={d:.3} relative_position_ms={d:.3} layer_total_ms={d:.3} qkv_ms={d:.3} relative_qk_ms={d:.3} attention_ms={d:.3} attention_output_ms={d:.3} ffn_intermediate_ms={d:.3} ffn_output_ms={d:.3} layernorm_residual_ms={d:.3}\n",
+        .{
+            nsToProfileMs(profile.embeddings_ns),
+            nsToProfileMs(profile.relative_position_ns),
+            nsToProfileMs(profile.layer_total_ns),
+            nsToProfileMs(profile.qkv_ns),
+            nsToProfileMs(profile.relative_qk_ns),
+            nsToProfileMs(profile.attention_ns),
+            nsToProfileMs(profile.attention_output_ns),
+            nsToProfileMs(profile.ffn_intermediate_ns),
+            nsToProfileMs(profile.ffn_output_ns),
+            nsToProfileMs(profile.layernorm_residual_ns),
+        },
+    );
+}
+
+fn printGlinerMetalArchitectureAudit(
+    backend_type: BackendType,
+    cfg: deberta_mod.Config,
+    before: ops.BackendDebugTimingSnapshot,
+    after: ops.BackendDebugTimingSnapshot,
+) void {
+    if (!glinerArchitectureAuditEnabled()) return;
+    if (backend_type != .metal) {
+        std.debug.print(
+            "gliner_arch_audit: backend={s} status=skip reason=non_metal\n",
+            .{@tagName(backend_type)},
+        );
+        return;
+    }
+
+    const b = before.provider;
+    const a = after.provider;
+    const layer_count: u64 = @intCast(cfg.num_hidden_layers);
+    const frame_begins = deltaU64(a.decoder_runtime_frame_begins, b.decoder_runtime_frame_begins);
+    const frame_submits = deltaU64(a.decoder_runtime_frame_submits, b.decoder_runtime_frame_submits);
+    const mps_standalone = deltaU64(a.metal_runtime_mps_dense_linear_standalone_calls, b.metal_runtime_mps_dense_linear_standalone_calls);
+    const mps_active = deltaU64(a.metal_runtime_mps_dense_linear_active_frame_calls, b.metal_runtime_mps_dense_linear_active_frame_calls);
+    const mps_ffn = deltaU64(a.metal_runtime_deberta_ffn_fused_mps_matmuls, b.metal_runtime_deberta_ffn_fused_mps_matmuls);
+    const mpsgraph_ffn = deltaU64(a.metal_runtime_mpsgraph_ffn_calls, b.metal_runtime_mpsgraph_ffn_calls);
+    const plan_successes = deltaU64(a.metal_runtime_deberta_encoder_frame_plan_successes, b.metal_runtime_deberta_encoder_frame_plan_successes);
+    const plan_failures = deltaU64(a.metal_runtime_deberta_encoder_frame_plan_failures, b.metal_runtime_deberta_encoder_frame_plan_failures);
+    const embedding_successes = deltaU64(a.metal_runtime_deberta_embeddings_successes, b.metal_runtime_deberta_embeddings_successes);
+    const embedding_fallbacks = deltaU64(a.metal_runtime_deberta_embeddings_fallbacks, b.metal_runtime_deberta_embeddings_fallbacks);
+    const layer_successes = deltaU64(a.metal_runtime_deberta_encoder_layer_successes, b.metal_runtime_deberta_encoder_layer_successes);
+    const layer_fallbacks = deltaU64(a.metal_runtime_deberta_encoder_layer_fallbacks, b.metal_runtime_deberta_encoder_layer_fallbacks);
+    const ffn_fused = deltaU64(a.metal_runtime_deberta_ffn_fused_calls, b.metal_runtime_deberta_ffn_fused_calls);
+    const ffn_fallbacks = deltaU64(a.metal_runtime_deberta_ffn_fused_fallbacks, b.metal_runtime_deberta_ffn_fused_fallbacks);
+    const packed_qkv = deltaU64(a.metal_runtime_dense_qkv_packed_calls, b.metal_runtime_dense_qkv_packed_calls);
+    const packed_qkv_fallbacks = deltaU64(a.metal_runtime_dense_qkv_packed_fallbacks, b.metal_runtime_dense_qkv_packed_fallbacks);
+    const relative_qk_pair = deltaU64(a.metal_runtime_deberta_relative_qk_pair_calls, b.metal_runtime_deberta_relative_qk_pair_calls);
+    const relative_qk_pair_fallbacks = deltaU64(a.metal_runtime_deberta_relative_qk_pair_fallbacks, b.metal_runtime_deberta_relative_qk_pair_fallbacks);
+    const attention_legacy = deltaU64(a.metal_runtime_deberta_attention_legacy_calls, b.metal_runtime_deberta_attention_legacy_calls);
+    const attention_gemm = deltaU64(a.metal_runtime_deberta_attention_gemm_calls, b.metal_runtime_deberta_attention_gemm_calls);
+    const attention_gemm_fallbacks = deltaU64(a.metal_runtime_deberta_attention_gemm_fallbacks, b.metal_runtime_deberta_attention_gemm_fallbacks);
+    const graph_plan_reuses = deltaU64(a.metal_runtime_graph_plan_reuses, b.metal_runtime_graph_plan_reuses);
+    const host_downloads = deltaU64(a.metal_tensor_to_host_calls, b.metal_tensor_to_host_calls);
+    const host_download_device_calls = deltaU64(a.metal_tensor_to_host_device_calls, b.metal_tensor_to_host_device_calls);
+    const host_download_bytes = deltaU64(a.metal_tensor_host_mirror_download_bytes, b.metal_tensor_host_mirror_download_bytes);
+
+    const resident_frame = frame_begins == 1 and frame_submits == 1;
+    const no_mps = mps_standalone == 0 and mps_active == 0 and a.metal_runtime_last_frame_mps_dense_linear_count == 0 and mps_ffn == 0 and mpsgraph_ffn == 0;
+    const planned_encoder = plan_successes >= 1 and plan_failures == 0;
+    const fused_embeddings = embedding_successes >= 1 and embedding_fallbacks == 0;
+    const planned_layers = layer_successes == layer_count and layer_fallbacks == 0;
+    const fused_ffn = ffn_fused == layer_count and ffn_fallbacks == 0;
+    const packed_qkv_ok = packed_qkv == layer_count and packed_qkv_fallbacks == 0;
+    const relative_qk_pair_ok = relative_qk_pair == layer_count and relative_qk_pair_fallbacks == 0;
+    const one_final_download = host_downloads <= 1 and host_download_device_calls <= 1;
+    const warm_plan_reuse = graph_plan_reuses > 0;
+    const pass = resident_frame and no_mps and planned_encoder and fused_embeddings and planned_layers and fused_ffn and packed_qkv_ok and relative_qk_pair_ok and one_final_download and warm_plan_reuse;
+
+    std.debug.print(
+        "gliner_arch_audit: status={s} resident_frame={s} no_mps={s} planned_encoder={s} fused_embeddings={s} planned_layers={s} fused_ffn={s} packed_qkv={s} relative_qk_pair={s} attention_gemm={} attention_legacy={} final_download_only={s} warm_plan_reuse={s} frame_begins={} frame_submits={} compute_encoders={} last_frame_compute_encoders={} mps_standalone={} mps_active={} last_frame_mps={} mps_ffn={} mpsgraph_ffn={}\n",
+        .{
+            if (pass) "pass" else "fail",
+            yesNo(resident_frame),
+            yesNo(no_mps),
+            yesNo(planned_encoder),
+            yesNo(fused_embeddings),
+            yesNo(planned_layers),
+            yesNo(fused_ffn),
+            yesNo(packed_qkv_ok),
+            yesNo(relative_qk_pair_ok),
+            attention_gemm,
+            attention_legacy,
+            yesNo(one_final_download),
+            yesNo(warm_plan_reuse),
+            frame_begins,
+            frame_submits,
+            deltaU64(a.metal_runtime_compute_encoder_count, b.metal_runtime_compute_encoder_count),
+            a.metal_runtime_last_frame_compute_encoder_count,
+            mps_standalone,
+            mps_active,
+            a.metal_runtime_last_frame_mps_dense_linear_count,
+            mps_ffn,
+            mpsgraph_ffn,
+        },
+    );
+    std.debug.print(
+        "gliner_arch_audit_detail: graph_plan_count={} graph_plan_reuses={} graph_plan_slots={} graph_plan_bytes={} embedding_successes={} embedding_fallbacks={} layer_successes={}/{} layer_fallbacks={} ffn_fused={}/{} ffn_fallbacks={} packed_qkv={}/{} packed_qkv_fallbacks={} relative_qk_pair={}/{} relative_qk_pair_fallbacks={} attention_gemm={} attention_gemm_fallbacks={} attention_legacy={} host_downloads={} host_download_device_calls={} host_download_bytes={}\n",
+        .{
+            deltaU64(a.metal_runtime_graph_plan_count, b.metal_runtime_graph_plan_count),
+            graph_plan_reuses,
+            a.metal_runtime_graph_plan_slots,
+            a.metal_runtime_graph_plan_bytes,
+            embedding_successes,
+            embedding_fallbacks,
+            layer_successes,
+            layer_count,
+            layer_fallbacks,
+            ffn_fused,
+            layer_count,
+            ffn_fallbacks,
+            packed_qkv,
+            layer_count,
+            packed_qkv_fallbacks,
+            relative_qk_pair,
+            layer_count,
+            relative_qk_pair_fallbacks,
+            attention_gemm,
+            attention_gemm_fallbacks,
+            attention_legacy,
+            host_downloads,
+            host_download_device_calls,
+            host_download_bytes,
+        },
+    );
+}
+
+fn printMetalRuntimeProfile(before: ops.BackendDebugTimingSnapshot, after: ops.BackendDebugTimingSnapshot) void {
+    if (!glinerProfileEnabled()) return;
+    const b = before.provider;
+    const a = after.provider;
+    std.debug.print(
+        "gliner_metal_profile: frame_begins={} frame_submits={} frame_wait_ms={d:.3} frame_gpu_ms={d:.3} compute_encoders={} last_frame_compute_encoders={} mps_standalone={} mps_active_frame={} mps_standalone_wait_ms={d:.3} mps_standalone_gpu_ms={d:.3} last_frame_mps={} graph_plan_count={} graph_plan_slots={} graph_plan_bytes={} graph_plan_reuses={} deberta_encoder_plan_attempts={} deberta_encoder_plan_successes={} deberta_encoder_plan_reuses={} deberta_encoder_plan_failures={} deberta_embeddings_attempts={} deberta_embeddings_successes={} deberta_embeddings_fallbacks={} deberta_encoder_layer_attempts={} deberta_encoder_layer_successes={} deberta_encoder_layer_fallbacks={} deberta_ffn_fused={} deberta_ffn_fused_mps={} deberta_ffn_fused_fallbacks={} deberta_attention_gemm={} deberta_attention_gemm_fallbacks={} deberta_attention_legacy={}\n",
+        .{
+            deltaU64(a.decoder_runtime_frame_begins, b.decoder_runtime_frame_begins),
+            deltaU64(a.decoder_runtime_frame_submits, b.decoder_runtime_frame_submits),
+            ns128ToProfileMs(deltaU128(a.decoder_runtime_frame_wait_nanos, b.decoder_runtime_frame_wait_nanos)),
+            ns128ToProfileMs(deltaU128(a.decoder_runtime_frame_gpu_nanos, b.decoder_runtime_frame_gpu_nanos)),
+            deltaU64(a.metal_runtime_compute_encoder_count, b.metal_runtime_compute_encoder_count),
+            a.metal_runtime_last_frame_compute_encoder_count,
+            deltaU64(a.metal_runtime_mps_dense_linear_standalone_calls, b.metal_runtime_mps_dense_linear_standalone_calls),
+            deltaU64(a.metal_runtime_mps_dense_linear_active_frame_calls, b.metal_runtime_mps_dense_linear_active_frame_calls),
+            nsToProfileMs(deltaU64(a.metal_runtime_mps_dense_linear_standalone_wait_nanos, b.metal_runtime_mps_dense_linear_standalone_wait_nanos)),
+            nsToProfileMs(deltaU64(a.metal_runtime_mps_dense_linear_standalone_gpu_nanos, b.metal_runtime_mps_dense_linear_standalone_gpu_nanos)),
+            a.metal_runtime_last_frame_mps_dense_linear_count,
+            deltaU64(a.metal_runtime_graph_plan_count, b.metal_runtime_graph_plan_count),
+            a.metal_runtime_graph_plan_slots,
+            a.metal_runtime_graph_plan_bytes,
+            deltaU64(a.metal_runtime_graph_plan_reuses, b.metal_runtime_graph_plan_reuses),
+            deltaU64(a.metal_runtime_deberta_encoder_frame_plan_attempts, b.metal_runtime_deberta_encoder_frame_plan_attempts),
+            deltaU64(a.metal_runtime_deberta_encoder_frame_plan_successes, b.metal_runtime_deberta_encoder_frame_plan_successes),
+            deltaU64(a.metal_runtime_deberta_encoder_frame_plan_reuses, b.metal_runtime_deberta_encoder_frame_plan_reuses),
+            deltaU64(a.metal_runtime_deberta_encoder_frame_plan_failures, b.metal_runtime_deberta_encoder_frame_plan_failures),
+            deltaU64(a.metal_runtime_deberta_embeddings_attempts, b.metal_runtime_deberta_embeddings_attempts),
+            deltaU64(a.metal_runtime_deberta_embeddings_successes, b.metal_runtime_deberta_embeddings_successes),
+            deltaU64(a.metal_runtime_deberta_embeddings_fallbacks, b.metal_runtime_deberta_embeddings_fallbacks),
+            deltaU64(a.metal_runtime_deberta_encoder_layer_attempts, b.metal_runtime_deberta_encoder_layer_attempts),
+            deltaU64(a.metal_runtime_deberta_encoder_layer_successes, b.metal_runtime_deberta_encoder_layer_successes),
+            deltaU64(a.metal_runtime_deberta_encoder_layer_fallbacks, b.metal_runtime_deberta_encoder_layer_fallbacks),
+            deltaU64(a.metal_runtime_deberta_ffn_fused_calls, b.metal_runtime_deberta_ffn_fused_calls),
+            deltaU64(a.metal_runtime_deberta_ffn_fused_mps_matmuls, b.metal_runtime_deberta_ffn_fused_mps_matmuls),
+            deltaU64(a.metal_runtime_deberta_ffn_fused_fallbacks, b.metal_runtime_deberta_ffn_fused_fallbacks),
+            deltaU64(a.metal_runtime_deberta_attention_gemm_calls, b.metal_runtime_deberta_attention_gemm_calls),
+            deltaU64(a.metal_runtime_deberta_attention_gemm_fallbacks, b.metal_runtime_deberta_attention_gemm_fallbacks),
+            deltaU64(a.metal_runtime_deberta_attention_legacy_calls, b.metal_runtime_deberta_attention_legacy_calls),
+        },
+    );
+    std.debug.print(
+        "gliner_metal_profile_mpsgraph: ffn={} ffn_fallbacks={} ffn_compiles={} ffn_cache_hits={}\n",
+        .{
+            deltaU64(a.metal_runtime_mpsgraph_ffn_calls, b.metal_runtime_mpsgraph_ffn_calls),
+            deltaU64(a.metal_runtime_mpsgraph_ffn_fallbacks, b.metal_runtime_mpsgraph_ffn_fallbacks),
+            deltaU64(a.metal_runtime_mpsgraph_ffn_compiles, b.metal_runtime_mpsgraph_ffn_compiles),
+            deltaU64(a.metal_runtime_mpsgraph_ffn_cache_hits, b.metal_runtime_mpsgraph_ffn_cache_hits),
+        },
+    );
+}
+
 fn shouldUseSharedGpuHostedEagerDenseLoad(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest, arch_config: ArchConfig) bool {
     if (forceMlxEagerDenseLoadDebug()) return true;
     switch (arch_config) {
@@ -4943,23 +5286,59 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                 return result;
             }
 
-            const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+            const profile_enabled = glinerProfileEnabled();
+            const audit_enabled = glinerArchitectureAuditEnabled();
+            const metal_profile_before = if (profile_enabled or audit_enabled) cb.debugTimingSnapshot() else ops.BackendDebugTimingSnapshot{};
+            _ = try deberta_arch.preplanMetalDebertaEncoderFrame(&cb, allocator, cfg, batch, seq_len);
+            var session_frame_active = false;
+            if (cb.kind() == .metal and glinerSessionFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
+                _ = reserveGlinerSessionScratch(&cb, batch, seq_len, span_idx, cfg);
+                session_frame_active = try cb.decoderRuntimeBeginFrame();
+            }
+            errdefer if (session_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+            const encoder_start_ns = glinerProfileNowNs();
+            var encoder_profile: deberta_arch.EncoderProfile = .{};
+            const hidden = try deberta_arch.forwardCtProfiled(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, if (profile_enabled) &encoder_profile else null);
             defer cb.free(hidden);
+            const encoder_ms = glinerProfileElapsedMs(encoder_start_ns);
 
             // Eager head path -- keeps the encoder/head boundary on the
             // backend (CT) so we skip the toFloat32 + fromFloat32Shape
             // round-trip the legacy []f32-typed APIs do.
-            const head_result = try gliner_head.forwardCtWithLabelMarkers(&cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, cfg.hidden_size, .{
+            var head_profile: gliner_head.ForwardProfile = .{};
+            const head_start_ns = glinerProfileNowNs();
+            const head_result = try gliner_head.forwardCtProfiledWithLabelMarkers(&cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, cfg.hidden_size, .{
                 .classification = cfg.classification_token_id,
                 .entity = cfg.entity_token_id,
                 .relation = cfg.relation_token_id,
-            });
+            }, if (profile_enabled) &head_profile else null);
             defer cb.free(head_result.logits);
+            const head_ms = glinerProfileElapsedMs(head_start_ns);
 
+            if (session_frame_active) {
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                session_frame_active = false;
+            }
+
+            const logits_start_ns = glinerProfileNowNs();
             const logits_f32 = if (head_result.num_labels == 0)
                 try allocator.alloc(f32, 0)
             else
                 try cb.toFloat32(head_result.logits, allocator);
+            const logits_materialize_ms = glinerProfileElapsedMs(logits_start_ns);
+            if (profile_enabled or audit_enabled) {
+                const metal_profile_after = cb.debugTimingSnapshot();
+                printGlinerMetalArchitectureAudit(self.backend_type, cfg, metal_profile_before, metal_profile_after);
+                if (profile_enabled) {
+                    std.debug.print(
+                        "gliner_session_profile: backend={s} batch={d} seq_len={d} encoder_ms={d:.3} head_ms={d:.3} logits_materialize_ms={d:.3}\n",
+                        .{ @tagName(self.backend_type), batch, seq_len, encoder_ms, head_ms, logits_materialize_ms },
+                    );
+                    printDebertaEncoderProfile(encoder_profile);
+                    printGlinerHeadProfile(head_profile);
+                    printMetalRuntimeProfile(metal_profile_before, metal_profile_after);
+                }
+            }
 
             const shape = [_]i64{
                 @intCast(batch),

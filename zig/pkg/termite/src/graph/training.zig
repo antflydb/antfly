@@ -30,6 +30,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ml = @import("ml");
+const platform = @import("antfly_platform");
 const Graph = ml.graph.Graph;
 const NodeId = ml.graph.NodeId;
 const null_node = ml.graph.null_node;
@@ -47,9 +48,11 @@ const RuntimeInput = interpreter.RuntimeInput;
 pub const TrainStepResult = struct {
     loss: f32,
     gradients: std.StringHashMapUnmanaged([]f32), // param_name -> gradient f32 data
+    device_gradients: std.StringHashMapUnmanaged(CT) = .{},
     profile: TrainStepProfile = .{},
     checkpoint_summary: ?CheckpointSummary = null,
     allocator: std.mem.Allocator,
+    compute_backend: ?*const ComputeBackend = null,
 
     pub fn deinit(self: *TrainStepResult) void {
         var it = self.gradients.iterator();
@@ -58,6 +61,14 @@ pub const TrainStepResult = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.gradients.deinit(self.allocator);
+        if (self.compute_backend) |cb| {
+            var device_it = self.device_gradients.iterator();
+            while (device_it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                cb.free(entry.value_ptr.*);
+            }
+        }
+        self.device_gradients.deinit(self.allocator);
     }
 };
 
@@ -84,6 +95,250 @@ pub const TrainStepOptions = struct {
     trainable_params: ?[]const []const u8 = null,
     checkpoint_config: ?checkpoint.CheckpointConfig = null,
     emit_checkpoint_analysis: bool = false,
+};
+
+pub const CompiledTrainSession = struct {
+    allocator: std.mem.Allocator,
+    graph: Graph,
+    id_map: []NodeId,
+    wrt_names: [][]const u8,
+    param_grads: []NodeId,
+    loss_output_index: usize = 0,
+    build_profile: TrainStepProfile = .{},
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        graph: *const Graph,
+        loss_node: NodeId,
+        options: TrainStepOptions,
+    ) !CompiledTrainSession {
+        var profile: TrainStepProfile = .{};
+        profile.peak_resident_bytes = currentResidentBytes();
+        compiledDiag(
+            "init begin nodes={} params={} outputs={} requested_wrt={} rss={}",
+            .{
+                graph.nodeCount(),
+                graph.parameters.items.len,
+                graph.outputs.items.len,
+                if (options.trainable_params) |params| params.len else @as(usize, 0),
+                profile.peak_resident_bytes,
+            },
+        );
+
+        const wrt = try resolveWrtParams(allocator, graph, options.trainable_params);
+        defer allocator.free(wrt);
+        compiledDiag("resolved wrt={} rss={}", .{ wrt.len, currentResidentBytes() });
+
+        const autodiff_start = nowNs();
+        compiledDiag("autodiff begin nodes={} loss_node={}", .{ graph.nodeCount(), loss_node });
+        var grad_result = try autodiff.gradient(allocator, graph, loss_node, wrt);
+        profile.autodiff_ns = elapsedNs(autodiff_start);
+        profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
+        errdefer grad_result.deinit();
+        compiledDiag(
+            "autodiff done grad_nodes={} grad_params={} autodiff_ms={d:.3} rss={}",
+            .{
+                grad_result.graph.nodeCount(),
+                grad_result.param_grads.len,
+                nsToMs(profile.autodiff_ns),
+                profile.peak_resident_bytes,
+            },
+        );
+
+        if (options.checkpoint_config) |cfg| {
+            const checkpoint_start = nowNs();
+            compiledDiag("checkpoint begin strategy={s} rss={}", .{ @tagName(cfg.strategy), currentResidentBytes() });
+            try checkpoint.applyCheckpointing(allocator, &grad_result, cfg);
+            profile.checkpoint_ns = elapsedNs(checkpoint_start);
+            profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
+            compiledDiag("checkpoint done checkpoint_ms={d:.3} rss={}", .{ nsToMs(profile.checkpoint_ns), profile.peak_resident_bytes });
+        }
+
+        const lowered_loss = grad_result.id_map[loss_node];
+        compiledDiag("mark outputs begin lowered_loss={} existing_outputs={} rss={}", .{ lowered_loss, grad_result.graph.outputs.items.len, currentResidentBytes() });
+        grad_result.graph.outputs.clearRetainingCapacity();
+        try grad_result.graph.markOutput(lowered_loss);
+
+        for (grad_result.param_grads) |grad_id| {
+            if (grad_id != null_node) try grad_result.graph.markOutput(grad_id);
+        }
+        compiledDiag("mark outputs done outputs={} rss={}", .{ grad_result.graph.outputs.items.len, currentResidentBytes() });
+
+        const id_map = try allocator.dupe(NodeId, grad_result.id_map);
+        errdefer allocator.free(id_map);
+        const param_grads = try allocator.dupe(NodeId, grad_result.param_grads);
+        errdefer allocator.free(param_grads);
+
+        const wrt_names = try allocator.alloc([]const u8, wrt.len);
+        errdefer allocator.free(wrt_names);
+        for (wrt, 0..) |param_id, i| {
+            const param_node = graph.node(param_id);
+            wrt_names[i] = try allocator.dupe(u8, graph.parameterName(param_node));
+        }
+        errdefer {
+            for (wrt_names) |name| allocator.free(name);
+        }
+
+        const compiled_graph = grad_result.graph;
+        grad_result.graph = Graph.init(allocator);
+        grad_result.deinit();
+        profile.total_ns = profile.autodiff_ns + profile.checkpoint_ns;
+        compiledDiag(
+            "init done compiled_nodes={} outputs={} total_ms={d:.3} peak_rss={}",
+            .{
+                compiled_graph.nodeCount(),
+                compiled_graph.outputs.items.len,
+                nsToMs(profile.total_ns),
+                profile.peak_resident_bytes,
+            },
+        );
+
+        return .{
+            .allocator = allocator,
+            .graph = compiled_graph,
+            .id_map = id_map,
+            .wrt_names = wrt_names,
+            .param_grads = param_grads,
+            .build_profile = profile,
+        };
+    }
+
+    pub fn deinit(self: *CompiledTrainSession) void {
+        self.graph.deinit();
+        self.allocator.free(self.id_map);
+        for (self.wrt_names) |name| self.allocator.free(name);
+        self.allocator.free(self.wrt_names);
+        self.allocator.free(self.param_grads);
+        self.* = undefined;
+    }
+
+    pub fn execute(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
+    ) !TrainStepResult {
+        return self.executeInternal(cb, runtime_inputs, false);
+    }
+
+    pub fn executeDeviceGradients(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
+    ) !TrainStepResult {
+        return self.executeInternal(cb, runtime_inputs, true);
+    }
+
+    fn executeInternal(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
+        retain_device_gradients: bool,
+    ) !TrainStepResult {
+        const total_start = nowNs();
+        var profile: TrainStepProfile = .{};
+        profile.peak_resident_bytes = currentResidentBytes();
+
+        var rt_list = std.ArrayListUnmanaged(RuntimeInput).empty;
+        defer rt_list.deinit(self.allocator);
+        if (runtime_inputs) |rt| {
+            var it = rt.iterator();
+            while (it.next()) |entry| {
+                const old_id = entry.key_ptr.*;
+                if (old_id >= self.id_map.len) continue;
+                const new_id = self.id_map[old_id];
+                if (new_id == null_node) continue;
+                try rt_list.append(self.allocator, .{ .node_id = new_id, .value = entry.value_ptr.* });
+            }
+        }
+
+        const rt_slice: ?[]const RuntimeInput = if (rt_list.items.len > 0) rt_list.items else null;
+
+        const execute_start = nowNs();
+        compiledDiag(
+            "execute begin nodes={} outputs={} runtime_inputs={} retain_device_gradients={} rss={}",
+            .{
+                self.graph.nodeCount(),
+                self.graph.outputs.items.len,
+                rt_list.items.len,
+                retain_device_gradients,
+                currentResidentBytes(),
+            },
+        );
+        var exec_result = try interpreter.execute(
+            self.allocator,
+            &self.graph,
+            cb,
+            .{ .runtime_inputs = rt_slice },
+        );
+        profile.execute_ns = elapsedNs(execute_start);
+        profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
+        compiledDiag("execute done execute_ms={d:.3} rss={}", .{ nsToMs(profile.execute_ns), profile.peak_resident_bytes });
+        defer exec_result.deinit(cb);
+
+        const extract_start = nowNs();
+        compiledDiag("extract begin outputs={} retain_device_gradients={} rss={}", .{ exec_result.outputs.len, retain_device_gradients, currentResidentBytes() });
+        const loss_data = try cb.toFloat32(exec_result.outputs[self.loss_output_index], self.allocator);
+        defer self.allocator.free(loss_data);
+        const loss_value: f32 = if (loss_data.len > 0) loss_data[0] else 0.0;
+
+        var gradients = std.StringHashMapUnmanaged([]f32){};
+        var device_gradients = std.StringHashMapUnmanaged(CT){};
+        errdefer {
+            var it = gradients.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*);
+            }
+            gradients.deinit(self.allocator);
+            var device_it = device_gradients.iterator();
+            while (device_it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                cb.free(entry.value_ptr.*);
+            }
+            device_gradients.deinit(self.allocator);
+        }
+
+        var grad_output_idx: usize = self.loss_output_index + 1;
+        for (self.wrt_names, 0..) |name, i| {
+            if (self.param_grads[i] == null_node) continue;
+            const grad_ct = exec_result.outputs[grad_output_idx];
+            const grad_output_node = self.graph.outputs.items[grad_output_idx];
+            grad_output_idx += 1;
+            const owned_name = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(owned_name);
+            if (retain_device_gradients) {
+                const retained = try cloneTensorForOutputShape(self.allocator, &self.graph, cb, grad_ct, grad_output_node);
+                errdefer cb.free(retained);
+                try device_gradients.put(self.allocator, owned_name, retained);
+            } else {
+                const grad_data = try cb.toFloat32(grad_ct, self.allocator);
+                try gradients.put(self.allocator, owned_name, grad_data);
+            }
+        }
+
+        profile.extract_ns = elapsedNs(extract_start);
+        profile.total_ns = elapsedNs(total_start);
+        profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
+        compiledDiag(
+            "extract done gradients={} device_gradients={} extract_ms={d:.3} total_ms={d:.3} rss={}",
+            .{
+                gradients.count(),
+                device_gradients.count(),
+                nsToMs(profile.extract_ns),
+                nsToMs(profile.total_ns),
+                profile.peak_resident_bytes,
+            },
+        );
+
+        return .{
+            .loss = loss_value,
+            .gradients = gradients,
+            .device_gradients = device_gradients,
+            .profile = profile,
+            .allocator = self.allocator,
+            .compute_backend = if (retain_device_gradients) cb else null,
+        };
+    }
 };
 
 pub fn trainStep(
@@ -241,6 +496,15 @@ fn elapsedNs(start_ns: u64) u64 {
     return end_ns - start_ns;
 }
 
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
+
+fn compiledDiag(comptime fmt: []const u8, args: anytype) void {
+    if (!platform.env.getenvBoolDefault("TERMITE_COMPILED_TRAIN_TRACE", false)) return;
+    std.debug.print("[compiled-train] " ++ fmt ++ "\n", args);
+}
+
 fn nowNs() u64 {
     var timespec: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &timespec))) {
@@ -260,6 +524,26 @@ fn currentResidentBytes() usize {
         .linux => std.math.mul(usize, maxrss, 1024) catch std.math.maxInt(usize),
         else => maxrss,
     };
+}
+
+fn cloneTensorForOutputShape(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    tensor: CT,
+    output_node: NodeId,
+) !CT {
+    const shape = graph.node(output_node).output_shape;
+    var dims: [8]i32 = undefined;
+    const rank = shape.rank();
+    if (rank > dims.len) return error.UnsupportedShape;
+    for (0..rank) |axis| {
+        dims[axis] = std.math.cast(i32, shape.dim(@intCast(axis))) orelse return error.UnsupportedShape;
+    }
+    if (try cb.cloneTensorShape(tensor, dims[0..rank])) |cloned| return cloned;
+    const data = try cb.toFloat32(tensor, allocator);
+    defer allocator.free(data);
+    return cb.fromFloat32Shape(data, dims[0..rank]);
 }
 
 /// Resolve which parameter NodeIds to differentiate. If trainable_params
@@ -541,6 +825,52 @@ test "trainStep computes loss and gradients for linear model" {
     try std.testing.expectEqual(@as(usize, 12), result.gradients.get("w").?.len);
     // bias gradient should have 3 elements
     try std.testing.expectEqual(@as(usize, 3), result.gradients.get("bias").?.len);
+}
+
+test "CompiledTrainSession can retain gradient tensors without host extraction" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const w = try bld.parameter("w", Shape.init(.f32, &.{ 3, 4 }));
+    const bias = try bld.parameter("bias", Shape.init(.f32, &.{3}));
+    const y = try bld.linear(x, w, bias, 2, 4, 3);
+    const loss = try bld.reduceSum(y, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var session = try CompiledTrainSession.init(allocator, &g, loss, .{ .trainable_params = &.{ "w", "bias" } });
+    defer session.deinit();
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const x_ct = try cb_val.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 2, 4 });
+    defer cb_val.free(x_ct);
+    const w_ct = try cb_val.fromFloat32Shape(&.{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2 }, &.{ 3, 4 });
+    defer cb_val.free(w_ct);
+    const bias_ct = try cb_val.fromFloat32Shape(&.{ 0.01, 0.02, 0.03 }, &.{3});
+    defer cb_val.free(bias_ct);
+
+    var rt = std.AutoHashMapUnmanaged(NodeId, CT){};
+    defer rt.deinit(allocator);
+    try rt.put(allocator, x, x_ct);
+    try rt.put(allocator, w, w_ct);
+    try rt.put(allocator, bias, bias_ct);
+
+    var result = try session.executeDeviceGradients(&cb_val, rt);
+    defer result.deinit();
+
+    try std.testing.expect(result.loss > 0.0);
+    try std.testing.expect(result.gradients.count() == 0);
+    const w_grad = result.device_gradients.get("w") orelse return error.MissingGradient;
+    const w_data = try cb_val.toFloat32(w_grad, allocator);
+    defer allocator.free(w_data);
+    try std.testing.expectEqual(@as(usize, 12), w_data.len);
+    try std.testing.expect(result.device_gradients.get("bias") != null);
 }
 
 test "trainStep on linear-gelu chain" {
