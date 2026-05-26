@@ -345,7 +345,7 @@ fn buildDiscoveredModelListings(
     }
 
     for (discovered) |entry| {
-        var manifest = manifest_mod.loadFromDir(allocator, entry.path) catch continue;
+        var manifest = manifest_mod.loadListingFromDir(allocator, entry.path) catch continue;
 
         if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) {
             manifest.deinit();
