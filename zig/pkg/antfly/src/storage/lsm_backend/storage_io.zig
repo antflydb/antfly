@@ -1487,6 +1487,22 @@ fn closeFd(fd: std.posix.fd_t) void {
 }
 
 fn fileSizeFromFd(fd: std.posix.fd_t) !u64 {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const empty_path: [*:0]const u8 = "";
+        while (true) {
+            var statx = std.mem.zeroes(linux.Statx);
+            switch (linux.errno(linux.statx(fd, empty_path, linux.AT.EMPTY_PATH, .{ .SIZE = true }, &statx))) {
+                .SUCCESS => {
+                    if (!statx.mask.SIZE) return error.Unexpected;
+                    return statx.size;
+                },
+                .INTR => continue,
+                else => |err| return posixStatError(err),
+            }
+        }
+    }
+
     const current = try seekFd(fd, 0, std.posix.SEEK.CUR);
     errdefer {
         _ = seekFd(fd, @intCast(current), std.posix.SEEK.SET) catch {};
@@ -2119,10 +2135,19 @@ test "native copied storage handle fails closed after owner deinit" {
 
     var native = try NativeStorage.init(std.testing.allocator, .threaded);
     const copied = native.storage();
+    const path = "/tmp/antfly-storage-closed-handle-file";
+    try native.storage().writeFileAbsolute(path, "hello");
     native.deinit();
 
     try std.testing.expectError(error.StorageClosed, copied.createDirPath("/tmp/antfly-storage-closed-handle"));
+    try std.testing.expectError(error.StorageClosed, copied.readFileAlloc(std.testing.allocator, path, 64));
+    try std.testing.expectError(error.StorageClosed, copied.fileSize(path));
+    try std.testing.expectError(error.StorageClosed, copied.readFileTrailerAlloc(std.testing.allocator, path, 2));
     try std.testing.expectEqual(@as(u64, 0), copied.nowNs());
+
+    var cleanup_native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer cleanup_native.deinit();
+    cleanup_native.storage().deleteFileAbsolute(path) catch {};
 }
 
 test "native atomic write sink retains invalidation state past storage deinit" {

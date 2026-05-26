@@ -1633,7 +1633,6 @@ pub export fn antfly_db_packed_dense_search_result_free(result: *capi.PackedDens
 }
 
 fn packDenseHits(
-    alloc: Allocator,
     total_hits: u32,
     ids: []const []const u8,
     scores: []const f32,
@@ -1642,6 +1641,7 @@ fn packDenseHits(
 ) !void {
     std.debug.assert(ids.len == scores.len);
 
+    const alloc = std.heap.c_allocator;
     const hits = try alloc.alloc(capi.PackedDenseSearchHit, ids.len);
     errdefer alloc.free(hits);
 
@@ -1815,11 +1815,11 @@ fn resolveDenseHitsFromProfiled(
 }
 
 fn packResolvedDenseHits(
-    alloc: Allocator,
     resolved: *DenseResolvedHits,
     identity_read_generation: u64,
     out_result: *capi.PackedDenseSearchResult,
 ) !void {
+    const alloc = std.heap.c_allocator;
     const hits = try alloc.alloc(capi.PackedDenseSearchHit, resolved.hits.len);
     errdefer alloc.free(hits);
 
@@ -1919,7 +1919,7 @@ fn searchDensePackedFast(
 
     var resolved = try resolveDenseHitsFromProfiled(handle.alloc, entry, &profiled, limit, offset);
     defer resolved.deinit();
-    try packResolvedDenseHits(handle.alloc, &resolved, identity_read_generation, out_result);
+    try packResolvedDenseHits(&resolved, identity_read_generation, out_result);
     return true;
 }
 
@@ -3217,7 +3217,7 @@ pub export fn antfly_db_search_dense(
     var owned = searchDenseOwned(handle, index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
     defer owned.deinit();
 
-    packDenseHits(handle.alloc, owned.total_hits, owned.ids, owned.scores, owned.identity_read_generation, out_result) catch return .internal;
+    packDenseHits(owned.total_hits, owned.ids, owned.scores, owned.identity_read_generation, out_result) catch return .internal;
     return .ok;
 }
 
@@ -3279,7 +3279,7 @@ pub export fn antfly_db_dense_fixed_packed_result(
 
     const ids = [_][]const u8{ "doc-fixed-1", "doc-fixed-2", "doc-fixed-3" };
     const scores = [_]f32{ 0.125, 0.25, 0.5 };
-    packDenseHits(handle.alloc, @intCast(ids.len), &ids, &scores, currentIdentityReadGenerationForHandle(handle, null) catch |err| return capi.mapError(err), out_result) catch return .internal;
+    packDenseHits(@intCast(ids.len), &ids, &scores, currentIdentityReadGenerationForHandle(handle, null) catch |err| return capi.mapError(err), out_result) catch return .internal;
     return .ok;
 }
 
@@ -3364,16 +3364,17 @@ pub export fn antfly_db_search_text_match(
     var owned = searchTextMatchOwned(handle, index_name.bytes(), field.bytes(), text.bytes(), "", 1.0, limit, offset) catch |err| return capi.mapError(err);
     defer owned.deinit();
 
-    const hits = handle.alloc.alloc(capi.DenseSearchHit, owned.ids.len) catch return .internal;
+    const result_alloc = std.heap.c_allocator;
+    const hits = result_alloc.alloc(capi.DenseSearchHit, owned.ids.len) catch return .internal;
     var initialized: usize = 0;
     errdefer {
         for (hits[0..initialized]) |hit| {
-            if (hit.id_ptr != null and hit.id_len > 0) handle.alloc.free(hit.id_ptr.?[0..hit.id_len]);
+            if (hit.id_ptr != null and hit.id_len > 0) result_alloc.free(hit.id_ptr.?[0..hit.id_len]);
         }
-        handle.alloc.free(hits);
+        result_alloc.free(hits);
     }
     for (owned.ids, owned.scores, 0..) |id, score, i| {
-        const duped = handle.alloc.dupe(u8, id) catch return .internal;
+        const duped = result_alloc.dupe(u8, id) catch return .internal;
         hits[i] = .{
             .id_ptr = duped.ptr,
             .id_len = duped.len,
@@ -3515,17 +3516,18 @@ pub export fn antfly_db_search_hits_json(
     defer result.deinit();
     if (result.graph_results.len > 0) return .invalid_argument;
 
-    const hits = handle.alloc.alloc(capi.DenseSearchHit, result.hits.len) catch return .internal;
+    const result_alloc = std.heap.c_allocator;
+    const hits = result_alloc.alloc(capi.DenseSearchHit, result.hits.len) catch return .internal;
     var initialized: usize = 0;
     errdefer {
         for (hits[0..initialized]) |hit| {
-            if (hit.id_ptr != null and hit.id_len > 0) handle.alloc.free(hit.id_ptr.?[0..hit.id_len]);
+            if (hit.id_ptr != null and hit.id_len > 0) result_alloc.free(hit.id_ptr.?[0..hit.id_len]);
         }
-        handle.alloc.free(hits);
+        result_alloc.free(hits);
     }
     for (result.hits, 0..) |hit, i| {
         if (hit.stored_data != null or hit.chunk_hits.len > 0) return .invalid_argument;
-        const id = handle.alloc.dupe(u8, hit.id) catch return .internal;
+        const id = result_alloc.dupe(u8, hit.id) catch return .internal;
         hits[i] = .{
             .id_ptr = id.ptr,
             .id_len = id.len,
