@@ -11009,6 +11009,10 @@ fn encodeThinReplayRecordPayload(
     }
     for (deleted_artifact_keys) |key| {
         try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, key);
+        if (internal_keys.isAssetArtifactKey(key) or internal_keys.isGraphEdgeArtifactKey(key)) {
+            try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
+        }
     }
 
     var record: change_journal_mod.Record = .{
@@ -12867,15 +12871,17 @@ fn buildDerivedBatch(
         }
     }
 
-    var changed_artifact_keys_list = try alloc.alloc([]const u8, changed_artifact_keys.len);
-    var changed_artifact_keys_initialized: usize = 0;
+    var changed_artifact_keys_list = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
-        for (changed_artifact_keys_list[0..changed_artifact_keys_initialized]) |key| alloc.free(key);
-        alloc.free(changed_artifact_keys_list);
+        for (changed_artifact_keys_list.items) |key| alloc.free(@constCast(key));
+        changed_artifact_keys_list.deinit(alloc);
     }
-    for (changed_artifact_keys, 0..) |key, i| {
-        changed_artifact_keys_list[i] = try alloc.dupe(u8, key);
-        changed_artifact_keys_initialized += 1;
+    for (changed_artifact_keys) |key| {
+        try changed_artifact_keys_list.append(alloc, try alloc.dupe(u8, key));
+    }
+    for (deleted_artifact_keys) |key| {
+        if (!internal_keys.isAssetArtifactKey(key) and !internal_keys.isGraphEdgeArtifactKey(key)) continue;
+        try changed_artifact_keys_list.append(alloc, try alloc.dupe(u8, key));
     }
 
     var graph_doc_clears = std.ArrayListUnmanaged(derived_types.DerivedGraphDocClear).empty;
@@ -13005,7 +13011,7 @@ fn buildDerivedBatch(
         .documents = documents,
         .deleted_keys = deleted_keys,
         .overwritten_doc_keys = try overwritten_doc_keys_list.toOwnedSlice(alloc),
-        .changed_artifact_keys = changed_artifact_keys_list,
+        .changed_artifact_keys = try changed_artifact_keys_list.toOwnedSlice(alloc),
         .graph_doc_clears = try graph_doc_clears.toOwnedSlice(alloc),
         .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
         .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
@@ -22609,6 +22615,108 @@ test "db graph relation artifact materializer replaces stale document edges" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
 }
 
+test "db graph artifact source lifecycle reuses and protects asset enrichments" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph_a",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    const created = (try db.getEnrichment(alloc, .asset, "relations_v1")) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = created;
+        tmp.deinit(alloc);
+    }
+    try std.testing.expectEqualStrings("relations", created.field);
+    try std.testing.expectEqualStrings("application/json", created.content_type);
+
+    try db.addIndex(.{
+        .name = "relations_graph_b",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try std.testing.expectError(error.EnrichmentInUse, db.deleteEnrichment(.asset, "relations_v1"));
+    try std.testing.expect(try db.deleteIndex("relations_graph_a"));
+    try std.testing.expectError(error.EnrichmentInUse, db.deleteEnrichment(.asset, "relations_v1"));
+
+    const still_present = (try db.getEnrichment(alloc, .asset, "relations_v1")) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = still_present;
+        tmp.deinit(alloc);
+    }
+    try std.testing.expectEqualStrings("relations", still_present.field);
+}
+
+test "db graph source artifact deletion clears materialized graph edges" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"}}]}}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    {
+        const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+    }
+
+    try db.batch(.{
+        .deletes = &.{"doc:a"},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+
+    const graph_artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+    defer alloc.free(graph_artifact_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, graph_artifact_key));
+}
+
 test "db async asset producer graph source materializes through replay" {
     const alloc = std.testing.allocator;
 
@@ -27622,6 +27730,36 @@ test "db encodeThinReplayRecordPayload treats embedding-only writes as artifact 
     try std.testing.expectEqualStrings("artifact:dense:doc:a", decoded.record.changed_artifact_keys[0]);
     try std.testing.expect(!journalRecordHasHint(decoded.record, .full_text));
     try std.testing.expect(journalRecordHasHint(decoded.record, .dense_vector));
+}
+
+test "db thin replay marks deleted asset and graph artifacts for graph apply" {
+    const alloc = std.testing.allocator;
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    const graph_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+    defer alloc.free(graph_key);
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        .{},
+        &.{},
+        &.{ asset_key, graph_key },
+        &.{},
+        &.{},
+        44,
+        false,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 44), decoded.record.sequence);
+    try std.testing.expectEqual(@as(usize, 2), decoded.record.changed_artifact_keys.len);
+    try std.testing.expectEqualStrings(asset_key, decoded.record.changed_artifact_keys[0]);
+    try std.testing.expectEqualStrings(graph_key, decoded.record.changed_artifact_keys[1]);
+    try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
 }
 
 test "db encodeThinReplayRecordPayload marks generated enrichment replay for async writes" {
