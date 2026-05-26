@@ -702,9 +702,10 @@ else
     };
 
 const NativeStorageState = struct {
-    // Storage handles may be copied into background work. Keep the runtime and
-    // fd cache behind a ref-counted state so late operations never dereference a
-    // NativeStorage wrapper that backend close has already destroyed.
+    // Storage handles are copyable vtable values and do not have a destructor.
+    // Keep the runtime and fd cache behind a ref-counted state, and leave a
+    // closed tombstone behind after final release so stale copied handles fail
+    // with StorageClosed instead of dereferencing freed memory.
     allocator: Allocator,
     refs: std.atomic.Value(usize) = .init(1),
     closing: std.atomic.Value(bool) = .init(false),
@@ -713,8 +714,8 @@ const NativeStorageState = struct {
 
     fn create(allocator: Allocator, kind: RuntimeKind) !*NativeStorageState {
         if (kind != .threaded) return error.UnsupportedEventedIoRuntime;
-        const state = try allocator.create(NativeStorageState);
-        errdefer allocator.destroy(state);
+        const state = try std.heap.page_allocator.create(NativeStorageState);
+        errdefer std.heap.page_allocator.destroy(state);
         state.* = undefined;
         state.allocator = allocator;
         state.refs = .init(1);
@@ -748,11 +749,9 @@ const NativeStorageState = struct {
 
     fn release(self: *NativeStorageState) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
-        const allocator = self.allocator;
         self.fd_cache.deinit();
         self.threaded.deinit();
-        self.* = undefined;
-        allocator.destroy(self);
+        self.refs.store(0, .release);
     }
 
     fn invalidatePath(self: *NativeStorageState, path: []const u8) void {
@@ -2144,6 +2143,17 @@ test "native atomic write sink supports patching and crc before finish" {
     const written = try native.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("hello world", written);
+}
+
+test "native copied storage handle fails closed after owner deinit" {
+    if (!supports_native_storage) return error.SkipZigTest;
+
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    const copied = native.storage();
+    native.deinit();
+
+    try std.testing.expectError(error.StorageClosed, copied.createDirPath("/tmp/antfly-storage-closed-handle"));
+    try std.testing.expectEqual(@as(u64, 0), copied.nowNs());
 }
 
 test "native atomic write sink retains invalidation state past storage deinit" {

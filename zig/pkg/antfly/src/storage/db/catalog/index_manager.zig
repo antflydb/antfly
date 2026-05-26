@@ -5443,7 +5443,8 @@ pub const IndexManager = struct {
     }
 
     fn beginTextMergeTaskForEntry(self: *IndexManager, entry: *TextIndex) !?TextMergeTask {
-        const snap = entry.persistent.snapshot();
+        const snap = entry.persistent.acquireSnapshot();
+        defer snap.release();
         if (snap.segments.len < 2) return null;
         const now_ns = platform_time.monotonicNs();
 
@@ -5569,7 +5570,8 @@ pub const IndexManager = struct {
     }
 
     fn textMergeSourceStillCurrent(_: *IndexManager, entry: *TextIndex, task: *const TextMergeTask) !bool {
-        const snap = entry.persistent.snapshot();
+        const snap = entry.persistent.acquireSnapshot();
+        defer snap.release();
         for (task.source) |source| {
             const seg = findSegmentById(snap, source.id) orelse return false;
             if (source.deleted) |expected| {
