@@ -41,6 +41,11 @@ pub const ModelEntry = struct {
     variant: []const u8,
 };
 
+const DiscoverKindMode = enum {
+    manifest,
+    path,
+};
+
 test {
     _ = download;
 }
@@ -93,6 +98,17 @@ pub const ModelRegistry = struct {
 
     /// Discover models in the models directory.
     pub fn discover(self: *ModelRegistry, io: Io) ![]ModelEntry {
+        return self.discoverWithKindMode(io, .manifest);
+    }
+
+    /// Discover model paths without loading manifests to classify model kind.
+    /// Callers that already load manifests should prefer this to avoid parsing
+    /// every manifest twice on listing-style paths.
+    pub fn discoverShallow(self: *ModelRegistry, io: Io) ![]ModelEntry {
+        return self.discoverWithKindMode(io, .path);
+    }
+
+    fn discoverWithKindMode(self: *ModelRegistry, io: Io, kind_mode: DiscoverKindMode) ![]ModelEntry {
         var entries = std.ArrayListUnmanaged(ModelEntry).empty;
         var seen = std.StringHashMapUnmanaged(void){};
         defer {
@@ -101,8 +117,8 @@ pub const ModelRegistry = struct {
             seen.deinit(self.allocator);
         }
 
-        try self.discoverFlat(io, &entries, &seen);
-        try self.discoverLegacy(io, &entries, &seen);
+        try self.discoverFlat(io, &entries, &seen, kind_mode);
+        try self.discoverLegacy(io, &entries, &seen, kind_mode);
 
         return try entries.toOwnedSlice(self.allocator);
     }
@@ -112,6 +128,7 @@ pub const ModelRegistry = struct {
         io: Io,
         entries: *std.ArrayListUnmanaged(ModelEntry),
         seen: *std.StringHashMapUnmanaged(void),
+        kind_mode: DiscoverKindMode,
     ) !void {
         var dir = Dir.cwd().openDir(io, self.models_dir, .{ .iterate = true }) catch return;
         defer dir.close(io);
@@ -125,7 +142,7 @@ pub const ModelRegistry = struct {
             defer self.allocator.free(entry_path);
 
             if (isModelDir(io, entry_path)) {
-                try self.appendDiscoveredModel(io, entries, seen, entry_path, entry.name);
+                try self.appendDiscoveredModel(io, entries, seen, entry_path, entry.name, kind_mode, null);
                 continue;
             }
 
@@ -140,7 +157,7 @@ pub const ModelRegistry = struct {
                 if (!isModelDir(io, model_path)) continue;
                 const model_name = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ entry.name, model_entry.name });
                 defer self.allocator.free(model_name);
-                try self.appendDiscoveredModel(io, entries, seen, model_path, model_name);
+                try self.appendDiscoveredModel(io, entries, seen, model_path, model_name, kind_mode, null);
             }
         }
     }
@@ -150,6 +167,7 @@ pub const ModelRegistry = struct {
         io: Io,
         entries: *std.ArrayListUnmanaged(ModelEntry),
         seen: *std.StringHashMapUnmanaged(void),
+        kind_mode: DiscoverKindMode,
     ) !void {
         const subdirs = [_]struct { dir: []const u8, kind: ModelKind }{
             .{ .dir = "embedders", .kind = .embedder },
@@ -177,7 +195,7 @@ pub const ModelRegistry = struct {
                     const entry_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
                     defer self.allocator.free(entry_path);
                     if (isModelDir(io, entry_path)) {
-                        try self.appendDiscoveredModel(io, entries, seen, entry_path, entry.name);
+                        try self.appendDiscoveredModel(io, entries, seen, entry_path, entry.name, kind_mode, subdir.kind);
                     } else {
                         var owner_dir = Dir.cwd().openDir(io, entry_path, .{ .iterate = true }) catch {
                             continue;
@@ -194,7 +212,7 @@ pub const ModelRegistry = struct {
                                 }
                                 const model_name = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ entry.name, model_entry.name });
                                 defer self.allocator.free(model_name);
-                                try self.appendDiscoveredModel(io, entries, seen, model_path, model_name);
+                                try self.appendDiscoveredModel(io, entries, seen, model_path, model_name, kind_mode, subdir.kind);
                             }
                         }
                     }
@@ -237,6 +255,8 @@ pub const ModelRegistry = struct {
         seen: *std.StringHashMapUnmanaged(void),
         model_path: []const u8,
         display_name: []const u8,
+        kind_mode: DiscoverKindMode,
+        kind_hint: ?ModelKind,
     ) !void {
         if (seen.contains(model_path)) return;
 
@@ -244,10 +264,13 @@ pub const ModelRegistry = struct {
         errdefer self.allocator.free(seen_path);
         try seen.put(self.allocator, seen_path, {});
 
-        const kind = blk: {
-            var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch break :blk inferModelKindFromPath(model_path);
-            defer manifest.deinit();
-            break :blk modelKindFromManifestType(manifest.model_type);
+        const kind = switch (kind_mode) {
+            .manifest => blk: {
+                var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch break :blk inferModelKindFromPath(model_path);
+                defer manifest.deinit();
+                break :blk modelKindFromManifestType(manifest.model_type);
+            },
+            .path => kind_hint orelse inferModelKindFromPath(model_path),
         };
 
         try entries.append(self.allocator, .{

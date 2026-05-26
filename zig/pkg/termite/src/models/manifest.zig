@@ -514,6 +514,108 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     return manifest;
 }
 
+/// Load only the metadata needed to list a model in server discovery results.
+///
+/// This intentionally avoids tokenizer parsing and GGUF metadata inspection. It
+/// still records enough artifact paths to hide obviously unloadable bundles and
+/// to expose text/image/audio listing metadata.
+pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !ModelManifest {
+    var manifest = ModelManifest{ .allocator = allocator };
+
+    if (std.mem.endsWith(u8, model_dir_path, ".gguf")) {
+        manifest.gguf_path = try allocator.dupe(u8, model_dir_path);
+        return manifest;
+    }
+
+    if (inferModelTypeFromPath(model_dir_path)) |model_type| {
+        manifest.model_type = model_type;
+    }
+
+    if (c_file.readFileFromDir(allocator, model_dir_path, "config.json")) |config_bytes| {
+        defer allocator.free(config_bytes);
+        parseListingConfigJson(&manifest, allocator, config_bytes) catch {};
+    } else |_| {}
+    if (manifest.native_arch_hint == .none and manifest.config_model_arch.len == 0) {
+        if (c_file.readFileFromDir(allocator, model_dir_path, "clip_config.json")) |config_bytes| {
+            defer allocator.free(config_bytes);
+            parseListingConfigJson(&manifest, allocator, config_bytes) catch {};
+        } else |_| {}
+    }
+
+    if (c_file.readFileFromDir(allocator, model_dir_path, "model_manifest.json")) |manifest_bytes| {
+        defer allocator.free(manifest_bytes);
+        parseModelManifestJson(&manifest, allocator, manifest_bytes) catch {};
+    } else |_| {}
+
+    if (c_file.readFileFromDir(allocator, model_dir_path, "termite_bundle.json")) |bundle_bytes| {
+        defer allocator.free(bundle_bytes);
+        parseTermiteBundleJson(&manifest, allocator, model_dir_path, bundle_bytes) catch {};
+    } else |_| {}
+    if (c_file.readFileFromDir(allocator, model_dir_path, "termite_variants.json")) |variants_bytes| {
+        defer allocator.free(variants_bytes);
+        parseTermiteVariantsJson(&manifest, allocator, model_dir_path, variants_bytes) catch {};
+    } else |_| {}
+
+    if (c_file.readFileFromDir(allocator, model_dir_path, "gliner_config.json")) |gliner_bytes| {
+        defer allocator.free(gliner_bytes);
+        parseGlinerConfig(&manifest, allocator, gliner_bytes) catch {};
+    } else |_| {}
+    if (c_file.readFileFromDir(allocator, model_dir_path, "added_tokens.json")) |at_bytes| {
+        defer allocator.free(at_bytes);
+        parseAddedTokens(&manifest, at_bytes) catch {};
+    } else |_| {}
+    applyListingGlinerHint(&manifest, allocator, model_dir_path);
+
+    if (!manifest.isClipclapGgufBundle()) {
+        if (manifest.onnx_path == null) manifest.onnx_path = try findFileInSubdirs(allocator, model_dir_path, &onnx_candidates, &onnx_subdirs);
+        if (manifest.visual_model_path == null) manifest.visual_model_path = try findFileInSubdirs(allocator, model_dir_path, &visual_model_candidates, &onnx_subdirs);
+        if (manifest.audio_model_path == null) manifest.audio_model_path = try findFileInSubdirs(allocator, model_dir_path, &audio_model_candidates, &onnx_subdirs);
+        if (manifest.text_projection_path == null) manifest.text_projection_path = try findFileInSubdirs(allocator, model_dir_path, &text_projection_candidates, &onnx_subdirs);
+        if (manifest.visual_projection_path == null) manifest.visual_projection_path = try findFileInSubdirs(allocator, model_dir_path, &visual_projection_candidates, &onnx_subdirs);
+        if (manifest.audio_projection_path == null) manifest.audio_projection_path = try findFileInSubdirs(allocator, model_dir_path, &audio_projection_candidates, &onnx_subdirs);
+    }
+
+    if (manifest.safetensors_path == null) manifest.safetensors_path = try findFileInSubdirs(allocator, model_dir_path, &safetensors_candidates, &.{""});
+    if (manifest.safetensors_index_path == null) manifest.safetensors_index_path = try findFileInSubdirs(allocator, model_dir_path, &safetensors_index_candidates, &.{""});
+    if (manifest.gliner_head_gguf_path == null) manifest.gliner_head_gguf_path = try findFileInSubdirs(allocator, model_dir_path, &.{"gliner_head.gguf"}, &.{""});
+    if (manifest.gliner_head_safetensors_path == null) manifest.gliner_head_safetensors_path = try findFileInSubdirs(allocator, model_dir_path, &.{"gliner_head.safetensors"}, &.{""});
+    if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, model_dir_path, &.{"config.json"}, &.{""});
+    if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, model_dir_path, &.{"model_manifest.json"}, &.{""});
+    if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, model_dir_path, &.{"tokenizer.json"}, &.{""});
+    if (manifest.tokenizer_config_path == null) manifest.tokenizer_config_path = try findFileInSubdirs(allocator, model_dir_path, &.{"tokenizer_config.json"}, &.{""});
+    if (manifest.preprocessor_config_path == null) manifest.preprocessor_config_path = try findFileInSubdirs(allocator, model_dir_path, &.{"preprocessor_config.json"}, &.{""});
+    if (manifest.processor_config_path == null) manifest.processor_config_path = try findFileInSubdirs(allocator, model_dir_path, &.{"processor_config.json"}, &.{""});
+    if (manifest.gguf_path == null) manifest.gguf_path = try findFirstGgufInDir(allocator, model_dir_path, false);
+    if (manifest.gguf_projector_path == null) manifest.gguf_projector_path = try findFirstGgufInDir(allocator, model_dir_path, true);
+
+    applyImplicitSparseOutputLayout(&manifest, model_dir_path);
+    applyImplicitModelTypeHints(&manifest, model_dir_path);
+
+    return manifest;
+}
+
+fn applyListingGlinerHint(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8) void {
+    if (manifest.gliner_model_type.len > 0) return;
+    if (!std.mem.eql(u8, manifest.config_model_arch, "extractor") and !hasGlinerPathHint(model_dir_path)) return;
+
+    if (c_file.readFileFromDir(allocator, model_dir_path, "special_tokens_map.json")) |tokens_bytes| {
+        defer allocator.free(tokens_bytes);
+        if (!listingSpecialTokensMapHasGlinerMarkers(tokens_bytes)) return;
+    } else |_| {
+        return;
+    }
+
+    manifest.gliner_model_type = allocator.dupe(u8, "gliner2") catch "";
+}
+
+fn listingSpecialTokensMapHasGlinerMarkers(json_bytes: []const u8) bool {
+    return std.mem.indexOf(u8, json_bytes, "\"[P]\"") != null and
+        std.mem.indexOf(u8, json_bytes, "\"[C]\"") != null and
+        std.mem.indexOf(u8, json_bytes, "\"[E]\"") != null and
+        std.mem.indexOf(u8, json_bytes, "\"[R]\"") != null and
+        std.mem.indexOf(u8, json_bytes, "\"[SEP_TEXT]\"") != null;
+}
+
 fn applyImplicitSparseOutputLayout(manifest: *ModelManifest, model_dir_path: []const u8) void {
     if (manifest.sparse_3d_output_layout != null) return;
     if (c_file.fileExistsInDir(manifest.allocator, model_dir_path, "1_SpladePooling/config.json")) {
@@ -997,6 +1099,59 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
                 if (jsonU32(v)) |val| manifest.max_position_embeddings = val;
             }
         }
+    }
+}
+
+fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+
+    if (obj.get("architectures")) |v| {
+        if (v == .array) {
+            for (v.array.items) |item| {
+                if (item != .string) continue;
+                if (inferModelTypeFromArchitectureName(item.string)) |inferred| {
+                    manifest.model_type = inferred;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (obj.get("model_type")) |v| {
+        if (v == .string) {
+            const s = v.string;
+            if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
+            manifest.config_model_arch = allocator.dupe(u8, s) catch "";
+            if (std.mem.eql(u8, s, "whisper")) {
+                manifest.native_arch_hint = .whisper;
+            } else if (std.mem.eql(u8, s, "florence2") or
+                std.mem.eql(u8, s, "florence-2") or
+                std.mem.startsWith(u8, s, "florence"))
+            {
+                manifest.native_arch_hint = .florence;
+            } else if (std.mem.eql(u8, s, "clip") or
+                std.mem.eql(u8, s, "clip_text_model") or
+                std.mem.eql(u8, s, "clip_vision_model") or
+                std.mem.eql(u8, s, "siglip") or
+                std.mem.eql(u8, s, "siglip_text_model"))
+            {
+                manifest.native_arch_hint = .clip;
+            } else if (std.mem.eql(u8, s, "clap")) {
+                manifest.native_arch_hint = .clap;
+            } else if (std.mem.eql(u8, s, "layoutlmv3")) {
+                manifest.native_arch_hint = .layoutlmv3;
+                if (manifest.model_type == .embedder) manifest.model_type = .classifier;
+            } else if (std.mem.eql(u8, s, "jina_embeddings_v5")) {
+                manifest.model_type = .embedder;
+            }
+        }
+    }
+
+    if (isJinaV5TextEmbeddingConfig(&obj)) {
+        manifest.model_type = .embedder;
     }
 }
 
@@ -2137,6 +2292,35 @@ test "manifest does not treat projector-only gguf as decoder weights" {
     try std.testing.expect(manifest.gguf_path == null);
     try std.testing.expect(manifest.gguf_projector_path != null);
     try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_projector_path.?, "mmproj.gguf"));
+}
+
+test "listing manifest detects gguf assets without gguf metadata parse" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model_manifest.json",
+        .data =
+        \\{"type":"generator","tasks":["generate"],"inputs":["text","image"]}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "gemma-4-e2b-it-Q8_0.gguf", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mmproj-gemma-4-e2b-it-bf16.gguf", .data = "" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadListingFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try std.testing.expect(manifest.hasTask("generate"));
+    try std.testing.expect(manifest.hasInput("image"));
+    try std.testing.expect(manifest.gguf_path != null);
+    try std.testing.expect(manifest.gguf_projector_path != null);
 }
 
 test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {
