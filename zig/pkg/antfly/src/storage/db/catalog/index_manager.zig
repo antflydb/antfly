@@ -10552,7 +10552,12 @@ fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtif
     if (source != .object) return error.InvalidIndexConfig;
     const kind = source.object.get("kind") orelse return error.InvalidIndexConfig;
     if (kind != .string) return error.InvalidIndexConfig;
-    if (std.mem.eql(u8, kind.string, "document_field")) return null;
+    if (std.mem.eql(u8, kind.string, "document_field")) {
+        const field = source.object.get("field") orelse return error.InvalidIndexConfig;
+        if (field != .string or field.string.len == 0) return error.InvalidIndexConfig;
+        if (!std.mem.eql(u8, field.string, "_edges")) return error.InvalidIndexConfig;
+        return null;
+    }
     if (!std.mem.eql(u8, kind.string, "artifact")) return error.InvalidIndexConfig;
 
     const artifact = source.object.get("artifact") orelse return error.InvalidIndexConfig;
@@ -10659,11 +10664,20 @@ fn parseGraphContextDocFields(alloc: Allocator, context: std.json.Value) ![]cons
 }
 
 fn validateGraphMappingTemplates(mapping: GraphArtifactMapping) !void {
+    try validateGraphMaterializedSourceTemplate(mapping.source_template);
     try validateGraphTemplateDocFields(mapping.source_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.target_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.edge_type_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.weight_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.metadata_template_json, mapping.context_doc_fields);
+}
+
+fn validateGraphMaterializedSourceTemplate(template_source: []const u8) !void {
+    const trimmed = std.mem.trim(u8, template_source, &std.ascii.whitespace);
+    if (trimmed.len == 0) return;
+    if (!std.mem.startsWith(u8, trimmed, "{{") or !std.mem.endsWith(u8, trimmed, "}}")) return error.InvalidIndexConfig;
+    const expr = std.mem.trim(u8, trimmed[2 .. trimmed.len - 2], &std.ascii.whitespace);
+    if (!std.mem.eql(u8, expr, "_doc.key")) return error.InvalidIndexConfig;
 }
 
 fn validateGraphTemplateDocFields(template_source: []const u8, declared_fields: []const []u8) !void {
@@ -10814,12 +10828,31 @@ test "graph config rejects undeclared doc value template fields and unsupported 
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}
     ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"nodes":{"source":"{{ _item.source.document_id }}"}}
+    ));
 }
 
 test "graph config rejects artifact source combined with document field edge types" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"kind":"artifact","artifact":"relations_v1"},"edge_types":[{"name":"mentions","field":"edges"}]}
+    ));
+}
+
+test "graph config validates document field source shape" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{"source":{"kind":"document_field","field":"_edges"}}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expect(cfg.artifact_source == null);
+
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"document_field"}}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"document_field","field":"links"}}
     ));
 }
 

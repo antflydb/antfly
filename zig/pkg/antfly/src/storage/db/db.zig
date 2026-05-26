@@ -22797,6 +22797,45 @@ test "db graph artifact source lifecycle reuses and protects asset enrichments" 
     try std.testing.expectEqualStrings("relations", still_present.field);
 }
 
+test "db graph artifact source reuses user enrichment and rejects incompatible shorthand" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "relations_v1",
+        .kind = .asset,
+        .field = "relations",
+        .content_type = "application/json",
+    });
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}
+        \\}
+        ,
+    });
+
+    try std.testing.expectError(error.ConflictingEnrichmentConfig, db.addIndex(.{
+        .name = "conflicting_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json"}
+        \\}
+        ,
+    }));
+}
+
 test "db graph source artifact deletion clears materialized graph edges" {
     const alloc = std.testing.allocator;
 
@@ -22845,6 +22884,113 @@ test "db graph source artifact deletion clears materialized graph edges" {
     const graph_artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
     defer alloc.free(graph_artifact_key);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, graph_artifact_key));
+}
+
+test "db graph artifact edges are visible to graph search queries" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"}}]}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"Beta\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    var result = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "mentions",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "relations_graph",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .params = .{ .direction = .out, .edge_types = &.{"mentions"} },
+                    .include_documents = true,
+                },
+            },
+        },
+        .limit = 10,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("doc:b", result.graph_results[0].hits[0].id);
+    try std.testing.expect(result.graph_results[0].hits[0].stored_data != null);
+}
+
+test "db graph artifact external node targets return ids without document hydration" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "nodes":{"model":"external","target":"{{ _item.target.entity_id }}"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"entity_id\":\"entity:person:ada_lovelace\"}}]}}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    var result = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "mentions",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "relations_graph",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .params = .{ .direction = .out, .edge_types = &.{"mentions"} },
+                    .include_documents = true,
+                },
+            },
+        },
+        .limit = 10,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("entity:person:ada_lovelace", result.graph_results[0].hits[0].id);
+    try std.testing.expect(result.graph_results[0].hits[0].stored_data == null);
+    try std.testing.expect(result.graph_results[0].hits[0].doc_ordinal == null);
 }
 
 test "db async asset producer graph source materializes through replay" {
