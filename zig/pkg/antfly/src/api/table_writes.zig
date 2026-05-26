@@ -47,6 +47,8 @@ const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
+const asset_producer_runtime = @import("../asset_producer_runtime.zig");
+const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const build_options = @import("build_options");
 const tracing = @import("../tracing/mod.zig");
@@ -6628,43 +6630,72 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
     remote_content: ?*const scraping.RemoteContentConfig,
     identity_namespace: ?doc_identity.Namespace,
 ) !db_mod.DB {
-    const EmbedderSet = struct {
+    const EnrichmentSet = struct {
         dense: ?db_embedder.DenseEmbedder = null,
         sparse: ?db_embedder.SparseEmbedder = null,
+        asset_runtime: ?*asset_producer_runtime.Runtime = null,
 
         fn deinit(self: @This(), allocator: std.mem.Allocator) void {
             if (self.dense) |owned| owned.deinit(allocator);
             if (self.sparse) |owned| owned.deinit(allocator);
+            if (self.asset_runtime) |runtime| {
+                runtime.deinit();
+                allocator.destroy(runtime);
+            }
+        }
+
+        fn enabled(self: @This()) bool {
+            return self.dense != null or self.sparse != null or self.asset_runtime != null;
+        }
+
+        fn config(self: @This()) db_mod.enrichment_runtime.Config {
+            return .{
+                .dense_embedder = self.dense,
+                .sparse_embedder = self.sparse,
+                .asset_producer = if (self.asset_runtime) |runtime| runtime.ownedProducer() else null,
+            };
         }
     };
 
-    const createEmbedders = struct {
+    const createEnrichments = struct {
         fn run(
             allocator: std.mem.Allocator,
             raw_indexes_json: []const u8,
+            runtime: ?*db_mod.background_runtime.BackendRuntime,
             local_provider: ?managed_embedder.LocalTermiteProvider,
             store: ?*common_secrets.FileStore,
             remote: ?*const scraping.RemoteContentConfig,
-        ) !EmbedderSet {
+        ) !EnrichmentSet {
+            const asset_runtime = if (try indexesJsonNeedsAssetProducer(allocator, raw_indexes_json)) blk: {
+                const io = if (runtime) |backend| backend.io() orelse return error.MissingBackendRuntimeIo else return error.MissingBackendRuntimeIo;
+                break :blk try asset_producer_runtime.Runtime.createOwned(allocator, io, .{
+                    .local_termite_provider = local_provider,
+                    .secret_store = store,
+                });
+            } else null;
+            errdefer if (asset_runtime) |owned| {
+                owned.deinit();
+                allocator.destroy(owned);
+            };
             return .{
                 .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .local_termite_provider = local_provider, .secret_store = store, .remote_content = remote }),
                 .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .local_termite_provider = local_provider, .secret_store = store, .remote_content = remote }),
+                .asset_runtime = asset_runtime,
             };
         }
     }.run;
 
-    var embedders = if (mode == .startup_catch_up)
-        EmbedderSet{}
+    var enrichments = if (mode == .startup_catch_up)
+        EnrichmentSet{}
     else
-        try createEmbedders(alloc, indexes_json, local_termite_provider, secret_store, remote_content);
-    errdefer embedders.deinit(alloc);
+        try createEnrichments(alloc, indexes_json, backend_runtime, local_termite_provider, secret_store, remote_content);
+    errdefer enrichments.deinit(alloc);
 
     const openDb = struct {
         fn run(
             allocator: std.mem.Allocator,
             db_path: []const u8,
-            dense: ?db_embedder.DenseEmbedder,
-            sparse: ?db_embedder.SparseEmbedder,
+            enrichment_cfg: ?db_mod.enrichment_runtime.Config,
             cache: ?*lsm_backend.Cache,
             vector_cache: ?*hbc_mod.Cache,
             root_generation: u64,
@@ -6685,13 +6716,10 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
                 .remote_content = remote,
                 .identity_namespace = namespace,
                 .prefer_existing_identity_namespace = namespace != null,
-                .enrichment = .{
-                    .dense_embedder = dense,
-                    .sparse_embedder = sparse,
-                },
+                .enrichment = enrichment_cfg,
             };
             return switch (open_mode) {
-                .default => if (dense != null or sparse != null)
+                .default => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, base)
                 else
                     try db_mod.DB.open(allocator, db_path, .{
@@ -6705,7 +6733,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                     }),
-                .default_async, .writer_no_replay => if (dense != null or sparse != null)
+                .default_async, .writer_no_replay => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
@@ -6716,10 +6744,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
-                        .enrichment = .{
-                            .dense_embedder = dense,
-                            .sparse_embedder = sparse,
-                        },
+                        .enrichment = enrichment_cfg,
                         .open_mode = .writer_no_replay,
                         // The managed write cache opens DBs synchronously while
                         // table/index metadata can still be settling. Keep
@@ -6757,7 +6782,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
                     .transaction_recovery = .{ .enabled = false },
                     .text_merge = .{ .enabled = false },
                 }),
-                .restore_repair => if (dense != null or sparse != null)
+                .restore_repair => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
@@ -6768,10 +6793,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
-                        .enrichment = .{
-                            .dense_embedder = dense,
-                            .sparse_embedder = sparse,
-                        },
+                        .enrichment = enrichment_cfg,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = true,
                         .ttl_cleanup = .{ .enabled = false },
@@ -6795,7 +6817,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
                         .transaction_recovery = .{ .enabled = false },
                         .text_merge = .{ .enabled = false },
                     }),
-                .status_only => if (dense != null or sparse != null)
+                .status_only => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
                         .lsm_cache = cache,
                         .hbc_cache = vector_cache,
@@ -6806,10 +6828,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
-                        .enrichment = .{
-                            .dense_embedder = dense,
-                            .sparse_embedder = sparse,
-                        },
+                        .enrichment = enrichment_cfg,
                         .open_mode = .status_only,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -6838,11 +6857,11 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
     }.run;
 
     var db = blk: {
-        const dense = embedders.dense;
-        const sparse = embedders.sparse;
-        const opened = try openDb(alloc, path, dense, sparse, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace);
-        embedders.dense = null;
-        embedders.sparse = null;
+        const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
+        const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace);
+        enrichments.dense = null;
+        enrichments.sparse = null;
+        enrichments.asset_runtime = null;
         break :blk opened;
     };
     var db_open = true;
@@ -6857,13 +6876,13 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
         // request work runs against the stabilized post-reconcile state.
         db.close();
         db_open = false;
-        embedders = try createEmbedders(alloc, indexes_json, local_termite_provider, secret_store, remote_content);
+        enrichments = try createEnrichments(alloc, indexes_json, backend_runtime, local_termite_provider, secret_store, remote_content);
         db = blk: {
-            const dense = embedders.dense;
-            const sparse = embedders.sparse;
-            const opened = try openDb(alloc, path, dense, sparse, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace);
-            embedders.dense = null;
-            embedders.sparse = null;
+            const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
+            const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace);
+            enrichments.dense = null;
+            enrichments.sparse = null;
+            enrichments.asset_runtime = null;
             break :blk opened;
         };
         db_open = true;
@@ -6879,6 +6898,49 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
         }
     }
     return db;
+}
+
+fn indexesJsonNeedsAssetProducer(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
+    if (indexes_json.len == 0) return false;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    return try jsonValueNeedsAssetProducer(alloc, parsed.value);
+}
+
+fn jsonValueNeedsAssetProducer(alloc: std.mem.Allocator, value: std.json.Value) !bool {
+    switch (value) {
+        .object => |object| {
+            if (try objectIsModelBackedAssetEnrichment(alloc, object)) return true;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (try jsonValueNeedsAssetProducer(alloc, entry.value_ptr.*)) return true;
+            }
+            return false;
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (try jsonValueNeedsAssetProducer(alloc, item)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+fn objectIsModelBackedAssetEnrichment(alloc: std.mem.Allocator, object: std.json.ObjectMap) !bool {
+    const kind = object.get("kind") orelse return false;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "asset")) return false;
+    const producer_value = object.get("producer_json") orelse return false;
+    const producer_json = switch (producer_value) {
+        .string => |raw| raw,
+        .object, .array => try std.json.Stringify.valueAlloc(alloc, producer_value, .{}),
+        else => return false,
+    };
+    const owns_producer_json = producer_value != .string;
+    defer if (owns_producer_json) alloc.free(@constCast(producer_json));
+    var producer_cfg = asset_producer_mod.parseProducerConfig(alloc, producer_json) catch return false;
+    defer producer_cfg.deinit(alloc);
+    return producer_cfg.type != .copy;
 }
 
 fn drainManagedDbBeforeClose(db: *db_mod.DB) !void {

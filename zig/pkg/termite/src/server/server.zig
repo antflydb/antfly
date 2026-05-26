@@ -569,6 +569,17 @@ pub const Node = struct {
             };
         }
 
+        return try self.generateMessagesDirect(allocator, model_name, messages);
+    }
+
+    pub fn generateMessagesDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        messages: []const generation.Message,
+    ) ![]u8 {
+        if (messages.len == 0) return error.InvalidGenerationRequest;
+
         const configured_max_tokens: i32 = 256;
         const queue_units = self.estimateGenerateQueueUnits(messages, configured_max_tokens);
         try self.request_queue.acquireUnits(queue_units);

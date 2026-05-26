@@ -773,6 +773,7 @@ fn localTermiteProvider(node: *termite.server.Node) antfly.inference.managed_emb
         .embed_sparse_texts = localTermiteEmbedSparseTexts,
         .rerank_texts = localTermiteRerankTexts,
         .generate_text = localTermiteGenerateText,
+        .generate_messages = localTermiteGenerateMessages,
     };
 }
 
@@ -830,6 +831,187 @@ fn localTermiteGenerateText(
 ) anyerror![]u8 {
     const node: *termite.server.Node = @ptrCast(@alignCast(ptr));
     return try node.generateTextDirect(alloc, model, roles, contents);
+}
+
+fn localTermiteGenerateMessages(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    messages: []const antfly.inference.ChatMessage,
+) anyerror![]u8 {
+    const node: *termite.server.Node = @ptrCast(@alignCast(ptr));
+    var converted = try convertLocalGenerateMessages(alloc, messages);
+    defer converted.deinit(alloc);
+    return try node.generateMessagesDirect(alloc, model, converted.messages);
+}
+
+const LocalGenerateMessages = struct {
+    messages: []termite.pipelines.generation.Message,
+    owned_texts: std.ArrayListUnmanaged([]u8) = .empty,
+    owned_media: std.ArrayListUnmanaged([]u8) = .empty,
+    owned_slices: std.ArrayListUnmanaged([]const []const u8) = .empty,
+    owned_parts: std.ArrayListUnmanaged([]termite.pipelines.generation.Message.ContentPart) = .empty,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.owned_texts.items) |text| alloc.free(text);
+        self.owned_texts.deinit(alloc);
+        for (self.owned_media.items) |media| alloc.free(media);
+        self.owned_media.deinit(alloc);
+        for (self.owned_slices.items) |slice| alloc.free(slice);
+        self.owned_slices.deinit(alloc);
+        for (self.owned_parts.items) |parts| alloc.free(parts);
+        self.owned_parts.deinit(alloc);
+        alloc.free(self.messages);
+        self.* = undefined;
+    }
+};
+
+fn convertLocalGenerateMessages(
+    alloc: std.mem.Allocator,
+    messages: []const antfly.inference.ChatMessage,
+) !LocalGenerateMessages {
+    var out = LocalGenerateMessages{
+        .messages = try alloc.alloc(termite.pipelines.generation.Message, messages.len),
+    };
+    errdefer out.deinit(alloc);
+
+    for (messages, 0..) |message, i| {
+        out.messages[i] = try convertLocalGenerateMessage(alloc, &out, message);
+    }
+    return out;
+}
+
+fn convertLocalGenerateMessage(
+    alloc: std.mem.Allocator,
+    owner: *LocalGenerateMessages,
+    message: antfly.inference.ChatMessage,
+) !termite.pipelines.generation.Message {
+    const role = message.role.toSlice();
+    const content = message.content orelse {
+        const text = try alloc.dupe(u8, "");
+        try owner.owned_texts.append(alloc, text);
+        return .{ .role = role, .content = text };
+    };
+
+    return switch (content) {
+        .text => |text_value| blk: {
+            const text = try alloc.dupe(u8, text_value);
+            try owner.owned_texts.append(alloc, text);
+            break :blk .{ .role = role, .content = text };
+        },
+        .parts => |parts| try convertLocalGenerateParts(alloc, owner, role, parts),
+    };
+}
+
+fn convertLocalGenerateParts(
+    alloc: std.mem.Allocator,
+    owner: *LocalGenerateMessages,
+    role: []const u8,
+    parts: []const antfly.inference.ContentPart,
+) !termite.pipelines.generation.Message {
+    var text_buf = std.ArrayListUnmanaged(u8).empty;
+    errdefer text_buf.deinit(alloc);
+    var images = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer images.deinit(alloc);
+    var audio = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer audio.deinit(alloc);
+    var out_parts = std.ArrayListUnmanaged(termite.pipelines.generation.Message.ContentPart).empty;
+    errdefer out_parts.deinit(alloc);
+
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| {
+                const start = text_buf.items.len;
+                try text_buf.appendSlice(alloc, text);
+                _ = start;
+                try out_parts.append(alloc, .{ .text = text });
+            },
+            .image_url => |image_url| {
+                const decoded = try decodeLocalGenerateDataUri(alloc, image_url.url, null);
+                errdefer alloc.free(decoded.data);
+                if (!std.mem.startsWith(u8, decoded.mime_type, "image/")) {
+                    return error.UnsupportedGeneratorProvider;
+                }
+                try images.append(alloc, decoded.data);
+                try out_parts.append(alloc, .{ .image = images.items.len - 1 });
+                try owner.owned_media.append(alloc, decoded.data);
+            },
+            .media => |media| {
+                const decoded = try decodeLocalGenerateDataUri(alloc, media.data, media.mime_type);
+                errdefer alloc.free(decoded.data);
+                if (std.mem.startsWith(u8, decoded.mime_type, "image/")) {
+                    try images.append(alloc, decoded.data);
+                    try out_parts.append(alloc, .{ .image = images.items.len - 1 });
+                    try owner.owned_media.append(alloc, decoded.data);
+                } else if (std.mem.startsWith(u8, decoded.mime_type, "audio/")) {
+                    try audio.append(alloc, decoded.data);
+                    try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
+                    try owner.owned_media.append(alloc, decoded.data);
+                } else {
+                    return error.UnsupportedGeneratorProvider;
+                }
+            },
+        }
+    }
+
+    const text = try text_buf.toOwnedSlice(alloc);
+    try owner.owned_texts.append(alloc, text);
+    const image_slice = if (images.items.len > 0) blk: {
+        const slice = try images.toOwnedSlice(alloc);
+        try owner.owned_slices.append(alloc, slice);
+        break :blk slice;
+    } else null;
+    const audio_slice = if (audio.items.len > 0) blk: {
+        const slice = try audio.toOwnedSlice(alloc);
+        try owner.owned_slices.append(alloc, slice);
+        break :blk slice;
+    } else null;
+    const content_parts = if (out_parts.items.len > 0) blk: {
+        const slice = try out_parts.toOwnedSlice(alloc);
+        try owner.owned_parts.append(alloc, slice);
+        break :blk slice;
+    } else null;
+
+    return .{
+        .role = role,
+        .content = text,
+        .image_bytes = image_slice,
+        .audio_bytes = audio_slice,
+        .content_parts = content_parts,
+    };
+}
+
+const DecodedLocalMedia = struct {
+    data: []u8,
+    mime_type: []const u8,
+};
+
+fn decodeLocalGenerateDataUri(
+    alloc: std.mem.Allocator,
+    raw: []const u8,
+    declared_mime_type: ?[]const u8,
+) !DecodedLocalMedia {
+    var mime_type = declared_mime_type orelse "application/octet-stream";
+    var payload = raw;
+    if (std.mem.startsWith(u8, raw, "data:")) {
+        const comma = std.mem.indexOfScalar(u8, raw, ',') orelse return error.UnsupportedGeneratorProvider;
+        const meta = raw["data:".len..comma];
+        if (!std.mem.endsWith(u8, meta, ";base64")) return error.UnsupportedGeneratorProvider;
+        const embedded_mime = meta[0 .. meta.len - ";base64".len];
+        if (embedded_mime.len > 0) {
+            if (declared_mime_type) |declared| {
+                if (!std.mem.eql(u8, declared, embedded_mime)) return error.UnsupportedGeneratorProvider;
+            }
+            mime_type = embedded_mime;
+        }
+        payload = raw[comma + 1 ..];
+    }
+
+    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(payload);
+    const decoded = try alloc.alloc(u8, decoded_len);
+    errdefer alloc.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, payload);
+    return .{ .data = decoded, .mime_type = mime_type };
 }
 
 // ---------------------------------------------------------------

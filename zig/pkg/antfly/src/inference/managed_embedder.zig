@@ -84,6 +84,12 @@ pub const LocalTermiteProvider = struct {
         roles: []const []const u8,
         contents: []const []const u8,
     ) anyerror![]u8 = null,
+    generate_messages: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        messages: []const inference_types.ChatMessage,
+    ) anyerror![]u8 = null,
     chunk_input: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,

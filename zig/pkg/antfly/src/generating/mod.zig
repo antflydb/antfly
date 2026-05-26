@@ -164,6 +164,13 @@ const BackendState = struct {
             },
             .termite => |*provider| try provider.generator().generate(alloc, model, messages),
             .local_termite => |local| blk: {
+                if (local.generate_messages) |generate_messages| {
+                    const content = try generate_messages(local.ptr, alloc, model, messages);
+                    break :blk inference.GenerateResult{
+                        .content = content,
+                        .allocator = alloc,
+                    };
+                }
                 const generate_text = local.generate_text orelse return error.UnsupportedGeneratorProvider;
                 const roles = try alloc.alloc([]const u8, messages.len);
                 defer alloc.free(roles);
@@ -387,4 +394,77 @@ test "generating backend routes antfly and url-less termite to local provider" {
     try std.testing.expectEqualStrings("local ok", termite_result.content);
 
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "generating backend passes multimodal messages to local provider callback" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const FakeLocal = struct {
+        calls: usize = 0,
+
+        fn embedDenseTexts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparseTexts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn generateMessages(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            model: []const u8,
+            messages: []const ChatMessage,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("local-model", model);
+            try std.testing.expectEqual(@as(usize, 1), messages.len);
+            const content = messages[0].content orelse return error.TestUnexpectedResult;
+            const parts = switch (content) {
+                .parts => |items| items,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(@as(usize, 2), parts.len);
+            switch (parts[0]) {
+                .text => |text| try std.testing.expectEqualStrings("describe", text),
+                else => return error.TestUnexpectedResult,
+            }
+            switch (parts[1]) {
+                .media => |media| try std.testing.expectEqualStrings("image/png", media.mime_type),
+                else => return error.TestUnexpectedResult,
+            }
+            return try a.dupe(u8, "local multimodal ok");
+        }
+    };
+
+    var fake = FakeLocal{};
+    const local_provider = managed_embedder.LocalTermiteProvider{
+        .ptr = &fake,
+        .embed_dense_texts = FakeLocal.embedDenseTexts,
+        .embed_sparse_texts = FakeLocal.embedSparseTexts,
+        .generate_messages = FakeLocal.generateMessages,
+    };
+
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .parts = &.{
+        .{ .text = "describe" },
+        .{ .media = .{ .mime_type = "image/png", .data = "AA==" } },
+    } } }};
+    const chain = [_]ChainLink{.{
+        .generator = .{
+            .provider = .antfly,
+            .model = "local-model",
+            .url = "",
+        },
+    }};
+    var result = try executeChainWithLocalTermite(alloc, &client, &chain, local_provider, &messages);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("local multimodal ok", result.content);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
