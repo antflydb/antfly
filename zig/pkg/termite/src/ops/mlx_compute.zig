@@ -3241,24 +3241,24 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
         // This avoids materializing the entire weight (e.g. 262144×8960 Q4_K → 8.75GB f32)
         // and instead dequantizes only the requested rows.
         if (weight_arr.quantized_storage) |storage| {
-            if (storage.shape.len == 2) {
-                const row_width: usize = @intCast(storage.shape[1]);
-                if (row_width == dim) {
-                    const output = try self.allocator.alloc(f32, total * dim);
-                    defer self.allocator.free(output);
-                    for (ids, 0..) |id, i| {
-                        const row: usize = @intCast(id);
-                        try quant_codec.dequantizeRow(
-                            storage.tensor_type,
-                            storage.raw_bytes,
-                            dim,
-                            row,
-                            output[i * dim ..][0..dim],
-                        );
-                    }
-                    const shape = [_]i32{ @intCast(total), @intCast(dim) };
-                    return self.fromFloat32Shape(output, &shape);
+            const maybe_rows: ?usize = native_compute_mod.quantizedEmbeddingRows(storage, dim) catch null;
+            if (maybe_rows) |rows| {
+                const output = try self.allocator.alloc(f32, total * dim);
+                defer self.allocator.free(output);
+                for (ids, 0..) |id, i| {
+                    if (id < 0) return error.InvalidTensorShape;
+                    const row: usize = @intCast(id);
+                    if (row >= rows) return error.InvalidTensorShape;
+                    try quant_codec.dequantizeRow(
+                        storage.tensor_type,
+                        storage.raw_bytes,
+                        dim,
+                        row,
+                        output[i * dim ..][0..dim],
+                    );
                 }
+                const shape = [_]i32{ @intCast(total), @intCast(dim) };
+                return self.fromFloat32Shape(output, &shape);
             }
         }
         var maybe_loaded: ?weight_source_mod.LoadedWeight = null;

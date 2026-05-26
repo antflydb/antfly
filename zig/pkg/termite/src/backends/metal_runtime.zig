@@ -1240,9 +1240,7 @@ pub fn decoderRuntimeQuantEmbeddingLookup(
     if (format == .unsupported) return null;
     const layout = packedQuantBlockLayout(kind) orelse return null;
     if (total == 0 or dim == 0 or dim % layout.values_per_block != 0) return null;
-    if (storage.shape.len != 2) return null;
-    const rows: usize = @intCast(storage.shape[0]);
-    if (rows == 0 or @as(usize, @intCast(storage.shape[1])) != dim) return null;
+    const rows = quantizedEmbeddingRows(storage, dim) orelse return null;
     if (ids.len != total) return null;
 
     const ids_u32 = try std.heap.c_allocator.alloc(u32, total);
@@ -1280,6 +1278,29 @@ pub fn decoderRuntimeQuantEmbeddingLookup(
     );
     if (lookup_rc != 0) return null;
     return output;
+}
+
+fn quantizedEmbeddingRows(storage: *const QuantizedStorage, dim: usize) ?usize {
+    if (dim == 0 or storage.shape.len == 0) return null;
+    const cols_i64 = storage.shape[storage.shape.len - 1];
+    if (cols_i64 <= 0) return null;
+    const cols: usize = @intCast(cols_i64);
+    if (cols != dim) return null;
+
+    const block_size = gguf_tensor_types.bytesPerBlock(storage.tensor_type) orelse return null;
+    const values_per_block = gguf_tensor_types.valuesPerBlock(storage.tensor_type) orelse return null;
+    if (dim % values_per_block != 0) return null;
+    const row_bytes = (dim / values_per_block) * block_size;
+    if (row_bytes == 0 or storage.raw_bytes.len % row_bytes != 0) return null;
+    const rows_from_bytes = storage.raw_bytes.len / row_bytes;
+
+    var rows_from_shape: usize = 1;
+    for (storage.shape[0 .. storage.shape.len - 1]) |axis| {
+        if (axis <= 0) return null;
+        rows_from_shape = std.math.mul(usize, rows_from_shape, @intCast(axis)) catch return null;
+    }
+    if (rows_from_shape != rows_from_bytes) return null;
+    return rows_from_shape;
 }
 
 pub fn decoderRuntimeNativeBf16EmbeddingLookup(
@@ -15630,7 +15651,7 @@ test "metal native quant row ops q8_0 linear slot match reference" {
         }
     }
 
-    const shape = [_]i64{ @intCast(source_rows), @intCast(dim) };
+    const shape = [_]i64{ 1, @intCast(source_rows), @intCast(dim) };
     const storage = QuantizedStorage{
         .tensor_type = .{ .known = .Q8_0 },
         .raw_bytes = &weight_raw,

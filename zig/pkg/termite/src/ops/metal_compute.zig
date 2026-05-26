@@ -6568,14 +6568,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const weight_buf = toBuf(weight);
         const quantized_storage = weight_buf.quantized_storage;
-        const shape = if (quantized_storage) |storage|
-            storage.shape
-        else
-            weight_buf.logical_shape orelse return error.InvalidTensorShape;
-        if (shape.len != 2) return error.InvalidTensorShape;
-        const rows: usize = @intCast(shape[0]);
-        const cols: usize = @intCast(shape[1]);
-        if (cols != dim) return error.InvalidTensorShape;
+        const rows: usize = if (quantized_storage) |storage| blk: {
+            break :blk try native_compute_mod.quantizedEmbeddingRows(storage, dim);
+        } else blk: {
+            const shape = weight_buf.logical_shape orelse return error.InvalidTensorShape;
+            if (shape.len != 2) return error.InvalidTensorShape;
+            const cols: usize = @intCast(shape[1]);
+            if (cols != dim) return error.InvalidTensorShape;
+            break :blk @intCast(shape[0]);
+        };
 
         if (quantized_storage == null and weight_buf.native_dense_bytes == null and !disableRuntimeEmbeddingLookup()) {
             var weight_mt = try self.ownedMetalTensorFromCt(weight);

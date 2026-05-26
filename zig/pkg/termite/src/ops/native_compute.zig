@@ -4511,6 +4511,29 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     return error.MissingWeight;
 }
 
+pub fn quantizedEmbeddingRows(storage: *const QuantizedStorage, dim: usize) !usize {
+    if (dim == 0 or storage.shape.len == 0) return error.InvalidTensorShape;
+    const cols_i64 = storage.shape[storage.shape.len - 1];
+    if (cols_i64 <= 0) return error.InvalidTensorShape;
+    const cols: usize = @intCast(cols_i64);
+    if (cols != dim) return error.InvalidTensorShape;
+
+    const block_size = gguf_tensor_types.bytesPerBlock(storage.tensor_type) orelse return error.UnsupportedTensorType;
+    const values_per_block = gguf_tensor_types.valuesPerBlock(storage.tensor_type) orelse return error.UnsupportedTensorType;
+    if (dim % values_per_block != 0) return error.InvalidQuantizedDataSize;
+    const row_bytes = (dim / values_per_block) * block_size;
+    if (row_bytes == 0 or storage.raw_bytes.len % row_bytes != 0) return error.InvalidQuantizedDataSize;
+    const rows_from_bytes = storage.raw_bytes.len / row_bytes;
+
+    var rows_from_shape: usize = 1;
+    for (storage.shape[0 .. storage.shape.len - 1]) |axis| {
+        if (axis <= 0) return error.InvalidTensorShape;
+        rows_from_shape = std.math.mul(usize, rows_from_shape, @intCast(axis)) catch return error.UnsupportedShape;
+    }
+    if (rows_from_shape != rows_from_bytes) return error.InvalidQuantizedDataSize;
+    return rows_from_shape;
+}
+
 fn prefetchWeightHint(ctx: *anyopaque, name: []const u8, hint: u32) void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     if (self.data.resident_weights.contains(name)) return;
@@ -4802,11 +4825,7 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
     errdefer self.allocator.free(out);
     const weight_buf = toBuf(weight);
     if (weight_buf.quantized_storage) |storage| {
-        if (storage.shape.len != 2) return error.InvalidTensorShape;
-        if (storage.shape[0] <= 0 or storage.shape[1] <= 0) return error.InvalidTensorShape;
-        const rows: usize = @intCast(storage.shape[0]);
-        const cols: usize = @intCast(storage.shape[1]);
-        if (cols != dim) return error.InvalidTensorShape;
+        const rows = try quantizedEmbeddingRows(storage, dim);
         for (0..total) |i| {
             if (ids[i] < 0) return error.InvalidTensorShape;
             const idx: usize = @intCast(ids[i]);
@@ -43775,6 +43794,37 @@ test "embeddingLookup dequantizes quantized GGUF rows" {
     }
     try quant_codec.dequantizeRow(.{ .known = .Q8_0 }, raw, 32, 0, &expected_row);
     for (out[32..64], expected_row) |actual, expected| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+
+    var dense_q4 = [_]f32{0} ** 256;
+    for (&dense_q4, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i)) / 17.0 - 4.0;
+    const raw_q4 = try quant_codec.quantizeQ4_KFromF32(allocator, &dense_q4);
+    defer allocator.free(raw_q4);
+
+    const rank3_shape = [_]i64{ 1, 1, 256 };
+    var q4_storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_K },
+        .raw_bytes = raw_q4,
+        .shape = &rank3_shape,
+        .raw_owned = false,
+        .allocator = allocator,
+    };
+
+    const q4_weight_ct = try compute.makeBufWithEntry(empty_f32[0..], false, "count_embed.pos_embedding.weight", null, &q4_storage, null);
+    defer cb.free(q4_weight_ct);
+
+    const q4_ids = [_]i64{ 0, 0 };
+    const q4_out_ct = try cb.embeddingLookup(q4_weight_ct, &q4_ids, q4_ids.len, 256);
+    defer cb.free(q4_out_ct);
+
+    var expected_q4 = [_]f32{0} ** 256;
+    try quant_codec.dequantizeRow(.{ .known = .Q4_K }, raw_q4, 256, 0, &expected_q4);
+    const q4_out = getData(q4_out_ct);
+    for (q4_out[0..256], expected_q4) |actual, expected| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
+    for (q4_out[256..512], expected_q4) |actual, expected| {
         try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
     }
 }
