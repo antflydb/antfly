@@ -688,8 +688,8 @@ pub const PersistentIndex = struct {
 
         // Create subdirectories
         var index_buf: [512]u8 = undefined;
-        const index_path = std.fmt.bufPrint(&index_buf, "{s}/index\x00", .{path_span}) catch return error.PathTooLong;
-        const index_path_span = std.mem.span(@as([*:0]const u8, @ptrCast(index_path.ptr)));
+        const index_path = std.fmt.bufPrintZ(&index_buf, "{s}/index", .{path_span}) catch return error.PathTooLong;
+        const index_path_span = index_path[0..index_path.len];
         if (builtin.os.tag != .freestanding and needs_host_dirs) {
             var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
@@ -698,7 +698,7 @@ pub const PersistentIndex = struct {
         }
 
         var wal_buf: [512]u8 = undefined;
-        const wal_path = std.fmt.bufPrint(&wal_buf, "{s}/wal\x00", .{path_span}) catch return error.PathTooLong;
+        const wal_path = std.fmt.bufPrintZ(&wal_buf, "{s}/wal", .{path_span}) catch return error.PathTooLong;
 
         var segment_files: ?SegmentFileStore = null;
         if (supports_main_lmdb) {
@@ -715,7 +715,7 @@ pub const PersistentIndex = struct {
         errdefer if (segment_files) |*store| store.close();
 
         // Open WAL
-        var wal = try wal_mod.WAL.open(@ptrCast(wal_path.ptr), .{
+        var wal = try wal_mod.WAL.open(wal_path.ptr, .{
             .map_size = opts.wal_map_size,
             .no_sync = opts.wal_no_sync,
             .commit_backend = walCommitBackendForOptions(opts.wal_commit_backend),
@@ -732,7 +732,7 @@ pub const PersistentIndex = struct {
         errdefer wal.close();
 
         // Open main backing store
-        var opened_main = try openMainStore(alloc, @ptrCast(index_path.ptr), index_path_span, opts);
+        var opened_main = try openMainStore(alloc, index_path.ptr, index_path_span, opts);
         errdefer {
             opened_main.store.deinit();
             opened_main.owner.close(alloc);
