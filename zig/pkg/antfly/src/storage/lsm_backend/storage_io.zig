@@ -1513,11 +1513,21 @@ fn closeFd(fd: std.posix.fd_t) void {
 }
 
 fn fileSizeFromFd(fd: std.posix.fd_t) !u64 {
-    var stat: std.posix.Stat = undefined;
+    const current = try seekFd(fd, 0, std.posix.SEEK.CUR);
+    errdefer {
+        _ = seekFd(fd, @intCast(current), std.posix.SEEK.SET) catch {};
+    }
+
+    const size = try seekFd(fd, 0, std.posix.SEEK.END);
+    _ = try seekFd(fd, @intCast(current), std.posix.SEEK.SET);
+    return size;
+}
+
+fn seekFd(fd: std.posix.fd_t, offset: i64, whence: usize) !u64 {
     while (true) {
-        const rc = std.posix.system.fstat(fd, &stat);
+        const rc = std.posix.system.lseek(fd, offset, @intCast(whence));
         switch (std.posix.errno(rc)) {
-            .SUCCESS => return @bitCast(stat.size),
+            .SUCCESS => return @intCast(rc),
             .INTR => continue,
             else => |err| return posixStatError(err),
         }
