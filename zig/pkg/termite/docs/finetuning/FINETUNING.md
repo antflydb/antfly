@@ -105,6 +105,131 @@ termite finetune smoke-fast
 
 `smoke-fast` runs quick dry-runs across every family adapter fixture, executes synthetic no-download GLiNER2, Qwen2, and Gemma4 recipe cases plus the fast scalar DPO/GRPO recipes, verifies the normalized run artifacts reach `status = "succeeded"`, and writes a suite summary at `/tmp/termite-finetune-smoke-fast/fast_smoke_summary.json` by default.
 
+### GLiNER2 Production Readiness
+
+GLiNER2 resident Metal and MLX fine-tuning are production-ready at the
+infrastructure level once the production-readiness gate passes on a non-toy
+train/eval dataset with a semantic adapter-reload golden and a nonzero quality
+floor. The current model-quality threshold is intentionally modest while
+per-label calibration work continues:
+
+```sh
+zig build -Dmetal=true gliner2-production-readiness -- \
+  /private/tmp/termite-models/gliner2 \
+  /private/tmp/gliner2-conll2003-train-200.jsonl \
+  /private/tmp/gliner2-conll2003-train-200.jsonl \
+  /private/tmp/termite-gliner2-metal-prod-gate \
+  person,organization,location \
+  --production-metal-gate \
+  --semantic-golden "Microsoft opened an office in London" Microsoft organization 0.03 \
+  --quality-eval \
+  --quality-max-examples 25 \
+  --quality-nms-overlap 0.0 \
+  --quality-top-k-per-label 1 \
+  --quality-max-predictions-per-example 3 \
+  --quality-best-span-per-label-start \
+  --min-entity-f1 0.15
+```
+
+`--production-metal-gate` is the canonical resident Metal preset: backend
+`metal`, compiled required, 200 examples/steps, batch size 1, sequence length
+32, Metal optimizer, zero trainable host/device transfers, nonzero resident
+trainable bytes, finite/decreasing loss, and `avg_step_wall_ms <= 3000`.
+It also runs the same 25-example shaped quality eval and requires
+`f1 >= 0.15`.
+`--production-mlx-gate` is the canonical resident MLX preset: backend `mlx`,
+compiled required, 200 examples/steps, batch size 1, sequence length 32, MLX
+optimizer, zero trainable host/device transfers, nonzero resident trainable bytes,
+finite/decreasing loss, entity-like semantic/quality decoding, and
+`avg_step_wall_ms <= 10000`. It also runs a 25-example shaped quality eval by
+default and requires `f1 >= 0.15`.
+Span-start training defaults to
+`--span-loss bce --span-positive-weight 32 --span-negative-weight 1` to
+optimize sparse positive span labels with a weighted binary objective. Use
+`--span-loss mse` only to reproduce older calibration runs. Metrics and
+manifests include
+`entity_label_positive_counts`, aligned to `entity_labels`, so target-label
+coverage can be audited alongside prediction quality.
+`--span-hard-negative-weight` adds extra loss weight to negative span labels
+whose candidate span overlaps a gold entity, which is useful when diagnostics
+show partial-span or wrong-label predictions near true entities.
+For long runs, loss-decrease validation uses a first-window vs last-window
+trend instead of comparing only the first and final individual step. Semantic
+goldens pass when the expected entity appears among decoded predictions above
+the requested score threshold; the reported `top_entity` remains available for
+calibration debugging.
+Semantic adapter reload is required by default. Use repeatable
+`--semantic-golden TEXT EXPECT_TEXT EXPECT_LABEL MIN_SCORE` entries for a
+stronger release gate; the older single-golden `--eval-text`,
+`--expect-label`, and `--min-score` form remains supported.
+Optional `--semantic-nms-overlap`, `--semantic-max-predictions`,
+`--semantic-top-k-per-label`, `--semantic-best-span-per-label-start`, and
+`--semantic-label-thresholds label=FLOAT[,label=FLOAT...]` flags expose
+stricter single-text decode shaping for calibration experiments.
+`--quality-eval` runs saved-adapter dataset evaluation and supports
+`--min-entity-precision`, `--min-entity-recall`, and `--min-entity-f1`.
+The evaluator reports exact-match metrics for all decoded entities above
+`--quality-min-prediction-score` / `--min-prediction-score`. Span calibration
+uses same-label overlap NMS by default; use
+`--quality-label-thresholds label=FLOAT[,label=FLOAT...]` for per-label score
+floors. Use `--quality-nms-overlap FLOAT`, `--quality-no-nms`, and
+`--quality-sweep-thresholds CSV` to inspect decoding calibration; threshold
+sweeps report both a global `best_threshold` and
+`best_per_label_thresholds` candidates.
+`--quality-top-k-per-label`,
+`--quality-max-predictions-per-example`, and
+`--quality-best-span-per-label-start` provide stricter decode shaping before
+raising model-quality thresholds.
+When quality eval is enabled, the production gate also writes
+`quality_summary.json` and `quality_thresholds.csv` in the run directory and
+includes both paths in the final gate JSON. The summary sidecar contains
+per-label metrics, threshold-sweep calibration candidates, a reusable
+`recommended_label_thresholds_csv` string, and a bounded FP/FN diagnostic sample
+controlled by `--quality-diagnostic-limit`. The CSV file can be fed back into
+`--semantic-label-thresholds` or `--quality-label-thresholds` for calibrated
+decode checks.
+
+Example 200-step resident Metal quality gate output from this rollout:
+`avg_step_wall_ms=2792.75`, `max_device_trainable_transfer_count=0`,
+`max_device_trainable_bytes=9486400`, and 25-example shaped quality
+`precision=0.1733`, `recall=0.2766`, `f1=0.2131` at threshold `0.03`.
+A post-run threshold sweep selected threshold `0.15` with `f1=0.2241`.
+Initial per-label thresholds are available as a calibration control, but the
+current adapter still needs model-side quality work: a stricter candidate
+`person=0.30,organization=0.15,location=0.25` reduced predictions from 75 to
+67 and raised organization precision, but aggregate F1 fell to `0.1930`.
+
+Example 200-step resident MLX quality gate output from this rollout:
+`avg_step_wall_ms=537.53`,
+`supervised_tokens_per_second=242.83`, `optimizer_backend=mlx`,
+`max_device_trainable_transfer_count=0`, `max_device_trainable_bytes=9486400`,
+`max_peak_resident_bytes=1441054720`, and 25-example shaped quality
+`precision=0.1467`, `recall=0.2340`, `f1=0.1803` at threshold `0.03`.
+This gate uses the compiled MLX gradient
+session and keeps LoRA/task-head weights, gradient accumulators, and AdamW
+moments resident as MLX arrays. The trainable-transfer metric counts
+optimizer/trainable host round-trips, not the per-step runtime input rebinding.
+
+For custom thresholds, pass the explicit options instead of the preset:
+
+```sh
+zig build -Dmetal=true gliner2-production-readiness -- \
+  /models/gliner2 \
+  /data/gliner2_train.jsonl \
+  /data/gliner2_eval.jsonl \
+  /runs/gliner2-prod-gate \
+  person,organization,location \
+  --eval-text "Alice joined Acme in Paris" \
+  --expect-label organization \
+  --min-score 0.05 \
+  --materialized-dir /runs/gliner2-prod-gate/materialized
+```
+
+The gate performs dataset readiness checks, full autodiff training, artifact
+validation, LoRA bundle inspection, fixed-text semantic eval against the
+reloaded adapter, and optional materialization. Use `--dry-run
+--skip-semantic-eval` to verify build wiring without local model/data files.
+
 ### Adapter Matrix
 
 | Recipe | Family | Current route |

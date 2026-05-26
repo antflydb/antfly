@@ -26,11 +26,59 @@ pub fn main(init: std.process.Init) !void {
     const model_dir = args.next() orelse return usageError();
     const input_path = args.next() orelse return usageError();
     const entity_types_csv = args.next() orelse return usageError();
-    const split = args.next();
-    const max_length_arg = args.next() orelse "256";
-    const max_span_width_arg = args.next() orelse "8";
-    const batch_size_arg = args.next() orelse "4";
-    const drop_no_target_arg = args.next() orelse "false";
+    var positional = std.ArrayListUnmanaged([]const u8).empty;
+    defer positional.deinit(allocator);
+    var readiness_options = gliner2_data.DatasetReadinessOptions{};
+    var fail_on_readiness = false;
+    while (args.next()) |arg| {
+        if (!std.mem.startsWith(u8, arg, "--")) {
+            try positional.append(allocator, arg);
+        } else if (std.mem.eql(u8, arg, "--preset")) {
+            const value = args.next() orelse return usageError();
+            if (std.mem.eql(u8, value, "smoke")) {
+                readiness_options = .{};
+            } else if (std.mem.eql(u8, value, "non-toy")) {
+                readiness_options = .{
+                    .min_examples = 100,
+                    .min_total_entities = 100,
+                    .min_unique_labels = 2,
+                    .min_target_entities = 100,
+                    .min_target_coverage_ratio = 0.95,
+                    .require_all_examples_with_target = true,
+                    .min_positive_span_labels = 100,
+                };
+            } else {
+                return usageError();
+            }
+        } else if (std.mem.eql(u8, arg, "--fail-on-readiness")) {
+            fail_on_readiness = true;
+        } else if (std.mem.eql(u8, arg, "--min-examples")) {
+            readiness_options.min_examples = try std.fmt.parseUnsigned(usize, args.next() orelse return usageError(), 10);
+        } else if (std.mem.eql(u8, arg, "--min-entities")) {
+            readiness_options.min_total_entities = try std.fmt.parseUnsigned(usize, args.next() orelse return usageError(), 10);
+        } else if (std.mem.eql(u8, arg, "--min-labels")) {
+            readiness_options.min_unique_labels = try std.fmt.parseUnsigned(usize, args.next() orelse return usageError(), 10);
+        } else if (std.mem.eql(u8, arg, "--min-target-entities")) {
+            readiness_options.min_target_entities = try std.fmt.parseUnsigned(usize, args.next() orelse return usageError(), 10);
+        } else if (std.mem.eql(u8, arg, "--min-target-coverage")) {
+            readiness_options.min_target_coverage_ratio = try std.fmt.parseFloat(f64, args.next() orelse return usageError());
+        } else if (std.mem.eql(u8, arg, "--require-all-examples-with-target")) {
+            readiness_options.require_all_examples_with_target = true;
+        } else if (std.mem.eql(u8, arg, "--min-positive-span-labels")) {
+            readiness_options.min_positive_span_labels = try std.fmt.parseUnsigned(usize, args.next() orelse return usageError(), 10);
+        } else if (std.mem.eql(u8, arg, "--min-positive-rate")) {
+            readiness_options.min_positive_rate_per_label = try std.fmt.parseFloat(f64, args.next() orelse return usageError());
+        } else {
+            return usageError();
+        }
+    }
+    if (positional.items.len > 5) return usageError();
+
+    const split = if (positional.items.len >= 1 and !std.mem.eql(u8, positional.items[0], "-")) positional.items[0] else null;
+    const max_length_arg = if (positional.items.len >= 2) positional.items[1] else "256";
+    const max_span_width_arg = if (positional.items.len >= 3) positional.items[2] else "8";
+    const batch_size_arg = if (positional.items.len >= 4) positional.items[3] else "4";
+    const drop_no_target_arg = if (positional.items.len >= 5) positional.items[4] else "false";
 
     const max_length = try std.fmt.parseUnsigned(usize, max_length_arg, 10);
     const max_span_width = try std.fmt.parseUnsigned(usize, max_span_width_arg, 10);
@@ -64,6 +112,16 @@ pub fn main(init: std.process.Init) !void {
         max_span_width,
         batch_size,
     );
+    var readiness = try gliner2_data.evaluateDatasetReadiness(
+        allocator,
+        loaded.examples,
+        entity_types,
+        max_length,
+        max_span_width,
+        batch_size,
+        readiness_options,
+    );
+    defer gliner2_data.freeDatasetReadinessSummary(allocator, &readiness);
 
     var tokenizer = try gliner2_data.Tokenizer.initGLiNER2HF(allocator, model_dir);
     defer tokenizer.deinit(allocator);
@@ -102,9 +160,11 @@ pub fn main(init: std.process.Init) !void {
             .input_ids_len = preview_batch.input_ids.len,
             .span_labels_len = preview_batch.span_labels.len,
         },
+        .readiness = readiness,
     }, .{ .whitespace = .indent_2 }, &writer.interface);
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
+    if (fail_on_readiness and !readiness.passed) return error.DatasetReadinessFailed;
 }
 
 fn parseCsv(allocator: std.mem.Allocator, value: []const u8) ![][]const u8 {
@@ -127,6 +187,18 @@ fn usageError() error{InvalidArguments} {
     std.debug.print(
         \\usage: inspect-gliner2-dataset <model_dir> <jsonl_or_dir> <entity_types_csv> [split] [max_length] [max_span_width] [batch_size] [drop_no_target]
         \\example: inspect-gliner2-dataset /tmp/gliner2_base /tmp/train person,organization,location train 256 8 4 true
+        \\
+        \\optional readiness flags:
+        \\  --preset smoke|non-toy
+        \\  --fail-on-readiness
+        \\  --min-examples N
+        \\  --min-entities N
+        \\  --min-labels N
+        \\  --min-target-entities N
+        \\  --min-target-coverage FLOAT
+        \\  --require-all-examples-with-target
+        \\  --min-positive-span-labels N
+        \\  --min-positive-rate FLOAT
         \\
     , .{});
     return error.InvalidArguments;

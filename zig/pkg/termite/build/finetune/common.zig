@@ -16,6 +16,7 @@ const std = @import("std");
 
 pub const Import = enum {
     antfly_image,
+    antfly_platform,
     build_options,
     jinja,
     ml,
@@ -53,6 +54,7 @@ pub const Context = struct {
     pjrt_mod: *std.Build.Module,
     protobuf_mod: *std.Build.Module,
     termite_linalg_mod: *std.Build.Module,
+    antfly_platform_mod: *std.Build.Module,
     enable_system_blas: bool,
     blas_root: ?[]const u8,
     enable_mlx: bool,
@@ -62,6 +64,7 @@ pub const Context = struct {
     pub fn moduleFor(ctx: Context, import: Import) *std.Build.Module {
         return switch (import) {
             .antfly_image => ctx.antfly_image_mod,
+            .antfly_platform => ctx.antfly_platform_mod,
             .build_options => ctx.build_options_mod,
             .jinja => ctx.jinja_mod,
             .ml => ctx.ml_mod,
@@ -198,6 +201,8 @@ fn configureMetal(ctx: Context, module: *std.Build.Module, enable_metal: bool) v
     if (!enable_metal or ctx.target.result.os.tag != .macos) return;
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
+    module.linkFramework("MetalPerformanceShaders", .{});
+    module.linkFramework("MetalPerformanceShadersGraph", .{});
     module.addCSourceFile(.{ .file = ctx.b.path("src/backends/metal_kernels.m"), .flags = &.{"-fobjc-arc"} });
 }
 

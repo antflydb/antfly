@@ -36,6 +36,7 @@ pub const config_file_name = "config.json";
 pub const encoder_config_file_name = "encoder_config/config.json";
 pub const adapter_checkpoint_file_name = "adapter_model.safetensors";
 pub const adapter_config_file_name = "adapter_config.json";
+pub const task_head_checkpoint_file_name = "task_head.safetensors";
 pub const tokenizer_file_name = "tokenizer.json";
 pub const tokenizer_config_file_name = "tokenizer_config.json";
 pub const special_tokens_map_file_name = "special_tokens_map.json";
@@ -379,6 +380,30 @@ pub const LoRATrainEvalSummary = struct {
     }
 };
 
+pub const AutodiffAdapterParam = struct {
+    name: []const u8,
+    dims: []const i32,
+    weights: []const f32,
+};
+
+pub const AutodiffAdapterExportSummary = struct {
+    artifact_family_version: []const u8,
+    output_dir: []const u8,
+    adapter_checkpoint_path: []const u8,
+    adapter_config_path: []const u8,
+    exported_tensor_count: usize,
+    lora_rank: usize,
+    lora_alpha: f32,
+    target_modules: []const []const u8,
+};
+
+pub const AutodiffRegularParamExportSummary = struct {
+    artifact_family_version: []const u8,
+    output_dir: []const u8,
+    checkpoint_path: []const u8,
+    exported_tensor_count: usize,
+};
+
 pub const MaterializeSummary = struct {
     artifact_family_version: []const u8,
     base_model_dir: []const u8,
@@ -388,12 +413,71 @@ pub const MaterializeSummary = struct {
     merged_lora_tensor_count: usize,
     merged_dora_tensor_count: usize = 0,
     task_head_passthrough_tensor_count: usize,
+    attached_task_head_tensor_count: usize = 0,
     span_rep_passthrough_tensor_count: usize,
     count_embed_passthrough_tensor_count: usize,
     copied_boundary_head: bool,
     copied_boundary_task_head: bool,
     copied_cleanup_head: bool,
     copied_base_tensor_count: usize,
+};
+
+pub const ClassifierTaskHead = struct {
+    allocator: std.mem.Allocator,
+    weight: []f32,
+    bias: []f32,
+    num_classes: usize,
+    hidden_size: usize,
+
+    pub fn deinit(self: *ClassifierTaskHead) void {
+        self.allocator.free(self.weight);
+        self.allocator.free(self.bias);
+        self.* = undefined;
+    }
+
+    pub fn scoreRowsAlloc(
+        self: *const ClassifierTaskHead,
+        allocator: std.mem.Allocator,
+        hidden_rows: []const f32,
+    ) ![]f32 {
+        if (self.hidden_size == 0 or hidden_rows.len % self.hidden_size != 0) return error.InvalidTaskHeadInputShape;
+        const row_count = hidden_rows.len / self.hidden_size;
+        const logits = try allocator.alloc(f32, row_count * self.num_classes);
+        for (0..row_count) |row_idx| {
+            const hidden = hidden_rows[row_idx * self.hidden_size ..][0..self.hidden_size];
+            for (0..self.num_classes) |class_idx| {
+                const weights = self.weight[class_idx * self.hidden_size ..][0..self.hidden_size];
+                var value = self.bias[class_idx];
+                for (hidden, weights) |h, w| value += h * w;
+                logits[row_idx * self.num_classes + class_idx] = value;
+            }
+        }
+        return logits;
+    }
+
+    pub fn predictRowsAlloc(
+        self: *const ClassifierTaskHead,
+        allocator: std.mem.Allocator,
+        hidden_rows: []const f32,
+    ) ![]usize {
+        const logits = try self.scoreRowsAlloc(allocator, hidden_rows);
+        defer allocator.free(logits);
+        const row_count = hidden_rows.len / self.hidden_size;
+        const predictions = try allocator.alloc(usize, row_count);
+        for (0..row_count) |row_idx| {
+            const row = logits[row_idx * self.num_classes ..][0..self.num_classes];
+            var best_idx: usize = 0;
+            var best = row[0];
+            for (row[1..], 1..) |value, class_idx| {
+                if (value > best) {
+                    best = value;
+                    best_idx = class_idx;
+                }
+            }
+            predictions[row_idx] = best_idx;
+        }
+        return predictions;
+    }
 };
 
 pub fn resolveArtifactPaths(allocator: std.mem.Allocator, model_input: []const u8) !ArtifactPaths {
@@ -924,6 +1008,132 @@ pub fn saveLoRABundle(bundle: *const LoadedLoRABundle, out_dir: []const u8) !voi
     try copySupportingArtifactIfPresent(allocator, bundle.base_model_dir, out_dir, special_tokens_map_file_name);
 }
 
+pub fn exportAutodiffAdaptersAsPeftBundle(
+    allocator: std.mem.Allocator,
+    out_dir: []const u8,
+    base_model_name_or_path: []const u8,
+    rank: usize,
+    alpha: f32,
+    target_modules: []const []const u8,
+    params: []const AutodiffAdapterParam,
+) !AutodiffAdapterExportSummary {
+    try compat.cwd().createDirPath(compat.io(), out_dir);
+    const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
+    errdefer allocator.free(checkpoint_path);
+    const config_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_config_file_name });
+    errdefer allocator.free(config_path);
+
+    var tensors = try allocator.alloc(WriteTensorF32, params.len);
+    defer allocator.free(tensors);
+    var owned_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (owned_names.items) |item| allocator.free(item);
+        owned_names.deinit(allocator);
+    }
+    var owned_shapes: std.ArrayListUnmanaged([]const usize) = .empty;
+    defer {
+        for (owned_shapes.items) |item| allocator.free(item);
+        owned_shapes.deinit(allocator);
+    }
+
+    var tensor_count: usize = 0;
+    for (params) |param| {
+        const peft_name = try autodiffParamNameToPeftName(allocator, param.name);
+        errdefer allocator.free(peft_name);
+        const shape = try i32DimsToUsize(allocator, param.dims);
+        errdefer allocator.free(shape);
+        if (elementCount(shape) != param.weights.len) return error.AdapterTensorShapeMismatch;
+
+        try owned_names.append(allocator, peft_name);
+        try owned_shapes.append(allocator, shape);
+        tensors[tensor_count] = .{
+            .name = peft_name,
+            .shape = shape,
+            .data = param.weights,
+        };
+        tensor_count += 1;
+    }
+
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, tensors[0..tensor_count]);
+    try writeAdapterConfigJson(allocator, config_path, base_model_name_or_path, rank, alpha, target_modules, false);
+
+    return .{
+        .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
+        .output_dir = try allocator.dupe(u8, out_dir),
+        .adapter_checkpoint_path = checkpoint_path,
+        .adapter_config_path = config_path,
+        .exported_tensor_count = tensor_count,
+        .lora_rank = rank,
+        .lora_alpha = alpha,
+        .target_modules = try dupeStringSlice(allocator, target_modules),
+    };
+}
+
+pub fn exportAutodiffRegularParamsAsSafetensors(
+    allocator: std.mem.Allocator,
+    out_dir: []const u8,
+    params: []const AutodiffAdapterParam,
+) !AutodiffRegularParamExportSummary {
+    try compat.cwd().createDirPath(compat.io(), out_dir);
+    const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, task_head_checkpoint_file_name });
+    errdefer allocator.free(checkpoint_path);
+
+    var tensors = try allocator.alloc(WriteTensorF32, params.len);
+    defer allocator.free(tensors);
+    var owned_shapes: std.ArrayListUnmanaged([]const usize) = .empty;
+    defer {
+        for (owned_shapes.items) |item| allocator.free(item);
+        owned_shapes.deinit(allocator);
+    }
+
+    for (params, 0..) |param, idx| {
+        const shape = try i32DimsToUsize(allocator, param.dims);
+        errdefer allocator.free(shape);
+        if (elementCount(shape) != param.weights.len) return error.AdapterTensorShapeMismatch;
+        try owned_shapes.append(allocator, shape);
+        tensors[idx] = .{
+            .name = param.name,
+            .shape = shape,
+            .data = param.weights,
+        };
+    }
+
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, tensors);
+    return .{
+        .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
+        .output_dir = try allocator.dupe(u8, out_dir),
+        .checkpoint_path = checkpoint_path,
+        .exported_tensor_count = params.len,
+    };
+}
+
+pub fn loadClassifierTaskHead(
+    allocator: std.mem.Allocator,
+    checkpoint_path: []const u8,
+) !ClassifierTaskHead {
+    var access = try openTensorAccessForFile(allocator, checkpoint_path);
+    defer access.deinit();
+
+    var weight_tensor = try loadTensorAsF32(allocator, access, "classifier.weight");
+    defer weight_tensor.deinit();
+    var bias_tensor = try loadTensorAsF32(allocator, access, "classifier.bias");
+    defer bias_tensor.deinit();
+
+    if (weight_tensor.shape.len != 2 or bias_tensor.shape.len != 1) return error.InvalidTaskHeadTensorShape;
+    const num_classes = positiveShapeDim(weight_tensor.shape[0]) orelse return error.InvalidTaskHeadTensorShape;
+    const hidden_size = positiveShapeDim(weight_tensor.shape[1]) orelse return error.InvalidTaskHeadTensorShape;
+    const bias_classes = positiveShapeDim(bias_tensor.shape[0]) orelse return error.InvalidTaskHeadTensorShape;
+    if (bias_classes != num_classes) return error.InvalidTaskHeadTensorShape;
+
+    return .{
+        .allocator = allocator,
+        .weight = try allocator.dupe(f32, weight_tensor.asFloat32()),
+        .bias = try allocator.dupe(f32, bias_tensor.asFloat32()),
+        .num_classes = num_classes,
+        .hidden_size = hidden_size,
+    };
+}
+
 pub fn materializeMergedModel(
     allocator: std.mem.Allocator,
     base_model_dir: []const u8,
@@ -984,6 +1194,7 @@ pub fn materializeMergedModel(
         const tensor = try Tensor.initFloat32(allocator, item.name, item.tensor.shape, item.tensor.asFloat32());
         try merged.put(allocator, try allocator.dupe(u8, item.name), tensor);
     }
+    const attached_task_head_tensor_count = try attachTaskHeadCheckpointIfPresent(allocator, adapter_model_dir, &merged);
 
     try compat.cwd().createDirPath(compat.io(), out_dir);
     const output_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
@@ -1035,6 +1246,7 @@ pub fn materializeMergedModel(
         .merged_lora_tensor_count = bundle.layers.len + bundle.passthrough_tensors.len,
         .merged_dora_tensor_count = merged_dora_tensor_count,
         .task_head_passthrough_tensor_count = bundle.passthrough_tensors.len,
+        .attached_task_head_tensor_count = attached_task_head_tensor_count,
         .span_rep_passthrough_tensor_count = span_rep_passthrough_tensor_count,
         .count_embed_passthrough_tensor_count = count_embed_passthrough_tensor_count,
         .copied_boundary_head = copied_boundary_head,
@@ -1085,6 +1297,23 @@ pub fn freeLoRABundleInspectionSummary(allocator: std.mem.Allocator, summary: *L
     }
     for (summary.tensors) |*item| freeLoRATensorSummary(allocator, item);
     allocator.free(summary.tensors);
+    summary.* = undefined;
+}
+
+pub fn freeAutodiffAdapterExportSummary(allocator: std.mem.Allocator, summary: *AutodiffAdapterExportSummary) void {
+    allocator.free(summary.artifact_family_version);
+    allocator.free(summary.output_dir);
+    allocator.free(summary.adapter_checkpoint_path);
+    allocator.free(summary.adapter_config_path);
+    for (summary.target_modules) |item| allocator.free(item);
+    allocator.free(summary.target_modules);
+    summary.* = undefined;
+}
+
+pub fn freeAutodiffRegularParamExportSummary(allocator: std.mem.Allocator, summary: *AutodiffRegularParamExportSummary) void {
+    allocator.free(summary.artifact_family_version);
+    allocator.free(summary.output_dir);
+    allocator.free(summary.checkpoint_path);
     summary.* = undefined;
 }
 
@@ -1163,6 +1392,28 @@ fn parseLoRAAdapterTensorName(tensor_name: []const u8) ?ParsedLoRAAdapterTensorN
         return .{ .base_tensor_base_name = base, .module_name = module, .kind = .b };
     }
     return null;
+}
+
+fn autodiffParamNameToPeftName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    if (std.mem.endsWith(u8, name, ".lora_A")) {
+        const base = name[0 .. name.len - ".lora_A".len];
+        return autodiffParamBaseToPeftName(allocator, tensorBaseName(base), "lora_A");
+    }
+    if (std.mem.endsWith(u8, name, ".lora_B")) {
+        const base = name[0 .. name.len - ".lora_B".len];
+        return autodiffParamBaseToPeftName(allocator, tensorBaseName(base), "lora_B");
+    }
+    return error.InvalidAutodiffAdapterName;
+}
+
+fn autodiffParamBaseToPeftName(allocator: std.mem.Allocator, base_no_weight: []const u8, adapter_name: []const u8) ![]const u8 {
+    // The autodiff trainer strips the outer HF "encoder." prefix before
+    // graph execution, while GLiNER2 checkpoint/bundle tools validate
+    // against the original HF checkpoint names.
+    if (std.mem.startsWith(u8, base_no_weight, "encoder.layer.")) {
+        return std.fmt.allocPrint(allocator, "encoder.{s}.{s}.weight", .{ base_no_weight, adapter_name });
+    }
+    return std.fmt.allocPrint(allocator, "{s}.{s}.weight", .{ base_no_weight, adapter_name });
 }
 
 fn moduleNameForBaseTensor(base_tensor_name: []const u8) ?[]const u8 {
@@ -1285,6 +1536,27 @@ fn buildZeroF32(allocator: std.mem.Allocator, len: usize) ![]f32 {
     const data = try allocator.alloc(f32, len);
     @memset(data, 0.0);
     return data;
+}
+
+fn i32DimsToUsize(allocator: std.mem.Allocator, dims: []const i32) ![]usize {
+    const out = try allocator.alloc(usize, dims.len);
+    errdefer allocator.free(out);
+    for (dims, 0..) |dim, idx| {
+        if (dim <= 0) return error.InvalidAdapterTensorShape;
+        out[idx] = @intCast(dim);
+    }
+    return out;
+}
+
+fn elementCount(shape: []const usize) usize {
+    var count: usize = 1;
+    for (shape) |dim| count *= dim;
+    return count;
+}
+
+fn positiveShapeDim(dim: i64) ?usize {
+    if (dim <= 0) return null;
+    return @intCast(dim);
 }
 
 fn tensorBaseName(tensor_name: []const u8) []const u8 {
@@ -1545,6 +1817,30 @@ fn freeLoRATensorSummary(allocator: std.mem.Allocator, item: *LoRATensorSummary)
     if (item.dora_magnitude_tensor_name) |value| allocator.free(value);
     allocator.free(item.module_name);
     item.* = undefined;
+}
+
+fn attachTaskHeadCheckpointIfPresent(
+    allocator: std.mem.Allocator,
+    adapter_model_dir: []const u8,
+    merged: *std.StringArrayHashMapUnmanaged(Tensor),
+) !usize {
+    const task_head_path = try optionalPathInDir(allocator, adapter_model_dir, task_head_checkpoint_file_name);
+    defer if (task_head_path) |path| allocator.free(path);
+    const path = task_head_path orelse return 0;
+
+    var access = try openTensorAccessForFile(allocator, path);
+    defer access.deinit();
+    const names = try access.listNames(allocator);
+    defer allocator.free(names);
+    if (!stringSliceContains(names, "classifier.weight")) return error.MissingTaskHeadTensors;
+    if (!stringSliceContains(names, "classifier.bias")) return error.MissingTaskHeadTensors;
+
+    for (names) |name| {
+        var tensor = try loadTensorAsF32(allocator, access, name);
+        errdefer tensor.deinit();
+        try merged.put(allocator, try allocator.dupe(u8, name), tensor);
+    }
+    return names.len;
 }
 
 fn copySupportingArtifactIfPresent(
@@ -2621,6 +2917,14 @@ test "gliner2 bootstrap and inspect lora bundle" {
         layer.dora_magnitude_tensor_name = try doraMagnitudeTensorName(allocator, layer.base_tensor_name);
     }
     try saveLoRABundle(&bundle, out_dir);
+    const task_head_path = try std.fs.path.join(allocator, &.{ out_dir, task_head_checkpoint_file_name });
+    defer allocator.free(task_head_path);
+    const classifier_weight = [_]f32{0.25} ** (3 * 128);
+    const classifier_bias = [_]f32{ 0.5, -0.25, 0.75 };
+    try writeHeaderAndTensorsF32(allocator, task_head_path, &.{
+        .{ .name = "classifier.weight", .shape = &.{ 3, 128 }, .data = &classifier_weight },
+        .{ .name = "classifier.bias", .shape = &.{3}, .data = &classifier_bias },
+    });
 
     var cleanup_head = try entity_cleanup_model.CleanupHead.init(allocator, 8, 4, 0);
     defer cleanup_head.deinit();
@@ -2647,4 +2951,148 @@ test "gliner2 bootstrap and inspect lora bundle" {
     }
     try std.testing.expect(materialize.copied_cleanup_head);
     try std.testing.expectEqual(@as(usize, 2), materialize.merged_dora_tensor_count);
+    try std.testing.expectEqual(@as(usize, 2), materialize.attached_task_head_tensor_count);
+
+    var materialized_access = try openTensorAccessForFile(allocator, materialize.output_checkpoint_path);
+    defer materialized_access.deinit();
+    var materialized_classifier_weight = try loadTensorAsF32(allocator, materialized_access, "classifier.weight");
+    defer materialized_classifier_weight.deinit();
+    var materialized_classifier_bias = try loadTensorAsF32(allocator, materialized_access, "classifier.bias");
+    defer materialized_classifier_bias.deinit();
+    try std.testing.expectEqualSlices(i64, &.{ 3, 128 }, materialized_classifier_weight.shape);
+    try std.testing.expectEqualSlices(i64, &.{3}, materialized_classifier_bias.shape);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), materialized_classifier_weight.asFloat32()[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.25), materialized_classifier_bias.asFloat32()[1], 1e-6);
+
+    var adapter_head = try loadClassifierTaskHead(allocator, task_head_path);
+    defer adapter_head.deinit();
+    var materialized_head = try loadClassifierTaskHead(allocator, materialize.output_checkpoint_path);
+    defer materialized_head.deinit();
+    try std.testing.expectEqual(adapter_head.num_classes, materialized_head.num_classes);
+    try std.testing.expectEqual(adapter_head.hidden_size, materialized_head.hidden_size);
+    try std.testing.expectEqualSlices(f32, adapter_head.weight, materialized_head.weight);
+    try std.testing.expectEqualSlices(f32, adapter_head.bias, materialized_head.bias);
+
+    const hidden_rows = [_]f32{0.5} ** (2 * 128);
+    const adapter_logits = try adapter_head.scoreRowsAlloc(allocator, &hidden_rows);
+    defer allocator.free(adapter_logits);
+    const materialized_logits = try materialized_head.scoreRowsAlloc(allocator, &hidden_rows);
+    defer allocator.free(materialized_logits);
+    try std.testing.expectEqualSlices(f32, adapter_logits, materialized_logits);
+    try std.testing.expectApproxEqAbs(@as(f32, 16.5), adapter_logits[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 15.75), adapter_logits[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 16.75), adapter_logits[2], 1e-5);
+}
+
+test "gliner2 exports autodiff adapter params as inspectable PEFT bundle" {
+    const allocator = std.testing.allocator;
+    const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_autodiff_export_test_{d}", .{std.posix.system.getpid()});
+    defer allocator.free(root);
+    compat.cwd().deleteTree(compat.io(), root) catch {};
+    try compat.cwd().createDirPath(compat.io(), root);
+    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    const encoder_dir = try std.fs.path.join(allocator, &.{ root, "encoder_config" });
+    defer allocator.free(encoder_dir);
+    try compat.cwd().createDirPath(compat.io(), encoder_dir);
+    const config_path = try std.fs.path.join(allocator, &.{ root, config_file_name });
+    defer allocator.free(config_path);
+    const encoder_config_path = try std.fs.path.join(allocator, &.{ root, encoder_config_file_name });
+    defer allocator.free(encoder_config_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = config_path,
+        .data = "{\"model_name\":\"urchade/gliner2\",\"model_type\":\"gliner2\",\"counting_layer\":\"count_embed\",\"token_pooling\":\"first\",\"max_width\":12}",
+    });
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = encoder_config_path,
+        .data = "{\"hidden_size\":128,\"num_hidden_layers\":1,\"num_attention_heads\":4}",
+    });
+    const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
+    defer allocator.free(checkpoint_path);
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &[_]f32{0} ** (4 * 128) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &[_]f32{0} ** (32 * 32) },
+        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &[_]f32{0} ** 128 },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
+    });
+
+    const out_dir = try std.fs.path.join(allocator, &.{ root, "autodiff_lora" });
+    defer allocator.free(out_dir);
+    const a_data = [_]f32{0.01} ** (2 * 128);
+    const b_data = [_]f32{0.02} ** (128 * 2);
+    const params = [_]AutodiffAdapterParam{
+        .{
+            .name = "encoder.layer.0.attention.self.query_proj.weight.lora_A",
+            .dims = &.{ 2, 128 },
+            .weights = &a_data,
+        },
+        .{
+            .name = "encoder.layer.0.attention.self.query_proj.weight.lora_B",
+            .dims = &.{ 128, 2 },
+            .weights = &b_data,
+        },
+    };
+    var exported = try exportAutodiffAdaptersAsPeftBundle(
+        allocator,
+        out_dir,
+        root,
+        2,
+        4,
+        &.{"query_proj"},
+        &params,
+    );
+    defer freeAutodiffAdapterExportSummary(allocator, &exported);
+    try std.testing.expectEqual(@as(usize, 2), exported.exported_tensor_count);
+
+    var inspected = try inspectLoRABundle(allocator, root, out_dir);
+    defer freeLoRABundleInspectionSummary(allocator, &inspected);
+    try std.testing.expectEqual(@as(usize, 1), inspected.resolved_tensor_count);
+    try std.testing.expectEqual(@as(usize, 512), inspected.trainable_parameter_count);
+    try std.testing.expectEqualStrings("encoder.encoder.layer.0.attention.self.query_proj.weight", inspected.tensors[0].base_tensor_name);
+    try std.testing.expectEqualStrings("encoder.encoder.layer.0.attention.self.query_proj.lora_A.weight", inspected.tensors[0].adapter_a_tensor_name);
+}
+
+test "gliner2 classifier task head reloads and scores golden hidden rows" {
+    const allocator = std.testing.allocator;
+    const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_task_head_score_test_{d}", .{std.posix.system.getpid()});
+    defer allocator.free(root);
+    compat.cwd().deleteTree(compat.io(), root) catch {};
+    try compat.cwd().createDirPath(compat.io(), root);
+    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+
+    const checkpoint_path = try std.fs.path.join(allocator, &.{ root, task_head_checkpoint_file_name });
+    defer allocator.free(checkpoint_path);
+    const weight = [_]f32{
+        1.0,  0.0,  0.5,  -1.0,
+        0.25, 0.25, 0.25, 0.25,
+        -1.0, 1.0,  0.0,  0.5,
+    };
+    const bias = [_]f32{ 0.1, -0.2, 0.0 };
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
+        .{ .name = "classifier.weight", .shape = &.{ 3, 4 }, .data = &weight },
+        .{ .name = "classifier.bias", .shape = &.{3}, .data = &bias },
+    });
+
+    var head = try loadClassifierTaskHead(allocator, checkpoint_path);
+    defer head.deinit();
+    try std.testing.expectEqual(@as(usize, 3), head.num_classes);
+    try std.testing.expectEqual(@as(usize, 4), head.hidden_size);
+
+    const hidden = [_]f32{
+        2.0,  -1.0, 0.5, 1.0,
+        -2.0, 3.0,  0.0, 2.0,
+    };
+    const logits = try head.scoreRowsAlloc(allocator, &hidden);
+    defer allocator.free(logits);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.35), logits[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.425), logits[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.5), logits[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -3.9), logits[3], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.55), logits[4], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), logits[5], 1e-6);
+
+    const predictions = try head.predictRowsAlloc(allocator, &hidden);
+    defer allocator.free(predictions);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, predictions);
 }

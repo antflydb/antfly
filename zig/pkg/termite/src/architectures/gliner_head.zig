@@ -641,7 +641,33 @@ fn mlp2(
     const b1 = try cb.getWeight(b1_name);
     defer cb.free(b1);
 
+    // Second layer
+    var buf3: [256]u8 = undefined;
+    const w2_name = std.fmt.bufPrint(&buf3, "{s}.3.weight", .{prefix}) catch return error.NameTooLong;
+    const w2 = try cb.getWeight(w2_name);
+    defer cb.free(w2);
+    const b2_name = std.fmt.bufPrint(&buf3, "{s}.3.bias", .{prefix}) catch return error.NameTooLong;
+    const b2 = try cb.getWeight(b2_name);
+    defer cb.free(b2);
+
     var timer = profileStart(profile);
+    if (try cb.denseMlp2(&.{
+        .input = input,
+        .first_weight = w1,
+        .first_bias = b1,
+        .second_weight = w2,
+        .second_bias = b2,
+        .rows = rows,
+        .in_dim = in_dim,
+        .hidden_dim = hidden_dim,
+        .out_dim = out_dim,
+        .activation = .relu,
+    })) |fused| {
+        if (profile) |p| p.span_out_project_first_linear_ns += profileElapsed(timer);
+        return fused;
+    }
+
+    timer = profileStart(profile);
     const h1_relu = if (try cb.linearRelu(input, w1, b1, rows, in_dim, hidden_dim)) |fused|
         fused
     else blk: {
@@ -653,15 +679,6 @@ fn mlp2(
     if (profile) |p| p.span_out_project_first_linear_ns += profileElapsed(timer);
 
     if (profile) |p| p.span_out_project_relu_ns += 0;
-
-    // Second layer
-    var buf3: [256]u8 = undefined;
-    const w2_name = std.fmt.bufPrint(&buf3, "{s}.3.weight", .{prefix}) catch return error.NameTooLong;
-    const w2 = try cb.getWeight(w2_name);
-    defer cb.free(w2);
-    const b2_name = std.fmt.bufPrint(&buf3, "{s}.3.bias", .{prefix}) catch return error.NameTooLong;
-    const b2 = try cb.getWeight(b2_name);
-    defer cb.free(b2);
 
     timer = profileStart(profile);
     const out = try cb.linear(h1_relu, w2, b2, rows, hidden_dim, out_dim);

@@ -32,6 +32,13 @@ const workflow_commands = [_]common.CommandSpec{
         .native_link = .default,
     },
     .{
+        .name = "gliner2-production-readiness",
+        .root_source_file = "src/finetune/run_gliner2_production_readiness.zig",
+        .description = "Run the GLiNER2 production-readiness gate: dataset checks, training, artifact validation, semantic eval, and optional materialization",
+        .imports = &.{ .build_options, .ml, .termite_internal, .termite_hf_tokenizer, .protobuf, .termite_linalg },
+        .native_link = .default,
+    },
+    .{
         .name = "run-gemma4-lora-pilot-workflow",
         .root_source_file = "src/finetune/train/run_gemma4_lora_pilot_workflow.zig",
         .description = "Run a larger single-device Gemma4 LoRA text or multimodal pilot workflow",
