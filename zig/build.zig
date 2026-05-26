@@ -99,6 +99,7 @@ const termite_delegated_steps = [_][]const u8{
     "bench-linalg",
     "bench-audio",
     "bench-gliner2-native",
+    "gliner2-production-readiness",
     "test-finetune",
     "test",
     "wasm",

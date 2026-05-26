@@ -153,6 +153,66 @@ pub const ExecutionResult = struct {
     }
 };
 
+const OpProfileEntry = struct {
+    name: []const u8,
+    count: usize = 0,
+    total_ns: u64 = 0,
+};
+
+const OpProfiler = struct {
+    allocator: std.mem.Allocator,
+    entries: std.ArrayListUnmanaged(OpProfileEntry) = .empty,
+
+    fn deinit(self: *OpProfiler) void {
+        self.entries.deinit(self.allocator);
+    }
+
+    fn add(self: *OpProfiler, name: []const u8, ns: u64) !void {
+        for (self.entries.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                entry.count += 1;
+                entry.total_ns += ns;
+                return;
+            }
+        }
+        try self.entries.append(self.allocator, .{
+            .name = name,
+            .count = 1,
+            .total_ns = ns,
+        });
+    }
+
+    fn print(self: *OpProfiler) void {
+        std.debug.print("[graph-op-profile] top ops by wall time\n", .{});
+        var printed: usize = 0;
+        var last_ns: ?u64 = null;
+        var last_name: []const u8 = "";
+        while (printed < 24) : (printed += 1) {
+            var best: ?OpProfileEntry = null;
+            for (self.entries.items) |entry| {
+                if (last_ns) |limit| {
+                    if (entry.total_ns > limit) continue;
+                    if (entry.total_ns == limit and std.mem.order(u8, entry.name, last_name) != .gt) continue;
+                }
+                if (best == null or entry.total_ns > best.?.total_ns or
+                    (entry.total_ns == best.?.total_ns and std.mem.order(u8, entry.name, best.?.name) == .lt))
+                {
+                    best = entry;
+                }
+            }
+            const entry = best orelse break;
+            last_ns = entry.total_ns;
+            last_name = entry.name;
+            const avg_ms = if (entry.count == 0) 0.0 else nsToMs(entry.total_ns) / @as(f64, @floatFromInt(entry.count));
+            std.debug.print(
+                "[graph-op-profile] {s}: count={} total_ms={d:.3} avg_ms={d:.3}\n",
+                .{ entry.name, entry.count, nsToMs(entry.total_ns), avg_ms },
+            );
+        }
+        if (printed == 0) std.debug.print("[graph-op-profile] no profiled ops\n", .{});
+    }
+};
+
 pub const CapturedValuesResult = struct {
     values: []CT,
     allocator: std.mem.Allocator,
@@ -168,6 +228,54 @@ fn containsCt(values: []const CT, needle: CT) bool {
         if (value == needle) return true;
     }
     return false;
+}
+
+fn graphExecTraceEnabled() bool {
+    const value = platform.env.getenv("TERMITE_GRAPH_EXEC_TRACE") orelse return false;
+    return value.len > 0 and !std.mem.eql(u8, value, "0") and !std.ascii.eqlIgnoreCase(value, "false");
+}
+
+fn graphOpProfileEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_GRAPH_OP_PROFILE", false);
+}
+
+fn graphOpSlowThresholdNs() u64 {
+    const value = platform.env.getenv("TERMITE_GRAPH_OP_SLOW_MS") orelse return 0;
+    const ms = std.fmt.parseFloat(f64, value) catch return 0;
+    if (ms <= 0) return 0;
+    return @intFromFloat(ms * 1_000_000.0);
+}
+
+fn graphExecDiag(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print("[graph-exec] " ++ fmt ++ "\n", args);
+}
+
+fn graphNowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
+}
+
+fn graphElapsedNs(start_ns: u64, end_ns: u64) u64 {
+    if (end_ns <= start_ns) return 0;
+    return end_ns - start_ns;
+}
+
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
+
+fn currentResidentBytes() usize {
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    if (usage.maxrss <= 0) return 0;
+    const maxrss: usize = @intCast(usage.maxrss);
+    return switch (@import("builtin").os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => maxrss,
+        .linux => std.math.mul(usize, maxrss, 1024) catch std.math.maxInt(usize),
+        else => maxrss,
+    };
 }
 
 /// Compute which nodes are reachable from graph outputs (walking
@@ -251,6 +359,20 @@ pub fn execute(
     options: ExecuteOptions,
 ) !ExecutionResult {
     const count = graph.nodeCount();
+    const trace_nodes = graphExecTraceEnabled();
+    const profile_ops = graphOpProfileEnabled();
+    const slow_op_threshold_ns = graphOpSlowThresholdNs();
+    var op_profiler = OpProfiler{ .allocator = allocator };
+    defer op_profiler.deinit();
+    defer if (profile_ops) op_profiler.print();
+    if (trace_nodes) {
+        graphExecDiag("begin nodes={} outputs={} runtime_inputs={} rss={}", .{
+            count,
+            graph.outputs.items.len,
+            if (options.runtime_inputs) |inputs| inputs.len else @as(usize, 0),
+            currentResidentBytes(),
+        });
+    }
 
     // 1-2. Use cached analysis if available, otherwise compute on the fly.
     const have_cache = options.cached_analysis != null;
@@ -311,6 +433,15 @@ pub fn execute(
 
         // Check for runtime input override
         if (rt_map.get(node_id)) |rt_val| {
+            if (trace_nodes) {
+                const node = graph.node(node_id);
+                graphExecDiag("node runtime id={} op={s} shape={any} rss={}", .{
+                    node_id,
+                    @tagName(std.meta.activeTag(node.op)),
+                    node.output_shape,
+                    currentResidentBytes(),
+                });
+            }
             values[i] = rt_val;
             logNodeRuntimeShape(graph, cb, node_id, rt_val);
             try recordRuntimeShape(allocator, cb, runtime_shapes, shape_capture, node_id, rt_val);
@@ -323,6 +454,29 @@ pub fn execute(
         // override was provided.
         if (graph.node(node_id).op == .fused_from_float32) continue;
 
+        if (trace_nodes) {
+            const node = graph.node(node_id);
+            graphExecDiag("node begin id={} op={s} shape={any} rss={}", .{
+                node_id,
+                @tagName(std.meta.activeTag(node.op)),
+                node.output_shape,
+                currentResidentBytes(),
+            });
+            if (std.meta.activeTag(node.op) == .add) {
+                for (node.getInputs(), 0..) |input_id, input_idx| {
+                    if (input_id == null_node or input_id >= count) continue;
+                    const input_node = graph.node(input_id);
+                    graphExecDiag("node input id={} input{}={} op={s} shape={any}", .{
+                        node_id,
+                        input_idx,
+                        input_id,
+                        @tagName(std.meta.activeTag(input_node.op)),
+                        input_node.output_shape,
+                    });
+                }
+            }
+        }
+        const op_start_ns = if (profile_ops) graphNowNs() else 0;
         values[i] = executeNode(graph, cb, values, node_id, &exec_state) catch |err| {
             std.log.warn("executeNode failed node_id={d} op={s} shape={any} err={}", .{
                 node_id,
@@ -332,6 +486,34 @@ pub fn execute(
             });
             return err;
         };
+        if (profile_ops) {
+            const elapsed_ns = graphElapsedNs(op_start_ns, graphNowNs());
+            try op_profiler.add(@tagName(std.meta.activeTag(graph.node(node_id).op)), elapsed_ns);
+            if (slow_op_threshold_ns != 0 and elapsed_ns >= slow_op_threshold_ns) {
+                const node = graph.node(node_id);
+                std.debug.print(
+                    "[graph-op-profile] slow node id={} op={s} ms={d:.3} shape={any}",
+                    .{ node_id, @tagName(std.meta.activeTag(node.op)), nsToMs(elapsed_ns), node.output_shape },
+                );
+                for (node.getInputs(), 0..) |input_id, input_idx| {
+                    if (input_id == null_node or input_id >= count) continue;
+                    const input_node = graph.node(input_id);
+                    std.debug.print(
+                        " input{}={}:{s}:{any}",
+                        .{ input_idx, input_id, @tagName(std.meta.activeTag(input_node.op)), input_node.output_shape },
+                    );
+                }
+                std.debug.print("\n", .{});
+            }
+        }
+        if (trace_nodes) {
+            const node = graph.node(node_id);
+            graphExecDiag("node done id={} op={s} rss={}", .{
+                node_id,
+                @tagName(std.meta.activeTag(node.op)),
+                currentResidentBytes(),
+            });
+        }
         logNodeRuntimeShape(graph, cb, node_id, values[i].?);
         try recordRuntimeShape(allocator, cb, runtime_shapes, shape_capture, node_id, values[i].?);
         try cloneOutputIfAliasedInputWouldBeFreed(
@@ -428,6 +610,9 @@ pub fn execute(
     // 8. Free MoE routing state from the last layer.
     exec_state.freeMoeState();
 
+    if (trace_nodes) {
+        graphExecDiag("done outputs={} rss={}", .{ outputs.len, currentResidentBytes() });
+    }
     return .{ .outputs = outputs, .allocator = allocator };
 }
 
@@ -904,7 +1089,6 @@ fn executeScatterAdd(
     if (dest_data.len != out_rows * dim or values_data.len != value_rows * dim or index_data.len < value_rows) return error.ShapeMismatch;
 
     const output = try allocator.dupe(f32, dest_data);
-    errdefer allocator.free(output);
     defer allocator.free(output);
     for (0..value_rows) |row_idx| {
         const out_row_f = @round(index_data[row_idx]);
@@ -2377,15 +2561,55 @@ pub fn executeNode(
             var dest_buf: [8]i64 = undefined;
             var values_buf: [8]i64 = undefined;
             var indices_buf: [8]i64 = undefined;
-            const dest_shape = fillShapeDims(graph, ins[0], &dest_buf);
-            const values_shape = fillShapeDims(graph, ins[1], &values_buf);
-            const indices_shape = fillShapeDims(graph, ins[2], &indices_buf);
+            var generated_dest: ?CT = null;
+            defer if (generated_dest) |ct| cb.free(ct);
+
+            var dest: CT = undefined;
+            var scatter_values: CT = undefined;
+            var indices: CT = undefined;
+            var dest_shape: []const i64 = undefined;
+            var values_shape: []const i64 = undefined;
+            var indices_shape: []const i64 = undefined;
+
+            if (graph.node(node_id).num_inputs == 2) {
+                const out_shape = graph.node(node_id).output_shape;
+                const rank = out_shape.rank();
+                if (rank > dest_buf.len) return error.UnsupportedShape;
+                var dims_i32: [8]i32 = undefined;
+                for (0..rank) |axis| {
+                    const dim = out_shape.dim(@intCast(axis));
+                    if (dim <= 0) return error.UnsupportedShape;
+                    dest_buf[axis] = dim;
+                    dims_i32[axis] = @intCast(dim);
+                }
+                const elem_count_i64 = out_shape.numElements() orelse return error.UnsupportedShape;
+                if (elem_count_i64 < 0) return error.UnsupportedShape;
+                const elem_count: usize = @intCast(elem_count_i64);
+                const zeros = try std.heap.page_allocator.alloc(f32, elem_count);
+                defer std.heap.page_allocator.free(zeros);
+                @memset(zeros, 0.0);
+                generated_dest = try cb.fromFloat32Shape(zeros, dims_i32[0..rank]);
+
+                dest = generated_dest.?;
+                scatter_values = V.get(ins[0]);
+                indices = V.get(ins[1]);
+                dest_shape = dest_buf[0..rank];
+                values_shape = fillShapeDims(graph, ins[0], &values_buf);
+                indices_shape = fillShapeDims(graph, ins[1], &indices_buf);
+            } else {
+                dest = V.get(ins[0]);
+                scatter_values = V.get(ins[1]);
+                indices = V.get(ins[2]);
+                dest_shape = fillShapeDims(graph, ins[0], &dest_buf);
+                values_shape = fillShapeDims(graph, ins[1], &values_buf);
+                indices_shape = fillShapeDims(graph, ins[2], &indices_buf);
+            }
             return executeScatterAdd(
                 std.heap.page_allocator,
                 cb,
-                V.get(ins[0]),
-                V.get(ins[1]),
-                V.get(ins[2]),
+                dest,
+                scatter_values,
+                indices,
                 dest_shape,
                 values_shape,
                 indices_shape,
@@ -3352,6 +3576,47 @@ test "scatter_add interpreter uses dest values and explicit indices input" {
     defer allocator.free(actual);
 
     try std.testing.expectEqualSlices(f32, &.{ 16, 28, 33, 44, 50, 60 }, actual);
+}
+
+test "scatter_add interpreter supports autodiff two-input gather gradient form" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const values = try builder.parameter("values", Shape.init(.f32, &.{ 3, 2 }));
+    const indices = try builder.parameter("indices", Shape.init(.i64, &.{3}));
+    const out = try g.addNode(.{
+        .op = .{ .scatter_add = .{ .axis = 0 } },
+        .output_shape = Shape.init(.f32, &.{ 3, 2 }),
+        .inputs = .{ values, indices, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(out);
+
+    var tc_backend = TestCompute.init(allocator);
+    defer tc_backend.deinit();
+    defer tc_backend.freeWeights();
+    var cb = tc_backend.backend();
+
+    const values_ct = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
+    const indices_ct = try cb.fromFloat32Shape(&.{ 0, 1, 0 }, &.{3});
+    defer cb.free(values_ct);
+    defer cb.free(indices_ct);
+
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = values, .value = values_ct },
+        .{ .node_id = indices, .value = indices_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb, .{ .runtime_inputs = &rt_inputs });
+    defer result.deinit(&cb);
+
+    const actual = try cb.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+
+    try std.testing.expectEqualSlices(f32, &.{ 6, 8, 3, 4, 0, 0 }, actual);
 }
 
 test "shouldReshapeToDeclaredShape does not collapse higher-rank tensors" {
