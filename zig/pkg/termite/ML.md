@@ -2,7 +2,7 @@
 
 ## Context
 
-termite-zig currently uses **eager execution** with a `ComputeBackend` VTable of ~45 fused ops (`src/ops/ops.zig:118-345`). Model architectures (`gpt.zig`, `bert.zig`, etc.) call `cb.linear(...)`, `cb.rmsNorm(...)` directly, and each backend (BLAS, MLX, WASM) implements these ops immediately.
+termite-zig currently uses **eager execution** with a `ComputeBackend` VTable of ~45 fused ops (`src/ops/ops.zig:118-345`). Model architectures (`gpt.zig`, `bert.zig`, etc.) call `cb.linear(...)`, `cb.rmsNorm(...)` directly, and each backend (native, Metal, WASM) implements these ops immediately.
 
 This works well for inference but prevents:
 - **Graph optimizations** (op fusion, memory planning, dead code elimination)
@@ -143,9 +143,9 @@ A `ComputeBackend` VTable implementation where every op appends a node to a `Gra
 **The golden correctness test:**
 ```
 For each architecture (GPT, BERT, T5, ...):
-  1. eager_logits  = gpt.forward(blas_cb, ...)           // existing path
+  1. eager_logits  = gpt.forward(native_cb, ...)           // existing path
   2. graph         = gpt.forward(tracing_cb, ...)         // tracing
-  3. interp_logits = interpreter.execute(graph, blas_cb)  // interpret
+  3. interp_logits = interpreter.execute(graph, native_cb)  // interpret
   4. assert(eager_logits == interp_logits)                // bit-exact
 ```
 
@@ -295,8 +295,8 @@ src/graph/                      -- Termite-specific bridge (imports lib/ml)
 |------|------|
 | `src/ops/ops.zig:110-345` | ComputeBackend VTable — the tracing target |
 | `src/architectures/gpt.zig:92-114` | GPT forward pass — primary test subject |
-| `src/ops/blas_compute.zig` | BLAS backend — reference interpreter target |
-| `src/ops/mlx_compute.zig` | MLX backend — fused kernel targets for optimization |
+| `src/ops/native_compute.zig` | native backend — reference interpreter target |
+| `src/ops/metal_compute.zig` | Metal backend — fused kernel targets for optimization |
 | `src/pipelines/generation.zig` | Generation pipeline — integration point for graph mode |
 | `src/backends/backends.zig:17-21` | BackendKind enum — needs `graph` variant |
 | `build.zig` | Build system — add `lib/ml` and `src/graph` to module resolution |

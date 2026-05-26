@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     const input_path = args.next() orelse return usage();
     const out_path = args.next() orelse return usage();
     const split = args.next();
-    const backend_arg = args.next() orelse "blas";
+    const backend_arg = args.next() orelse "native";
     const max_examples_arg = args.next() orelse "128";
     const max_length_arg = args.next() orelse "256";
     const max_span_width_arg = args.next() orelse "8";
@@ -76,8 +76,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn parseBackend(value: []const u8) !text_encoder_boundary.BackendChoice {
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
+    if (std.mem.eql(u8, value, "native")) return .native;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "auto")) return .auto;
     return error.InvalidBackend;
 }
@@ -85,7 +85,7 @@ fn parseBackend(value: []const u8) !text_encoder_boundary.BackendChoice {
 fn usage() error{InvalidArguments}!void {
     std.debug.print(
         \\usage: prepare-gliner2-entity-cleanup-cache <model_dir> <jsonl_or_dir> <out_json> [split] [backend] [max_examples] [max_length] [max_span_width] [top_layer_count]
-        \\example: prepare-gliner2-entity-cleanup-cache /tmp/gliner2_base /tmp/entity_cleanup.jsonl /tmp/entity_cleanup_gliner_cache.json train blas 128 256 8 1
+        \\example: prepare-gliner2-entity-cleanup-cache /tmp/gliner2_base /tmp/entity_cleanup.jsonl /tmp/entity_cleanup_gliner_cache.json train native 128 256 8 1
         \\
     , .{});
     return error.InvalidArguments;

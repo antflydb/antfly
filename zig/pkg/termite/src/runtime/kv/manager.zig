@@ -432,7 +432,7 @@ test "manager allocates paged tail blocks" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 4,
         .num_kv_heads = 8,
@@ -553,7 +553,7 @@ test "manager can attach sequence with shared prefix blocks" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 2,
         .num_kv_heads = 1,
@@ -605,7 +605,7 @@ test "manager trims sequence to sliding window in whole blocks" {
     defer manager.deinit();
 
     const pool_id = try manager.addPool(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 2,
         .num_kv_heads = 1,

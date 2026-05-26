@@ -33,7 +33,7 @@
 // DATA:
 //   /tmp/ner_train.jsonl (JSONL with {text, entities} per line)
 //
-// NOTE: This test requires the full build module graph (`ml`, BLAS linkage).
+// NOTE: This test requires the full build module graph (`ml`, system BLAS linkage).
 // It will NOT compile standalone via `zig test`. Run via:
 //   zig build test-gliner2-real-training
 // after adding a build step in build.zig, or by referencing this file from

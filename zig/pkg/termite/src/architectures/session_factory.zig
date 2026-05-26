@@ -15,7 +15,7 @@
 // Unified session factory for architecture-based models (BERT, T5, etc).
 //
 // Given a model directory, loads the manifest, detects the architecture,
-// creates the appropriate ComputeBackend (native CPU or MLX), and returns a
+// creates the appropriate ComputeBackend (native CPU or Metal), and returns a
 // Session that runs the model's forward pass.
 
 const std = @import("std");
@@ -64,12 +64,24 @@ const gguf_mod = @import("../gguf/root.zig");
 const c_file = @import("../util/c_file.zig");
 const runtime = @import("../runtime/root.zig");
 
-const mlx_compute_mod = if (build_options.enable_mlx) @import("../ops/mlx_compute.zig") else struct {};
-const MlxCompute = if (build_options.enable_mlx) mlx_compute_mod.MlxCompute else void;
 const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
-const MlxQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
-const mlx_mod = if (build_options.enable_mlx) @import("../backends/mlx.zig") else struct {};
-const mlx_quant_mod = if (build_options.enable_mlx) @import("../backends/mlx_quant.zig") else struct {
+const GpuHostedQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
+const GpuHostedCompute = void;
+const gpu_hosted_mod = struct {
+    pub fn arrayFromTensor(_: anytype, _: anytype, _: anytype) !void {
+        unreachable;
+    }
+    pub fn insertWeight(_: anytype, _: anytype, _: anytype, _: anytype) !void {
+        unreachable;
+    }
+    pub fn loadSafetensors(_: anytype, _: anytype, _: anytype) !void {
+        unreachable;
+    }
+    pub fn check(_: anytype) !void {
+        unreachable;
+    }
+};
+const gpu_hosted_quant_mod = struct {
     pub const Provider = void;
     pub fn nullProvider() void {
         return {};
@@ -78,7 +90,29 @@ const mlx_quant_mod = if (build_options.enable_mlx) @import("../backends/mlx_qua
         return {};
     }
 };
-const mlx_c = if (build_options.enable_mlx) mlx_mod.c else struct {};
+const gpu_hosted_c = struct {
+    pub const resident_stream = void;
+    pub const resident_map_string_to_array = void;
+    pub const resident_array = void;
+    pub fn resident_map_string_to_array_iterator_new(_: anytype) void {
+        unreachable;
+    }
+    pub fn resident_map_string_to_array_iterator_free(_: anytype) c_int {
+        unreachable;
+    }
+    pub fn resident_array_new() void {
+        unreachable;
+    }
+    pub fn resident_array_free(_: anytype) c_int {
+        unreachable;
+    }
+    pub fn resident_map_string_to_array_iterator_next(_: anytype, _: anytype, _: anytype) c_int {
+        unreachable;
+    }
+    pub fn resident_transpose(_: anytype, _: anytype, _: anytype) c_int {
+        unreachable;
+    }
+};
 const metal_runtime = if (build_options.enable_metal) @import("../backends/metal_runtime.zig") else struct {
     fn metalDeviceAvailable() bool {
         return false;
@@ -91,10 +125,10 @@ fn directQuantEnabled() bool {
     return !platform.env.getenvBool("TERMITE_NATIVE_DISABLE_DIRECT_QUANT");
 }
 
-fn mlxQuantExecutionMode(direct_quant_enabled: bool) MlxQuantExecutionMode {
+fn gpuHostedQuantExecutionMode(direct_quant_enabled: bool) GpuHostedQuantExecutionMode {
     if (!direct_quant_enabled) return .prefer_backend_dense;
 
-    const slice = platform.env.getenv("TERMITE_MLX_QUANT_MODE") orelse return .device_native;
+    const slice = platform.env.getenv("TERMITE_METAL_QUANT_MODE") orelse return .device_native;
     if (std.ascii.eqlIgnoreCase(slice, "dense") or std.ascii.eqlIgnoreCase(slice, "prefer_backend_dense")) {
         return .prefer_backend_dense;
     }
@@ -107,13 +141,13 @@ fn mlxQuantExecutionMode(direct_quant_enabled: bool) MlxQuantExecutionMode {
     return .device_native;
 }
 
-fn mlxEagerDenseMaxBytes() u64 {
-    const mb = platform.env.getenvUsize("TERMITE_MLX_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
+fn gpuHostedEagerDenseMaxBytes() u64 {
+    const mb = platform.env.getenvUsize("TERMITE_METAL_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
     return mb * 1024 * 1024;
 }
 
-fn forceMlxEagerDenseLoadDebug() bool {
-    return platform.env.getenvBool("TERMITE_FORCE_MLX_EAGER_DENSE");
+fn forceGpuHostedEagerDenseLoadDebug() bool {
+    return platform.env.getenvBool("TERMITE_FORCE_METAL_EAGER_DENSE");
 }
 
 fn disablePrefetchWorkerDebug() bool {
@@ -125,17 +159,13 @@ fn graphRuntimeStrategyEnabled(strategy: ?graph_runtime.Strategy) bool {
 }
 
 fn shouldUseSharedGpuHostedEagerDenseLoad(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest, arch_config: ArchConfig) bool {
-    if (forceMlxEagerDenseLoadDebug()) return true;
+    if (forceGpuHostedEagerDenseLoadDebug()) return true;
     switch (arch_config) {
         .gpt => |cfg| if (cfg.usesMoe()) return false,
         else => {},
     }
     const total_bytes = estimateNativeWeightBytes(allocator, mf) catch return false;
-    return total_bytes > 0 and total_bytes <= mlxEagerDenseMaxBytes();
-}
-
-fn shouldUseMlxHostedEagerDenseLoad(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest, arch_config: ArchConfig) bool {
-    return shouldUseSharedGpuHostedEagerDenseLoad(allocator, mf, arch_config);
+    return total_bytes > 0 and total_bytes <= gpuHostedEagerDenseMaxBytes();
 }
 
 fn shouldUseMetalHostedEagerDenseLoad(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest, arch_config: ArchConfig) bool {
@@ -152,13 +182,12 @@ fn shouldUseGpuHostedEagerDenseLoad(
     arch_config: ArchConfig,
 ) bool {
     return switch (backend_type) {
-        .mlx => shouldUseMlxHostedEagerDenseLoad(allocator, mf, arch_config),
         .metal => shouldUseMetalHostedEagerDenseLoad(allocator, mf, arch_config),
         else => unreachable,
     };
 }
 
-fn shouldPreferMlxF32DenseTensors(arch_config: ArchConfig) bool {
+fn shouldPreferGpuHostedF32DenseTensors(arch_config: ArchConfig) bool {
     return switch (arch_config) {
         .gpt => |cfg| cfg.family == .gemma,
         .layoutlmv3 => true,
@@ -166,8 +195,8 @@ fn shouldPreferMlxF32DenseTensors(arch_config: ArchConfig) bool {
     };
 }
 
-fn shouldForceMlxF32DenseTensorByName(arch_config: ArchConfig, name: []const u8) bool {
-    if (!shouldPreferMlxF32DenseTensors(arch_config)) return false;
+fn shouldForceGpuHostedF32DenseTensorByName(arch_config: ArchConfig, name: []const u8) bool {
+    if (!shouldPreferGpuHostedF32DenseTensors(arch_config)) return false;
     const is_large_non_linear_weight = std.mem.startsWith(u8, name, "vision_tower.") or
         std.mem.startsWith(u8, name, "multi_modal_projector.") or
         std.mem.endsWith(u8, name, "token_embd.weight");
@@ -175,7 +204,7 @@ fn shouldForceMlxF32DenseTensorByName(arch_config: ArchConfig, name: []const u8)
     return !is_large_non_linear_weight;
 }
 
-fn estimateMlxResidentTensorBytes(tensor: *const Tensor, force_f32: bool) usize {
+fn estimateGpuHostedResidentTensorBytes(tensor: *const Tensor, force_f32: bool) usize {
     if (force_f32 and (tensor.dtype == .f16 or tensor.dtype == .bf16)) {
         var elements: usize = 1;
         for (tensor.shape) |dim| {
@@ -602,14 +631,14 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
 
 /// Create a PJRT-backed session from a model directory.
 ///
-/// Weights are loaded via BLAS (the host backend). A PJRT client is
+/// Weights are loaded via the native CPU host backend. A PJRT client is
 /// initialized via `Client.initFromEnv` which searches for the plugin in:
 ///   1. `PJRT_PLUGIN_PATH` env var
 ///   2. `~/Library/Application Support/go-xla/pjrt_c_api_cpu_plugin.dylib`
 ///   3. `~/.termite/pjrt/darwin-arm64/pjrt_c_api_cpu_plugin.dylib`
 ///
 /// If the plugin is not found, the session is created anyway but without a
-/// PJRT client (falls back to pure BLAS execution — no XLA-compiled
+/// PJRT client (falls back to pure native CPU execution — no XLA-compiled
 /// partitions). Callers can check `getPjrtClientPtr` to see whether a client
 /// is actually available.
 ///
@@ -621,7 +650,7 @@ pub fn createPjrtSession(allocator: std.mem.Allocator, model_path: []const u8) !
 }
 
 pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
-    // PJRT weights are served through BLAS — re-use the full BLAS load path.
+    // PJRT weights are served through native CPU — re-use the full native CPU load path.
     const direct_quant_enabled = directQuantEnabled();
     const cpu_plan_context = defaultPlanContextForBackend(.cpu);
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
@@ -824,12 +853,12 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     }
 
     // Attempt to initialize the PJRT client. On failure (plugin not found,
-    // etc.) we log a warning and proceed with pure-BLAS execution. The
+    // etc.) we log a warning and proceed with pure native CPU execution. The
     // compiled-partition path in generation.zig simply won't be activated.
     const pjrt_client: if (build_options.enable_pjrt) ?pjrt_lib.pjrt.Client else void = blk: {
         if (!build_options.enable_pjrt) break :blk {};
         const client = pjrt_lib.pjrt.Client.initFromEnv(allocator) catch |err| {
-            std.log.warn("PJRT plugin not found ({s}); PJRT session will use BLAS fallback", .{@errorName(err)});
+            std.log.warn("PJRT plugin not found ({s}); PJRT session will use native CPU fallback", .{@errorName(err)});
             break :blk null;
         };
         std.log.info("PJRT client initialized via session factory", .{});
@@ -893,15 +922,6 @@ pub fn getPjrtClientPtr(session: Session) ?*anyopaque {
     return null;
 }
 
-/// Create an MLX-backed session from a model directory.
-pub fn createMlxSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
-    return createMlxSessionWithTaskOverride(allocator, model_path, null);
-}
-
-pub fn createMlxSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
-    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .mlx);
-}
-
 pub fn createMetalSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
     return createMetalSessionWithTaskOverride(allocator, model_path, null);
 }
@@ -963,7 +983,7 @@ fn eagerLoadResidentsFromStore(
     actual_prefix: []const u8,
     is_gliner: bool,
 ) !usize {
-    if (comptime !build_options.enable_mlx) return error.MlxNotEnabled;
+    if (comptime !false) return error.GpuHostedNotEnabled;
     var resident_weight_estimate_bytes: usize = 0;
     var eager_sharded_source: ?*weight_source_mod.ShardedSafetensorsSource = null;
     defer if (eager_sharded_source) |src| src.weightSource().deinit();
@@ -995,10 +1015,10 @@ fn eagerLoadResidentsFromStore(
             try transposeGpt2Conv1dLoadedWeightInPlace(allocator, key, &loaded);
         }
 
-        const force_f32 = shouldForceMlxF32DenseTensorByName(arch_config.*, full_name);
-        resident_weight_estimate_bytes += estimateMlxResidentTensorBytes(&loaded.tensor, force_f32);
-        const arr = try mlx_mod.arrayFromTensor(allocator, &loaded.tensor, force_f32);
-        try mlx_mod.insertWeight(resident_weights.*, allocator, key, arr);
+        const force_f32 = shouldForceGpuHostedF32DenseTensorByName(arch_config.*, full_name);
+        resident_weight_estimate_bytes += estimateGpuHostedResidentTensorBytes(&loaded.tensor, force_f32);
+        const arr = try gpu_hosted_mod.arrayFromTensor(allocator, &loaded.tensor, force_f32);
+        try gpu_hosted_mod.insertWeight(resident_weights.*, allocator, key, arr);
     }
     try refineArchConfigFromStore(allocator, tensor_store, all_names, arch_config);
     return resident_weight_estimate_bytes;
@@ -1011,10 +1031,10 @@ fn loadSafetensorsIntoResident(
     st_path: []const u8,
     arch_config: ArchConfig,
 ) ![]const u8 {
-    if (comptime !build_options.enable_mlx) return error.MlxNotEnabled;
-    resident_weights.* = try mlx_mod.loadSafetensors(st_path, allocator, stream);
+    if (comptime !false) return error.GpuHostedNotEnabled;
+    resident_weights.* = try gpu_hosted_mod.loadSafetensors(st_path, allocator, stream);
     if (arch_config == .gpt and arch_config.gpt.family == .gpt2) {
-        try transposeGpt2Conv1dResidentMlxWeights(allocator, resident_weights, stream);
+        try transposeGpt2Conv1dResidentGpuHostedWeights(allocator, resident_weights, stream);
     }
     return switch (arch_config) {
         .t5, .gpt, .whisper, .florence, .clip, .clap => "",
@@ -1023,13 +1043,13 @@ fn loadSafetensorsIntoResident(
         .layoutlmv3 => "layoutlmv3",
         .bert => |cfg| detected: {
             var detected = cfg.effectivePrefix();
-            const it = mlx_c.mlx_map_string_to_array_iterator_new(resident_weights.*);
-            defer _ = mlx_c.mlx_map_string_to_array_iterator_free(it);
+            const it = gpu_hosted_c.resident_map_string_to_array_iterator_new(resident_weights.*);
+            defer _ = gpu_hosted_c.resident_map_string_to_array_iterator_free(it);
             while (true) {
                 var key: [*c]const u8 = null;
-                var val = mlx_c.mlx_array_new();
-                defer _ = mlx_c.mlx_array_free(val);
-                if (mlx_c.mlx_map_string_to_array_iterator_next(&key, &val, it) != 0) break;
+                var val = gpu_hosted_c.resident_array_new();
+                defer _ = gpu_hosted_c.resident_array_free(val);
+                if (gpu_hosted_c.resident_map_string_to_array_iterator_next(&key, &val, it) != 0) break;
                 if (key == null) break;
                 const name = std.mem.span(key);
                 if (std.mem.startsWith(u8, name, "bert.")) {
@@ -1062,20 +1082,12 @@ fn createGpuHostedSessionWithTaskOverride(
 ) !Session {
     try ensureGpuHostedSessionAvailable(backend_type);
     const direct_quant_enabled = directQuantEnabled();
-    const quant_mode = mlxQuantExecutionMode(direct_quant_enabled);
+    const quant_mode = gpuHostedQuantExecutionMode(direct_quant_enabled);
 
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
     defer mf.deinit();
     var gpu_jina_lora_adapter: ?*gpu_hosted_store_mod.JinaLoraAdapter = null;
     errdefer if (gpu_jina_lora_adapter) |adapter| adapter.destroy();
-    if (std.mem.eql(u8, mf.config_model_arch, "jina_embeddings_v5") and backend_type == .mlx) {
-        if (try jinaRetrievalAdapterPaths(allocator, model_path)) |paths| {
-            allocator.free(paths.config);
-            allocator.free(paths.weights);
-            return error.JinaV5AdapterMergeRequiresNativeBackend;
-        }
-    }
-
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
@@ -1087,17 +1099,11 @@ fn createGpuHostedSessionWithTaskOverride(
         }
     }
 
-    const stream = try openGpuHostedStream(backend_type);
-    var resident_weights = if (comptime build_options.enable_mlx) mlx_c.mlx_map_string_to_array_new() else {};
     var lazy_weights = std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry){};
     var tensor_store: ?tensor_store_mod.TensorStore = null;
     errdefer {
         var it = lazy_weights.iterator();
         while (it.next()) |entry| {
-            if (comptime build_options.enable_mlx) {
-                if (entry.value_ptr.loaded_transposed) |arr| _ = mlx_c.mlx_array_free(arr);
-                if (entry.value_ptr.loaded) |arr| _ = mlx_c.mlx_array_free(arr);
-            }
             if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
             if (entry.value_ptr.host_loaded) |*host_loaded| host_loaded.deinit();
             entry.value_ptr.tensor_ref.deinit(allocator);
@@ -1105,36 +1111,17 @@ fn createGpuHostedSessionWithTaskOverride(
         }
         lazy_weights.deinit(allocator);
         if (tensor_store) |store| store.deinit();
-        if (comptime build_options.enable_mlx) {
-            if (backend_type == .mlx) {
-                _ = mlx_c.mlx_map_string_to_array_free(resident_weights);
-                _ = mlx_c.mlx_stream_free(stream);
-            }
-        }
     }
 
     var eager_dense = false;
-    var resident_weight_bytes_override: usize = 0;
+    const resident_weight_bytes_override: usize = 0;
     const budget_policy = gpuHostedBudgetPolicy(backend_type, model_weight_bytes, mf, arch_config, quant_mode);
     const prefer_f32_dense_tensors = budget_policy.prefer_f32_dense_tensors;
     const budget_floor = budget_policy.budget_floor;
     const shared_cache_floor = budget_policy.shared_cache_floor;
     const plan_context = budget_policy.plan_context;
 
-    const mlx_prefix: []const u8 = if (mf.safetensors_path != null and backend_type == .mlx) mlx_st_blk: {
-        const st_path = mf.safetensors_path.?;
-        if (comptime !build_options.enable_mlx) {
-            std.log.err("MLX backend cannot load safetensors without -Dmlx=true: {s}", .{st_path});
-            return error.SafetensorsRequiresMlx;
-        }
-        break :mlx_st_blk try loadSafetensorsIntoResident(
-            allocator,
-            stream,
-            &resident_weights,
-            st_path,
-            arch_config,
-        );
-    } else if (mf.safetensors_path != null or mf.safetensors_index_path != null or mf.gguf_path != null) blk: {
+    const resident_prefix: []const u8 = if (mf.safetensors_path != null or mf.safetensors_index_path != null or mf.gguf_path != null) blk: {
         tensor_store = try tensor_store_mod.openFromManifest(allocator, mf);
         const source = (try tensor_store.?.weightSource()) orelse return error.NoDenseWeightSource;
         const all_names = try source.listNames(allocator);
@@ -1177,23 +1164,12 @@ fn createGpuHostedSessionWithTaskOverride(
         };
         eager_dense = shouldUseGpuHostedEagerDenseLoad(backend_type, allocator, mf, arch_config);
         if (eager_dense) {
-            if (comptime !build_options.enable_mlx) {
-                std.log.err("metal-native build cannot eager-load dense weights without -Dmlx=true", .{});
-                return error.EagerDenseLoadRequiresMlx;
+            if (comptime !false) {
+                std.log.err("metal backend no longer supports eager dense resident loading", .{});
+                return error.EagerDenseLoadRequiresGpuHosted;
             }
-            resident_weight_bytes_override = try eagerLoadResidentsFromStore(
-                allocator,
-                &resident_weights,
-                tensor_store.?,
-                mf,
-                &arch_config,
-                all_names,
-                source,
-                actual_prefix,
-                is_gliner,
-            );
-            tensor_store.?.deinit();
-            tensor_store = null;
+            std.log.err("metal backend no longer supports eager dense resident loading", .{});
+            return error.EagerDenseLoadUnsupported;
         } else {
             for (all_names) |full_name| {
                 if (try appendPackedMoeLazyWeights(allocator, &lazy_weights, tensor_store.?, arch_config, full_name, plan_context)) {
@@ -1243,8 +1219,8 @@ fn createGpuHostedSessionWithTaskOverride(
         null;
     const tier_cache = if (lazy_weights.count() > 0) blk: {
         var budget = runtime.tier.cache.defaultBudgetForBackend(.gpu);
-        if (shouldUseLargeMlxLazyQuantBudgets(model_weight_bytes, mf, quant_mode, eager_dense)) {
-            const floor = recommendedMlxLazyQuantSharedCacheBudget(model_weight_bytes, quant_mode);
+        if (shouldUseLargeGpuHostedLazyQuantBudgets(model_weight_bytes, mf, quant_mode, eager_dense)) {
+            const floor = recommendedGpuHostedLazyQuantSharedCacheBudget(model_weight_bytes, quant_mode);
             budget.host_limit_bytes = @max(budget.host_limit_bytes, floor.host_limit_bytes);
             budget.backend_limit_bytes = @max(budget.backend_limit_bytes, floor.backend_limit_bytes);
         }
@@ -1269,10 +1245,8 @@ fn createGpuHostedSessionWithTaskOverride(
         .shared_cache_budget_floor = shared_cache_floor,
         .backend_data = makeGpuHostedBackendData(backend_type, .{
             .allocator = allocator,
-            .resident_weights = resident_weights,
             .resident_weight_estimate_bytes = resident_weight_bytes_override,
-            .stream = stream,
-            .prefix = mlx_prefix,
+            .prefix = resident_prefix,
             .lazy_weights = lazy_weights,
             .tensor_store = tensor_store,
             .moe_num_experts = @intCast(moe_num_experts),
@@ -2760,8 +2734,8 @@ fn defaultPlanContextForBackend(backend: runtime.tier.planner.BackendClass) runt
     };
 }
 
-fn recommendedMlxLazyQuantBudgetFloor(model_weight_bytes: u64, quant_mode: MlxQuantExecutionMode) runtime.tier.memory.Limits {
-    if (model_weight_bytes == 0 or model_weight_bytes <= mlxEagerDenseMaxBytes()) return .{};
+fn recommendedGpuHostedLazyQuantBudgetFloor(model_weight_bytes: u64, quant_mode: GpuHostedQuantExecutionMode) runtime.tier.memory.Limits {
+    if (model_weight_bytes == 0 or model_weight_bytes <= gpuHostedEagerDenseMaxBytes()) return .{};
 
     const total_bytes: usize = @intCast(@min(model_weight_bytes, std.math.maxInt(usize)));
     // In device_native mode, quantized weights stay quantized on GPU — no 3× expansion.
@@ -2782,19 +2756,19 @@ fn recommendedMlxLazyQuantBudgetFloor(model_weight_bytes: u64, quant_mode: MlxQu
     };
 }
 
-fn recommendedMlxLazyQuantSharedCacheBudget(model_weight_bytes: u64, quant_mode: MlxQuantExecutionMode) runtime.tier.cache.Budget {
-    const floor = recommendedMlxLazyQuantBudgetFloor(model_weight_bytes, quant_mode);
+fn recommendedGpuHostedLazyQuantSharedCacheBudget(model_weight_bytes: u64, quant_mode: GpuHostedQuantExecutionMode) runtime.tier.cache.Budget {
+    const floor = recommendedGpuHostedLazyQuantBudgetFloor(model_weight_bytes, quant_mode);
     return .{
         .host_limit_bytes = floor.host_limit_bytes,
         .backend_limit_bytes = floor.backend_limit_bytes,
     };
 }
 
-fn recommendedMlxLargeMultimodalGemmaBudgetFloor(
+fn recommendedGpuHostedLargeMultimodalGemmaBudgetFloor(
     model_weight_bytes: u64,
     prefer_f32_dense_tensors: bool,
 ) runtime.tier.memory.Limits {
-    if (model_weight_bytes == 0 or model_weight_bytes <= mlxEagerDenseMaxBytes()) return .{};
+    if (model_weight_bytes == 0 or model_weight_bytes <= gpuHostedEagerDenseMaxBytes()) return .{};
 
     const total_bytes: usize = @intCast(@min(model_weight_bytes, std.math.maxInt(usize)));
     const promoted_bytes = if (prefer_f32_dense_tensors)
@@ -2815,11 +2789,11 @@ fn recommendedMlxLargeMultimodalGemmaBudgetFloor(
     };
 }
 
-fn recommendedMlxLargeMultimodalGemmaSharedCacheBudget(
+fn recommendedGpuHostedLargeMultimodalGemmaSharedCacheBudget(
     model_weight_bytes: u64,
     prefer_f32_dense_tensors: bool,
 ) runtime.tier.cache.Budget {
-    const floor = recommendedMlxLargeMultimodalGemmaBudgetFloor(model_weight_bytes, prefer_f32_dense_tensors);
+    const floor = recommendedGpuHostedLargeMultimodalGemmaBudgetFloor(model_weight_bytes, prefer_f32_dense_tensors);
     return .{
         .host_limit_bytes = floor.host_limit_bytes,
         .backend_limit_bytes = floor.backend_limit_bytes,
@@ -2828,27 +2802,18 @@ fn recommendedMlxLargeMultimodalGemmaSharedCacheBudget(
 
 fn ensureGpuHostedSessionAvailable(backend_type: BackendType) !void {
     return switch (backend_type) {
-        .mlx => ensureMlxHostedSessionAvailable(),
         .metal => ensureMetalHostedSessionAvailable(),
         else => unreachable,
     };
 }
 
-const GpuHostedStream = if (build_options.enable_mlx) mlx_c.mlx_stream else void;
+const GpuHostedStream = if (false) gpu_hosted_c.resident_stream else void;
 
 fn openGpuHostedStream(backend_type: BackendType) !GpuHostedStream {
     return switch (backend_type) {
-        .mlx => openMlxHostedStream(),
         .metal => openMetalHostedStream(),
         else => unreachable,
     };
-}
-
-fn ensureMlxHostedSessionAvailable() !void {
-    if (!build_options.enable_mlx) return error.MlxNotEnabled;
-    if (!mlx_mod.metalDeviceAvailable() and !mlx_mod.allowCpuStreamWithoutMetal()) {
-        return error.MlxMetalUnavailable;
-    }
 }
 
 fn ensureMetalHostedSessionAvailable() !void {
@@ -2856,15 +2821,9 @@ fn ensureMetalHostedSessionAvailable() !void {
     if (!metal_runtime.metalDeviceAvailable()) return error.MetalDeviceUnavailable;
 }
 
-fn openMlxHostedStream() !GpuHostedStream {
-    try ensureMlxHostedSessionAvailable();
-    if (comptime !build_options.enable_mlx) return error.MlxNotEnabled;
-    return mlx_mod.openDefaultStream().stream;
-}
-
 fn openMetalHostedStream() !GpuHostedStream {
     try ensureMetalHostedSessionAvailable();
-    if (comptime build_options.enable_mlx) {
+    if (comptime false) {
         return std.mem.zeroes(GpuHostedStream);
     }
     return {};
@@ -2882,29 +2841,19 @@ fn gpuHostedBudgetPolicy(
     model_weight_bytes: u64,
     manifest: manifest_mod.ModelManifest,
     arch_config: ArchConfig,
-    quant_mode: MlxQuantExecutionMode,
+    quant_mode: GpuHostedQuantExecutionMode,
 ) GpuHostedBudgetPolicy {
     return switch (backend_type) {
-        .mlx => mlxHostedBudgetPolicy(model_weight_bytes, manifest, arch_config, quant_mode),
         .metal => metalHostedBudgetPolicy(model_weight_bytes, manifest, arch_config, quant_mode),
         else => unreachable,
     };
-}
-
-fn mlxHostedBudgetPolicy(
-    model_weight_bytes: u64,
-    manifest: manifest_mod.ModelManifest,
-    arch_config: ArchConfig,
-    quant_mode: MlxQuantExecutionMode,
-) GpuHostedBudgetPolicy {
-    return sharedGpuHostedBudgetPolicy(model_weight_bytes, manifest, arch_config, quant_mode);
 }
 
 fn metalHostedBudgetPolicy(
     model_weight_bytes: u64,
     manifest: manifest_mod.ModelManifest,
     arch_config: ArchConfig,
-    quant_mode: MlxQuantExecutionMode,
+    quant_mode: GpuHostedQuantExecutionMode,
 ) GpuHostedBudgetPolicy {
     return sharedGpuHostedBudgetPolicy(model_weight_bytes, manifest, arch_config, quant_mode);
 }
@@ -2913,23 +2862,23 @@ fn sharedGpuHostedBudgetPolicy(
     model_weight_bytes: u64,
     manifest: manifest_mod.ModelManifest,
     arch_config: ArchConfig,
-    quant_mode: MlxQuantExecutionMode,
+    quant_mode: GpuHostedQuantExecutionMode,
 ) GpuHostedBudgetPolicy {
-    const prefer_f32_dense_tensors = shouldPreferMlxF32DenseTensors(arch_config);
-    const lazy_quant_budget_floor = if (shouldUseLargeMlxLazyQuantBudgets(model_weight_bytes, manifest, quant_mode, false))
-        recommendedMlxLazyQuantBudgetFloor(model_weight_bytes, quant_mode)
+    const prefer_f32_dense_tensors = shouldPreferGpuHostedF32DenseTensors(arch_config);
+    const lazy_quant_budget_floor = if (shouldUseLargeGpuHostedLazyQuantBudgets(model_weight_bytes, manifest, quant_mode, false))
+        recommendedGpuHostedLazyQuantBudgetFloor(model_weight_bytes, quant_mode)
     else
         runtime.tier.memory.Limits{};
-    const lazy_quant_shared_cache_floor = if (shouldUseLargeMlxLazyQuantBudgets(model_weight_bytes, manifest, quant_mode, false))
-        recommendedMlxLazyQuantSharedCacheBudget(model_weight_bytes, quant_mode)
+    const lazy_quant_shared_cache_floor = if (shouldUseLargeGpuHostedLazyQuantBudgets(model_weight_bytes, manifest, quant_mode, false))
+        recommendedGpuHostedLazyQuantSharedCacheBudget(model_weight_bytes, quant_mode)
     else
         runtime.tier.cache.Budget{};
-    const gemma_budget_floor = if (shouldUseLargeMlxMultimodalGemmaBudgets(model_weight_bytes, arch_config))
-        recommendedMlxLargeMultimodalGemmaBudgetFloor(model_weight_bytes, prefer_f32_dense_tensors)
+    const gemma_budget_floor = if (shouldUseLargeGpuHostedMultimodalGemmaBudgets(model_weight_bytes, arch_config))
+        recommendedGpuHostedLargeMultimodalGemmaBudgetFloor(model_weight_bytes, prefer_f32_dense_tensors)
     else
         runtime.tier.memory.Limits{};
-    const gemma_shared_cache_floor = if (shouldUseLargeMlxMultimodalGemmaBudgets(model_weight_bytes, arch_config))
-        recommendedMlxLargeMultimodalGemmaSharedCacheBudget(model_weight_bytes, prefer_f32_dense_tensors)
+    const gemma_shared_cache_floor = if (shouldUseLargeGpuHostedMultimodalGemmaBudgets(model_weight_bytes, arch_config))
+        recommendedGpuHostedLargeMultimodalGemmaSharedCacheBudget(model_weight_bytes, prefer_f32_dense_tensors)
     else
         runtime.tier.cache.Budget{};
     const budget_floor = widenLimits(lazy_quant_budget_floor, gemma_budget_floor);
@@ -2959,13 +2908,12 @@ pub fn widenBudgetLimitsForModelPath(
 ) !runtime.tier.memory.Limits {
     if (!backend_type.usesGpuHostedSession()) return limits;
     switch (backend_type) {
-        .mlx => if (!build_options.enable_mlx) return limits,
         .metal => if (!build_options.enable_metal) return limits,
         else => unreachable,
     }
 
     const direct_quant_enabled = directQuantEnabled();
-    const quant_mode = mlxQuantExecutionMode(direct_quant_enabled);
+    const quant_mode = gpuHostedQuantExecutionMode(direct_quant_enabled);
 
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
     defer mf.deinit();
@@ -2977,23 +2925,23 @@ pub fn widenBudgetLimitsForModelPath(
     return widenLimits(limits, policy.budget_floor);
 }
 
-fn shouldUseLargeMlxLazyQuantBudgets(
+fn shouldUseLargeGpuHostedLazyQuantBudgets(
     model_weight_bytes: u64,
     manifest: manifest_mod.ModelManifest,
-    quant_mode: MlxQuantExecutionMode,
+    quant_mode: GpuHostedQuantExecutionMode,
     eager_dense: bool,
 ) bool {
     return manifest.gguf_path != null and
         !eager_dense and
         quant_mode == .device_native and
-        model_weight_bytes > mlxEagerDenseMaxBytes();
+        model_weight_bytes > gpuHostedEagerDenseMaxBytes();
 }
 
-fn shouldUseLargeMlxMultimodalGemmaBudgets(
+fn shouldUseLargeGpuHostedMultimodalGemmaBudgets(
     model_weight_bytes: u64,
     arch_config: ArchConfig,
 ) bool {
-    if (model_weight_bytes == 0 or model_weight_bytes <= mlxEagerDenseMaxBytes()) return false;
+    if (model_weight_bytes == 0 or model_weight_bytes <= gpuHostedEagerDenseMaxBytes()) return false;
     return switch (arch_config) {
         .gpt => |cfg| cfg.family == .gemma and !cfg.usesMoe() and cfg.isMultimodal(),
         else => false,
@@ -3002,9 +2950,7 @@ fn shouldUseLargeMlxMultimodalGemmaBudgets(
 
 const GpuHostedBackendInit = struct {
     allocator: std.mem.Allocator,
-    resident_weights: if (build_options.enable_mlx) mlx_c.mlx_map_string_to_array else void,
     resident_weight_estimate_bytes: usize,
-    stream: if (build_options.enable_mlx) mlx_c.mlx_stream else void,
     prefix: []const u8,
     lazy_weights: std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry),
     tensor_store: ?tensor_store_mod.TensorStore,
@@ -3012,7 +2958,7 @@ const GpuHostedBackendInit = struct {
     residency: ?runtime.moe.residency.SharedResidency,
     tier_cache: ?runtime.tier.cache.SharedCache,
     allow_direct_quant: bool,
-    quant_execution_mode: MlxQuantExecutionMode,
+    quant_execution_mode: GpuHostedQuantExecutionMode,
     prefer_f32_dense_tensors: bool,
     jina_lora_adapter: ?*gpu_hosted_store_mod.JinaLoraAdapter = null,
 };
@@ -3021,20 +2967,13 @@ fn makeGpuHostedBackendData(
     backend_type: BackendType,
     init: GpuHostedBackendInit,
 ) BackendData {
-    if (comptime !build_options.enable_mlx and !build_options.enable_metal) {
+    if (comptime !build_options.enable_metal) {
         unreachable;
     }
 
-    const native_quant = switch (backend_type) {
-        .mlx => mlxHostedQuantProvider(),
-        .metal => metalHostedQuantProvider(),
-        else => unreachable,
-    };
     const data: GpuHostedData = .{
         .allocator = init.allocator,
-        .resident_weights = init.resident_weights,
         .resident_weight_estimate_bytes = init.resident_weight_estimate_bytes,
-        .stream = init.stream,
         .prefix = init.prefix,
         .lazy_weights = init.lazy_weights,
         .tensor_store = init.tensor_store,
@@ -3043,28 +2982,19 @@ fn makeGpuHostedBackendData(
         .tier_cache = init.tier_cache,
         .allow_direct_quant = init.allow_direct_quant,
         .quant_execution_mode = init.quant_execution_mode,
-        .native_quant = native_quant,
         .prefer_f32_dense_tensors = init.prefer_f32_dense_tensors,
         .mirror_kv_to_manager = false,
         .jina_lora_adapter = init.jina_lora_adapter,
     };
     return switch (backend_type) {
-        .mlx => if (comptime build_options.enable_mlx) .{ .mlx = data } else unreachable,
         .metal => if (comptime build_options.enable_metal) .{ .metal = data } else unreachable,
         else => unreachable,
     };
 }
 
-fn mlxHostedQuantProvider() mlx_quant_mod.Provider {
-    if (comptime build_options.enable_mlx) {
-        return mlx_quant_mod.defaultProvider();
-    }
-    return {};
-}
-
-fn metalHostedQuantProvider() mlx_quant_mod.Provider {
-    if (comptime build_options.enable_mlx) {
-        return mlx_quant_mod.nullProvider();
+fn metalHostedQuantProvider() gpu_hosted_quant_mod.Provider {
+    if (comptime false) {
+        return gpu_hosted_quant_mod.nullProvider();
     }
     return {};
 }
@@ -3084,24 +3014,9 @@ fn makeGpuHostedComputeBackend(
     run_budget: ?*runtime.tier.memory.RunBudget,
 ) !ops.ComputeBackend {
     return switch (self.backend_type) {
-        .mlx => makeMlxHostedComputeBackend(self, allocator, run_budget),
         .metal => makeMetalHostedComputeBackend(self, allocator, run_budget),
         else => unreachable,
     };
-}
-
-fn makeMlxHostedComputeBackend(
-    self: *ArchSession,
-    allocator: std.mem.Allocator,
-    run_budget: ?*runtime.tier.memory.RunBudget,
-) !ops.ComputeBackend {
-    if (!build_options.enable_mlx) return error.MlxNotEnabled;
-    const compute = try allocator.create(MlxCompute);
-    compute.* = if (self.io) |io_handle|
-        try MlxCompute.initMlxHostedWithIo(allocator, gpuBackendData(self), run_budget, io_handle)
-    else
-        try MlxCompute.initMlxHosted(allocator, gpuBackendData(self), run_budget);
-    return compute.computeBackend();
 }
 
 fn makeMetalHostedComputeBackend(
@@ -3121,9 +3036,6 @@ fn makeMetalHostedComputeBackend(
 fn initGpuHostedPrefetch(self: *ArchSession) !void {
     const gpu_data = gpuBackendData(self);
     switch (self.backend_type) {
-        .mlx => if (comptime build_options.enable_mlx) {
-            mlx_compute_mod.initPrefetchQueue(gpu_data, self.allocator);
-        } else return error.MlxNotEnabled,
         .metal => if (comptime build_options.enable_metal) {
             metal_compute_mod.initPrefetchQueue(gpu_data, self.allocator);
         } else return error.MetalNotEnabled,
@@ -3131,9 +3043,6 @@ fn initGpuHostedPrefetch(self: *ArchSession) !void {
     }
     if (gpu_data.lazy_weights.count() > 0 and !disablePrefetchWorkerDebug()) {
         switch (self.backend_type) {
-            .mlx => if (comptime build_options.enable_mlx) {
-                try mlx_compute_mod.startPrefetchWorker(gpu_data);
-            } else return error.MlxNotEnabled,
             .metal => if (comptime build_options.enable_metal) {
                 try metal_compute_mod.startPrefetchWorker(gpu_data);
             } else return error.MetalNotEnabled,
@@ -3352,28 +3261,28 @@ fn applyJinaV5RetrievalAdapterIfPresent(
     }
 }
 
-fn transposeGpt2Conv1dResidentMlxWeights(
+fn transposeGpt2Conv1dResidentGpuHostedWeights(
     allocator: std.mem.Allocator,
     weights: anytype,
     stream: GpuHostedStream,
 ) !void {
-    if (comptime !build_options.enable_mlx) return error.MlxNotEnabled;
+    if (comptime !false) return error.GpuHostedNotEnabled;
 
-    const rebuilt = mlx_c.mlx_map_string_to_array_new();
-    errdefer _ = mlx_c.mlx_map_string_to_array_free(rebuilt);
+    const rebuilt = gpu_hosted_c.resident_map_string_to_array_new();
+    errdefer _ = gpu_hosted_c.resident_map_string_to_array_free(rebuilt);
 
-    const it = mlx_c.mlx_map_string_to_array_iterator_new(weights.*);
-    defer _ = mlx_c.mlx_map_string_to_array_iterator_free(it);
+    const it = gpu_hosted_c.resident_map_string_to_array_iterator_new(weights.*);
+    defer _ = gpu_hosted_c.resident_map_string_to_array_iterator_free(it);
 
     while (true) {
         var key: [*c]const u8 = null;
-        var val = mlx_c.mlx_array_new();
-        if (mlx_c.mlx_map_string_to_array_iterator_next(&key, &val, it) != 0) {
-            _ = mlx_c.mlx_array_free(val);
+        var val = gpu_hosted_c.resident_array_new();
+        if (gpu_hosted_c.resident_map_string_to_array_iterator_next(&key, &val, it) != 0) {
+            _ = gpu_hosted_c.resident_array_free(val);
             break;
         }
         if (key == null) {
-            _ = mlx_c.mlx_array_free(val);
+            _ = gpu_hosted_c.resident_array_free(val);
             break;
         }
 
@@ -3382,25 +3291,25 @@ fn transposeGpt2Conv1dResidentMlxWeights(
         defer allocator.free(name_z);
 
         if (isGpt2Conv1dWeight(name) and
-            mlx_c.mlx_array_ndim(val) == 2 and
-            mlx_c.mlx_array_dtype(val) == mlx_c.MLX_FLOAT32)
+            gpu_hosted_c.resident_array_ndim(val) == 2 and
+            gpu_hosted_c.resident_array_dtype(val) == gpu_hosted_c.GPU_HOSTED_FLOAT32)
         {
-            var transposed = mlx_c.mlx_array_new();
-            errdefer _ = mlx_c.mlx_array_free(transposed);
-            try mlx_mod.check(mlx_c.mlx_transpose(&transposed, val, stream));
-            if (mlx_c.mlx_map_string_to_array_insert(rebuilt, name_z.ptr, transposed) != 0) {
-                return error.MlxMapInsertFailed;
+            var transposed = gpu_hosted_c.resident_array_new();
+            errdefer _ = gpu_hosted_c.resident_array_free(transposed);
+            try gpu_hosted_mod.check(gpu_hosted_c.resident_transpose(&transposed, val, stream));
+            if (gpu_hosted_c.resident_map_string_to_array_insert(rebuilt, name_z.ptr, transposed) != 0) {
+                return error.GpuHostedMapInsertFailed;
             }
-            _ = mlx_c.mlx_array_free(transposed);
+            _ = gpu_hosted_c.resident_array_free(transposed);
         } else {
-            if (mlx_c.mlx_map_string_to_array_insert(rebuilt, name_z.ptr, val) != 0) {
-                return error.MlxMapInsertFailed;
+            if (gpu_hosted_c.resident_map_string_to_array_insert(rebuilt, name_z.ptr, val) != 0) {
+                return error.GpuHostedMapInsertFailed;
             }
         }
-        _ = mlx_c.mlx_array_free(val);
+        _ = gpu_hosted_c.resident_array_free(val);
     }
 
-    _ = mlx_c.mlx_map_string_to_array_free(weights.*);
+    _ = gpu_hosted_c.resident_map_string_to_array_free(weights.*);
     weights.* = rebuilt;
 }
 
@@ -4006,7 +3915,7 @@ const gpu_hosted_store_mod = @import("../ops/gpu_hosted_store.zig");
 const NativeData = native_mod.WeightStore;
 const LazyWeightEntry = native_mod.LazyWeightEntry;
 
-const GpuHostedData = if (build_options.enable_mlx or build_options.enable_metal) gpu_hosted_store_mod.WeightStore else void;
+const GpuHostedData = if (false or build_options.enable_metal) gpu_hosted_store_mod.WeightStore else void;
 
 /// PJRT backend data: weights are stored and served via the native backend,
 /// while the PJRT client is used for compiled partition execution.
@@ -4015,7 +3924,7 @@ const PjrtData = struct {
     /// conversion (host CTs ↔ PJRT buffers).
     native: NativeData,
     /// Initialized PJRT client. null when the plugin was not found and we
-    /// fell back to pure-BLAS execution.
+    /// fell back to pure native CPU execution.
     client: if (build_options.enable_pjrt) ?pjrt_lib.pjrt.Client else void =
         if (build_options.enable_pjrt) null else {},
 };
@@ -4026,7 +3935,6 @@ const CudaData = struct {
 
 const BackendData = union {
     native: NativeData,
-    mlx: if (build_options.enable_mlx) GpuHostedData else void,
     metal: if (build_options.enable_metal) GpuHostedData else void,
     cuda: if (build_options.enable_cuda) CudaData else void,
     pjrt: PjrtData,
@@ -4043,7 +3951,7 @@ const ArchSession = struct {
     /// Optional Io for parallel GEMM dispatch via lib/linalg's Io variants.
     /// Set by `attachIo` (called from SessionManager when its `io` field is
     /// non-null).  Threaded through `makeComputeBackend` to NativeCompute
-    /// /MlxCompute/MetalCompute via their `initWithIo` constructors.
+    /// /GpuHostedCompute/MetalCompute via their `initWithIo` constructors.
     io: ?std.Io = null,
     /// Optional graph-runtime execution strategy.  Set by
     /// `attachGraphRuntimeStrategy` (called from SessionManager when its
@@ -4058,8 +3966,7 @@ const ArchSession = struct {
 /// Attach a runtime Io to a Session created by this factory so its
 /// compute backend dispatches matmul work through the caller's thread
 /// pool.  Safe to call on any Session; no-op when the Session wasn't
-/// produced by `createNativeSession` / `createMlxSession` /
-/// `createMetalSession` (i.e. when the vtable isn't `arch_vtable`).
+/// produced by `createNativeSession` / `createMetalSession`.
 pub fn attachIo(session: Session, io: std.Io) void {
     if (session.vtable != &arch_vtable) return;
     const arch_session: *ArchSession = @ptrCast(@alignCast(session.ptr));
@@ -4110,7 +4017,6 @@ test "attachIo reaches native compute backend" {
 
 fn gpuBackendData(self: *ArchSession) *GpuHostedData {
     return switch (self.backend_type) {
-        .mlx => if (comptime build_options.enable_mlx) &self.backend_data.mlx else unreachable,
         .metal => if (comptime build_options.enable_metal) &self.backend_data.metal else unreachable,
         else => unreachable,
     };
@@ -4138,9 +4044,8 @@ fn makeComputeBackend(
                     .backend_limit_bytes = @max(budget.limits.backend_limit_bytes, self.shared_cache_budget_floor.backend_limit_bytes),
                 });
             },
-            .mlx => if (build_options.enable_mlx) widenGpuHostedTierCache(self, budget),
             .metal => if (build_options.enable_metal) widenGpuHostedTierCache(self, budget),
-            // PJRT: widen the BLAS host-backend tier cache if present.
+            // PJRT: widen the native CPU host-backend tier cache if present.
             .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*tier_cache| {
                 tier_cache.widenToAtLeast(.{
                     .host_limit_bytes = @max(budget.limits.host_limit_bytes, self.shared_cache_budget_floor.host_limit_bytes),
@@ -4161,9 +4066,9 @@ fn makeComputeBackend(
                 NativeCompute.init(allocator, &self.backend_data.native, run_budget);
             break :blk compute.computeBackend();
         },
-        .mlx, .metal => try makeGpuHostedComputeBackend(self, allocator, run_budget),
+        .metal => try makeGpuHostedComputeBackend(self, allocator, run_budget),
         // PJRT does not have a generic ComputeBackend VTable of its own.
-        // Non-partitioned ops (weight loads, sampling, etc.) run on BLAS.
+        // Non-partitioned ops (weight loads, sampling, etc.) run on native CPU.
         // Compiled partitions are executed via PjrtExecutor through the
         // multi_executor pipeline; see generation.zig attachPjrtExecutors.
         .pjrt => blk: {
@@ -4221,7 +4126,7 @@ pub fn recommendedKvDTypeForSession(session: Session, backend_kind: runtime.kv.p
     return switch (backend_kind) {
         .native => .f32,
         .cuda => .f16,
-        .metal, .mlx => blk: {
+        .metal => blk: {
             if (getGptConfig(session)) |cfg| {
                 if (cfg.family == .gemma) break :blk .f32;
             }
@@ -4266,7 +4171,7 @@ pub fn getFlorenceConfig(session: Session) ?florence_mod.Config {
     };
 }
 
-/// Get a ComputeBackend from a session. Only works for native/MLX arch sessions.
+/// Get a ComputeBackend from an architecture session.
 pub fn getComputeBackend(session: Session, allocator: std.mem.Allocator) !ops.ComputeBackend {
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
@@ -4333,12 +4238,6 @@ pub fn memoryBudgetExceededDetail(
             tier_cache.lastDenialString(buf)
         else
             std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
-        .mlx => if (build_options.enable_mlx) {
-            if (gpuBackendData(self).tier_cache) |*tier_cache| {
-                return tier_cache.lastDenialString(buf);
-            }
-            return std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{});
-        } else std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
         .metal => if (build_options.enable_metal) {
             if (gpuBackendData(self).tier_cache) |*tier_cache| {
                 return tier_cache.lastDenialString(buf);
@@ -4360,11 +4259,6 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     switch (self.backend_type) {
         .native => self.backend_data.native.shared_prefetch = shared_prefetch,
-        .mlx => if (build_options.enable_mlx) {
-            gpuBackendData(self).shared_prefetch = shared_prefetch;
-        } else {
-            return error.MlxNotEnabled;
-        },
         .metal => if (build_options.enable_metal) {
             gpuBackendData(self).shared_prefetch = shared_prefetch;
         } else {
@@ -5294,37 +5188,6 @@ fn archClose(ptr: *anyopaque) void {
             if (self.backend_data.native.residency) |*residency| residency.deinit();
             if (self.backend_data.native.tensor_store) |tensor_store| tensor_store.deinit();
         },
-        .mlx => {
-            if (comptime build_options.enable_mlx) {
-                const gpu_data = gpuBackendData(self);
-                mlx_compute_mod.stopPrefetchWorker(gpu_data);
-                var it = gpu_data.lazy_weights.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.loaded_transposed) |arr| _ = mlx_c.mlx_array_free(arr);
-                    if (entry.value_ptr.loaded) |arr| _ = mlx_c.mlx_array_free(arr);
-                    if (entry.value_ptr.loaded_quantized) |arr| _ = mlx_c.mlx_array_free(arr);
-                    if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
-                    if (entry.value_ptr.host_loaded) |*host_loaded| host_loaded.deinit();
-                    entry.value_ptr.tensor_ref.deinit(self.allocator);
-                    self.allocator.free(entry.key_ptr.*);
-                }
-                gpu_data.lazy_weights.deinit(self.allocator);
-                mlx_compute_mod.deinitPackedExpertViews(gpu_data, self.allocator);
-                mlx_compute_mod.deinitPrefetchQueue(gpu_data);
-                if (gpu_data.residency) |*residency| residency.deinit();
-                gpu_data.native_quant.deinit();
-                if (gpu_data.jina_lora_adapter) |adapter| adapter.destroy();
-                if (gpu_data.tensor_store) |store| store.deinit();
-                var resident_transposed_it = gpu_data.resident_transposed_weights.iterator();
-                while (resident_transposed_it.next()) |entry| {
-                    _ = mlx_c.mlx_array_free(entry.value_ptr.*);
-                    self.allocator.free(entry.key_ptr.*);
-                }
-                gpu_data.resident_transposed_weights.deinit(self.allocator);
-                _ = mlx_c.mlx_map_string_to_array_free(gpu_data.resident_weights);
-                _ = mlx_c.mlx_stream_free(gpu_data.stream);
-            }
-        },
         .metal => {
             if (comptime build_options.enable_metal) {
                 const gpu_data = gpuBackendData(self);
@@ -5332,11 +5195,6 @@ fn archClose(ptr: *anyopaque) void {
                 metal_compute_mod.deinitSharedNativeProvider(gpu_data);
                 var it = gpu_data.lazy_weights.iterator();
                 while (it.next()) |entry| {
-                    if (comptime build_options.enable_mlx) {
-                        if (entry.value_ptr.loaded_transposed) |arr| _ = mlx_c.mlx_array_free(arr);
-                        if (entry.value_ptr.loaded) |arr| _ = mlx_c.mlx_array_free(arr);
-                        if (entry.value_ptr.loaded_quantized) |arr| _ = mlx_c.mlx_array_free(arr);
-                    }
                     if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
                     if (entry.value_ptr.host_loaded) |*host_loaded| host_loaded.deinit();
                     entry.value_ptr.tensor_ref.deinit(self.allocator);
@@ -5346,9 +5204,6 @@ fn archClose(ptr: *anyopaque) void {
                 metal_compute_mod.deinitPackedExpertViews(gpu_data, self.allocator);
                 metal_compute_mod.deinitPrefetchQueue(gpu_data);
                 if (gpu_data.residency) |*residency| residency.deinit();
-                if (comptime build_options.enable_mlx) {
-                    gpu_data.native_quant.deinit();
-                }
                 if (gpu_data.jina_lora_adapter) |adapter| adapter.destroy();
                 if (gpu_data.tensor_store) |store| store.deinit();
             }
@@ -5360,7 +5215,7 @@ fn archClose(ptr: *anyopaque) void {
                     client.deinit();
                 }
             }
-            // Clean up the BLAS host-backend weight store.
+            // Clean up the native CPU host-backend weight store.
             native_mod.stopPrefetchWorker(&self.backend_data.pjrt.native);
             var it = self.backend_data.pjrt.native.resident_weights.iterator();
             while (it.next()) |entry| {
@@ -5399,23 +5254,23 @@ test "gemma gguf ffn norm maps to pre-feedforward layernorm" {
     try std.testing.expectEqualStrings("model.layers.0.pre_feedforward_layernorm.weight", mapped);
 }
 
-test "large MLX lazy quant budget floor widens host and backend limits" {
-    const floor = recommendedMlxLazyQuantBudgetFloor(3 * 1024 * 1024 * 1024, .prefer_backend_dense);
+test "large GPU-hosted lazy quant budget floor widens host and backend limits" {
+    const floor = recommendedGpuHostedLazyQuantBudgetFloor(3 * 1024 * 1024 * 1024, .prefer_backend_dense);
     try std.testing.expect(floor.host_limit_bytes >= 3 * 1024 * 1024 * 1024);
     try std.testing.expect(floor.backend_limit_bytes >= 6 * 1024 * 1024 * 1024);
     try std.testing.expect(floor.combined_limit_bytes >= floor.host_limit_bytes + floor.backend_limit_bytes);
 }
 
-test "device-native MLX lazy quant budget covers E2B Q8 host cache" {
+test "device-native GPU-hosted lazy quant budget covers E2B Q8 host cache" {
     const e2b_q8_bytes = 4700 * 1024 * 1024;
-    const floor = recommendedMlxLazyQuantBudgetFloor(e2b_q8_bytes, .device_native);
+    const floor = recommendedGpuHostedLazyQuantBudgetFloor(e2b_q8_bytes, .device_native);
     try std.testing.expect(floor.host_limit_bytes >= e2b_q8_bytes + 256 * 1024 * 1024);
     try std.testing.expect(floor.host_limit_bytes <= gib(6));
     try std.testing.expect(floor.combined_limit_bytes >= floor.host_limit_bytes + floor.backend_limit_bytes);
 }
 
-test "large multimodal gemma mlx budget floor widens dense limits" {
-    const floor = recommendedMlxLargeMultimodalGemmaBudgetFloor(8 * 1024 * 1024 * 1024, true);
+test "large multimodal gemma gpu_hosted budget floor widens dense limits" {
+    const floor = recommendedGpuHostedLargeMultimodalGemmaBudgetFloor(8 * 1024 * 1024 * 1024, true);
     try std.testing.expect(floor.host_limit_bytes >= 2 * 1024 * 1024 * 1024);
     try std.testing.expect(floor.backend_limit_bytes >= 6 * 1024 * 1024 * 1024);
     try std.testing.expect(floor.combined_limit_bytes >= floor.backend_limit_bytes);

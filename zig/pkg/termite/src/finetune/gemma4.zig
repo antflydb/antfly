@@ -175,9 +175,6 @@ pub const TrainEpochOptions = struct {
     use_schedule_free: bool = false,
     warmup_steps: u32 = 0,
     compute_backend: ?*const @import("../ops/ops.zig").ComputeBackend = null,
-    mlx_dist_group: if (build_options.enable_mlx) ?@import("../backends/mlx.zig").DistributedGroup else void =
-        if (build_options.enable_mlx) null else {},
-    world_size: u32 = 1,
     ddp_rank: u32 = 0,
     pjrt_lora_steps: if (build_options.enable_pjrt) ?[]?graph_bridge.LoRAPjrtTrainStep else void =
         if (build_options.enable_pjrt) null else {},
@@ -1927,9 +1924,9 @@ pub fn trainPreparedExamplesEpoch(
         accum_supervised_tokens += example.num_supervised_tokens;
 
         if (accum_count % accum_steps == 0 or is_last) {
-            if (comptime build_options.enable_mlx) {
+            if (comptime false) {
                 if (options.mlx_dist_group) |group| {
-                    const mlx_mod = @import("../backends/mlx.zig");
+                    const mlx_mod = struct {};
                     const stream_handle = mlx_mod.openDefaultStream();
                     defer stream_handle.deinit();
                     for (0..bundle.layers.len) |li| {
@@ -1939,7 +1936,7 @@ pub fn trainPreparedExamplesEpoch(
                 }
             }
 
-            const eff_world_size: u32 = if (comptime build_options.enable_mlx) options.world_size else 1;
+            const eff_world_size: u32 = if (comptime false) options.world_size else 1;
             const token_denom = @max(accum_supervised_tokens, 1);
             const norm_factor = 1.0 / (@as(f32, @floatFromInt(token_denom)) * @as(f32, @floatFromInt(eff_world_size)));
             for (bundle.layers, 0..) |*layer, li| {

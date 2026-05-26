@@ -19,8 +19,8 @@
 // context, or a remote worker. The mesh is topology-agnostic: callers
 // decide how to map partitions to devices.
 //
-// For Apple Silicon, a typical 2-device mesh is [mlx:0, native:cpu].
-// For multi-GPU, it might be [mlx:0, mlx:1].
+// For Apple Silicon, a typical 2-device mesh is [metal:0, native:cpu].
+// For multi-GPU, it might be [metal:0, metal:1].
 
 const std = @import("std");
 const contracts = @import("backend_contracts.zig");
@@ -73,14 +73,14 @@ test "DeviceMesh basic lookup" {
     const fake_cb_b = @as(*const ComputeBackend, @ptrFromInt(0x2000));
 
     var mesh = try DeviceMesh.init(allocator, &.{
-        .{ .id = 0, .backend = fake_cb_a, .kind = .mlx },
+        .{ .id = 0, .backend = fake_cb_a, .kind = .metal },
         .{ .id = 1, .backend = fake_cb_b, .kind = .native },
     });
     defer mesh.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), mesh.deviceCount());
     try std.testing.expect(mesh.device(0) != null);
-    try std.testing.expectEqual(BackendKind.mlx, mesh.device(0).?.kind);
+    try std.testing.expectEqual(BackendKind.metal, mesh.device(0).?.kind);
     try std.testing.expectEqual(BackendKind.native, mesh.device(1).?.kind);
     try std.testing.expect(mesh.device(99) == null);
 }

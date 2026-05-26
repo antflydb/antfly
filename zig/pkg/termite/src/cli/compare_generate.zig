@@ -34,7 +34,7 @@ const print = std.debug.print;
 const BackendChoice = enum {
     auto,
     native,
-    mlx,
+    metal,
 };
 
 const Options = struct {
@@ -1461,18 +1461,18 @@ fn parseArgs(args: []const []const u8) !Options {
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "native")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
     return null;
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => &.{ .onnx, .mlx, .native },
-        .native => &.{ .native, .onnx, .mlx },
-        .mlx => &.{ .mlx, .onnx, .native },
+        .auto => &.{ .onnx, .metal, .native },
+        .native => &.{ .native, .onnx, .metal },
+        .metal => &.{ .metal, .onnx, .native },
     };
 }
 
 fn printUsage() void {
-    print("usage: termite compare <native-model-dir> <reference-model-dir> <prompt> [--image path] [--image-features-only] [--onnx-prompt-embeddings-only] [--backend auto|native|mlx] [--top-k N] [--no-chat-template]\n", .{});
+    print("usage: termite compare <native-model-dir> <reference-model-dir> <prompt> [--image path] [--image-features-only] [--onnx-prompt-embeddings-only] [--backend auto|native|metal] [--top-k N] [--no-chat-template]\n", .{});
 }

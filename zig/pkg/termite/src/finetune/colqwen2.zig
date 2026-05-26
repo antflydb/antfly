@@ -28,7 +28,7 @@ const weight_source = @import("../models/weight_source.zig");
 const image_pipeline = @import("../pipelines/image.zig");
 const multimodal_qwen_adapter = @import("../pipelines/multimodal_qwen_adapter.zig");
 const hf_tokenizer = @import("termite_hf_tokenizer");
-const blas_mod = @import("../ops/blas_compute.zig");
+const native_compute = @import("../ops/native_compute.zig");
 const ml = @import("ml");
 const optimizers = ml.graph.optimizers;
 
@@ -146,24 +146,16 @@ pub const TrainEpochOptions = struct {
     use_schedule_free: bool = false,
     neftune_alpha: f32 = 0.0,
     /// Optional compute backend for gradient computation.
-    /// If null, defaults to CPU (pure-Zig) math. Pass an MLX backend for Metal GPU acceleration.
+    /// If null, defaults to native CPU math.
     compute_backend: ?*const @import("../ops/ops.zig").ComputeBackend = null,
-    /// MLX distributed group for DDP gradient averaging.
-    /// Obtain via mlx_mod.initDistributed() at process startup.
-    /// null = single-device training (default).
-    mlx_dist_group: if (build_options.enable_mlx) ?@import("../backends/mlx.zig").DistributedGroup else void =
-        if (build_options.enable_mlx) null else {},
-    /// Number of DDP replicas (world size). Must equal 1 when mlx_dist_group is null.
-    world_size: u32 = 1,
     /// DDP rank of this process. Rank 0 is responsible for checkpoint writes.
     /// Set to 0 for single-device training (default).
     ddp_rank: u32 = 0,
     /// Linear LR warmup steps. LR ramps from 0 → learning_rate over the first warmup_steps
     /// optimizer updates. 0 = no warmup.
     warmup_steps: u32 = 0,
-    /// Pre-compiled PJRT gradient executors, one per LoRA layer (null = use CPU/MLX path).
+    /// Pre-compiled PJRT gradient executors, one per LoRA layer.
     /// Length must equal bundle.layers.len if non-null.
-    /// Note: PJRT is automatically disabled when world_size > 1 (no collective ops in PJRT path).
     pjrt_lora_steps: if (build_options.enable_pjrt) ?[]?graph_bridge.LoRAPjrtTrainStep else void =
         if (build_options.enable_pjrt) null else {},
 };
@@ -1074,12 +1066,12 @@ pub fn trainLoRABundleOneStep(
 
     const adapter_a_before = l2Norm(layer.adapter_a);
     const adapter_b_before = l2Norm(layer.adapter_b);
-    var weight_store = blas_mod.WeightStore{
+    var weight_store = native_compute.WeightStore{
         .allocator = allocator,
         .resident_weights = .{},
         .lazy_weights = .{},
     };
-    var compute = blas_mod.BlasCompute.init(allocator, &weight_store, null);
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
     var cb = compute.computeBackend();
     var optimizer_state = optimizers.OptimizerState.init(allocator);
     defer optimizer_state.deinit();
@@ -1426,7 +1418,7 @@ pub fn trainPreparedExamplesEpoch(
                 }
             }
 
-            // Try PJRT path first; fall back to CPU/MLX on error or when disabled.
+            // Try PJRT path first; fall back to CPU on error or when disabled.
             // PJRT is skipped when world_size > 1: no collective ops in PJRT gradient path.
             var used_pjrt = false;
             if (comptime build_options.enable_pjrt) {
@@ -1453,7 +1445,7 @@ pub fn trainPreparedExamplesEpoch(
                 }
             }
             if (!used_pjrt) {
-                // CPU/MLX fallback.
+                // CPU fallback.
                 const a_mat = lora.Matrix{ .rows = layer.input_dim, .cols = layer.rank, .data = layer.adapter_a };
                 const b_mat = lora.Matrix{ .rows = layer.rank, .cols = layer.output_dim, .data = layer.adapter_b };
                 lora.accumulateLinearLoRAGradsBackend(
@@ -1477,9 +1469,9 @@ pub fn trainPreparedExamplesEpoch(
         if (accum_count % accum_steps == 0 or is_last) {
             // Distributed DDP: allReduce gradient buffers across all replicas first,
             // so clipping and normalization operate on the globally averaged gradients.
-            if (comptime build_options.enable_mlx) {
+            if (comptime false) {
                 if (options.mlx_dist_group) |group| {
-                    const mlx_mod = @import("../backends/mlx.zig");
+                    const mlx_mod = struct {};
                     const stream_handle = mlx_mod.openDefaultStream();
                     defer stream_handle.deinit();
                     for (0..bundle.layers.len) |li| {
@@ -1490,7 +1482,7 @@ pub fn trainPreparedExamplesEpoch(
             }
 
             // Normalize accumulated gradients by accum steps and world size before clipping.
-            const eff_world_size_norm: u32 = if (comptime build_options.enable_mlx) options.world_size else 1;
+            const eff_world_size_norm: u32 = if (comptime false) options.world_size else 1;
             const norm_factor = 1.0 / (@as(f32, @floatFromInt(accum_count)) * @as(f32, @floatFromInt(eff_world_size_norm)));
             for (bundle.layers, 0..) |*layer, li| {
                 if (!layerMatchesScope(layer.base_tensor_name, options.layer_name)) continue;

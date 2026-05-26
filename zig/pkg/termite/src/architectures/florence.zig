@@ -22,7 +22,7 @@
 //
 // The vision tower is hybrid: conv/window/channel pieces run in Zig over f32
 // buffers, while dense linear, attention, GELU, and LayerNorm use the active
-// ComputeBackend so the same code works for native and MLX.
+// ComputeBackend so the same code works for native .
 
 const std = @import("std");
 const ops = @import("../ops/ops.zig");
@@ -303,7 +303,7 @@ fn visionEncoderForward(
 }
 
 fn useTensorNativeVision(cb: *const ComputeBackend) bool {
-    return cb.kind() == .mlx;
+    return cb.kind() == .metal;
 }
 
 fn daViTBlockData(

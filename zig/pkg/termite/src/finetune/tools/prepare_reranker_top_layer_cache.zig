@@ -77,15 +77,15 @@ pub fn main(init: std.process.Init) !void {
 
 fn parseBackendChoice(value: []const u8) ?reranker_head.BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
+    if (std.mem.eql(u8, value, "native")) return .native;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
     return null;
 }
 
 fn usage() error{InvalidArguments}!void {
     print(
-        \\usage: prepare-reranker-top-layer-cache <model-dir> <jsonl-or-dir> <out-summary-json> [split] [--backend auto|blas|mlx] [--max-examples N] [--top-layer-count N]
-        \\example: prepare-reranker-top-layer-cache /tmp/bge-reranker /tmp/rerank /tmp/reranker_top_layer_cache.json train --backend mlx --max-examples 128 --top-layer-count 1
+        \\usage: prepare-reranker-top-layer-cache <model-dir> <jsonl-or-dir> <out-summary-json> [split] [--backend auto|native] [--max-examples N] [--top-layer-count N]
+        \\example: prepare-reranker-top-layer-cache /tmp/bge-reranker /tmp/rerank /tmp/reranker_top_layer_cache.json train --backend native --max-examples 128 --top-layer-count 1
         \\
     , .{});
     return error.InvalidArguments;

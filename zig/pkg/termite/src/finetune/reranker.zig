@@ -33,15 +33,15 @@ pub const EvalSummary = struct {
 pub const BackendChoice = enum {
     auto,
     native,
-    mlx,
+    metal,
 };
 
 pub const RuntimeEvalResult = struct {
     summary: EvalSummary,
     backend_selected: backends.BackendType,
     distributed: runtime.distributed.Config,
-    uses_distributed_mlx: bool,
-    uses_tensor_parallel_mlx: bool,
+    uses_distributed_gpu_hosted: bool,
+    uses_tensor_parallel_gpu_hosted: bool,
 };
 
 const RankPair = struct {
@@ -139,8 +139,8 @@ pub fn evaluateExamplesRuntime(
         .summary = try computeEvalSummary(allocator, effective_examples, predicted),
         .backend_selected = model.session.backend(),
         .distributed = runtime.distributed.configFromEnv(),
-        .uses_distributed_mlx = pipeline.usesDistributedMlx(),
-        .uses_tensor_parallel_mlx = pipeline.usesTensorParallelMlx(),
+        .uses_distributed_gpu_hosted = pipeline.usesDistributedGpuHosted(),
+        .uses_tensor_parallel_gpu_hosted = pipeline.usesTensorParallelGpuHosted(),
     };
 }
 
@@ -281,9 +281,9 @@ fn computeOneGroupedRankingMetrics(
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => &.{ backends.BackendType.mlx, backends.BackendType.native },
+        .auto => &.{ backends.BackendType.metal, backends.BackendType.native },
         .native => &.{backends.BackendType.native},
-        .mlx => &.{backends.BackendType.mlx},
+        .metal => &.{backends.BackendType.metal},
     };
 }
 

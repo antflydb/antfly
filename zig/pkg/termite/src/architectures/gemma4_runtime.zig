@@ -49,7 +49,7 @@ pub fn supportsWholeFramePrefill(config: gpt_mod.Config, configured_layer_count:
 }
 
 pub fn preparedLayers(configured_layers: usize) usize {
-    const value = c_std.getenv("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN_GATED_LAYERS") orelse return configured_layers;
+    const value = c_std.getenv("TERMITE_METAL_WHOLE_TOKEN_GATED_LAYERS") orelse return configured_layers;
     const parsed = std.fmt.parseUnsigned(usize, std.mem.span(value), 10) catch return configured_layers;
     return @min(configured_layers, parsed);
 }

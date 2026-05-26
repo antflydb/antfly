@@ -358,7 +358,7 @@ fn usage() void {
         \\  termite finetune dataset prepare gemma4-lora /models/gemma4 /tmp/pilot.jsonl train /tmp/prepared.json
         \\  termite finetune adapter bootstrap gemma4 /models/gemma4 /tmp/adapter --rank 16 --alpha 32 --target-preset all-linear
         \\  termite finetune train gemma4-lora /models/gemma4 /tmp/adapter /tmp/prepared.json /tmp/out --trainer autodiff
-        \\  termite finetune workflow gemma4-pilot text /models/gemma4 /tmp/pilot-run --count 1000 --backend mlx
+        \\  termite finetune workflow gemma4-pilot text /models/gemma4 /tmp/pilot-run --count 1000 --backend native
         \\
     , .{});
 }

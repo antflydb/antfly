@@ -16,7 +16,7 @@
 //
 // Architecture: encode input text → decode output text autoregressively.
 // Uses the EncoderDecoderPipeline for the generation loop — works with any
-// backend that provides separate encode/decode sessions (ONNX, native, MLX).
+// backend that provides separate encode/decode sessions (ONNX, native).
 //
 // Required model files:
 //   - encoder_model.onnx (or encoder.onnx)

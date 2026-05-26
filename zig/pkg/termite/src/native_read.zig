@@ -15,7 +15,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const backends = @import("backends/backends.zig");
-const mlx_backend = if (build_options.enable_mlx) @import("backends/mlx.zig") else struct {};
 const metal_runtime = if (build_options.enable_metal) @import("backends/metal_runtime.zig") else struct {
     fn metalDeviceAvailable() bool {
         return false;
@@ -34,7 +33,6 @@ const BackendChoice = enum {
     onnx,
     native,
     metal,
-    mlx,
 };
 
 const Options = struct {
@@ -241,24 +239,18 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
     if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
     return null;
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => if (build_options.enable_metal and build_options.enable_mlx)
-            &.{ backends.BackendType.onnx, backends.BackendType.metal, backends.BackendType.mlx, backends.BackendType.native }
-        else if (build_options.enable_metal)
+        .auto => if (build_options.enable_metal)
             &.{ backends.BackendType.onnx, backends.BackendType.metal, backends.BackendType.native }
-        else if (build_options.enable_mlx)
-            &.{ backends.BackendType.onnx, backends.BackendType.mlx, backends.BackendType.native }
         else
             &.{ backends.BackendType.onnx, backends.BackendType.native },
         .onnx => &.{backends.BackendType.onnx},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-        .mlx => if (build_options.enable_mlx) &.{backends.BackendType.mlx} else &.{backends.BackendType.native},
     };
 }
 
@@ -266,16 +258,8 @@ fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
     switch (choice) {
         .auto, .native => return,
         .onnx => return,
-        .metal, .mlx => {
-            if (choice == .metal) {
-                if (native_backend_guard.checkMetal(build_options.enable_metal, metal_runtime.metalDeviceAvailable())) |failure| {
-                    native_backend_guard.printFailure(failure);
-                    return native_backend_guard.raise(failure);
-                }
-                return;
-            }
-            const mlx_metal_available = if (build_options.enable_mlx) mlx_backend.metalDeviceAvailable() else false;
-            if (native_backend_guard.checkMlx(build_options.enable_mlx, mlx_metal_available)) |failure| {
+        .metal => {
+            if (native_backend_guard.checkMetal(build_options.enable_metal, metal_runtime.metalDeviceAvailable())) |failure| {
                 native_backend_guard.printFailure(failure);
                 return native_backend_guard.raise(failure);
             }
@@ -285,7 +269,7 @@ fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: termite read <model-dir> <image-path> [--backend auto|onnx|native|metal|mlx] [--prompt <prompt>] [--max-tokens <n>] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3]
+        \\usage: termite read <model-dir> <image-path> [--backend auto|onnx|native|metal] [--prompt <prompt>] [--max-tokens <n>] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3]
         \\  Runs local document/image reading and prints a JSON response to stdout.
         \\
     , .{});
@@ -296,7 +280,7 @@ test "parseArgs accepts backend, prompt, and max tokens" {
         "/tmp/model",
         "/tmp/image.jpg",
         "--backend",
-        "mlx",
+        "metal",
         "--prompt",
         "<CAPTION>",
         "--max-tokens",
@@ -307,7 +291,7 @@ test "parseArgs accepts backend, prompt, and max tokens" {
 
     try std.testing.expectEqualStrings("/tmp/model", opts.model_dir);
     try std.testing.expectEqualStrings("/tmp/image.jpg", opts.image_path);
-    try std.testing.expectEqual(BackendChoice.mlx, opts.backend);
+    try std.testing.expectEqual(BackendChoice.metal, opts.backend);
     try std.testing.expectEqualStrings("<CAPTION>", opts.prompt.?);
     try std.testing.expectEqual(@as(?usize, 128), opts.max_tokens);
     try std.testing.expectEqualStrings("turbo3", opts.cache_dtype.?);

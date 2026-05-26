@@ -10,7 +10,7 @@ The immediate problems are:
 - request-time `RunBudget` decisions do not coordinate globally
 - model loading has no comparable admission control
 - concurrent cold loads can overcommit memory before inference starts
-- large GGUF/MLX runs still fall back to coarse eager estimates instead of a
+- large GGUF/Metal runs still fall back to coarse eager estimates instead of a
   bounded working-set model
 
 The intended end state is still Hypura-like:
@@ -31,7 +31,7 @@ The intended end state is still Hypura-like:
   - `disk`, `host`, `backend`
 - mmap-backed GGUF tensor storage in `src/models/tensor_store.zig`
 - lazy promotion / eviction paths in:
-  - `src/ops/mlx_compute.zig`
+  - `src/ops/metal_compute.zig`
   - `src/ops/native_compute.zig`
 - model cache and cold-load path in `src/server/model_manager.zig`
 
@@ -213,7 +213,7 @@ Deliverables:
 
 Acceptance:
 
-- large MLX/GGUF models stop failing solely because of full-artifact estimates
+- large Metal/GGUF models stop failing solely because of full-artifact estimates
 
 ### Phase 6: Tie budgets to tiered degradation
 

@@ -90,7 +90,7 @@ Qwen3.5 can be marked production fine-tuning-ready when the training path has:
    multimodal recipes.
 5. Multimodal SFT/DPO/GRPO data preparation that preserves dynamic Qwen image
    token counts and image embedding injection offsets.
-6. CPU smoke tests in `test-finetune`, plus MLX/Metal smoke tests on a machine
+6. CPU smoke tests in `test-finetune`, plus Metal smoke tests on a machine
    with enough memory for Chandra.
 
 ### Recurrent Gated DeltaNet Training Checklist

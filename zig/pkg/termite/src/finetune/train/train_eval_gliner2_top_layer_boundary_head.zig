@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     const train_summary_path = args.next() orelse return usageError();
     const eval_summary_path = args.next() orelse return usageError();
     const out_dir = args.next() orelse return usageError();
-    const backend_arg = args.next() orelse "blas";
+    const backend_arg = args.next() orelse "native";
     const learning_rate_arg = args.next() orelse "0.001";
     const epochs_arg = args.next() orelse "1";
 
@@ -69,8 +69,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn parseBackend(value: []const u8) !reranker.BackendChoice {
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
+    if (std.mem.eql(u8, value, "native")) return .native;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "auto")) return .auto;
     return error.InvalidBackend;
 }
@@ -78,7 +78,7 @@ fn parseBackend(value: []const u8) !reranker.BackendChoice {
 fn usageError() error{InvalidArguments} {
     std.debug.print(
         \\usage: train-eval-gliner2-top-layer-boundary-head <model_dir> <train_boundary_summary.json> <eval_boundary_summary.json> <out_dir> [backend] [learning_rate] [epochs]
-        \\example: train-eval-gliner2-top-layer-boundary-head /tmp/gliner2_base /tmp/gliner2_train_boundary.json /tmp/gliner2_eval_boundary.json /tmp/gliner2_boundary_head blas 0.001 2
+        \\example: train-eval-gliner2-top-layer-boundary-head /tmp/gliner2_base /tmp/gliner2_train_boundary.json /tmp/gliner2_eval_boundary.json /tmp/gliner2_boundary_head native 0.001 2
         \\
     , .{});
     return error.InvalidArguments;

@@ -4,7 +4,7 @@
 **Commit**: dfaca28
 **Model**: gemma-4-26B-A4B-it Q5_K_M GGUF
 **Hardware**: Apple Silicon (M-series), 36GB unified memory
-**Build**: ReleaseFast, MLX backend
+**Build**: ReleaseFast, Metal backend
 
 ## Current Numbers (30 tokens decode)
 
@@ -42,8 +42,8 @@ Total per token:              ~8,100ms
 ```
 
 Graph mode eliminates per-layer eval barriers but the interpreter
-dispatches 2011 MLX lazy ops per token, each going through vtable →
-MLX C API → lazy graph construction. The actual GPU work is identical.
+dispatches 2011 Metal lazy ops per token, each going through vtable →
+Metal C API → lazy graph construction. The actual GPU work is identical.
 
 ## Why graph mode doesn't help (yet)
 
@@ -52,12 +52,12 @@ The eval barriers force GPU sync (214ms each = 3.2s/token), but the
 vtable dispatch overhead is higher (~8s/token) because:
 
 1. Each of 2011 ops goes through: Zig vtable → C function pointer →
-   MLX C wrapper → MLX C++ lazy array construction
-2. MLX builds its own internal lazy graph regardless
+   Metal C wrapper → Metal C++ lazy array construction
+2. Metal builds its own internal lazy graph regardless
 3. The single eval at the end materializes the same computation
 
 Graph mode would help if the interpreter could emit Metal commands
-directly (bypass MLX lazy evaluation) or batch operations.
+directly (bypass Metal lazy evaluation) or batch operations.
 
 ## Bottleneck Analysis
 
@@ -91,7 +91,7 @@ Actual: ~7.8s per token → **87x slower than bandwidth limit**.
 The gap is from:
 - **930 separate Metal kernel dispatches** per token (each has fixed overhead)
 - **Eval barriers** forcing GPU↔CPU sync 15 times per token
-- **Lazy evaluation overhead** in MLX's graph construction
+- **Lazy evaluation overhead** in Metal's graph construction
 
 ## Optimization Opportunities
 
@@ -126,7 +126,7 @@ The gap is from:
    - Already have infrastructure in generation.zig
 
 6. **Graph interpreter → Metal command buffer** (target: eliminate dispatch overhead)
-   - Instead of dispatching MLX lazy ops, emit Metal compute commands directly
+   - Instead of dispatching Metal lazy ops, emit Metal compute commands directly
    - Pre-compile the compute pipeline from the graph
    - This is the long-term path for graph mode to actually help
 
@@ -154,7 +154,7 @@ generate_timing_ms: prompt_format=0 tokenize=0 prefill=11818 decode=232729 total
 gpt_timing_ms: attention=1994 attn_norm=32 attn_qkv=1238 attn_core=111 attn_rope=46 attn_gqa=62 attn_out_proj=609 ffn=101832
 gpt_moe_timing_ms: grouped_attempts=900 grouped_successes=900 moe_grouped=298
 gpt_overhead_ms: eval=96259 eval_count=450 shared_expert_ffn=928 norm=59
-mlx_quant_counts: provider_calls=6180 provider_grouped_calls=2700 device_native_moe_grouped_calls=2700
+metal_quant_counts: provider_calls=6180 provider_grouped_calls=2700 device_native_moe_grouped_calls=2700
 ```
 
 ### Graph mode (30 tokens)
@@ -164,7 +164,7 @@ generate_timing_ms: prompt_format=0 tokenize=0 prefill=11657 decode=242462 total
 gpt_timing_ms: attention=1683 attn_norm=17 attn_qkv=1077 attn_core=5 attn_rope=1 attn_gqa=4 attn_out_proj=582 ffn=4659
 gpt_moe_timing_ms: grouped_attempts=30 grouped_successes=30 moe_grouped=39
 gpt_overhead_ms: eval=3392 eval_count=30 shared_expert_ffn=904 norm=28
-mlx_quant_counts: provider_calls=6180 provider_grouped_calls=2700 device_native_moe_grouped_calls=2700
+metal_quant_counts: provider_calls=6180 provider_grouped_calls=2700 device_native_moe_grouped_calls=2700
 ```
 
 ## Key Insight

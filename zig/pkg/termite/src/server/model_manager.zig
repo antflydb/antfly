@@ -78,19 +78,15 @@ fn shouldPreferNativeSession(man: manifest_mod.ModelManifest) bool {
 }
 
 fn nativeBackendsAvailable() bool {
-    return build_options.enable_native or build_options.enable_mlx or build_options.enable_cuda;
+    return build_options.enable_native or build_options.enable_metal or build_options.enable_cuda;
 }
 
 fn manifestHasNativeAssets(man: manifest_mod.ModelManifest) bool {
     return man.gguf_path != null or man.safetensors_path != null or man.safetensors_index_path != null;
 }
 
-fn metalWholeModelExecutorRequested() bool {
-    return platform.env.getenvBoolDefault("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN", false);
-}
-
 fn shouldUseMetalWholeModelExecutor(session: backends.Session) bool {
-    return session.backend() == .metal or metalWholeModelExecutorRequested();
+    return session.backend() == .metal;
 }
 
 fn spinLock(m: *std.atomic.Mutex) void {
@@ -1106,7 +1102,7 @@ fn preferredModelPathForBackend(
 ) ?[]const u8 {
     return switch (backend) {
         .onnx => man.onnx_path orelse model_dir,
-        .native, .metal, .mlx, .cuda, .wasm => if (!manifestHasNativeAssets(man) and man.onnx_path != null)
+        .native, .metal, .cuda, .wasm => if (!manifestHasNativeAssets(man) and man.onnx_path != null)
             man.onnx_path.?
         else
             model_dir,
@@ -1215,7 +1211,7 @@ test "preferredModelPathForBackend keeps metal/native on model directory when na
     try std.testing.expectEqualStrings("/tmp/model.onnx", preferredModelPathForBackend("/tmp/model", man, .onnx).?);
     try std.testing.expectEqualStrings("/tmp/model", preferredModelPathForBackend("/tmp/model", man, .metal).?);
     try std.testing.expectEqualStrings("/tmp/model", preferredModelPathForBackend("/tmp/model", man, .native).?);
-    try std.testing.expectEqualStrings("/tmp/model", preferredModelPathForBackend("/tmp/model", man, .mlx).?);
+    try std.testing.expectEqualStrings("/tmp/model", preferredModelPathForBackend("/tmp/model", man, .metal).?);
 }
 
 test "preferredModelPathForBackend routes direct compute backends to onnx path for onnx-only bundle" {
@@ -1230,7 +1226,7 @@ test "preferredModelPathForBackend routes direct compute backends to onnx path f
     try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .onnx).?);
     try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .native).?);
     try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .metal).?);
-    try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .mlx).?);
+    try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .metal).?);
 }
 
 test "shouldPreferNativeSession prefers split GLiNER gguf bundle" {
@@ -1294,7 +1290,7 @@ test "shouldPreferNativeSession prefers native classifier and recognizer weights
 
 test "effectiveLoadBackends keeps gpu native backends ahead of cpu native before onnx" {
     const allocator = std.testing.allocator;
-    const preferred = [_]backends.BackendType{ .onnx, .metal, .mlx, .native };
+    const preferred = [_]backends.BackendType{ .onnx, .metal, .native };
     var scratch: [7]backends.BackendType = undefined;
 
     var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
@@ -1302,7 +1298,7 @@ test "effectiveLoadBackends keeps gpu native backends ahead of cpu native before
     classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
 
     const effective = effectiveLoadBackends(&scratch, &preferred, classifier);
-    try std.testing.expectEqualSlices(backends.BackendType, &.{ .metal, .mlx, .native, .onnx }, effective);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{ .metal, .native, .onnx }, effective);
 }
 
 test "effectiveLoadBackends preserves explicit onnx-only classifier preference" {

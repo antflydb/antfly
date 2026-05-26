@@ -51,10 +51,9 @@ currently live under `go/pkg/termite/` and `go/pkg/termite/docs/`.
 
 - Zig `0.16.0` or newer.
 - `uv` for Python e2e suites and repository helper scripts.
-- Optional native runtime dependencies for some Termite features, such as MLX,
-  ONNX Runtime, FFmpeg, or platform GPU support. The build detects available
-  local support and exposes flags such as `-Dmlx=...`, `-Dmetal=...`, and
-  `-Donnx=...`.
+- Optional native runtime dependencies for some Termite features, such as ONNX
+  Runtime, FFmpeg, or platform GPU support. The build detects available local
+  support and exposes flags such as `-Dmetal=...` and `-Donnx=...`.
 
 ## Common Builds
 

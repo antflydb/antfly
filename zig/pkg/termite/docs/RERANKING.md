@@ -12,8 +12,8 @@ Relevant code:
 - `src/models/bert.zig`
 - `src/architectures/bert.zig`
 - `src/pipelines/reranking.zig`
-- `src/ops/mlx_compute.zig`
-- `src/backends/mlx.zig`
+- `src/ops/native_compute.zig`
+- `src/backends/metal_runtime.zig`
 
 ### Endpoint
 
@@ -21,31 +21,27 @@ Relevant code:
 
 Standard cross-encoder inference: tokenize `[CLS] query [SEP] document [SEP]` pairs, run through the BERT/RoBERTa encoder session, extract classification logits, apply sigmoid (num_labels=1) or softmax.
 
-### Distributed MLX Tensor Parallel
+### Distributed Metal Tensor Parallel
 
-Distributed MLX configuration for the native reranker path:
+Distributed Metal configuration for the native reranker path:
 
 ```
-TERMITE_MLX_DISTRIBUTED_ENABLE=1
-TERMITE_MLX_DISTRIBUTED_MODE=tensor_parallel
-TERMITE_MLX_DISTRIBUTED_BACKEND=ring
-TERMITE_MLX_WORLD_SIZE=<n>
-TERMITE_MLX_RANK=<rank>
-TERMITE_MLX_LOCAL_RANK=<rank>
-MLX_WORLD_SIZE=<n>
-MLX_RANK=<rank>
-MLX_HOSTFILE=<path>
-TERMITE_MLX_ALLOW_CPU_STREAM_WITHOUT_METAL=1
+TERMITE_DISTRIBUTED_ENABLE=1
+TERMITE_DISTRIBUTED_MODE=tensor_parallel
+TERMITE_DISTRIBUTED_BACKEND=ring
+TERMITE_DISTRIBUTED_WORLD_SIZE=<n>
+TERMITE_DISTRIBUTED_RANK=<rank>
+TERMITE_DISTRIBUTED_LOCAL_RANK=<rank>
 ```
 
 The current verified local setup is 2-rank ring mode on one host.
 
 What the TP path implements:
 - Fixed TP linear math for sharded `[out, in]` weights
-- MLX-native matmul for TP linears
+- Metal-native matmul for TP linears
 - Per-rank row/column/bias shard cache keyed by tensor name
-- Cached borrowed MLX arrays and transposes for those shards
-- BERT/RoBERTa encoder attention and FFN projection seams routed through MLX tensor-parallel helpers when TP mode is enabled
+- Cached borrowed Metal arrays and transposes for those shards
+- BERT/RoBERTa encoder attention and FFN projection seams routed through Metal tensor-parallel helpers when TP mode is enabled
 
 ### Build and Verify
 
@@ -65,16 +61,16 @@ Run a one-shot probe:
   "what is termite zig" \
   "termite is a zig inference server with native model runtimes" \
   --tokenizer-dir /Users/tim/.cache/bge-reranker-base \
-  --backend blas
+  --backend native
 ```
 
-Run the bounded BLAS-vs-MLX TP verifier:
+Run the bounded native-vs-Metal TP verifier:
 
 ```bash
 bash ./scripts/verify_cross_encoder_rerank.sh
 ```
 
-That script builds the standalone probe, runs a BLAS baseline, runs a 2-rank MLX tensor-parallel check, and compares scores within tolerance.
+That script builds the standalone probe, runs a native baseline, runs a 2-rank Metal tensor-parallel check, and compares scores within tolerance.
 
 ### Benchmarking
 
@@ -83,7 +79,7 @@ TERMITE_RERANK_BENCH_REPEAT=8 \
 bash ./scripts/benchmark_cross_encoder_rerank.sh
 ```
 
-Runs repeated reranks in-process on one loaded model session for BLAS and 2-rank MLX TP. The probe reports `last_ms`, `min_ms`, `max_ms`, `avg_ms`, `warm_avg_ms`. `warm_avg_ms` excludes the first run (most useful for the TP shard/transposed-weight cache).
+Runs repeated reranks in-process on one loaded model session for native and 2-rank Metal TP. The probe reports `last_ms`, `min_ms`, `max_ms`, `avg_ms`, `warm_avg_ms`. `warm_avg_ms` excludes the first run (most useful for the TP shard/transposed-weight cache).
 
 Server-lifecycle benchmark:
 
@@ -101,22 +97,22 @@ Measured on bounded local benchmark input (`bge-reranker-base`):
 
 | Backend | avg_ms | warm_avg_ms |
 |---------|--------|-------------|
-| BLAS | 3061 | 3056 |
-| 2-rank MLX TP | 440 | 297 |
+| Native | 3061 | 3056 |
+| 2-rank Metal TP | 440 | 297 |
 
 Cold spike ~1.4s, then stable ~295ms warm.
 
 Verifier parity:
-- BLAS score: `0.506288`
-- 2-rank MLX TP score: `0.506027`
+- native score: `0.506288`
+- 2-rank Metal TP score: `0.506027`
 - diff: `0.000261` (within tolerance `0.000500`)
 
 Server path via `/api/rerank`:
 
 | Backend | avg_ms | warm_avg_ms |
 |---------|--------|-------------|
-| Server BLAS | 3075.3 | 3075.4 |
-| Server 2-rank MLX TP | 170.3 | 166.3 |
+| Server native | 3075.3 | 3075.4 |
+| Server 2-rank Metal TP | 170.3 | 166.3 |
 
 Server scores matched the standalone verifier exactly.
 
@@ -164,22 +160,22 @@ Late-interaction single-text encoding is chosen from the model config:
 
 This makes the reranker compatible with both BERT-style ColBERT checkpoints and decoder-style text models that expose token-level hidden states.
 
-### Distributed MLX
+### Distributed Metal
 
-The same distributed MLX env contract as the cross-encoder path applies to text late-interaction rerankers:
+The same distributed Metal env contract as the cross-encoder path applies to text late-interaction rerankers:
 
 ```
-TERMITE_MLX_DISTRIBUTED_ENABLE=1
-TERMITE_MLX_DISTRIBUTED_MODE=data_parallel   # or tensor_parallel
-TERMITE_MLX_DISTRIBUTED_BACKEND=ring
-TERMITE_MLX_WORLD_SIZE=<n>
-TERMITE_MLX_RANK=<rank>
-TERMITE_MLX_LOCAL_RANK=<rank>
+TERMITE_DISTRIBUTED_ENABLE=1
+TERMITE_DISTRIBUTED_MODE=data_parallel   # or tensor_parallel
+TERMITE_DISTRIBUTED_BACKEND=ring
+TERMITE_DISTRIBUTED_WORLD_SIZE=<n>
+TERMITE_DISTRIBUTED_RANK=<rank>
+TERMITE_DISTRIBUTED_LOCAL_RANK=<rank>
 ```
 
-The distributed MLX config is plumbed into the native reranker pipeline configuration used by `LoadedModel.rerankingPipeline()`.
+The distributed Metal config is plumbed into the native reranker pipeline configuration used by `LoadedModel.rerankingPipeline()`.
 
-Current state on the native BERT/RoBERTa cross-encoder path: distributed MLX TP is implemented and verified; bounded BLAS-vs-TP verification passes; repeated-request benchmarking shows warm TP behavior after the shard/transposed-weight cache is populated.
+Current state on the native BERT/RoBERTa cross-encoder path: distributed Metal TP is implemented and verified; bounded native-vs-TP verification passes; repeated-request benchmarking shows warm TP behavior after the shard/transposed-weight cache is populated.
 
 ---
 
@@ -234,7 +230,7 @@ TERMITE_COLQWEN_IMAGE_PATH=<path>
 TERMITE_COLQWEN_QUERY=<string>
 ```
 
-The verification script rebuilds `probe-colqwen2-rerank`, runs the full native MLX ColQwen2 path, and asserts that the probe reaches `document_encode` and emits a final `score=...` line.
+The verification script rebuilds `probe-colqwen2-rerank`, runs the full native Metal ColQwen2 path, and asserts that the probe reaches `document_encode` and emits a final `score=...` line.
 
 The probe emits:
 - `distributed enabled=... mode=... backend=... rank=... world_size=... local_rank=...`
@@ -246,9 +242,9 @@ The published `vidore/colqwen2-v1.0-hf` config contains the full `vlm_config.vis
 
 ### Remaining Work
 
-- Bounded BLAS-vs-MLX TP verification on a real local ColQwen2 bundle
+- Bounded native-vs-Metal TP verification on a real local ColQwen2 bundle
 - Request-level `/rerank_multimodal` smoke/regression surface
-- Verify native Qwen2-VL vision behavior under distributed MLX on the larger machine
+- Verify native Qwen2-VL vision behavior under distributed Metal on the larger machine
 - Unified text and multimodal late-interaction reporting semantics
 - Broader multimodal server-path regression coverage
 ```

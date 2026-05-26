@@ -64,44 +64,44 @@ the relevant type ids are:
   per-row absmax INT8 activation quantization plus ternary weight dot products.
   Resident quantized BitNet projection weights do not need full tensor expansion
   for correctness.
-- MLX/Metal has a direct `I2_S` kernel with the same activation-quantized
+- Metal has a direct `I2_S` kernel with the same activation-quantized
   semantics.
-- Real-model MLX/Metal validation now exists for
+- Real-model Metal validation now exists for
   `microsoft/bitnet-b1.58-2B-4T-gguf/ggml-model-i2_s.gguf`: `termite generate`
-  on `--backend mlx` completes end-to-end using the direct `I2_S` path.
+  on `--backend metal` completes end-to-end using the direct `I2_S` path.
   On this machine and build, a 1-token prompt completed in about 4.0s total
   including model load, and an 8-token prompt completed in about 2.7s total
   after a warm rebuild. This is materially faster than the native CPU path,
   which was about 25.8s for a single token in the same environment.
-- The current MLX/Metal gap is no longer the BitNet quant formats themselves.
+- The current Metal gap is no longer the BitNet quant formats themselves.
   `I2_S`, `I8_S`, `TL1`, and `TL2` now all have direct device-native paths.
   The remaining GPU work is deeper decode-path optimization. Termite now has
   raw whole-token Metal RMSNorm coverage for the BitNet layer-0 norms, and the
   raw entry path can start from the BitNet token embedding instead of the
   GPT-2 absolute-position path. The larger gap is still quantized layer-0
   weight residency: the BitNet attention/FFN linears are quantized GGUF
-  tensors, so they still run through the existing quantized MLX execution path
+  tensors, so they still run through the existing quantized Metal execution path
   rather than a persistent raw whole-token decode runtime.
 - WebGPU/WASM has an `I2_S` quantized matmul bridge and WGSL kernel with the
   same activation-quantized semantics. The shader still needs browser-side
   WebGPU validation on a real device.
 - `I8_S` has signed-int8 CPU materialization plus native generic quantized
-  linear execution, and MLX/Metal now has a direct device-native path for the
+  linear execution, and Metal now has a direct device-native path for the
   same signed-int8 layout.
 - `TL1` and `TL2` have CPU dense materialization fallbacks and native direct
   quantized linear execution for Microsoft BitNet's generated/preset LUT
   layouts. The direct native path builds activation-side LUTs per input row,
   decodes from packed TL bytes, and uses portable vector accumulation without
   expanding the full weight tensor.
-- `TL1` now also has a direct MLX/Metal kernel with the same activation-
+- `TL1` now also has a direct Metal kernel with the same activation-
   quantized semantics as the CPU path, validated against a synthetic GGUF-
   layout tensor using one of the upstream preset matrix shapes.
-- `TL2` now also has a direct MLX/Metal kernel with the same activation-
+- `TL2` now also has a direct Metal kernel with the same activation-
   quantized semantics as the CPU path, including the padded GGUF scale offset,
   validated against a synthetic GGUF-layout tensor using one of the upstream
   preset matrix shapes.
 - The shared `TL2` codec/materialization path now also has explicit coverage
-  for preset shapes with a nonzero tail-pair section, and the MLX/Metal parity
+  for preset shapes with a nonzero tail-pair section, and the Metal parity
   tests now exercise multi-row activation quantization and that tail layout.
 - The TL1/TL2 native path now follows the upstream table-lookup shape, but it
   still needs real-model validation and platform-tuned AVX/NEON kernels before
@@ -148,8 +148,8 @@ the relevant type ids are:
   materialization.
 - [x] Add BitLinear execution with activation quantization semantics for the
   native CPU `I2_S` correctness path.
-- [x] Add an MLX/Metal direct `I2_S` kernel with activation quantization.
-- [x] Validate real-model MLX/Metal `I2_S` generation on
+- [x] Add an Metal direct `I2_S` kernel with activation quantization.
+- [x] Validate real-model Metal `I2_S` generation on
   `microsoft/bitnet-b1.58-2B-4T-gguf/ggml-model-i2_s.gguf`.
 - [x] Add WebGPU direct `I2_S` kernels.
 - [ ] Validate WebGPU `I2_S` shader dispatch in browser/worker mode.
@@ -157,14 +157,14 @@ the relevant type ids are:
   fixed prompt.
 - [x] Add `I8_S` signed-int8 materialization and native CPU generic quantized
   linear execution.
-- [x] Add an MLX/Metal direct `I8_S` kernel.
+- [x] Add an Metal direct `I8_S` kernel.
 - [x] Add `TL1` dense materialization fallback for upstream preset LUT layouts.
 - [x] Add `TL2` dense materialization fallback for upstream preset LUT layouts,
   including the padded scale offset used by BitNet's converter/runtime.
 - [x] Add native direct TL1/TL2 quantized linear execution to avoid full dense
   weight materialization.
-- [x] Add an MLX/Metal direct `TL1` kernel.
-- [x] Add an MLX/Metal direct `TL2` kernel.
+- [x] Add an Metal direct `TL1` kernel.
+- [x] Add an Metal direct `TL2` kernel.
 - [ ] Validate `TL1` and `TL2` materialization against real GGUF tensors or
   reference `bitnet.cpp` logits.
 - [x] Replace the scalar TL1/TL2 direct path with activation-side LUT kernels
@@ -178,8 +178,8 @@ the relevant type ids are:
   through existing backend ops.
 - [x] Add subln normalization support if existing norm ops do not match the
   released BitNet model.
-- [x] Add MLX/Metal kernels for useful local execution.
-- [ ] Add WebGPU/WASM kernels only after CPU and MLX correctness are verified.
+- [x] Add Metal kernels for useful local execution.
+- [ ] Add WebGPU/WASM kernels only after CPU and Metal correctness are verified.
 - [ ] Add a smoke command for
   `microsoft/bitnet-b1.58-2B-4T-gguf/ggml-model-i2_s.gguf` that verifies:
   - architecture detection succeeds
@@ -201,7 +201,7 @@ The conservative bring-up order should be:
 4. Add a slow CPU correctness path, even if it is not fast.
 5. Validate logits or short generation against `bitnet.cpp` for a fixed prompt.
 6. Add direct native CPU kernels.
-7. Add MLX/Metal and WebGPU kernels.
+7. Add Metal and WebGPU kernels.
 
 The official BitNet docs warn that generic transformer execution paths do not
 deliver the efficiency benefits of BitNet. Termite should keep that distinction

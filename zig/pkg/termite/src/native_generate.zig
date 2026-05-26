@@ -448,7 +448,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         graph_mod.executor_stats.printBypass("termite.generate", "native_generation_direct_decoder_runtime");
     }
 
-    const decoder_runtime_scheduler_override = model.session.backend().usesGpuHostedSession() and enableMlxRawMetalWholeTokenDebug();
+    const decoder_runtime_scheduler_override = false;
     var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
     defer if (native_generate_lease) |lease| {
         if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
@@ -470,7 +470,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
-        .mlx => .mlx,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
@@ -482,7 +481,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
     const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
         .native => .cpu,
-        .metal, .mlx, .cuda => .gpu,
+        else => .gpu,
     };
     var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
     budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
@@ -642,8 +641,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .pjrt_client = if (pjrt_client) |*client| client else null,
     };
 
-    if ((build_options.enable_mlx or build_options.enable_metal) and opts.print_timing and model.session.backend().usesGpuHostedSession()) {
-        debug_timing.resetLiveMlxTimingStats(&cb);
+    if (build_options.enable_metal and opts.print_timing and model.session.backend().usesGpuHostedSession()) {
+        debug_timing.resetLiveGpuTimingStats(&cb);
         generation.resetDecoderRuntimeDebugStats();
     }
     gpt_arch.resetDebugTimingStats();
@@ -693,62 +692,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 durationMillis(started_at, finished_generate_at),
             },
         );
-        if ((build_options.enable_mlx or build_options.enable_metal) and model.session.backend().usesGpuHostedSession() and detailedGpuTimingEnabled()) {
+        if (build_options.enable_metal and model.session.backend().usesGpuHostedSession() and detailedGpuTimingEnabled()) {
             printGpuHostedTimingDetails(&cb);
-            const quant_stats = cb.debugTimingSnapshot().quant;
-            const decoder_runtime_stats = generation.getDecoderRuntimeDebugStats();
-            if (build_options.enable_mlx) {
-                print(
-                    "mlx_decoder_runtime: forward_attempts={d} flag_disabled={d} backend_not_mlx={d} scheduler_blocked={d} graph_blocked={d} first_token_blocked={d} kv_missing={d} non_greedy={d} grammar_blocked={d} prepare_attempts={d} prepare_calls={d} prepare_flag_disabled={d} prepare_backend_not_mlx={d} prepare_kv_missing={d} prepare_scheduler_blocked={d} prepare_graph_blocked={d} prepare_arch_blocked={d} prepare_model_blocked={d} input_attempts={d} input_successes={d} input_flag_disabled={d} input_backend_not_mlx={d} input_kv_missing={d} input_arch_blocked={d} input_model_blocked={d} input_seq_empty={d}\n",
-                    .{
-                        decoder_runtime_stats.forward_attempts,
-                        decoder_runtime_stats.flag_disabled,
-                        decoder_runtime_stats.backend_not_mlx,
-                        decoder_runtime_stats.scheduler_blocked,
-                        decoder_runtime_stats.graph_blocked,
-                        decoder_runtime_stats.first_token_blocked,
-                        decoder_runtime_stats.kv_missing,
-                        decoder_runtime_stats.non_greedy,
-                        decoder_runtime_stats.grammar_blocked,
-                        decoder_runtime_stats.prepare_attempts,
-                        decoder_runtime_stats.prepare_calls,
-                        decoder_runtime_stats.prepare_flag_disabled,
-                        decoder_runtime_stats.prepare_backend_not_mlx,
-                        decoder_runtime_stats.prepare_kv_missing,
-                        decoder_runtime_stats.prepare_scheduler_blocked,
-                        decoder_runtime_stats.prepare_graph_blocked,
-                        decoder_runtime_stats.prepare_arch_blocked,
-                        decoder_runtime_stats.prepare_model_blocked,
-                        decoder_runtime_stats.input_attempts,
-                        decoder_runtime_stats.input_successes,
-                        decoder_runtime_stats.input_flag_disabled,
-                        decoder_runtime_stats.input_backend_not_mlx,
-                        decoder_runtime_stats.input_kv_missing,
-                        decoder_runtime_stats.input_arch_blocked,
-                        decoder_runtime_stats.input_model_blocked,
-                        decoder_runtime_stats.input_seq_empty,
-                    },
-                );
-                print(
-                    "mlx_moe_grouped_failures: recovered_packed_metadata={d} not_device_native={d} missing_quant_storage={d} not_packed={d} provider_null={d}\n",
-                    .{
-                        quant_stats.moe_grouped_recovered_packed_metadata,
-                        quant_stats.moe_grouped_fail_not_device_native,
-                        quant_stats.moe_grouped_fail_missing_quant_storage,
-                        quant_stats.moe_grouped_fail_not_packed,
-                        quant_stats.moe_grouped_fail_provider_null,
-                    },
-                );
-                print(
-                    "mlx_moe_grouped_staging: calls={d} bytes={d} experts={d} ms={d}\n",
-                    .{
-                        quant_stats.moe_grouped_stage_calls,
-                        quant_stats.moe_grouped_stage_bytes,
-                        quant_stats.moe_grouped_stage_experts,
-                        @divTrunc(quant_stats.moe_grouped_stage_nanos, std.time.ns_per_ms),
-                    },
-                );
-            }
         }
         if (build_options.enable_metal and cb.kind() == .metal) {
             const metal_snapshot = cb.debugTimingSnapshot();
@@ -1028,11 +973,11 @@ fn durationMillis(from: std.Io.Timestamp, to: std.Io.Timestamp) u64 {
 }
 
 fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
-    if (!build_options.enable_mlx and !build_options.enable_metal) {
+    if (!build_options.enable_metal) {
         return;
     }
-    const backend_stats = if (cb_opt) |cb| cb.debugTimingSnapshot() else debug_timing.fallbackMlxTimingSnapshot();
-    const backend_kind: ops.BackendKind = if (cb_opt) |cb| cb.kind() else .mlx;
+    const backend_stats = if (cb_opt) |cb| cb.debugTimingSnapshot() else debug_timing.fallbackGpuTimingSnapshot();
+    const backend_kind: ops.BackendKind = if (cb_opt) |cb| cb.kind() else .metal;
     const decoder_runtime_runtime_ready = if (cb_opt) |cb| cb.decoderRuntimeReady() else false;
     const decoder_runtime_embeddings_prepared = if (cb_opt) |cb| cb.decoderRuntimeAbsoluteEmbeddingsPrepared() else false;
     debug_timing.printBackendTimingDetails(
@@ -1072,9 +1017,9 @@ fn liveWholeModelExecutorRequested(opts: *const Options) bool {
     const explicit_whole_model = opts.mode != null and opts.mode.? == .compiled and
         opts.compiled_target != null and opts.compiled_target.? == .whole_model;
     if (explicit_whole_model) return false;
-    if (!explicit_whole_model and opts.backend != .metal and !enableMlxRawMetalWholeTokenDebug()) return false;
+    if (!explicit_whole_model and opts.backend != .metal) return false;
     return switch (opts.backend) {
-        .auto, .native, .metal, .mlx => true,
+        .auto, .native, .metal => true,
         else => false,
     };
 }
@@ -1150,7 +1095,6 @@ fn tryRunLiveWholeModelExecutorGenerate(
 
     const kv_backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .metal => .metal,
-        .mlx => .mlx,
         .native => .native,
         else => .native,
     };
@@ -1624,7 +1568,6 @@ fn runOnnxWholeModelGraphGenerate(
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
-        .mlx => .mlx,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
@@ -1636,7 +1579,7 @@ fn runOnnxWholeModelGraphGenerate(
         session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
     const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
         .native => .cpu,
-        .metal, .mlx, .cuda => .gpu,
+        else => .gpu,
     };
     var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
     budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
@@ -2048,7 +1991,7 @@ fn preflightModelLoadBudget(
     });
     const predicted_backend_type: backends.BackendType = switch (reservation_tier) {
         .host => .native,
-        .backend => if (opts.backend == .metal) .metal else .mlx,
+        .backend => .metal,
         .disk => unreachable,
     };
     limits = try session_factory.widenBudgetLimitsForModelPath(
@@ -2083,28 +2026,24 @@ fn predictedWeightTier(
             if (!build_options.enable_metal) return .host;
             return .backend;
         },
-        .mlx => {
-            if (!build_options.enable_mlx) return .host;
-            return .backend;
-        },
         .cuda => {
             if (!build_options.enable_cuda) return .host;
             return .backend;
         },
         .auto => {
-            if (build_options.enable_mlx and !shouldPreferNativeAheadOfMlx(allocator, manifest)) return .backend;
+            if (build_options.enable_metal and !shouldPreferNativeAheadOfMetal(allocator, manifest)) return .backend;
             return .host;
         },
         .onnx, .xla, .webgpu => return .host,
     }
 }
 
-fn shouldPreferNativeAheadOfMlx(
+fn shouldPreferNativeAheadOfMetal(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
 ) bool {
     const total_bytes = estimateModelArtifactBytes(allocator, manifest) catch return true;
-    return total_bytes == 0 or total_bytes > mlxEagerDenseMaxBytes();
+    return total_bytes == 0 or total_bytes > metalEagerDenseMaxBytes();
 }
 
 fn estimateModelArtifactBytes(
@@ -2116,18 +2055,14 @@ fn estimateModelArtifactBytes(
     return 0;
 }
 
-fn mlxEagerDenseMaxBytes() u64 {
-    const mb = platform.env.getenvUsize("TERMITE_MLX_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
+fn metalEagerDenseMaxBytes() u64 {
+    const mb = platform.env.getenvUsize("TERMITE_METAL_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
     return mb * 1024 * 1024;
-}
-
-fn enableMlxRawMetalWholeTokenDebug() bool {
-    return platform.env.getenvBool("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN");
 }
 
 fn printUsage() void {
     print(
-        \\usage: termite generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|mlx|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
+        \\usage: termite generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
         \\  Explicit compiled backends consult ~/.termite/artifacts/<owner>/<model>/<backend>/... by default.

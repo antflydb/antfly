@@ -124,7 +124,7 @@ Runtime findings from implementation:
   not include an explicit `lm_head.weight`; the current implementation uses the
   assistant embedding matrix for logits, then applies the clustered mask when
   `masked_embedding.*` tensors are present.
-- MLX-VLM's public Gemma 4 assistant implementation and the SeatownSin
+- Metal-VLM's public Gemma 4 assistant implementation and the SeatownSin
   extracted PyTorch drafter both highlight runtime details that are easy to get
   subtly wrong:
   - the target activation passed to the drafter is the target hidden state that
@@ -369,11 +369,11 @@ lifetime/barrier issue is isolated. After reverting, minimal API-validation
 smoke `pkg/termite/.debug/metal-command-20260507-215452` completed with
 `token_ids: 10979` and no new diagnostic reports.
 
-The native Metal GGUF route must not depend on MLX availability when Termite is
+The native Metal GGUF route must not depend on Metal availability when Termite is
 built with both backends enabled. A later 4-token compiled whole-model smoke was
 failing before model execution with `MlxMetalUnavailable`; the long-term fix is
 to keep `.metal` sessions on the native Metal provider/stream path and reserve
-MLX streams/providers for the `.mlx` backend. The repaired smoke
+Metal streams/providers for the `.metal` backend. The repaired smoke
 `pkg/termite/.debug/metal-command-20260507-222950` passed API validation with
 `token_ids: 10979 236888 2088 740`, `prefill=157ms`, `decode=149ms`,
 `total=1006ms`, and no diagnostic reports.
@@ -418,7 +418,7 @@ MLX streams/providers for the `.mlx` backend. The repaired smoke
 - Do assistant checkpoints expose enough metadata to validate exact target
   compatibility, or do we need a local compatibility table?
 - Should the experimental inverse `masked_embedding.token_ordering` environment
-  override be removed now that MLX-VLM confirms centroid-to-token ordering?
+  override be removed now that Metal-VLM confirms centroid-to-token ordering?
 - Should the clustered embedder move into a cached backend-native path? The
   baseline implementation currently materializes the ordering on host per draft
   step for correctness/debuggability.

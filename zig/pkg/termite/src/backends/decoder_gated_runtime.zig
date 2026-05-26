@@ -1248,7 +1248,7 @@ fn tracePrepareLayerFailure(layer: usize, kind: []const u8, slot: usize, in_dim:
 }
 
 pub fn overrideLevel() usize {
-    const value = c_std.getenv("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN_GATED_OVERRIDE_LEVEL") orelse return 4;
+    const value = c_std.getenv("TERMITE_METAL_WHOLE_TOKEN_GATED_OVERRIDE_LEVEL") orelse return 4;
     return std.fmt.parseUnsigned(usize, std.mem.span(value), 10) catch 4;
 }
 

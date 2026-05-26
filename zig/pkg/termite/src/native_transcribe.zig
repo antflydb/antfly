@@ -15,7 +15,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const backends = @import("backends/backends.zig");
-const mlx_backend = if (build_options.enable_mlx) @import("backends/mlx.zig") else struct {};
 const metal_runtime = if (build_options.enable_metal) @import("backends/metal_runtime.zig") else struct {
     fn metalDeviceAvailable() bool {
         return false;
@@ -36,7 +35,6 @@ const BackendChoice = enum {
     auto,
     native,
     metal,
-    mlx,
 };
 
 const Options = struct {
@@ -312,37 +310,23 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
     return null;
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => if (build_options.enable_metal and build_options.enable_mlx)
-            &.{ backends.BackendType.metal, backends.BackendType.mlx, backends.BackendType.native }
-        else if (build_options.enable_metal)
+        .auto => if (build_options.enable_metal)
             &.{ backends.BackendType.metal, backends.BackendType.native }
-        else if (build_options.enable_mlx)
-            &.{ backends.BackendType.mlx, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-        .mlx => if (build_options.enable_mlx) &.{backends.BackendType.mlx} else &.{backends.BackendType.native},
     };
 }
 
 fn ensureRequestedMetalHostedBackendAvailable(choice: BackendChoice) !void {
-    if (choice != .metal and choice != .mlx) return;
-    if (choice == .metal) {
-        if (native_backend_guard.checkMetal(build_options.enable_metal, metal_runtime.metalDeviceAvailable())) |failure| {
-            native_backend_guard.printFailure(failure);
-            return native_backend_guard.raise(failure);
-        }
-        return;
-    }
-    const mlx_metal_available = if (build_options.enable_mlx) mlx_backend.metalDeviceAvailable() else false;
-    if (native_backend_guard.checkMlx(build_options.enable_mlx, mlx_metal_available)) |failure| {
+    if (choice != .metal) return;
+    if (native_backend_guard.checkMetal(build_options.enable_metal, metal_runtime.metalDeviceAvailable())) |failure| {
         native_backend_guard.printFailure(failure);
         return native_backend_guard.raise(failure);
     }
@@ -350,7 +334,7 @@ fn ensureRequestedMetalHostedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: termite transcribe <model-dir> <audio.wav> [--backend auto|native|metal|mlx] [--language <lang>]
+        \\usage: termite transcribe <model-dir> <audio.wav> [--backend auto|native|metal] [--language <lang>]
         \\  Runs local audio transcription and prints a JSON response to stdout.
         \\
     , .{});
@@ -361,13 +345,13 @@ test "parseArgs accepts backend and language" {
         "/tmp/model",
         "/tmp/audio.wav",
         "--backend",
-        "mlx",
+        "metal",
         "--language",
         "en",
     });
 
     try std.testing.expectEqualStrings("/tmp/model", opts.model_dir);
     try std.testing.expectEqualStrings("/tmp/audio.wav", opts.audio_path);
-    try std.testing.expectEqual(BackendChoice.mlx, opts.backend);
+    try std.testing.expectEqual(BackendChoice.metal, opts.backend);
     try std.testing.expectEqualStrings("en", opts.language.?);
 }

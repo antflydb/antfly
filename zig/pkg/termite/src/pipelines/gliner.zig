@@ -84,14 +84,14 @@ pub const GlinerPipeline = struct {
     tok: Tokenizer,
     config: GlinerConfig,
 
-    pub fn usesDistributedMlx(self: *const GlinerPipeline) bool {
+    pub fn usesDistributedGpuHosted(self: *const GlinerPipeline) bool {
         return self.config.distributed.enabled and
             self.config.distributed.world_size > 1 and
             self.session.backend().usesGpuHostedSession();
     }
 
-    pub fn usesTensorParallelMlx(self: *const GlinerPipeline) bool {
-        return self.usesDistributedMlx() and self.config.distributed.mode == .tensor_parallel;
+    pub fn usesTensorParallelGpuHosted(self: *const GlinerPipeline) bool {
+        return self.usesDistributedGpuHosted() and self.config.distributed.mode == .tensor_parallel;
     }
 
     /// Recognize entities in a batch of texts using provided or default labels.
@@ -1199,7 +1199,7 @@ test "gliner relation candidate labels support qualified head labels" {
     try std.testing.expectEqualStrings("location::founded", labels.items[4]);
 }
 
-test "gliner distributed mlx helpers mirror pipeline/session state" {
+test "gliner distributed GPU-hosted helpers mirror pipeline/session state" {
     const allocator = std.testing.allocator;
     const FakeSession = struct {
         fn session() backends.Session {
@@ -1228,7 +1228,7 @@ test "gliner distributed mlx helpers mirror pipeline/session state" {
         }
 
         fn backend(_: *anyopaque) backends.BackendType {
-            return .mlx;
+            return .metal;
         }
 
         fn close(_: *anyopaque) void {}
@@ -1243,6 +1243,6 @@ test "gliner distributed mlx helpers mirror pipeline/session state" {
             .distributed = .{ .enabled = true, .mode = .tensor_parallel, .world_size = 2, .rank = 0, .local_rank = 0 },
         },
     };
-    try std.testing.expect(pipeline.usesDistributedMlx());
-    try std.testing.expect(pipeline.usesTensorParallelMlx());
+    try std.testing.expect(pipeline.usesDistributedGpuHosted());
+    try std.testing.expect(pipeline.usesTensorParallelGpuHosted());
 }

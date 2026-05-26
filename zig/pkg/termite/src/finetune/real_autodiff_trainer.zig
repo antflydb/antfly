@@ -105,7 +105,7 @@ pub const GradBlock = struct {
 /// `(name, data)` pairs — one per LoRA parameter block — and the hook is
 /// expected to mutate each `data` slice in place with the all-reduced
 /// gradient. When null (default), no reduction is performed (single-rank
-/// training). The harness does not know about MLX / NCCL / any specific
+/// training). The harness does not know about backend-specific
 /// transport — the caller is responsible for plumbing the real primitive.
 pub const ReduceGradsFn = *const fn (
     ctx: *anyopaque,
@@ -141,7 +141,7 @@ pub const TrainerConfig = struct {
     /// Optional distributed gradient-reduction hook. Called exactly once per
     /// accumulation flush, immediately before the optimizer step, with a
     /// GradBlock per LoRA parameter. A typical DDP caller would wire this to
-    /// `mlx_compute.allSumFloat32InPlaceOnStream` (one all-reduce per block)
+    /// the backend all-reduce hook
     /// to fold LoRA gradients across ranks before AdamW updates.
     reduce_grads: ?ReduceGradsFn = null,
     /// Opaque context pointer forwarded to `reduce_grads` on each call.

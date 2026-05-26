@@ -1,17 +1,17 @@
 # termite-zig Roadmap
 
-termite-zig is a Zig reimplementation of the Go Termite ML inference service targeting full API parity with all 10 endpoints, plus native MLX/SafeTensors support for Apple Silicon. The Kubernetes operator and proxy stay in Go — only the inference binary is being rewritten.
+termite-zig is a Zig reimplementation of the Go Termite ML inference service targeting full API parity with all 10 endpoints, plus native Metal/SafeTensors support for Apple Silicon. The Kubernetes operator and proxy stay in Go — only the inference binary is being rewritten.
 
 ## Architecture
 
 ```
 .onnx files ──────► ONNX Runtime (CPU, CUDA, TensorRT, ROCm)
                          │
-SafeTensors/GGUF ──► Hand-written forward pass ──► MLX (Metal, macOS only)
+SafeTensors/GGUF ──► Hand-written forward pass ──► Metal (Metal, macOS only)
                          │                    └──► BLAS (CPU everywhere)
 ```
 
-ONNX Runtime is the universal backend (loads `.onnx` directly). MLX and BLAS need SafeTensors weight loading + hand-written model architectures per model family.
+ONNX Runtime is the universal backend (loads `.onnx` directly). Metal and BLAS need SafeTensors weight loading + hand-written model architectures per model family.
 
 ---
 
@@ -33,18 +33,18 @@ The Go binary continues to work — Zig is a drop-in replacement for the inferen
 - BERT config parsing + weight mapping (bert, roberta, distilbert)
 - Tensor type (multi-dtype, shape, owned/borrowed)
 - Session vtable (run, inputInfo, outputInfo, backend, close)
-- BLAS math primitives (sgemm, l2Normalize, meanPool)
+- Native math primitives (sgemm, l2Normalize, meanPool)
 - TTL ResultCache with stats
 - Model registry (local discovery, ModelRef parsing)
 - HTTP server (httpx.zig, route stubs)
 - CLI (run, list, pull, version)
-- Build system (conditional `-Donnx`, `-Dmlx`, `-Dblas`)
+- Build system (conditional `-Donnx`, `-Dmetal`, `-Dsystem-blas`)
 - Working `/api/embed` via ONNX
 - Reranking pipeline and `/api/rerank`
-- Native BERT/RoBERTa cross-encoder path with MLX TP
+- Native BERT/RoBERTa cross-encoder path
 - ColBERT late-interaction text reranker
 - ColQwen multimodal reranker and `/rerank_multimodal`
-- GLiNER2 native DeBERTa + span-head path with distributed MLX TP
+- GLiNER2 native DeBERTa + span-head path with distributed Metal TP
 - Document classification runtime (`/api/classify/document`, `/api/classify/document_tokens`)
 - LayoutLMv3 PEFT surface (LoRA bootstrap, train, inspect, materialize)
 - Autodiff and training loop (reverse-mode AD, VJP rules, FlatTrainingState, LoRA injection)
@@ -62,25 +62,25 @@ The Go binary continues to work — Zig is a drop-in replacement for the inferen
 
 ## Active Work
 
-### MLX Gemma Follow-Up
+### Metal Gemma Follow-Up
 
-- [ ] **Budget accounting for native MLX Gemma**: large native Gemma 3 MLX runs exceed the intended runtime budget because resident MLX tensors and other backend allocations are not fully accounted for by the current host/backend/KV/scratch reservation system.
-- [ ] **NVMe spill for native MLX Gemma**: current `disk`/`host`/`backend` budgeting is still tensor-store reload semantics, not a true NVMe-managed residency path. Cold dense weights should stay on disk/NVMe by default rather than being pulled resident too eagerly.
-- [ ] **Clean up MLX Gemma debug scaffolding**: remove the temporary scheduler/KV/paged-attention debug env toggles and noisy MLX tied-logits logging added during the Gemma 3 decode investigation, while keeping the actual correctness fixes.
+- [ ] **Budget accounting for native Metal Gemma**: large native Gemma 3 Metal runs exceed the intended runtime budget because resident Metal tensors and other backend allocations are not fully accounted for by the current host/backend/KV/scratch reservation system.
+- [ ] **NVMe spill for native Metal Gemma**: current `disk`/`host`/`backend` budgeting is still tensor-store reload semantics, not a true NVMe-managed residency path. Cold dense weights should stay on disk/NVMe by default rather than being pulled resident too eagerly.
+- [ ] **Clean up Metal Gemma debug scaffolding**: remove the temporary scheduler/KV/paged-attention debug env toggles and noisy Metal tied-logits logging added during the Gemma 3 decode investigation, while keeping the actual correctness fixes.
 
 ### Reranker and Multimodal Verification
 
-- [ ] **Bounded BLAS-vs-MLX TP verification on a real local ColQwen2 bundle**
+- [ ] **Bounded BLAS-vs-Metal TP verification on a real local ColQwen2 bundle**
 - [ ] **`/rerank_multimodal` smoke/regression surface** (request-level)
-- [ ] **Verify native Qwen2-VL vision behavior under distributed MLX** on the larger machine
+- [ ] **Verify native Qwen2-VL vision behavior under distributed Metal** on the larger machine
 - [ ] **Unify text and multimodal late-interaction reporting semantics**
 - [ ] **Broader multimodal server-path regression coverage**
-- [ ] **Rank-aware MLX device/stream selection polish** for distributed reranker
+- [ ] **Rank-aware Metal device/stream selection polish** for distributed reranker
 - [ ] **Request orchestration semantics** for server-side distributed rerank execution
 
 ### Native GLiNER Parity
 
-- [ ] **GLiNER parity validation**: GLiNER has a native DeBERTa + span-head path. Remaining work: prove parity with real GLiNER models across MLX/BLAS, add backend-specific tests, tighten performance gaps in the native head.
+- [ ] **GLiNER parity validation**: GLiNER has a native DeBERTa + span-head path. Remaining work: prove parity with real GLiNER models across Metal/BLAS, add backend-specific tests, tighten performance gaps in the native head.
 - [ ] **Bounded BLAS-vs-TP parity run** on a real local GLiNER2 bundle
 - [ ] **Server-path orchestration** for distributed multi-rank GLiNER2 execution
 - [ ] **Thread server/reporting semantics** through native `/classify` and `/recognize`
@@ -176,7 +176,7 @@ The Go binary continues to work — Zig is a drop-in replacement for the inferen
 
 **CI matrix:**
 ```
-macOS arm64:  ONNX + BLAS + MLX
+macOS arm64:  ONNX + BLAS + Metal
 Linux x86_64: ONNX + BLAS
 Linux arm64:  ONNX + BLAS
 ```
@@ -206,8 +206,8 @@ Here's a summary of what was done and key decisions made:
 
 **docs/finetuning/FINETUNING.md** — merged TRAINING.md, TRAINING_FEATURES.md, LAYOUTLMV3_FINETUNE.md, and RUN_CONTRACT.md into a single document organized as: autodiff/IR architecture → core training primitives → optimizer features → feature matrix with per-feature explanations → SafeTensors checkpoint format → benchmarking → LayoutLMv3 PEFT surface (commands, runbook, artifact contracts) → CLI reference for all model families → run contract (JSON artifact schemas).
 
-**docs/RERANKING.md** — merged COLBERT_RERANKING.md, COLQWEN_RERANKING.md, and NATIVE_CROSS_ENCODER_MLX.md. Organized as three top-level sections (cross-encoder, ColBERT late-interaction, ColQwen multimodal) with the native cross-encoder section expanded since it has the most concrete performance data and verification scripts. Eliminated the duplicate distributed MLX env var tables (one canonical table per section instead).
+**docs/RERANKING.md** — merged COLBERT_RERANKING.md, COLQWEN_RERANKING.md, and NATIVE_CROSS_ENCODER_METAL.md. Organized as three top-level sections (cross-encoder, ColBERT late-interaction, ColQwen multimodal) with the native cross-encoder section expanded since it has the most concrete performance data and verification scripts. Eliminated the duplicate distributed Metal env var tables (one canonical table per section instead).
 
-**docs/NATIVE_MODELS.md** — merged GLINER2_DISTRIBUTED_MLX.md and LAYOUTDOC_RUNTIME.md. Cut the "as of April 8" datestamp and "phase" language; kept all HTTP API contracts, probe commands, and env vars verbatim.
+**docs/NATIVE_MODELS.md** — merged GLINER2_DISTRIBUTED_METAL.md and LAYOUTDOC_RUNTIME.md. Cut the "as of April 8" datestamp and "phase" language; kept all HTTP API contracts, probe commands, and env vars verbatim.
 
-**ROADMAP.md** — merged ROADMAP.md (the old one was actually the full parity plan from early development) with TODO.md. Restructured as: architecture overview → what stays in Go → shipped items (consolidating the old "What's Done" list with items from TODO's checked boxes) → active work (MLX Gemma, reranker verification, GLiNER, LayoutDoc) → remaining API parity (endpoint status table + per-endpoint notes) → infrastructure gaps (from TODO unchecked items + Phase 6 items) → E2E testing. Removed the numbered Phase 1–6 planning structure and forward-looking phase language throughout.
+**ROADMAP.md** — merged ROADMAP.md (the old one was actually the full parity plan from early development) with TODO.md. Restructured as: architecture overview → what stays in Go → shipped items (consolidating the old "What's Done" list with items from TODO's checked boxes) → active work (Metal Gemma, reranker verification, GLiNER, LayoutDoc) → remaining API parity (endpoint status table + per-endpoint notes) → infrastructure gaps (from TODO unchecked items + Phase 6 items) → E2E testing. Removed the numbered Phase 1–6 planning structure and forward-looking phase language throughout.

@@ -157,7 +157,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
-        .mlx => .mlx,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
@@ -169,7 +168,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
     const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
         .native => .cpu,
-        .metal, .mlx, .cuda => .gpu,
+        else => .gpu,
     };
     var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
     budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
@@ -420,16 +419,12 @@ fn predictedWeightTier(
             if (!build_options.enable_metal) return .host;
             return .backend;
         },
-        .mlx => {
-            if (!build_options.enable_mlx) return .host;
-            return .backend;
-        },
         .cuda => {
             if (!build_options.enable_cuda) return .host;
             return .backend;
         },
         .auto => {
-            if ((build_options.enable_metal or build_options.enable_mlx) and !shouldPreferNativeAheadOfMlx(allocator, manifest)) return .backend;
+            if (build_options.enable_metal and !shouldPreferNativeAheadOfMetal(allocator, manifest)) return .backend;
             return .host;
         },
         .onnx, .xla, .webgpu => return .host,
@@ -440,19 +435,18 @@ fn predictedBackendType(choice: BackendChoice, tier: runtime.tier.memory.Residen
     if (tier != .backend) return .native;
     return switch (choice) {
         .metal => .metal,
-        .mlx => .mlx,
         .cuda => .cuda,
-        .auto => if (build_options.enable_metal) .metal else .mlx,
+        .auto => if (build_options.enable_metal) .metal else .native,
         .onnx, .native, .xla, .webgpu => .native,
     };
 }
 
-fn shouldPreferNativeAheadOfMlx(
+fn shouldPreferNativeAheadOfMetal(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
 ) bool {
     const total_bytes = estimateModelArtifactBytes(allocator, manifest) catch return true;
-    return total_bytes == 0 or total_bytes > mlxEagerDenseMaxBytes();
+    return total_bytes == 0 or total_bytes > metalEagerDenseMaxBytes();
 }
 
 fn estimateModelArtifactBytes(
@@ -464,19 +458,14 @@ fn estimateModelArtifactBytes(
     return 0;
 }
 
-fn mlxEagerDenseMaxBytes() u64 {
-    const mb = platform.env.getenvUsize("TERMITE_MLX_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
+fn metalEagerDenseMaxBytes() u64 {
+    const mb = platform.env.getenvUsize("TERMITE_METAL_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
     return mb * 1024 * 1024;
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     if (choice == .onnx) {
-        session_manager.preferred_backends = if (build_options.enable_native)
-            &.{backends.BackendType.native}
-        else if (build_options.enable_mlx)
-            &.{backends.BackendType.mlx}
-        else
-            &.{};
+        session_manager.preferred_backends = if (build_options.enable_native) &.{backends.BackendType.native} else &.{};
         return;
     }
     native_backend_choice.configureSessionPreference(session_manager, choice);
@@ -593,7 +582,7 @@ fn printGgufSummary(
 
 fn printUsage() void {
     print(
-        \\usage: termite smoke <model-dir> <prompt> [--backend auto|onnx|native|metal|mlx|xla] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--prefill-chunk-size N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--inspect-only] [--no-chat-template]
+        \\usage: termite smoke <model-dir> <prompt> [--backend auto|onnx|native|metal|xla] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--prefill-chunk-size N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--inspect-only] [--no-chat-template]
         \\  Loads a native GGUF/SafeTensors model, prints GGUF tensor coverage, and runs one native generation pass.
         \\
     , .{});

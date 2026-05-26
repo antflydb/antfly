@@ -96,14 +96,14 @@ pub const Pipeline = struct {
         };
     }
 
-    pub fn usesDistributedMlx(self: *const Pipeline) bool {
+    pub fn usesDistributedGpuHosted(self: *const Pipeline) bool {
         return self.config.distributed.enabled and
             self.config.distributed.world_size > 1 and
-            self.cb.kind() == .mlx;
+            self.cb.kind() == .metal;
     }
 
-    pub fn usesTensorParallelMlx(self: *const Pipeline) bool {
-        return self.usesDistributedMlx() and self.config.distributed.mode == .tensor_parallel;
+    pub fn usesTensorParallelGpuHosted(self: *const Pipeline) bool {
+        return self.usesDistributedGpuHosted() and self.config.distributed.mode == .tensor_parallel;
     }
 
     pub fn encodeQueryText(self: *const Pipeline, query: []const u8) !EncodedSequence {

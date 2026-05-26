@@ -14,17 +14,17 @@ The biggest remaining parity gaps are:
 Additional native reranker status:
 
 - the base-model-backed native BERT/RoBERTa cross-encoder reranker path now has
-  distributed MLX tensor-parallel support and standalone verification for
+  distributed Metal tensor-parallel support and standalone verification for
   `bge-reranker-base`-style checkpoints
 - the current repeated-request in-process benchmark on that path shows:
   - BLAS warm average around `3056 ms`
-  - 2-rank MLX TP warm average around `297 ms`
+  - 2-rank Metal TP warm average around `297 ms`
   - score parity within the current verifier tolerance
 - the real `/api/rerank` server path is now also verified on the same native
   reranker path:
   - BLAS average around `3075 ms`
-  - 2-rank MLX TP average around `170 ms`
-  - 2-rank MLX TP warm average around `166 ms`
+  - 2-rank Metal TP average around `170 ms`
+  - 2-rank Metal TP warm average around `166 ms`
   - server-path score parity matches the standalone verifier, with score diff
     around `0.000261`
 
@@ -33,7 +33,7 @@ Additional native reranker status:
 ### Tested Here
 
 - `zig build test` previously passed on this tree after the GLiNER classifier/extractor work, the GLiNER/REBEL relation work, the native BERT-family classifier-head work, the generic native DeBERTa session work, and the native token-classifier session work for BERT/DeBERTa recognizers.
-- A rebuilt local Zig binary with `onnx=true`, `mlx=true`, and `native=true` was run against the real local Go registry at `../antfly/termite/registry/models`.
+- A rebuilt local Zig binary with `onnx=true`, `metal=true`, and `native=true` was run against the real local Go registry at `../antfly/termite/registry/models`.
 - Live E2E results against local models:
   - `e2e/termite/test_classify.py`: 3/3 passed
   - `e2e/termite/test_recognize.py`: 5/5 passed
@@ -55,22 +55,22 @@ Additional native reranker status:
 - A local native-only `safetensors` classifier was pulled with the Zig CLI:
   - `./zig-out/bin/termite pull hf:cross-encoder/nli-distilroberta-base:native --models-dir models/classifiers`
   - the resulting model was exercised through `/api/classify` with `models` as the server model root
-  - server logs confirmed the path fell through ONNX, selected `mlx`, and returned live classification scores from the native session
+  - server logs confirmed the path fell through ONNX, selected `metal`, and returned live classification scores from the native session
 - A local native-only `safetensors` DeBERTa classifier was also pulled with the Zig CLI:
   - `./zig-out/bin/termite pull hf:MoritzLaurer/mDeBERTa-v3-base-mnli-xnli:native --models-dir models/classifiers`
   - the resulting model was exercised through `/api/classify` with `models` as the server model root
-  - server logs confirmed the path fell through ONNX, selected `mlx`, and returned live classification scores from the native DeBERTa session
+  - server logs confirmed the path fell through ONNX, selected `metal`, and returned live classification scores from the native DeBERTa session
 - A local native-only `safetensors` BERT token-classifier recognizer was also pulled with the Zig CLI:
   - `./zig-out/bin/termite pull hf:dslim/bert-base-NER:native --models-dir models/recognizers`
   - the resulting model was exercised through `/api/recognize` with `models` as the server model root
-  - server logs confirmed the path fell through ONNX, selected `mlx`, and returned live entity spans from the native token-classifier session
+  - server logs confirmed the path fell through ONNX, selected `metal`, and returned live entity spans from the native token-classifier session
   - focused E2E coverage passed:
     - `TERMITE_URL=http://127.0.0.1:8097 uv run --project e2e/termite pytest -q e2e/termite/test_recognize.py -k native_safetensors_bert_token_classifier -rs`
     - result: `1 passed`
 - A local native-only `safetensors` DeBERTa token-classifier recognizer was also pulled with the Zig CLI:
   - `./zig-out/bin/termite pull hf:mukuls9971/pii-deberta-v3-xsmall:native --models-dir models/recognizers`
   - the resulting model was exercised through `/api/recognize` with `models` as the server model root
-  - server logs confirmed the path fell through ONNX, selected `mlx`, and returned live entity spans from the native DeBERTa token-classifier session
+  - server logs confirmed the path fell through ONNX, selected `metal`, and returned live entity spans from the native DeBERTa token-classifier session
   - this also validated two raw-Hugging-Face gaps:
     - `num_labels` inference from `id2label` / `label2id` when `config.json` omits `num_labels`
     - offset-aware `encodeForModel(...)` for `Unigram + Metaspace(split=true)` tokenizers

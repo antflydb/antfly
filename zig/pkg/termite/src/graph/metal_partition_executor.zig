@@ -5852,19 +5852,8 @@ fn deinitEmptyNativeWeightStore(weight_store: *native_compute.WeightStore, alloc
 }
 
 fn initEmptyMetalWeightStore(allocator: std.mem.Allocator) gpu_hosted_store_mod.WeightStore {
-    if (comptime build_options.enable_mlx) {
-        return .{
-            .allocator = allocator,
-            .resident_weights = .{},
-            .stream = .{},
-            .prefix = "",
-            .lazy_weights = .empty,
-        };
-    }
     return .{
         .allocator = allocator,
-        .resident_weights = {},
-        .stream = {},
         .prefix = "",
         .lazy_weights = .empty,
     };

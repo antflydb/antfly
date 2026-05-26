@@ -29,7 +29,7 @@ const document_data = @import("document_data.zig");
 const lora = @import("lora.zig");
 const neftune = @import("neftune.zig");
 const graph_bridge = @import("graph_bridge.zig");
-const blas_mod = @import("../ops/blas_compute.zig");
+const native_compute = @import("../ops/native_compute.zig");
 const ml = @import("ml");
 const optimizers = ml.graph.optimizers;
 
@@ -245,7 +245,7 @@ pub const SequenceTrainEvalOptions = struct {
     /// DDP rank of this process. Rank 0 is responsible for checkpoint writes.
     ddp_rank: u32 = 0,
     /// Optional compute backend for gradient computation.
-    /// If null, defaults to BLAS CPU. Pass an MLX backend for Metal GPU acceleration.
+    /// If null, defaults to native CPU math.
     compute_backend: ?*const ComputeBackend = null,
     /// NEFTune embedding-noise scale (Jain et al., NeurIPS 2023).
     /// 0.0 disables. Typical values: 5.0 - 15.0. Applied only during training,
@@ -312,20 +312,12 @@ pub const TokenTrainEvalOptions = struct {
     grad_accum_steps: u32 = 1,
     use_schedule_free: bool = false,
     /// Optional compute backend for gradient computation.
-    /// If null, defaults to BLAS CPU. Pass an MLX backend for Metal GPU acceleration.
+    /// If null, defaults to native CPU math.
     compute_backend: ?*const ComputeBackend = null,
-    /// MLX distributed group for DDP gradient averaging.
-    /// Obtain via mlx_mod.initDistributed() at process startup.
-    /// null = single-device training (default).
-    mlx_dist_group: if (build_options.enable_mlx) ?@import("../backends/mlx.zig").DistributedGroup else void =
-        if (build_options.enable_mlx) null else {},
-    /// Number of DDP replicas (world size). Must equal 1 when mlx_dist_group is null.
-    world_size: u32 = 1,
     /// DDP rank of this process. Rank 0 is responsible for checkpoint writes.
     ddp_rank: u32 = 0,
-    /// Pre-compiled PJRT gradient executors, one per LoRA layer (null = use CPU/MLX path).
+    /// Pre-compiled PJRT gradient executors, one per LoRA layer.
     /// Length must equal bundle.layers.len if non-null.
-    /// Note: PJRT is automatically disabled when world_size > 1 (no collective ops in PJRT path).
     pjrt_lora_steps: if (build_options.enable_pjrt) ?[]?graph_bridge.LoRAPjrtTrainStep else void =
         if (build_options.enable_pjrt) null else {},
     /// NEFTune embedding-noise scale (Jain et al., NeurIPS 2023).
@@ -889,8 +881,8 @@ pub fn trainLoRABundleOneStep(
 
     const a_before = l2Norm(layer.adapter_a);
     const b_before = l2Norm(layer.adapter_b);
-    var graph_weight_store = blas_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    var graph_compute = blas_mod.BlasCompute.init(allocator, &graph_weight_store, null);
+    var graph_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var graph_compute = native_compute.NativeCompute.init(allocator, &graph_weight_store, null);
     const graph_cb = graph_compute.computeBackend();
     var graph_optimizer_state = optimizers.OptimizerState.init(allocator);
     defer graph_optimizer_state.deinit();
@@ -1078,8 +1070,6 @@ pub fn trainEvalTokenLoRABundle(
             options.grad_accum_steps,
             options.use_schedule_free,
             options.compute_backend,
-            options.mlx_dist_group,
-            options.world_size,
             options.pjrt_lora_steps,
             options.neftune_alpha,
             &neftune_step,
@@ -2632,11 +2622,11 @@ fn trainSequenceEpoch(
         .{ .adamw = .{} };
     if (limit == 0 or head.num_labels < 2) return metrics;
 
-    // Use provided backend, or fall back to internal BlasCompute.
-    var blas_weight_store = blas_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    var blas_compute = blas_mod.BlasCompute.init(allocator, &blas_weight_store, null);
-    var blas_cb = blas_compute.computeBackend();
-    const graph_cb: *const ComputeBackend = provided_cb orelse &blas_cb;
+    // Use provided backend, or fall back to internal native compute.
+    var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var fallback_native = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    var native_cb = fallback_native.computeBackend();
+    const graph_cb: *const ComputeBackend = provided_cb orelse &native_cb;
     var graph_optimizer_state = optimizers.OptimizerState.init(allocator);
     defer graph_optimizer_state.deinit();
 
@@ -2775,8 +2765,6 @@ fn trainTokenEpoch(
     grad_accum_steps: u32,
     use_schedule_free: bool,
     provided_cb: ?*const ComputeBackend,
-    mlx_dist_group: if (build_options.enable_mlx) ?@import("../backends/mlx.zig").DistributedGroup else void,
-    world_size: u32,
     pjrt_lora_steps: if (build_options.enable_pjrt) ?[]?graph_bridge.LoRAPjrtTrainStep else void,
     neftune_alpha: f32,
     step_base: *u64,
@@ -2786,11 +2774,11 @@ fn trainTokenEpoch(
     const max_inner_steps: usize = 6;
     if (limit == 0 or head.num_labels < 2) return metrics;
 
-    // Use provided backend, or fall back to internal BlasCompute.
-    var blas_weight_store = blas_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    var blas_compute = blas_mod.BlasCompute.init(allocator, &blas_weight_store, null);
-    var blas_cb = blas_compute.computeBackend();
-    const graph_cb: *const ComputeBackend = provided_cb orelse &blas_cb;
+    // Use provided backend, or fall back to internal native compute.
+    var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var fallback_native = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    var native_cb = fallback_native.computeBackend();
+    const graph_cb: *const ComputeBackend = provided_cb orelse &native_cb;
     var graph_optimizer_state = optimizers.OptimizerState.init(allocator);
     defer graph_optimizer_state.deinit();
 
@@ -2968,29 +2956,26 @@ fn trainTokenEpoch(
                         const output_grads = try allocator.alloc(f32, head.hidden_size);
                         defer allocator.free(output_grads);
                         for (output_grads, grad_hidden) |*dst, grad| dst.* = grad * scale;
-                        // Try PJRT path first; fall back to CPU/MLX on error or when disabled.
-                        // PJRT is skipped when world_size > 1: no collective ops in PJRT path.
+                        // Try PJRT path first; fall back to CPU on error or when disabled.
                         var used_pjrt_lora = false;
                         if (comptime build_options.enable_pjrt) {
-                            if (world_size <= 1) {
-                                if (pjrt_lora_steps) |pjrt_steps| {
-                                    if (pjrt_steps[layer_idx]) |*pjrt_step| {
-                                        if (graph_bridge.computeLoRALinearGradsWithPjrt(
-                                            allocator,
-                                            pjrt_step,
-                                            layer.base_weight,
-                                            layer.adapter_a,
-                                            layer.adapter_b,
-                                            hidden,
-                                            output_grads,
-                                        )) |grads| {
-                                            defer allocator.free(grads.grad_a);
-                                            defer allocator.free(grads.grad_b);
-                                            for (grad_a, grads.grad_a) |*acc, g| acc.* += g;
-                                            for (grad_b, grads.grad_b) |*acc, g| acc.* += g;
-                                            used_pjrt_lora = true;
-                                        } else |_| {}
-                                    }
+                            if (pjrt_lora_steps) |pjrt_steps| {
+                                if (pjrt_steps[layer_idx]) |*pjrt_step| {
+                                    if (graph_bridge.computeLoRALinearGradsWithPjrt(
+                                        allocator,
+                                        pjrt_step,
+                                        layer.base_weight,
+                                        layer.adapter_a,
+                                        layer.adapter_b,
+                                        hidden,
+                                        output_grads,
+                                    )) |grads| {
+                                        defer allocator.free(grads.grad_a);
+                                        defer allocator.free(grads.grad_b);
+                                        for (grad_a, grads.grad_a) |*acc, g| acc.* += g;
+                                        for (grad_b, grads.grad_b) |*acc, g| acc.* += g;
+                                        used_pjrt_lora = true;
+                                    } else |_| {}
                                 }
                             }
                         }
@@ -3093,25 +3078,7 @@ fn trainTokenEpoch(
         if (final_example_all_correct) metrics.exact_match_accuracy += 1.0;
         accum_doc_count += 1;
         if (accum_doc_count % grad_accum_steps == 0 or is_last_example) {
-            // Distributed DDP: allReduce gradient buffers across all replicas.
-            if (comptime build_options.enable_mlx) {
-                if (mlx_dist_group) |group| {
-                    const mlx_mod = @import("../backends/mlx.zig");
-                    const stream_handle = mlx_mod.openDefaultStream();
-                    defer stream_handle.deinit();
-                    for (bundle.layers, 0..) |_, idx| {
-                        if (accum_grad_a[idx]) |acc| {
-                            if (acc.len > 0) try mlx_mod.allSumFloat32InPlaceOnStream(acc, stream_handle.stream, group);
-                        }
-                        if (accum_grad_b[idx]) |acc| {
-                            if (acc.len > 0) try mlx_mod.allSumFloat32InPlaceOnStream(acc, stream_handle.stream, group);
-                        }
-                    }
-                }
-            }
-            // Normalize accumulated grads by grad_accum_steps and world size, then apply optimizer
-            const eff_world_size: u32 = if (comptime build_options.enable_mlx) world_size else 1;
-            const inv_accum: f32 = 1.0 / (@as(f32, @floatFromInt(grad_accum_steps)) * @as(f32, @floatFromInt(eff_world_size)));
+            const inv_accum: f32 = 1.0 / @as(f32, @floatFromInt(grad_accum_steps));
             for (bundle.layers, 0..) |*layer, idx| {
                 if (accum_grad_a[idx]) |acc| for (acc) |*g| {
                     g.* *= inv_accum;

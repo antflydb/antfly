@@ -31,7 +31,6 @@ pub const SessionPool = session_pool.SessionPool;
 pub const onnx = if (build_options.enable_onnx) @import("onnx.zig") else struct {};
 pub const ortgenai = if (build_options.enable_onnx) @import("ortgenai.zig") else struct {};
 pub const imported_onnx_session = @import("imported_onnx_session.zig");
-pub const mlx = if (build_options.enable_mlx) @import("mlx.zig") else struct {};
 pub const metal_kv_storage = if (build_options.enable_metal) @import("metal_kv_storage.zig") else struct {};
 
 const session_factory = @import("../architectures/session_factory.zig");
@@ -40,7 +39,6 @@ pub const BackendType = enum {
     native,
     onnx,
     metal,
-    mlx,
     cuda,
     pjrt,
     wasm,
@@ -50,7 +48,6 @@ pub const BackendType = enum {
             .native => build_options.enable_native,
             .onnx => true,
             .metal => build_options.enable_metal,
-            .mlx => build_options.enable_mlx,
             .cuda => build_options.enable_cuda,
             .pjrt => build_options.enable_pjrt,
             .wasm => build_options.enable_wasm,
@@ -61,7 +58,6 @@ pub const BackendType = enum {
         return switch (self) {
             .onnx => 10,
             .metal => 15,
-            .mlx => 20,
             .cuda => 25,
             .pjrt => 35,
             .wasm => 50,
@@ -71,7 +67,7 @@ pub const BackendType = enum {
 
     pub fn usesGpuHostedSession(self: BackendType) bool {
         return switch (self) {
-            .metal, .mlx, .cuda => true,
+            .metal, .cuda => true,
             else => false,
         };
     }
@@ -79,7 +75,7 @@ pub const BackendType = enum {
     /// Whether SessionManager.loadModel can create a Session directly for this backend.
     pub fn supportsDirectSessionLoad(self: BackendType) bool {
         return switch (self) {
-            .native, .onnx, .metal, .mlx, .cuda, .wasm => true,
+            .native, .onnx, .metal, .cuda, .wasm => true,
             .pjrt => false,
         };
     }
@@ -172,18 +168,6 @@ pub const SessionManager = struct {
                     }
                 else
                     continue,
-                .mlx => if (isOnnxFilePath(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .mlx, shared_backend_ctx) catch |err| {
-                        std.log.err("imported onnx MLX session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
-                        continue;
-                    }
-                else if (build_options.enable_mlx)
-                    session_factory.createMlxSession(self.allocator, model_path) catch |err| {
-                        std.log.err("MLX session create failed for {s}: {s}", .{ model_path, @errorName(err) });
-                        continue;
-                    }
-                else
-                    continue,
                 .cuda => if (isOnnxFilePath(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .cuda, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx CUDA session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
@@ -215,7 +199,7 @@ pub const SessionManager = struct {
                     continue,
                 .pjrt => continue,
             };
-            // For sessions produced by session_factory (native/Metal/MLX
+            // For sessions produced by session_factory (native/Metal
             // direct loads -- not the imported_onnx path which already
             // received options.io), attach the SessionManager's Io now so
             // matmul work composes with the caller's runtime.  attachIo
@@ -265,14 +249,13 @@ fn configuredPreferredBackends() []const BackendType {
         return switch (backend) {
             .onnx => &.{.onnx},
             .metal => if (build_options.enable_metal) &.{.metal} else &.{.native},
-            .mlx => if (build_options.enable_mlx) &.{.mlx} else &.{.native},
             .cuda => if (build_options.enable_cuda) &.{.cuda} else &.{.native},
-            .pjrt => if (build_options.enable_pjrt) &.{ .pjrt, .onnx, .metal, .mlx, .native } else &.{ .onnx, .metal, .mlx, .native },
+            .pjrt => if (build_options.enable_pjrt) &.{ .pjrt, .onnx, .metal, .native } else &.{ .onnx, .metal, .native },
             .native => &.{.native},
-            .wasm => &.{ .onnx, .metal, .mlx, .native },
+            .wasm => &.{ .onnx, .metal, .native },
         };
     }
-    return &.{ .onnx, .metal, .mlx, .native };
+    return &.{ .onnx, .metal, .native };
 }
 
 fn defaultImportedOnnxBackend() BackendType {
@@ -316,30 +299,29 @@ fn preferredBackendOverride() ?BackendType {
     if (std.ascii.eqlIgnoreCase(slice, "onnx")) return .onnx;
     if (std.ascii.eqlIgnoreCase(slice, "metal")) return .metal;
     if (std.ascii.eqlIgnoreCase(slice, "pjrt")) return .pjrt;
-    if (std.ascii.eqlIgnoreCase(slice, "mlx")) return .mlx;
     if (std.ascii.eqlIgnoreCase(slice, "cuda")) return .cuda;
     if (std.ascii.eqlIgnoreCase(slice, "native")) return .native;
     return null;
 }
 
-fn mlxEagerDenseMaxBytes() u64 {
+fn gpuEagerDenseMaxBytes() u64 {
     if (build_options.enable_wasm or !build_options.link_libc) return 1024 * 1024 * 1024;
-    const value = std.c.getenv("TERMITE_MLX_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
+    const value = std.c.getenv("TERMITE_GPU_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
     const slice = std.mem.span(value);
     const mb = std.fmt.parseInt(u64, slice, 10) catch return 1024 * 1024 * 1024;
     return mb * 1024 * 1024;
 }
 
-fn shouldPreferBlasBeforeMlxForBytes(total_bytes: u64, max_eager_dense_bytes: u64) bool {
+fn shouldPreferBlasBeforeGpuForBytes(total_bytes: u64, max_eager_dense_bytes: u64) bool {
     return total_bytes == 0 or total_bytes > max_eager_dense_bytes;
 }
 
-fn shouldPreferBlasBeforeMlx(allocator: std.mem.Allocator, manifest: ?manifest_mod.ModelManifest) bool {
+fn shouldPreferBlasBeforeGpu(allocator: std.mem.Allocator, manifest: ?manifest_mod.ModelManifest) bool {
     if (build_options.enable_wasm) return false;
     const man = manifest orelse return false;
     const gguf_path = man.gguf_path orelse return false;
     const total_bytes = c_file.fileSize(allocator, gguf_path) catch return true;
-    return shouldPreferBlasBeforeMlxForBytes(total_bytes, mlxEagerDenseMaxBytes());
+    return shouldPreferBlasBeforeGpuForBytes(total_bytes, gpuEagerDenseMaxBytes());
 }
 
 fn shouldPreferNativeTextEncoder(man: manifest_mod.ModelManifest) bool {
@@ -359,32 +341,32 @@ fn effectiveBackendOrder(
     preferred: []const BackendType,
     manifest: ?manifest_mod.ModelManifest,
 ) []const BackendType {
-    const prefer_blas_before_mlx = shouldPreferBlasBeforeMlx(allocator, manifest);
+    const prefer_blas_before_gpu = shouldPreferBlasBeforeGpu(allocator, manifest);
     if (manifest) |man| {
         if (shouldPreferNativeTextEncoder(man)) {
             return reorderNativeAheadOfOnnx(scratch, preferred, true);
         }
         if (man.native_arch_hint == .layoutlmv3 and man.safetensors_path != null) {
-            return reorderNativeAheadOfOnnx(scratch, preferred, prefer_blas_before_mlx);
+            return reorderNativeAheadOfOnnx(scratch, preferred, prefer_blas_before_gpu);
         }
     }
-    return effectiveBackendOrderForPreference(scratch, preferred, prefer_blas_before_mlx);
+    return effectiveBackendOrderForPreference(scratch, preferred, prefer_blas_before_gpu);
 }
 
 fn effectiveBackendOrderForPreference(
     scratch: *[4]BackendType,
     preferred: []const BackendType,
-    prefer_blas_before_mlx: bool,
+    prefer_blas_before_gpu: bool,
 ) []const BackendType {
-    if (!prefer_blas_before_mlx) return preferred;
+    if (!prefer_blas_before_gpu) return preferred;
 
-    var has_mlx = false;
+    var has_gpu = false;
     var has_blas = false;
     for (preferred) |backend| {
-        has_mlx = has_mlx or backend.usesGpuHostedSession();
+        has_gpu = has_gpu or backend.usesGpuHostedSession();
         has_blas = has_blas or backend == .native;
     }
-    if (!has_mlx or !has_blas) return preferred;
+    if (!has_gpu or !has_blas) return preferred;
 
     var idx: usize = 0;
 
@@ -406,10 +388,10 @@ fn effectiveBackendOrderForPreference(
 fn reorderNativeAheadOfOnnx(
     scratch: *[4]BackendType,
     preferred: []const BackendType,
-    prefer_blas_before_mlx: bool,
+    prefer_blas_before_gpu: bool,
 ) []const BackendType {
     var idx: usize = 0;
-    if (prefer_blas_before_mlx) {
+    if (prefer_blas_before_gpu) {
         for (preferred) |backend| {
             if (backend == .native) {
                 scratch[idx] = backend;
@@ -444,33 +426,30 @@ test {
     _ = native;
     _ = activations;
     _ = session_factory;
-    if (build_options.enable_mlx) {
-        _ = mlx;
-    }
     _ = imported_onnx_session;
 }
 
-test "shouldPreferBlasBeforeMlxForBytes prefers native only above eager dense threshold" {
-    try std.testing.expect(shouldPreferBlasBeforeMlxForBytes(2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024));
-    try std.testing.expect(!shouldPreferBlasBeforeMlxForBytes(256 * 1024 * 1024, 1024 * 1024 * 1024));
+test "shouldPreferBlasBeforeGpuForBytes prefers native only above eager dense threshold" {
+    try std.testing.expect(shouldPreferBlasBeforeGpuForBytes(2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024));
+    try std.testing.expect(!shouldPreferBlasBeforeGpuForBytes(256 * 1024 * 1024, 1024 * 1024 * 1024));
 }
 
-test "effective backend order prefers native before mlx for large gguf generators" {
-    const preferred = [_]BackendType{ .onnx, .metal, .mlx, .native };
+test "effective backend order prefers native before gpu for large gguf generators" {
+    const preferred = [_]BackendType{ .onnx, .metal, .native };
     var scratch: [4]BackendType = undefined;
     const effective = effectiveBackendOrderForPreference(&scratch, &preferred, true);
-    try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .native, .metal, .mlx }, effective);
+    try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .native, .metal }, effective);
 }
 
-test "effective backend order preserves mlx preference for small gguf generators" {
-    const preferred = [_]BackendType{ .onnx, .metal, .mlx, .native };
+test "effective backend order preserves gpu preference for small gguf generators" {
+    const preferred = [_]BackendType{ .onnx, .metal, .native };
     var scratch: [4]BackendType = undefined;
     const effective = effectiveBackendOrderForPreference(&scratch, &preferred, false);
     try std.testing.expectEqualSlices(BackendType, &preferred, effective);
 }
 
 test "effective backend order preserves order for non-gguf models" {
-    const preferred = [_]BackendType{ .onnx, .metal, .mlx, .native };
+    const preferred = [_]BackendType{ .onnx, .metal, .native };
     var scratch: [4]BackendType = undefined;
     const manifest: manifest_mod.ModelManifest = .{
         .allocator = std.testing.allocator,
@@ -482,7 +461,7 @@ test "effective backend order preserves order for non-gguf models" {
 }
 
 test "effective backend order prefers native layoutlmv3 before onnx" {
-    const preferred = [_]BackendType{ .onnx, .metal, .mlx, .native };
+    const preferred = [_]BackendType{ .onnx, .metal, .native };
     var scratch: [4]BackendType = undefined;
     const manifest: manifest_mod.ModelManifest = .{
         .allocator = std.testing.allocator,
@@ -490,5 +469,5 @@ test "effective backend order prefers native layoutlmv3 before onnx" {
         .safetensors_path = "dummy",
     };
     const effective = effectiveBackendOrder(std.testing.allocator, &scratch, &preferred, manifest);
-    try std.testing.expectEqualSlices(BackendType, &.{ .metal, .mlx, .native, .onnx }, effective);
+    try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native, .onnx }, effective);
 }

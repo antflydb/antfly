@@ -112,14 +112,14 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
 
 fn parseBackendChoice(value: []const u8) ?reranker_head.BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
+    if (std.mem.eql(u8, value, "native")) return .native;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
     return null;
 }
 
 fn usage() error{InvalidArguments}!void {
     print(
-        \\usage: train-eval-reranker-lora-top-layer-cached-surrogate <model-dir> <adapter-dir> <head-dir-or-file> <train-top-layer-cache-json> <eval-top-layer-cache-json> <out-dir> [--backend auto|blas|mlx] [--max-examples N] [--epochs N] [--learning-rate LR] [--layer-name NAME]
+        \\usage: train-eval-reranker-lora-top-layer-cached-surrogate <model-dir> <adapter-dir> <head-dir-or-file> <train-top-layer-cache-json> <eval-top-layer-cache-json> <out-dir> [--backend auto|native] [--max-examples N] [--epochs N] [--learning-rate LR] [--layer-name NAME]
         \\note: for BERT/RoBERTa families, omitting --layer-name uses the exact cached full replayed top-layer block path when available; passing --layer-name keeps single-layer targeting.
         \\example: train-eval-reranker-lora-top-layer-cached-surrogate /tmp/bge-reranker /tmp/adapter /tmp/head /tmp/train_top_cache.json /tmp/eval_top_cache.json /tmp/out --epochs 2 --learning-rate 0.0005
         \\

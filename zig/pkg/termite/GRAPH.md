@@ -23,7 +23,7 @@ trace → Pipeline.default(fold, fuse, cse) → cache → interpreter.execute()
 1. **Tracing**: Model forward pass runs against `TracingCompute`, recording ops into a DAG (`lib/ml/src/graph/graph.zig`). Each node stores an `OpCode` (primitive or fused), input edges, output shape, and optional attributes.
 2. **Optimization**: Compiler passes transform the graph before execution.
 3. **Caching**: `src/graph/cache.zig` stores optimized graphs in an LRU cache (32 entries) keyed by `(config_hash, batch, seq_len, attention_mode)`. Weight tensors and reachability analysis are materialized on first execution and cached alongside the graph.
-4. **Execution**: `src/graph/interpreter.zig` walks the DAG in topological order, dispatching each node to a `ComputeBackend` (BLAS, MLX, etc.). Intermediate tensors are freed based on precomputed last-use analysis.
+4. **Execution**: `src/graph/interpreter.zig` walks the DAG in topological order, dispatching each node to a `ComputeBackend` (BLAS, Metal, etc.). Intermediate tensors are freed based on precomputed last-use analysis.
 
 ## Generic Static Graph Runtime
 
@@ -117,7 +117,7 @@ Imported ONNX sessions now use a ref-counted backend context. When a loaded
 model opens sidecar sessions for compatible ONNX phases, those sidecars retain
 the main session's context. This makes resident value passing safe for GPU
 backends too: `runResidentInputs` still requires exact backend identity, but
-Metal/MLX sidecars can satisfy that requirement by sharing the same backend
+Metal sidecars can satisfy that requirement by sharing the same backend
 context instead of constructing independent contexts. Long term, broader
 multimodal fusion should build on this shared-context model rather than
 weakening resident tensor validation.
@@ -211,7 +211,7 @@ text runs `1/4/16/32`, image and audio run `1/4/16`. `--compare-quant` emits a
 dense baseline row and a quantized candidate row for each target/batch pair.
 
 ```sh
-zig build bench-clipclap-native -Donnx=false -Dmlx=false -Dmetal=false -- \
+zig build bench-clipclap-native -Donnx=false -Dmetal=false -- \
   --matrix --compare-quant --quant q5_k --warmup-iters 3 --measure-iters 15 \
   --format csv
 ```
@@ -228,7 +228,7 @@ checks; promotion gates should use representative model dimensions.
 
 ```sh
 zig build bench-clipclap-native -Denable-native-quant-dispatch-stats=true \
-  -Donnx=false -Dmlx=false -Dmetal=false -- \
+  -Donnx=false -Dmetal=false -- \
   --target clip_text --batch 1 --clip-text-layers 1 --quant q5_k \
   --warmup-iters 1 --measure-iters 5 --format csv
 ```
@@ -240,7 +240,7 @@ the rows share the same synthetic model dimensions and random seed.
 
 ```sh
 zig build bench-clipclap-native -Denable-native-quant-dispatch-stats=true \
-  -Donnx=false -Dmlx=false -Dmetal=false -- \
+  -Donnx=false -Dmetal=false -- \
   --target clip_text --batch 1 --clip-text-layers 1 --quant q5_k \
   --compare-dispatch --warmup-iters 1 --measure-iters 5 --format csv
 ```
@@ -251,7 +251,7 @@ dense-dequant-plus-SGEMM timings for each supported quant/shape pair and skips
 K-block formats whose block width does not divide the candidate input width.
 
 ```sh
-zig build bench-clipclap-kernels -Donnx=false -Dmlx=false -Dmetal=false -- \
+zig build bench-clipclap-kernels -Donnx=false -Dmetal=false -- \
   --only-clipclap-quant-policy --warmup-iters 1 --measure-iters 5
 ```
 
@@ -302,8 +302,8 @@ Termite now treats graph execution as two layers:
 
 The `ComputeBackend` vtable (`src/ops/ops.zig`) abstracts tensor operations. Host backends implement fused ops for inference and optional primitive ops for training:
 
-- **BLAS / native** (`src/ops/blas_compute.zig`, `src/ops/native_compute.zig`): CPU backend using Accelerate/OpenBLAS and native helpers. Supports quantized weight formats (Q2_K through Q8_K, Q4_0, Q5_0).
-- **MLX** (`src/ops/mlx_compute.zig`): Apple GPU backend via MLX C API. Fused ops only (training primitives not yet implemented).
+- **BLAS / native** (`src/ops/native_compute.zig`, `src/ops/native_compute.zig`): CPU backend using Accelerate/OpenBLAS and native helpers. Supports quantized weight formats (Q2_K through Q8_K, Q4_0, Q5_0).
+- **Metal** (`src/ops/metal_compute.zig`): Apple GPU backend via Metal C API. Fused ops only (training primitives not yet implemented).
 
 ### Compiled graph backends
 
@@ -418,7 +418,7 @@ Closure artifacts must preserve the same runtime ABI as the full graph for state
 | `src/native_compile.zig` | Offline artifact compiler CLI |
 | `src/native_run_artifact.zig` | Offline artifact runner / validator CLI |
 | `src/ops/ops.zig` | ComputeBackend vtable definition |
-| `src/ops/blas_compute.zig` | CPU/BLAS backend implementation |
+| `src/ops/native_compute.zig` | Native CPU backend implementation |
 | `src/pipelines/generation.zig` | Generation pipeline with graph caching |
 
 ## Decisions
@@ -426,7 +426,7 @@ Closure artifacts must preserve the same runtime ABI as the full graph for state
 These are the current graph/backend architecture decisions:
 
 1. Host backends and compiled backends are different layers.
-   - `native` / `mlx` are host execution backends.
+   - `native` / `metal` are host execution backends.
    - `onnx` / `pjrt` are compiled graph backends.
 
 2. Compiled backends should move toward offline compile + load-only runtime.

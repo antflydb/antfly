@@ -493,12 +493,12 @@ pub fn estimateGptGeneration(
         .kv_bytes = kv_bytes,
         .kv_tier = switch (backend) {
             .native => .host,
-            .metal, .mlx, .cuda => .backend,
+            .metal, .cuda => .backend,
         },
         .scratch_bytes = scratch_bytes,
         .scratch_tier = switch (backend) {
             .native => .host,
-            .metal, .mlx, .cuda => .backend,
+            .metal, .cuda => .backend,
         },
     };
 }
@@ -572,18 +572,18 @@ test "gpt generation estimate accounts for sliding window and page alignment" {
         .position_encoding = .rope,
     };
 
-    const estimate = estimateGptGeneration(.mlx, .f16, cfg, 100, 10, 64);
+    const estimate = estimateGptGeneration(.metal, .f16, cfg, 100, 10, 64);
     try std.testing.expectEqual(@as(usize, 110), estimate.retained_tokens);
     try std.testing.expectEqual(@as(usize, 112), estimate.kv_bytes / (32 * 8 * 128 * 2 * 2));
     try std.testing.expectEqual(ResidencyTier.backend, estimate.kv_tier);
     try std.testing.expect(estimate.scratch_bytes > 0);
 
     // int8: bytesForTokenRow(8, 128) = 1024 + 8*4 = 1056
-    const est_int8 = estimateGptGeneration(.mlx, .int8, cfg, 100, 10, 64);
+    const est_int8 = estimateGptGeneration(.metal, .int8, cfg, 100, 10, 64);
     try std.testing.expectEqual(@as(usize, 112 * 32 * 1056 * 2), est_int8.kv_bytes);
 
     // int4: bytesForTokenRow(8, 128) = ceil(1024/32)*18 = 32*18 = 576
-    const est_int4 = estimateGptGeneration(.mlx, .int4, cfg, 100, 10, 64);
+    const est_int4 = estimateGptGeneration(.metal, .int4, cfg, 100, 10, 64);
     try std.testing.expectEqual(@as(usize, 112 * 32 * 576 * 2), est_int4.kv_bytes);
 }
 

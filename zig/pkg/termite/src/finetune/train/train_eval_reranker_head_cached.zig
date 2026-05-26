@@ -98,15 +98,15 @@ pub fn main(init: std.process.Init) !void {
 
 fn parseBackendChoice(value: []const u8) ?reranker_head.BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
+    if (std.mem.eql(u8, value, "native")) return .native;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
     return null;
 }
 
 fn usage() error{InvalidArguments}!void {
     print(
-        \\usage: train-eval-reranker-head-cached <model-dir> <train-cache-json> <eval-cache-json> <out-dir> [--backend auto|blas|mlx] [--max-examples N] [--epochs N] [--learning-rate LR]
-        \\example: train-eval-reranker-head-cached /tmp/bge-reranker /tmp/train_cache.json /tmp/eval_cache.json /tmp/out --backend mlx --epochs 2 --learning-rate 0.0005
+        \\usage: train-eval-reranker-head-cached <model-dir> <train-cache-json> <eval-cache-json> <out-dir> [--backend auto|native] [--max-examples N] [--epochs N] [--learning-rate LR]
+        \\example: train-eval-reranker-head-cached /tmp/bge-reranker /tmp/train_cache.json /tmp/eval_cache.json /tmp/out --backend native --epochs 2 --learning-rate 0.0005
         \\
     , .{});
     return error.InvalidArguments;

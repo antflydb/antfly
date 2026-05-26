@@ -17,13 +17,11 @@ class TermiteBackendCapabilities:
     Attributes:
         native (bool | Unset): Whether the native CPU backend is built into this runtime Example: True.
         onnx (bool | Unset): Whether the ONNX Runtime backend is built into this runtime
-        mlx (bool | Unset): Whether the MLX backend is built into this runtime Example: True.
         wasm (bool | Unset): Whether the WASM backend is built into this runtime
     """
 
     native: bool | Unset = UNSET
     onnx: bool | Unset = UNSET
-    mlx: bool | Unset = UNSET
     wasm: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -31,8 +29,6 @@ class TermiteBackendCapabilities:
         native = self.native
 
         onnx = self.onnx
-
-        mlx = self.mlx
 
         wasm = self.wasm
 
@@ -43,8 +39,6 @@ class TermiteBackendCapabilities:
             field_dict["native"] = native
         if onnx is not UNSET:
             field_dict["onnx"] = onnx
-        if mlx is not UNSET:
-            field_dict["mlx"] = mlx
         if wasm is not UNSET:
             field_dict["wasm"] = wasm
 
@@ -57,14 +51,11 @@ class TermiteBackendCapabilities:
 
         onnx = d.pop("onnx", UNSET)
 
-        mlx = d.pop("mlx", UNSET)
-
         wasm = d.pop("wasm", UNSET)
 
         termite_backend_capabilities = cls(
             native=native,
             onnx=onnx,
-            mlx=mlx,
             wasm=wasm,
         )
 

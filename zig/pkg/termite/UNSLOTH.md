@@ -114,7 +114,7 @@ is `blk.1.ffn_gate_up_exps.weight` with shape `[2816, 1408, 128]`.
   full dequantize, row dequantize, dense linear fallback, and packed-expert
   packed-row fallback.
 - [ ] Ensure every hot path has fast backend support where practical:
-  native direct matmul, MLX device-native linear, MLX grouped MoE, and optional
+  native direct matmul, Metal device-native linear, Metal grouped MoE, and optional
   WebGPU dispatch.
 - [ ] Run and record the real text smoke for
   `unsloth/gemma-4-26B-A4B-it-GGUF:gguf:UD-Q4_K_M` using the recipe below.
@@ -160,7 +160,7 @@ termite smoke ~/.termite/models/unsloth/gemma-4-26B-A4B-it-GGUF "hello" --max-to
 The default backend is `auto`. Do not force `--backend native` for the normal
 smoke; `auto` uses the best compiled backend available and is the closest path
 to how users run the model. Use `--backend native` only when intentionally
-validating CPU fallback behavior, and use `--backend metal` or `--backend mlx`
+validating CPU fallback behavior, and use `--backend metal` or `--backend metal`
 when isolating those backend-specific paths.
 
 For the 26B `UD-Q4_K_M` artifact, the local Metal smoke needs an explicit
@@ -207,7 +207,7 @@ Keep the fallback path conservative:
 1. Parse GGUF tensor type and block size.
 2. Dequantize full tensors and individual rows correctly.
 3. Execute quantized linear directly on CPU for correctness and memory safety.
-4. Add MLX/Metal and WebGPU kernels only after the CPU path is verified.
+4. Add Metal and WebGPU kernels only after the CPU path is verified.
 
 For Gemma 4 26B A4B, packed MoE behavior is part of correctness. Densifying
 packed expert tensors can make the model appear supported while exceeding the

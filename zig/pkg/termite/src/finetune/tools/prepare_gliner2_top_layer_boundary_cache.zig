@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
     const entity_types_csv = args.next() orelse return usageError();
     const out_path = args.next() orelse return usageError();
     const split = args.next();
-    const backend_arg = args.next() orelse "blas";
+    const backend_arg = args.next() orelse "native";
     const max_examples_arg = args.next() orelse "128";
     const max_length_arg = args.next() orelse "256";
     const max_span_width_arg = args.next() orelse "8";
@@ -92,8 +92,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn parseBackend(value: []const u8) !reranker.BackendChoice {
-    if (std.mem.eql(u8, value, "blas")) return .native;
-    if (std.mem.eql(u8, value, "mlx")) return .mlx;
+    if (std.mem.eql(u8, value, "native")) return .native;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "auto")) return .auto;
     return error.InvalidBackend;
 }
@@ -117,7 +117,7 @@ fn parseCsv(allocator: std.mem.Allocator, value: []const u8) ![][]const u8 {
 fn usageError() error{InvalidArguments} {
     std.debug.print(
         \\usage: prepare-gliner2-top-layer-boundary-cache <model_dir> <jsonl_or_dir> <entity_types_csv> <out_json> [split] [backend] [max_examples] [max_length] [max_span_width] [top_layer_count]
-        \\example: prepare-gliner2-top-layer-boundary-cache /tmp/gliner2_base /tmp/train person,organization,location /tmp/gliner2_boundary.json train blas 128 256 8 1
+        \\example: prepare-gliner2-top-layer-boundary-cache /tmp/gliner2_base /tmp/train person,organization,location /tmp/gliner2_boundary.json train native 128 256 8 1
         \\
     , .{});
     return error.InvalidArguments;

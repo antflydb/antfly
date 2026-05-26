@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Speech2Seq audio transcription pipeline (Whisper via ONNX or native/MLX).
+// Speech2Seq audio transcription pipeline (Whisper via ONNX or native).
 //
 // Architecture: audio preprocessing → encoder → text decoder.
 // Converts audio to text using Whisper-style models.
 //
 // Required model files:
-//   - encoder_model.onnx (or via native/MLX architectures)
+//   - encoder_model.onnx (or via native architectures)
 //   - decoder_model.onnx
 //   - tokenizer.json
 //   - config.json (model_type: whisper)

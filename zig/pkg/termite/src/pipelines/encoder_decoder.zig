@@ -55,7 +55,7 @@ pub const EncoderDecoderResult = struct {
 };
 
 /// Encoder-decoder pipeline that orchestrates encode → decode → generate.
-/// Backend-agnostic: works with any pair of Sessions (ONNX, native, MLX).
+/// Backend-agnostic: works with any pair of Sessions (ONNX, native).
 pub const EncoderDecoderPipeline = struct {
     allocator: std.mem.Allocator,
     encoder: backends.Session,

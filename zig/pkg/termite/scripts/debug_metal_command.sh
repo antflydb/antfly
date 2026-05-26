@@ -722,7 +722,7 @@ run_unit_filter() {
       fi
       filter_expr+="$escaped"
     done
-    run_capture zig build test -Dmetal=true -Dmlx=false -- --test-filter "$filter_expr" || status=$?
+    run_capture zig build test -Dmetal=true -- --test-filter "$filter_expr" || status=$?
   fi
   RUNTIME_CURRENT_FILE="$previous_runtime_current_file"
   RUNTIME_TRACE_FILE="$previous_runtime_trace_file"
@@ -780,7 +780,7 @@ prebuild_unit_test_binary() {
   RUN_CWD="$PKG_DIR"
   WATCH_PATTERN=""
   local prebuild_status=0
-  run_capture zig build test-bin -Dmetal=true -Dmlx=false -Druntime-test-filter=true || prebuild_status=$?
+  run_capture zig build test-bin -Dmetal=true -Druntime-test-filter=true || prebuild_status=$?
   if [[ "$prebuild_status" -ne 0 ]]; then
     return "$prebuild_status"
   fi
@@ -1141,7 +1141,7 @@ EOF
     else
       local prebuild_label="prebuild unit test binary"
       write_marker_file "$current_file" "$prebuild_label"
-      write_current_manifest "zig build test-bin -Dmetal=true -Dmlx=false -Druntime-test-filter=true"
+      write_current_manifest "zig build test-bin -Dmetal=true -Druntime-test-filter=true"
       write_progress "RUNNING" "$prebuild_label"
       local prebuild_status=0
       prebuild_unit_test_binary "$unit_out_dir" || prebuild_status=$?

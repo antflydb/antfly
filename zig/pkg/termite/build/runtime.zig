@@ -22,8 +22,6 @@ pub const FfmpegPaths = struct {
 pub const BackendOptions = struct {
     enable_onnx: bool = false,
     onnx_root: []const u8 = "onnxruntime/unknown-unknown",
-    enable_mlx: bool = false,
-    mlx_root: ?[]const u8 = null,
     enable_metal: bool = false,
     enable_cuda: bool = false,
     cuda_artifacts: []const u8 = "portable",
@@ -412,7 +410,6 @@ fn addAudioOpenCorpusBuildOptions(b: *std.Build, backend: BackendOptions) *std.B
 
 fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) void {
     options.addOption(bool, "enable_onnx", backend.enable_onnx);
-    options.addOption(bool, "enable_mlx", backend.enable_mlx);
     options.addOption(bool, "enable_metal", backend.enable_metal);
     options.addOption(bool, "enable_cuda", backend.enable_cuda);
     options.addOption([]const u8, "cuda_artifacts", backend.cuda_artifacts);
@@ -598,7 +595,6 @@ fn configureRuntimeLinks(
     }
     configureOnnxRuntime(b, module, backend.enable_onnx, backend.onnx_root);
     configureMetal(b, module, target, backend.enable_metal, paths);
-    configureMlx(b, module, target, backend.enable_mlx, backend.mlx_root);
     if (backend.ffmpeg_paths) |ffmpeg_paths| {
         module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
         module.addLibraryPath(.{ .cwd_relative = ffmpeg_paths.lib_dir });
@@ -656,21 +652,6 @@ pub fn configureMetal(
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
     module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.termite_root, "src/backends/metal_kernels.m")), .flags = &.{"-fobjc-arc"} });
-}
-
-pub fn configureMlx(
-    b: *std.Build,
-    module: *std.Build.Module,
-    target: std.Build.ResolvedTarget,
-    enable_mlx: bool,
-    mlx_root: ?[]const u8,
-) void {
-    if (!enable_mlx or target.result.os.tag != .macos) return;
-    if (mlx_root) |root| {
-        module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
-        module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
-    }
-    module.linkSystemLibrary("mlxc", .{});
 }
 
 fn pathExists(b: *std.Build, path: []const u8) bool {
