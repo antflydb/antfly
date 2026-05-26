@@ -328,8 +328,9 @@ const DiscoveredModelListing = struct {
         self.manifest.deinit();
     }
 
-    fn kindName(self: @This()) []const u8 {
-        return @tagName(self.entry.kind);
+    fn listingKindName(self: @This()) []const u8 {
+        if (self.entry.kind == .extractor) return @tagName(self.entry.kind);
+        return @tagName(self.manifest.model_type);
     }
 };
 
@@ -351,7 +352,7 @@ fn buildDiscoveredModelListings(
             continue;
         }
 
-        const kind_name = @tagName(entry.kind);
+        const kind_name = if (entry.kind == .extractor) @tagName(entry.kind) else @tagName(manifest.model_type);
         const reader_candidate = taskMatchesModelListing(
             "readers",
             kind_name,
@@ -413,7 +414,7 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
     var counts = ModelCounts{};
 
     const ra = node.registry.allocator;
-    const discovered = node.registry.discover(io) catch &[_]registry_mod.ModelEntry{};
+    const discovered = node.registry.discoverShallow(io) catch &[_]registry_mod.ModelEntry{};
     defer {
         for (discovered) |entry| {
             ra.free(entry.name);
@@ -429,7 +430,7 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         for (model_listing_tasks) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
             if (std.mem.eql(u8, task, "readers") and !listing.reader_supported) continue;
-            if (taskMatchesModelListing(task, listing.kindName(), listing.manifest.gliner_model_type, listing.manifest.tasks, listing.manifest.capabilities)) {
+            if (taskMatchesModelListing(task, listing.listingKindName(), listing.manifest.gliner_model_type, listing.manifest.tasks, listing.manifest.capabilities)) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -464,7 +465,7 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
 
     var registry = registry_mod.ModelRegistry.init(allocator, models_dir);
     defer registry.deinit();
-    const discovered = registry.discover(io) catch &[_]registry_mod.ModelEntry{};
+    const discovered = registry.discoverShallow(io) catch &[_]registry_mod.ModelEntry{};
     defer {
         for (discovered) |entry| {
             allocator.free(entry.name);
@@ -480,7 +481,7 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
         for (model_listing_tasks) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
             if (std.mem.eql(u8, task, "readers") and !listing.reader_supported) continue;
-            if (taskMatchesModelListing(task, listing.kindName(), listing.manifest.gliner_model_type, listing.manifest.tasks, listing.manifest.capabilities)) {
+            if (taskMatchesModelListing(task, listing.listingKindName(), listing.manifest.gliner_model_type, listing.manifest.tasks, listing.manifest.capabilities)) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -4004,7 +4005,7 @@ pub const Node = struct {
 
         // Discover models from filesystem registry
         const ra = self.registry.allocator;
-        const discovered = self.registry.discover(ctx.io) catch &[_]registry_mod.ModelEntry{};
+        const discovered = self.registry.discoverShallow(ctx.io) catch &[_]registry_mod.ModelEntry{};
         defer {
             for (discovered) |entry| {
                 ra.free(entry.name);
@@ -4033,7 +4034,7 @@ pub const Node = struct {
             // Add discovered models matching this task
             for (listings) |listing| {
                 if (std.mem.eql(u8, task, "readers") and !listing.reader_supported) continue;
-                if (!taskMatchesModelListing(task, listing.kindName(), listing.manifest.gliner_model_type, listing.manifest.tasks, listing.manifest.capabilities)) continue;
+                if (!taskMatchesModelListing(task, listing.listingKindName(), listing.manifest.gliner_model_type, listing.manifest.tasks, listing.manifest.capabilities)) continue;
 
                 if (model_count > 0) try body.append(a, ',');
                 try jsonEncodeString(&body, a, listing.entry.name);
@@ -4041,7 +4042,7 @@ pub const Node = struct {
                 try appendModelInfo(
                     &body,
                     a,
-                    listing.kindName(),
+                    listing.listingKindName(),
                     listing.manifest.gliner_model_type,
                     listing.manifest.capabilities,
                     listing.manifest.inputs,
@@ -5000,7 +5001,7 @@ test "buildDiscoveredModelListings parses reusable model listing metadata" {
     try std.testing.expect(listings[0].manifest.hasInput("text"));
     try std.testing.expect(taskMatchesModelListing(
         "embedders",
-        listings[0].kindName(),
+        listings[0].listingKindName(),
         listings[0].manifest.gliner_model_type,
         listings[0].manifest.tasks,
         listings[0].manifest.capabilities,
