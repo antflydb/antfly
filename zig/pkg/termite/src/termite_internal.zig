@@ -46,6 +46,7 @@ pub const finetune = struct {
     pub const gliner2 = @import("finetune/gliner2.zig");
     pub const gliner2_boundary = @import("finetune/gliner2_boundary.zig");
     pub const gliner2_data = @import("finetune/gliner2_data.zig");
+    pub const gliner2_run_validation = @import("finetune/gliner2_run_validation.zig");
     pub const entity_cleanup_data = @import("finetune/entity_cleanup_data.zig");
     pub const entity_cleanup_gliner_cache = @import("finetune/entity_cleanup_gliner_cache.zig");
     pub const entity_cleanup_model = @import("finetune/entity_cleanup_model.zig");
@@ -94,6 +95,8 @@ pub const models = struct {
 };
 pub const native_compute = struct {
     pub const native = @import("ops/native_compute.zig");
+    pub const gpu_hosted_store = @import("ops/gpu_hosted_store.zig");
+    pub const metal = if (build_options.enable_metal) @import("ops/metal_compute.zig") else struct {};
     pub const blas = @import("ops/blas_compute.zig");
     pub const mlx = if (build_options.enable_mlx) @import("ops/mlx_compute.zig") else struct {};
     pub const cuda = if (build_options.enable_cuda) @import("ops/cuda/cuda_compute.zig") else struct {};

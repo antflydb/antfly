@@ -776,6 +776,7 @@ pub const DecoderRuntimePrepareReuseResult = struct {
 
 pub const DecoderRuntimeDecodeContract = enum(u8) {
     gemma4_gated_ple_shared_kv,
+    gliner_deberta_encoder,
     qwen3_dense_text_embedding,
 };
 
@@ -894,6 +895,49 @@ pub const DecoderRuntimeGraphCommandPlanFrameRequest = struct {
     ple_vectors: ?CT = null,
     layers: []const DecoderRuntimeLayerSpec,
     output_hidden: *?CT,
+};
+
+pub const DebertaEncoderLayerSpec = struct {
+    q_linear_slot: usize,
+    k_linear_slot: usize,
+    v_linear_slot: usize,
+    attention_output_linear_slot: usize,
+    intermediate_linear_slot: usize,
+    output_linear_slot: usize,
+    attention_layer_norm_slot: usize,
+    output_layer_norm_slot: usize,
+};
+
+pub const DebertaEncoderFramePlanRequest = struct {
+    contract: DecoderRuntimeDecodeContract = .gliner_deberta_encoder,
+    layer_count: usize,
+    batch: usize,
+    seq_len: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_attention_heads: usize,
+    position_buckets: usize,
+    max_position_embeddings: usize,
+    norm_eps: f32,
+    layers: []const DebertaEncoderLayerSpec,
+};
+
+pub const DebertaEncoderLayerRequest = struct {
+    contract: DecoderRuntimeDecodeContract = .gliner_deberta_encoder,
+    layer: DebertaEncoderLayerSpec,
+    hidden: CT,
+    relative_embeddings: CT,
+    relative_full_to_unique: ?[]const i64 = null,
+    relative_unique_count: usize,
+    relative_full_count: usize,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_attention_heads: usize,
+    head_dim: usize,
+    norm_eps: f32,
 };
 
 test "tensor storage classes classify host and device residency" {

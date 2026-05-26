@@ -1185,6 +1185,24 @@ fn getArr(ct: CT) c.mlx_array {
 }
 
 pub const MlxCompute = struct {
+    pub const TrainingAdamWOptions = struct {
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bias_correction1: f32,
+        bias_correction2: f32,
+        grad_scale: f32,
+    };
+
+    pub const TrainingAdamWResult = struct {
+        weight: CT,
+        grad_accum: CT,
+        m: CT,
+        v: CT,
+    };
+
     pub const HostedBackend = enum {
         mlx,
         metal,
@@ -1659,6 +1677,153 @@ pub const MlxCompute = struct {
         const arr = mlx.arrayFromFloat32(data, shape);
         const final_arr = try self.castToBf16IfMixed(arr);
         return self.makeArr(final_arr, true);
+    }
+
+    pub fn trainingUploadF32(self: *MlxCompute, data: []const f32, shape: []const i32) !CT {
+        return self.fromFloat32Shape(data, shape);
+    }
+
+    pub fn trainingZeroF32(self: *MlxCompute, elem_count: usize, shape: []const i32) !CT {
+        _ = elem_count;
+        var result = c.mlx_array_new();
+        try mlx.check(c.mlx_zeros(&result, shape.ptr, shape.len, c.MLX_FLOAT32, self.data.stream));
+        return self.makeArr(result, true);
+    }
+
+    pub fn trainingAccumulateF32Replace(
+        self: *MlxCompute,
+        accum: CT,
+        grad: CT,
+        scale: f32,
+        first: bool,
+    ) !CT {
+        const s = self.data.stream;
+        const scale_arr = c.mlx_array_new_float(scale);
+        defer _ = c.mlx_array_free(scale_arr);
+
+        var scaled = c.mlx_array_new();
+        errdefer _ = c.mlx_array_free(scaled);
+        try mlx.check(c.mlx_multiply(&scaled, getArr(grad), scale_arr, s));
+        if (first) return self.makeArr(scaled, true);
+
+        var result = c.mlx_array_new();
+        errdefer _ = c.mlx_array_free(result);
+        try mlx.check(c.mlx_add(&result, getArr(accum), scaled, s));
+        _ = c.mlx_array_free(scaled);
+        return self.makeArr(result, true);
+    }
+
+    pub fn trainingSumSquaresF32(self: *MlxCompute, input: CT) !f32 {
+        const s = self.data.stream;
+        var squared = c.mlx_array_new();
+        defer _ = c.mlx_array_free(squared);
+        try mlx.check(c.mlx_multiply(&squared, getArr(input), getArr(input), s));
+
+        var sum = c.mlx_array_new();
+        defer _ = c.mlx_array_free(sum);
+        try mlx.check(c.mlx_sum(&sum, squared, false, s));
+
+        const values = try mlx.readFloat32(sum, self.allocator);
+        defer self.allocator.free(values);
+        return if (values.len > 0) values[0] else 0.0;
+    }
+
+    pub fn trainingAdamWF32Replace(
+        self: *MlxCompute,
+        weight: CT,
+        grad_accum: CT,
+        m: CT,
+        v: CT,
+        opts: TrainingAdamWOptions,
+    ) !TrainingAdamWResult {
+        const s = self.data.stream;
+        const beta1 = c.mlx_array_new_float(opts.beta1);
+        defer _ = c.mlx_array_free(beta1);
+        const beta2 = c.mlx_array_new_float(opts.beta2);
+        defer _ = c.mlx_array_free(beta2);
+        const one_minus_beta1 = c.mlx_array_new_float(1.0 - opts.beta1);
+        defer _ = c.mlx_array_free(one_minus_beta1);
+        const one_minus_beta2 = c.mlx_array_new_float(1.0 - opts.beta2);
+        defer _ = c.mlx_array_free(one_minus_beta2);
+        const grad_scale = c.mlx_array_new_float(opts.grad_scale);
+        defer _ = c.mlx_array_free(grad_scale);
+        const bias_correction1 = c.mlx_array_new_float(opts.bias_correction1);
+        defer _ = c.mlx_array_free(bias_correction1);
+        const bias_correction2 = c.mlx_array_new_float(opts.bias_correction2);
+        defer _ = c.mlx_array_free(bias_correction2);
+        const eps = c.mlx_array_new_float(opts.eps);
+        defer _ = c.mlx_array_free(eps);
+        const lr = c.mlx_array_new_float(opts.lr);
+        defer _ = c.mlx_array_free(lr);
+        const weight_decay = c.mlx_array_new_float(opts.weight_decay);
+        defer _ = c.mlx_array_free(weight_decay);
+
+        var g = c.mlx_array_new();
+        defer _ = c.mlx_array_free(g);
+        try mlx.check(c.mlx_multiply(&g, getArr(grad_accum), grad_scale, s));
+
+        var beta1_m = c.mlx_array_new();
+        defer _ = c.mlx_array_free(beta1_m);
+        try mlx.check(c.mlx_multiply(&beta1_m, getArr(m), beta1, s));
+        var one_minus_beta1_g = c.mlx_array_new();
+        defer _ = c.mlx_array_free(one_minus_beta1_g);
+        try mlx.check(c.mlx_multiply(&one_minus_beta1_g, g, one_minus_beta1, s));
+        var new_m = c.mlx_array_new();
+        errdefer _ = c.mlx_array_free(new_m);
+        try mlx.check(c.mlx_add(&new_m, beta1_m, one_minus_beta1_g, s));
+
+        var g2 = c.mlx_array_new();
+        defer _ = c.mlx_array_free(g2);
+        try mlx.check(c.mlx_multiply(&g2, g, g, s));
+        var beta2_v = c.mlx_array_new();
+        defer _ = c.mlx_array_free(beta2_v);
+        try mlx.check(c.mlx_multiply(&beta2_v, getArr(v), beta2, s));
+        var one_minus_beta2_g2 = c.mlx_array_new();
+        defer _ = c.mlx_array_free(one_minus_beta2_g2);
+        try mlx.check(c.mlx_multiply(&one_minus_beta2_g2, g2, one_minus_beta2, s));
+        var new_v = c.mlx_array_new();
+        errdefer _ = c.mlx_array_free(new_v);
+        try mlx.check(c.mlx_add(&new_v, beta2_v, one_minus_beta2_g2, s));
+
+        var m_hat = c.mlx_array_new();
+        defer _ = c.mlx_array_free(m_hat);
+        try mlx.check(c.mlx_divide(&m_hat, new_m, bias_correction1, s));
+        var v_hat = c.mlx_array_new();
+        defer _ = c.mlx_array_free(v_hat);
+        try mlx.check(c.mlx_divide(&v_hat, new_v, bias_correction2, s));
+        var sqrt_v = c.mlx_array_new();
+        defer _ = c.mlx_array_free(sqrt_v);
+        try mlx.check(c.mlx_sqrt(&sqrt_v, v_hat, s));
+        var denom = c.mlx_array_new();
+        defer _ = c.mlx_array_free(denom);
+        try mlx.check(c.mlx_add(&denom, sqrt_v, eps, s));
+        var adam_update = c.mlx_array_new();
+        defer _ = c.mlx_array_free(adam_update);
+        try mlx.check(c.mlx_divide(&adam_update, m_hat, denom, s));
+
+        var decayed = c.mlx_array_new();
+        defer _ = c.mlx_array_free(decayed);
+        try mlx.check(c.mlx_multiply(&decayed, getArr(weight), weight_decay, s));
+        var update = c.mlx_array_new();
+        defer _ = c.mlx_array_free(update);
+        try mlx.check(c.mlx_add(&update, adam_update, decayed, s));
+        var scaled_update = c.mlx_array_new();
+        defer _ = c.mlx_array_free(scaled_update);
+        try mlx.check(c.mlx_multiply(&scaled_update, update, lr, s));
+        var new_weight = c.mlx_array_new();
+        errdefer _ = c.mlx_array_free(new_weight);
+        try mlx.check(c.mlx_subtract(&new_weight, getArr(weight), scaled_update, s));
+
+        var zero_grad = c.mlx_array_new();
+        errdefer _ = c.mlx_array_free(zero_grad);
+        try mlx.check(c.mlx_zeros_like(&zero_grad, getArr(grad_accum), s));
+
+        return .{
+            .weight = try self.makeArr(new_weight, true),
+            .grad_accum = try self.makeArr(zero_grad, true),
+            .m = try self.makeArr(new_m, true),
+            .v = try self.makeArr(new_v, true),
+        };
     }
 
     fn tensorParallelWeightRowShard(
@@ -3241,24 +3406,24 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
         // This avoids materializing the entire weight (e.g. 262144×8960 Q4_K → 8.75GB f32)
         // and instead dequantizes only the requested rows.
         if (weight_arr.quantized_storage) |storage| {
-            if (storage.shape.len == 2) {
-                const row_width: usize = @intCast(storage.shape[1]);
-                if (row_width == dim) {
-                    const output = try self.allocator.alloc(f32, total * dim);
-                    defer self.allocator.free(output);
-                    for (ids, 0..) |id, i| {
-                        const row: usize = @intCast(id);
-                        try quant_codec.dequantizeRow(
-                            storage.tensor_type,
-                            storage.raw_bytes,
-                            dim,
-                            row,
-                            output[i * dim ..][0..dim],
-                        );
-                    }
-                    const shape = [_]i32{ @intCast(total), @intCast(dim) };
-                    return self.fromFloat32Shape(output, &shape);
+            const maybe_rows: ?usize = native_compute_mod.quantizedEmbeddingRows(storage, dim) catch null;
+            if (maybe_rows) |rows| {
+                const output = try self.allocator.alloc(f32, total * dim);
+                defer self.allocator.free(output);
+                for (ids, 0..) |id, i| {
+                    if (id < 0) return error.InvalidTensorShape;
+                    const row: usize = @intCast(id);
+                    if (row >= rows) return error.InvalidTensorShape;
+                    try quant_codec.dequantizeRow(
+                        storage.tensor_type,
+                        storage.raw_bytes,
+                        dim,
+                        row,
+                        output[i * dim ..][0..dim],
+                    );
                 }
+                const shape = [_]i32{ @intCast(total), @intCast(dim) };
+                return self.fromFloat32Shape(output, &shape);
             }
         }
         var maybe_loaded: ?weight_source_mod.LoadedWeight = null;
@@ -9740,8 +9905,11 @@ fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT
     const self: *MlxCompute = @ptrCast(@alignCast(ctx));
     var shape_i32: [8]c_int = undefined;
     for (new_shape, 0..) |d, i| shape_i32[i] = @intCast(d);
+    var contiguous = c.mlx_array_new();
+    defer _ = c.mlx_array_free(contiguous);
+    try mlx.check(c.mlx_contiguous(&contiguous, getArr(input), false, self.data.stream));
     var result = c.mlx_array_new();
-    try mlx.check(c.mlx_reshape(&result, getArr(input), &shape_i32, new_shape.len, self.data.stream));
+    try mlx.check(c.mlx_reshape(&result, contiguous, &shape_i32, new_shape.len, self.data.stream));
     return self.makeArr(result, true);
 }
 
