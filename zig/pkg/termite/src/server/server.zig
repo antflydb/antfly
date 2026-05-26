@@ -1636,9 +1636,9 @@ pub const Node = struct {
                                 const decoded_payload = decodeMediaData(ctx.allocator, data_val.string) catch
                                     return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid base64 data" });
                                 const decoded = decoded_payload.data;
-                                errdefer ctx.allocator.free(decoded);
+                                var decoded_owned = true;
+                                defer if (decoded_owned) ctx.allocator.free(decoded);
                                 if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) {
-                                    ctx.allocator.free(decoded);
                                     return ctx.status(400).json(.{
                                         .@"error" = "INVALID_REQUEST",
                                         .message = "media data URI mime_type does not match content part mime_type",
@@ -1647,14 +1647,15 @@ pub const Node = struct {
 
                                 if (std.mem.startsWith(u8, mime_val.string, "image/")) {
                                     try decoded_images.append(ctx.allocator, decoded);
+                                    decoded_owned = false;
                                     try msg_images.append(ctx.allocator, decoded);
                                     try msg_parts.append(ctx.allocator, .{ .image = msg_images.items.len - 1 });
                                 } else if (std.mem.startsWith(u8, mime_val.string, "audio/")) {
                                     try decoded_audio.append(ctx.allocator, decoded);
+                                    decoded_owned = false;
                                     try msg_audio.append(ctx.allocator, decoded);
                                     try msg_parts.append(ctx.allocator, .{ .audio = msg_audio.items.len - 1 });
                                 } else {
-                                    ctx.allocator.free(decoded);
                                     return ctx.status(400).json(.{
                                         .@"error" = "INVALID_REQUEST",
                                         .message = "media content part must have mime_type starting with 'audio/' or 'image/'",
