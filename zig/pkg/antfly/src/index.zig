@@ -691,6 +691,38 @@ pub const IndexWriter = struct {
         old.release();
     }
 
+    fn cloneGlobalFieldLens(alloc: Allocator, src: std.StringHashMapUnmanaged(u64)) !std.StringHashMapUnmanaged(u64) {
+        var cloned = std.StringHashMapUnmanaged(u64).empty;
+        errdefer cloned.deinit(alloc);
+
+        var it = src.iterator();
+        while (it.next()) |entry| {
+            const gop = try cloned.getOrPut(alloc, entry.key_ptr.*);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* = entry.value_ptr.*;
+        }
+
+        return cloned;
+    }
+
+    fn addSegmentFieldLens(
+        alloc: Allocator,
+        global_field_lens: *std.StringHashMapUnmanaged(u64),
+        reader: *const segment_mod.SegmentReader,
+    ) !void {
+        for (reader.fields) |*fi| {
+            if (std.mem.eql(u8, fi.name, segment_mod.doc_ordinals_field)) continue;
+            for (fi.sections) |*si| {
+                if (si.section_type != .inverted_text) continue;
+                const sec_data = reader.data[@intCast(si.offset)..][0..@intCast(si.length)];
+                const inv = inverted.InvertedIndexReader.init(alloc, sec_data) catch continue;
+                const gop = try global_field_lens.getOrPut(alloc, fi.name);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += inv.total_field_len;
+            }
+        }
+    }
+
     /// Like addSegment() but with an explicit segment ID (for recovery).
     pub fn addSegmentWithId(self: *IndexWriter, seg_id: u64, segment_bytes: []const u8) !void {
         const owned = try self.alloc.dupe(u8, segment_bytes);
@@ -725,7 +757,29 @@ pub const IndexWriter = struct {
 
         if (seg_id >= self.next_segment_id) self.next_segment_id = seg_id + 1;
 
-        try self.rebuildSnapshot(new_segments, &.{});
+        var global_field_lens = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
+        errdefer global_field_lens.deinit(self.alloc);
+        try addSegmentFieldLens(self.alloc, &global_field_lens, &reader);
+
+        const new_snap = try self.alloc.create(IndexSnapshot);
+        errdefer self.alloc.destroy(new_snap);
+        new_snap.* = .{
+            .alloc = self.alloc,
+            .ref_count = 1,
+            .epoch = self.next_epoch,
+            .segments = new_segments,
+            .global_doc_count = old.global_doc_count + new_segments[new_segments.len - 1].liveDocCount(),
+            .global_total_field_len = global_field_lens,
+            .term_doc_freq_cache_mu = .unlocked,
+            .term_doc_freq_cache = .empty,
+            .term_doc_freq_cache_hits = 0,
+            .term_doc_freq_cache_misses = 0,
+            .retired_segments = &.{},
+        };
+        self.next_epoch += 1;
+
+        @atomicStore(*IndexSnapshot, &self.current, new_snap, .release);
+        old.release();
         owned = null;
     }
 

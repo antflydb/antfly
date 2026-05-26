@@ -415,7 +415,7 @@ fn tokenizeUnicodeWords(alloc: Allocator, text: []const u8) ![]Token {
         position += 1;
     }
 
-    return try alloc.dupe(Token, tokens.items);
+    return try tokens.toOwnedSlice(alloc);
 }
 
 fn tokenizeWhitespace(alloc: Allocator, text: []const u8) ![]Token {
@@ -443,7 +443,7 @@ fn tokenizeWhitespace(alloc: Allocator, text: []const u8) ![]Token {
         position += 1;
     }
 
-    return try alloc.dupe(Token, tokens.items);
+    return try tokens.toOwnedSlice(alloc);
 }
 
 fn tokenizeKeyword(alloc: Allocator, text: []const u8) ![]Token {
@@ -479,7 +479,7 @@ fn tokenizeCharacter(alloc: Allocator, text: []const u8) ![]Token {
         pos = end;
     }
 
-    return try alloc.dupe(Token, tokens.items);
+    return try tokens.toOwnedSlice(alloc);
 }
 
 fn tokenizeNgram(alloc: Allocator, text: []const u8, cfg: NgramConfig) ![]Token {
@@ -505,7 +505,7 @@ fn tokenizeNgram(alloc: Allocator, text: []const u8, cfg: NgramConfig) ![]Token 
         }
     }
 
-    return try alloc.dupe(Token, tokens.items);
+    return try tokens.toOwnedSlice(alloc);
 }
 
 fn tokenizeEdgeNgram(alloc: Allocator, text: []const u8, cfg: EdgeNgramConfig) ![]Token {
@@ -538,7 +538,7 @@ fn tokenizeEdgeNgram(alloc: Allocator, text: []const u8, cfg: EdgeNgramConfig) !
         }
     }
 
-    return try alloc.dupe(Token, tokens.items);
+    return try tokens.toOwnedSlice(alloc);
 }
 
 fn isAlphanumeric(c: u8) bool {
@@ -606,6 +606,7 @@ pub const TokenFilter = union(enum) {
 
 fn applyLowercase(alloc: Allocator, tokens: []Token) ![]Token {
     for (tokens) |*tok| {
+        if (!containsAsciiUpper(tok.term)) continue;
         const lowered = try alloc.alloc(u8, tok.term.len);
         const len = tok.term.len;
         var i: usize = 0;
@@ -634,6 +635,25 @@ fn applyLowercase(alloc: Allocator, tokens: []Token) ![]Token {
         tok.term = lowered;
     }
     return tokens;
+}
+
+fn containsAsciiUpper(s: []const u8) bool {
+    var i: usize = 0;
+    const simd_len = s.len - (s.len % 16);
+    while (i < simd_len) : (i += 16) {
+        const V = @Vector(16, u8);
+        const v: V = s[i..][0..16].*;
+        const a_vec: V = @splat('A');
+        const z_vec: V = @splat('Z');
+        const ge_a: u16 = @bitCast(v >= a_vec);
+        const le_z: u16 = @bitCast(v <= z_vec);
+        if ((ge_a & le_z) != 0) return true;
+    }
+
+    while (i < s.len) : (i += 1) {
+        if (s[i] >= 'A' and s[i] <= 'Z') return true;
+    }
+    return false;
 }
 
 fn applyStopWords(alloc: Allocator, tokens: []Token) ![]Token {
@@ -667,7 +687,7 @@ fn applyNgramFilter(alloc: Allocator, tokens: []Token, cfg: NgramConfig) ![]Toke
     }
 
     alloc.free(tokens);
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn applyEdgeNgramFilter(alloc: Allocator, tokens: []Token, cfg: EdgeNgramConfig) ![]Token {
@@ -693,7 +713,7 @@ fn applyEdgeNgramFilter(alloc: Allocator, tokens: []Token, cfg: EdgeNgramConfig)
     }
 
     alloc.free(tokens);
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn applyShingle(alloc: Allocator, tokens: []Token, cfg: TokenFilter.ShingleConfig) ![]Token {
@@ -735,7 +755,7 @@ fn applyShingle(alloc: Allocator, tokens: []Token, cfg: TokenFilter.ShingleConfi
     for (tokens) |tok| alloc.free(@constCast(tok.term));
     alloc.free(tokens);
 
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn applyLength(alloc: Allocator, tokens: []Token, cfg: TokenFilter.LengthConfig) ![]Token {
@@ -756,7 +776,7 @@ fn applyLength(alloc: Allocator, tokens: []Token, cfg: TokenFilter.LengthConfig)
     }
 
     alloc.free(tokens);
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn applyTruncate(alloc: Allocator, tokens: []Token, cfg: TokenFilter.TruncateConfig) ![]Token {
@@ -791,7 +811,7 @@ fn applyUnique(alloc: Allocator, tokens: []Token) ![]Token {
     }
 
     alloc.free(tokens);
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn applyReverse(alloc: Allocator, tokens: []Token) ![]Token {
@@ -846,7 +866,7 @@ fn applyCamelCase(alloc: Allocator, tokens: []Token) ![]Token {
     }
 
     alloc.free(tokens);
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn toLowerDupe(alloc: Allocator, s: []const u8) ![]u8 {
@@ -896,6 +916,15 @@ fn applyApostrophe(alloc: Allocator, tokens: []Token) ![]Token {
 
 fn applyStopWordsLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Token {
     const stops = stopwords_mod.getStopWords(lang);
+    var has_stop = false;
+    for (tokens) |tok| {
+        if (stops.has(tok.term)) {
+            has_stop = true;
+            break;
+        }
+    }
+    if (!has_stop) return tokens;
+
     var result = std.ArrayListUnmanaged(Token).empty;
     defer result.deinit(alloc);
 
@@ -912,7 +941,7 @@ fn applyStopWordsLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Toke
     }
 
     alloc.free(tokens);
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn applyStemmerLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Token {
@@ -935,8 +964,17 @@ fn applyStemmerLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Token 
 pub fn porter2Stem(alloc: Allocator, word: []const u8) ![]const u8 {
     if (word.len <= 2) return word;
 
-    // Work on a mutable copy
-    var buf = try alloc.alloc(u8, word.len);
+    // Work on a mutable copy. Most indexed terms are short and many do not
+    // stem; keep that common path off the allocator and only allocate the final
+    // returned term when the stem actually changes.
+    var stack_buf: [256]u8 = undefined;
+    var heap_buf: ?[]u8 = null;
+    var buf: []u8 = if (word.len <= stack_buf.len) stack_buf[0..word.len] else blk: {
+        const owned = try alloc.alloc(u8, word.len);
+        heap_buf = owned;
+        break :blk owned;
+    };
+    defer if (heap_buf) |owned| alloc.free(owned);
     @memcpy(buf, word);
     var len = buf.len;
 
@@ -965,17 +1003,10 @@ pub fn porter2Stem(alloc: Allocator, word: []const u8) ![]const u8 {
     len = step5(buf, len);
 
     if (len == word.len and std.mem.eql(u8, buf[0..len], word)) {
-        alloc.free(buf);
         return word;
     }
 
-    // Resize buffer to actual length
-    if (len < buf.len) {
-        const result = try alloc.dupe(u8, buf[0..len]);
-        alloc.free(buf);
-        return result;
-    }
-    return buf[0..len];
+    return try alloc.dupe(u8, buf[0..len]);
 }
 
 pub fn isVowel(c: u8) bool {
