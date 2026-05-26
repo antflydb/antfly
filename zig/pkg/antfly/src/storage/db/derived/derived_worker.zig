@@ -364,7 +364,7 @@ const ReplayChunkBuilder = struct {
             .graph => {
                 for (record.deleted_doc_keys) |key| try self.appendUniqueKey(&self.deleted_doc_keys, &self.seen_deleted_docs, key);
                 for (record.changed_artifact_keys) |key| {
-                    if (!internal_keys.isGraphEdgeArtifactKey(key)) continue;
+                    if (!internal_keys.isGraphEdgeArtifactKey(key) and !internal_keys.isAssetArtifactKey(key)) continue;
                     try self.appendUniqueKey(&self.changed_artifact_keys, &self.seen_changed_artifacts, key);
                 }
             },

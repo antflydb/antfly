@@ -12260,7 +12260,7 @@ fn appendPrecomputedGraphSourceArtifacts(
 
             const raw_doc = try batchDocumentValueForGraphSource(self.alloc, self.core.store, store_writes.items, artifact_ref.document_id);
             defer if (raw_doc) |value| self.alloc.free(value);
-            const graph_writes = try graphWritesFromArtifactValueAlloc(self.alloc, graph_entry.config.name, artifact_ref.document_id, artifact_write.value, source, raw_doc);
+            const graph_writes = try graphWritesFromArtifactValueAlloc(self.alloc, graph_entry.config.name, artifact_ref.document_id, artifact_write.value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
             defer freeGraphWrites(self.alloc, graph_writes);
 
             for (graph_writes) |write| {
@@ -12316,6 +12316,11 @@ fn storeDocumentValueForGraphSource(
         error.NotFound => null,
         else => return err,
     };
+}
+
+fn graphArtifactContentType(index_manager: *const index_manager_mod.IndexManager, artifact_name: []const u8) []const u8 {
+    const cfg = index_manager.getEnrichment(.asset, artifact_name) orelse return "";
+    return cfg.content_type;
 }
 
 fn shouldPrecomputeGeneratedRequest(
@@ -15531,7 +15536,7 @@ fn materializeGraphSourceArtifactsForIndex(
         defer deletes.deinit(alloc);
         for (existing) |entry| {
             try deletes.append(alloc, entry.key);
-            try appendUniqueOwnedKey(alloc, &changed, try alloc.dupe(u8, entry.key));
+            try appendUniqueOwnedKey(alloc, &changed, entry.key);
         }
 
         const raw = store.get(alloc, artifact_key) catch |err| switch (err) {
@@ -15552,7 +15557,7 @@ fn materializeGraphSourceArtifactsForIndex(
         if (raw) |value| {
             const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id);
             defer if (raw_doc) |doc_value| alloc.free(doc_value);
-            const graph_writes = try graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, raw_doc);
+            const graph_writes = try graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc);
             defer freeGraphWrites(alloc, graph_writes);
             for (graph_writes) |write| {
                 const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
@@ -15564,7 +15569,7 @@ fn materializeGraphSourceArtifactsForIndex(
                 try writes.append(alloc, .{ .key = key, .value = payload });
                 key_owned = false;
                 payload_owned = false;
-                try appendUniqueOwnedKey(alloc, &changed, try alloc.dupe(u8, key));
+                try appendUniqueOwnedKey(alloc, &changed, key);
             }
         }
 
@@ -15593,6 +15598,7 @@ fn graphWritesFromArtifactValueAlloc(
     doc_key: []const u8,
     raw: []const u8,
     source: index_manager_mod.GraphArtifactSource,
+    artifact_content_type: []const u8,
     raw_doc: ?[]const u8,
 ) ![]types.GraphEdgeWrite {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
@@ -15605,13 +15611,13 @@ fn graphWritesFromArtifactValueAlloc(
     errdefer freeGraphWrites(alloc, writes.items);
 
     switch (source.format) {
-        .extraction_relation => try appendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping),
+        .extraction_relation => try appendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value),
         .extraction_graph => {
             if (source.path.len > 0) {
-                try appendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping);
+                try appendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
             } else if (parsed.value == .object) {
-                if (parsed.value.object.get("relations")) |relations| try appendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, relations, source.mapping);
-                if (parsed.value.object.get("edges")) |edges| try appendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, edges, source.mapping);
+                if (parsed.value.object.get("relations")) |relations| try appendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, relations, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
+                if (parsed.value.object.get("edges")) |edges| try appendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, edges, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
             }
         },
     }
@@ -15628,10 +15634,13 @@ fn appendRelationItemsFromPath(
     root: std.json.Value,
     path: []const u8,
     mapping: index_manager_mod.GraphArtifactMapping,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) !void {
-    if (path.len == 0 or std.mem.eql(u8, path, "$")) return appendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, root, mapping);
+    if (path.len == 0 or std.mem.eql(u8, path, "$")) return appendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, root, mapping, artifact_name, artifact_content_type, artifact_value);
     const selected = selectGraphArtifactPath(root, path) orelse return;
-    try appendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, selected, mapping);
+    try appendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, selected, mapping, artifact_name, artifact_content_type, artifact_value);
 }
 
 fn selectGraphArtifactPath(root: std.json.Value, path: []const u8) ?std.json.Value {
@@ -15658,11 +15667,14 @@ fn appendRelationValueItems(
     doc_value: ?std.json.Value,
     value: std.json.Value,
     mapping: index_manager_mod.GraphArtifactMapping,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) !void {
     if (value == .array) {
-        for (value.array.items, 0..) |item, i| try appendRelationItem(alloc, writes, index_name, doc_key, doc_value, item, i, mapping);
+        for (value.array.items, 0..) |item, i| try appendRelationItem(alloc, writes, index_name, doc_key, doc_value, item, i, mapping, artifact_name, artifact_content_type, artifact_value);
     } else {
-        try appendRelationItem(alloc, writes, index_name, doc_key, doc_value, value, 0, mapping);
+        try appendRelationItem(alloc, writes, index_name, doc_key, doc_value, value, 0, mapping, artifact_name, artifact_content_type, artifact_value);
     }
 }
 
@@ -15675,10 +15687,13 @@ fn appendRelationItem(
     item: std.json.Value,
     item_index: usize,
     mapping: index_manager_mod.GraphArtifactMapping,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) !void {
     if (item != .object) return;
     const mapped_edge_type = if (mapping.edge_type_template.len > 0)
-        try renderGraphArtifactTemplateAlloc(alloc, mapping.edge_type_template, doc_key, doc_value, item, item_index)
+        try renderGraphArtifactTemplateAlloc(alloc, mapping.edge_type_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
     else
         null;
     defer if (mapped_edge_type) |value| alloc.free(value);
@@ -15689,7 +15704,7 @@ fn appendRelationItem(
     if (edge_type.len == 0) return;
 
     const mapped_source = if (mapping.source_template.len > 0)
-        try renderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index)
+        try renderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
     else
         null;
     defer if (mapped_source) |value| alloc.free(value);
@@ -15697,12 +15712,12 @@ fn appendRelationItem(
         const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
         break :blk if (trimmed.len > 0) trimmed else doc_key;
     } else if (item.object.get("source")) |source_value|
-        jsonEndpointDocumentId(source_value) orelse doc_key
+        jsonEndpointDocumentIdResolved(source_value, artifact_value) orelse doc_key
     else
         doc_key;
 
     const mapped_target = if (mapping.target_template.len > 0)
-        try renderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index)
+        try renderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
     else
         null;
     defer if (mapped_target) |value| alloc.free(value);
@@ -15712,17 +15727,17 @@ fn appendRelationItem(
         break :blk trimmed;
     } else blk: {
         const target_value = item.object.get("target") orelse return;
-        break :blk jsonEndpointDocumentId(target_value) orelse return;
+        break :blk jsonEndpointDocumentIdResolved(target_value, artifact_value) orelse return;
     };
 
     const weight = if (mapping.weight_template.len > 0) blk: {
-        const rendered = try renderGraphArtifactTemplateAlloc(alloc, mapping.weight_template, doc_key, doc_value, item, item_index);
+        const rendered = try renderGraphArtifactTemplateAlloc(alloc, mapping.weight_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
         defer alloc.free(rendered);
         const trimmed = std.mem.trim(u8, rendered, &std.ascii.whitespace);
         break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
     } else jsonFloatField(item, "weight") orelse jsonFloatField(item, "confidence") orelse 1.0;
     const metadata_json = if (mapping.metadata_template_json.len > 0)
-        try renderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index)
+        try renderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
     else
         try std.json.Stringify.valueAlloc(alloc, item, .{});
     errdefer alloc.free(metadata_json);
@@ -15746,6 +15761,9 @@ fn renderGraphArtifactTemplateAlloc(
     doc_value: ?std.json.Value,
     item: std.json.Value,
     item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -15762,7 +15780,7 @@ fn renderGraphArtifactTemplateAlloc(
             break;
         };
         const expr = std.mem.trim(u8, template_source[body_start..end], &std.ascii.whitespace);
-        const rendered = try renderGraphArtifactExpressionAlloc(alloc, expr, doc_key, doc_value, item, item_index);
+        const rendered = try renderGraphArtifactExpressionAlloc(alloc, expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
         defer alloc.free(rendered);
         try out.appendSlice(alloc, rendered);
         pos = end + 2;
@@ -15777,12 +15795,15 @@ fn renderGraphArtifactExpressionAlloc(
     doc_value: ?std.json.Value,
     item: std.json.Value,
     item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) ![]u8 {
     if (std.mem.startsWith(u8, expr, "default ")) {
         var parts = std.mem.tokenizeAny(u8, expr["default ".len..], &std.ascii.whitespace);
         const path = parts.next() orelse return try alloc.dupe(u8, "");
         const fallback = parts.next() orelse "";
-        const value = graphTemplateValue(path, doc_key, doc_value, item, item_index);
+        const value = graphTemplateValue(path, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
         const text = if (value) |found| try graphJsonValueTextAlloc(alloc, found) else try alloc.dupe(u8, fallback);
         if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0 and fallback.len > 0) {
             alloc.free(text);
@@ -15790,22 +15811,53 @@ fn renderGraphArtifactExpressionAlloc(
         }
         return text;
     }
-    if (graphTemplateValue(expr, doc_key, doc_value, item, item_index)) |value| {
+    if (graphTemplateValue(expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)) |value| {
         return try graphJsonValueTextAlloc(alloc, value);
     }
     return try alloc.dupe(u8, "");
 }
 
-fn graphTemplateValue(path: []const u8, doc_key: []const u8, doc_value: ?std.json.Value, item: std.json.Value, item_index: usize) ?std.json.Value {
+fn graphTemplateValue(
+    path: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) ?std.json.Value {
     if (std.mem.eql(u8, path, "_doc.key")) return .{ .string = doc_key };
     if (std.mem.startsWith(u8, path, "_doc.value.")) {
         const doc = doc_value orelse return null;
         return selectJsonDotPath(doc, path["_doc.value.".len..]);
     }
+    if (std.mem.eql(u8, path, "_artifact.name")) return .{ .string = artifact_name };
+    if (std.mem.eql(u8, path, "_artifact.content_type")) return .{ .string = artifact_content_type };
+    if (std.mem.eql(u8, path, "_artifact.value")) return artifact_value;
+    if (std.mem.startsWith(u8, path, "_artifact.value.")) return selectJsonDotPath(artifact_value, path["_artifact.value.".len..]);
     if (std.mem.eql(u8, path, "_item_index")) return .{ .integer = @intCast(item_index) };
     if (std.mem.eql(u8, path, "_item")) return item;
-    if (std.mem.startsWith(u8, path, "_item.")) return selectJsonDotPath(item, path["_item.".len..]);
+    if (std.mem.startsWith(u8, path, "_item.")) return selectGraphItemDotPath(item, path["_item.".len..], artifact_value);
     return null;
+}
+
+fn selectGraphItemDotPath(item: std.json.Value, path: []const u8, artifact_value: std.json.Value) ?std.json.Value {
+    if (std.mem.eql(u8, path, "source") or std.mem.startsWith(u8, path, "source.")) {
+        if (item != .object) return null;
+        const endpoint = item.object.get("source") orelse return null;
+        const selected = resolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
+        if (std.mem.eql(u8, path, "source")) return selected;
+        return selectJsonDotPath(selected, path["source.".len..]);
+    }
+    if (std.mem.eql(u8, path, "target") or std.mem.startsWith(u8, path, "target.")) {
+        if (item != .object) return null;
+        const endpoint = item.object.get("target") orelse return null;
+        const selected = resolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
+        if (std.mem.eql(u8, path, "target")) return selected;
+        return selectJsonDotPath(selected, path["target.".len..]);
+    }
+    return selectJsonDotPath(item, path);
 }
 
 fn selectJsonDotPath(root: std.json.Value, path: []const u8) ?std.json.Value {
@@ -15838,10 +15890,13 @@ fn renderGraphArtifactMetadataTemplateAlloc(
     doc_value: ?std.json.Value,
     item: std.json.Value,
     item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata_template_json, .{});
     defer parsed.deinit();
-    var rendered = try renderGraphArtifactMetadataValueAlloc(alloc, parsed.value, doc_key, doc_value, item, item_index);
+    var rendered = try renderGraphArtifactMetadataValueAlloc(alloc, parsed.value, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
     defer freeGraphRenderedJsonValue(alloc, &rendered);
     return try std.json.Stringify.valueAlloc(alloc, rendered, .{});
 }
@@ -15853,13 +15908,16 @@ fn renderGraphArtifactMetadataValueAlloc(
     doc_value: ?std.json.Value,
     item: std.json.Value,
     item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) !std.json.Value {
     return switch (value) {
-        .string => |text| .{ .string = try renderGraphArtifactTemplateAlloc(alloc, text, doc_key, doc_value, item, item_index) },
+        .string => |text| .{ .string = try renderGraphArtifactTemplateAlloc(alloc, text, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value) },
         .array => |array| blk: {
             var out = std.json.Array.init(alloc);
             errdefer out.deinit();
-            for (array.items) |child| try out.append(try renderGraphArtifactMetadataValueAlloc(alloc, child, doc_key, doc_value, item, item_index));
+            for (array.items) |child| try out.append(try renderGraphArtifactMetadataValueAlloc(alloc, child, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
             break :blk .{ .array = out };
         },
         .object => |object| blk: {
@@ -15867,7 +15925,7 @@ fn renderGraphArtifactMetadataValueAlloc(
             errdefer out.deinit(alloc);
             var it = object.iterator();
             while (it.next()) |entry| {
-                try out.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try renderGraphArtifactMetadataValueAlloc(alloc, entry.value_ptr.*, doc_key, doc_value, item, item_index));
+                try out.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try renderGraphArtifactMetadataValueAlloc(alloc, entry.value_ptr.*, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
             }
             break :blk .{ .object = out };
         },
@@ -15898,7 +15956,33 @@ fn freeGraphRenderedJsonValue(alloc: Allocator, value: *std.json.Value) void {
 fn jsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
     return switch (value) {
         .string => value.string,
-        .object => jsonStringField(value, "document_id") orelse jsonStringField(value, "doc_key") orelse jsonStringField(value, "key"),
+        .object => jsonStringField(value, "document_id") orelse jsonStringField(value, "doc_key") orelse jsonStringField(value, "key") orelse if (value.object.get("doc_ref")) |doc_ref| jsonEndpointDocumentId(doc_ref) else null,
+        else => null,
+    };
+}
+
+fn jsonEndpointDocumentIdResolved(value: std.json.Value, artifact_value: std.json.Value) ?[]const u8 {
+    return jsonEndpointDocumentId(value) orelse if (resolveGraphEndpointEntity(value, artifact_value)) |entity| jsonEndpointDocumentId(entity) else null;
+}
+
+fn resolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
+    if (value != .object) return null;
+    const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "local_id") orelse return null;
+    return findGraphArtifactEntity(artifact_value, entity_id);
+}
+
+fn findGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []const u8) ?std.json.Value {
+    if (artifact_value != .object) return null;
+    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
+    return switch (entities) {
+        .array => |array| blk: {
+            for (array.items) |entity| {
+                const id = jsonStringField(entity, "id") orelse jsonStringField(entity, "local_id") orelse continue;
+                if (std.mem.eql(u8, id, entity_id)) break :blk entity;
+            }
+            break :blk null;
+        },
+        .object => entities.object.get(entity_id),
         else => null,
     };
 }
@@ -22569,6 +22653,52 @@ test "db graph relation artifact materializer uses mapping templates" {
     try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"tenant\":\"tenant-a\"") != null);
 }
 
+test "db graph relation artifact materializer resolves entity refs and artifact template values" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_graph"},
+        \\  "nodes":{"source":"{{ _doc.key }}","target":"{{ _item.target.doc_ref.key }}"},
+        \\  "edge":{"type":"{{ _item.type }}","metadata":{"artifact":"{{ _artifact.name }}","content_type":"{{ _artifact.content_type }}","source_text":"{{ _item.source.text }}","target_text":"{{ _item.target.text }}"}},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","text":"Ada Lovelace","document_id":"doc:a"},{"id":"e1","text":"Analytical Engine","doc_ref":{"key":"doc:b"}}],"relations":[{"type":"mentions","source":{"entity_id":"e0"},"target":{"entity_id":"e1"}}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"artifact\":\"relations_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"content_type\":\"application/json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"source_text\":\"Ada Lovelace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"target_text\":\"Analytical Engine\"") != null);
+}
+
 test "db graph relation artifact materializer replaces stale document edges" {
     const alloc = std.testing.allocator;
 
@@ -22739,6 +22869,7 @@ test "db async asset producer graph source materializes through replay" {
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "edge":{"metadata":{"artifact":"{{ _artifact.name }}","content_type":"{{ _artifact.content_type }}"}},
         \\  "artifact":{"name":"relations_v1","kind":"asset","field":"target_doc","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
         \\}
         ,
@@ -22758,6 +22889,107 @@ test "db async asset producer graph source materializes through replay" {
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("doc:b", edges[0].target);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"artifact\":\"relations_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"content_type\":\"application/json\"") != null);
+}
+
+test "db graph artifact source replay catches up after reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{
+            \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+            \\}
+            ,
+        });
+
+        const doc_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(doc_key);
+        const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+        defer alloc.free(artifact_key);
+        var ctx = db.batchContext();
+        const sequence = db.core.store.reserveNextReplaySequence(1);
+        const replay_payload = try encodeChangeRecordPayload(&ctx, .{
+            .changed_artifact_keys = &.{artifact_key},
+        }, sequence);
+        defer alloc.free(replay_payload);
+
+        try db.core.store.putBatchWithReplay(null, &.{
+            .{ .key = doc_key, .value = "{\"title\":\"alpha\"}" },
+            .{ .key = artifact_key, .value = "{\"relations\":[{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"}}]}" },
+        }, &.{}, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    try reopened.runUntilIdle();
+
+    const edges = try reopened.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+}
+
+test "db graph edge artifact replay catches up after reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json = "{}",
+        });
+
+        const graph_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+        defer alloc.free(graph_key);
+        const graph_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 0.8, 0, 0, "");
+        defer alloc.free(graph_value);
+        var ctx = db.batchContext();
+        const sequence = db.core.store.reserveNextReplaySequence(1);
+        const replay_payload = try encodeChangeRecordPayload(&ctx, .{
+            .changed_artifact_keys = &.{graph_key},
+        }, sequence);
+        defer alloc.free(replay_payload);
+
+        try db.core.store.putBatchWithReplay(null, &.{
+            .{ .key = graph_key, .value = graph_value },
+        }, &.{}, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    try reopened.runUntilIdle();
+
+    const edges = try reopened.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), edges[0].weight, 0.0001);
 }
 
 test "db batch marks generated enrichment replay for generator-enabled dense index" {

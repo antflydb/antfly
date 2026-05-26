@@ -1469,7 +1469,7 @@ fn materializeGraphAssetForRuntime(
         const source = graph_entry.artifact_source orelse continue;
         if (!std.mem.eql(u8, source.artifact_name, artifact_name)) continue;
 
-        const graph_writes = try runtimeGraphWritesFromArtifactValueAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, raw_doc);
+        const graph_writes = try runtimeGraphWritesFromArtifactValueAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc);
         defer runtimeFreeGraphWrites(runtime.alloc, graph_writes);
 
         var writes = std.ArrayListUnmanaged(KVPair).empty;
@@ -1528,6 +1528,7 @@ fn runtimeGraphWritesFromArtifactValueAlloc(
     doc_key: []const u8,
     raw: []const u8,
     source: index_manager_mod.GraphArtifactSource,
+    artifact_content_type: []const u8,
     raw_doc: ?[]const u8,
 ) ![]types.GraphEdgeWrite {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
@@ -1540,13 +1541,13 @@ fn runtimeGraphWritesFromArtifactValueAlloc(
     errdefer runtimeFreeGraphWrites(alloc, writes.items);
 
     switch (source.format) {
-        .extraction_relation => try runtimeAppendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping),
+        .extraction_relation => try runtimeAppendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value),
         .extraction_graph => {
             if (source.path.len > 0) {
-                try runtimeAppendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping);
+                try runtimeAppendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
             } else if (parsed.value == .object) {
-                if (parsed.value.object.get("relations")) |relations| try runtimeAppendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, relations, source.mapping);
-                if (parsed.value.object.get("edges")) |edges| try runtimeAppendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, edges, source.mapping);
+                if (parsed.value.object.get("relations")) |relations| try runtimeAppendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, relations, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
+                if (parsed.value.object.get("edges")) |edges| try runtimeAppendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, edges, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
             }
         },
     }
@@ -1574,10 +1575,13 @@ fn runtimeAppendRelationItemsFromPath(
     root: std.json.Value,
     path: []const u8,
     mapping: index_manager_mod.GraphArtifactMapping,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) !void {
-    if (path.len == 0 or std.mem.eql(u8, path, "$")) return runtimeAppendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, root, mapping);
+    if (path.len == 0 or std.mem.eql(u8, path, "$")) return runtimeAppendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, root, mapping, artifact_name, artifact_content_type, artifact_value);
     const selected = runtimeSelectGraphArtifactPath(root, path) orelse return;
-    try runtimeAppendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, selected, mapping);
+    try runtimeAppendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, selected, mapping, artifact_name, artifact_content_type, artifact_value);
 }
 
 fn runtimeSelectGraphArtifactPath(root: std.json.Value, path: []const u8) ?std.json.Value {
@@ -1604,11 +1608,14 @@ fn runtimeAppendRelationValueItems(
     doc_value: ?std.json.Value,
     value: std.json.Value,
     mapping: index_manager_mod.GraphArtifactMapping,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) !void {
     if (value == .array) {
-        for (value.array.items, 0..) |item, i| try runtimeAppendRelationItem(alloc, writes, index_name, doc_key, doc_value, item, i, mapping);
+        for (value.array.items, 0..) |item, i| try runtimeAppendRelationItem(alloc, writes, index_name, doc_key, doc_value, item, i, mapping, artifact_name, artifact_content_type, artifact_value);
     } else {
-        try runtimeAppendRelationItem(alloc, writes, index_name, doc_key, doc_value, value, 0, mapping);
+        try runtimeAppendRelationItem(alloc, writes, index_name, doc_key, doc_value, value, 0, mapping, artifact_name, artifact_content_type, artifact_value);
     }
 }
 
@@ -1621,10 +1628,13 @@ fn runtimeAppendRelationItem(
     item: std.json.Value,
     item_index: usize,
     mapping: index_manager_mod.GraphArtifactMapping,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) !void {
     if (item != .object) return;
     const mapped_edge_type = if (mapping.edge_type_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.edge_type_template, doc_key, doc_value, item, item_index)
+        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.edge_type_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
     else
         null;
     defer if (mapped_edge_type) |value| alloc.free(value);
@@ -1635,7 +1645,7 @@ fn runtimeAppendRelationItem(
     if (edge_type.len == 0) return;
 
     const mapped_source = if (mapping.source_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index)
+        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
     else
         null;
     defer if (mapped_source) |value| alloc.free(value);
@@ -1643,12 +1653,12 @@ fn runtimeAppendRelationItem(
         const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
         break :blk if (trimmed.len > 0) trimmed else doc_key;
     } else if (item.object.get("source")) |source_value|
-        runtimeJsonEndpointDocumentId(source_value) orelse doc_key
+        runtimeJsonEndpointDocumentIdResolved(source_value, artifact_value) orelse doc_key
     else
         doc_key;
 
     const mapped_target = if (mapping.target_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index)
+        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
     else
         null;
     defer if (mapped_target) |value| alloc.free(value);
@@ -1658,17 +1668,17 @@ fn runtimeAppendRelationItem(
         break :blk trimmed;
     } else blk: {
         const target_value = item.object.get("target") orelse return;
-        break :blk runtimeJsonEndpointDocumentId(target_value) orelse return;
+        break :blk runtimeJsonEndpointDocumentIdResolved(target_value, artifact_value) orelse return;
     };
 
     const weight = if (mapping.weight_template.len > 0) blk: {
-        const rendered = try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.weight_template, doc_key, doc_value, item, item_index);
+        const rendered = try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.weight_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
         defer alloc.free(rendered);
         const trimmed = std.mem.trim(u8, rendered, &std.ascii.whitespace);
         break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
     } else runtimeJsonFloatField(item, "weight") orelse runtimeJsonFloatField(item, "confidence") orelse 1.0;
     const metadata_json = if (mapping.metadata_template_json.len > 0)
-        try runtimeRenderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index)
+        try runtimeRenderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
     else
         try std.json.Stringify.valueAlloc(alloc, item, .{});
     errdefer alloc.free(metadata_json);
@@ -1690,6 +1700,9 @@ fn runtimeRenderGraphArtifactTemplateAlloc(
     doc_value: ?std.json.Value,
     item: std.json.Value,
     item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -1706,7 +1719,7 @@ fn runtimeRenderGraphArtifactTemplateAlloc(
             break;
         };
         const expr = std.mem.trim(u8, template_source[body_start..end], &std.ascii.whitespace);
-        const rendered = try runtimeRenderGraphArtifactExpressionAlloc(alloc, expr, doc_key, doc_value, item, item_index);
+        const rendered = try runtimeRenderGraphArtifactExpressionAlloc(alloc, expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
         defer alloc.free(rendered);
         try out.appendSlice(alloc, rendered);
         pos = end + 2;
@@ -1721,12 +1734,15 @@ fn runtimeRenderGraphArtifactExpressionAlloc(
     doc_value: ?std.json.Value,
     item: std.json.Value,
     item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) ![]u8 {
     if (std.mem.startsWith(u8, expr, "default ")) {
         var parts = std.mem.tokenizeAny(u8, expr["default ".len..], &std.ascii.whitespace);
         const path = parts.next() orelse return try alloc.dupe(u8, "");
         const fallback = parts.next() orelse "";
-        const value = runtimeGraphTemplateValue(path, doc_key, doc_value, item, item_index);
+        const value = runtimeGraphTemplateValue(path, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
         const text = if (value) |found| try runtimeGraphJsonValueTextAlloc(alloc, found) else try alloc.dupe(u8, fallback);
         if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0 and fallback.len > 0) {
             alloc.free(text);
@@ -1734,22 +1750,53 @@ fn runtimeRenderGraphArtifactExpressionAlloc(
         }
         return text;
     }
-    if (runtimeGraphTemplateValue(expr, doc_key, doc_value, item, item_index)) |value| {
+    if (runtimeGraphTemplateValue(expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)) |value| {
         return try runtimeGraphJsonValueTextAlloc(alloc, value);
     }
     return try alloc.dupe(u8, "");
 }
 
-fn runtimeGraphTemplateValue(path: []const u8, doc_key: []const u8, doc_value: ?std.json.Value, item: std.json.Value, item_index: usize) ?std.json.Value {
+fn runtimeGraphTemplateValue(
+    path: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) ?std.json.Value {
     if (std.mem.eql(u8, path, "_doc.key")) return .{ .string = doc_key };
     if (std.mem.startsWith(u8, path, "_doc.value.")) {
         const doc = doc_value orelse return null;
         return runtimeSelectJsonDotPath(doc, path["_doc.value.".len..]);
     }
+    if (std.mem.eql(u8, path, "_artifact.name")) return .{ .string = artifact_name };
+    if (std.mem.eql(u8, path, "_artifact.content_type")) return .{ .string = artifact_content_type };
+    if (std.mem.eql(u8, path, "_artifact.value")) return artifact_value;
+    if (std.mem.startsWith(u8, path, "_artifact.value.")) return runtimeSelectJsonDotPath(artifact_value, path["_artifact.value.".len..]);
     if (std.mem.eql(u8, path, "_item_index")) return .{ .integer = @intCast(item_index) };
     if (std.mem.eql(u8, path, "_item")) return item;
-    if (std.mem.startsWith(u8, path, "_item.")) return runtimeSelectJsonDotPath(item, path["_item.".len..]);
+    if (std.mem.startsWith(u8, path, "_item.")) return runtimeSelectGraphItemDotPath(item, path["_item.".len..], artifact_value);
     return null;
+}
+
+fn runtimeSelectGraphItemDotPath(item: std.json.Value, path: []const u8, artifact_value: std.json.Value) ?std.json.Value {
+    if (std.mem.eql(u8, path, "source") or std.mem.startsWith(u8, path, "source.")) {
+        if (item != .object) return null;
+        const endpoint = item.object.get("source") orelse return null;
+        const selected = runtimeResolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
+        if (std.mem.eql(u8, path, "source")) return selected;
+        return runtimeSelectJsonDotPath(selected, path["source.".len..]);
+    }
+    if (std.mem.eql(u8, path, "target") or std.mem.startsWith(u8, path, "target.")) {
+        if (item != .object) return null;
+        const endpoint = item.object.get("target") orelse return null;
+        const selected = runtimeResolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
+        if (std.mem.eql(u8, path, "target")) return selected;
+        return runtimeSelectJsonDotPath(selected, path["target.".len..]);
+    }
+    return runtimeSelectJsonDotPath(item, path);
 }
 
 fn runtimeSelectJsonDotPath(root: std.json.Value, path: []const u8) ?std.json.Value {
@@ -1782,10 +1829,13 @@ fn runtimeRenderGraphArtifactMetadataTemplateAlloc(
     doc_value: ?std.json.Value,
     item: std.json.Value,
     item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata_template_json, .{});
     defer parsed.deinit();
-    var rendered = try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, parsed.value, doc_key, doc_value, item, item_index);
+    var rendered = try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, parsed.value, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
     defer runtimeFreeGraphRenderedJsonValue(alloc, &rendered);
     return try std.json.Stringify.valueAlloc(alloc, rendered, .{});
 }
@@ -1797,13 +1847,16 @@ fn runtimeRenderGraphArtifactMetadataValueAlloc(
     doc_value: ?std.json.Value,
     item: std.json.Value,
     item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
 ) !std.json.Value {
     return switch (value) {
-        .string => |text| .{ .string = try runtimeRenderGraphArtifactTemplateAlloc(alloc, text, doc_key, doc_value, item, item_index) },
+        .string => |text| .{ .string = try runtimeRenderGraphArtifactTemplateAlloc(alloc, text, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value) },
         .array => |array| blk: {
             var out = std.json.Array.init(alloc);
             errdefer out.deinit();
-            for (array.items) |child| try out.append(try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, child, doc_key, doc_value, item, item_index));
+            for (array.items) |child| try out.append(try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, child, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
             break :blk .{ .array = out };
         },
         .object => |object| blk: {
@@ -1811,7 +1864,7 @@ fn runtimeRenderGraphArtifactMetadataValueAlloc(
             errdefer out.deinit(alloc);
             var it = object.iterator();
             while (it.next()) |entry| {
-                try out.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, entry.value_ptr.*, doc_key, doc_value, item, item_index));
+                try out.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, entry.value_ptr.*, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
             }
             break :blk .{ .object = out };
         },
@@ -1842,7 +1895,33 @@ fn runtimeFreeGraphRenderedJsonValue(alloc: Allocator, value: *std.json.Value) v
 fn runtimeJsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
     return switch (value) {
         .string => value.string,
-        .object => runtimeJsonStringField(value, "document_id") orelse runtimeJsonStringField(value, "doc_key") orelse runtimeJsonStringField(value, "key"),
+        .object => runtimeJsonStringField(value, "document_id") orelse runtimeJsonStringField(value, "doc_key") orelse runtimeJsonStringField(value, "key") orelse if (value.object.get("doc_ref")) |doc_ref| runtimeJsonEndpointDocumentId(doc_ref) else null,
+        else => null,
+    };
+}
+
+fn runtimeJsonEndpointDocumentIdResolved(value: std.json.Value, artifact_value: std.json.Value) ?[]const u8 {
+    return runtimeJsonEndpointDocumentId(value) orelse if (runtimeResolveGraphEndpointEntity(value, artifact_value)) |entity| runtimeJsonEndpointDocumentId(entity) else null;
+}
+
+fn runtimeResolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
+    if (value != .object) return null;
+    const entity_id = runtimeJsonStringField(value, "entity_id") orelse runtimeJsonStringField(value, "local_id") orelse return null;
+    return runtimeFindGraphArtifactEntity(artifact_value, entity_id);
+}
+
+fn runtimeFindGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []const u8) ?std.json.Value {
+    if (artifact_value != .object) return null;
+    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
+    return switch (entities) {
+        .array => |array| blk: {
+            for (array.items) |entity| {
+                const id = runtimeJsonStringField(entity, "id") orelse runtimeJsonStringField(entity, "local_id") orelse continue;
+                if (std.mem.eql(u8, id, entity_id)) break :blk entity;
+            }
+            break :blk null;
+        },
+        .object => entities.object.get(entity_id),
         else => null,
     };
 }
