@@ -1047,7 +1047,7 @@ else blk: {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
             const retained = try state.retain();
             defer retained.release();
-            return try std.Io.Dir.cwd().readFileAlloc(retained.threaded.io(), path, allocator, .limited(max_bytes));
+            return try readFileAllocSync(allocator, path, max_bytes);
         }
 
         fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
@@ -1154,6 +1154,32 @@ else blk: {
         }
     };
 };
+
+fn readFileAllocSync(allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
+        // Manifest/table full reads run during recovery; keep this path on
+        // direct positional file I/O instead of the shared threaded runtime.
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+
+        const fd = try std.posix.openatZ(std.posix.AT.FDCWD, path_z, .{
+            .ACCMODE = .RDONLY,
+            .CLOEXEC = true,
+        }, 0);
+        defer closeFd(fd);
+
+        const size = try fileSizeFromFd(fd);
+        if (size > max_bytes or size > std.math.maxInt(usize)) return error.StreamTooLong;
+        const out = try allocator.alloc(u8, @intCast(size));
+        errdefer allocator.free(out);
+        try readAllAtOffset(fd, out, 0);
+        return out;
+    }
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    return try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(max_bytes));
+}
 
 fn writeFileAbsoluteWithIo(io: anytype, path: []const u8, contents: []const u8) !void {
     var file = openFilePathForWriteWithIo(io, path, .{ .truncate = true }) catch |err| {
