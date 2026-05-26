@@ -2374,28 +2374,42 @@ Status as of 2026-05-19:
   documents at exhaustion; and the focused DOCID gate names mixed-version
   lifecycle classification plus stale-namespace range validation. The extended
   operational hardening gate now makes restart/partition chaos and compaction
-  chaos part of the explicit DOCID evidence path. The remaining DOCID work is
-  broader production-scale and real rolling-upgrade validation rather than a
-  known internal public-document-ID exchange path.
+  chaos part of the explicit DOCID evidence path. A follow-on focused hardening
+  pass adds deterministic interleaved split handoff coverage with writes,
+  query-summary checks, crash, and reopen; snapshot-generation reassignment
+  coverage that proves stale namespace writers reject and old generation
+  visibility still resolves to the same ordinals after canonical-ID rewrite;
+  mixed-version ShardDocSet wire fixtures that tolerate additive fields while
+  rejecting missing required namespace/generation data and invalid ordinals;
+  rolling merge validation for old status reporters that have not yet emitted
+  ordinal rows; shared cache prefix invalidation for ownership moves with
+  pinned old generations; and near-`u32` ordinal pressure simulation that
+  reassigns the final allocatable ordinal without allocating a production-scale
+  shard. The remaining DOCID work is broader production-scale and real
+  rolling-upgrade validation rather than a known internal public-document-ID
+  exchange path.
 
 ## Open Problems
 
 The hard parts are operational rather than syntactic:
 
 - production-scale ordinal stability coverage across async/background
-  compaction beyond the explicit LSM/full-text chaos gates
-- production multi-node split/merge/reassignment chaos with concurrent
-  query/write pressure beyond the deterministic metadata restart/partition
-  simulations
+  compaction beyond the explicit LSM/full-text chaos gates and deterministic
+  cache invalidation fixtures
+- production multi-node split/merge/reassignment chaos with sustained
+  concurrent query/write pressure beyond deterministic split handoff,
+  metadata restart/partition, and public traffic simulations
 - broader snapshot visibility and MVCC integration across public distributed
-  query paths
+  query paths beyond the focused generation-cutover identity coverage
 - rebuild validation beyond strict namespace repair/reopen checks
 - production shared/global bitmap cache invalidation beyond the structured
-  filter cache's namespace-and-generation key primitive
+  filter cache's namespace-and-generation key primitive and LSM cache
+  ownership-prefix invalidation coverage
 - very large shards that approach `u32` ordinal limits under production-scale
-  data volumes
+  data volumes, beyond the final-ordinal simulation
 - real old/new binary mixed-version rolling upgrades beyond doc-identity
-  lifecycle fail-closed fixtures
+  lifecycle fail-closed fixtures and internal wire/status compatibility
+  fixtures
 - continued audit that public query errors fail closed or use exact doc-key
   fallback when ordinal coverage is missing
 

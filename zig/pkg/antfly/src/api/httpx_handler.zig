@@ -169,12 +169,19 @@ pub const AntflyApiHandler = struct {
     ) !httpx.Response {
         const runtime = backend_runtime orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
         var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+        const job_alloc = std.heap.page_allocator;
+        const owned_table_name = try job_alloc.dupe(u8, table_name);
+        errdefer job_alloc.free(owned_table_name);
+        const owned_body_data = try job_alloc.dupe(u8, body_data);
+        errdefer job_alloc.free(owned_body_data);
         var job = OffloadedTableBatch{
-            .alloc = std.heap.page_allocator,
-            .table_name = table_name,
-            .body_data = body_data,
+            .alloc = job_alloc,
+            .table_name = owned_table_name,
+            .body_data = owned_body_data,
             .api = api,
         };
+        defer job_alloc.free(owned_table_name);
+        defer job_alloc.free(owned_body_data);
         var future = try runtime_io.concurrent(OffloadedTableBatch.run, .{&job});
         while (!job.done.load(.acquire)) {
             ctx.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
@@ -182,7 +189,7 @@ pub const AntflyApiHandler = struct {
         _ = future.await(runtime_io);
         if (job.err) |err| return err;
         var resp = job.result.?;
-        defer resp.deinit(std.heap.page_allocator);
+        defer resp.deinit(job_alloc);
         return respondApiResponseBody(ctx, resp.status, resp.body);
     }
 

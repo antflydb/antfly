@@ -12120,6 +12120,49 @@ test "index manager sim workloads stay green" {
     try runIndexManagerCrashCase(alloc, "index-manager-crash-default", 0xA17F_D201, 6);
 }
 
+test "index manager split handoff preserves interleaved write and query summaries" {
+    const alloc = std.testing.allocator;
+    const actions = [_]IndexManagerSimAction{
+        .{ .add_doc = .mixed_alpha_beta },
+        .{ .add_doc = .left_gamma },
+        .split_handoff,
+        .{ .add_doc = .mixed_alpha_beta },
+        .reopen,
+        .{ .add_doc = .right_beta },
+        .{ .add_doc = .left_alpha },
+    };
+
+    var source_path_buf: [256]u8 = undefined;
+    var dest_path_buf: [256]u8 = undefined;
+    const source_path = indexManagerTmpPathWithSuffix(&source_path_buf, "deterministic-split-src");
+    const dest_path = indexManagerTmpPathWithSuffix(&dest_path_buf, "deterministic-split-dst");
+    defer cleanupIndexManagerDir(source_path);
+    defer cleanupIndexManagerDir(dest_path);
+
+    var modeled_device = storage_sim.ModeledDevice.init(alloc);
+    defer modeled_device.deinit();
+    const backend_options = db_config.IndexBackendOptions{
+        .text_main_backend = .lsm,
+        .text_lsm_storage = modeled_device.storage(),
+        .dense_storage_backend = .lsm,
+        .dense_lsm_storage = modeled_device.storage(),
+        .graph_reverse_backend = .lsm,
+        .graph_lsm_storage = modeled_device.storage(),
+    };
+
+    var runtime = try IndexManagerSimRuntime.initWithOptions(alloc, source_path, dest_path, backend_options);
+    defer runtime.deinit();
+    for (actions, 0..) |action, step| {
+        try runtime.applyReplayAction(action, step);
+        const actual = try runtime.summary(alloc);
+        try expectIndexManagerSummaryEqual("deterministic-split-step", try expectedIndexManagerSummary(actions[0 .. step + 1]), actual);
+    }
+
+    try modeled_device.device().crash();
+    try runtime.reopen();
+    try expectIndexManagerSummaryEqual("deterministic-split-reopen", try expectedIndexManagerSummary(&actions), try runtime.summary(alloc));
+}
+
 test "index manager replay fixtures stay green" {
     try runIndexManagerReplayFixtures(std.testing.allocator);
 }

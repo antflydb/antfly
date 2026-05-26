@@ -323,3 +323,88 @@ test "doc filter wire round-trips ordinal and doc-key filters" {
     try std.testing.expect(parsed_filter.include.containsOrdinal(7));
     try std.testing.expectEqual(@as(usize, 2), parsed_filter.exclude.doc_keys.len);
 }
+
+test "doc filter wire rejects old required-field fixtures but tolerates additive fields" {
+    const alloc = std.testing.allocator;
+
+    const additive_fixture =
+        \\{
+        \\  "namespace": {
+        \\    "table_id": 1,
+        \\    "shard_id": 2,
+        \\    "range_id": 3,
+        \\    "future_owner_epoch": 99
+        \\  },
+        \\  "identity_read_generation": 8,
+        \\  "include": {
+        \\    "kind": "ordinals",
+        \\    "values": [5, 1, 5],
+        \\    "future_codec": "ignored"
+        \\  },
+        \\  "exclude": {
+        \\    "kind": "none"
+        \\  },
+        \\  "future_top_level": true
+        \\}
+    ;
+    var additive_json = try std.json.parseFromSlice(std.json.Value, alloc, additive_fixture, .{});
+    defer additive_json.deinit();
+    var parsed = try parseFilterEnvelopeAlloc(alloc, additive_json.value);
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.context.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
+    try std.testing.expectEqual(@as(u64, 8), parsed.context.identity_read_generation);
+    const additive_filter: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(parsed.resolved_doc_filter));
+    try std.testing.expect(additive_filter.include.containsOrdinal(1));
+    try std.testing.expect(additive_filter.include.containsOrdinal(5));
+
+    const missing_range_fixture =
+        \\{
+        \\  "namespace": {"table_id": 1, "shard_id": 2},
+        \\  "identity_read_generation": 8,
+        \\  "include": {"kind": "all"},
+        \\  "exclude": {"kind": "none"}
+        \\}
+    ;
+    var missing_range_json = try std.json.parseFromSlice(std.json.Value, alloc, missing_range_fixture, .{});
+    defer missing_range_json.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseFilterEnvelopeAlloc(alloc, missing_range_json.value));
+
+    const missing_generation_fixture =
+        \\{
+        \\  "namespace": {"table_id": 1, "shard_id": 2, "range_id": 3},
+        \\  "include": {"kind": "all"},
+        \\  "exclude": {"kind": "none"}
+        \\}
+    ;
+    var missing_generation_json = try std.json.parseFromSlice(std.json.Value, alloc, missing_generation_fixture, .{});
+    defer missing_generation_json.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseFilterEnvelopeAlloc(alloc, missing_generation_json.value));
+}
+
+test "doc filter wire rejects invalid ordinal fixtures from mixed-version senders" {
+    const alloc = std.testing.allocator;
+
+    const negative_fixture =
+        \\{
+        \\  "namespace": {"table_id": 1, "shard_id": 2, "range_id": 3},
+        \\  "identity_read_generation": 8,
+        \\  "include": {"kind": "ordinals", "values": [-1]},
+        \\  "exclude": {"kind": "none"}
+        \\}
+    ;
+    var negative_json = try std.json.parseFromSlice(std.json.Value, alloc, negative_fixture, .{});
+    defer negative_json.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseFilterEnvelopeAlloc(alloc, negative_json.value));
+
+    const overflow_fixture =
+        \\{
+        \\  "namespace": {"table_id": 1, "shard_id": 2, "range_id": 3},
+        \\  "identity_read_generation": 8,
+        \\  "include": {"kind": "ordinals", "values": [4294967296]},
+        \\  "exclude": {"kind": "none"}
+        \\}
+    ;
+    var overflow_json = try std.json.parseFromSlice(std.json.Value, alloc, overflow_fixture, .{});
+    defer overflow_json.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseFilterEnvelopeAlloc(alloc, overflow_json.value));
+}
