@@ -3817,9 +3817,10 @@ pub const Node = struct {
         });
     }
 
-    pub fn extractJSON(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed = (try ctx.parseJson(api.ExtractRequest)) orelse
+    pub fn extract(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const raw_body = (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        var parsed = api.server.parseExtractBody(ctx.allocator, raw_body) catch return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid extraction request" });
         defer parsed.deinit();
         const body = parsed.value;
         if (try self.acquireSlot(ctx)) |resp| return resp;
@@ -3830,21 +3831,66 @@ pub const Node = struct {
         if (body.model.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
         }
-        if (body.schema.map.count() == 0) {
+        const has_entities = if (body.schema.entities) |entities| entities.len > 0 else false;
+        const has_relations = if (body.schema.relations) |relations| relations.len > 0 else false;
+        const has_classifications = if (body.schema.classifications) |classifications| classifications.len > 0 else false;
+        const has_structures = if (body.schema.structures) |structures| structures.map.count() > 0 else false;
+        if (!has_entities and !has_relations and !has_classifications and !has_structures) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "schema is required" });
         }
+        if (body.inputs.len == 0) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "inputs are required" });
+        }
 
-        const texts = body.texts orelse &.{};
-        const images = body.images orelse &.{};
-        const has_texts = texts.len > 0;
-        const has_images = images.len > 0;
-        if (has_texts == has_images) {
+        var extracted_inputs = canonicalExtractionInputs(ctx.allocator, body.inputs) catch |err| switch (err) {
+            error.UnsupportedExtractionContent => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "each extraction input must contain text or one image content part",
+            }),
+            else => return err,
+        };
+        defer extracted_inputs.deinit(ctx.allocator);
+        if (extracted_inputs.hasTexts() == extracted_inputs.hasImages()) {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
-                .message = "exactly one of texts or images must be provided",
+                .message = "inputs must be all text or all image content",
             });
         }
-        const schemas = extraction_mod.parseSchemas(ctx.allocator, &body.schema) catch |err| {
+
+        const texts = extracted_inputs.texts.items;
+        const images = extracted_inputs.images.items;
+        const prompt_tokens = if (extracted_inputs.hasTexts()) estimateTextsTokens(texts) else 0;
+
+        if ((has_entities or has_relations) and !has_structures and !has_classifications) {
+            if (!extracted_inputs.hasTexts()) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "entity and relation extraction currently require text inputs",
+                });
+            }
+            const relation_labels = try canonicalRelationLabels(ctx.allocator, body.schema.relations);
+            defer ctx.allocator.free(relation_labels);
+            return self.extractEntitiesCanonical(ctx, body.model, texts, body.schema.entities, relation_labels, prompt_tokens);
+        }
+
+        if (has_classifications and !has_entities and !has_relations and !has_structures) {
+            if (!extracted_inputs.hasTexts()) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "classification extraction currently requires text inputs",
+                });
+            }
+            return self.extractClassificationsCanonical(ctx, body.model, texts, body.schema.classifications.?, prompt_tokens);
+        }
+
+        if (!has_structures) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "mixed extraction schemas are not yet supported by this model path",
+            });
+        }
+
+        const schemas = canonicalStructureSchemas(ctx.allocator, body.schema.structures.?) catch |err| {
             const message = try std.fmt.allocPrint(ctx.allocator, "invalid schema: {s}", .{@errorName(err)});
             defer ctx.allocator.free(message);
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = message });
@@ -3855,10 +3901,10 @@ pub const Node = struct {
         }
 
         const config = extraction_mod.ExtractionConfig{
-            .threshold = body.threshold orelse 0.3,
-            .flat_ner = body.flat_ner orelse true,
-            .include_confidence = body.include_confidence orelse false,
-            .include_spans = body.include_spans orelse false,
+            .threshold = if (body.options) |options| options.threshold orelse 0.3 else 0.3,
+            .flat_ner = if (body.options) |options| options.flat_ner orelse true else true,
+            .include_confidence = if (body.options) |options| options.include_confidence orelse false else false,
+            .include_spans = if (body.options) |options| options.include_spans orelse false else false,
         };
 
         const extractor_ctx = extractors_mod.Context{
@@ -3868,11 +3914,11 @@ pub const Node = struct {
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
         };
-        var extractor = extractors_mod.resolve(extractor_ctx, body.model, has_images) catch
+        var extractor = extractors_mod.resolve(extractor_ctx, body.model, extracted_inputs.hasImages()) catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
         defer extractor.deinit(ctx.allocator);
 
-        const results = (if (has_texts)
+        const results = (if (extracted_inputs.hasTexts())
             extractor.extractText(extractor_ctx, schemas, config, texts)
         else blk: {
             const image_datas = try self.downloadImagesForExtraction(ctx, images);
@@ -3881,13 +3927,13 @@ pub const Node = struct {
                 ctx.allocator.free(image_datas);
             }
             break :blk extractor.extractImages(extractor_ctx, schemas, config, image_datas, .{
-                .prompt = body.prompt,
-                .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else null,
+                .prompt = null,
+                .max_tokens = null,
             });
         }) catch |err| switch (err) {
             error.UnsupportedInput => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",
-                .message = if (has_images)
+                .message = if (extracted_inputs.hasImages())
                     "model does not support image extraction"
                 else
                     "model does not support text extraction",
@@ -3919,13 +3965,141 @@ pub const Node = struct {
             ctx.allocator.free(results);
         }
 
-        const prompt_tokens = if (has_texts)
-            estimateTextsTokens(texts)
-        else if (body.prompt) |prompt|
-            estimateTextTokens(prompt) * images.len
-        else
-            0;
-        return buildExtractionResponse(ctx, body.model, results, prompt_tokens);
+        return buildCanonicalStructureExtractionResponse(ctx, body.model, body.inputs, results, prompt_tokens);
+    }
+
+    fn extractEntitiesCanonical(
+        self: *Node,
+        ctx: *httpx.Context,
+        model_name_raw: []const u8,
+        texts: []const []const u8,
+        labels: ?[]const []const u8,
+        relation_labels: []const []const u8,
+        prompt_tokens: usize,
+    ) !httpx.Response {
+        const model_name: ?[]const u8 = if (model_name_raw.len > 0) model_name_raw else null;
+        const model_path = self.resolveModelPath(ctx.io, model_name, "recognizers") catch
+            return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
+        if (rebel_mod.isRebelModel(ctx.allocator, model_path)) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "REBEL extraction is not wired to the canonical extraction response yet" });
+        }
+
+        const model = self.model_manager.loadFromDir(model_path) catch |err|
+            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+        if (model.isGlinerModel()) {
+            var pipeline = model.glinerPipeline(ctx.allocator);
+            if (relation_labels.len > 0) {
+                if (!model.supportsRelationExtraction() or !pipeline.supportsRelationExtraction()) {
+                    return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model does not support relation extraction" });
+                }
+                const extracted = pipeline.extractRelationsBatch(texts, labels, relation_labels) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                defer {
+                    for (extracted.entities) |entities| {
+                        for (entities) |entity| ctx.allocator.free(entity.text);
+                        ctx.allocator.free(entities);
+                    }
+                    ctx.allocator.free(extracted.entities);
+                    for (extracted.relations) |relations| {
+                        for (relations) |*relation| relation.deinit(ctx.allocator);
+                        ctx.allocator.free(relations);
+                    }
+                    ctx.allocator.free(extracted.relations);
+                }
+                return buildCanonicalEntityExtractionResponse(ctx, model_name_raw, extracted.entities, extracted.relations, prompt_tokens);
+            }
+
+            const all_entities = pipeline.recognizeBatch(texts, labels) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            defer {
+                for (all_entities) |entities| {
+                    for (entities) |entity| ctx.allocator.free(entity.text);
+                    ctx.allocator.free(entities);
+                }
+                ctx.allocator.free(all_entities);
+            }
+            const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, try model.getCleanupHead(), texts, all_entities);
+            defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
+            return buildCanonicalEntityExtractionResponse(ctx, model_name_raw, cleaned_entities orelse all_entities, null, prompt_tokens);
+        }
+
+        if (relation_labels.len > 0) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model does not support relation extraction" });
+        }
+
+        var pipeline = model.nerPipeline(ctx.allocator);
+        const all_entities = pipeline.recognizeBatch(texts) catch |err|
+            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+        defer {
+            for (all_entities) |entities| {
+                for (entities) |entity| ctx.allocator.free(entity.text);
+                ctx.allocator.free(entities);
+            }
+            ctx.allocator.free(all_entities);
+        }
+        const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, try model.getCleanupHead(), texts, all_entities);
+        defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
+        return buildCanonicalEntityExtractionResponse(ctx, model_name_raw, cleaned_entities orelse all_entities, null, prompt_tokens);
+    }
+
+    fn extractClassificationsCanonical(
+        self: *Node,
+        ctx: *httpx.Context,
+        model_name_raw: []const u8,
+        texts: []const []const u8,
+        schemas: anytype,
+        prompt_tokens: usize,
+    ) !httpx.Response {
+        if (schemas.len == 0) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "classification schema is required" });
+        const schema = schemas[0];
+        const model_name: ?[]const u8 = if (model_name_raw.len > 0) model_name_raw else null;
+        if (self.resolveModelPath(ctx.io, model_name, "classifiers")) |model_path| {
+            const model = self.model_manager.loadFromDir(model_path) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            const entailment_idx: ?usize = if (model.manifest.id2label) |labels| blk: {
+                for (labels, 0..) |label, i| {
+                    if (std.mem.eql(u8, label, "entailment") or std.mem.eql(u8, label, "ENTAILMENT")) break :blk i;
+                }
+                break :blk null;
+            } else null;
+            const config = @import("../pipelines/classification.zig").ClassificationConfig{
+                .max_length = model.manifest.max_position_embeddings,
+                .hypothesis_template = "This example is {}.",
+                .multi_label = schema.multi_label orelse false,
+                .entailment_index = entailment_idx,
+            };
+            var pipeline = model.classificationPipeline(ctx.allocator, config);
+            const all_results = pipeline.classifyBatch(texts, schema.labels) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            defer {
+                for (all_results) |results| ctx.allocator.free(results);
+                ctx.allocator.free(all_results);
+            }
+            return buildCanonicalClassificationExtractionResponse(ctx, model_name_raw, schema.name, all_results, prompt_tokens);
+        } else |_| {}
+
+        if (self.resolveModelPath(ctx.io, model_name, "recognizers")) |model_path| {
+            const model = self.model_manager.loadFromDir(model_path) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            if (!model.isGlinerModel() or !model.supportsClassification()) {
+                return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
+            }
+            var pipeline = model.glinerPipeline(ctx.allocator);
+            const all_results = pipeline.classifyBatch(texts, schema.labels, .{
+                .threshold = 0.0,
+                .multi_label = schema.multi_label orelse false,
+            }) catch |err| switch (err) {
+                error.MissingSpecialTokenIds => return ctx.status(500).json(.{ .@"error" = "MODEL_CONFIG_INVALID", .message = @errorName(err) }),
+                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            };
+            defer {
+                for (all_results) |results| ctx.allocator.free(results);
+                ctx.allocator.free(all_results);
+            }
+            return buildCanonicalClassificationExtractionResponse(ctx, model_name_raw, schema.name, all_results, prompt_tokens);
+        } else |_| {}
+
+        return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
     }
 
     fn downloadImagesForExtraction(self: *Node, ctx: *httpx.Context, images: []const api.ImageURL) ![][]const u8 {
@@ -4194,6 +4368,400 @@ pub const Node = struct {
         });
     }
 };
+
+const CanonicalExtractionInputs = struct {
+    texts: std.ArrayListUnmanaged([]const u8) = .empty,
+    images: std.ArrayListUnmanaged(api.ImageURL) = .empty,
+    allocated_image_urls: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    fn hasTexts(self: @This()) bool {
+        return self.texts.items.len > 0;
+    }
+
+    fn hasImages(self: @This()) bool {
+        return self.images.items.len > 0;
+    }
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        for (self.texts.items) |text| allocator.free(text);
+        self.texts.deinit(allocator);
+        for (self.allocated_image_urls.items) |url| allocator.free(url);
+        self.allocated_image_urls.deinit(allocator);
+        self.images.deinit(allocator);
+    }
+};
+
+fn canonicalExtractionInputs(allocator: std.mem.Allocator, inputs: anytype) !CanonicalExtractionInputs {
+    var out = CanonicalExtractionInputs{};
+    errdefer out.deinit(allocator);
+    for (inputs) |input| {
+        const parsed = try canonicalInputContent(allocator, input.content);
+        switch (parsed) {
+            .text => |text| try out.texts.append(allocator, text),
+            .image_url => |url| {
+                try out.allocated_image_urls.append(allocator, url);
+                try out.images.append(allocator, .{ .url = url });
+            },
+        }
+    }
+    return out;
+}
+
+const CanonicalInputContent = union(enum) {
+    text: []const u8,
+    image_url: []const u8,
+};
+
+fn canonicalInputContent(allocator: std.mem.Allocator, content: std.json.Value) !CanonicalInputContent {
+    switch (content) {
+        .string => |text| return .{ .text = try allocator.dupe(u8, text) },
+        .object => return try canonicalInputPart(allocator, content),
+        .array => |parts| {
+            var text = std.ArrayListUnmanaged(u8).empty;
+            errdefer text.deinit(allocator);
+            for (parts.items) |part| {
+                const parsed = try canonicalInputPart(allocator, part);
+                switch (parsed) {
+                    .image_url => |url| {
+                        text.deinit(allocator);
+                        return .{ .image_url = url };
+                    },
+                    .text => |part_text| {
+                        defer allocator.free(part_text);
+                        if (text.items.len > 0) try text.append(allocator, '\n');
+                        try text.appendSlice(allocator, part_text);
+                    },
+                }
+            }
+            if (text.items.len == 0) return error.UnsupportedExtractionContent;
+            return .{ .text = try text.toOwnedSlice(allocator) };
+        },
+        else => return error.UnsupportedExtractionContent,
+    }
+}
+
+fn canonicalInputPart(allocator: std.mem.Allocator, part: std.json.Value) !CanonicalInputContent {
+    if (part != .object) return error.UnsupportedExtractionContent;
+    if (part.object.get("text")) |text_value| {
+        if (text_value == .string) return .{ .text = try allocator.dupe(u8, text_value.string) };
+    }
+    if (part.object.get("image_url")) |image_url_value| {
+        if (image_url_value == .object) {
+            if (image_url_value.object.get("url")) |url_value| {
+                if (url_value == .string) return .{ .image_url = try allocator.dupe(u8, url_value.string) };
+            }
+        }
+    }
+    if (part.object.get("data")) |data_value| {
+        if (data_value == .string) {
+            const mime_type = if (part.object.get("mime_type")) |mime_value|
+                if (mime_value == .string) mime_value.string else "application/octet-stream"
+            else
+                "application/octet-stream";
+            if (!std.mem.startsWith(u8, mime_type, "image/")) return error.UnsupportedExtractionContent;
+            return .{ .image_url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ mime_type, data_value.string }) };
+        }
+    }
+    return error.UnsupportedExtractionContent;
+}
+
+fn canonicalRelationLabels(allocator: std.mem.Allocator, relations: anytype) ![]const []const u8 {
+    const relation_slice = relations orelse return try allocator.alloc([]const u8, 0);
+    const labels = try allocator.alloc([]const u8, relation_slice.len);
+    for (relation_slice, 0..) |relation, i| labels[i] = relation.type;
+    return labels;
+}
+
+fn canonicalStructureSchemas(
+    allocator: std.mem.Allocator,
+    structures: anytype,
+) ![]extraction_mod.ExtractionSchema {
+    var schemas = std.ArrayListUnmanaged(extraction_mod.ExtractionSchema).empty;
+    errdefer {
+        for (schemas.items) |*schema| schema.deinit(allocator);
+        schemas.deinit(allocator);
+    }
+
+    var it = structures.map.iterator();
+    while (it.next()) |entry| {
+        const struct_name = std.mem.trim(u8, entry.key_ptr.*, " \t\r\n");
+        if (struct_name.len == 0) return error.EmptyStructureName;
+        const fields_map = entry.value_ptr.fields orelse return error.EmptyStructureFields;
+        if (fields_map.map.count() == 0) return error.EmptyStructureFields;
+
+        const schema_name = try allocator.dupe(u8, struct_name);
+        errdefer allocator.free(schema_name);
+        var fields = std.ArrayListUnmanaged(extraction_mod.SchemaField).empty;
+        errdefer {
+            for (fields.items) |*field| field.deinit(allocator);
+            fields.deinit(allocator);
+        }
+
+        var fields_it = fields_map.map.iterator();
+        while (fields_it.next()) |field_entry| {
+            const field_name = std.mem.trim(u8, field_entry.key_ptr.*, " \t\r\n");
+            if (field_name.len == 0) return error.EmptyFieldName;
+            const field_type: extraction_mod.FieldType = if (canonicalStructureFieldIsList(field_entry.value_ptr.*)) .list else .str;
+            try fields.append(allocator, .{
+                .name = try allocator.dupe(u8, field_name),
+                .field_type = field_type,
+                .choices = &.{},
+            });
+        }
+
+        try schemas.append(allocator, .{
+            .name = schema_name,
+            .fields = try fields.toOwnedSlice(allocator),
+        });
+    }
+
+    return try schemas.toOwnedSlice(allocator);
+}
+
+fn canonicalStructureFieldIsList(value: std.json.Value) bool {
+    if (value == .string) return std.mem.eql(u8, value.string, "list");
+    if (value == .object) {
+        if (value.object.get("type")) |type_value| {
+            return type_value == .string and std.mem.eql(u8, type_value.string, "list");
+        }
+    }
+    return false;
+}
+
+test "canonical extraction content accepts text parts and image urls" {
+    const allocator = std.testing.allocator;
+    var parsed_text = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[
+        \\  {"type":"text","text":"one"},
+        \\  {"type":"text","text":"two"}
+        \\]
+    , .{});
+    defer parsed_text.deinit();
+    const text_content = try canonicalInputContent(allocator, parsed_text.value);
+    defer switch (text_content) {
+        .text => |text| allocator.free(text),
+        .image_url => |url| allocator.free(url),
+    };
+    switch (text_content) {
+        .text => |text| try std.testing.expectEqualStrings("one\ntwo", text),
+        .image_url => return error.ExpectedTextContent,
+    }
+
+    var parsed_image = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"type":"image_url","image_url":{"url":"data:image/png;base64,aaa"}}
+    , .{});
+    defer parsed_image.deinit();
+    const image_content = try canonicalInputContent(allocator, parsed_image.value);
+    defer switch (image_content) {
+        .text => |text| allocator.free(text),
+        .image_url => |url| allocator.free(url),
+    };
+    switch (image_content) {
+        .image_url => |url| try std.testing.expectEqualStrings("data:image/png;base64,aaa", url),
+        .text => return error.ExpectedImageContent,
+    }
+}
+
+test "canonical structure schemas map field objects to extraction fields" {
+    const allocator = std.testing.allocator;
+    const TestStructureSchema = struct {
+        fields: ?std.json.ArrayHashMap(std.json.Value) = null,
+    };
+    var parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(TestStructureSchema), allocator,
+        \\{
+        \\  "invoice": {
+        \\    "fields": {
+        \\      "vendor": "organization",
+        \\      "line_items": {"type": "list"}
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    defer parsed.deinit();
+
+    const schemas = try canonicalStructureSchemas(allocator, parsed.value);
+    defer {
+        for (schemas) |*schema| schema.deinit(allocator);
+        allocator.free(schemas);
+    }
+    try std.testing.expectEqual(@as(usize, 1), schemas.len);
+    try std.testing.expectEqualStrings("invoice", schemas[0].name);
+    try std.testing.expectEqual(@as(usize, 2), schemas[0].fields.len);
+    try std.testing.expectEqualStrings("vendor", schemas[0].fields[0].name);
+    try std.testing.expectEqual(extraction_mod.FieldType.str, schemas[0].fields[0].field_type);
+    try std.testing.expectEqualStrings("line_items", schemas[0].fields[1].name);
+    try std.testing.expectEqual(extraction_mod.FieldType.list, schemas[0].fields[1].field_type);
+}
+
+const CanonicalExtractionEntity = struct {
+    label: []const u8,
+    text: []const u8,
+    start: ?i64 = null,
+    end: ?i64 = null,
+    score: ?f32 = null,
+};
+
+const CanonicalExtractionRelationEndpoint = struct {
+    entity_index: ?i64 = null,
+};
+
+const CanonicalExtractionRelation = struct {
+    type: []const u8,
+    source: ?CanonicalExtractionRelationEndpoint = null,
+    target: ?CanonicalExtractionRelationEndpoint = null,
+    score: ?f32 = null,
+};
+
+const CanonicalExtractionClassification = struct {
+    name: []const u8,
+    label: []const u8,
+    score: ?f32 = null,
+};
+
+const CanonicalExtractionObject = struct {
+    id: ?[]const u8 = null,
+    entities: ?[]const CanonicalExtractionEntity = null,
+    relations: ?[]const CanonicalExtractionRelation = null,
+    classifications: ?[]const CanonicalExtractionClassification = null,
+    structures: ?std.json.Value = null,
+};
+
+fn buildCanonicalEntityExtractionResponse(
+    ctx: *httpx.Context,
+    model_name: []const u8,
+    all_entities: []const []const @import("../pipelines/ner.zig").Entity,
+    all_relations: ?[]const []const gliner_mod.Relation,
+    prompt_tokens: usize,
+) !httpx.Response {
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const data = try alloc.alloc(CanonicalExtractionObject, all_entities.len);
+    for (all_entities, 0..) |entities, i| {
+        const out_entities = try alloc.alloc(CanonicalExtractionEntity, entities.len);
+        for (entities, 0..) |entity, entity_index| {
+            out_entities[entity_index] = .{
+                .label = entity.label,
+                .text = entity.text,
+                .start = @intCast(entity.start),
+                .end = @intCast(entity.end),
+                .score = entity.score,
+            };
+        }
+
+        const out_relations: ?[]const CanonicalExtractionRelation = if (all_relations) |relations_by_input| blk: {
+            const relations = if (i < relations_by_input.len) relations_by_input[i] else &.{};
+            const relation_values = try alloc.alloc(CanonicalExtractionRelation, relations.len);
+            for (relations, 0..) |relation, relation_index| {
+                relation_values[relation_index] = .{
+                    .type = relation.label,
+                    .source = .{ .entity_index = findCanonicalEntityIndex(entities, relation.head) },
+                    .target = .{ .entity_index = findCanonicalEntityIndex(entities, relation.tail) },
+                    .score = relation.score,
+                };
+            }
+            break :blk relation_values;
+        } else null;
+
+        data[i] = .{
+            .entities = out_entities,
+            .relations = out_relations,
+        };
+    }
+
+    return ctx.json(.{
+        .object = "extraction",
+        .model = model_name,
+        .data = data,
+        .usage = tokenUsage(prompt_tokens, 0),
+    });
+}
+
+fn findCanonicalEntityIndex(entities: []const @import("../pipelines/ner.zig").Entity, target: @import("../pipelines/ner.zig").Entity) ?i64 {
+    for (entities, 0..) |entity, i| {
+        if (entity.start == target.start and entity.end == target.end and
+            std.mem.eql(u8, entity.text, target.text) and std.mem.eql(u8, entity.label, target.label))
+        {
+            return @intCast(i);
+        }
+    }
+    return null;
+}
+
+fn buildCanonicalClassificationExtractionResponse(
+    ctx: *httpx.Context,
+    model_name: []const u8,
+    classification_name: []const u8,
+    all_results: anytype,
+    prompt_tokens: usize,
+) !httpx.Response {
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const data = try alloc.alloc(CanonicalExtractionObject, all_results.len);
+    for (all_results, 0..) |results, i| {
+        const classifications = try alloc.alloc(CanonicalExtractionClassification, results.len);
+        for (results, 0..) |result, j| {
+            classifications[j] = .{
+                .name = classification_name,
+                .label = result.label,
+                .score = result.score,
+            };
+        }
+        data[i] = .{ .classifications = classifications };
+    }
+
+    return ctx.json(.{
+        .object = "extraction",
+        .model = model_name,
+        .data = data,
+        .usage = tokenUsage(prompt_tokens, 0),
+    });
+}
+
+fn buildCanonicalStructureExtractionResponse(
+    ctx: *httpx.Context,
+    model_name: []const u8,
+    inputs: anytype,
+    all_results: []const extraction_mod.ExtractionResult,
+    prompt_tokens: usize,
+) !httpx.Response {
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const data = try alloc.alloc(CanonicalExtractionObject, all_results.len);
+    for (all_results, 0..) |result, result_index| {
+        var structures_obj: std.json.ObjectMap = .empty;
+        try structures_obj.ensureTotalCapacity(alloc, result.structures.len);
+        for (result.structures) |structure| {
+            const instances = try alloc.alloc(std.json.Value, structure.instances.len);
+            for (structure.instances, 0..) |instance, instance_index| {
+                var instance_obj: std.json.ObjectMap = .empty;
+                try instance_obj.ensureTotalCapacity(alloc, instance.fields.len);
+                for (instance.fields) |field| {
+                    try instance_obj.put(alloc, field.name, try extractedFieldToValue(alloc, field.value));
+                }
+                instances[instance_index] = .{ .object = instance_obj };
+            }
+            structures_obj.putAssumeCapacity(structure.name, .{ .array = std.json.Array.fromOwnedSlice(alloc, instances) });
+        }
+
+        data[result_index] = .{
+            .id = if (result_index < inputs.len) inputs[result_index].id else null,
+            .structures = .{ .object = structures_obj },
+        };
+    }
+
+    return ctx.json(.{
+        .object = "extraction",
+        .model = model_name,
+        .data = data,
+        .usage = tokenUsage(prompt_tokens, 0),
+    });
+}
 
 fn buildClassificationResponse(
     ctx: *httpx.Context,

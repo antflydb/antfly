@@ -30,6 +30,7 @@ const chunking_types = @import("../chunking/types.zig");
 const termite_chunker = @import("termite_chunker");
 const transcribing = @import("antfly_transcribing");
 const readers = @import("antfly_readers");
+const extracting = @import("antfly_extracting");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
     @import("../storage/db/template_stub.zig")
 else
@@ -102,6 +103,12 @@ pub const LocalTermiteProvider = struct {
         model: []const u8,
         request: readers.Request,
     ) anyerror![]readers.Result = null,
+    extract: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: extracting.Request,
+    ) anyerror!extracting.Response = null,
 };
 
 pub const InitOptions = struct {

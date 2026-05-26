@@ -11,7 +11,7 @@ info:
     - **Embedding Generation**: OpenAI-compatible text embedding endpoints, with dense or sparse embedding payloads
     - **Text Chunking**: Semantic chunking with ONNX models or fixed-size fallback
     - **Reranking**: Relevance re-scoring for search results
-    - **Named Entity Recognition**: Extract persons, organizations, locations from text
+    - **Extraction**: Schema-driven entity, relation, classification, and structured extraction
     - **Text Rewriting**: Transform text using Seq2Seq models (question generation, query generation, etc.)
 
     Download the latest release at https://antfly.io/docs/downloads
@@ -363,240 +363,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-  /recognize:
-    post:
-      summary: Recognize named entities
-      description: |
-        Recognizes named entities (persons, organizations, locations, etc.) from text using ONNX recognition models.
-
-        ## Entity Types
-
-        Standard CoNLL entity types:
-        - **PER**: Person names (e.g., "John Smith")
-        - **ORG**: Organizations (e.g., "Google", "Apple Inc.")
-        - **LOC**: Locations (e.g., "New York", "France")
-        - **MISC**: Miscellaneous entities
-
-        ## Models
-
-        - Models are auto-discovered from `models_dir/recognizers/`
-        - Supports quantized variants (model_i8.onnx)
-        - Compatible with HuggingFace BERT-based recognition models
-        - GLiNER models support custom entity labels via the `labels` parameter
-      operationId: recognizeEntities
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/RecognizeRequest'
-      responses:
-        '200':
-          description: Entities extracted successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/RecognizeResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '404':
-          description: Model not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '503':
-          description: Recognition service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-  /classify:
-    post:
-      summary: Zero-shot text classification
-      description: |
-        Classifies text into arbitrary categories using NLI-based zero-shot classification models.
-
-        ## How It Works
-
-        Zero-shot classification uses Natural Language Inference (NLI) to classify text
-        without requiring training data for the specific categories. The model determines
-        how well a text "entails" each candidate label.
-
-        ## Models
-
-        - Models are auto-discovered from `models_dir/classifiers/`
-        - Supports multilingual models like mDeBERTa-mnli-xnli
-        - Compatible with HuggingFace NLI/MNLI models exported to ONNX
-
-        ## Use Cases
-
-        - **Sentiment Analysis**: Classify as positive/negative/neutral
-        - **Topic Classification**: Categorize by topic without training
-        - **Intent Detection**: Identify user intents from text
-        - **Content Moderation**: Detect inappropriate content types
-
-        ## Multilingual Support
-
-        The mDeBERTa-mnli-xnli model supports 100+ languages. You can classify text
-        in any supported language using labels in that language.
-      operationId: classifyText
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ClassifyRequest'
-      responses:
-        '200':
-          description: Classification completed successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ClassifyResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '404':
-          description: Model not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-
-  /classify/document:
-    post:
-      summary: Document classification
-      description: |
-        Runs a native document classification head against a document image.
-
-        This endpoint serves `layoutdoc_sequence_head.safetensors` artifacts produced by
-        the Zig finetuning stack. It currently reconstructs the same compact visual/layout
-        feature vector used by the training code and applies the saved sequence head.
-
-        ## Current Scope
-
-        - Native `layoutdoc_sequence_head` checkpoints only
-        - Local image path input only
-        - Caller must supply labels in model output order
-        - Supports JPEG, PNG, and JPEG2000 image files
-
-        ## Not Yet Included
-
-        - Served `layoutdoc_token_head`
-        - OCR token / bbox request shapes
-        - Label vocab discovery from checkpoint artifacts
-      operationId: classifyDocument
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/DocumentClassificationRequest'
-      responses:
-        '200':
-          description: Document classification completed successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DocumentClassificationResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '404':
-          description: Model or image not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-
-  /classify/document_tokens:
-    post:
-      summary: Document token classification
-      description: |
-        Runs a native document token classification head against caller-provided OCR tokens and bounding boxes.
-
-        This endpoint serves `layoutdoc_token_head.safetensors` artifacts produced by the
-        Zig finetuning stack. It reconstructs the same compact 6-dimensional token feature
-        vector used by the training code for each OCR token.
-
-        ## Current Scope
-
-        - Native `layoutdoc_token_head` checkpoints only
-        - Caller-provided OCR token text and bboxes
-        - Caller must supply labels in model output order
-
-        ## Not Yet Included
-
-        - OCR extraction inside this endpoint
-        - Sequence-head image features
-        - Label vocab discovery from checkpoint artifacts
-      operationId: classifyDocumentTokens
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/DocumentTokenClassificationRequest'
-      responses:
-        '200':
-          description: Document token classification completed successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DocumentTokenClassificationResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '404':
-          description: Model not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '503':
-          description: Classification service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
   /rewrite:
     post:
       summary: Rewrite text using Seq2Seq models
@@ -798,69 +564,26 @@ paths:
                 $ref: '#/components/schemas/Error'
   /extract:
     post:
-      summary: Extract structured data from text
+      summary: Extract entities, relations, classifications, and structures
       description: |
-        Extracts structured data from text using GLiNER2 models.
-        Field names in the schema are treated as NER labels, and the model's
-        span extraction pipeline populates field values.
-
-        ## Schema Format
-
-        The schema maps structure names to arrays of field definitions:
-        ```json
-        {
-          "person": ["name::str", "age::str", "skills::list"]
-        }
-        ```
-
-        Field types:
-        - `::str` - Keep only the top-scoring span (default if no type specified)
-        - `::list` - Keep all extracted spans as an array
-        - `::[opt1|opt2]::str` - Choice field, classified against options
-
-        ## Example
-
-        ```json
-        {
-          "model": "fastino/gliner2-base-v1",
-          "texts": ["John Smith is 30 years old and works at Google."],
-          "schema": {
-            "person": ["name::str", "age::str", "company::str"]
-          }
-        }
-        ```
-
-        Response:
-        ```json
-        {
-          "model": "fastino/gliner2-base-v1",
-          "results": [
-            {
-              "person": [
-                {
-                  "name": {"value": "John Smith"},
-                  "age": {"value": "30"},
-                  "company": {"value": "Google"}
-                }
-              ]
-            }
-          ]
-        }
-        ```
-      operationId: extractJSON
+        Schema-driven extraction over shared AI content parts. This is the
+        canonical public API for named entity recognition, relation extraction,
+        text/document classification, token classification, and structured
+        document extraction.
+      operationId: extract
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ExtractRequest'
+              $ref: '../ai/extraction.yaml#/components/schemas/ExtractionRequest'
       responses:
         '200':
           description: Extraction completed successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ExtractResponse'
+                $ref: '../ai/extraction.yaml#/components/schemas/ExtractionResponse'
         '400':
           description: Invalid request
           content:

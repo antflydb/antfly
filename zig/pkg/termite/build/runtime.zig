@@ -477,8 +477,10 @@ fn addTermiteApiModule(
             .target = target,
             .optimize = optimize,
         });
+        const ai_messages_mod = addAiMessagesOpenApiModule(b, target, optimize, paths);
         mod.addImport("httpx", httpx_mod);
-        mod.addImport("antfly_ai_messages_openapi", addAiMessagesOpenApiModule(b, target, optimize, paths));
+        mod.addImport("antfly_ai_messages_openapi", ai_messages_mod);
+        mod.addImport("antfly_extraction_openapi", addExtractionOpenApiModule(b, target, optimize, paths, ai_messages_mod));
         return mod;
     }
 
@@ -502,6 +504,7 @@ fn addTermiteApiModule(
     codegen.addArgs(&.{ "--generate", "types,server,client" });
     codegen.addArgs(&.{"--import-mapping"});
     codegen.addArg(b.fmt("{s}={s}", .{ "../ai/messages.yaml", "antfly_ai_messages_openapi" }));
+    codegen.addArg(b.fmt("{s}={s}", .{ "../ai/extraction.yaml", "antfly_extraction_openapi" }));
     codegen.addArg("--output");
     const gen_dir = codegen.addOutputDirectoryArg("termite_api");
     const mod = addOrCreateModule(b, register_public_modules, "termite_api", .{
@@ -509,8 +512,10 @@ fn addTermiteApiModule(
         .target = target,
         .optimize = optimize,
     });
+    const ai_messages_mod = addAiMessagesOpenApiModule(b, target, optimize, paths);
     mod.addImport("httpx", httpx_mod);
-    mod.addImport("antfly_ai_messages_openapi", addAiMessagesOpenApiModule(b, target, optimize, paths));
+    mod.addImport("antfly_ai_messages_openapi", ai_messages_mod);
+    mod.addImport("antfly_extraction_openapi", addExtractionOpenApiModule(b, target, optimize, paths, ai_messages_mod));
     return mod;
 }
 
@@ -525,6 +530,22 @@ fn addAiMessagesOpenApiModule(
         .target = target,
         .optimize = optimize,
     });
+}
+
+fn addExtractionOpenApiModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    paths: Paths,
+    ai_messages_mod: *std.Build.Module,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("antfly_ai_messages_openapi", ai_messages_mod);
+    return mod;
 }
 
 fn addTokenizerDataModule(b: *std.Build, paths: Paths, register_public_modules: bool) *std.Build.Module {

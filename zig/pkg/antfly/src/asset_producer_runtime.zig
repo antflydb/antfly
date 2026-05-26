@@ -19,6 +19,7 @@ const managed_embedder = @import("inference/managed_embedder.zig");
 const common_secrets = @import("common/secrets.zig");
 const readers = @import("antfly_readers");
 const transcribing = @import("antfly_transcribing");
+const extracting = @import("antfly_extracting");
 const asset_producer = @import("storage/db/enrichment/asset_producer.zig");
 
 const Allocator = std.mem.Allocator;
@@ -98,6 +99,7 @@ pub const Runtime = struct {
             .generator => try self.generate(alloc, request),
             .reader => try self.read(alloc, request),
             .transcriber => try self.transcribe(alloc, request),
+            .extractor => try self.extract(alloc, request),
         };
     }
 
@@ -207,6 +209,32 @@ pub const Runtime = struct {
         }
         return try alloc.dupe(u8, result.text orelse "");
     }
+
+    fn extract(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+        var cfg = try extracting.parseConfigFromSlice(alloc, request.config_json);
+        defer cfg.deinit(alloc);
+
+        const content_json = try extractionContentJsonAlloc(alloc, request.source_text, request.source_parts_json);
+        defer alloc.free(content_json);
+        const input = extracting.Input{ .content_json = content_json };
+        const extract_request = extracting.Request{
+            .inputs = &.{input},
+            .schema_json = cfg.schema_json,
+            .options_json = cfg.options_json,
+        };
+
+        var response = if (cfg.provider == .antfly and cfg.resolvedUrl() == null) blk: {
+            const local = self.local_termite_provider orelse return error.UnsupportedExtractionProvider;
+            const extract_fn = local.extract orelse return error.UnsupportedExtractionProvider;
+            break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request);
+        } else try extracting.extractWithConfig(alloc, self.http, cfg, extract_request);
+        defer response.deinit();
+
+        if (isJsonContentType(request.content_type) or request.content_type.len == 0) {
+            return try extracting.firstResultJsonAlloc(alloc, response.json);
+        }
+        return try alloc.dupe(u8, response.json);
+    }
 };
 
 const ReaderSource = struct {
@@ -289,6 +317,13 @@ fn encodeReaderResults(alloc: Allocator, content_type: []const u8, results: []co
 fn isJsonContentType(content_type: []const u8) bool {
     return std.mem.eql(u8, content_type, "application/json") or
         std.mem.endsWith(u8, content_type, "+json");
+}
+
+fn extractionContentJsonAlloc(alloc: Allocator, source_text: []const u8, source_parts_json: ?[]const u8) ![]u8 {
+    if (source_parts_json) |raw_parts| {
+        if (raw_parts.len > 0) return try alloc.dupe(u8, raw_parts);
+    }
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(source_text, .{})});
 }
 
 fn parseGeneratorContentParts(alloc: Allocator, source_text: []const u8, raw_parts: []const u8) ![]generating_runtime.ContentPart {
@@ -536,4 +571,63 @@ test "asset producer runtime routes antfly transcriber without url to local prov
 
     try std.testing.expectEqualStrings("local transcript", result);
     try std.testing.expectEqual(@as(usize, 1), local.transcribe_calls);
+}
+
+test "asset producer runtime routes antfly extractor without url to local provider" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Local = struct {
+        extract_calls: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.LocalTermiteProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .extract = extract,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.extract_calls += 1;
+            try std.testing.expectEqualStrings("local-extractor", model);
+            try std.testing.expectEqual(@as(usize, 1), request.inputs.len);
+            try std.testing.expect(std.mem.indexOf(u8, request.inputs[0].content_json, "Ada") != null);
+            try std.testing.expect(std.mem.indexOf(u8, request.schema_json, "person") != null);
+            return .{
+                .allocator = a,
+                .json = try a.dupe(u8, "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\"}],\"relations\":[]}]}"),
+            };
+        }
+    };
+
+    var local = Local{};
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .local_termite_provider = local.provider() });
+    const producer = runtime.producer();
+
+    const result = try producer.produce(alloc, .{
+        .producer_type = .extractor,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"local-extractor\",\"schema\":{\"entities\":[\"person\"]}}",
+        .source_text = "Ada works at Antfly.",
+        .content_type = "application/json",
+    });
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"entities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"Ada\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), local.extract_calls);
 }

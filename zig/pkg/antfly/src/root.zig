@@ -124,6 +124,7 @@ pub const reranking = @import("antfly_reranking");
 pub const reranking_runtime = @import("reranking/mod.zig");
 pub const transcribing = @import("antfly_transcribing");
 pub const readers = @import("antfly_readers");
+pub const extracting = @import("antfly_extracting");
 pub const synthesizing = @import("antfly_synthesizing");
 pub const asset_producer_runtime = @import("asset_producer_runtime.zig");
 

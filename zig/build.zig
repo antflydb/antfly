@@ -424,8 +424,10 @@ const AntflyRootImports = struct {
     common_openapi: *std.Build.Module,
     generating_openapi: *std.Build.Module,
     reranking_openapi: *std.Build.Module,
+    extraction_openapi: *std.Build.Module,
     transcribing: *std.Build.Module,
     readers: *std.Build.Module,
+    extracting: *std.Build.Module,
     synthesizing: *std.Build.Module,
     httpx: *std.Build.Module,
     google: *std.Build.Module,
@@ -483,8 +485,10 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_common_openapi", .field = "common_openapi" },
         .{ .name = "antfly_generating_openapi", .field = "generating_openapi" },
         .{ .name = "antfly_reranking_openapi", .field = "reranking_openapi" },
+        .{ .name = "antfly_extraction_openapi", .field = "extraction_openapi" },
         .{ .name = "antfly_transcribing", .field = "transcribing" },
         .{ .name = "antfly_readers", .field = "readers" },
+        .{ .name = "antfly_extracting", .field = "extracting" },
         .{ .name = "antfly_synthesizing", .field = "synthesizing" },
         .{ .name = "httpx", .field = "httpx" },
         .{ .name = "antfly_google", .field = "google" },
@@ -996,6 +1000,9 @@ fn addOpenApiRegenStep(
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/generating/openapi.yaml"), "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/reranking/openapi.yaml"), "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/ai/messages.yaml"), "antfly_ai_messages_openapi", antfly_generated_root ++ "/antfly_ai_messages_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/ai/extraction.yaml"), "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi", "types", &.{
+            .{ "../ai/messages.yaml", "antfly_ai_messages_openapi" },
+        }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/ai/openapi.yaml"), "antfly_ai_openapi", antfly_generated_root ++ "/antfly_ai_openapi", "types", &.{
             .{ "../../../generating/openapi.yaml", "antfly_generating_openapi" },
             .{ "../websearch/openapi.yaml", "antfly_websearch_openapi" },
@@ -1003,6 +1010,7 @@ fn addOpenApiRegenStep(
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/termite/api.yaml"), "termite_api", termite_generated_root ++ "/termite_api", "types,server", &.{
             .{ "../ai/messages.yaml", "antfly_ai_messages_openapi" },
+            .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
     };
@@ -1151,7 +1159,9 @@ pub fn build(b: *std.Build) void {
     const generating_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi");
     const reranking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi");
     const ai_messages_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_ai_messages_openapi", antfly_generated_root ++ "/antfly_ai_messages_openapi");
+    const extraction_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi");
     const ai_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_ai_openapi", antfly_generated_root ++ "/antfly_ai_openapi");
+    extraction_openapi_mod.addImport("antfly_ai_messages_openapi", ai_messages_openapi_mod);
     indexes_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     indexes_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     indexes_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
@@ -1380,6 +1390,13 @@ pub fn build(b: *std.Build) void {
     });
     reranking_mod.addImport("antfly-json", json_mod);
     reranking_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
+    const extracting_mod = b.createModule(.{
+        .root_source_file = b.path("lib/extracting/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    extracting_mod.addImport("httpx", httpx_mod);
+    extracting_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
 
     // Inference dependencies
     const openai_api_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "openai_api", antfly_generated_root ++ "/openai_api", httpx_mod);
@@ -1510,6 +1527,7 @@ pub fn build(b: *std.Build) void {
     const termite_build_options_mod = termite_graph.build_options_mod;
     const termite_api_mod = termite_graph.termite_api_mod;
     termite_api_mod.addImport("antfly_ai_messages_openapi", ai_messages_openapi_mod);
+    termite_api_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     const termite_hf_tokenizer_mod = termite_graph.termite_hf_tokenizer_mod;
     const termite_fixed_tokenizer_data_mod = termite_graph.termite_fixed_tokenizer_data_mod;
     const termite_chunker_mod = termite_graph.termite_chunker_mod;
@@ -1569,8 +1587,10 @@ pub fn build(b: *std.Build) void {
         .common_openapi = common_openapi_mod,
         .generating_openapi = generating_openapi_mod,
         .reranking_openapi = reranking_openapi_mod,
+        .extraction_openapi = extraction_openapi_mod,
         .transcribing = transcribing_mod,
         .readers = readers_mod,
+        .extracting = extracting_mod,
         .synthesizing = synthesizing_mod,
         .httpx = httpx_mod,
         .google = google_mod,
@@ -2160,6 +2180,13 @@ pub fn build(b: *std.Build) void {
     const run_lib_readers_tests = b.addRunArtifact(lib_readers_tests);
     const lib_readers_test_step = b.step("lib-readers-test", "Run standalone lib/readers tests");
     lib_readers_test_step.dependOn(&run_lib_readers_tests.step);
+
+    const lib_extracting_tests = b.addTest(.{
+        .root_module = extracting_mod,
+    });
+    const run_lib_extracting_tests = b.addRunArtifact(lib_extracting_tests);
+    const lib_extracting_test_step = b.step("lib-extracting-test", "Run standalone lib/extracting tests");
+    lib_extracting_test_step.dependOn(&run_lib_extracting_tests.step);
 
     const image_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/image_test_root.zig"),

@@ -85,6 +85,12 @@ The shared AI message module is generated under:
 pkg/antfly/src/openapi/generated/antfly_ai_messages_openapi/
 ```
 
+The shared AI extraction module is generated under:
+
+```text
+pkg/antfly/src/openapi/generated/antfly_extraction_openapi/
+```
+
 Generated files start with:
 
 ```zig

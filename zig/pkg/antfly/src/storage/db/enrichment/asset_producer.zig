@@ -21,12 +21,14 @@ pub const ProducerType = enum {
     generator,
     reader,
     transcriber,
+    extractor,
 
     pub fn parse(text: []const u8) ?ProducerType {
         if (std.mem.eql(u8, text, "copy")) return .copy;
         if (std.mem.eql(u8, text, "generator")) return .generator;
         if (std.mem.eql(u8, text, "reader")) return .reader;
         if (std.mem.eql(u8, text, "transcriber")) return .transcriber;
+        if (std.mem.eql(u8, text, "extractor")) return .extractor;
         return null;
     }
 };
@@ -105,4 +107,14 @@ test "asset producer parses typed config" {
     defer cfg.deinit(alloc);
     try std.testing.expectEqual(ProducerType.reader, cfg.type);
     try std.testing.expect(std.mem.indexOf(u8, cfg.config_json, "\"provider\":\"vertex\"") != null);
+}
+
+test "asset producer parses extractor config" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseProducerConfig(alloc,
+        \\{"type":"extractor","config":{"provider":"antfly","model":"gliner","schema":{"entities":["person"]}}}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(ProducerType.extractor, cfg.type);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.config_json, "\"entities\"") != null);
 }

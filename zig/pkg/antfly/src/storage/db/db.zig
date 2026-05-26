@@ -22146,6 +22146,7 @@ const TestAssetProducer = struct {
             .generator => self.generator_calls += 1,
             .reader => self.reader_calls += 1,
             .transcriber => self.transcriber_calls += 1,
+            .extractor => {},
         }
         return try std.fmt.allocPrint(alloc, "{s}:{s}", .{ @tagName(request.producer_type), request.source_text });
     }

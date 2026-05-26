@@ -222,6 +222,9 @@ The model-facing producer types are separate from artifact kinds:
 
 - **generators** call LLM-style generation endpoints, including tool-calling
   models and prompt-driven extraction.
+- **extractors** produce schema-driven JSON values for entities, relations,
+  classifications, document classification, token classification, and structured
+  field extraction.
 - **transcribers** produce text or structured transcript values from audio.
 - **readers** produce text or structured values from images/documents, including
   OCR providers and multimodal LLMs.
