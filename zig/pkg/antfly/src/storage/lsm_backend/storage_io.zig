@@ -450,14 +450,14 @@ else
         fn fileSize(self: *FdCache, path: []const u8) !u64 {
             const entry = try self.retain(path);
             defer self.release(entry);
-            return try fileSizeFromFd(entry.fd);
+            return try fileSizeForEntry(entry.path, entry.fd);
         }
 
         fn readTrailerAlloc(self: *FdCache, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
             const entry = try self.retain(path);
             defer self.release(entry);
 
-            const size = try fileSizeFromFd(entry.fd);
+            const size = try fileSizeForEntry(entry.path, entry.fd);
             if (size < len) return error.EndOfStream;
 
             const out = try allocator.alloc(u8, len);
@@ -1486,13 +1486,12 @@ fn closeFd(fd: std.posix.fd_t) void {
     _ = std.posix.system.close(fd);
 }
 
-fn fileSizeFromFd(fd: std.posix.fd_t) !u64 {
+fn fileSizeForEntry(path_z: [*:0]const u8, fd: std.posix.fd_t) !u64 {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
-        const empty_path: [*:0]const u8 = "";
         while (true) {
             var statx = std.mem.zeroes(linux.Statx);
-            switch (linux.errno(linux.statx(fd, empty_path, linux.AT.EMPTY_PATH, .{ .SIZE = true }, &statx))) {
+            switch (linux.errno(linux.statx(std.posix.AT.FDCWD, path_z, 0, .{ .SIZE = true }, &statx))) {
                 .SUCCESS => {
                     if (!statx.mask.SIZE) return error.Unexpected;
                     return statx.size;
