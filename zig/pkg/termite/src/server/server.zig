@@ -1525,17 +1525,27 @@ pub const Node = struct {
         var messages = std.ArrayListUnmanaged(generation.Message).empty;
         defer messages.deinit(ctx.allocator);
 
-        // Track decoded image bytes for cleanup
+        // Track decoded media bytes for cleanup
         var decoded_images = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (decoded_images.items) |img| ctx.allocator.free(img);
             decoded_images.deinit(ctx.allocator);
+        }
+        var decoded_audio = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (decoded_audio.items) |audio| ctx.allocator.free(audio);
+            decoded_audio.deinit(ctx.allocator);
         }
         // Track per-message image slices for cleanup
         var image_slices = std.ArrayListUnmanaged([]const []const u8).empty;
         defer {
             for (image_slices.items) |s| ctx.allocator.free(s);
             image_slices.deinit(ctx.allocator);
+        }
+        var audio_slices = std.ArrayListUnmanaged([]const []const u8).empty;
+        defer {
+            for (audio_slices.items) |s| ctx.allocator.free(s);
+            audio_slices.deinit(ctx.allocator);
         }
 
         for (body.messages) |msg| {
@@ -1550,6 +1560,8 @@ pub const Node = struct {
             defer text_buf.deinit(ctx.allocator);
             var msg_images = std.ArrayListUnmanaged([]const u8).empty;
             defer msg_images.deinit(ctx.allocator);
+            var msg_audio = std.ArrayListUnmanaged([]const u8).empty;
+            defer msg_audio.deinit(ctx.allocator);
             var msg_parts = std.ArrayListUnmanaged(generation.Message.ContentPart).empty;
             defer msg_parts.deinit(ctx.allocator);
 
@@ -1603,6 +1615,51 @@ pub const Node = struct {
                                 try decoded_images.append(ctx.allocator, downloaded.data);
                                 try msg_images.append(ctx.allocator, downloaded.data);
                                 try msg_parts.append(ctx.allocator, .{ .image = msg_images.items.len - 1 });
+                            } else if (std.mem.eql(u8, ptype, "media")) {
+                                const data_val = obj.get("data") orelse return ctx.status(400).json(.{
+                                    .@"error" = "INVALID_REQUEST",
+                                    .message = "media content part missing 'data' field",
+                                });
+                                if (data_val != .string) return ctx.status(400).json(.{
+                                    .@"error" = "INVALID_REQUEST",
+                                    .message = "media 'data' must be a base64 string",
+                                });
+                                const mime_val = obj.get("mime_type") orelse return ctx.status(400).json(.{
+                                    .@"error" = "INVALID_REQUEST",
+                                    .message = "media content part missing 'mime_type' field",
+                                });
+                                if (mime_val != .string) return ctx.status(400).json(.{
+                                    .@"error" = "INVALID_REQUEST",
+                                    .message = "media 'mime_type' must be a string",
+                                });
+
+                                const decoded_payload = decodeMediaData(ctx.allocator, data_val.string) catch
+                                    return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid base64 data" });
+                                const decoded = decoded_payload.data;
+                                errdefer ctx.allocator.free(decoded);
+                                if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) {
+                                    ctx.allocator.free(decoded);
+                                    return ctx.status(400).json(.{
+                                        .@"error" = "INVALID_REQUEST",
+                                        .message = "media data URI mime_type does not match content part mime_type",
+                                    });
+                                }
+
+                                if (std.mem.startsWith(u8, mime_val.string, "image/")) {
+                                    try decoded_images.append(ctx.allocator, decoded);
+                                    try msg_images.append(ctx.allocator, decoded);
+                                    try msg_parts.append(ctx.allocator, .{ .image = msg_images.items.len - 1 });
+                                } else if (std.mem.startsWith(u8, mime_val.string, "audio/")) {
+                                    try decoded_audio.append(ctx.allocator, decoded);
+                                    try msg_audio.append(ctx.allocator, decoded);
+                                    try msg_parts.append(ctx.allocator, .{ .audio = msg_audio.items.len - 1 });
+                                } else {
+                                    ctx.allocator.free(decoded);
+                                    return ctx.status(400).json(.{
+                                        .@"error" = "INVALID_REQUEST",
+                                        .message = "media content part must have mime_type starting with 'audio/' or 'image/'",
+                                    });
+                                }
                             }
                         }
                     },
@@ -1616,6 +1673,11 @@ pub const Node = struct {
             else
                 null;
             if (msg_img_slice) |s| try image_slices.append(ctx.allocator, s);
+            const msg_audio_slice: ?[]const []const u8 = if (msg_audio.items.len > 0)
+                try ctx.allocator.dupe([]const u8, msg_audio.items)
+            else
+                null;
+            if (msg_audio_slice) |s| try audio_slices.append(ctx.allocator, s);
             const msg_part_slice: ?[]const generation.Message.ContentPart = if (msg_parts.items.len > 0)
                 try ctx.allocator.dupe(generation.Message.ContentPart, msg_parts.items)
             else
@@ -1625,6 +1687,7 @@ pub const Node = struct {
                 .role = role,
                 .content = content,
                 .image_bytes = msg_img_slice,
+                .audio_bytes = msg_audio_slice,
                 .content_parts = msg_part_slice,
             });
         }
