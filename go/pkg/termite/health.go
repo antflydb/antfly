@@ -75,17 +75,8 @@ func (ln *TermiteNode) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		resp.Models.Generators = len(ln.generatorRegistry.List())
 	}
 
-	// Service is ready if at least one model type is available
-	// (chunker always has "fixed" built-in, so we're always ready)
-	totalModels := resp.Models.Embedders + resp.Models.Chunkers + resp.Models.Rerankers + resp.Models.Generators
-	if totalModels == 0 {
-		resp.Status = "not_ready"
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(resp)
-		return
-	}
-
+	// Model availability is workload-specific. Readiness means the API is
+	// initialized and able to accept requests; /ml/v1/models reports inventory.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)

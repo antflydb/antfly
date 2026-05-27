@@ -391,19 +391,6 @@ const ModelCounts = struct {
     readers: usize = 0,
     transcribers: usize = 0,
     extractors: usize = 0,
-
-    fn total(self: @This()) usize {
-        return self.embedders +
-            self.rerankers +
-            self.chunkers +
-            self.generators +
-            self.recognizers +
-            self.classifiers +
-            self.rewriters +
-            self.readers +
-            self.transcribers +
-            self.extractors;
-    }
 };
 
 fn incrementModelCount(counts: *ModelCounts, task: []const u8) void {
@@ -4213,10 +4200,8 @@ pub const Node = struct {
             },
         });
         const counts = collectDiscoveredModelCounts(models_dir, ctx.allocator, ctx.io);
-        const status_text = if (counts.total() > 0) "ready" else "not_ready";
-        const status_code: u16 = if (counts.total() > 0) 200 else 503;
-        return ctx.status(status_code).json(.{
-            .status = status_text,
+        return ctx.status(200).json(.{
+            .status = "ready",
             .models = .{
                 .embedders = counts.embedders,
                 .rerankers = counts.rerankers,
@@ -4897,6 +4882,30 @@ test "root operational routes stay outside termite API prefix" {
     try std.testing.expect(server.hasRoute(.get, "/readyz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
+}
+
+test "readyz reports ready with empty model inventory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+
+    active_models_dir = models_dir;
+    defer active_models_dir = null;
+
+    var req = try httpx.Request.init(allocator, .GET, "/readyz");
+    defer req.deinit();
+
+    var ctx = httpx.Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+
+    var response = try Node.readyzHandler(&ctx);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body orelse "", "\"status\":\"ready\"") != null);
 }
 
 test "registerRoutesOn supports alternate prefixes through the shared router" {
