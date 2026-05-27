@@ -91,6 +91,7 @@ pub fn supportsMetalEagerGraph(op: OpCode) bool {
         .transpose,
         .broadcast_in_dim,
         .gather,
+        .scatter_add,
         .slice,
         .concat_prim,
         .dot_general,
@@ -313,8 +314,9 @@ fn metalEagerGraphNodeHasSupportedResidentShape(query: CapabilityQuery) bool {
         .fused_conv1d => metalFusedConv1dHasResidentShape(query),
         .fused_conv2d => metalFusedConv2dHasResidentShape(query),
         .reduce_sum, .reduce_max, .reduce_mean => metalReduceLastDimHasResidentShape(query),
-        .broadcast_in_dim => metalBroadcastLastDimHasResidentShape(query),
+        .broadcast_in_dim => metalBroadcastHasResidentShape(query),
         .gather => metalGatherHasResidentShape(query),
+        .scatter_add => metalScatterAddHasResidentShape(query),
         .slice => metalSliceHasResidentShape(query),
         .argmax => metalArgmaxHasResidentShape(query),
         .fused_sdpa => metalSdpaHasResidentShape(query),
@@ -328,6 +330,28 @@ fn metalEagerGraphNodeHasSupportedResidentShape(query: CapabilityQuery) bool {
 fn metalConvertDTypeHasResidentShape(query: CapabilityQuery) bool {
     const input_shape = nodeInputShape(query, 0) orelse return false;
     return shapeHasConcreteElements(input_shape);
+}
+
+fn metalScatterAddHasResidentShape(query: CapabilityQuery) bool {
+    const attrs = switch (query.op) {
+        .scatter_add => |attrs| attrs,
+        else => return false,
+    };
+    if (attrs.axis != 0) return false;
+    const n = query.graph.node(query.node_id);
+    const inputs = n.getInputs();
+    if (inputs.len != 3) return false;
+
+    const dest_shape = nodeInputShape(query, 0) orelse return false;
+    const values_shape = nodeInputShape(query, 1) orelse return false;
+    const indices_shape = nodeInputShape(query, 2) orelse return false;
+    const output_shape = n.output_shape;
+    if (dest_shape.dtype != .f32 or values_shape.dtype != .f32 or output_shape.dtype != .f32) return false;
+    if (dest_shape.rank() != 2 or values_shape.rank() != 2 or indices_shape.rank() != 1 or output_shape.rank() != 2) return false;
+    if (!shapeHasConcreteElements(dest_shape) or !shapeHasConcreteElements(values_shape) or !shapeHasConcreteElements(indices_shape) or !shapeHasConcreteElements(output_shape)) return false;
+    if (dest_shape.dim(1) != values_shape.dim(1) or output_shape.dim(0) != dest_shape.dim(0) or output_shape.dim(1) != dest_shape.dim(1)) return false;
+    if (values_shape.dim(0) != indices_shape.dim(0)) return false;
+    return true;
 }
 
 fn metalTransposeHasResidentShape(query: CapabilityQuery) bool {
@@ -533,7 +557,7 @@ fn metalSoftmaxHasResidentShape(query: CapabilityQuery) bool {
     return elems % attrs.dim == 0;
 }
 
-fn metalBroadcastLastDimHasResidentShape(query: CapabilityQuery) bool {
+fn metalBroadcastHasResidentShape(query: CapabilityQuery) bool {
     const attrs = switch (query.op) {
         .broadcast_in_dim => |attrs| attrs,
         else => return false,
@@ -542,20 +566,24 @@ fn metalBroadcastLastDimHasResidentShape(query: CapabilityQuery) bool {
     const output_shape = query.graph.node(query.node_id).output_shape;
     if (input_shape.dtype != .f32 or output_shape.dtype != .f32) return false;
     const rank = input_shape.rank();
-    if (rank == 0 or output_shape.rank() != rank or attrs.num_axes != rank) return false;
-    for (0..rank) |axis| {
-        if (attrs.broadcast_axes[axis] != axis) return false;
+    const output_rank = output_shape.rank();
+    if (rank == 0 or output_rank == 0 or attrs.num_axes != rank) return false;
+    const input_elems = shapeElementCount(input_shape) orelse return false;
+    const output_elems = shapeElementCount(output_shape) orelse return false;
+    if (input_elems > std.math.maxInt(u32) or output_elems > std.math.maxInt(u32)) return false;
+
+    var mapped_output_axes = [_]bool{false} ** ml.graph.shape.max_rank;
+    for (0..rank) |input_axis| {
+        const output_axis: usize = attrs.broadcast_axes[input_axis];
+        if (output_axis >= output_rank or mapped_output_axes[output_axis]) return false;
+        mapped_output_axes[output_axis] = true;
+
+        const in_dim = input_shape.dim(@intCast(input_axis));
+        const out_dim = output_shape.dim(@intCast(output_axis));
+        if (in_dim <= 0 or out_dim <= 0) return false;
+        if (in_dim != 1 and in_dim != out_dim) return false;
     }
-    for (0..rank - 1) |axis| {
-        const in_dim = input_shape.dims[axis];
-        const out_dim = output_shape.dims[axis];
-        if (in_dim <= 0 or out_dim <= 0 or in_dim != out_dim) return false;
-    }
-    const in_last = input_shape.dim(rank - 1);
-    const out_last = output_shape.dim(rank - 1);
-    if (in_last <= 0 or out_last <= 0) return false;
-    if (in_last != 1 and in_last != out_last) return false;
-    return shapeHasConcreteElements(input_shape) and shapeHasConcreteElements(output_shape);
+    return true;
 }
 
 fn metalSliceHasResidentShape(query: CapabilityQuery) bool {
@@ -990,7 +1018,7 @@ const metalHostElementwiseMinTransferBytes: u64 = 256 * 1024;
 const Builder = ml.graph.Builder;
 const Shape = ml.graph.Shape;
 
-test "metal eager graph capability leaves unsupported ops to native fallback" {
+test "metal eager graph capability keeps GLiNER scatter_add resident" {
     const allocator = std.testing.allocator;
 
     var graph = Graph.init(allocator);
@@ -1011,14 +1039,11 @@ test "metal eager graph capability leaves unsupported ops to native fallback" {
     defer plan.deinit();
 
     var saw_metal = false;
-    var saw_native = false;
     for (plan.partitions) |part| {
         if (part.backend == .metal) saw_metal = true;
-        if (part.backend == .native) saw_native = true;
     }
     try std.testing.expect(saw_metal);
-    try std.testing.expect(saw_native);
-    try std.testing.expect(!supportsMetalEagerGraph(graph.node(scattered).op));
+    try std.testing.expect(supportsMetalEagerGraph(graph.node(scattered).op));
 }
 
 test "metal eager graph diagnostics distinguish host-assisted accepted ops" {
@@ -1353,6 +1378,53 @@ test "metal planner accepts clip attention-layout transpose with resident input"
 
 test "metal eager graph capability decisions are attrs and shape aware" {
     const allocator = std.testing.allocator;
+
+    var broadcast_graph = Graph.init(allocator);
+    defer broadcast_graph.deinit();
+    var broadcast_builder = Builder.init(&broadcast_graph);
+    const broadcast_input = try broadcast_builder.parameter("broadcast_input", Shape.init(.f32, &.{ 2, 4 }));
+    const rank_expanding_broadcast = try broadcast_graph.addNode(.{
+        .op = .{ .broadcast_in_dim = .{
+            .target_shape = Shape.init(.f32, &.{ 2, 3, 4 }),
+            .broadcast_axes = .{ 0, 2, 0, 0, 0, 0, 0, 0 },
+            .num_axes = 2,
+        } },
+        .output_shape = Shape.init(.f32, &.{ 2, 3, 4 }),
+        .inputs = .{ broadcast_input, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    const duplicate_axis_broadcast = try broadcast_graph.addNode(.{
+        .op = .{ .broadcast_in_dim = .{
+            .target_shape = Shape.init(.f32, &.{ 2, 3, 4 }),
+            .broadcast_axes = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_axes = 2,
+        } },
+        .output_shape = Shape.init(.f32, &.{ 2, 3, 4 }),
+        .inputs = .{ broadcast_input, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+
+    const broadcast_seeds = try partition.allocTensorDescriptorSeeds(allocator, &broadcast_graph);
+    defer allocator.free(broadcast_seeds);
+    try partition.seedAllParameterResidency(broadcast_seeds, &broadcast_graph, .metal, 0);
+
+    const rank_expanding_broadcast_query = CapabilityQuery{
+        .graph = &broadcast_graph,
+        .node_id = rank_expanding_broadcast,
+        .op = broadcast_graph.node(rank_expanding_broadcast).op,
+        .tensor_descs = broadcast_seeds,
+    };
+    try std.testing.expect(decideMetalEagerGraph(rank_expanding_broadcast_query).can_execute);
+    try std.testing.expect(!metalEagerGraphNodeIsHostAssisted(rank_expanding_broadcast_query));
+
+    const duplicate_axis_broadcast_query = CapabilityQuery{
+        .graph = &broadcast_graph,
+        .node_id = duplicate_axis_broadcast,
+        .op = broadcast_graph.node(duplicate_axis_broadcast).op,
+        .tensor_descs = broadcast_seeds,
+    };
+    try std.testing.expect(!decideMetalEagerGraph(duplicate_axis_broadcast_query).can_execute);
+    try std.testing.expect(!metalEagerGraphNodeIsHostAssisted(duplicate_axis_broadcast_query));
 
     var gather_graph = Graph.init(allocator);
     defer gather_graph.deinit();
