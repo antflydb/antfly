@@ -6,11 +6,11 @@ on:
       - "zig/v*"
 
 env:
-  GCP_REGION: us-east5
+  GCP_REGION: us-central1
   GCP_PROJECT: antfly-image-artifacts
-  GCP_REPOSITORY: antfly-labs
-  GAR_REGISTRY: us-east5-docker.pkg.dev
-  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-east5/workerPools/antfly-container-builders
+  GCP_REPOSITORY: containers
+  GAR_REGISTRY: us-central1-docker.pkg.dev
+  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
 
 jobs:
   publish:
