@@ -289,6 +289,7 @@ pub const ProvisionedTableWriteCache = struct {
         schema_json: ?[]u8 = null,
         active_leases: usize = 0,
         retired: bool = false,
+        allow_generation_adoption: bool = false,
         bulk_ingest_session_open: bool = false,
         auto_bulk_ingest_session_open: bool = false,
         auto_bulk_ingest_ops: usize = 0,
@@ -591,6 +592,16 @@ pub const ProvisionedTableWriteCache = struct {
         };
     }
 
+    fn adoptSeededEntryGenerationLocked(self: *ProvisionedTableWriteCache, entry: *Entry, lsm_root_generation: u64) bool {
+        _ = self;
+        if (!entry.allow_generation_adoption) return false;
+        if (entry.active_leases != 0) return false;
+        if (entry.bulk_ingest_session_open) return false;
+        entry.lsm_root_generation = lsm_root_generation;
+        entry.allow_generation_adoption = false;
+        return true;
+    }
+
     fn getOrPrepareOpenLocked(
         self: *ProvisionedTableWriteCache,
         group_id: u64,
@@ -613,6 +624,23 @@ pub const ProvisionedTableWriteCache = struct {
                     },
                 };
             }
+        }
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) continue;
+            _ = self.hit_count.fetchAdd(1, .monotonic);
+            lockAtomic(&self.entry_lifecycle_mutex);
+            defer self.entry_lifecycle_mutex.unlock();
+            entry.active_leases += 1;
+            return .{
+                .cached = .{
+                    .cache = self,
+                    .entry = entry,
+                    .db = &entry.db,
+                    .schema_json = entry.schema_json,
+                },
+            };
         }
 
         _ = self.miss_count.fetchAdd(1, .monotonic);
@@ -758,6 +786,7 @@ pub const ProvisionedTableWriteCache = struct {
             .db = db,
             .schema_json = owned_schema_json,
             .active_leases = 0,
+            .allow_generation_adoption = true,
         };
         errdefer owned_entry.deinit(self.alloc);
 
@@ -820,6 +849,10 @@ pub const ProvisionedTableWriteCache = struct {
                 continue;
             }
             if (entry.lsm_root_generation == lsm_root_generation) {
+                i += 1;
+                continue;
+            }
+            if (self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) {
                 i += 1;
                 continue;
             }
@@ -17501,4 +17534,90 @@ test "write cache prunes stale generations instead of clearing current entries" 
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);
+}
+
+test "write cache adopts just-created db across reconcile generation bump" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-created-generation", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const GenerationSource = struct {
+        fn iface(value: *u64) table_reads.GroupLsmGenerationSource {
+            return .{
+                .ptr = value,
+                .generation_for_group = generationForGroup,
+            };
+        }
+
+        fn generationForGroup(ptr: *anyopaque, _: u64) u64 {
+            return (@as(*u64, @ptrCast(@alignCast(ptr)))).*;
+        }
+    };
+
+    var generation: u64 = 1;
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+    source.group_lsm_generation = GenerationSource.iface(&generation);
+
+    var cached_seed = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, generation, "docs");
+    cached_seed.deinit(alloc);
+    write_cache.entries.items[0].allow_generation_adoption = true;
+    try std.testing.expectEqual(@as(u64, 1), write_cache.entries.items[0].lsm_root_generation);
+    const misses_before = write_cache.miss_count.load(.monotonic);
+
+    generation = 2;
+    source.pruneStaleWriteCacheLocked();
+
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
+    try std.testing.expect(!write_cache.entries.items[0].allow_generation_adoption);
+
+    var cached_after_bump = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
+    cached_after_bump.deinit(alloc);
+    try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
+    try std.testing.expect(write_cache.hit_count.load(.monotonic) > 0);
 }
