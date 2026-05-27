@@ -9,12 +9,15 @@ import type { IndexConfig } from "@antfly/sdk";
 import type React from "react";
 import { useNavigate } from "react-router-dom";
 import type { TableSchema } from "../api";
-import { api } from "../api";
 import TableSchemaForm from "../components/schema-builder/TableSchemaForm";
+import { useApi } from "../hooks/use-api-config";
+import { useTable } from "../hooks/use-table";
 
 const CreateTablePage: React.FC = () => {
   const theme = localStorage.getItem("theme") || "light";
   const navigate = useNavigate();
+  const api = useApi();
+  const { refreshTables, setSelectedTable } = useTable();
 
   const handleCreateTable = async (data: {
     name: string;
@@ -34,6 +37,8 @@ const CreateTablePage: React.FC = () => {
       for (const index of data.indexes) {
         await api.indexes.create(data.name, index);
       }
+      setSelectedTable(data.name);
+      await refreshTables();
       navigate("/");
     } catch (error) {
       console.error("Failed to create table:", error);

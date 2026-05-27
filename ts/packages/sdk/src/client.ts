@@ -63,6 +63,21 @@ type SuccessMessage = {
   message?: string;
 };
 
+function apiErrorMessage(error: unknown, fallback: string): string {
+  if (error && typeof error === "object") {
+    const fields = error as {
+      error?: unknown;
+      detail?: unknown;
+      message?: unknown;
+      title?: unknown;
+    };
+    for (const value of [fields.error, fields.detail, fields.message, fields.title]) {
+      if (typeof value === "string" && value.trim()) return value;
+    }
+  }
+  return fallback;
+}
+
 export class AntflyClient {
   private client: Client<paths>;
   private config: AntflyConfig;
@@ -555,7 +570,9 @@ export class AntflyClient {
         params: { path: { tableName } },
         body: config,
       });
-      if (error) throw new Error(`Failed to create table: ${error.error}`);
+      if (error) {
+        throw new Error(`Failed to create table: ${apiErrorMessage(error, "unknown error")}`);
+      }
       return data;
     },
 
