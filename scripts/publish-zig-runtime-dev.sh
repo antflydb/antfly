@@ -83,6 +83,22 @@ fi
 image_base="${gar_registry}/${gcp_project}/${gcp_repository}/antfly"
 artifact_uri="gs://${artifact_bucket}/zig/dev/${tag}/antfly-zig-${arch}.tar.gz"
 
+inspect_image() {
+  local image="$1"
+  local digest
+  digest="$(gcloud artifacts docker images describe "$image" \
+    --project="$gcp_project" \
+    --format='value(image_summary.digest)' 2>/dev/null || true)"
+  if [[ -n "$digest" ]]; then
+    echo "Verified GAR image: $image"
+    echo "Digest: $digest"
+    return 0
+  fi
+
+  echo "GAR image metadata lookup failed; trying docker buildx imagetools inspect" >&2
+  docker buildx imagetools inspect "$image"
+}
+
 if [[ "$manifest" == true ]]; then
   gcloud builds submit "$repo_root" \
     --project="$gcp_project" \
@@ -90,7 +106,7 @@ if [[ "$manifest" == true ]]; then
     --worker-pool="$worker_pool" \
     --config=zig/cloudbuild.manifest.yaml \
     --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=zig-${tag},_ALIAS_TAG=__skip_alias__,_AMD64_TAG=zig-${tag}-amd64,_ARM64_TAG=zig-${tag}-arm64"
-  docker buildx imagetools inspect "${image_base}:zig-${tag}"
+  inspect_image "${image_base}:zig-${tag}"
   exit 0
 fi
 
@@ -131,7 +147,7 @@ gcloud builds submit "$repo_root" \
   --config=zig/cloudbuild.runtime.yaml \
   --substitutions="_ARTIFACT_URI=${artifact_uri},_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=zig-${tag}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
 
-docker buildx imagetools inspect "${image_base}:zig-${tag}-${arch}"
+inspect_image "${image_base}:zig-${tag}-${arch}"
 
 cat <<EOF
 
