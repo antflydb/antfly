@@ -2411,7 +2411,7 @@ pub const IndexManager = struct {
                 defer generator.deinit(alloc);
                 const chunk_cfg = resolveChunkGenerator(self, generator);
                 const embedding_name = entry.embedding_name orelse entry.config.name;
-                if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.artifact_name)) {
+                if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name)) {
                     try requests.append(alloc, .{
                         .kind = .chunk_text,
                         .index_name = try alloc.dupe(u8, entry.config.name),
@@ -2424,7 +2424,7 @@ pub const IndexManager = struct {
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                     });
                 }
-                if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.artifact_name, embedding_name)) {
+                if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name, embedding_name)) {
                     try requests.append(alloc, .{
                         .kind = .dense_embedding,
                         .index_name = try alloc.dupe(u8, entry.config.name),
@@ -2444,7 +2444,7 @@ pub const IndexManager = struct {
                 if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                 if (embedding_cfg.source_artifact_name.len > 0) {
                     const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                    if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.name)) {
+                    if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
                         try requests.append(alloc, .{
                             .kind = .chunk_text,
                             .index_name = try alloc.dupe(u8, entry.config.name),
@@ -2457,7 +2457,7 @@ pub const IndexManager = struct {
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                         });
                     }
-                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, chunk_cfg.name, embedding_name)) {
+                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                         try requests.append(alloc, .{
                             .kind = .dense_embedding,
                             .index_name = try alloc.dupe(u8, entry.config.name),
@@ -2473,7 +2473,7 @@ pub const IndexManager = struct {
                         });
                     }
                 } else {
-                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, "", embedding_name)) {
+                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
                         try requests.append(alloc, .{
                             .kind = .dense_embedding,
                             .index_name = try alloc.dupe(u8, entry.config.name),
@@ -2500,7 +2500,7 @@ pub const IndexManager = struct {
             if (try parseSparseGeneratorConfig(alloc, entry.config.config_json)) |generator| {
                 defer generator.deinit(alloc);
                 const chunk_cfg = resolveChunkGenerator(self, generator);
-                if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.artifact_name)) {
+                if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name)) {
                     try requests.append(alloc, .{
                         .kind = .chunk_text,
                         .index_name = try alloc.dupe(u8, entry.config.name),
@@ -5310,7 +5310,12 @@ pub const IndexManager = struct {
 
     fn ensureChunkEnrichment(self: *IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !bool {
         if (self.getEnrichment(.chunk, cfg.name)) |existing| {
-            if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or existing.chunk_size != cfg.chunk_size or existing.chunk_overlap != cfg.chunk_overlap or !std.mem.eql(u8, existing.chunker_json, cfg.chunker_json)) {
+            if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
+                !std.mem.eql(u8, existing.source_template, cfg.source_template) or
+                existing.chunk_size != cfg.chunk_size or
+                existing.chunk_overlap != cfg.chunk_overlap or
+                !std.mem.eql(u8, existing.chunker_json, cfg.chunker_json))
+            {
                 return error.ConflictingEnrichmentConfig;
             }
             return false;
@@ -5323,6 +5328,7 @@ pub const IndexManager = struct {
     fn ensureEmbeddingEnrichment(self: *IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !bool {
         if (self.getEnrichment(.embedding, cfg.name)) |existing| {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
+                !std.mem.eql(u8, existing.source_template, cfg.source_template) or
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.expected_dims != cfg.expected_dims)
             {
@@ -10566,12 +10572,14 @@ fn hasGeneratedChunkRequest(
     requests: []const enrichment_types.GeneratedEnrichmentRequest,
     doc_key: []const u8,
     source_field: []const u8,
+    source_template: []const u8,
     artifact_name: []const u8,
 ) bool {
     for (requests) |request| {
         if (request.kind != .chunk_text) continue;
         if (!std.mem.eql(u8, request.doc_key, doc_key)) continue;
         if (!std.mem.eql(u8, request.source_field, source_field)) continue;
+        if (!std.mem.eql(u8, request.source_template, source_template)) continue;
         if (!std.mem.eql(u8, request.artifact_name, artifact_name)) continue;
         return true;
     }
@@ -10582,6 +10590,7 @@ fn hasGeneratedDenseEmbeddingRequest(
     requests: []const enrichment_types.GeneratedEnrichmentRequest,
     doc_key: []const u8,
     source_field: []const u8,
+    source_template: []const u8,
     artifact_name: []const u8,
     embedding_name: []const u8,
 ) bool {
@@ -10589,6 +10598,7 @@ fn hasGeneratedDenseEmbeddingRequest(
         if (request.kind != .dense_embedding) continue;
         if (!std.mem.eql(u8, request.doc_key, doc_key)) continue;
         if (!std.mem.eql(u8, request.source_field, source_field)) continue;
+        if (!std.mem.eql(u8, request.source_template, source_template)) continue;
         if (!std.mem.eql(u8, request.artifact_name, artifact_name)) continue;
         if (!std.mem.eql(u8, request.embedding_name, embedding_name)) continue;
         return true;
@@ -12782,6 +12792,90 @@ test "parseSparseGeneratorConfig parses source_template" {
     try std.testing.expectEqualStrings("body", generator.source_field);
     try std.testing.expectEqualStrings("{{title}} {{body}}", generator.source_template);
     try std.testing.expectEqualStrings("body_chunks", generator.artifact_name);
+}
+
+test "shorthand chunk and embedding enrichment compatibility includes source_template" {
+    const alloc = std.testing.allocator;
+
+    var manager = try IndexManager.init(alloc, ".");
+    defer manager.deinit();
+
+    try std.testing.expect(try manager.ensureChunkEnrichment(.{
+        .name = "body_chunks",
+        .kind = .chunk,
+        .source_field = "body",
+        .source_template = "{{title}} {{body}}",
+        .chunk_size = 256,
+    }));
+    try std.testing.expect(!try manager.ensureChunkEnrichment(.{
+        .name = "body_chunks",
+        .kind = .chunk,
+        .source_field = "body",
+        .source_template = "{{title}} {{body}}",
+        .chunk_size = 256,
+    }));
+    try std.testing.expectError(error.ConflictingEnrichmentConfig, manager.ensureChunkEnrichment(.{
+        .name = "body_chunks",
+        .kind = .chunk,
+        .source_field = "body",
+        .source_template = "{{body}}",
+        .chunk_size = 256,
+    }));
+
+    try std.testing.expect(try manager.ensureEmbeddingEnrichment(.{
+        .name = "body_embedding",
+        .kind = .embedding,
+        .source_field = "body",
+        .source_template = "{{title}} {{body}}",
+        .source_artifact_name = "body_chunks",
+        .expected_dims = 384,
+    }));
+    try std.testing.expect(!try manager.ensureEmbeddingEnrichment(.{
+        .name = "body_embedding",
+        .kind = .embedding,
+        .source_field = "body",
+        .source_template = "{{title}} {{body}}",
+        .source_artifact_name = "body_chunks",
+        .expected_dims = 384,
+    }));
+    try std.testing.expectError(error.ConflictingEnrichmentConfig, manager.ensureEmbeddingEnrichment(.{
+        .name = "body_embedding",
+        .kind = .embedding,
+        .source_field = "body",
+        .source_template = "{{body}}",
+        .source_artifact_name = "body_chunks",
+        .expected_dims = 384,
+    }));
+}
+
+test "generated enrichment request identity includes source_template" {
+    const requests = [_]enrichment_types.GeneratedEnrichmentRequest{
+        .{
+            .kind = .chunk_text,
+            .index_name = "semantic",
+            .artifact_name = "body_chunks",
+            .doc_key = "doc:1",
+            .source_field = "body",
+            .source_template = "{{title}} {{body}}",
+            .chunk_size = 256,
+        },
+        .{
+            .kind = .dense_embedding,
+            .index_name = "semantic",
+            .artifact_name = "body_chunks",
+            .embedding_name = "body_embedding",
+            .doc_key = "doc:1",
+            .source_field = "body",
+            .source_template = "{{title}} {{body}}",
+            .expected_dims = 384,
+        },
+    };
+
+    try std.testing.expect(hasGeneratedChunkRequest(requests[0..], "doc:1", "body", "{{title}} {{body}}", "body_chunks"));
+    try std.testing.expect(!hasGeneratedChunkRequest(requests[0..], "doc:1", "body", "{{body}}", "body_chunks"));
+
+    try std.testing.expect(hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{title}} {{body}}", "body_chunks", "body_embedding"));
+    try std.testing.expect(!hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{body}}", "body_chunks", "body_embedding"));
 }
 
 test "parseTextConfig prefers source artifact name and accepts legacy chunk name" {
