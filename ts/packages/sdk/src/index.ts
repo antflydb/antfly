@@ -186,6 +186,7 @@ export type {
   JoinStrategy,
   JoinType,
   MergeProfile,
+  PathWeightMode,
   Permission,
   PermissionType,
   // Query Builder Agent types

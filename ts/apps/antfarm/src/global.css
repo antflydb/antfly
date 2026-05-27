@@ -2,8 +2,11 @@
 @import "tw-animate-css";
 @import "@antfly/design-system/styles.css";
 @import "@antfly/design-system/theme";
+@import "@xyflow/react/dist/style.css";
+@import "@antfly/graph/styles.css";
 
 @source "../node_modules/@antfly/design-system/dist/**/*.js";
+@source "../../../packages/graph/src/**/*.{ts,tsx,js,jsx}";
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));

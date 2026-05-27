@@ -29,9 +29,15 @@ importers:
       '@antfly/design-system':
         specifier: workspace:*
         version: link:../../packages/design-system
+      '@antfly/graph':
+        specifier: workspace:*
+        version: link:../../packages/graph
       '@antfly/sdk':
         specifier: workspace:*
         version: link:../../packages/sdk
+      '@xyflow/react':
+        specifier: ^12.10.2
+        version: 12.10.2(@types/react@19.2.14)(immer@11.1.4)(react-dom@19.2.4(react@19.2.4))(react@19.2.4)
       '@hookform/resolvers':
         specifier: ^5.2.2
         version: 5.2.2(react-hook-form@7.74.0(react@19.2.4))
