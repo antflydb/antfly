@@ -10193,22 +10193,25 @@ fn openTextPersistentIndexWithRetry(
     opts: persistent_mod.PersistentIndexOptions,
 ) !persistent_mod.PersistentIndex {
     const max_attempts: usize = 6;
+    const debug_open = std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        std.log.info(
-            "full_text persistent open begin attempt={d} path={s} main_backend={s} wal_backend={s} main_lsm_storage={any} wal_storage={any} read_only={any} main_read_only={any} wal_read_only={any}",
-            .{
-                attempt + 1,
-                std.mem.span(opts.path),
-                @tagName(opts.main_backend),
-                @tagName(opts.resolvedWalBackend()),
-                opts.main_lsm_storage != null,
-                opts.wal_storage != null,
-                opts.read_only,
-                opts.main_lsm_options.backend.read_only,
-                opts.wal_lsm_options.backend.read_only,
-            },
-        );
+        if (debug_open) {
+            std.log.info(
+                "full_text persistent open begin attempt={d} path={s} main_backend={s} wal_backend={s} main_lsm_storage={any} wal_storage={any} read_only={any} main_read_only={any} wal_read_only={any}",
+                .{
+                    attempt + 1,
+                    std.mem.span(opts.path),
+                    @tagName(opts.main_backend),
+                    @tagName(opts.resolvedWalBackend()),
+                    opts.main_lsm_storage != null,
+                    opts.wal_storage != null,
+                    opts.read_only,
+                    opts.main_lsm_options.backend.read_only,
+                    opts.wal_lsm_options.backend.read_only,
+                },
+            );
+        }
         return persistent_mod.PersistentIndex.open(alloc, opts) catch |err| {
             std.log.warn("full_text persistent open attempt failed attempt={d} path={s} err={s}", .{
                 attempt + 1,

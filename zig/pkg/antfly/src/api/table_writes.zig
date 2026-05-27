@@ -682,6 +682,7 @@ pub const ProvisionedTableWriteCache = struct {
         }
 
         var db = opened.* orelse unreachable;
+        opened.* = null;
         errdefer db.close();
 
         const start_bulk_session = switch (mode) {
@@ -717,6 +718,51 @@ pub const ProvisionedTableWriteCache = struct {
             .db = &owned_entry.db,
             .schema_json = owned_entry.schema_json,
         };
+    }
+
+    fn seedCreatedDbLocked(
+        self: *ProvisionedTableWriteCache,
+        opened: *?db_mod.DB,
+        group_id: u64,
+        lsm_root_generation: u64,
+        table_name: []const u8,
+        indexes_json: []const u8,
+        schema_json: []const u8,
+    ) !void {
+        self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (entry.lsm_root_generation != lsm_root_generation) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (opened.*) |*db| db.close();
+            opened.* = null;
+            try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
+            return;
+        }
+
+        var db = opened.* orelse unreachable;
+        opened.* = null;
+        errdefer db.close();
+
+        const owned_table_name = try self.alloc.dupe(u8, table_name);
+        errdefer self.alloc.free(owned_table_name);
+        const owned_schema_json = try self.alloc.dupe(u8, schema_json);
+        errdefer self.alloc.free(owned_schema_json);
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, 1);
+        const owned_entry = try self.alloc.create(Entry);
+        errdefer self.alloc.destroy(owned_entry);
+        owned_entry.* = .{
+            .group_id = group_id,
+            .lsm_root_generation = lsm_root_generation,
+            .table_name = owned_table_name,
+            .db = db,
+            .schema_json = owned_schema_json,
+            .active_leases = 0,
+        };
+        errdefer owned_entry.deinit(self.alloc);
+
+        try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
+        try self.entries.append(self.alloc, owned_entry);
     }
 
     pub fn getLocked(
@@ -1112,6 +1158,36 @@ pub const ProvisionedTableWriteCache = struct {
         self.removeDbEntriesForTable(table_name);
         var removed = self.table_metadata.orderedRemove(0);
         removed.deinit(self.alloc);
+    }
+
+    fn replaceTableMetadataLocked(
+        self: *ProvisionedTableWriteCache,
+        table_name: []const u8,
+        indexes_json: []const u8,
+        schema_json: []const u8,
+    ) !void {
+        var i: usize = 0;
+        while (i < self.table_metadata.items.len) {
+            if (!std.mem.eql(u8, self.table_metadata.items[i].table_name, table_name)) {
+                i += 1;
+                continue;
+            }
+            var removed = self.table_metadata.orderedRemove(i);
+            removed.deinit(self.alloc);
+        }
+
+        if (self.table_metadata.items.len >= max_cached_write_tables) self.evictOldestTable();
+        const owned_table_name = try self.alloc.dupe(u8, table_name);
+        errdefer self.alloc.free(owned_table_name);
+        const owned_indexes_json = try self.alloc.dupe(u8, indexes_json);
+        errdefer self.alloc.free(owned_indexes_json);
+        const owned_schema_json = try self.alloc.dupe(u8, schema_json);
+        errdefer self.alloc.free(owned_schema_json);
+        try self.table_metadata.append(self.alloc, .{
+            .table_name = owned_table_name,
+            .indexes_json = owned_indexes_json,
+            .schema_json = owned_schema_json,
+        });
     }
 
     fn getOrLoadMetadataLocked(
@@ -4200,9 +4276,33 @@ pub const ProvisionedTableWriteSource = struct {
             defer alloc.free(path);
 
             const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
-            var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity(alloc, path, indexes_json, null, null, 0, null, .default, self.backend_runtime, self.local_termite_provider, self.secret_store, self.remote_content, identity_namespace);
-            defer db.close();
-            try applyLocalTableSchemaJson(alloc, &db, schema_json);
+            const lsm_root_generation = self.lsmRootGeneration(group_id);
+            if (self.write_cache) |cache| {
+                if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
+                cache.local_termite_provider = self.local_termite_provider;
+                cache.secret_store = self.secret_store;
+                cache.remote_content = self.remote_content;
+            }
+            var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity(
+                alloc,
+                path,
+                indexes_json,
+                if (self.write_cache) |cache| cache.lsm_cache else null,
+                if (self.write_cache) |cache| cache.hbc_cache else null,
+                lsm_root_generation,
+                if (self.write_cache) |cache| cache.resource_manager else null,
+                .default,
+                if (self.write_cache) |cache| cache.backend_runtime else self.backend_runtime,
+                self.local_termite_provider,
+                self.secret_store,
+                self.remote_content,
+                identity_namespace,
+            );
+            defer if (opened) |*db| db.close();
+            try applyLocalTableSchemaJson(alloc, &opened.?, schema_json);
+            if (self.write_cache) |cache| {
+                try cache.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table_name, indexes_json, schema_json);
+            }
             std.log.info("provisioned create table local group ready table={s} group_id={d}", .{ table_name, group_id });
         }
 
