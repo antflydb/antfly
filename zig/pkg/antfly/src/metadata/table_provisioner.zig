@@ -380,7 +380,7 @@ pub fn collectLocalRestoreProgress(
     return try out.toOwnedSlice(alloc);
 }
 
-fn applyRestoreIntentIfNeeded(
+pub fn applyRestoreIntentIfNeeded(
     alloc: std.mem.Allocator,
     path: []const u8,
     group_id: u64,

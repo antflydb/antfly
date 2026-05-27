@@ -2945,7 +2945,12 @@ pub const ProvisionedTableWriteSource = struct {
                 var i: usize = 0;
                 while (i < cache.entries.items.len) {
                     const entry = cache.entries.items[i];
-                    if (entry.lsm_root_generation == write_source.lsmRootGeneration(entry.group_id)) {
+                    const current_generation = write_source.lsmRootGeneration(entry.group_id);
+                    if (entry.lsm_root_generation == current_generation) {
+                        i += 1;
+                        continue;
+                    }
+                    if (cache.adoptSeededEntryGenerationLocked(entry, current_generation)) {
                         i += 1;
                         continue;
                     }
@@ -2970,6 +2975,85 @@ pub const ProvisionedTableWriteSource = struct {
 
         if (self.write_cache) |cache| pruneCache(self, cache);
         if (self.startup_write_cache) |cache| pruneCache(self, cache);
+    }
+
+    pub fn reconcileReplicaRootTablesWithWriteCacheLocked(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64,
+        hosted_group_ids: []const u64,
+        tables: []const metadata_table_manager.TableRecord,
+        ranges: []const metadata_table_manager.RangeRecord,
+        backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ) !metadata_table_provisioner.ProvisionSummary {
+        const cache = self.write_cache orelse return try metadata_table_provisioner.reconcileReplicaRootWithOptions(
+            alloc,
+            self.replica_root_dir,
+            metadata_group_id,
+            hosted_group_ids,
+            tables,
+            ranges,
+            .{ .backend_runtime = backend_runtime },
+        );
+
+        if (cache.backend_runtime == null) cache.backend_runtime = backend_runtime orelse self.backend_runtime;
+        cache.local_termite_provider = self.local_termite_provider;
+        cache.secret_store = self.secret_store;
+        cache.remote_content = self.remote_content;
+
+        var summary: metadata_table_provisioner.ProvisionSummary = .{};
+        for (hosted_group_ids) |group_id| {
+            if (group_id == metadata_group_id) continue;
+            const range = findRangeRecord(ranges, group_id) orelse continue;
+            const table = findTableRecord(tables, range.table_id) orelse continue;
+            summary.groups_considered += 1;
+
+            const path = try metadata_table_provisioner.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            try fs_paths.createDirPathPortable(io_impl.io(), path);
+            try metadata_table_provisioner.applyRestoreIntentIfNeeded(alloc, path, group_id, table, range);
+
+            const lsm_root_generation = self.lsmRootGeneration(group_id);
+            const identity_namespace = doc_identity.Namespace{
+                .table_id = table.table_id,
+                .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
+                .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+            };
+            if (cache.getLocked(group_id, lsm_root_generation, table.name)) |db| {
+                try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, db);
+                try applyLocalTableSchemaJson(alloc, db, table.schema_json);
+                const index_summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, db, table.indexes_json);
+                summary.indexes_removed += index_summary.indexes_removed;
+                summary.indexes_added += index_summary.indexes_added;
+                summary.enrichments_added += index_summary.enrichments_added;
+                try cache.replaceTableMetadataLocked(table.name, table.indexes_json, table.schema_json);
+                continue;
+            }
+            var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity(
+                alloc,
+                path,
+                table.indexes_json,
+                cache.lsm_cache,
+                cache.hbc_cache,
+                lsm_root_generation,
+                cache.resource_manager,
+                .default,
+                cache.backend_runtime,
+                self.local_termite_provider,
+                self.secret_store,
+                self.remote_content,
+                identity_namespace,
+            );
+            defer if (opened) |*db| db.close();
+            summary.dbs_opened += 1;
+
+            try applyLocalTableSchemaJson(alloc, &opened.?, table.schema_json);
+            try cache.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table.name, table.indexes_json, table.schema_json);
+        }
+        return summary;
     }
 
     pub fn clearStartupWriteCacheLocked(self: *ProvisionedTableWriteSource) void {
@@ -8285,6 +8369,20 @@ fn loadTableIdentityNamespaceForGroup(
             .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
             .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
         };
+    }
+    return null;
+}
+
+fn findTableRecord(tables: []const metadata_table_manager.TableRecord, table_id: u64) ?metadata_table_manager.TableRecord {
+    for (tables) |table| {
+        if (table.table_id == table_id) return table;
+    }
+    return null;
+}
+
+fn findRangeRecord(ranges: []const metadata_table_manager.RangeRecord, group_id: u64) ?metadata_table_manager.RangeRecord {
+    for (ranges) |range| {
+        if (range.group_id == group_id) return range;
     }
     return null;
 }
@@ -17620,4 +17718,109 @@ test "write cache adopts just-created db across reconcile generation bump" {
     cached_after_bump.deinit(alloc);
     try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
     try std.testing.expect(write_cache.hit_count.load(.monotonic) > 0);
+}
+
+test "replica root reconcile seeds write cache across generation bump" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-reconcile-generation", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const GenerationSource = struct {
+        fn iface(value: *u64) table_reads.GroupLsmGenerationSource {
+            return .{
+                .ptr = value,
+                .generation_for_group = generationForGroup,
+            };
+        }
+
+        fn generationForGroup(ptr: *anyopaque, _: u64) u64 {
+            return (@as(*u64, @ptrCast(@alignCast(ptr)))).*;
+        }
+    };
+
+    const tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .placement_role = "data",
+        .indexes_json = "{\"indexes\":[]}",
+    }};
+    const ranges = [_]metadata_table_manager.RangeRecord{.{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+        .end_key = null,
+    }};
+    const hosted_groups = [_]u64{7001};
+
+    var generation: u64 = 1;
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+    source.group_lsm_generation = GenerationSource.iface(&generation);
+
+    const summary = try source.reconcileReplicaRootTablesWithWriteCacheLocked(
+        alloc,
+        1,
+        &hosted_groups,
+        &tables,
+        &ranges,
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), summary.groups_considered);
+    try std.testing.expectEqual(@as(usize, 1), summary.dbs_opened);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expect(write_cache.entries.items[0].allow_generation_adoption);
+    const misses_before = write_cache.miss_count.load(.monotonic);
+
+    generation = 2;
+    source.pruneStaleWriteCacheLocked();
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
+
+    var cached_after_bump = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
+    cached_after_bump.deinit(alloc);
+    try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
 }

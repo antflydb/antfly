@@ -4972,16 +4972,13 @@ pub const DataServer = struct {
             self.last_provision_metadata_epoch = head.metadata_epoch;
             return;
         }
-        _ = try antfly.metadata.reconcileReplicaRootTablesWithOptions(
+        _ = try self.write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
             self.alloc,
-            self.write_source.replica_root_dir,
             head.metadata_group_id,
             local_group_ids,
             snapshot.tables,
             snapshot.ranges,
-            .{
-                .backend_runtime = try self.ensureBackendRuntime(),
-            },
+            try self.ensureBackendRuntime(),
         );
         try self.provisioned_storage.bumpGroupGenerations(local_group_ids);
         self.provisioned_storage.read_cache.clear();
