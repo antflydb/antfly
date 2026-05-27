@@ -12,22 +12,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! LMDB-backed document key-value store with structured key encoding.
+//! LMDB-backed document key-value store with centralized binary key encoding.
 //!
-//! Foundation for graph indexes, sparse embedding indexes, and shard splitting.
-//! All key semantics are encoded in the key string (flat keyspace), matching
-//! Go antfly's Pebble-based storeutils pattern.
-//!
-//! Key encoding scheme:
-//!   Document:    <docID>
-//!   Embedding:   <docID>:i:<indexName>:e
-//!   Summary:     <docID>:i:<indexName>:s
-//!   Chunk:       <docID>:i:<indexName>:<chunkID>:c
-//!   Enrichment:  <docID>:e:<type>:<name>:...
-//!   Edge out:    <source>:i:<indexName>:out:<edgeType>:<target>:o
-//!   Edge in:     <target>:i:<indexName>:in:<edgeType>:<source>:i
-//!   Range start: <key>:\x00
-//!   Range end:   <key>:\xFF
+//! Public document IDs are raw byte strings. Internal primary, TTL, artifact,
+//! chunk, and graph records are encoded through storage/internal_keys.zig so
+//! user-controlled IDs never share a delimiter namespace with derived records.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -563,6 +552,13 @@ pub const DocStore = struct {
                 try self.runtime.?.put(key, value);
             }
 
+            pub fn appendPut(self: @This(), key: []const u8, value: []const u8) !void {
+                if (supports_lmdb) {
+                    if (self.raw != null) return error.Unsupported;
+                }
+                try self.runtime.?.appendPut(key, value);
+            }
+
             pub fn delete(self: @This(), key: []const u8) !void {
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
@@ -991,8 +987,23 @@ pub const DocStore = struct {
                 else => return err,
             };
         }
-        for (writes) |kv| {
-            try txn.put(kv.key, kv.value);
+        var used_bulk_append = false;
+        if (deletes.len == 0 and options.mode == .bulk_ingest) {
+            used_bulk_append = true;
+            for (writes) |kv| {
+                txn.appendPut(kv.key, kv.value) catch |err| switch (err) {
+                    error.Unsupported => {
+                        used_bulk_append = false;
+                        break;
+                    },
+                    else => return err,
+                };
+            }
+        }
+        if (!used_bulk_append) {
+            for (writes) |kv| {
+                try txn.put(kv.key, kv.value);
+            }
         }
         if (replay) |entry| {
             try batch.setReplayOpaque(entry.sequence, entry.payload);
@@ -2202,7 +2213,7 @@ test "docstore does not expose commit stats for runtime-backed stores" {
     try std.testing.expect(store.commitStatsSnapshot() == null);
 }
 
-test "docstore runtime lsm exposes large replaying prefix batch immediately after commit" {
+test "docstore runtime lsm exposes large replaying graph artifact prefix batch immediately after commit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2225,9 +2236,11 @@ test "docstore runtime lsm exposes large replaying prefix batch immediately afte
 
     var i: usize = 0;
     while (i < 1500) : (i += 1) {
-        const key = try std.fmt.allocPrint(alloc, "doc:0000:i:gr_v1:out:links:doc:{d:0>4}:o", .{i});
+        const target = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i});
+        defer alloc.free(target);
+        const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:0000", "gr_v1", "links", target);
         errdefer alloc.free(key);
-        const value = try std.fmt.allocPrint(alloc, "{{\"target\":\"doc:{d:0>4}\"}}", .{i});
+        const value = try std.fmt.allocPrint(alloc, "{{\"target\":\"{s}\"}}", .{target});
         errdefer alloc.free(value);
         try writes.append(alloc, .{ .key = key, .value = value });
     }
@@ -2243,7 +2256,9 @@ test "docstore runtime lsm exposes large replaying prefix batch immediately afte
         .payload = "replay:graph",
     });
 
-    const results = try store.scanPrefix(alloc, "doc:0000:i:gr_v1:out:links:");
+    const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(alloc, "doc:0000", "gr_v1");
+    defer alloc.free(prefix);
+    const results = try store.scanPrefix(alloc, prefix);
     defer DocStore.freeResults(alloc, results);
     try std.testing.expectEqual(@as(usize, 1500), results.len);
 }

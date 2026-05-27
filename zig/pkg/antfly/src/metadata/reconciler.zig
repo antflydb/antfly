@@ -22,6 +22,9 @@ const platform_time = @import("../platform/time.zig");
 const transition_controller = @import("transition_controller.zig");
 const transition_state = @import("transition_state.zig");
 
+const doc_identity_transition_rollback_reason = "doc_identity_namespace_mismatch";
+const doc_identity_merge_rollback_reason = doc_identity_transition_rollback_reason;
+
 pub const SplitRuntimeObservation = struct {
     transition_id: u64,
     observation: transition_state.SplitObservation,
@@ -79,8 +82,18 @@ pub const MergedGroupStatus = struct {
     replay_caught_up: bool = false,
     cutover_ready: bool = false,
     reads_ready_after_cutover: bool = false,
+    doc_identity_reassignment_active: bool = false,
     restore_pending: bool = false,
+    doc_identity_lifecycle: []const u8 = doc_identity_lifecycle_unknown,
+    doc_identity: table_manager.RuntimeDocIdentityStatusReport = .{},
+    doc_identity_namespace_conflict: bool = false,
 };
+
+pub const doc_identity_lifecycle_unknown = "unknown";
+pub const doc_identity_lifecycle_preserving = "preserving";
+pub const doc_identity_lifecycle_reassigning = "reassigning";
+pub const doc_identity_lifecycle_rebuild_required = "rebuild_required";
+pub const doc_identity_lifecycle_ready = "ready";
 
 pub const PlannedSplitStep = struct {
     record: transition_state.SplitTransitionRecord,
@@ -324,10 +337,31 @@ pub const Reconciler = struct {
         }
         for (desired_splits) |desired| {
             const existing = findSplitRecord(current.split_transitions, desired.transition_id);
-            if (existing == null or !splitRecordsEqual(existing.?, desired)) {
+            if (existing == null) {
+                if (!splitTransitionDocIdentityCompatible(current, desired)) continue;
                 try split_upserts.append(self.alloc, try cloneSplitRecord(self.alloc, desired));
                 continue;
             }
+
+            var effective_record = try cloneSplitRecord(self.alloc, desired);
+            var effective_record_owned = true;
+            errdefer if (effective_record_owned) table_manager.freeSplitTransitionRecord(self.alloc, effective_record);
+            if (existing.?.rollback_reason) |reason| {
+                if (effective_record.rollback_reason == null) {
+                    effective_record.rollback_reason = try self.alloc.dupe(u8, reason);
+                }
+            } else if (splitTransitionCanRollback(existing.?) and !splitTransitionDocIdentityCompatible(current, existing.?)) {
+                effective_record.rollback_reason = try self.alloc.dupe(u8, doc_identity_transition_rollback_reason);
+            }
+
+            if (!splitRecordsEqual(existing.?, effective_record)) {
+                try split_upserts.append(self.alloc, effective_record);
+                effective_record_owned = false;
+                continue;
+            }
+            table_manager.freeSplitTransitionRecord(self.alloc, effective_record);
+            effective_record_owned = false;
+
             const observation = findSplitObservation(current.split_observations, desired.transition_id) orelse defaultSplitObservation();
             const planned_record = try cloneSplitRecord(self.alloc, existing.?);
             errdefer table_manager.freeSplitTransitionRecord(self.alloc, planned_record);
@@ -339,10 +373,31 @@ pub const Reconciler = struct {
 
         for (desired_merges) |desired| {
             const existing = findMergeRecord(current.merge_transitions, desired.transition_id);
-            if (existing == null or !mergeRecordsEqual(existing.?, desired)) {
+            if (existing == null) {
+                if (!mergeTransitionDocIdentityCompatible(current, desired, .disallow_active)) continue;
                 try merge_upserts.append(self.alloc, try cloneMergeRecord(self.alloc, desired));
                 continue;
             }
+
+            var effective_record = try cloneMergeRecord(self.alloc, desired);
+            var effective_record_owned = true;
+            errdefer if (effective_record_owned) table_manager.freeMergeTransitionRecord(self.alloc, effective_record);
+            if (existing.?.rollback_reason) |reason| {
+                if (effective_record.rollback_reason == null) {
+                    effective_record.rollback_reason = try self.alloc.dupe(u8, reason);
+                }
+            } else if (mergeTransitionCanRollback(existing.?) and !mergeTransitionDocIdentityCompatible(current, existing.?, .allow_existing_active)) {
+                effective_record.rollback_reason = try self.alloc.dupe(u8, doc_identity_merge_rollback_reason);
+            }
+
+            if (!mergeRecordsEqual(existing.?, effective_record)) {
+                try merge_upserts.append(self.alloc, effective_record);
+                effective_record_owned = false;
+                continue;
+            }
+            table_manager.freeMergeTransitionRecord(self.alloc, effective_record);
+            effective_record_owned = false;
+
             const observation = findMergeObservation(current.merge_observations, desired.transition_id) orelse defaultMergeObservation(existing.?);
             const planned_record = try cloneMergeRecord(self.alloc, existing.?);
             errdefer table_manager.freeMergeTransitionRecord(self.alloc, planned_record);
@@ -504,6 +559,7 @@ pub const Reconciler = struct {
                     if (!groupStatusFresh(self.config, left_status, now_monotonic_ms) or !groupStatusFresh(self.config, right_status, now_monotonic_ms)) continue;
                     if (!groupStatusReadyForAutomaticPlanning(left_status) or !groupStatusReadyForAutomaticPlanning(right_status)) continue;
                     if (!self.groupOldEnoughForMerge(left_status, now_realtime_ms) or !self.groupOldEnoughForMerge(right_status, now_realtime_ms)) continue;
+                    if (!docIdentityNamespacesCompatibleForAutomaticMerge(left_status, right_status)) continue;
 
                     const left_size = left_status.disk_bytes;
                     const right_size = right_status.disk_bytes;
@@ -537,6 +593,7 @@ pub const Reconciler = struct {
                 if (!groupHasFullHealthyPlacement(current, range.group_id, status)) continue;
                 if (!groupStatusFresh(self.config, status, now_monotonic_ms)) continue;
                 if (!groupStatusReadyForAutomaticPlanning(status)) continue;
+                if (!docIdentityNamespaceReadyForAutomaticSplit(status)) continue;
                 if (status.disk_bytes <= self.config.max_shard_size_bytes) continue;
                 const lookup = self.config.median_key_lookup orelse continue;
                 const owned_split_key = (lookup.fetchMedianKey(self.alloc, range.group_id) catch continue) orelse continue;
@@ -833,18 +890,19 @@ fn activeRangeTransitionCountForTable(current: CurrentMetadataState, table_id: u
 fn mergedGroupStatus(current: CurrentMetadataState, group_id: u64) ?MergedGroupStatus {
     if (current.merged_group_statuses.len > 0) {
         for (current.merged_group_statuses) |status| {
-            if (status.group_id == group_id) return mergeRuntimeGroupFacts(status, current.stores, current.placement_intents, group_id);
+            if (status.group_id == group_id) return mergeRuntimeGroupFacts(status, current.stores, current.placement_intents, current.ranges, group_id);
         }
         return null;
     }
     const fallback = mergeHealthyGroupStatusFallback(current.stores, group_id) orelse return null;
-    return mergeRuntimeGroupFacts(fallback, current.stores, current.placement_intents, group_id);
+    return mergeRuntimeGroupFacts(fallback, current.stores, current.placement_intents, current.ranges, group_id);
 }
 
 fn mergeRuntimeGroupFacts(
     base: MergedGroupStatus,
     stores: []const table_manager.StoreRecord,
     placements: []const raft_reconciler.PlacementIntent,
+    ranges: []const table_manager.RangeRecord,
     group_id: u64,
 ) MergedGroupStatus {
     var merged = base;
@@ -862,19 +920,256 @@ fn mergeRuntimeGroupFacts(
         }
         for (store.runtime_statuses) |status| {
             if (status.group_id != group_id) continue;
-            store_reports_runtime_facts = store_reports_runtime_facts or status.doc_count > 0 or status.disk_bytes > 0;
+            store_reports_runtime_facts = store_reports_runtime_facts or
+                status.doc_count > 0 or
+                status.disk_bytes > 0 or
+                runtimeDocIdentityHasFacts(status.doc_identity);
             if (status.doc_count > merged.doc_count) merged.doc_count = status.doc_count;
             if (status.disk_bytes > merged.disk_bytes) merged.disk_bytes = status.disk_bytes;
             if (status.doc_count > 0 or status.disk_bytes > 0) merged.empty = false;
             const updated_at_millis = @divTrunc(status.updated_at_ns, std.time.ns_per_ms);
             if (updated_at_millis > merged.updated_at_millis) merged.updated_at_millis = updated_at_millis;
+            mergeRuntimeDocIdentity(&merged, status.doc_identity);
         }
         if (store_reports_voter or (!store_reports_group and store_reports_runtime_facts and storeHasPlacement(placements, group_id, store.node_id))) {
             healthy_voter_reports +|= 1;
         }
     }
     if (healthy_voter_reports > merged.healthy_voter_reports) merged.healthy_voter_reports = healthy_voter_reports;
+    markDocIdentityRebuildRequiredOnNamespaceMismatch(&merged, ranges, group_id);
+    refreshDocIdentityLifecycle(&merged);
     return merged;
+}
+
+fn mergeRuntimeDocIdentity(
+    merged: *MergedGroupStatus,
+    incoming: table_manager.RuntimeDocIdentityStatusReport,
+) void {
+    if (!runtimeDocIdentityHasFacts(incoming)) return;
+    if (!runtimeDocIdentityHasFacts(merged.doc_identity)) {
+        merged.doc_identity = incoming;
+        return;
+    }
+
+    if (runtimeDocIdentityHasOrdinalRows(merged.doc_identity) and runtimeDocIdentityHasOrdinalRows(incoming) and
+        !runtimeDocIdentitySameNamespace(merged.doc_identity, incoming))
+    {
+        merged.doc_identity_namespace_conflict = true;
+    }
+
+    merged.doc_identity.rebuild_required = merged.doc_identity.rebuild_required or incoming.rebuild_required;
+    merged.doc_identity.ordinal_capacity_exhausted = merged.doc_identity.ordinal_capacity_exhausted or incoming.ordinal_capacity_exhausted;
+    merged.doc_identity.complete = merged.doc_identity.complete and incoming.complete;
+    merged.doc_identity.allocated_ordinals = @max(merged.doc_identity.allocated_ordinals, incoming.allocated_ordinals);
+    merged.doc_identity.state_rows = @max(merged.doc_identity.state_rows, incoming.state_rows);
+    merged.doc_identity.live_ordinals = @max(merged.doc_identity.live_ordinals, incoming.live_ordinals);
+    merged.doc_identity.tombstone_ordinals = @max(merged.doc_identity.tombstone_ordinals, incoming.tombstone_ordinals);
+    merged.doc_identity.primary_docs_missing_ordinals = @max(merged.doc_identity.primary_docs_missing_ordinals, incoming.primary_docs_missing_ordinals);
+    merged.doc_identity.primary_docs_missing_identity_state = @max(merged.doc_identity.primary_docs_missing_identity_state, incoming.primary_docs_missing_identity_state);
+    merged.doc_identity.primary_docs_with_tombstone_ordinals = @max(merged.doc_identity.primary_docs_with_tombstone_ordinals, incoming.primary_docs_with_tombstone_ordinals);
+}
+
+fn markDocIdentityRebuildRequiredOnNamespaceMismatch(
+    status: *MergedGroupStatus,
+    ranges: []const table_manager.RangeRecord,
+    group_id: u64,
+) void {
+    if (!runtimeDocIdentityHasNamespace(status.doc_identity)) return;
+    const range = findRangeRecord(ranges, group_id) orelse return;
+    if (status.doc_identity.namespace_table_id == range.table_id and
+        status.doc_identity.namespace_shard_id == table_manager.rangeDocIdentityShardId(range) and
+        status.doc_identity.namespace_range_id == table_manager.rangeDocIdentityRangeId(range)) return;
+    status.doc_identity.rebuild_required = true;
+}
+
+fn docIdentityNamespacesCompatibleForAutomaticMerge(left: MergedGroupStatus, right: MergedGroupStatus) bool {
+    if (left.doc_identity_reassignment_active or right.doc_identity_reassignment_active) return false;
+    if (left.doc_identity_namespace_conflict or right.doc_identity_namespace_conflict) return false;
+    if (left.doc_identity.rebuild_required or right.doc_identity.rebuild_required) return false;
+    if (left.doc_identity.ordinal_capacity_exhausted or right.doc_identity.ordinal_capacity_exhausted) return false;
+    if (!runtimeDocIdentityHasOrdinalRows(left.doc_identity) or !runtimeDocIdentityHasOrdinalRows(right.doc_identity)) return true;
+    return runtimeDocIdentitySameNamespace(left.doc_identity, right.doc_identity);
+}
+
+fn docIdentityNamespaceReadyForAutomaticSplit(status: MergedGroupStatus) bool {
+    if (status.doc_identity_reassignment_active) return false;
+    if (status.doc_identity_namespace_conflict) return false;
+    if (status.doc_identity.rebuild_required) return false;
+    if (status.doc_identity.ordinal_capacity_exhausted) return false;
+    return true;
+}
+
+const ReassignmentActivityPolicy = enum { disallow_active, allow_existing_active };
+
+fn mergeTransitionDocIdentityCompatible(
+    current: CurrentMetadataState,
+    record: transition_state.MergeTransitionRecord,
+    activity_policy: ReassignmentActivityPolicy,
+) bool {
+    const donor = mergedGroupStatus(current, record.donor_group_id) orelse return mergeTransitionMissingDocIdentityStatusCompatible(current, record);
+    const receiver = mergedGroupStatus(current, record.receiver_group_id) orelse return mergeTransitionMissingDocIdentityStatusCompatible(current, record);
+    if (record.allow_doc_identity_reassignment) return docIdentityNamespacesCanReassign(donor, receiver, activity_policy);
+    return docIdentityNamespacesCompatibleForAutomaticMerge(donor, receiver);
+}
+
+fn mergeTransitionMissingDocIdentityStatusCompatible(
+    current: CurrentMetadataState,
+    record: transition_state.MergeTransitionRecord,
+) bool {
+    if (record.allow_doc_identity_reassignment) return false;
+    return !currentHasDocIdentityTelemetry(current);
+}
+
+fn splitTransitionDocIdentityCompatible(current: CurrentMetadataState, record: transition_state.SplitTransitionRecord) bool {
+    const source = mergedGroupStatus(current, record.source_group_id) orelse return !currentHasDocIdentityTelemetry(current);
+    return docIdentityNamespaceReadyForAutomaticSplit(source);
+}
+
+fn currentHasDocIdentityTelemetry(current: CurrentMetadataState) bool {
+    if (current.merged_group_statuses.len > 0) return true;
+    for (current.stores) |store| {
+        for (store.runtime_statuses) |status| {
+            if (runtimeDocIdentityHasFacts(status.doc_identity)) return true;
+        }
+    }
+    return false;
+}
+
+fn docIdentityNamespacesCanReassign(left: MergedGroupStatus, right: MergedGroupStatus, activity_policy: ReassignmentActivityPolicy) bool {
+    if (activity_policy == .disallow_active and
+        (left.doc_identity_reassignment_active or right.doc_identity_reassignment_active)) return false;
+    if (left.doc_identity_namespace_conflict or right.doc_identity_namespace_conflict) return false;
+    if (left.doc_identity.rebuild_required or right.doc_identity.rebuild_required) return false;
+    if (left.doc_identity.ordinal_capacity_exhausted or right.doc_identity.ordinal_capacity_exhausted) return false;
+    return true;
+}
+
+pub fn refreshDocIdentityLifecycle(status: *MergedGroupStatus) void {
+    status.doc_identity_lifecycle = deriveDocIdentityLifecycle(status.*);
+}
+
+pub fn deriveDocIdentityLifecycle(status: MergedGroupStatus) []const u8 {
+    if (status.doc_identity_namespace_conflict or
+        status.doc_identity.rebuild_required or
+        status.doc_identity.ordinal_capacity_exhausted)
+    {
+        return doc_identity_lifecycle_rebuild_required;
+    }
+    if (status.doc_identity_reassignment_active) return doc_identity_lifecycle_reassigning;
+    if (!runtimeDocIdentityHasFacts(status.doc_identity)) return doc_identity_lifecycle_unknown;
+    if (status.doc_identity.complete and runtimeDocIdentityRepairCountersClear(status.doc_identity)) {
+        return doc_identity_lifecycle_ready;
+    }
+    return doc_identity_lifecycle_preserving;
+}
+
+fn runtimeDocIdentityRepairCountersClear(stats: table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.primary_docs_missing_ordinals == 0 and
+        stats.primary_docs_missing_identity_state == 0 and
+        stats.primary_docs_with_tombstone_ordinals == 0;
+}
+
+test "metadata reconciler doc identity guards block new planning during active reassignment" {
+    var receiver = MergedGroupStatus{
+        .group_id = 9001,
+        .doc_identity_reassignment_active = true,
+        .doc_identity = .{
+            .namespace_table_id = 90,
+            .namespace_shard_id = 9001,
+            .namespace_range_id = 1,
+            .next_ordinal = 11,
+            .allocated_ordinals = 10,
+            .live_ordinals = 10,
+        },
+    };
+    const donor = MergedGroupStatus{
+        .group_id = 9002,
+        .doc_identity = .{
+            .namespace_table_id = 90,
+            .namespace_shard_id = 9002,
+            .namespace_range_id = 2,
+            .next_ordinal = 9,
+            .allocated_ordinals = 8,
+            .live_ordinals = 8,
+        },
+    };
+    const statuses = [_]MergedGroupStatus{ receiver, donor };
+    const current = CurrentMetadataState{ .merged_group_statuses = &statuses };
+    const merge = transition_state.MergeTransitionRecord{
+        .transition_id = 90001,
+        .donor_group_id = 9002,
+        .receiver_group_id = 9001,
+        .allow_doc_identity_reassignment = true,
+    };
+
+    try std.testing.expect(!docIdentityNamespacesCompatibleForAutomaticMerge(receiver, donor));
+    try std.testing.expect(!docIdentityNamespaceReadyForAutomaticSplit(receiver));
+    try std.testing.expect(!mergeTransitionDocIdentityCompatible(current, merge, .disallow_active));
+    try std.testing.expect(mergeTransitionDocIdentityCompatible(current, merge, .allow_existing_active));
+
+    receiver.doc_identity_reassignment_active = false;
+    receiver.doc_identity_namespace_conflict = true;
+    try std.testing.expect(!docIdentityNamespacesCanReassign(receiver, donor, .disallow_active));
+}
+
+fn splitTransitionCanRollback(record: transition_state.SplitTransitionRecord) bool {
+    return switch (record.phase) {
+        .finalized, .rolled_back => false,
+        else => true,
+    };
+}
+
+fn mergeTransitionCanRollback(record: transition_state.MergeTransitionRecord) bool {
+    return switch (record.phase) {
+        .finalized, .rolled_back => false,
+        else => true,
+    };
+}
+
+fn runtimeDocIdentityHasFacts(stats: table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.namespace_table_id != 0 or
+        stats.namespace_shard_id != 0 or
+        stats.namespace_range_id != 0 or
+        stats.next_ordinal != 1 or
+        stats.allocated_ordinals != 0 or
+        stats.ordinal_capacity_remaining != 0 or
+        stats.ordinal_capacity_exhausted or
+        stats.rebuild_required or
+        stats.state_rows != 0 or
+        stats.live_ordinals != 0 or
+        stats.tombstone_ordinals != 0 or
+        stats.min_created_generation != 0 or
+        stats.max_created_generation != 0 or
+        stats.min_deleted_generation != 0 or
+        stats.max_deleted_generation != 0 or
+        stats.scanned_primary_docs != 0 or
+        stats.primary_docs_missing_ordinals != 0 or
+        stats.primary_docs_missing_identity_state != 0 or
+        stats.primary_docs_with_tombstone_ordinals != 0 or
+        stats.complete;
+}
+
+fn runtimeDocIdentityHasOrdinalRows(stats: table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.next_ordinal != 1 or
+        stats.allocated_ordinals != 0 or
+        stats.state_rows != 0 or
+        stats.live_ordinals != 0 or
+        stats.tombstone_ordinals != 0;
+}
+
+fn runtimeDocIdentityHasNamespace(stats: table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.namespace_table_id != 0 or
+        stats.namespace_shard_id != 0 or
+        stats.namespace_range_id != 0;
+}
+
+fn runtimeDocIdentitySameNamespace(
+    left: table_manager.RuntimeDocIdentityStatusReport,
+    right: table_manager.RuntimeDocIdentityStatusReport,
+) bool {
+    return left.namespace_table_id == right.namespace_table_id and
+        left.namespace_shard_id == right.namespace_shard_id and
+        left.namespace_range_id == right.namespace_range_id;
 }
 
 fn storeHasPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
@@ -1361,6 +1656,7 @@ fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTran
         .receiver_group_id = record.receiver_group_id,
         .phase = record.phase,
         .rollback_reason = if (record.rollback_reason) |value| try alloc.dupe(u8, value) else null,
+        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
     };
 }
 
@@ -1379,6 +1675,7 @@ fn mergeRecordsEqual(a: transition_state.MergeTransitionRecord, b: transition_st
         a.donor_group_id == b.donor_group_id and
         a.receiver_group_id == b.receiver_group_id and
         a.phase == b.phase and
+        a.allow_doc_identity_reassignment == b.allow_doc_identity_reassignment and
         optionalBytesEqual(a.rollback_reason, b.rollback_reason);
 }
 
@@ -1558,6 +1855,147 @@ test "metadata reconciler emits runtime steps once transitions are committed" {
     try std.testing.expectEqual(@as(usize, 1), plan.split_steps.len);
     try std.testing.expectEqual(transition_controller.SplitExecutionStateTag.awaiting_source_start, plan.split_steps[0].execution.tag);
     try std.testing.expect(plan.split_steps[0].execution.actionable());
+}
+
+test "metadata reconciler rolls back existing split with stale doc identity namespace" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 11, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 1101,
+        .range_id = 9001,
+        .table_id = 11,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+    try manager.requestSplit(.{
+        .transition_id = 7201,
+        .table_id = 11,
+        .source_group_id = 1101,
+        .destination_group_id = 1102,
+        .split_key = "doc:m",
+    });
+
+    const desired = try manager.listDesiredSplitTransitions(std.testing.allocator);
+    defer manager.freeSplitTransitions(std.testing.allocator, desired);
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+
+    const statuses = [_]MergedGroupStatus{.{
+        .group_id = 1101,
+        .doc_count = 10,
+        .disk_bytes = 10,
+        .empty = false,
+        .updated_at_millis = monotonicMillis(),
+        .doc_identity = .{
+            .namespace_table_id = 11,
+            .namespace_shard_id = 1101,
+            .namespace_range_id = 9001,
+            .next_ordinal = 11,
+            .allocated_ordinals = 10,
+            .live_ordinals = 10,
+            .rebuild_required = true,
+        },
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .merged_group_statuses = &statuses,
+        .split_transitions = desired,
+        .split_observations = &.{.{
+            .transition_id = 7201,
+            .observation = defaultSplitObservation(),
+        }},
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_steps.len);
+    try std.testing.expectEqual(@as(u64, 7201), plan.split_upserts[0].transition_id);
+    try std.testing.expectEqualStrings(doc_identity_transition_rollback_reason, plan.split_upserts[0].rollback_reason.?);
+}
+
+test "metadata reconciler does not upsert desired split with stale doc identity namespace" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 12, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 1201,
+        .range_id = 9101,
+        .table_id = 12,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+    try manager.requestSplit(.{
+        .transition_id = 7301,
+        .table_id = 12,
+        .source_group_id = 1201,
+        .destination_group_id = 1202,
+        .split_key = "doc:m",
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+
+    const statuses = [_]MergedGroupStatus{.{
+        .group_id = 1201,
+        .doc_count = 10,
+        .disk_bytes = 10,
+        .empty = false,
+        .updated_at_millis = monotonicMillis(),
+        .doc_identity = .{
+            .namespace_table_id = 12,
+            .namespace_shard_id = 1201,
+            .namespace_range_id = 9101,
+            .next_ordinal = 11,
+            .allocated_ordinals = 10,
+            .live_ordinals = 10,
+            .rebuild_required = true,
+        },
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .merged_group_statuses = &statuses,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_steps.len);
+
+    const missing_statuses = [_]MergedGroupStatus{.{
+        .group_id = 1299,
+        .doc_count = 10,
+        .disk_bytes = 10,
+        .empty = false,
+        .updated_at_millis = monotonicMillis(),
+        .doc_identity = .{
+            .namespace_table_id = 12,
+            .namespace_shard_id = 1299,
+            .namespace_range_id = 9199,
+            .next_ordinal = 11,
+            .allocated_ordinals = 10,
+            .live_ordinals = 10,
+        },
+    }};
+    var missing_status_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .merged_group_statuses = &missing_statuses,
+    });
+    defer missing_status_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), missing_status_plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), missing_status_plan.split_steps.len);
 }
 
 test "metadata reconciler distinguishes repair from rebalance placement changes" {
@@ -1809,6 +2247,145 @@ test "metadata reconciler plans an automatic split from fresh group status" {
     try std.testing.expectEqual(@as(u64, 4001), plan.split_upserts[0].source_group_id);
     try std.testing.expect(plan.split_upserts[0].destination_group_id != 0);
     try std.testing.expectEqualStrings("doc:m", plan.split_upserts[0].split_key.?);
+}
+
+test "metadata reconciler does not automatically split stale doc identity namespace" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 416, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 4161,
+        .range_id = 9001,
+        .table_id = 416,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+
+    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const updated_at_ns = now_ms * std.time.ns_per_ms;
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 1,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .failure_domain = "rack-a",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 4161,
+                .doc_count = 200,
+                .disk_bytes = 200,
+                .empty = false,
+                .updated_at_millis = now_ms,
+                .local_leader = true,
+            }})[0..]),
+            .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{.{
+                .table_id = 416,
+                .table_name = "docs",
+                .group_id = 4161,
+                .updated_at_ns = updated_at_ns,
+                .doc_identity = .{
+                    .namespace_table_id = 416,
+                    .namespace_shard_id = 4161,
+                    .namespace_range_id = 42,
+                    .next_ordinal = 201,
+                    .allocated_ordinals = 200,
+                    .live_ordinals = 200,
+                },
+            }})[0..]),
+        },
+    };
+
+    var lookup = TestMedianKeyLookup{ .median_key = "doc:m" };
+    var reconciler = Reconciler.initWithConfig(std.testing.allocator, .{
+        .max_shard_size_bytes = 100,
+        .max_shards_per_table = 8,
+        .median_key_lookup = lookup.iface(),
+    });
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .stores = &stores,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
+}
+
+test "metadata reconciler does not automatically split ordinal exhausted doc identity" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 417, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 4171,
+        .range_id = 9001,
+        .table_id = 417,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+
+    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const updated_at_ns = now_ms * std.time.ns_per_ms;
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 1,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .failure_domain = "rack-a",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 4171,
+                .doc_count = 200,
+                .disk_bytes = 200,
+                .empty = false,
+                .updated_at_millis = now_ms,
+                .local_leader = true,
+            }})[0..]),
+            .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{.{
+                .table_id = 417,
+                .table_name = "docs",
+                .group_id = 4171,
+                .updated_at_ns = updated_at_ns,
+                .doc_identity = .{
+                    .namespace_table_id = 417,
+                    .namespace_shard_id = 4171,
+                    .namespace_range_id = 9001,
+                    .next_ordinal = std.math.maxInt(u32),
+                    .allocated_ordinals = std.math.maxInt(u32) - 1,
+                    .live_ordinals = 200,
+                    .ordinal_capacity_exhausted = true,
+                },
+            }})[0..]),
+        },
+    };
+
+    var lookup = TestMedianKeyLookup{ .median_key = "doc:m" };
+    var reconciler = Reconciler.initWithConfig(std.testing.allocator, .{
+        .max_shard_size_bytes = 100,
+        .max_shards_per_table = 8,
+        .median_key_lookup = lookup.iface(),
+    });
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .stores = &stores,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
 }
 
 test "metadata reconciler does not split when a replica is missing healthy group status" {
@@ -2133,6 +2710,502 @@ test "metadata reconciler plans an automatic merge from adjacent small fresh gro
     try std.testing.expectEqual(@as(usize, 1), plan.merge_upserts.len);
     try std.testing.expectEqual(@as(u64, 4102), plan.merge_upserts[0].donor_group_id);
     try std.testing.expectEqual(@as(u64, 4101), plan.merge_upserts[0].receiver_group_id);
+}
+
+test "metadata reconciler does not automatically merge incompatible doc identity namespaces" {
+    var compatible_left = MergedGroupStatus{
+        .group_id = 4101,
+        .doc_identity = .{
+            .namespace_table_id = 410,
+            .namespace_shard_id = 4101,
+            .namespace_range_id = 4101,
+            .allocated_ordinals = 1,
+        },
+    };
+    const compatible_right = MergedGroupStatus{
+        .group_id = 4102,
+        .doc_identity = .{
+            .namespace_table_id = 410,
+            .namespace_shard_id = 4101,
+            .namespace_range_id = 4101,
+            .allocated_ordinals = 1,
+        },
+    };
+    try std.testing.expect(docIdentityNamespacesCompatibleForAutomaticMerge(compatible_left, compatible_right));
+    compatible_left.doc_identity.ordinal_capacity_exhausted = true;
+    try std.testing.expect(!docIdentityNamespacesCompatibleForAutomaticMerge(compatible_left, compatible_right));
+
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 411, .name = "docs", .min_ranges = 1 });
+    try manager.upsertRange(.{
+        .group_id = 4111,
+        .range_id = 1001,
+        .table_id = 411,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+    });
+    try manager.upsertRange(.{
+        .group_id = 4112,
+        .range_id = 1002,
+        .table_id = 411,
+        .start_key = "doc:m",
+        .end_key = "doc:z",
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+
+    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const updated_at_ns = now_ms * std.time.ns_per_ms;
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 1,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .failure_domain = "rack-a",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{
+                .{
+                    .group_id = 4111,
+                    .doc_count = 10,
+                    .disk_bytes = 20,
+                    .empty = false,
+                    .updated_at_millis = now_ms,
+                    .local_leader = true,
+                },
+                .{
+                    .group_id = 4112,
+                    .doc_count = 8,
+                    .disk_bytes = 15,
+                    .empty = false,
+                    .updated_at_millis = now_ms,
+                    .local_leader = true,
+                },
+            })[0..]),
+            .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{
+                .{
+                    .table_id = 411,
+                    .table_name = "docs",
+                    .group_id = 4111,
+                    .updated_at_ns = updated_at_ns,
+                    .doc_identity = .{
+                        .namespace_table_id = 411,
+                        .namespace_shard_id = 4111,
+                        .namespace_range_id = 1001,
+                        .next_ordinal = 11,
+                        .allocated_ordinals = 10,
+                        .live_ordinals = 10,
+                    },
+                },
+                .{
+                    .table_id = 411,
+                    .table_name = "docs",
+                    .group_id = 4112,
+                    .updated_at_ns = updated_at_ns,
+                    .doc_identity = .{
+                        .namespace_table_id = 411,
+                        .namespace_shard_id = 4112,
+                        .namespace_range_id = 1002,
+                        .next_ordinal = 9,
+                        .allocated_ordinals = 8,
+                        .live_ordinals = 8,
+                    },
+                },
+            })[0..]),
+        },
+    };
+
+    var reconciler = Reconciler.initWithConfig(std.testing.allocator, .{
+        .max_shard_size_bytes = 100,
+        .min_shard_size_bytes = 30,
+        .min_shards_per_table = 1,
+        .max_shards_per_table = 8,
+    });
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .stores = &stores,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.merge_upserts.len);
+}
+
+test "metadata reconciler does not automatically merge stale doc identity range namespace" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 415, .name = "docs", .min_ranges = 1 });
+    try manager.upsertRange(.{
+        .group_id = 4151,
+        .range_id = 5001,
+        .table_id = 415,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+    });
+    try manager.upsertRange(.{
+        .group_id = 4152,
+        .range_id = 5002,
+        .table_id = 415,
+        .start_key = "doc:m",
+        .end_key = "doc:z",
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+
+    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const updated_at_ns = now_ms * std.time.ns_per_ms;
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 1,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .failure_domain = "rack-a",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{
+                .{
+                    .group_id = 4151,
+                    .doc_count = 10,
+                    .disk_bytes = 20,
+                    .empty = false,
+                    .updated_at_millis = now_ms,
+                    .local_leader = true,
+                },
+                .{
+                    .group_id = 4152,
+                    .doc_count = 8,
+                    .disk_bytes = 15,
+                    .empty = false,
+                    .updated_at_millis = now_ms,
+                    .local_leader = true,
+                },
+            })[0..]),
+            .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{
+                .{
+                    .table_id = 415,
+                    .table_name = "docs",
+                    .group_id = 4151,
+                    .updated_at_ns = updated_at_ns,
+                    .doc_identity = .{
+                        .namespace_table_id = 415,
+                        .namespace_shard_id = 4151,
+                        .namespace_range_id = 5001,
+                        .next_ordinal = 11,
+                        .allocated_ordinals = 10,
+                        .live_ordinals = 10,
+                    },
+                },
+                .{
+                    .table_id = 415,
+                    .table_name = "docs",
+                    .group_id = 4152,
+                    .updated_at_ns = updated_at_ns,
+                    .doc_identity = .{
+                        .namespace_table_id = 415,
+                        .namespace_shard_id = 4151,
+                        .namespace_range_id = 5001,
+                        .next_ordinal = 9,
+                        .allocated_ordinals = 8,
+                        .live_ordinals = 8,
+                    },
+                },
+            })[0..]),
+        },
+    };
+
+    var reconciler = Reconciler.initWithConfig(std.testing.allocator, .{
+        .max_shard_size_bytes = 100,
+        .min_shard_size_bytes = 30,
+        .min_shards_per_table = 1,
+        .max_shards_per_table = 8,
+    });
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .stores = &stores,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.merge_upserts.len);
+}
+
+test "metadata reconciler allows explicit merge with doc identity reassignment opt-in" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 414, .name = "docs", .min_ranges = 1 });
+    try manager.upsertRange(.{
+        .group_id = 4141,
+        .range_id = 3001,
+        .table_id = 414,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+    });
+    try manager.upsertRange(.{
+        .group_id = 4142,
+        .range_id = 3002,
+        .table_id = 414,
+        .start_key = "doc:m",
+        .end_key = "doc:z",
+    });
+    try manager.requestMerge(.{
+        .transition_id = 41401,
+        .table_id = 414,
+        .donor_group_id = 4142,
+        .receiver_group_id = 4141,
+        .allow_doc_identity_reassignment = true,
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+
+    const now_ms = monotonicMillis();
+    const statuses = [_]MergedGroupStatus{
+        .{
+            .group_id = 4141,
+            .doc_count = 10,
+            .disk_bytes = 10,
+            .empty = false,
+            .updated_at_millis = now_ms,
+            .doc_identity = .{
+                .namespace_table_id = 414,
+                .namespace_shard_id = 4141,
+                .namespace_range_id = 3001,
+                .next_ordinal = 11,
+                .allocated_ordinals = 10,
+                .live_ordinals = 10,
+            },
+        },
+        .{
+            .group_id = 4142,
+            .doc_count = 9,
+            .disk_bytes = 9,
+            .empty = false,
+            .updated_at_millis = now_ms,
+            .doc_identity = .{
+                .namespace_table_id = 414,
+                .namespace_shard_id = 4142,
+                .namespace_range_id = 3002,
+                .next_ordinal = 10,
+                .allocated_ordinals = 9,
+                .live_ordinals = 9,
+            },
+        },
+    };
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .merged_group_statuses = &statuses,
+        .merge_transitions = &.{},
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.merge_upserts.len);
+    try std.testing.expectEqual(@as(u64, 41401), plan.merge_upserts[0].transition_id);
+    try std.testing.expect(plan.merge_upserts[0].allow_doc_identity_reassignment);
+
+    var missing_status_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .merged_group_statuses = statuses[0..1],
+        .merge_transitions = &.{},
+    });
+    defer missing_status_plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), missing_status_plan.merge_upserts.len);
+
+    var blocked_statuses = statuses;
+    blocked_statuses[1].doc_identity.rebuild_required = true;
+    var blocked_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .merged_group_statuses = &blocked_statuses,
+        .merge_transitions = &.{},
+    });
+    defer blocked_plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), blocked_plan.merge_upserts.len);
+
+    var exhausted_statuses = statuses;
+    exhausted_statuses[0].doc_identity.ordinal_capacity_exhausted = true;
+    var exhausted_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .merged_group_statuses = &exhausted_statuses,
+        .merge_transitions = &.{},
+    });
+    defer exhausted_plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), exhausted_plan.merge_upserts.len);
+}
+
+test "metadata reconciler blocks merge replay when one side lacks doc identity status" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 416, .name = "docs", .min_ranges = 1 });
+    try manager.upsertRange(.{
+        .group_id = 4161,
+        .range_id = 6001,
+        .table_id = 416,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+    });
+    try manager.upsertRange(.{
+        .group_id = 4162,
+        .range_id = 6002,
+        .table_id = 416,
+        .start_key = "doc:m",
+        .end_key = "doc:z",
+    });
+    try manager.requestMerge(.{
+        .transition_id = 41601,
+        .table_id = 416,
+        .donor_group_id = 4162,
+        .receiver_group_id = 4161,
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+    const desired_merges = try manager.listDesiredMergeTransitions(std.testing.allocator);
+    defer manager.freeMergeTransitions(std.testing.allocator, desired_merges);
+
+    const statuses = [_]MergedGroupStatus{.{
+        .group_id = 4161,
+        .doc_count = 10,
+        .disk_bytes = 10,
+        .empty = false,
+        .updated_at_millis = monotonicMillis(),
+        .doc_identity = .{
+            .namespace_table_id = 416,
+            .namespace_shard_id = 4161,
+            .namespace_range_id = 6001,
+            .next_ordinal = 11,
+            .allocated_ordinals = 10,
+            .live_ordinals = 10,
+        },
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .merged_group_statuses = &statuses,
+        .merge_transitions = &.{},
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.merge_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.merge_steps.len);
+
+    var replay_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .merged_group_statuses = &statuses,
+        .merge_transitions = desired_merges,
+    });
+    defer replay_plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), replay_plan.merge_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), replay_plan.merge_steps.len);
+    try std.testing.expectEqualStrings(doc_identity_merge_rollback_reason, replay_plan.merge_upserts[0].rollback_reason.?);
+}
+
+test "metadata reconciler rolls back existing merge with incompatible doc identity namespaces" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 413, .name = "docs", .min_ranges = 1 });
+    try manager.upsertRange(.{
+        .group_id = 4131,
+        .range_id = 2001,
+        .table_id = 413,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+    });
+    try manager.upsertRange(.{
+        .group_id = 4132,
+        .range_id = 2002,
+        .table_id = 413,
+        .start_key = "doc:m",
+        .end_key = "doc:z",
+    });
+    try manager.requestMerge(.{
+        .transition_id = 41301,
+        .table_id = 413,
+        .donor_group_id = 4132,
+        .receiver_group_id = 4131,
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+    const desired_merges = try manager.listDesiredMergeTransitions(std.testing.allocator);
+    defer manager.freeMergeTransitions(std.testing.allocator, desired_merges);
+
+    const now_ms = monotonicMillis();
+    const statuses = [_]MergedGroupStatus{
+        .{
+            .group_id = 4131,
+            .doc_count = 10,
+            .disk_bytes = 10,
+            .empty = false,
+            .updated_at_millis = now_ms,
+            .doc_identity = .{
+                .namespace_table_id = 413,
+                .namespace_shard_id = 4131,
+                .namespace_range_id = 2001,
+                .next_ordinal = 11,
+                .allocated_ordinals = 10,
+                .live_ordinals = 10,
+            },
+        },
+        .{
+            .group_id = 4132,
+            .doc_count = 9,
+            .disk_bytes = 9,
+            .empty = false,
+            .updated_at_millis = now_ms,
+            .doc_identity = .{
+                .namespace_table_id = 413,
+                .namespace_shard_id = 4132,
+                .namespace_range_id = 2002,
+                .next_ordinal = 10,
+                .allocated_ordinals = 9,
+                .live_ordinals = 9,
+            },
+        },
+    };
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .merged_group_statuses = &statuses,
+        .merge_transitions = desired_merges,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.merge_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.merge_steps.len);
+    try std.testing.expectEqual(@as(u64, 41301), plan.merge_upserts[0].transition_id);
+    try std.testing.expectEqualStrings(doc_identity_merge_rollback_reason, plan.merge_upserts[0].rollback_reason.?);
 }
 
 test "metadata reconciler does not merge when a replica is missing healthy group status" {

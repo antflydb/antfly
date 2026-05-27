@@ -26,6 +26,7 @@ const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
 const analysis_mod = @import("search/analysis.zig");
 const geo_mod = @import("search/geo.zig");
+const platform_time = @import("platform/time.zig");
 
 /// A batch of documents to index.
 pub const Batch = struct {
@@ -35,6 +36,7 @@ pub const Batch = struct {
         id: []const u8,
         stored_data: []const u8,
         fields: []const FieldTerms,
+        doc_ordinal: ?u32 = null,
     };
 
     pub const FieldTerms = struct {
@@ -77,7 +79,7 @@ fn buildSegmentWithExtraSections(
 
     for (batch.docs, 0..) |doc, doc_idx| {
         // Store the document
-        try seg_writer.addStoredDoc(doc.id, doc.stored_data);
+        try seg_writer.addStoredDocBorrowed(doc.id, doc.stored_data);
 
         // Process each field's term hits
         for (doc.fields) |field| {
@@ -95,17 +97,30 @@ fn buildSegmentWithExtraSections(
         }
     }
 
+    var doc_ordinals = std.ArrayListUnmanaged(u32).empty;
+    defer doc_ordinals.deinit(alloc);
+    var has_doc_ordinal = false;
+    for (batch.docs) |doc| {
+        const ordinal = doc.doc_ordinal orelse 0;
+        has_doc_ordinal = has_doc_ordinal or ordinal != 0;
+        try doc_ordinals.append(alloc, ordinal);
+    }
+    if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
+
     // Build inverted indexes and attach to segment
     var fit = field_builders.iterator();
     while (fit.next()) |entry| {
         const field_name = entry.key_ptr.*;
         const inv_data = try entry.value_ptr.build();
-        defer alloc.free(inv_data);
+        errdefer alloc.free(inv_data);
 
-        if (inv_data.len == 0) continue;
+        if (inv_data.len == 0) {
+            alloc.free(inv_data);
+            continue;
+        }
 
         const field_idx = field_indices.get(field_name).?;
-        try seg_writer.addSection(field_idx, .inverted_text, inv_data);
+        try seg_writer.addSectionOwned(field_idx, .inverted_text, inv_data);
     }
 
     // Attach any additional field sections, such as typed doc values.
@@ -152,6 +167,7 @@ pub const TextDocument = struct {
     id: []const u8,
     stored_data: []const u8,
     text_fields: []const TextField,
+    doc_ordinal: ?u32 = null,
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
     typed_fields: ?[]const TypedFieldValue = null,
@@ -167,6 +183,26 @@ pub const TextField = struct {
 pub const BuildTextOptions = struct {
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    profile: ?*BuildTextProfile = null,
+};
+
+pub const BuildTextProfile = struct {
+    doc_count: u64 = 0,
+    text_field_count: u64 = 0,
+    token_count: u64 = 0,
+    term_hit_count: u64 = 0,
+    typed_value_count: u64 = 0,
+    segment_bytes: u64 = 0,
+    analyzer_ns: u64 = 0,
+    term_accum_ns: u64 = 0,
+    hit_materialize_ns: u64 = 0,
+    typed_collect_ns: u64 = 0,
+    typed_build_ns: u64 = 0,
+    section_attach_ns: u64 = 0,
+    stored_doc_attach_ns: u64 = 0,
+    stored_compress_ns: u64 = 0,
+    segment_assembly_ns: u64 = 0,
+    segment_encode_ns: u64 = 0,
 };
 
 /// Build a segment from text documents, analyzing each text field.
@@ -200,42 +236,36 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
     text_analysis: TextAnalysisConfig,
     options: BuildTextOptions,
 ) ![]u8 {
-    // Track all allocations for cleanup after buildSegment
-    var field_name_strings = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (field_name_strings.items) |s| alloc.free(s);
-        field_name_strings.deinit(alloc);
+    const profile = options.profile;
+    if (profile) |p| {
+        p.doc_count +|= @intCast(docs.len);
     }
 
-    // Track all allocations for cleanup after buildSegment
-    var term_strings = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (term_strings.items) |s| alloc.free(s);
-        term_strings.deinit(alloc);
-    }
-    var position_slices = std.ArrayListUnmanaged([]u32).empty;
-    defer {
-        for (position_slices.items) |s| alloc.free(s);
-        position_slices.deinit(alloc);
-    }
-    var hit_slices = std.ArrayListUnmanaged([]inverted.InvertedIndexBuilder.TermHit).empty;
-    defer {
-        for (hit_slices.items) |s| alloc.free(s);
-        hit_slices.deinit(alloc);
-    }
-    var field_slices = std.ArrayListUnmanaged([]Batch.FieldTerms).empty;
-    defer {
-        for (field_slices.items) |s| alloc.free(s);
-        field_slices.deinit(alloc);
-    }
     var typed_sections = std.ArrayListUnmanaged(ExtraSection).empty;
     defer {
         for (typed_sections.items) |section| alloc.free(@constCast(section.data));
         typed_sections.deinit(alloc);
     }
 
-    var batch_docs = std.ArrayListUnmanaged(Batch.Document).empty;
-    defer batch_docs.deinit(alloc);
+    var field_builders = std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder).empty;
+    defer {
+        var it = field_builders.valueIterator();
+        while (it.next()) |b| b.deinit();
+        field_builders.deinit(alloc);
+    }
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+
+    var field_indices = std.StringHashMapUnmanaged(u16).empty;
+    defer field_indices.deinit(alloc);
+
+    var analyzer_cache = std.StringHashMapUnmanaged(*const analysis_mod.Analyzer).empty;
+    defer analyzer_cache.deinit(alloc);
+
+    var doc_ordinals = std.ArrayListUnmanaged(u32).empty;
+    defer doc_ordinals.deinit(alloc);
+    var has_doc_ordinal = false;
 
     var typed_fields = std.StringHashMapUnmanaged(TypedFieldCollector).empty;
     defer {
@@ -248,73 +278,108 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
         typed_fields.deinit(alloc);
     }
 
+    var doc_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer doc_arena_state.deinit();
+
     for (docs, 0..) |text_doc, doc_idx| {
-        var fields = std.ArrayListUnmanaged(Batch.FieldTerms).empty;
-        defer fields.deinit(alloc);
+        _ = doc_arena_state.reset(.retain_capacity);
+        const doc_alloc = doc_arena_state.allocator();
 
-        var field_maps = std.StringHashMapUnmanaged(FieldAcc).empty;
-        defer {
-            var field_it = field_maps.iterator();
-            while (field_it.next()) |entry| {
-                var term_it = entry.value_ptr.term_map.valueIterator();
-                while (term_it.next()) |term_acc| term_acc.positions.deinit(alloc);
-                entry.value_ptr.term_map.deinit(alloc);
+        const stored_attach_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+        try seg_writer.addStoredDocBorrowed(text_doc.id, text_doc.stored_data);
+        if (profile) |p| p.stored_doc_attach_ns +|= platform_time.monotonicNs() - stored_attach_start_ns;
+
+        const doc_ordinal = text_doc.doc_ordinal orelse 0;
+        has_doc_ordinal = has_doc_ordinal or doc_ordinal != 0;
+        try doc_ordinals.append(alloc, doc_ordinal);
+
+        if (!hasDuplicateTextFieldNames(text_doc.text_fields)) {
+            for (text_doc.text_fields) |tf| {
+                try addSingleTextFieldToBuilders(
+                    alloc,
+                    doc_alloc,
+                    &field_builders,
+                    &field_indices,
+                    &seg_writer,
+                    &analyzer_cache,
+                    @intCast(doc_idx),
+                    tf,
+                    default_analyzer,
+                    text_analysis,
+                    profile,
+                );
             }
-            field_maps.deinit(alloc);
-        }
+        } else {
+            var field_maps = std.StringHashMapUnmanaged(FieldAcc).empty;
 
-        for (text_doc.text_fields) |tf| {
-            const analyzer = tf.analyzer orelse resolveFieldAnalyzer(tf.field_name, text_analysis) orelse default_analyzer;
-            const tokens = try analyzer.analyze(alloc, tf.text);
-            defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
-
-            const field_gop = try field_maps.getOrPut(alloc, tf.field_name);
-            if (!field_gop.found_existing) {
-                const owned_field_name = try alloc.dupe(u8, tf.field_name);
-                try field_name_strings.append(alloc, owned_field_name);
-                field_gop.key_ptr.* = owned_field_name;
-                field_gop.value_ptr.* = .{};
-            }
-            const base_position = field_gop.value_ptr.token_offset;
-
-            for (tokens) |tok| {
-                const gop = try field_gop.value_ptr.term_map.getOrPut(alloc, tok.term);
-                if (!gop.found_existing) {
-                    const owned = try alloc.dupe(u8, tok.term);
-                    try term_strings.append(alloc, owned);
-                    gop.key_ptr.* = owned;
-                    gop.value_ptr.* = .{ .freq = 0, .positions = .empty };
+            for (text_doc.text_fields) |tf| {
+                if (profile) |p| p.text_field_count +|= 1;
+                const analyzer = try cachedFieldAnalyzer(alloc, &analyzer_cache, tf, default_analyzer, text_analysis);
+                const analyzer_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+                const tokens = try analyzer.analyze(doc_alloc, tf.text);
+                if (profile) |p| {
+                    p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
+                    p.token_count +|= @intCast(tokens.len);
                 }
-                gop.value_ptr.freq += 1;
-                try gop.value_ptr.positions.append(alloc, base_position + tok.position);
+                if (tokens.len == 0) {
+                    continue;
+                }
+
+                const term_accum_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+                const field_gop = try field_maps.getOrPut(doc_alloc, tf.field_name);
+                if (!field_gop.found_existing) {
+                    field_gop.key_ptr.* = tf.field_name;
+                    field_gop.value_ptr.* = .{};
+                }
+                const base_position = field_gop.value_ptr.token_offset;
+
+                for (tokens) |tok| {
+                    const gop = try field_gop.value_ptr.term_map.getOrPut(doc_alloc, tok.term);
+                    if (!gop.found_existing) {
+                        gop.key_ptr.* = tok.term;
+                        gop.value_ptr.* = .{ .freq = 0, .positions = .empty };
+                    }
+                    gop.value_ptr.freq += 1;
+                    try gop.value_ptr.positions.append(doc_alloc, base_position + tok.position);
+                }
+                field_gop.value_ptr.token_offset += @intCast(tokens.len);
+                if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
             }
-            field_gop.value_ptr.token_offset += @intCast(tokens.len);
-        }
 
-        var field_it = field_maps.iterator();
-        while (field_it.next()) |field_entry| {
-            // Convert to TermHit slice
-            var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
-            defer hits.deinit(alloc);
+            const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+            var field_it = field_maps.iterator();
+            while (field_it.next()) |field_entry| {
+                // Convert to TermHit slice
+                var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
 
-            var it = field_entry.value_ptr.term_map.iterator();
-            while (it.next()) |entry| {
-                const positions = try alloc.dupe(u32, entry.value_ptr.positions.items);
-                try position_slices.append(alloc, positions);
-                try hits.append(alloc, .{
-                    .term = entry.key_ptr.*,
-                    .freq = entry.value_ptr.freq,
-                    .norm = field_entry.value_ptr.token_offset,
-                    .positions = positions,
-                });
+                var it = field_entry.value_ptr.term_map.iterator();
+                while (it.next()) |entry| {
+                    try hits.append(doc_alloc, .{
+                        .term = entry.key_ptr.*,
+                        .freq = entry.value_ptr.freq,
+                        .norm = field_entry.value_ptr.token_offset,
+                        .positions = entry.value_ptr.positions.items,
+                    });
+                    if (profile) |p| p.term_hit_count +|= 1;
+                }
+
+                if (hits.items.len == 0) continue;
+
+                const field_name = field_entry.key_ptr.*;
+                const builder_gop = try field_builders.getOrPut(alloc, field_name);
+                if (!builder_gop.found_existing) {
+                    builder_gop.key_ptr.* = field_name;
+                    builder_gop.value_ptr.* = inverted.InvertedIndexBuilder.init(alloc, .{});
+                }
+                try builder_gop.value_ptr.addDocument(@intCast(doc_idx), hits.items);
+
+                const field_index_gop = try field_indices.getOrPut(alloc, field_name);
+                if (!field_index_gop.found_existing) {
+                    field_index_gop.key_ptr.* = field_name;
+                    field_index_gop.value_ptr.* = try seg_writer.addField(field_name);
+                }
             }
-
-            const hits_owned = try alloc.dupe(inverted.InvertedIndexBuilder.TermHit, hits.items);
-            try hit_slices.append(alloc, hits_owned);
-            try fields.append(alloc, .{
-                .field_name = field_entry.key_ptr.*,
-                .hits = hits_owned,
-            });
+            if (profile) |p| p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
         }
 
         var doc_options = options;
@@ -322,31 +387,23 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
         if (text_doc.infer_type_dynamic_paths.len > 0) {
             doc_options.infer_type_dynamic_paths = text_doc.infer_type_dynamic_paths;
         }
+        const typed_collect_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
         if (text_doc.typed_fields) |projected_typed_fields| {
             for (projected_typed_fields) |field| {
                 try appendTypedFieldValue(alloc, &typed_fields, field.field_name, @intCast(doc_idx), .{
                     .value_type = field.value_type,
                     .value = field.value,
-                });
+                }, profile);
             }
         } else if (text_doc.typed_source) |typed_source| {
             try collectTypedFieldValuesFromValue(alloc, typed_source, @intCast(doc_idx), &typed_fields, text_analysis, doc_options);
         } else {
             try collectTypedFieldValues(alloc, text_doc.stored_data, @intCast(doc_idx), &typed_fields, text_analysis, doc_options);
         }
-
-        const fields_owned = try alloc.dupe(Batch.FieldTerms, fields.items);
-        try field_slices.append(alloc, fields_owned);
-        try batch_docs.append(alloc, .{
-            .id = text_doc.id,
-            .stored_data = text_doc.stored_data,
-            .fields = fields_owned,
-        });
+        if (profile) |p| p.typed_collect_ns +|= platform_time.monotonicNs() - typed_collect_start_ns;
     }
 
-    const docs_slice = try alloc.dupe(Batch.Document, batch_docs.items);
-    defer alloc.free(docs_slice);
-
+    const typed_build_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
     var typed_it = typed_fields.iterator();
     while (typed_it.next()) |entry| {
         if (entry.value_ptr.conflicted or entry.value_ptr.writer == null) continue;
@@ -359,8 +416,48 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
             .data = section_data,
         });
     }
+    if (profile) |p| p.typed_build_ns +|= platform_time.monotonicNs() - typed_build_start_ns;
 
-    return buildSegmentWithExtraSections(alloc, .{ .docs = docs_slice }, typed_sections.items);
+    const segment_encode_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
+
+    const section_attach_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    var fit = field_builders.iterator();
+    while (fit.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        const inv_data = try entry.value_ptr.build();
+        errdefer alloc.free(inv_data);
+
+        if (inv_data.len == 0) {
+            alloc.free(inv_data);
+            continue;
+        }
+
+        const field_idx = field_indices.get(field_name).?;
+        try seg_writer.addSectionOwned(field_idx, .inverted_text, inv_data);
+    }
+
+    for (typed_sections.items) |*section| {
+        const gop = try field_indices.getOrPut(alloc, section.field_name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = section.field_name;
+            gop.value_ptr.* = try seg_writer.addField(section.field_name);
+        }
+        const owned = @constCast(section.data);
+        try seg_writer.addSectionOwned(gop.value_ptr.*, section.section_type, owned);
+        section.data = &.{};
+    }
+    if (profile) |p| p.section_attach_ns +|= platform_time.monotonicNs() - section_attach_start_ns;
+
+    const segment_assembly_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    const segment = try seg_writer.build();
+    if (profile) |p| {
+        p.segment_assembly_ns +|= platform_time.monotonicNs() - segment_assembly_start_ns;
+        p.stored_compress_ns +|= seg_writer.last_stored_compress_ns;
+        p.segment_encode_ns +|= platform_time.monotonicNs() - segment_encode_start_ns;
+        p.segment_bytes +|= @intCast(segment.len);
+    }
+    return segment;
 }
 
 const TermAcc = struct {
@@ -372,6 +469,142 @@ const FieldAcc = struct {
     token_offset: u32 = 0,
     term_map: std.StringHashMapUnmanaged(TermAcc) = .empty,
 };
+
+fn hasDuplicateTextFieldNames(fields: []const TextField) bool {
+    for (fields, 0..) |field, i| {
+        for (fields[0..i]) |prev| {
+            if (std.mem.eql(u8, prev.field_name, field.field_name)) return true;
+        }
+    }
+    return false;
+}
+
+fn cachedFieldAnalyzer(
+    alloc: Allocator,
+    cache: *std.StringHashMapUnmanaged(*const analysis_mod.Analyzer),
+    field: TextField,
+    default_analyzer: *const analysis_mod.Analyzer,
+    text_analysis: TextAnalysisConfig,
+) !*const analysis_mod.Analyzer {
+    if (field.analyzer) |analyzer| return analyzer;
+    const gop = try cache.getOrPut(alloc, field.field_name);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = field.field_name;
+        gop.value_ptr.* = resolveFieldAnalyzer(field.field_name, text_analysis) orelse default_analyzer;
+    }
+    return gop.value_ptr.*;
+}
+
+fn addSingleTextFieldToBuilders(
+    alloc: Allocator,
+    doc_alloc: Allocator,
+    field_builders: *std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder),
+    field_indices: *std.StringHashMapUnmanaged(u16),
+    seg_writer: *segment_mod.SegmentWriter,
+    analyzer_cache: *std.StringHashMapUnmanaged(*const analysis_mod.Analyzer),
+    doc_idx: u32,
+    field: TextField,
+    default_analyzer: *const analysis_mod.Analyzer,
+    text_analysis: TextAnalysisConfig,
+    profile: ?*BuildTextProfile,
+) !void {
+    if (profile) |p| p.text_field_count +|= 1;
+    const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
+    const analyzer_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    const tokens = try analyzer.analyze(doc_alloc, field.text);
+    if (profile) |p| {
+        p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
+        p.token_count +|= @intCast(tokens.len);
+    }
+    if (tokens.len == 0) return;
+
+    const term_accum_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    if (tokens.len <= 64 and tokenTermsAreUnique(tokens)) {
+        if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
+
+        const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+        const positions = try doc_alloc.alloc(u32, tokens.len);
+        var hits = try doc_alloc.alloc(inverted.InvertedIndexBuilder.TermHit, tokens.len);
+        const norm: u32 = @intCast(tokens.len);
+        for (tokens, 0..) |tok, i| {
+            positions[i] = tok.position;
+            hits[i] = .{
+                .term = tok.term,
+                .freq = 1,
+                .norm = norm,
+                .positions = positions[i .. i + 1],
+            };
+        }
+        if (profile) |p| {
+            p.term_hit_count +|= @intCast(hits.len);
+            p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
+        }
+        try addFieldHitsToBuilder(alloc, field_builders, field_indices, seg_writer, doc_idx, field.field_name, hits);
+        return;
+    }
+
+    var field_acc = FieldAcc{};
+    for (tokens) |tok| {
+        const gop = try field_acc.term_map.getOrPut(doc_alloc, tok.term);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = tok.term;
+            gop.value_ptr.* = .{ .freq = 0, .positions = .empty };
+        }
+        gop.value_ptr.freq += 1;
+        try gop.value_ptr.positions.append(doc_alloc, tok.position);
+    }
+    field_acc.token_offset = @intCast(tokens.len);
+    if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
+
+    const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
+    var it = field_acc.term_map.iterator();
+    while (it.next()) |entry| {
+        try hits.append(doc_alloc, .{
+            .term = entry.key_ptr.*,
+            .freq = entry.value_ptr.freq,
+            .norm = field_acc.token_offset,
+            .positions = entry.value_ptr.positions.items,
+        });
+        if (profile) |p| p.term_hit_count +|= 1;
+    }
+    if (profile) |p| p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
+    if (hits.items.len == 0) return;
+
+    try addFieldHitsToBuilder(alloc, field_builders, field_indices, seg_writer, doc_idx, field.field_name, hits.items);
+}
+
+fn tokenTermsAreUnique(tokens: []const analysis_mod.Token) bool {
+    for (tokens, 0..) |token, i| {
+        for (tokens[0..i]) |prev| {
+            if (std.mem.eql(u8, token.term, prev.term)) return false;
+        }
+    }
+    return true;
+}
+
+fn addFieldHitsToBuilder(
+    alloc: Allocator,
+    field_builders: *std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder),
+    field_indices: *std.StringHashMapUnmanaged(u16),
+    seg_writer: *segment_mod.SegmentWriter,
+    doc_idx: u32,
+    field_name: []const u8,
+    hits: []const inverted.InvertedIndexBuilder.TermHit,
+) !void {
+    const builder_gop = try field_builders.getOrPut(alloc, field_name);
+    if (!builder_gop.found_existing) {
+        builder_gop.key_ptr.* = field_name;
+        builder_gop.value_ptr.* = inverted.InvertedIndexBuilder.init(alloc, .{});
+    }
+    try builder_gop.value_ptr.addDocument(doc_idx, hits);
+
+    const field_index_gop = try field_indices.getOrPut(alloc, field_name);
+    if (!field_index_gop.found_existing) {
+        field_index_gop.key_ptr.* = field_name;
+        field_index_gop.value_ptr.* = try seg_writer.addField(field_name);
+    }
+}
 
 const TypedFieldCollector = struct {
     value_type: ?typed_dv.ValueType = null,
@@ -438,11 +671,11 @@ fn collectTypedFieldValuesFromValue(
     if (value != .object) return;
 
     if (options.recursive_typed_fields) {
-        try collectTypedFieldValuesRecursive(alloc, value, "", doc_id, typed_fields, text_analysis);
+        try collectTypedFieldValuesRecursive(alloc, value, "", doc_id, typed_fields, text_analysis, options.profile);
         return;
     }
     if (options.infer_type_dynamic_paths.len > 0) {
-        try collectTypedFieldValuesRecursiveScoped(alloc, value, "", doc_id, typed_fields, text_analysis, options.infer_type_dynamic_paths);
+        try collectTypedFieldValuesRecursiveScoped(alloc, value, "", doc_id, typed_fields, text_analysis, options.infer_type_dynamic_paths, options.profile);
         return;
     }
 
@@ -452,7 +685,7 @@ fn collectTypedFieldValuesFromValue(
         if (field_name.len > 0 and field_name[0] == '_') continue;
 
         const detected = detectTypedValue(field_name, entry.value_ptr.*, text_analysis) orelse continue;
-        try appendTypedFieldValue(alloc, typed_fields, field_name, doc_id, detected);
+        try appendTypedFieldValue(alloc, typed_fields, field_name, doc_id, detected, options.profile);
     }
 }
 
@@ -542,6 +775,20 @@ fn appendTypedFieldProjectionValue(
     });
 }
 
+pub fn detectTypedFieldProjectionValue(
+    alloc: Allocator,
+    field_name: []const u8,
+    value: std.json.Value,
+    text_analysis: TextAnalysisConfig,
+) !?TypedFieldValue {
+    const detected = detectTypedValue(field_name, value, text_analysis) orelse return null;
+    return .{
+        .field_name = try alloc.dupe(u8, field_name),
+        .value_type = detected.value_type,
+        .value = try cloneTypedValue(alloc, detected.value),
+    };
+}
+
 fn cloneTypedValue(alloc: Allocator, value: typed_dv.TypedValue) !typed_dv.TypedValue {
     return switch (value) {
         .bytes_val => |bytes| .{ .bytes_val = try alloc.dupe(u8, bytes) },
@@ -559,10 +806,11 @@ fn collectTypedFieldValuesRecursive(
     doc_id: u32,
     typed_fields: *std.StringHashMapUnmanaged(TypedFieldCollector),
     text_analysis: TextAnalysisConfig,
+    profile: ?*BuildTextProfile,
 ) !void {
     if (path.len > 0) {
         if (detectTypedValue(path, value, text_analysis)) |detected| {
-            try appendTypedFieldValue(alloc, typed_fields, path, doc_id, detected);
+            try appendTypedFieldValue(alloc, typed_fields, path, doc_id, detected, profile);
             if (value == .object and detected.value_type == .geo_point) return;
         }
     }
@@ -577,12 +825,12 @@ fn collectTypedFieldValuesRecursive(
                 else
                     try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
                 defer alloc.free(child_path);
-                try collectTypedFieldValuesRecursive(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis);
+                try collectTypedFieldValuesRecursive(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis, profile);
             }
         },
         .array => |array| {
             for (array.items) |item| {
-                try collectTypedFieldValuesRecursive(alloc, item, path, doc_id, typed_fields, text_analysis);
+                try collectTypedFieldValuesRecursive(alloc, item, path, doc_id, typed_fields, text_analysis, profile);
             }
         },
         else => {},
@@ -597,10 +845,11 @@ fn collectTypedFieldValuesRecursiveScoped(
     typed_fields: *std.StringHashMapUnmanaged(TypedFieldCollector),
     text_analysis: TextAnalysisConfig,
     scoped_paths: []const []const u8,
+    profile: ?*BuildTextProfile,
 ) !void {
     if (path.len > 0 and pathFallsUnderAnyScopedPath(scoped_paths, path)) {
         if (detectTypedValue(path, value, text_analysis)) |detected| {
-            try appendTypedFieldValue(alloc, typed_fields, path, doc_id, detected);
+            try appendTypedFieldValue(alloc, typed_fields, path, doc_id, detected, profile);
             if (value == .object and detected.value_type == .geo_point) return;
         }
     }
@@ -615,12 +864,12 @@ fn collectTypedFieldValuesRecursiveScoped(
                 else
                     try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
                 defer alloc.free(child_path);
-                try collectTypedFieldValuesRecursiveScoped(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis, scoped_paths);
+                try collectTypedFieldValuesRecursiveScoped(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis, scoped_paths, profile);
             }
         },
         .array => |array| {
             for (array.items) |item| {
-                try collectTypedFieldValuesRecursiveScoped(alloc, item, path, doc_id, typed_fields, text_analysis, scoped_paths);
+                try collectTypedFieldValuesRecursiveScoped(alloc, item, path, doc_id, typed_fields, text_analysis, scoped_paths, profile);
             }
         },
         else => {},
@@ -643,6 +892,7 @@ fn appendTypedFieldValue(
     field_name: []const u8,
     doc_id: u32,
     detected: DetectedTypedValue,
+    profile: ?*BuildTextProfile,
 ) !void {
     const gop = try typed_fields.getOrPut(alloc, field_name);
     if (!gop.found_existing) {
@@ -662,6 +912,7 @@ fn appendTypedFieldValue(
     }
 
     try gop.value_ptr.writer.?.add(doc_id, detected.value);
+    if (profile) |p| p.typed_value_count +|= 1;
 }
 
 const FieldDateTimeParser = struct {
@@ -1679,6 +1930,28 @@ test "buildSegmentFromText analyzes and indexes text" {
     const stop_results = try snap.search(alloc, "title", &.{"the"}, 10);
     defer alloc.free(stop_results.hits);
     try std.testing.expectEqual(@as(usize, 0), stop_results.hits.len);
+}
+
+test "buildSegmentFromTextWithAnalysisOptions records build profile" {
+    const alloc = std.testing.allocator;
+
+    var profile = BuildTextProfile{};
+    const seg_bytes = try buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+        .{
+            .id = "doc1",
+            .stored_data = "{\"title\":\"alpha beta\",\"price\":42}",
+            .text_fields = &.{.{ .field_name = "title", .text = "alpha beta" }},
+        },
+    }, &analysis_mod.default_analyzer, .{}, .{
+        .profile = &profile,
+    });
+    defer alloc.free(seg_bytes);
+
+    try std.testing.expectEqual(@as(u64, 1), profile.doc_count);
+    try std.testing.expectEqual(@as(u64, 1), profile.text_field_count);
+    try std.testing.expect(profile.token_count > 0);
+    try std.testing.expect(profile.term_hit_count > 0);
+    try std.testing.expect(profile.segment_bytes > 0);
 }
 
 test "buildSegmentFromText omits empty inverted sections" {

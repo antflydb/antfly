@@ -639,7 +639,10 @@ fn preflightQueryRequestAgainstContext(
     var runtime_preflight: ?db_mod.RuntimePreflightSummary = null;
     defer if (runtime_preflight) |*summary| summary.deinit(alloc);
     var contract_preflight = query_contract.preflightQueryRequestAlloc(alloc, query_request) catch |err| blk: {
-        const feedback = try std.fmt.allocPrint(alloc, "query_request failed contract preflight: {s}", .{@errorName(err)});
+        const feedback = if (query_request.graph_searches != null)
+            try std.fmt.allocPrint(alloc, "query_request.graph_searches failed executor preflight: {s}", .{@errorName(err)})
+        else
+            try std.fmt.allocPrint(alloc, "query_request failed contract preflight: {s}", .{@errorName(err)});
         defer alloc.free(feedback);
         try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "query_contract_preflight_failed", "query_request", feedback);
         break :blk null;
@@ -1309,6 +1312,7 @@ fn metadataValidateGraphSearchesAgainstContext(
             }
         }
     }
+    if (try metadataPreflightGraphSearchesAgainstExecutorParser(alloc, graph_searches)) |feedback| return feedback;
     return null;
 }
 

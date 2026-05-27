@@ -95,6 +95,14 @@ const Handle = struct {
     }
 };
 
+fn currentIdentityReadGenerationForHandle(handle: *Handle, requested: ?u64) !u64 {
+    return try handle.db.currentIdentityReadGenerationForRequest(requested);
+}
+
+fn stampSearchRequestIdentityGeneration(handle: *Handle, req: *db_mod.types.SearchRequest) !void {
+    req.identity_read_generation = try currentIdentityReadGenerationForHandle(handle, req.identity_read_generation);
+}
+
 const ReadableLeaseHookFn = *const fn (
     ctx: ?*anyopaque,
     group_id: u64,
@@ -611,6 +619,7 @@ const JsonSearchHit = struct {
 
 const JsonSearchResult = struct {
     total_hits: u32,
+    identity_read_generation: ?u64 = null,
     hits: []JsonSearchHit,
     graph_results: []JsonGraphSearchResult = &.{},
     aggregations: []JsonSearchAggregationResult = &.{},
@@ -619,6 +628,7 @@ const JsonSearchResult = struct {
 const JsonAggregateHitsRequest = struct {
     index_name: []const u8 = "",
     hit_ids_b64: []const []const u8 = &.{},
+    identity_read_generation: ?u64 = null,
     aggregations: []const JsonSearchAggregationRequest = &.{},
 };
 
@@ -655,11 +665,12 @@ const JsonNamedGraphInputSetRequest = struct {
 const JsonGraphSearchResult = struct {
     name: []u8,
     total_hits: u32,
+    identity_read_generation: ?u64 = null,
     nodes: []JsonGraphNode,
     paths: []JsonPath = &.{},
     hits: []JsonSearchHit,
 
-    fn init(alloc: Allocator, result: db_mod.types.GraphSearchResult) !JsonGraphSearchResult {
+    fn init(alloc: Allocator, result: db_mod.types.GraphSearchResult, identity_read_generation: ?u64) !JsonGraphSearchResult {
         var nodes = try alloc.alloc(JsonGraphNode, result.nodes.len);
         errdefer alloc.free(nodes);
         var node_count: usize = 0;
@@ -695,6 +706,7 @@ const JsonGraphSearchResult = struct {
         return .{
             .name = try alloc.dupe(u8, result.name),
             .total_hits = result.total_hits,
+            .identity_read_generation = identity_read_generation,
             .nodes = nodes,
             .paths = paths,
             .hits = hits,
@@ -1621,14 +1633,15 @@ pub export fn antfly_db_packed_dense_search_result_free(result: *capi.PackedDens
 }
 
 fn packDenseHits(
-    alloc: Allocator,
     total_hits: u32,
     ids: []const []const u8,
     scores: []const f32,
+    identity_read_generation: u64,
     out_result: *capi.PackedDenseSearchResult,
 ) !void {
     std.debug.assert(ids.len == scores.len);
 
+    const alloc = std.heap.c_allocator;
     const hits = try alloc.alloc(capi.PackedDenseSearchHit, ids.len);
     errdefer alloc.free(hits);
 
@@ -1654,6 +1667,7 @@ fn packDenseHits(
         .total_hits = total_hits,
         .ids_ptr = if (ids_blob.len > 0) ids_blob.ptr else null,
         .ids_len = ids_blob.len,
+        .identity_read_generation = identity_read_generation,
     };
 }
 
@@ -1662,6 +1676,7 @@ const DenseOwnedResult = struct {
     total_hits: u32,
     ids: [][]const u8,
     scores: []f32,
+    identity_read_generation: u64,
 
     fn deinit(self: *DenseOwnedResult) void {
         for (self.ids) |id| self.alloc.free(id);
@@ -1709,6 +1724,7 @@ const DenseOwnedProfile = struct {
             .total_hits = 0,
             .ids = &.{},
             .scores = &.{},
+            .identity_read_generation = result.identity_read_generation,
         };
         return result;
     }
@@ -1799,10 +1815,11 @@ fn resolveDenseHitsFromProfiled(
 }
 
 fn packResolvedDenseHits(
-    alloc: Allocator,
     resolved: *DenseResolvedHits,
+    identity_read_generation: u64,
     out_result: *capi.PackedDenseSearchResult,
 ) !void {
+    const alloc = std.heap.c_allocator;
     const hits = try alloc.alloc(capi.PackedDenseSearchHit, resolved.hits.len);
     errdefer alloc.free(hits);
 
@@ -1828,17 +1845,19 @@ fn packResolvedDenseHits(
         .total_hits = resolved.total_hits,
         .ids_ptr = if (ids_blob.len > 0) ids_blob.ptr else null,
         .ids_len = ids_blob.len,
+        .identity_read_generation = identity_read_generation,
     };
 }
 
 fn encodeResolvedDenseWireResponse(
     resolved: *DenseResolvedHits,
+    identity_read_generation: u64,
 ) !capi.Buffer {
     const header_len: usize = 4 + 2 + 2 + 4 + 4 + 4;
     const hits_len: usize = resolved.hits.len * @sizeOf(search_wire.PackedHit);
     var ids_len: usize = 0;
     for (resolved.hits) |hit| ids_len += hit.id.len;
-    const total_len = header_len + hits_len + ids_len;
+    const total_len = header_len + hits_len + ids_len + @sizeOf(u64);
     const out = try std.heap.c_allocator.alloc(u8, total_len);
     errdefer std.heap.c_allocator.free(out);
 
@@ -1873,6 +1892,7 @@ fn encodeResolvedDenseWireResponse(
         @memcpy(out[cursor..][0..hit.id.len], hit.id);
         cursor += hit.id.len;
     }
+    std.mem.writeInt(u64, out[cursor..][0..8], identity_read_generation, .little);
 
     return .{ .ptr = out.ptr, .len = out.len };
 }
@@ -1884,6 +1904,7 @@ fn searchDensePackedFast(
     k: u32,
     limit: u32,
     offset: u32,
+    identity_read_generation: u64,
     out_result: *capi.PackedDenseSearchResult,
 ) !bool {
     if (handle.db.core.schema != null and handle.db.core.schema.?.ttl_duration_ns != 0) return false;
@@ -1898,7 +1919,7 @@ fn searchDensePackedFast(
 
     var resolved = try resolveDenseHitsFromProfiled(handle.alloc, entry, &profiled, limit, offset);
     defer resolved.deinit();
-    try packResolvedDenseHits(handle.alloc, &resolved, out_result);
+    try packResolvedDenseHits(&resolved, identity_read_generation, out_result);
     return true;
 }
 
@@ -1909,6 +1930,7 @@ fn searchDenseWireFast(
     k: u32,
     limit: u32,
     offset: u32,
+    identity_read_generation: u64,
 ) !?capi.Buffer {
     if (handle.db.core.schema != null and handle.db.core.schema.?.ttl_duration_ns != 0) return null;
     const entry = handle.db.core.index_manager.denseIndex(index_name) orelse return null;
@@ -1922,7 +1944,7 @@ fn searchDenseWireFast(
 
     var resolved = try resolveDenseHitsFromProfiled(handle.alloc, entry, &profiled, limit, offset);
     defer resolved.deinit();
-    return try encodeResolvedDenseWireResponse(&resolved);
+    return try encodeResolvedDenseWireResponse(&resolved, identity_read_generation);
 }
 
 fn searchDenseWireOwnedProfiled(
@@ -1935,6 +1957,7 @@ fn searchDenseWireOwnedProfiled(
     var req = try search_wire.decodeDenseRequest(handle.alloc, request_buf);
     defer search_wire.freeDenseRequest(handle.alloc, &req);
     const decode_end = monotonicNowNs();
+    const identity_read_generation = try currentIdentityReadGenerationForHandle(handle, null);
 
     if (handle.db.core.schema == null or handle.db.core.schema.?.ttl_duration_ns == 0) {
         if (handle.db.core.index_manager.denseIndex(req.index_name)) |entry| {
@@ -1953,7 +1976,7 @@ fn searchDenseWireOwnedProfiled(
                 const resolve_end = monotonicNowNs();
 
                 const encode_start = monotonicNowNs();
-                const out = try encodeResolvedDenseWireResponse(&resolved);
+                const out = try encodeResolvedDenseWireResponse(&resolved, identity_read_generation);
                 const encode_end = monotonicNowNs();
 
                 return .{
@@ -1993,7 +2016,7 @@ fn searchDenseWireOwnedProfiled(
     const fallback_end = monotonicNowNs();
 
     const encode_start = monotonicNowNs();
-    const out = try search_wire.encodeDenseResponse(owned.total_hits, owned.ids, owned.scores);
+    const out = try search_wire.encodeDenseResponseAtGeneration(owned.total_hits, owned.ids, owned.scores, owned.identity_read_generation);
     const encode_end = monotonicNowNs();
 
     return .{
@@ -2047,6 +2070,7 @@ fn searchDenseOwnedProfiled(
     offset: u32,
 ) !DenseOwnedProfile {
     if (vector.len == 0) return error.InvalidArgument;
+    const identity_read_generation = try currentIdentityReadGenerationForHandle(handle, null);
 
     const total_start = monotonicNowNs();
     const lookup_start = monotonicNowNs();
@@ -2096,6 +2120,7 @@ fn searchDenseOwnedProfiled(
                         .total_hits = @intCast(raw_hits.len),
                         .ids = ids,
                         .scores = scores,
+                        .identity_read_generation = identity_read_generation,
                     },
                     .total_ns = @intCast(hits_end - total_start),
                     .index_lookup_ns = @intCast(lookup_end - lookup_start),
@@ -2135,6 +2160,7 @@ fn searchDenseOwnedProfiled(
         .limit = limit,
         .offset = offset,
         .include_stored = false,
+        .identity_read_generation = identity_read_generation,
     };
 
     const fallback_start = monotonicNowNs();
@@ -2163,6 +2189,7 @@ fn searchDenseOwnedProfiled(
             .total_hits = result.total_hits,
             .ids = ids,
             .scores = scores,
+            .identity_read_generation = identity_read_generation,
         },
         .total_ns = @intCast(total_end - total_start),
         .index_lookup_ns = @intCast(lookup_end - lookup_start),
@@ -2266,6 +2293,7 @@ fn searchTextOwned(
     offset: u32,
 ) !DenseOwnedResult {
     if (index_name.len == 0) return error.InvalidArgument;
+    const identity_read_generation = try currentIdentityReadGenerationForHandle(handle, null);
 
     const req: db_mod.types.SearchRequest = .{
         .index_name = index_name,
@@ -2273,6 +2301,7 @@ fn searchTextOwned(
         .limit = limit,
         .offset = offset,
         .include_stored = false,
+        .identity_read_generation = identity_read_generation,
     };
 
     try handle.prepareSearchRequest(req);
@@ -2299,6 +2328,7 @@ fn searchTextOwned(
         .total_hits = result.total_hits,
         .ids = ids,
         .scores = scores,
+        .identity_read_generation = identity_read_generation,
     };
 }
 
@@ -3037,6 +3067,7 @@ pub export fn antfly_db_search_json(
         distance_under: ?f32 = null,
         filter_ids: []const u64 = &.{},
         exclude_ids: []const u64 = &.{},
+        identity_read_generation: ?u64 = null,
         aggregations: []const JsonSearchAggregationRequest = &.{},
     };
     var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch |err| {
@@ -3068,6 +3099,7 @@ pub export fn antfly_db_search_json(
         .distance_under = parsed.value.distance_under,
         .filter_ids = parsed.value.filter_ids,
         .exclude_ids = parsed.value.exclude_ids,
+        .identity_read_generation = parsed.value.identity_read_generation,
     };
 
     if (std.mem.eql(u8, parsed.value.mode, "full_text")) {
@@ -3098,6 +3130,7 @@ pub export fn antfly_db_search_json(
         return .invalid_argument;
     }
 
+    stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
     handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
     var result = handle.db.search(handle.alloc, req) catch |err| return capi.mapError(err);
     defer result.deinit();
@@ -3123,6 +3156,7 @@ pub export fn antfly_db_search_json(
         const backend_results = aggregations_mod.computeSearchAggregations(handle.alloc, requests, source.*, .{
             .index_manager = handle.db.core.index_manager,
             .full_text_index_name = req.index_name,
+            .identity_read_generation = req.identity_read_generation.?,
         }) catch |err| return capi.mapError(err);
         defer aggregations_mod.deinitResults(handle.alloc, backend_results);
         aggregation_results = toJsonAggregationResults(handle.alloc, backend_results) catch return .internal;
@@ -3149,11 +3183,12 @@ pub export fn antfly_db_search_json(
         if (graph_results.len > 0) handle.alloc.free(graph_results);
     }
     for (result.graph_results, 0..) |graph_result, i| {
-        graph_results[i] = JsonGraphSearchResult.init(handle.alloc, graph_result) catch return .internal;
+        graph_results[i] = JsonGraphSearchResult.init(handle.alloc, graph_result, req.identity_read_generation) catch return .internal;
         graph_count += 1;
     }
     out_buf.* = stringifyJson(JsonSearchResult{
         .total_hits = result.total_hits,
+        .identity_read_generation = req.identity_read_generation,
         .hits = hits,
         .graph_results = graph_results,
         .aggregations = aggregation_results,
@@ -3174,14 +3209,15 @@ pub export fn antfly_db_search_dense(
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (vector_ptr == null or vector_len == 0) return .invalid_argument;
     handle.prepareDenseSearchRequest(index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
+    const identity_read_generation = currentIdentityReadGenerationForHandle(handle, null) catch |err| return capi.mapError(err);
 
-    const fast = searchDensePackedFast(handle, index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset, out_result) catch |err| return capi.mapError(err);
+    const fast = searchDensePackedFast(handle, index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset, identity_read_generation, out_result) catch |err| return capi.mapError(err);
     if (fast) return .ok;
 
     var owned = searchDenseOwned(handle, index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
     defer owned.deinit();
 
-    packDenseHits(handle.alloc, owned.total_hits, owned.ids, owned.scores, out_result) catch return .internal;
+    packDenseHits(owned.total_hits, owned.ids, owned.scores, owned.identity_read_generation, out_result) catch return .internal;
     return .ok;
 }
 
@@ -3243,7 +3279,7 @@ pub export fn antfly_db_dense_fixed_packed_result(
 
     const ids = [_][]const u8{ "doc-fixed-1", "doc-fixed-2", "doc-fixed-3" };
     const scores = [_]f32{ 0.125, 0.25, 0.5 };
-    packDenseHits(handle.alloc, @intCast(ids.len), &ids, &scores, out_result) catch return .internal;
+    packDenseHits(@intCast(ids.len), &ids, &scores, currentIdentityReadGenerationForHandle(handle, null) catch |err| return capi.mapError(err), out_result) catch return .internal;
     return .ok;
 }
 
@@ -3258,7 +3294,8 @@ pub export fn antfly_db_search_dense_wire(
     defer search_wire.freeDenseRequest(handle.alloc, &req);
     handle.prepareDenseSearchRequest(req.index_name, req.vector, req.k, req.limit, req.offset) catch |err| return capi.mapError(err);
 
-    const maybe_fast = searchDenseWireFast(handle, req.index_name, req.vector, req.k, req.limit, req.offset) catch |err| return capi.mapError(err);
+    const identity_read_generation = currentIdentityReadGenerationForHandle(handle, null) catch |err| return capi.mapError(err);
+    const maybe_fast = searchDenseWireFast(handle, req.index_name, req.vector, req.k, req.limit, req.offset, identity_read_generation) catch |err| return capi.mapError(err);
     if (maybe_fast) |out| {
         out_buf.* = out;
         return .ok;
@@ -3267,7 +3304,7 @@ pub export fn antfly_db_search_dense_wire(
     var owned = searchDenseOwned(handle, req.index_name, req.vector, req.k, req.limit, req.offset) catch |err| return capi.mapError(err);
     defer owned.deinit();
 
-    out_buf.* = search_wire.encodeDenseResponse(owned.total_hits, owned.ids, owned.scores) catch return .internal;
+    out_buf.* = search_wire.encodeDenseResponseAtGeneration(owned.total_hits, owned.ids, owned.scores, owned.identity_read_generation) catch return .internal;
     return .ok;
 }
 
@@ -3327,16 +3364,17 @@ pub export fn antfly_db_search_text_match(
     var owned = searchTextMatchOwned(handle, index_name.bytes(), field.bytes(), text.bytes(), "", 1.0, limit, offset) catch |err| return capi.mapError(err);
     defer owned.deinit();
 
-    const hits = handle.alloc.alloc(capi.DenseSearchHit, owned.ids.len) catch return .internal;
+    const result_alloc = std.heap.c_allocator;
+    const hits = result_alloc.alloc(capi.DenseSearchHit, owned.ids.len) catch return .internal;
     var initialized: usize = 0;
     errdefer {
         for (hits[0..initialized]) |hit| {
-            if (hit.id_ptr != null and hit.id_len > 0) handle.alloc.free(hit.id_ptr.?[0..hit.id_len]);
+            if (hit.id_ptr != null and hit.id_len > 0) result_alloc.free(hit.id_ptr.?[0..hit.id_len]);
         }
-        handle.alloc.free(hits);
+        result_alloc.free(hits);
     }
     for (owned.ids, owned.scores, 0..) |id, score, i| {
-        const duped = handle.alloc.dupe(u8, id) catch return .internal;
+        const duped = result_alloc.dupe(u8, id) catch return .internal;
         hits[i] = .{
             .id_ptr = duped.ptr,
             .id_len = duped.len,
@@ -3348,6 +3386,7 @@ pub export fn antfly_db_search_text_match(
         .hits_ptr = hits.ptr,
         .hit_count = hits.len,
         .total_hits = owned.total_hits,
+        .identity_read_generation = owned.identity_read_generation,
     };
     return .ok;
 }
@@ -3365,7 +3404,7 @@ pub export fn antfly_db_search_text_match_wire(
     var owned = searchTextMatchOwned(handle, req.index_name, req.field, req.text, req.analyzer, req.boost, req.limit, req.offset) catch |err| return capi.mapError(err);
     defer owned.deinit();
 
-    out_buf.* = search_wire.encodeDenseResponse(owned.total_hits, owned.ids, owned.scores) catch return .internal;
+    out_buf.* = search_wire.encodeDenseResponseAtGeneration(owned.total_hits, owned.ids, owned.scores, owned.identity_read_generation) catch return .internal;
     return .ok;
 }
 
@@ -3382,7 +3421,7 @@ pub export fn antfly_db_search_text_term_wire(
     var owned = searchTextTermOwned(handle, req.index_name, req.field, req.text, req.boost, req.limit, req.offset) catch |err| return capi.mapError(err);
     defer owned.deinit();
 
-    out_buf.* = search_wire.encodeDenseResponse(owned.total_hits, owned.ids, owned.scores) catch return .internal;
+    out_buf.* = search_wire.encodeDenseResponseAtGeneration(owned.total_hits, owned.ids, owned.scores, owned.identity_read_generation) catch return .internal;
     return .ok;
 }
 
@@ -3399,7 +3438,7 @@ pub export fn antfly_db_search_text_match_phrase_wire(
     var owned = searchTextMatchPhraseOwned(handle, req.index_name, req.field, req.text, req.analyzer, req.fuzziness, req.auto, req.boost, req.limit, req.offset) catch |err| return capi.mapError(err);
     defer owned.deinit();
 
-    out_buf.* = search_wire.encodeDenseResponse(owned.total_hits, owned.ids, owned.scores) catch return .internal;
+    out_buf.* = search_wire.encodeDenseResponseAtGeneration(owned.total_hits, owned.ids, owned.scores, owned.identity_read_generation) catch return .internal;
     return .ok;
 }
 
@@ -3425,6 +3464,7 @@ pub export fn antfly_db_search_hits_json(
         limit: u32 = 10,
         offset: u32 = 0,
         include_stored: bool = false,
+        identity_read_generation: ?u64 = null,
     };
 
     var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
@@ -3444,6 +3484,7 @@ pub export fn antfly_db_search_hits_json(
         .limit = parsed.value.limit,
         .offset = parsed.value.offset,
         .include_stored = false,
+        .identity_read_generation = parsed.value.identity_read_generation,
     };
 
     if (std.mem.eql(u8, parsed.value.mode, "full_text")) {
@@ -3469,22 +3510,24 @@ pub export fn antfly_db_search_hits_json(
         return .invalid_argument;
     }
 
+    stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
     handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
     var result = handle.db.search(handle.alloc, req) catch |err| return capi.mapError(err);
     defer result.deinit();
     if (result.graph_results.len > 0) return .invalid_argument;
 
-    const hits = handle.alloc.alloc(capi.DenseSearchHit, result.hits.len) catch return .internal;
+    const result_alloc = std.heap.c_allocator;
+    const hits = result_alloc.alloc(capi.DenseSearchHit, result.hits.len) catch return .internal;
     var initialized: usize = 0;
     errdefer {
         for (hits[0..initialized]) |hit| {
-            if (hit.id_ptr != null and hit.id_len > 0) handle.alloc.free(hit.id_ptr.?[0..hit.id_len]);
+            if (hit.id_ptr != null and hit.id_len > 0) result_alloc.free(hit.id_ptr.?[0..hit.id_len]);
         }
-        handle.alloc.free(hits);
+        result_alloc.free(hits);
     }
     for (result.hits, 0..) |hit, i| {
         if (hit.stored_data != null or hit.chunk_hits.len > 0) return .invalid_argument;
-        const id = handle.alloc.dupe(u8, hit.id) catch return .internal;
+        const id = result_alloc.dupe(u8, hit.id) catch return .internal;
         hits[i] = .{
             .id_ptr = id.ptr,
             .id_len = id.len,
@@ -3496,6 +3539,7 @@ pub export fn antfly_db_search_hits_json(
         .hits_ptr = hits.ptr,
         .hit_count = hits.len,
         .total_hits = result.total_hits,
+        .identity_read_generation = req.identity_read_generation.?,
     };
     return .ok;
 }
@@ -3973,10 +4017,17 @@ pub export fn antfly_db_execute_graph_queries_json(
         limit: u32 = 10,
         offset: u32 = 0,
         include_stored: bool = true,
+        identity_read_generation: ?u64 = null,
     };
 
     var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
     defer parsed.deinit();
+
+    if (parsed.value.identity_read_generation == null) {
+        for (parsed.value.named_sets) |named_set| {
+            if (named_set.hit_ids_b64.len > 0) return .invalid_argument;
+        }
+    }
 
     const graph_queries = parseNamedGraphQueries(handle.alloc, parsed.value.graph_queries) catch return .invalid_argument;
     defer freeOwnedNamedGraphQueries(handle.alloc, graph_queries);
@@ -3984,12 +4035,16 @@ pub export fn antfly_db_execute_graph_queries_json(
     const named_sets = parseNamedGraphInputSets(handle.alloc, parsed.value.named_sets) catch return .invalid_argument;
     defer freeOwnedNamedGraphInputSets(handle.alloc, named_sets);
 
-    const req: db_mod.types.SearchRequest = .{
+    var req: db_mod.types.SearchRequest = .{
         .limit = parsed.value.limit,
         .offset = parsed.value.offset,
         .include_stored = parsed.value.include_stored,
+        .graph_queries = graph_queries,
+        .identity_read_generation = parsed.value.identity_read_generation,
     };
 
+    stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
+    handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
     const results = handle.db.executeNamedGraphQueries(handle.alloc, req, graph_queries, named_sets) catch |err| return capi.mapError(err);
     defer {
         for (results) |*result| result.deinit(handle.alloc);
@@ -4003,7 +4058,7 @@ pub export fn antfly_db_execute_graph_queries_json(
         if (payload.len > 0) handle.alloc.free(payload);
     }
     for (results, 0..) |result, i| {
-        payload[i] = JsonGraphSearchResult.init(handle.alloc, result) catch return .internal;
+        payload[i] = JsonGraphSearchResult.init(handle.alloc, result, req.identity_read_generation) catch return .internal;
         count += 1;
     }
     out_buf.* = stringifyJson(payload) catch return .internal;
@@ -4018,6 +4073,9 @@ pub export fn antfly_db_aggregate_hits_json(
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     var parsed = std.json.parseFromSlice(JsonAggregateHitsRequest, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
     defer parsed.deinit();
+
+    if (parsed.value.hit_ids_b64.len > 0 and parsed.value.identity_read_generation == null) return .invalid_argument;
+    const identity_read_generation = currentIdentityReadGenerationForHandle(handle, parsed.value.identity_read_generation) catch |err| return capi.mapError(err);
 
     const requests = toAggregationRequest(handle.alloc, parsed.value.aggregations) catch return .internal;
     defer freeAggregationRequests(handle.alloc, requests);
@@ -4053,6 +4111,7 @@ pub export fn antfly_db_aggregate_hits_json(
     const backend_results = aggregations_mod.computeSearchAggregations(handle.alloc, requests, result, .{
         .index_manager = handle.db.core.index_manager,
         .full_text_index_name = if (parsed.value.index_name.len > 0) parsed.value.index_name else null,
+        .identity_read_generation = identity_read_generation,
     }) catch |err| return capi.mapError(err);
     defer aggregations_mod.deinitResults(handle.alloc, backend_results);
 
@@ -5550,8 +5609,8 @@ test "capi transaction lifecycle" {
     var handle_ptr: ?*anyopaque = null;
     cleanupTestDir(path);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
-    defer antfly_db_close(handle_ptr);
     defer cleanupTestDir(path);
+    defer antfly_db_close(handle_ptr);
 
     const txn_id: [16]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_begin_transaction_with_id(handle_ptr, &txn_id, 1_000, null, 0));
@@ -5582,8 +5641,8 @@ test "capi batch and lookup json" {
     var handle_ptr: ?*anyopaque = null;
     cleanupTestDir(path);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
-    defer antfly_db_close(handle_ptr);
     defer cleanupTestDir(path);
+    defer antfly_db_close(handle_ptr);
 
     const writes = [_]capi.WriteIntent{
         .{
@@ -5601,6 +5660,290 @@ test "capi batch and lookup json" {
     }, &out));
     defer antfly_db_buffer_free(out.ptr, out.len);
     try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"title\":\"ok\"") != null);
+}
+
+test "capi execute graph queries honors identity read generation" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "capi-execute-graph-generation");
+    defer alloc.free(path);
+    var handle_ptr: ?*anyopaque = null;
+    cleanupTestDir(path);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
+    defer cleanupTestDir(path);
+    defer antfly_db_close(handle_ptr);
+
+    const handle = asHandle(handle_ptr).?;
+    try handle.db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+    try handle.db.batch(.{
+        .writes = &.{
+            .{ .key = "n:a", .value = "{\"title\":\"A\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:b\"}]}}}" },
+            .{ .key = "n:b", .value = "{\"title\":\"B\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const missing_generation_request =
+        \\{"graph_queries":[{"name":"neighbors","type":"neighbors","index_name":"gr_v1","start_nodes":{"result_ref":"seed"},"edge_types":["links"]}],"named_sets":[{"name":"seed","hit_ids_b64":["bjph"]}],"limit":10}
+    ;
+    var missing_generation_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_execute_graph_queries_json(
+        handle_ptr,
+        .{ .ptr = missing_generation_request.ptr, .len = missing_generation_request.len },
+        &missing_generation_out,
+    ));
+
+    const current_generation = handle.db.core.nextDerivedSequence();
+    const request = try std.fmt.allocPrint(alloc,
+        \\{{"identity_read_generation":{d},"graph_queries":[{{"name":"neighbors","type":"neighbors","index_name":"gr_v1","start_nodes":{{"result_ref":"seed"}},"edge_types":["links"]}}],"named_sets":[{{"name":"seed","hit_ids_b64":["bjph"]}}],"limit":10}}
+    , .{current_generation});
+    defer alloc.free(request);
+    var out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_execute_graph_queries_json(
+        handle_ptr,
+        .{ .ptr = request.ptr, .len = request.len },
+        &out,
+    ));
+    defer antfly_db_buffer_free(out.ptr, out.len);
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"key_b64\":\"bjpi\"") != null);
+    var parsed_out = try std.json.parseFromSlice(std.json.Value, alloc, out.ptr.?[0..out.len], .{});
+    defer parsed_out.deinit();
+    try std.testing.expectEqual(@as(i64, @intCast(current_generation)), parsed_out.value.array.items[0].object.get("identity_read_generation").?.integer);
+
+    const stale_generation = handle.db.core.nextDerivedSequence() -| 1;
+    const stale_request = try std.fmt.allocPrint(alloc,
+        \\{{"identity_read_generation":{d},"graph_queries":[{{"name":"neighbors","type":"neighbors","index_name":"gr_v1","start_nodes":{{"result_ref":"seed"}},"edge_types":["links"]}}],"named_sets":[{{"name":"seed","hit_ids_b64":["bjph"]}}],"limit":10}}
+    , .{stale_generation});
+    defer alloc.free(stale_request);
+    var stale_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_execute_graph_queries_json(
+        handle_ptr,
+        .{ .ptr = stale_request.ptr, .len = stale_request.len },
+        &stale_out,
+    ));
+}
+
+test "capi search rejects stale identity generation before readable lease hook" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "capi-stale-generation-before-lease");
+    defer alloc.free(path);
+
+    cleanupTestDir(path);
+
+    const Recorder = struct {
+        count: usize = 0,
+
+        fn callback(
+            ctx: ?*anyopaque,
+            _: u64,
+            _: ?[*]const u8,
+            _: usize,
+        ) callconv(.c) capi.ErrorCode {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.count += 1;
+            return .ok;
+        }
+    };
+
+    var handle = Handle{
+        .alloc = alloc,
+        .db = try db_mod.DB.open(alloc, path, .{}),
+    };
+    defer {
+        handle.db.close();
+        cleanupTestDir(path);
+    }
+
+    try handle.db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try handle.db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"embedding\":[1,0],\"title\":\"alpha\"}",
+        }},
+    });
+
+    var recorder = Recorder{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_readable_lease_hook(
+        @ptrCast(&handle),
+        42,
+        &recorder,
+        &Recorder.callback,
+    ));
+
+    const stale_generation = handle.db.core.nextDerivedSequence() -| 1;
+    const request = try std.fmt.allocPrint(alloc,
+        \\{{"mode":"dense","index_name":"dv_v1","vector":[1,0],"k":1,"limit":1,"identity_read_generation":{d}}}
+    , .{stale_generation});
+    defer alloc.free(request);
+
+    var out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_search_json(
+        @ptrCast(&handle),
+        .{ .ptr = request.ptr, .len = request.len },
+        &out,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), recorder.count);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_readable_lease_hook(
+        @ptrCast(&handle),
+        0,
+        null,
+        null,
+    ));
+}
+
+test "capi search json returns stamped identity generation" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "capi-search-generation-response");
+    defer alloc.free(path);
+
+    cleanupTestDir(path);
+
+    var handle = Handle{
+        .alloc = alloc,
+        .db = try db_mod.DB.open(alloc, path, .{}),
+    };
+    defer {
+        handle.db.close();
+        cleanupTestDir(path);
+    }
+
+    try handle.db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try handle.db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try handle.db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"embedding\":[1,0],\"title\":\"alpha\"}",
+        }},
+    });
+
+    const current_generation = handle.db.core.nextDerivedSequence();
+    const search_req =
+        "{\"mode\":\"dense\",\"index_name\":\"dv_v1\",\"vector\":[1,0],\"k\":1,\"limit\":1,\"offset\":0,\"include_stored\":false}";
+    var out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(
+        @ptrCast(&handle),
+        .{ .ptr = search_req.ptr, .len = search_req.len },
+        &out,
+    ));
+    defer antfly_db_buffer_free(out.ptr, out.len);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.ptr.?[0..out.len], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, @intCast(current_generation)), parsed.value.object.get("identity_read_generation").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "doc_ordinal") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "ordinal") == null);
+
+    var packed_result: capi.PackedDenseSearchResult = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense(
+        @ptrCast(&handle),
+        .{ .ptr = "dv_v1".ptr, .len = "dv_v1".len },
+        (&[_]f32{ 1.0, 0.0 }).ptr,
+        2,
+        1,
+        1,
+        0,
+        &packed_result,
+    ));
+    defer antfly_db_packed_dense_search_result_free(&packed_result);
+    try std.testing.expectEqual(current_generation, packed_result.identity_read_generation);
+
+    var text_result: capi.DenseSearchResult = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_text_match(
+        @ptrCast(&handle),
+        .{ .ptr = "ft_v1".ptr, .len = "ft_v1".len },
+        .{ .ptr = "title".ptr, .len = "title".len },
+        .{ .ptr = "alpha".ptr, .len = "alpha".len },
+        1,
+        0,
+        &text_result,
+    ));
+    defer antfly_db_dense_search_result_free(&text_result);
+    try std.testing.expectEqual(current_generation, text_result.identity_read_generation);
+
+    const hits_request =
+        "{\"mode\":\"full_text\",\"index_name\":\"ft_v1\",\"text_query_type\":\"match\",\"field\":\"title\",\"text\":\"alpha\",\"limit\":1}";
+    var hits_result: capi.DenseSearchResult = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_hits_json(
+        @ptrCast(&handle),
+        .{ .ptr = hits_request.ptr, .len = hits_request.len },
+        &hits_result,
+    ));
+    defer antfly_db_dense_search_result_free(&hits_result);
+    try std.testing.expectEqual(current_generation, hits_result.identity_read_generation);
+}
+
+test "capi aggregate hits rejects stale identity generation before aggregation materialization" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "capi-aggregate-stale-generation");
+    defer alloc.free(path);
+
+    cleanupTestDir(path);
+
+    var handle = Handle{
+        .alloc = alloc,
+        .db = try db_mod.DB.open(alloc, path, .{}),
+    };
+    defer {
+        handle.db.close();
+        cleanupTestDir(path);
+    }
+
+    try handle.db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"title\":\"alpha\"}",
+        }},
+    });
+
+    const current_generation = handle.db.core.nextDerivedSequence();
+    const stale_generation = current_generation -| 1;
+    try std.testing.expect(stale_generation != current_generation);
+
+    const request_template =
+        \\{{"identity_read_generation":{d},"hit_ids_b64":["ZG9jOmE="],"aggregations":[{{"name":"bad","type":"terms","field":"title","background_query_type":"bogus"}}]}}
+    ;
+    const current_request = try std.fmt.allocPrint(alloc, request_template, .{current_generation});
+    defer alloc.free(current_request);
+    var current_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.internal, antfly_db_aggregate_hits_json(
+        @ptrCast(&handle),
+        .{ .ptr = current_request.ptr, .len = current_request.len },
+        &current_out,
+    ));
+
+    const missing_generation_request =
+        \\{"hit_ids_b64":["ZG9jOmE="],"aggregations":[{"name":"bad","type":"terms","field":"title","background_query_type":"bogus"}]}
+    ;
+    var missing_generation_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_aggregate_hits_json(
+        @ptrCast(&handle),
+        .{ .ptr = missing_generation_request.ptr, .len = missing_generation_request.len },
+        &missing_generation_out,
+    ));
+
+    const stale_request = try std.fmt.allocPrint(alloc, request_template, .{stale_generation});
+    defer alloc.free(stale_request);
+    var stale_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_aggregate_hits_json(
+        @ptrCast(&handle),
+        .{ .ptr = stale_request.ptr, .len = stale_request.len },
+        &stale_out,
+    ));
 }
 
 test "capi request paths trigger readable lease hook" {
@@ -5656,6 +5999,7 @@ test "capi request paths trigger readable lease hook" {
             },
         },
     });
+    const current_generation = handle.db.core.nextDerivedSequence();
 
     var recorder = Recorder{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_readable_lease_hook(
@@ -5735,6 +6079,7 @@ test "capi request paths trigger readable lease hook" {
         .{ .ptr = &dense_wire_req, .len = dense_wire_req.len },
         &dense_wire_out,
     ));
+    try std.testing.expectEqual(@as(?u64, current_generation), try search_wire.denseResponseIdentityReadGeneration(dense_wire_out.ptr.?[0..dense_wire_out.len]));
     antfly_db_buffer_free(dense_wire_out.ptr, dense_wire_out.len);
 
     var dense_wire_profile_out: capi.Buffer = .{};
@@ -5745,6 +6090,7 @@ test "capi request paths trigger readable lease hook" {
         &dense_wire_profile_out,
         &dense_wire_profile,
     ));
+    try std.testing.expectEqual(@as(?u64, current_generation), try search_wire.denseResponseIdentityReadGeneration(dense_wire_profile_out.ptr.?[0..dense_wire_profile_out.len]));
     antfly_db_buffer_free(dense_wire_profile_out.ptr, dense_wire_profile_out.len);
 
     var text_result: capi.DenseSearchResult = .{};
@@ -5797,8 +6143,8 @@ test "capi artifact decode and lookup json" {
     var handle_ptr: ?*anyopaque = null;
     cleanupTestDir(path);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
-    defer antfly_db_close(handle_ptr);
     defer cleanupTestDir(path);
+    defer antfly_db_close(handle_ptr);
 
     const handle = asHandle(handle_ptr).?;
     var artifact_ref = db_mod.types.ArtifactRef{
@@ -5810,7 +6156,7 @@ test "capi artifact decode and lookup json" {
     defer artifact_ref.deinit(handle.alloc);
     const internal_key = try db_mod.artifact_ids.internalKeyForArtifactRefAlloc(handle.alloc, artifact_ref);
     defer handle.alloc.free(internal_key);
-    try handle.db.store.put(internal_key, "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}");
+    try handle.db.core.store.put(internal_key, "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}");
 
     const artifact_id = try db_mod.artifact_ids.artifactPublicIdAlloc(handle.alloc, artifact_ref);
     defer handle.alloc.free(artifact_id);
@@ -5891,18 +6237,18 @@ test "capi dense search profile breakdown" {
 
     var hbc_total_ns: u64 = 0;
     for (0..reps) |_| {
-        const start = std.time.nanoTimestamp();
+        const start = monotonicNowNs();
         var result = try dense_entry.index.search(&.{ 1.0, 0.0 }, 10);
         defer result.deinit();
-        hbc_total_ns += @intCast(std.time.nanoTimestamp() - start);
+        hbc_total_ns += monotonicNowNs() - start;
     }
 
     var db_total_ns: u64 = 0;
     for (0..reps) |_| {
-        const start = std.time.nanoTimestamp();
+        const start = monotonicNowNs();
         var result = try handle.db.search(alloc, req);
         defer result.deinit();
-        db_total_ns += @intCast(std.time.nanoTimestamp() - start);
+        db_total_ns += monotonicNowNs() - start;
     }
 
     const request_json =
@@ -5910,13 +6256,13 @@ test "capi dense search profile breakdown" {
     var capi_total_ns: u64 = 0;
     for (0..reps) |_| {
         var out: capi.Buffer = .{};
-        const start = std.time.nanoTimestamp();
+        const start = monotonicNowNs();
         try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(
             @ptrCast(&handle),
             .{ .ptr = request_json.ptr, .len = request_json.len },
             &out,
         ));
-        capi_total_ns += @intCast(std.time.nanoTimestamp() - start);
+        capi_total_ns += monotonicNowNs() - start;
         antfly_db_buffer_free(out.ptr, out.len);
     }
 

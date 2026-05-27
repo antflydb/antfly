@@ -34,6 +34,8 @@ const internal_keys = @import("../../internal_keys.zig");
 const lsm_backend = @import("../../lsm_backend.zig");
 const lsm_storage_io = @import("../../lsm_backend/storage_io.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
+const doc_identity = @import("../doc_identity.zig");
+const doc_set = @import("../doc_set.zig");
 const derived_types = @import("../derived/derived_types.zig");
 const regex_mod = @import("../../../search/regex.zig");
 const levenshtein_mod = @import("../../../search/levenshtein.zig");
@@ -2293,6 +2295,19 @@ fn containsDocId(doc_ids: []const []const u8, expected: []const u8) bool {
     return false;
 }
 
+fn containsOrdinal(ordinals: []const doc_set.DocOrdinal, expected: doc_set.DocOrdinal) bool {
+    for (ordinals) |ordinal| {
+        if (ordinal == expected) return true;
+    }
+    return false;
+}
+
+fn ordinalComponent(ordinal: doc_set.DocOrdinal) [4]u8 {
+    var out: [4]u8 = undefined;
+    std.mem.writeInt(u32, &out, ordinal, .big);
+    return out;
+}
+
 const SymbolCache = struct {
     entries: std.StringHashMapUnmanaged([]u8) = .empty,
 
@@ -2560,6 +2575,24 @@ const StoredJoinFact = struct {
         self.* = undefined;
     }
 };
+
+fn storedJoinFactSlicesEquivalent(left: []const StoredJoinFact, right: []const StoredJoinFact) bool {
+    if (left.len != right.len) return false;
+    for (left) |lhs| {
+        var found = false;
+        for (right) |rhs| {
+            if (std.mem.eql(u8, lhs.key, rhs.key) and
+                std.mem.eql(u8, lhs.join_id, rhs.join_id) and
+                std.mem.eql(u8, lhs.payload, rhs.payload))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
 
 const JoinScanBounds = struct {
     prefix: []u8,
@@ -3398,6 +3431,15 @@ pub const Index = struct {
         store: *docstore_mod.DocStore,
         request: DerivedJoinFoldRequest,
     ) !?[]FoldEntry {
+        return try self.scanDerivedJoinFoldEntriesAtGeneration(store, request, null);
+    }
+
+    pub fn scanDerivedJoinFoldEntriesAtGeneration(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        request: DerivedJoinFoldRequest,
+        generation: ?u64,
+    ) !?[]FoldEntry {
         if (!self.plannerLifecycleReady()) return null;
         const join_cfg = self.joinConfigByName(request.join.name) orelse return null;
         const law_id = law_mod.fromOp(request.op);
@@ -3411,7 +3453,7 @@ pub const Index = struct {
 
         var txn = try store.beginReadTxn();
         defer txn.abort();
-        return try self.scanDerivedJoinFoldEntriesTxn(&txn, join_cfg, request, law_id);
+        return try self.scanDerivedJoinFoldEntriesTxn(&txn, join_cfg, request, law_id, generation);
     }
 
     pub fn scanDerivedJoinFoldEntriesWithTensorProgram(
@@ -3421,6 +3463,18 @@ pub const Index = struct {
         access_paths: []const ir.PhysicalAccessPath,
         program: ir.TensorProgram,
         output_ref: ir.TensorProgramRef,
+    ) !?[]FoldEntry {
+        return try self.scanDerivedJoinFoldEntriesWithTensorProgramAtGeneration(store, request, access_paths, program, output_ref, null);
+    }
+
+    pub fn scanDerivedJoinFoldEntriesWithTensorProgramAtGeneration(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        request: DerivedJoinFoldRequest,
+        access_paths: []const ir.PhysicalAccessPath,
+        program: ir.TensorProgram,
+        output_ref: ir.TensorProgramRef,
+        generation: ?u64,
     ) !?[]FoldEntry {
         const proof = try ir.tensorProgramProof(self.alloc, access_paths, program);
         if (!proof.safe()) return null;
@@ -3438,7 +3492,7 @@ pub const Index = struct {
         defer self.alloc.free(expected_metadata);
         const metadata = expr.metadata orelse return null;
         if (!std.mem.eql(u8, metadata, expected_metadata)) return null;
-        return try self.scanDerivedJoinFoldEntries(store, request);
+        return try self.scanDerivedJoinFoldEntriesAtGeneration(store, request, generation);
     }
 
     fn derivedJoinProgramHasAccessPath(request: DerivedJoinFoldRequest, access_paths: []const ir.PhysicalAccessPath) bool {
@@ -3462,6 +3516,18 @@ pub const Index = struct {
         program: ir.TensorProgram,
         output_ref: ir.TensorProgramRef,
     ) !?[]FoldEntry {
+        return try self.scanDocFactBucketFoldEntriesWithTensorProgramAtGeneration(store, request, access_paths, program, output_ref, null);
+    }
+
+    pub fn scanDocFactBucketFoldEntriesWithTensorProgramAtGeneration(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        request: DocFactBucketFoldRequest,
+        access_paths: []const ir.PhysicalAccessPath,
+        program: ir.TensorProgram,
+        output_ref: ir.TensorProgramRef,
+        generation: ?u64,
+    ) !?[]FoldEntry {
         if (!self.plannerLifecycleReady()) return null;
         const proof = try ir.tensorProgramProof(self.alloc, access_paths, program);
         if (!proof.safe()) return null;
@@ -3481,7 +3547,7 @@ pub const Index = struct {
         if (!std.mem.eql(u8, metadata, expected_metadata)) return null;
         var txn = try store.beginReadTxn();
         defer txn.abort();
-        return try self.scanDocFactBucketFoldEntriesTxn(&txn, request, law_mod.fromOp(request.op));
+        return try self.scanDocFactBucketFoldEntriesTxn(&txn, request, law_mod.fromOp(request.op), generation);
     }
 
     pub fn scanPathFactBucketFoldEntriesWithTensorProgram(
@@ -3491,6 +3557,18 @@ pub const Index = struct {
         access_paths: []const ir.PhysicalAccessPath,
         program: ir.TensorProgram,
         output_ref: ir.TensorProgramRef,
+    ) !?[]FoldEntry {
+        return try self.scanPathFactBucketFoldEntriesWithTensorProgramAtGeneration(store, request, access_paths, program, output_ref, null);
+    }
+
+    pub fn scanPathFactBucketFoldEntriesWithTensorProgramAtGeneration(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        request: PathFactBucketFoldRequest,
+        access_paths: []const ir.PhysicalAccessPath,
+        program: ir.TensorProgram,
+        output_ref: ir.TensorProgramRef,
+        generation: ?u64,
     ) !?[]FoldEntry {
         if (!self.plannerLifecycleReady()) return null;
         const proof = try ir.tensorProgramProof(self.alloc, access_paths, program);
@@ -3512,7 +3590,7 @@ pub const Index = struct {
         var txn = try store.beginReadTxn();
         defer txn.abort();
         if (!(try self.pathFactStringCoercionAllowedTxn(&txn, request))) return null;
-        return try self.scanPathFactBucketFoldEntriesTxn(&txn, request, law_mod.fromOp(request.op));
+        return try self.scanPathFactBucketFoldEntriesTxn(&txn, request, law_mod.fromOp(request.op), generation);
     }
 
     pub fn scanDistributedCardinalityPartialsWithTensorProgram(
@@ -3522,6 +3600,18 @@ pub const Index = struct {
         access_paths: []const ir.PhysicalAccessPath,
         program: ir.TensorProgram,
         output_ref: ir.TensorProgramRef,
+    ) !?[]distributed_mod.Partial {
+        return try self.scanDistributedCardinalityPartialsWithTensorProgramAtGeneration(store, request, access_paths, program, output_ref, null);
+    }
+
+    pub fn scanDistributedCardinalityPartialsWithTensorProgramAtGeneration(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        request: CardinalityPartialsRequest,
+        access_paths: []const ir.PhysicalAccessPath,
+        program: ir.TensorProgram,
+        output_ref: ir.TensorProgramRef,
+        generation: ?u64,
     ) !?[]distributed_mod.Partial {
         if (!self.plannerLifecycleReady()) return null;
         const proof = try ir.tensorProgramProof(self.alloc, access_paths, program);
@@ -3550,6 +3640,7 @@ pub const Index = struct {
             request.aggregation_name,
             request.field_or_path,
             request.constraints,
+            generation,
         )) orelse return null;
     }
 
@@ -3560,6 +3651,18 @@ pub const Index = struct {
         access_paths: []const ir.PhysicalAccessPath,
         program: ir.TensorProgram,
         output_ref: ir.TensorProgramRef,
+    ) !?[]distributed_mod.Partial {
+        return try self.scanDistributedTermsCardinalityPartialsWithTensorProgramAtGeneration(store, request, access_paths, program, output_ref, null);
+    }
+
+    pub fn scanDistributedTermsCardinalityPartialsWithTensorProgramAtGeneration(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        request: TermsCardinalityPartialsRequest,
+        access_paths: []const ir.PhysicalAccessPath,
+        program: ir.TensorProgram,
+        output_ref: ir.TensorProgramRef,
+        generation: ?u64,
     ) !?[]distributed_mod.Partial {
         if (!self.plannerLifecycleReady()) return null;
         if (request.children.len == 0) return null;
@@ -3591,6 +3694,7 @@ pub const Index = struct {
             request.bucket_field_or_path,
             request.children,
             request.constraints,
+            generation,
         )) orelse return null;
     }
 
@@ -3601,6 +3705,18 @@ pub const Index = struct {
         access_paths: []const ir.PhysicalAccessPath,
         program: ir.TensorProgram,
         output_ref: ir.TensorProgramRef,
+    ) !?[]distributed_mod.Partial {
+        return try self.scanDistributedRangeCardinalityPartialsWithTensorProgramAtGeneration(store, request, access_paths, program, output_ref, null);
+    }
+
+    pub fn scanDistributedRangeCardinalityPartialsWithTensorProgramAtGeneration(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        request: RangeCardinalityPartialsRequest,
+        access_paths: []const ir.PhysicalAccessPath,
+        program: ir.TensorProgram,
+        output_ref: ir.TensorProgramRef,
+        generation: ?u64,
     ) !?[]distributed_mod.Partial {
         if (!self.plannerLifecycleReady()) return null;
         if (request.ranges.len == 0 or request.children.len == 0) return null;
@@ -3634,6 +3750,7 @@ pub const Index = struct {
             request.ranges,
             request.children,
             request.constraints,
+            generation,
         )) orelse return null;
     }
 
@@ -3644,6 +3761,18 @@ pub const Index = struct {
         access_paths: []const ir.PhysicalAccessPath,
         program: ir.TensorProgram,
         output_ref: ir.TensorProgramRef,
+    ) !?[]distributed_mod.Partial {
+        return try self.scanDistributedHistogramCardinalityPartialsWithTensorProgramAtGeneration(store, request, access_paths, program, output_ref, null);
+    }
+
+    pub fn scanDistributedHistogramCardinalityPartialsWithTensorProgramAtGeneration(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        request: HistogramCardinalityPartialsRequest,
+        access_paths: []const ir.PhysicalAccessPath,
+        program: ir.TensorProgram,
+        output_ref: ir.TensorProgramRef,
+        generation: ?u64,
     ) !?[]distributed_mod.Partial {
         if (!self.plannerLifecycleReady()) return null;
         if (request.field_or_path.len == 0 or request.children.len == 0) return null;
@@ -3679,6 +3808,7 @@ pub const Index = struct {
             request.date_bucket_name,
             request.children,
             request.constraints,
+            generation,
         )) orelse return null;
     }
 
@@ -3797,6 +3927,16 @@ pub const Index = struct {
         access_paths: []const ir.PhysicalAccessPath,
         program: ir.TensorProgram,
     ) !?[]distributed_mod.Partial {
+        return try self.scanDistributedPartialsForTensorProgramAtGeneration(store, access_paths, program, null);
+    }
+
+    pub fn scanDistributedPartialsForTensorProgramAtGeneration(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        access_paths: []const ir.PhysicalAccessPath,
+        program: ir.TensorProgram,
+        generation: ?u64,
+    ) !?[]distributed_mod.Partial {
         const proof = try ir.tensorProgramProof(self.alloc, access_paths, program);
         if (!proof.safe()) {
             self.distributed_partial_validation_rejected_count += 1;
@@ -3828,7 +3968,7 @@ pub const Index = struct {
             };
             if (cardinality) |*cardinality_request| {
                 defer cardinality_request.deinit(self.alloc);
-                const cardinality_partials = (try self.scanDistributedCardinalityPartialsWithTensorProgram(store, cardinality_request.request, access_paths, program, ref)) orelse return null;
+                const cardinality_partials = (try self.scanDistributedCardinalityPartialsWithTensorProgramAtGeneration(store, cardinality_request.request, access_paths, program, ref, generation)) orelse return null;
                 defer distributed_mod.freePartials(self.alloc, cardinality_partials);
                 for (cardinality_partials) |partial| {
                     try self.appendDistributedPartialForCanonicalAxis(&partials, partial.canonical_axis, partial.metric, partial.law_id, partial.value);
@@ -3842,7 +3982,7 @@ pub const Index = struct {
             };
             if (terms_cardinality) |*terms_cardinality_request| {
                 defer terms_cardinality_request.deinit(self.alloc);
-                const terms_cardinality_partials = (try self.scanDistributedTermsCardinalityPartialsWithTensorProgram(store, terms_cardinality_request.request, access_paths, program, ref)) orelse return null;
+                const terms_cardinality_partials = (try self.scanDistributedTermsCardinalityPartialsWithTensorProgramAtGeneration(store, terms_cardinality_request.request, access_paths, program, ref, generation)) orelse return null;
                 defer distributed_mod.freePartials(self.alloc, terms_cardinality_partials);
                 for (terms_cardinality_partials) |partial| {
                     try self.appendDistributedPartialForCanonicalAxis(&partials, partial.canonical_axis, partial.metric, partial.law_id, partial.value);
@@ -3856,7 +3996,7 @@ pub const Index = struct {
             };
             if (range_cardinality) |*range_cardinality_request| {
                 defer range_cardinality_request.deinit(self.alloc);
-                const range_cardinality_partials = (try self.scanDistributedRangeCardinalityPartialsWithTensorProgram(store, range_cardinality_request.request, access_paths, program, ref)) orelse return null;
+                const range_cardinality_partials = (try self.scanDistributedRangeCardinalityPartialsWithTensorProgramAtGeneration(store, range_cardinality_request.request, access_paths, program, ref, generation)) orelse return null;
                 defer distributed_mod.freePartials(self.alloc, range_cardinality_partials);
                 for (range_cardinality_partials) |partial| {
                     try self.appendDistributedPartialForCanonicalAxis(&partials, partial.canonical_axis, partial.metric, partial.law_id, partial.value);
@@ -3870,7 +4010,7 @@ pub const Index = struct {
             };
             if (histogram_cardinality) |*histogram_cardinality_request| {
                 defer histogram_cardinality_request.deinit(self.alloc);
-                const histogram_cardinality_partials = (try self.scanDistributedHistogramCardinalityPartialsWithTensorProgram(store, histogram_cardinality_request.request, access_paths, program, ref)) orelse return null;
+                const histogram_cardinality_partials = (try self.scanDistributedHistogramCardinalityPartialsWithTensorProgramAtGeneration(store, histogram_cardinality_request.request, access_paths, program, ref, generation)) orelse return null;
                 defer distributed_mod.freePartials(self.alloc, histogram_cardinality_partials);
                 for (histogram_cardinality_partials) |partial| {
                     try self.appendDistributedPartialForCanonicalAxis(&partials, partial.canonical_axis, partial.metric, partial.law_id, partial.value);
@@ -3887,7 +4027,7 @@ pub const Index = struct {
                                 else => return join_err,
                             };
                             defer join_fold.deinit(self.alloc);
-                            const entries = (try self.scanDerivedJoinFoldEntriesWithTensorProgram(store, join_fold.request, access_paths, program, ref)) orelse return null;
+                            const entries = (try self.scanDerivedJoinFoldEntriesWithTensorProgramAtGeneration(store, join_fold.request, access_paths, program, ref, generation)) orelse return null;
                             defer {
                                 for (entries) |*entry| entry.deinit(self.alloc);
                                 if (entries.len > 0) self.alloc.free(entries);
@@ -3900,7 +4040,7 @@ pub const Index = struct {
                         else => return path_err,
                     };
                     defer path_fold.deinit(self.alloc);
-                    const entries = (try self.scanPathFactBucketFoldEntriesWithTensorProgram(store, path_fold.request, access_paths, program, ref)) orelse return null;
+                    const entries = (try self.scanPathFactBucketFoldEntriesWithTensorProgramAtGeneration(store, path_fold.request, access_paths, program, ref, generation)) orelse return null;
                     defer {
                         for (entries) |*entry| entry.deinit(self.alloc);
                         if (entries.len > 0) self.alloc.free(entries);
@@ -3913,7 +4053,7 @@ pub const Index = struct {
                 else => return err,
             };
             defer fold.deinit(self.alloc);
-            const entries = (try self.scanDocFactBucketFoldEntriesWithTensorProgram(store, fold.request, access_paths, program, ref)) orelse return null;
+            const entries = (try self.scanDocFactBucketFoldEntriesWithTensorProgramAtGeneration(store, fold.request, access_paths, program, ref, generation)) orelse return null;
             defer {
                 for (entries) |*entry| entry.deinit(self.alloc);
                 if (entries.len > 0) self.alloc.free(entries);
@@ -4096,6 +4236,41 @@ pub const Index = struct {
         return out orelse try self.alloc.alloc([]u8, 0);
     }
 
+    pub fn resolvedDocSetForConstraintsAlloc(self: *Index, store: *docstore_mod.DocStore, constraints: []const ir.Constraint) !?doc_set.ResolvedDocSet {
+        return try self.resolvedDocSetForConstraintsAtGenerationAlloc(store, constraints, null);
+    }
+
+    pub fn resolvedDocSetForConstraintsAtGenerationAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        constraints: []const ir.Constraint,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        if (constraints.len == 0) return .all;
+
+        var out: ?doc_set.ResolvedDocSet = null;
+        errdefer if (out) |*set| set.deinit(self.alloc);
+
+        for (constraints) |constraint| {
+            const field = self.fieldConfig(constraint.field, .group) orelse return .none;
+            const scalar = try self.constraintTokenAlloc(self.alloc, field.name, constraint.value);
+            defer self.alloc.free(scalar);
+            var item_set = (try self.resolvedDocSetForScalarFactAlloc(store, .group, field.name, scalar)) orelse return null;
+            defer item_set.deinit(self.alloc);
+            if (out) |*current| {
+                const next = (try doc_set.intersectAlloc(self.alloc, current, &item_set)) orelse return null;
+                current.deinit(self.alloc);
+                out = next;
+            } else {
+                out = try doc_set.cloneAlloc(self.alloc, &item_set);
+            }
+        }
+
+        var resolved = out orelse .none;
+        defer resolved.deinit(self.alloc);
+        return try doc_identity.visibleFilteredDocSetFromStoreAlloc(self.alloc, store, &resolved, generation);
+    }
+
     pub fn exactCardinalityForFieldAlloc(
         self: *Index,
         store: *docstore_mod.DocStore,
@@ -4111,6 +4286,26 @@ pub const Index = struct {
 
         const field = self.uniqueExistingFactField(field_or_path) orelse return null;
         return try self.exactDocFactCardinalityAlloc(store, field, constraint_ids);
+    }
+
+    pub fn exactCardinalityForFieldAtGenerationAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        field_or_path: []const u8,
+        constraints: []const ir.Constraint,
+        generation: ?u64,
+    ) !?u64 {
+        if (generation == null) return try self.exactCardinalityForFieldAlloc(store, field_or_path, constraints);
+
+        const constraint_ids = (try self.docIdsForSupportedCardinalityConstraintsAlloc(store, constraints)) orelse return null;
+        defer self.freeDocIds(constraint_ids);
+
+        if (isExplicitJsonPointerPath(field_or_path)) {
+            return try self.exactPathCardinalityAtGenerationAlloc(store, field_or_path, constraint_ids, generation);
+        }
+
+        const field = self.uniqueExistingFactField(field_or_path) orelse return null;
+        return try self.exactDocFactCardinalityAtGenerationAlloc(store, field, constraint_ids, generation);
     }
 
     pub fn exactCardinalityForDocIdsAlloc(
@@ -4133,6 +4328,7 @@ pub const Index = struct {
         aggregation_name: []const u8,
         field_or_path: []const u8,
         constraints: []const ir.Constraint,
+        generation: ?u64,
     ) !?[]distributed_mod.Partial {
         const constraint_ids = (try self.docIdsForSupportedCardinalityConstraintsAlloc(store, constraints)) orelse return null;
         defer self.freeDocIds(constraint_ids);
@@ -4145,10 +4341,10 @@ pub const Index = struct {
         }
 
         if (isExplicitJsonPointerPath(field_or_path)) {
-            try self.collectPathCardinalityValues(store, field_or_path, constraint_ids, &values);
+            try self.collectPathCardinalityValuesAtGeneration(store, field_or_path, constraint_ids, generation, &values);
         } else {
             const field = self.uniqueExistingFactField(field_or_path) orelse return null;
-            try self.collectDocFactCardinalityValues(store, field, constraint_ids, &values);
+            try self.collectDocFactCardinalityValuesAtGeneration(store, field, constraint_ids, generation, &values);
         }
 
         var partials = std.ArrayListUnmanaged(distributed_mod.Partial).empty;
@@ -4176,10 +4372,14 @@ pub const Index = struct {
         ranges: []const CardinalityRangeRequest,
         child_requests: []const CardinalityChildRequest,
         constraints: []const ir.Constraint,
+        generation: ?u64,
     ) !?[]distributed_mod.Partial {
         if (ranges.len == 0 or child_requests.len == 0) return null;
         const constraint_ids = (try self.docIdsForSupportedCardinalityConstraintsAlloc(store, constraints)) orelse return null;
         defer self.freeDocIds(constraint_ids);
+        var live_txn: ?docstore_mod.DocStore.Txn = null;
+        if (generation != null) live_txn = try store.beginReadTxn();
+        defer if (live_txn) |*txn| txn.abort();
 
         var partials = std.ArrayListUnmanaged(distributed_mod.Partial).empty;
         errdefer {
@@ -4201,11 +4401,17 @@ pub const Index = struct {
             else
                 try self.dupeDocIdsAlloc(range_ids);
             defer self.freeDocIds(effective_ids);
+            const live_effective_ids = if (live_txn) |*txn|
+                try self.filterDocIdsVisibleAtGenerationAlloc(txn, effective_ids, generation)
+            else
+                null;
+            defer if (live_effective_ids) |ids| self.freeDocIds(ids);
+            const bucket_ids = live_effective_ids orelse effective_ids;
             const axis = try rangeCardinalityAxisAlloc(self.alloc, kind, range);
             defer self.alloc.free(axis);
-            try self.appendDistributedCountPartial(&partials, axis, aggregation_name, @intCast(effective_ids.len));
+            try self.appendDistributedCountPartial(&partials, axis, aggregation_name, @intCast(bucket_ids.len));
             for (child_requests) |child| {
-                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, effective_ids)) orelse return null;
+                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, bucket_ids)) orelse return null;
                 defer distributed_mod.freePartials(self.alloc, child_partials);
                 for (child_partials) |partial| {
                     try self.appendDistributedPartialForAxis(&partials, axis, partial.metric, partial.law_id, partial.value);
@@ -4226,6 +4432,7 @@ pub const Index = struct {
         date_bucket_name: []const u8,
         child_requests: []const CardinalityChildRequest,
         constraints: []const ir.Constraint,
+        generation: ?u64,
     ) !?[]distributed_mod.Partial {
         if (field_name.len == 0 or child_requests.len == 0) return null;
         if (kind == .numeric and numeric_interval <= 0) return null;
@@ -4242,6 +4449,7 @@ pub const Index = struct {
                 date_bucket_name,
                 child_requests,
                 constraint_ids,
+                generation,
             );
         }
 
@@ -4266,6 +4474,9 @@ pub const Index = struct {
             for (entries) |*entry| entry.deinit(self.alloc);
             if (entries.len > 0) self.alloc.free(entries);
         }
+        var live_txn: ?docstore_mod.DocStore.Txn = null;
+        if (generation != null) live_txn = try store.beginReadTxn();
+        defer if (live_txn) |*txn| txn.abort();
 
         const BucketDocs = struct {
             axis: []u8,
@@ -4293,6 +4504,9 @@ pub const Index = struct {
 
         for (entries) |entry| {
             if (!cardinalityDocMatchesConstraints(constraint_ids, entry.doc_id)) continue;
+            if (live_txn) |*txn| {
+                if (!try self.docVisibleAtGenerationTxn(txn, entry.doc_id, generation)) continue;
+            }
             const axis = switch (kind) {
                 .numeric => blk: {
                     const text = try self.scalarTokenTextAlloc(self.alloc, entry.scalar);
@@ -4345,6 +4559,88 @@ pub const Index = struct {
         return try partials.toOwnedSlice(self.alloc);
     }
 
+    pub fn docVisibleAtGenerationTxn(
+        self: *Index,
+        txn: anytype,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) !bool {
+        const at = generation orelse return true;
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_id)) orelse return false;
+        const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return false;
+        return state.isVisibleAt(at);
+    }
+
+    fn docOrdinalVisibleAtGenerationTxn(
+        self: *Index,
+        txn: anytype,
+        ordinal: doc_set.DocOrdinal,
+        generation: ?u64,
+    ) !bool {
+        _ = self;
+        const at = generation orelse return true;
+        const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return false;
+        return state.isVisibleAt(at);
+    }
+
+    fn docFactKeyVisibleAtGenerationTxn(
+        self: *Index,
+        txn: anytype,
+        key: []const u8,
+        prefix: []const u8,
+        generation: ?u64,
+    ) !bool {
+        const at = generation orelse return true;
+        _ = at;
+        const doc_component = token.componentAt(key, prefix.len) catch return true;
+        if (doc_component.next != key.len) return true;
+        return try self.docVisibleAtGenerationTxn(txn, doc_component.payload, generation);
+    }
+
+    fn joinFactKeyVisibleAtGenerationTxn(
+        self: *Index,
+        txn: anytype,
+        key: []const u8,
+        generation: ?u64,
+    ) !bool {
+        _ = generation orelse return true;
+        var pos: usize = namespace_prefix.len;
+        var component_index: usize = 0;
+        var row_namespace: ?[]const u8 = null;
+        var last_component: ?[]const u8 = null;
+        while (pos < key.len) {
+            const component = token.componentAt(key, pos) catch return true;
+            if (component_index == 2) row_namespace = component.payload;
+            last_component = component.payload;
+            component_index += 1;
+            pos = component.next;
+        }
+        const identity = last_component orelse return true;
+        if (row_namespace) |kind| {
+            if (std.mem.eql(u8, kind, "jf_ord")) {
+                if (identity.len != 4) return true;
+                const ordinal = std.mem.readInt(u32, identity[0..4], .big);
+                return try self.docOrdinalVisibleAtGenerationTxn(txn, ordinal, generation);
+            }
+        }
+        return try self.docVisibleAtGenerationTxn(txn, identity, generation);
+    }
+
+    fn filterDocIdsVisibleAtGenerationAlloc(
+        self: *Index,
+        txn: *docstore_mod.DocStore.Txn,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) ![][]u8 {
+        var out = std.ArrayListUnmanaged([]u8).empty;
+        errdefer self.freeDocIds(out.items);
+        for (doc_ids) |doc_id| {
+            if (!try self.docVisibleAtGenerationTxn(txn, doc_id, generation)) continue;
+            try out.append(self.alloc, try self.alloc.dupe(u8, doc_id));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
     fn scanDistributedPathHistogramCardinalityPartials(
         self: *Index,
         store: *docstore_mod.DocStore,
@@ -4355,6 +4651,7 @@ pub const Index = struct {
         date_bucket_name: []const u8,
         child_requests: []const CardinalityChildRequest,
         constraint_ids: []const []const u8,
+        generation: ?u64,
     ) !?[]distributed_mod.Partial {
         const date_bucket = if (kind == .date) cylinder.Bucket.parse(date_bucket_name) orelse return null else undefined;
         const BucketDocs = struct {
@@ -4396,6 +4693,7 @@ pub const Index = struct {
             const doc_component = token.componentAt(entry.key, prefix.len) catch continue;
             if (doc_component.next != entry.key.len) continue;
             if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (generation != null and !try self.docVisibleAtGenerationTxn(&txn, doc_component.payload, generation)) continue;
             var projection = pathfact_mod.decodeProjectionAlloc(self.alloc, entry.value) catch |err| switch (err) {
                 error.InvalidPathFactList => continue,
                 else => return err,
@@ -4458,21 +4756,39 @@ pub const Index = struct {
         bucket_field_name: []const u8,
         child_requests: []const CardinalityChildRequest,
         constraints: []const ir.Constraint,
+        generation: ?u64,
     ) !?[]distributed_mod.Partial {
         if (child_requests.len == 0) return null;
         if (isExplicitJsonPointerPath(bucket_field_name)) {
-            return try self.scanDistributedPathTermsCardinalityPartials(store, terms_aggregation_name, bucket_field_name, child_requests, constraints);
+            return try self.scanDistributedPathTermsCardinalityPartials(store, terms_aggregation_name, bucket_field_name, child_requests, constraints, generation);
         }
         const bucket_field = self.fieldConfig(bucket_field_name, .group) orelse return null;
         if (self.constraintValueForFieldName(constraints, bucket_field.name) != null) return null;
         const constraint_ids = (try self.docIdsForSupportedCardinalityConstraintsAlloc(store, constraints)) orelse return null;
         defer self.freeDocIds(constraint_ids);
 
-        var bucket_counts = std.StringHashMapUnmanaged(i64).empty;
+        const BucketDocs = struct {
+            axis: []u8,
+            doc_ids: std.ArrayListUnmanaged([]u8) = .empty,
+
+            fn appendDocId(item: *@This(), alloc: Allocator, doc_id: []const u8) !void {
+                for (item.doc_ids.items) |existing| {
+                    if (std.mem.eql(u8, existing, doc_id)) return;
+                }
+                try item.doc_ids.append(alloc, try alloc.dupe(u8, doc_id));
+            }
+
+            fn deinit(item: *@This(), alloc: Allocator) void {
+                alloc.free(item.axis);
+                for (item.doc_ids.items) |doc_id| alloc.free(doc_id);
+                item.doc_ids.deinit(alloc);
+                item.* = undefined;
+            }
+        };
+        var buckets = std.ArrayListUnmanaged(BucketDocs).empty;
         defer {
-            var it = bucket_counts.keyIterator();
-            while (it.next()) |key| self.alloc.free(key.*);
-            bucket_counts.deinit(self.alloc);
+            for (buckets.items) |*bucket| bucket.deinit(self.alloc);
+            buckets.deinit(self.alloc);
         }
 
         const bucket_entries = try self.scalarDocFactEntriesForFieldAlloc(store, .group, bucket_field.name);
@@ -4480,15 +4796,23 @@ pub const Index = struct {
             for (bucket_entries) |*entry| entry.deinit(self.alloc);
             if (bucket_entries.len > 0) self.alloc.free(bucket_entries);
         }
+        var live_txn: ?docstore_mod.DocStore.Txn = null;
+        if (generation != null) live_txn = try store.beginReadTxn();
+        defer if (live_txn) |*txn| txn.abort();
+
         for (bucket_entries) |entry| {
             if (!cardinalityDocMatchesConstraints(constraint_ids, entry.doc_id)) continue;
-            const gop = try bucket_counts.getOrPut(self.alloc, entry.scalar);
-            if (gop.found_existing) {
-                gop.value_ptr.* += 1;
-            } else {
-                gop.key_ptr.* = try self.alloc.dupe(u8, entry.scalar);
-                gop.value_ptr.* = 1;
+            if (live_txn) |*txn| {
+                if (!try self.docVisibleAtGenerationTxn(txn, entry.doc_id, generation)) continue;
             }
+            const bucket = blk: {
+                for (buckets.items) |*bucket| {
+                    if (std.mem.eql(u8, bucket.axis, entry.scalar)) break :blk bucket;
+                }
+                try buckets.append(self.alloc, .{ .axis = try self.alloc.dupe(u8, entry.scalar) });
+                break :blk &buckets.items[buckets.items.len - 1];
+            };
+            try BucketDocs.appendDocId(bucket, self.alloc, entry.doc_id);
         }
 
         var partials = std.ArrayListUnmanaged(distributed_mod.Partial).empty;
@@ -4501,21 +4825,13 @@ pub const Index = struct {
             partials.deinit(self.alloc);
         }
 
-        var bucket_it = bucket_counts.iterator();
-        while (bucket_it.next()) |entry| {
-            try self.appendDistributedCountPartial(&partials, entry.key_ptr.*, terms_aggregation_name, entry.value_ptr.*);
-            const bucket_text = try self.scalarTokenTextAlloc(self.alloc, entry.key_ptr.*);
-            defer self.alloc.free(bucket_text);
-            const child_constraints = try self.alloc.alloc(ir.Constraint, constraints.len + 1);
-            defer self.alloc.free(child_constraints);
-            @memcpy(child_constraints[0..constraints.len], constraints);
-            child_constraints[constraints.len] = .{ .field = bucket_field.name, .value = bucket_text };
-
+        for (buckets.items) |bucket| {
+            try self.appendDistributedCountPartial(&partials, bucket.axis, terms_aggregation_name, @intCast(bucket.doc_ids.items.len));
             for (child_requests) |child| {
-                const child_partials = (try self.scanDistributedCardinalityPartials(store, child.name, child.field, child_constraints)) orelse return null;
+                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, bucket.doc_ids.items)) orelse return null;
                 defer distributed_mod.freePartials(self.alloc, child_partials);
                 for (child_partials) |partial| {
-                    try self.appendDistributedPartialForAxis(&partials, entry.key_ptr.*, partial.metric, partial.law_id, partial.value);
+                    try self.appendDistributedPartialForAxis(&partials, bucket.axis, partial.metric, partial.law_id, partial.value);
                 }
             }
         }
@@ -4530,6 +4846,7 @@ pub const Index = struct {
         bucket_path: []const u8,
         child_requests: []const CardinalityChildRequest,
         constraints: []const ir.Constraint,
+        generation: ?u64,
     ) !?[]distributed_mod.Partial {
         const constraint_ids = (try self.docIdsForSupportedCardinalityConstraintsAlloc(store, constraints)) orelse return null;
         defer self.freeDocIds(constraint_ids);
@@ -4570,6 +4887,7 @@ pub const Index = struct {
             const doc_component = token.componentAt(entry.key, prefix.len) catch continue;
             if (doc_component.next != entry.key.len) continue;
             if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (generation != null and !try self.docVisibleAtGenerationTxn(&txn, doc_component.payload, generation)) continue;
             var projection = pathfact_mod.decodeProjectionAlloc(self.alloc, entry.value) catch |err| switch (err) {
                 error.InvalidPathFactList => continue,
                 else => return err,
@@ -4731,6 +5049,23 @@ pub const Index = struct {
         return values.count();
     }
 
+    fn exactDocFactCardinalityAtGenerationAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        field: ExistsFieldSpec,
+        constraint_ids: []const []const u8,
+        generation: ?u64,
+    ) !u64 {
+        var values = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var it = values.keyIterator();
+            while (it.next()) |key| self.alloc.free(key.*);
+            values.deinit(self.alloc);
+        }
+        try self.collectDocFactCardinalityValuesAtGeneration(store, field, constraint_ids, generation, &values);
+        return values.count();
+    }
+
     fn collectDocFactCardinalityValues(
         self: *Index,
         store: *docstore_mod.DocStore,
@@ -4756,6 +5091,33 @@ pub const Index = struct {
         }
     }
 
+    fn collectDocFactCardinalityValuesAtGeneration(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        field: ExistsFieldSpec,
+        constraint_ids: []const []const u8,
+        generation: ?u64,
+        values: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        const prefix = try self.docFactScalarFieldPrefixAlloc(field.role, field.field);
+        defer self.alloc.free(prefix);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const scalar_component = token.componentAt(entry.key, prefix.len) catch continue;
+            const doc_component = token.componentAt(entry.key, scalar_component.next) catch continue;
+            if (doc_component.next != entry.key.len) continue;
+            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!try self.docVisibleAtGenerationTxn(&txn, doc_component.payload, generation)) continue;
+            const gop = try values.getOrPut(self.alloc, scalar_component.payload);
+            if (!gop.found_existing) gop.key_ptr.* = try self.alloc.dupe(u8, scalar_component.payload);
+        }
+    }
+
     fn exactPathCardinalityAlloc(
         self: *Index,
         store: *docstore_mod.DocStore,
@@ -4769,6 +5131,23 @@ pub const Index = struct {
             values.deinit(self.alloc);
         }
         try self.collectPathCardinalityValues(store, path, constraint_ids, &values);
+        return values.count();
+    }
+
+    fn exactPathCardinalityAtGenerationAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        path: []const u8,
+        constraint_ids: []const []const u8,
+        generation: ?u64,
+    ) !u64 {
+        var values = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var it = values.keyIterator();
+            while (it.next()) |key| self.alloc.free(key.*);
+            values.deinit(self.alloc);
+        }
+        try self.collectPathCardinalityValuesAtGeneration(store, path, constraint_ids, generation, &values);
         return values.count();
     }
 
@@ -4794,6 +5173,40 @@ pub const Index = struct {
             const doc_component = token.componentAt(entry.key, value_component.next) catch continue;
             if (doc_component.next != entry.key.len) continue;
             if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            const value_key = try token.canonicalTupleAlloc(self.alloc, &.{ kind_component.payload, value_component.payload });
+            const gop = try values.getOrPut(self.alloc, value_key);
+            if (gop.found_existing) {
+                self.alloc.free(value_key);
+            } else {
+                gop.key_ptr.* = value_key;
+            }
+        }
+    }
+
+    fn collectPathCardinalityValuesAtGeneration(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        path: []const u8,
+        constraint_ids: []const []const u8,
+        generation: ?u64,
+        values: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        const prefix = try self.pathLookupPathPrefixAlloc(path);
+        defer self.alloc.free(prefix);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const kind_component = token.componentAt(entry.key, prefix.len) catch continue;
+            if (!pathLookupKindIsScalarValue(kind_component.payload)) continue;
+            const value_component = token.componentAt(entry.key, kind_component.next) catch continue;
+            const doc_component = token.componentAt(entry.key, value_component.next) catch continue;
+            if (doc_component.next != entry.key.len) continue;
+            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!try self.docVisibleAtGenerationTxn(&txn, doc_component.payload, generation)) continue;
             const value_key = try token.canonicalTupleAlloc(self.alloc, &.{ kind_component.payload, value_component.payload });
             const gop = try values.getOrPut(self.alloc, value_key);
             if (gop.found_existing) {
@@ -5060,14 +5473,474 @@ pub const Index = struct {
         }
     };
 
+    pub const FilterBinding = struct {
+        name: []const u8,
+        set: FilterDocIdSet,
+    };
+
+    pub const ResolvedFilterBinding = struct {
+        name: []const u8,
+        filter: doc_set.ResolvedDocFilter,
+    };
+
     pub fn docIdSetForFilterJsonAlloc(self: *Index, store: *docstore_mod.DocStore, filter_json: []const u8) !?FilterDocIdSet {
+        return try self.docIdSetForFilterJsonWithBindingsAlloc(store, filter_json, &.{});
+    }
+
+    pub fn docIdSetForFilterJsonWithBindingsAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        filter_json: []const u8,
+        bindings: []const FilterBinding,
+    ) !?FilterDocIdSet {
         if (filter_json.len == 0) return null;
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, filter_json, .{}) catch return null;
         defer parsed.deinit();
-        return try self.docIdSetForFilterValueAlloc(store, parsed.value);
+        return try self.docIdSetForFilterValueWithBindingsAlloc(store, parsed.value, bindings);
+    }
+
+    pub fn resolvedDocFilterForFilterJsonAlloc(self: *Index, store: *docstore_mod.DocStore, filter_json: []const u8) !?doc_set.ResolvedDocFilter {
+        return try self.resolvedDocFilterForFilterJsonAtGenerationAlloc(store, filter_json, null);
+    }
+
+    pub fn resolvedDocFilterForFilterJsonAtGenerationAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        filter_json: []const u8,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocFilter {
+        if (filter_json.len == 0) return null;
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, filter_json, .{}) catch return null;
+        defer parsed.deinit();
+
+        if (try self.resolvedDocFilterForFilterValueAlloc(store, parsed.value, generation, &.{})) |resolved| {
+            var owned_resolved = resolved;
+            defer owned_resolved.deinit(self.alloc);
+            var filter = doc_set.ResolvedDocFilter{
+                .include = try doc_identity.visibleFilteredDocSetFromStoreAlloc(self.alloc, store, &owned_resolved.include, generation),
+                .exclude = try doc_identity.visibleFilteredDocSetFromStoreAlloc(self.alloc, store, &owned_resolved.exclude, generation),
+            };
+            errdefer filter.deinit(self.alloc);
+            return filter;
+        }
+
+        var id_set = (try self.docIdSetForFilterValueWithBindingsAlloc(store, parsed.value, &.{})) orelse return null;
+        defer id_set.deinit(self);
+
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        var filter = doc_set.ResolvedDocFilter{};
+        errdefer filter.deinit(self.alloc);
+        if (id_set.include) |include| {
+            filter.include = try doc_identity.resolvedDocSetForIdsAtGenerationTxn(self.alloc, &txn, include, generation);
+        }
+        if (id_set.exclude.len > 0) {
+            filter.exclude = try doc_identity.resolvedDocSetForIdsAtGenerationTxn(self.alloc, &txn, id_set.exclude, generation);
+        }
+        return filter;
+    }
+
+    pub fn resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        filter_json: []const u8,
+        generation: ?u64,
+        bindings: []const ResolvedFilterBinding,
+    ) !?doc_set.ResolvedDocFilter {
+        if (filter_json.len == 0) return null;
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, filter_json, .{}) catch return null;
+        defer parsed.deinit();
+
+        var resolved = (try self.resolvedDocFilterForFilterValueAlloc(store, parsed.value, generation, bindings)) orelse return null;
+        defer resolved.deinit(self.alloc);
+        var filter = doc_set.ResolvedDocFilter{
+            .include = try doc_identity.visibleFilteredDocSetFromStoreAlloc(self.alloc, store, &resolved.include, generation),
+            .exclude = try doc_identity.visibleFilteredDocSetFromStoreAlloc(self.alloc, store, &resolved.exclude, generation),
+        };
+        errdefer filter.deinit(self.alloc);
+        return filter;
+    }
+
+    pub fn resolvedDocFilterForFilterJsonUncheckedAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        filter_json: []const u8,
+        bindings: []const ResolvedFilterBinding,
+    ) !?doc_set.ResolvedDocFilter {
+        if (filter_json.len == 0) return null;
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, filter_json, .{}) catch return null;
+        defer parsed.deinit();
+        return try self.resolvedDocFilterForFilterValueAlloc(store, parsed.value, null, bindings);
+    }
+
+    fn resolvedDocFilterForFilterValueAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        generation: ?u64,
+        bindings: []const ResolvedFilterBinding,
+    ) !?doc_set.ResolvedDocFilter {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        if (object.get("ref")) |ref_value| {
+            const name = jsonStringValue(ref_value) orelse return null;
+            const binding = findResolvedFilterBinding(bindings, name) orelse return null;
+            return try self.visibleFilteredResolvedDocFilterAlloc(store, &binding.filter, generation);
+        }
+        if (object.get("bool")) |bool_value| return try self.resolvedDocFilterForBoolFilterAlloc(store, bool_value, generation, bindings);
+        if (try self.resolvedDocSetForFilterValueAlloc(store, value, generation, bindings)) |include| {
+            var filter = doc_set.ResolvedDocFilter{ .include = include };
+            errdefer filter.deinit(self.alloc);
+            return filter;
+        }
+        return null;
+    }
+
+    fn resolvedDocSetForFilterValueAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        generation: ?u64,
+        bindings: []const ResolvedFilterBinding,
+    ) !?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        if (object.get("ref")) |ref_value| {
+            const name = jsonStringValue(ref_value) orelse return null;
+            const binding = findResolvedFilterBinding(bindings, name) orelse return null;
+            return try self.resolvedDocSetForFilterAlloc(store, &binding.filter, generation);
+        }
+        if (object.get("match_none") != null) return .none;
+        if (object.get("match_all") != null) return .all;
+        if (object.get("ids")) |ids_value| return try self.resolvedDocSetForIdsFilterAlloc(store, ids_value, generation);
+        if (object.get("doc_id")) |ids_value| return try self.resolvedDocSetForIdsFilterAlloc(store, ids_value, generation);
+        if (object.get("doc_ids")) |ids_value| return try self.resolvedDocSetForIdsFilterAlloc(store, ids_value, generation);
+        if (object.get("docids")) |ids_value| return try self.resolvedDocSetForIdsFilterAlloc(store, ids_value, generation);
+        if (object.get("term")) |term_value| return try self.resolvedDocSetForTermFilterAlloc(store, term_value);
+        if (object.get("bool_field")) |bool_value| return try self.resolvedDocSetForBoolFieldFilterAlloc(store, bool_value);
+        if (object.get("terms")) |terms_value| return try self.resolvedDocSetForTermsFilterAlloc(store, terms_value);
+        if (object.get("match")) |match_value| return try self.resolvedDocSetForMatchFilterAlloc(store, match_value);
+        if (object.get("range")) |range_value| return try self.resolvedDocSetForStandardRangeFilterAlloc(store, range_value);
+        if (object.get("numeric_range")) |range_value| return try self.resolvedDocSetForRangeFilterAlloc(store, range_value, .numeric);
+        if (object.get("term_range")) |range_value| return try self.resolvedDocSetForRangeFilterAlloc(store, range_value, .term);
+        if (object.get("date_range")) |range_value| return try self.resolvedDocSetForRangeFilterAlloc(store, range_value, .date);
+        if (object.get("ip_range")) |range_value| return try self.resolvedDocSetForIpRangeFilterAlloc(store, range_value);
+        if (object.get("geo_bbox")) |geo_value| return try self.resolvedDocSetForGeoBBoxFilterAlloc(store, geo_value);
+        if (object.get("geo_distance")) |geo_value| return try self.resolvedDocSetForGeoDistanceFilterAlloc(store, geo_value);
+        if (object.get("geo_shape")) |geo_value| return try self.resolvedDocSetForGeoShapeFilterAlloc(store, geo_value);
+        if (object.get("prefix")) |prefix_value| return try self.resolvedDocSetForPrefixFilterAlloc(store, prefix_value, object.get("field"));
+        if (object.get("wildcard")) |wildcard_value| return try self.resolvedDocSetForWildcardFilterAlloc(store, wildcard_value);
+        if (object.get("regexp")) |regexp_value| return try self.resolvedDocSetForRegexpFilterAlloc(store, regexp_value);
+        if (object.get("fuzzy")) |fuzzy_value| return try self.resolvedDocSetForFuzzyFilterAlloc(store, fuzzy_value);
+        if (object.get("exists")) |exists_value| return try self.resolvedDocSetForExistsFilterAlloc(store, exists_value);
+        if (object.get("conjuncts")) |conjuncts| return try self.resolvedDocSetForAllFilterValueAlloc(store, conjuncts, generation, bindings);
+        if (object.get("disjuncts")) |disjuncts| return try self.resolvedDocSetForAnyFilterValueAlloc(store, disjuncts, generation, bindings);
+        if (object.get("bool")) |bool_value| return try self.resolvedDocSetForBoolFilterAlloc(store, bool_value, generation, bindings);
+        return null;
+    }
+
+    fn resolvedDocFilterForBoolFilterAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        generation: ?u64,
+        bindings: []const ResolvedFilterBinding,
+    ) anyerror!?doc_set.ResolvedDocFilter {
+        const bool_object = switch (value) {
+            .object => |inner| inner,
+            else => return null,
+        };
+        var include_filter: ?doc_set.ResolvedDocFilter = null;
+        var exclude: ?doc_set.ResolvedDocSet = null;
+        errdefer {
+            if (include_filter) |*filter| filter.deinit(self.alloc);
+            if (exclude) |*set| set.deinit(self.alloc);
+        }
+
+        if (bool_object.get("must")) |must_value| {
+            include_filter = (try self.resolvedDocFilterForAllFilterValueAlloc(store, must_value, generation, bindings)) orelse return null;
+        }
+        if (bool_object.get("filter")) |filter_value| {
+            var filter_clause = (try self.resolvedDocFilterForAllFilterValueAlloc(store, filter_value, generation, bindings)) orelse return null;
+            defer filter_clause.deinit(self.alloc);
+            if (include_filter) |*current| {
+                const next = (try doc_set.intersectFiltersAlloc(self.alloc, current, &filter_clause)) orelse return null;
+                current.deinit(self.alloc);
+                include_filter = next;
+            } else {
+                include_filter = try cloneResolvedDocFilterAlloc(self.alloc, &filter_clause);
+            }
+        }
+        if (bool_object.get("should")) |should_value| {
+            if (include_filter != null) {
+                if (!boolMinimumShouldMatchIsOptional(bool_object.get("minimum_should_match"))) return null;
+            } else if (boolMinimumShouldMatchIsSingleRequired(bool_object.get("minimum_should_match"))) {
+                const include = (try self.resolvedDocSetForAnyFilterValueAlloc(store, should_value, generation, bindings)) orelse return null;
+                include_filter = .{ .include = include };
+            } else if (!boolMinimumShouldMatchIsOptional(bool_object.get("minimum_should_match"))) {
+                return null;
+            }
+        }
+        if (bool_object.get("must_not")) |must_not_value| {
+            exclude = (try self.resolvedDocSetForAnyFilterValueAlloc(store, must_not_value, generation, bindings)) orelse return null;
+        }
+        if (include_filter == null and exclude == null) return null;
+
+        var filter = if (include_filter) |owned| blk: {
+            include_filter = null;
+            break :blk owned;
+        } else doc_set.ResolvedDocFilter{};
+        errdefer filter.deinit(self.alloc);
+        if (exclude) |set| {
+            var owned_set = set;
+            exclude = null;
+            defer owned_set.deinit(self.alloc);
+            const merged = (try doc_set.unionAlloc(self.alloc, &filter.exclude, &owned_set)) orelse return null;
+            filter.exclude.deinit(self.alloc);
+            filter.exclude = merged;
+        }
+        return filter;
+    }
+
+    fn resolvedDocFilterForAllFilterValueAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        generation: ?u64,
+        bindings: []const ResolvedFilterBinding,
+    ) anyerror!?doc_set.ResolvedDocFilter {
+        const array = switch (value) {
+            .array => |array| array,
+            else => {
+                var filter = (try self.resolvedDocFilterForFilterValueAlloc(store, value, generation, bindings)) orelse return null;
+                defer filter.deinit(self.alloc);
+                return try self.visibleFilteredResolvedDocFilterAlloc(store, &filter, generation);
+            },
+        };
+        if (array.items.len == 0) return null;
+        var out: ?doc_set.ResolvedDocFilter = null;
+        errdefer if (out) |*filter| filter.deinit(self.alloc);
+        for (array.items) |item| {
+            var raw_item_filter = (try self.resolvedDocFilterForFilterValueAlloc(store, item, generation, bindings)) orelse return null;
+            defer raw_item_filter.deinit(self.alloc);
+            if (out) |*current| {
+                const maybe_next = try doc_set.intersectFiltersAlloc(self.alloc, current, &raw_item_filter);
+                const next = maybe_next orelse {
+                    current.deinit(self.alloc);
+                    out = null;
+                    return null;
+                };
+                current.deinit(self.alloc);
+                out = next;
+            } else {
+                out = try cloneResolvedDocFilterAlloc(self.alloc, &raw_item_filter);
+            }
+        }
+        return out;
+    }
+
+    fn resolvedDocSetForAllFilterValueAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        generation: ?u64,
+        bindings: []const ResolvedFilterBinding,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        const array = switch (value) {
+            .array => |array| array,
+            else => {
+                var set = (try self.resolvedDocSetForFilterValueAlloc(store, value, generation, bindings)) orelse return null;
+                defer set.deinit(self.alloc);
+                return try doc_identity.visibleFilteredDocSetFromStoreAlloc(self.alloc, store, &set, generation);
+            },
+        };
+        if (array.items.len == 0) return null;
+        var out: ?doc_set.ResolvedDocSet = null;
+        errdefer if (out) |*set| set.deinit(self.alloc);
+        for (array.items) |item| {
+            var raw_item_set = (try self.resolvedDocSetForFilterValueAlloc(store, item, generation, bindings)) orelse return null;
+            defer raw_item_set.deinit(self.alloc);
+            if (out) |*current| {
+                const maybe_next = try doc_set.intersectAlloc(self.alloc, current, &raw_item_set);
+                const next = maybe_next orelse {
+                    current.deinit(self.alloc);
+                    out = null;
+                    return null;
+                };
+                current.deinit(self.alloc);
+                out = next;
+            } else {
+                out = try doc_set.cloneAlloc(self.alloc, &raw_item_set);
+            }
+        }
+        return out;
+    }
+
+    fn resolvedDocSetForAnyFilterValueAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        generation: ?u64,
+        bindings: []const ResolvedFilterBinding,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        const array = switch (value) {
+            .array => |array| array,
+            else => {
+                var set = (try self.resolvedDocSetForFilterValueAlloc(store, value, generation, bindings)) orelse return null;
+                defer set.deinit(self.alloc);
+                return try doc_identity.visibleFilteredDocSetFromStoreAlloc(self.alloc, store, &set, generation);
+            },
+        };
+        if (array.items.len == 0) return null;
+        var out: doc_set.ResolvedDocSet = .none;
+        errdefer out.deinit(self.alloc);
+        for (array.items) |item| {
+            var raw_item_set = (try self.resolvedDocSetForFilterValueAlloc(store, item, generation, bindings)) orelse return null;
+            defer raw_item_set.deinit(self.alloc);
+            const maybe_next = try doc_set.unionAlloc(self.alloc, &out, &raw_item_set);
+            const next = maybe_next orelse {
+                out.deinit(self.alloc);
+                out = .none;
+                return null;
+            };
+            out.deinit(self.alloc);
+            out = next;
+        }
+        return out;
+    }
+
+    fn resolvedDocSetForBoolFilterAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        generation: ?u64,
+        bindings: []const ResolvedFilterBinding,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        const bool_object = switch (value) {
+            .object => |inner| inner,
+            else => return null,
+        };
+        if (bool_object.get("must_not") != null) return null;
+        var out: ?doc_set.ResolvedDocSet = null;
+        errdefer if (out) |*set| set.deinit(self.alloc);
+        if (bool_object.get("must")) |must_value| {
+            out = (try self.resolvedDocSetForAllFilterValueAlloc(store, must_value, generation, bindings)) orelse return null;
+        }
+        if (bool_object.get("filter")) |filter_value| {
+            var filter_set = (try self.resolvedDocSetForAllFilterValueAlloc(store, filter_value, generation, bindings)) orelse return null;
+            defer filter_set.deinit(self.alloc);
+            if (out) |*current| {
+                const next = (try doc_set.intersectAlloc(self.alloc, current, &filter_set)) orelse return null;
+                current.deinit(self.alloc);
+                out = next;
+            } else {
+                out = try doc_set.cloneAlloc(self.alloc, &filter_set);
+            }
+        }
+        if (bool_object.get("should")) |should_value| {
+            if (out != null) {
+                if (!boolMinimumShouldMatchIsOptional(bool_object.get("minimum_should_match"))) {
+                    if (out) |*current| current.deinit(self.alloc);
+                    return null;
+                }
+            } else {
+                if (!boolMinimumShouldMatchIsSingleRequired(bool_object.get("minimum_should_match"))) return null;
+                out = (try self.resolvedDocSetForAnyFilterValueAlloc(store, should_value, generation, bindings)) orelse return null;
+            }
+        }
+        return out;
+    }
+
+    fn findResolvedFilterBinding(bindings: []const ResolvedFilterBinding, name: []const u8) ?ResolvedFilterBinding {
+        for (bindings) |binding| {
+            if (std.mem.eql(u8, binding.name, name)) return binding;
+        }
+        return null;
+    }
+
+    fn cloneResolvedDocFilterAlloc(alloc: std.mem.Allocator, filter: *const doc_set.ResolvedDocFilter) !doc_set.ResolvedDocFilter {
+        var out = doc_set.ResolvedDocFilter{
+            .include = try doc_set.cloneAlloc(alloc, &filter.include),
+        };
+        errdefer out.deinit(alloc);
+        out.exclude = try doc_set.cloneAlloc(alloc, &filter.exclude);
+        return out;
+    }
+
+    fn visibleFilteredResolvedDocFilterAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        filter: *const doc_set.ResolvedDocFilter,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocFilter {
+        var out = doc_set.ResolvedDocFilter{
+            .include = try doc_identity.visibleFilteredDocSetFromStoreAlloc(self.alloc, store, &filter.include, generation),
+        };
+        errdefer out.deinit(self.alloc);
+        out.exclude = try doc_identity.visibleFilteredDocSetFromStoreAlloc(self.alloc, store, &filter.exclude, generation);
+        return out;
+    }
+
+    fn resolvedDocSetIsNone(set: *const doc_set.ResolvedDocSet) bool {
+        return switch (set.*) {
+            .none => true,
+            else => false,
+        };
+    }
+
+    fn resolvedDocSetForFilterAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        filter: *const doc_set.ResolvedDocFilter,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        var normalized = try self.visibleFilteredResolvedDocFilterAlloc(store, filter, generation);
+        defer normalized.deinit(self.alloc);
+
+        if (resolvedDocSetIsNone(&normalized.exclude)) return try doc_set.cloneAlloc(self.alloc, &normalized.include);
+        if (try doc_set.differenceAlloc(self.alloc, &normalized.include, &normalized.exclude)) |difference| return difference;
+
+        switch (normalized.include) {
+            .all => switch (normalized.exclude) {
+                .ordinals, .ordinal_bitmap => {
+                    var visible = try doc_identity.visibleDocSetFromStoreAlloc(self.alloc, store, generation);
+                    defer visible.deinit(self.alloc);
+                    return try doc_set.differenceAlloc(self.alloc, &visible, &normalized.exclude);
+                },
+                .doc_keys => return null,
+                .none, .all => unreachable,
+            },
+            .none, .doc_keys, .ordinals, .ordinal_bitmap => return null,
+        }
+    }
+
+    fn resolvedDocSetForIdsFilterAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        const ids = (try self.docIdsForIdsFilterAlloc(store, value)) orelse return null;
+        defer self.freeDocIds(ids);
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        return try doc_identity.resolvedDocSetForIdsAtGenerationTxn(self.alloc, &txn, ids, generation);
     }
 
     fn docIdsForFilterValueAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?[][]u8 {
+        return try self.docIdsForFilterValueWithBindingsAlloc(store, value, &.{});
+    }
+
+    fn docIdsForFilterValueWithBindingsAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        bindings: []const FilterBinding,
+    ) anyerror!?[][]u8 {
         var constraints = std.ArrayListUnmanaged(ir.Constraint).empty;
         defer freeConstraintList(self.alloc, &constraints);
         if (try self.collectFilterConstraintsAlloc(value, &constraints)) {
@@ -5079,6 +5952,13 @@ pub const Index = struct {
             .object => |object| object,
             else => return null,
         };
+        if (object.get("ref")) |ref_value| {
+            const name = jsonStringValue(ref_value) orelse return null;
+            const binding = self.findFilterBinding(bindings, name) orelse return null;
+            if (binding.set.exclude.len > 0) return null;
+            const include = binding.set.include orelse return null;
+            return try self.cloneDocIdsAlloc(include);
+        }
         if (object.get("match_none") != null) return try self.alloc.alloc([]u8, 0);
         if (object.get("match_all") != null) return null;
         if (object.get("range")) |range_value| return try self.docIdsForStandardRangeFilterAlloc(store, range_value);
@@ -5102,8 +5982,8 @@ pub const Index = struct {
         if (object.get("regexp")) |regexp_value| return try self.docIdsForRegexpFilterAlloc(store, regexp_value);
         if (object.get("fuzzy")) |fuzzy_value| return try self.docIdsForFuzzyFilterAlloc(store, fuzzy_value);
         if (object.get("exists")) |exists_value| return try self.docIdsForExistsFilterAlloc(store, exists_value);
-        if (object.get("conjuncts")) |conjuncts| return try self.docIdsForAllFilterArrayAlloc(store, conjuncts);
-        if (object.get("disjuncts")) |disjuncts| return try self.docIdsForAnyFilterValueAlloc(store, disjuncts);
+        if (object.get("conjuncts")) |conjuncts| return try self.docIdsForAllFilterArrayWithBindingsAlloc(store, conjuncts, bindings);
+        if (object.get("disjuncts")) |disjuncts| return try self.docIdsForAnyFilterValueWithBindingsAlloc(store, disjuncts, bindings);
         if (object.get("bool")) |bool_value| {
             const bool_object = switch (bool_value) {
                 .object => |inner| inner,
@@ -5113,10 +5993,10 @@ pub const Index = struct {
             var out: ?[][]u8 = null;
             errdefer if (out) |ids| self.freeDocIds(ids);
             if (bool_object.get("must")) |must_value| {
-                out = (try self.docIdsForAllFilterValueAlloc(store, must_value)) orelse return null;
+                out = (try self.docIdsForAllFilterValueWithBindingsAlloc(store, must_value, bindings)) orelse return null;
             }
             if (bool_object.get("filter")) |filter_value| {
-                const filter_ids = (try self.docIdsForAllFilterValueAlloc(store, filter_value)) orelse return null;
+                const filter_ids = (try self.docIdsForAllFilterValueWithBindingsAlloc(store, filter_value, bindings)) orelse return null;
                 if (out) |current| {
                     defer self.freeDocIds(current);
                     defer self.freeDocIds(filter_ids);
@@ -5133,7 +6013,7 @@ pub const Index = struct {
                     }
                 } else {
                     if (!boolMinimumShouldMatchIsSingleRequired(bool_object.get("minimum_should_match"))) return null;
-                    out = (try self.docIdsForAnyFilterValueAlloc(store, should_value)) orelse return null;
+                    out = (try self.docIdsForAnyFilterValueWithBindingsAlloc(store, should_value, bindings)) orelse return null;
                 }
             }
             return out;
@@ -5256,6 +6136,141 @@ pub const Index = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    fn resolvedDocSetForRangeSpecAlloc(self: *Index, store: *docstore_mod.DocStore, spec: RangeSpec) !?doc_set.ResolvedDocSet {
+        var legacy_count: usize = 0;
+        {
+            const legacy_prefix = try self.docFactScalarFieldPrefixAlloc(spec.role, spec.field);
+            defer self.alloc.free(legacy_prefix);
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(legacy_prefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, legacy_prefix)) break;
+                const scalar_component = token.componentAt(entry.key, legacy_prefix.len) catch continue;
+                const doc_component = token.componentAt(entry.key, scalar_component.next) catch continue;
+                if (doc_component.next != entry.key.len) continue;
+                if (!(rangeSpecMatchesScalar(self.alloc, spec, scalar_component.payload) catch false)) continue;
+                legacy_count += 1;
+            }
+        }
+
+        const ordinal_prefix = try self.docFactScalarOrdinalFieldPrefixAlloc(spec.role, spec.field);
+        defer self.alloc.free(ordinal_prefix);
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(self.alloc);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(ordinal_prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, ordinal_prefix)) break;
+            const scalar_component = token.componentAt(entry.key, ordinal_prefix.len) catch continue;
+            const ordinal_component = token.componentAt(entry.key, scalar_component.next) catch continue;
+            if (ordinal_component.next != entry.key.len or ordinal_component.payload.len != @sizeOf(doc_set.DocOrdinal)) continue;
+            if (!(rangeSpecMatchesScalar(self.alloc, spec, scalar_component.payload) catch false)) continue;
+            const ordinal = std.mem.readInt(u32, ordinal_component.payload[0..4], .big);
+            if (containsOrdinal(ordinals.items, ordinal)) continue;
+            try ordinals.append(self.alloc, ordinal);
+        }
+        if (ordinals.items.len == 0 and legacy_count > 0) return null;
+        if (ordinals.items.len != legacy_count) return null;
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals.items);
+    }
+
+    fn resolvedDocSetForStandardRangeFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+
+        if (object.get("field") != null or object.get("path") != null) {
+            if (try self.pathStandardRangePredicateAlloc(object)) |predicate| {
+                return try self.resolvedDocSetForPathRangeAlloc(store, predicate);
+            }
+            const field_name = jsonStringValue(object.get("field") orelse return null) orelse return null;
+            const field = self.standardRangeFieldSpec(field_name, object.get("role")) orelse return null;
+            const spec = (standardRangeSpecFromObject(field, object) catch return null) orelse return null;
+            return try self.resolvedDocSetForRangeSpecAlloc(store, spec);
+        }
+
+        if (object.count() != 1) return null;
+        var it = object.iterator();
+        const entry = it.next() orelse return null;
+        const range_object = switch (entry.value_ptr.*) {
+            .object => |inner| inner,
+            else => return null,
+        };
+        if (isExplicitJsonPointerPath(entry.key_ptr.*)) {
+            const predicate = (try self.pathStandardRangePredicateFromObjectAlloc(entry.key_ptr.*, range_object)) orelse return null;
+            return try self.resolvedDocSetForPathRangeAlloc(store, predicate);
+        }
+        const field = self.standardRangeFieldSpec(entry.key_ptr.*, range_object.get("role")) orelse return null;
+        const spec = (standardRangeSpecFromObject(field, range_object) catch return null) orelse return null;
+        return try self.resolvedDocSetForRangeSpecAlloc(store, spec);
+    }
+
+    fn resolvedDocSetForRangeFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value, kind: RangeKind) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        if (try self.pathRangePredicateAlloc(object, kind)) |predicate| {
+            return try self.resolvedDocSetForPathRangeAlloc(store, predicate);
+        }
+        const field_name = jsonStringValue(object.get("field") orelse return null) orelse return null;
+        const field = self.rangeFieldSpec(field_name, object.get("role"), kind) orelse return null;
+        const spec = switch (kind) {
+            .numeric => blk: {
+                if (!rangeFieldAcceptsNumeric(field.type)) return null;
+                break :blk RangeSpec{
+                    .field = field.field,
+                    .role = field.role,
+                    .kind = .numeric,
+                    .min_number = jsonOptionalF64Strict(object.get("min")) catch return null,
+                    .max_number = jsonOptionalF64Strict(object.get("max")) catch return null,
+                    .inclusive_min = (jsonOptionalBoolStrict(object.get("inclusive_min")) catch return null) orelse true,
+                    .inclusive_max = (jsonOptionalBoolStrict(object.get("inclusive_max")) catch return null) orelse false,
+                };
+            },
+            .term => blk: {
+                if (!rangeFieldAcceptsTerm(field.type)) return null;
+                break :blk RangeSpec{
+                    .field = field.field,
+                    .role = field.role,
+                    .kind = .term,
+                    .min_term = jsonOptionalStringStrict(object.get("min")) catch return null,
+                    .max_term = jsonOptionalStringStrict(object.get("max")) catch return null,
+                    .inclusive_min = (jsonOptionalBoolStrict(object.get("inclusive_min")) catch return null) orelse true,
+                    .inclusive_max = (jsonOptionalBoolStrict(object.get("inclusive_max")) catch return null) orelse false,
+                };
+            },
+            .date => blk: {
+                if (value_mod.kindFromFieldType(field.type) != .datetime) return null;
+                const start_ns = if (object.get("start_ns") != null)
+                    jsonOptionalU64Strict(object.get("start_ns")) catch return null
+                else
+                    jsonOptionalDateTimeNsStrict(object.get("start")) catch return null;
+                const end_ns = if (object.get("end_ns") != null)
+                    jsonOptionalU64Strict(object.get("end_ns")) catch return null
+                else
+                    jsonOptionalDateTimeNsStrict(object.get("end")) catch return null;
+                break :blk RangeSpec{
+                    .field = field.field,
+                    .role = field.role,
+                    .kind = .date,
+                    .start_ns = start_ns,
+                    .end_ns = end_ns,
+                    .inclusive_min = (jsonOptionalBoolStrict(object.get("inclusive_start")) catch return null) orelse true,
+                    .inclusive_max = (jsonOptionalBoolStrict(object.get("inclusive_end")) catch return null) orelse false,
+                };
+            },
+        };
+        return try self.resolvedDocSetForRangeSpecAlloc(store, spec);
+    }
+
     fn docIdsForIpRangeFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?[][]u8 {
         const object = switch (value) {
             .object => |object| object,
@@ -5344,6 +6359,167 @@ pub const Index = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    fn resolvedDocSetForIpRangeFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        const cidr_text = jsonStringValue(object.get("cidr") orelse return null) orelse return null;
+        if (pathFromPathPredicateObject(object)) |path| return try self.resolvedDocSetForPathIpRangeAlloc(store, path, cidr_text);
+        if (object.get("role") == null) {
+            if (object.get("field")) |field_value| {
+                const field_or_path = jsonStringValue(field_value) orelse return null;
+                if (isExplicitJsonPointerPath(field_or_path)) return try self.resolvedDocSetForPathIpRangeAlloc(store, field_or_path, cidr_text);
+            }
+        }
+        const field_name = jsonStringValue(object.get("field") orelse return null) orelse return null;
+        const field = self.scalarFieldSpec(field_name, object.get("role")) orelse return null;
+        if (!rangeFieldAcceptsTerm(field.type)) return null;
+        const query = ipRangeQuery(cidr_text) orelse return null;
+        return try self.resolvedDocSetForScalarIpRangeAlloc(store, field.role, field.field, query);
+    }
+
+    fn resolvedDocSetForPathIpRangeAlloc(self: *Index, store: *docstore_mod.DocStore, path: []const u8, cidr_text: []const u8) !?doc_set.ResolvedDocSet {
+        const query = ipRangeQuery(cidr_text) orelse return .none;
+        if (!(try self.pathProfileHasKind(store, path, .string))) return .none;
+        if (try self.readyPathPromotionMaterializationIdAlloc(store, path, .string)) |materialization_id| {
+            defer self.alloc.free(materialization_id);
+            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, .string, "json-scalar-v1", "kind-qualified");
+            return try self.resolvedDocSetForPathDictionaryLabelScanAlloc(store, identity, .{ .ip_range = query });
+        }
+        return try self.resolvedDocSetForPathLookupStringScanAlloc(store, path, .{ .ip_range = query });
+    }
+
+    fn resolvedDocSetForScalarIpRangeAlloc(self: *Index, store: *docstore_mod.DocStore, role: fact_mod.Role, field: []const u8, query: IpRangeQuery) !?doc_set.ResolvedDocSet {
+        var legacy_count: usize = 0;
+        {
+            const legacy_prefix = try self.docFactScalarFieldPrefixAlloc(role, field);
+            defer self.alloc.free(legacy_prefix);
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(legacy_prefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, legacy_prefix)) break;
+                const scalar_component = token.componentAt(entry.key, legacy_prefix.len) catch continue;
+                const doc_component = token.componentAt(entry.key, scalar_component.next) catch continue;
+                if (doc_component.next != entry.key.len) continue;
+                const scalar = value_mod.parseScalarAlloc(self.alloc, scalar_component.payload) catch continue;
+                defer value_mod.deinitScalar(self.alloc, scalar);
+                if (!ipRangeQueryMatches(query, scalar.canonical)) continue;
+                legacy_count += 1;
+            }
+        }
+        const ordinal_prefix = try self.docFactScalarOrdinalFieldPrefixAlloc(role, field);
+        defer self.alloc.free(ordinal_prefix);
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(self.alloc);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(ordinal_prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, ordinal_prefix)) break;
+            const scalar_component = token.componentAt(entry.key, ordinal_prefix.len) catch continue;
+            const ordinal_component = token.componentAt(entry.key, scalar_component.next) catch continue;
+            if (ordinal_component.next != entry.key.len or ordinal_component.payload.len != @sizeOf(doc_set.DocOrdinal)) continue;
+            const scalar = value_mod.parseScalarAlloc(self.alloc, scalar_component.payload) catch continue;
+            defer value_mod.deinitScalar(self.alloc, scalar);
+            if (!ipRangeQueryMatches(query, scalar.canonical)) continue;
+            const ordinal = std.mem.readInt(u32, ordinal_component.payload[0..4], .big);
+            if (containsOrdinal(ordinals.items, ordinal)) continue;
+            try ordinals.append(self.alloc, ordinal);
+        }
+        if (ordinals.items.len == 0 and legacy_count > 0) return null;
+        if (ordinals.items.len != legacy_count) return null;
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals.items);
+    }
+
+    const ScalarStringScan = union(enum) {
+        contains: []const u8,
+        prefix: []const u8,
+        wildcard: []const u8,
+        regexp: struct {
+            pattern: []const u8,
+            compiled: *regex_mod.RegexAutomaton,
+        },
+        fuzzy: struct {
+            literal_prefix: []const u8,
+            folded_term: []const u8,
+            max_edits: u8,
+        },
+    };
+
+    fn scalarStringScanMatches(self: *Index, scan: ScalarStringScan, canonical: []const u8) !bool {
+        return switch (scan) {
+            .contains => |text| containsCaseInsensitive(canonical, text),
+            .prefix => |wanted_prefix| std.mem.startsWith(u8, canonical, wanted_prefix),
+            .wildcard => |pattern| wildcardMatch(pattern, canonical),
+            .regexp => |regexp| regex_mod.matchesCompiled(regexp.pattern, regexp.compiled, canonical),
+            .fuzzy => |fuzzy| blk: {
+                if (!std.mem.startsWith(u8, canonical, fuzzy.literal_prefix)) break :blk false;
+                break :blk try fuzzyMatchesScalar(self.alloc, canonical, fuzzy.folded_term, fuzzy.max_edits);
+            },
+        };
+    }
+
+    fn resolvedDocSetForScalarStringScanAlloc(self: *Index, store: *docstore_mod.DocStore, role: fact_mod.Role, field: []const u8, scan: ScalarStringScan) !?doc_set.ResolvedDocSet {
+        var legacy_docs = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (legacy_docs.items) |doc_id| self.alloc.free(doc_id);
+            legacy_docs.deinit(self.alloc);
+        }
+        {
+            const legacy_prefix = try self.docFactScalarFieldPrefixAlloc(role, field);
+            defer self.alloc.free(legacy_prefix);
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(legacy_prefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, legacy_prefix)) break;
+                const scalar_component = token.componentAt(entry.key, legacy_prefix.len) catch continue;
+                const doc_component = token.componentAt(entry.key, scalar_component.next) catch continue;
+                if (doc_component.next != entry.key.len) continue;
+                const scalar = value_mod.parseScalarAlloc(self.alloc, scalar_component.payload) catch continue;
+                defer value_mod.deinitScalar(self.alloc, scalar);
+                if (!(try self.scalarStringScanMatches(scan, scalar.canonical))) continue;
+                if (containsDocId(legacy_docs.items, doc_component.payload)) continue;
+                try legacy_docs.append(self.alloc, try self.alloc.dupe(u8, doc_component.payload));
+            }
+        }
+        const ordinal_prefix = try self.docFactScalarOrdinalFieldPrefixAlloc(role, field);
+        defer self.alloc.free(ordinal_prefix);
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(self.alloc);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(ordinal_prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, ordinal_prefix)) break;
+            const scalar_component = token.componentAt(entry.key, ordinal_prefix.len) catch continue;
+            const ordinal_component = token.componentAt(entry.key, scalar_component.next) catch continue;
+            if (ordinal_component.next != entry.key.len or ordinal_component.payload.len != @sizeOf(doc_set.DocOrdinal)) continue;
+            const scalar = value_mod.parseScalarAlloc(self.alloc, scalar_component.payload) catch continue;
+            defer value_mod.deinitScalar(self.alloc, scalar);
+            if (!(try self.scalarStringScanMatches(scan, scalar.canonical))) continue;
+            const ordinal = std.mem.readInt(u32, ordinal_component.payload[0..4], .big);
+            if (containsOrdinal(ordinals.items, ordinal)) continue;
+            try ordinals.append(self.alloc, ordinal);
+        }
+        if (ordinals.items.len == 0 and legacy_docs.items.len > 0) return try doc_set.cloneDocKeysAlloc(self.alloc, legacy_docs.items);
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals.items);
+    }
+
+    fn resolvedDocSetForScalarPrefixAlloc(self: *Index, store: *docstore_mod.DocStore, role: fact_mod.Role, field: []const u8, wanted_prefix: []const u8) !?doc_set.ResolvedDocSet {
+        return try self.resolvedDocSetForScalarStringScanAlloc(store, role, field, .{ .prefix = wanted_prefix });
+    }
+
     const PathGeoBBoxSpec = struct {
         path: []const u8,
         min_lat: f64,
@@ -5398,6 +6574,34 @@ pub const Index = struct {
         var spec = (try self.pathGeoShapeSpecFromObject(object)) orelse return null;
         defer spec.deinit(self.alloc);
         return try self.docIdsForPathGeoShapeAlloc(store, spec);
+    }
+
+    fn resolvedDocSetForGeoBBoxFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        const spec = (try self.pathGeoBBoxSpecFromObject(object)) orelse return null;
+        return try self.resolvedDocSetForPathGeoPredicateAlloc(store, spec.path, .{ .bbox = spec });
+    }
+
+    fn resolvedDocSetForGeoDistanceFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        const spec = (try self.pathGeoDistanceSpecFromObject(object)) orelse return null;
+        return try self.resolvedDocSetForPathGeoPredicateAlloc(store, spec.path, .{ .distance = spec });
+    }
+
+    fn resolvedDocSetForGeoShapeFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        var spec = (try self.pathGeoShapeSpecFromObject(object)) orelse return null;
+        defer spec.deinit(self.alloc);
+        return try self.resolvedDocSetForPathGeoPredicateAlloc(store, spec.path, .{ .shape = spec });
     }
 
     fn pathGeoBBoxSpecFromObject(self: *Index, object: anytype) !?PathGeoBBoxSpec {
@@ -5560,6 +6764,47 @@ pub const Index = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    fn resolvedDocSetForPathGeoPredicateAlloc(self: *Index, store: *docstore_mod.DocStore, path: []const u8, predicate: PathGeoPredicate) !?doc_set.ResolvedDocSet {
+        const lat_path = try self.pathGeoChildPathAlloc(path, "lat");
+        defer self.alloc.free(lat_path);
+        const lon_path = try self.pathGeoChildPathAlloc(path, "lon");
+        defer self.alloc.free(lon_path);
+        if (!(try self.pathProfileHasKind(store, lat_path, .number)) or !(try self.pathProfileHasKind(store, lon_path, .number))) {
+            return .none;
+        }
+
+        const legacy_ids = try self.docIdsForPathGeoPredicateAlloc(store, path, predicate);
+        defer self.freeDocIds(legacy_ids);
+
+        const prefix = try self.pathFactOrdinalPrefixAlloc();
+        defer self.alloc.free(prefix);
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(self.alloc);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const ordinal_component = token.componentAt(entry.key, prefix.len) catch continue;
+            if (ordinal_component.next != entry.key.len or ordinal_component.payload.len != @sizeOf(doc_set.DocOrdinal)) continue;
+            var projection = pathfact_mod.decodeProjectionAlloc(self.alloc, entry.value) catch |err| switch (err) {
+                error.InvalidPathFactList => continue,
+                else => return err,
+            };
+            defer projection.deinit(self.alloc);
+            const point = pathGeoPointFromFacts(projection.facts, lat_path, lon_path) orelse continue;
+            if (!pathGeoPredicateMatches(predicate, point)) continue;
+            const ordinal = std.mem.readInt(u32, ordinal_component.payload[0..4], .big);
+            if (containsOrdinal(ordinals.items, ordinal)) continue;
+            try ordinals.append(self.alloc, ordinal);
+        }
+        if (ordinals.items.len == 0 and legacy_ids.len > 0) return null;
+        if (ordinals.items.len != legacy_ids.len) return null;
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals.items);
+    }
+
     fn pathGeoChildPathAlloc(self: *Index, path: []const u8, child: []const u8) ![]u8 {
         if (std.mem.eql(u8, path, "/")) return try std.fmt.allocPrint(self.alloc, "/{s}", .{child});
         return try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ path, child });
@@ -5705,10 +6950,24 @@ pub const Index = struct {
     }
 
     fn docIdSetForFilterValueAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?FilterDocIdSet {
+        return try self.docIdSetForFilterValueWithBindingsAlloc(store, value, &.{});
+    }
+
+    fn docIdSetForFilterValueWithBindingsAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        bindings: []const FilterBinding,
+    ) anyerror!?FilterDocIdSet {
         const object = switch (value) {
             .object => |object| object,
             else => return null,
         };
+        if (object.get("ref")) |ref_value| {
+            const name = jsonStringValue(ref_value) orelse return null;
+            const binding = self.findFilterBinding(bindings, name) orelse return null;
+            return try self.cloneFilterDocIdSetAlloc(binding.set);
+        }
         if (object.get("bool")) |bool_value| {
             const bool_object = switch (bool_value) {
                 .object => |inner| inner,
@@ -5717,10 +6976,10 @@ pub const Index = struct {
             var out = FilterDocIdSet{};
             errdefer out.deinit(self);
             if (bool_object.get("must")) |must_value| {
-                out.include = (try self.docIdsForAllFilterValueAlloc(store, must_value)) orelse return null;
+                out.include = (try self.docIdsForAllFilterValueWithBindingsAlloc(store, must_value, bindings)) orelse return null;
             }
             if (bool_object.get("filter")) |filter_value| {
-                const filter_ids = (try self.docIdsForAllFilterValueAlloc(store, filter_value)) orelse return null;
+                const filter_ids = (try self.docIdsForAllFilterValueWithBindingsAlloc(store, filter_value, bindings)) orelse return null;
                 if (out.include) |current| {
                     defer self.freeDocIds(current);
                     defer self.freeDocIds(filter_ids);
@@ -5736,22 +6995,51 @@ pub const Index = struct {
                         return null;
                     }
                 } else if (boolMinimumShouldMatchIsSingleRequired(bool_object.get("minimum_should_match"))) {
-                    out.include = (try self.docIdsForAnyFilterValueAlloc(store, should_value)) orelse return null;
+                    out.include = (try self.docIdsForAnyFilterValueWithBindingsAlloc(store, should_value, bindings)) orelse return null;
                 } else if (!boolMinimumShouldMatchIsOptional(bool_object.get("minimum_should_match"))) {
                     out.deinit(self);
                     return null;
                 }
             }
             if (bool_object.get("must_not")) |must_not_value| {
-                out.exclude = (try self.docIdsForAnyFilterValueAlloc(store, must_not_value)) orelse return null;
+                out.exclude = (try self.docIdsForAnyFilterValueWithBindingsAlloc(store, must_not_value, bindings)) orelse return null;
             }
             if (out.include == null and out.exclude.len == 0) return null;
             return out;
         }
 
-        const include = (try self.docIdsForFilterValueAlloc(store, value)) orelse return null;
+        const include = (try self.docIdsForFilterValueWithBindingsAlloc(store, value, bindings)) orelse return null;
         errdefer self.freeDocIds(include);
         return .{ .include = include };
+    }
+
+    fn findFilterBinding(self: *Index, bindings: []const FilterBinding, name: []const u8) ?FilterBinding {
+        _ = self;
+        for (bindings) |binding| {
+            if (std.mem.eql(u8, binding.name, name)) return binding;
+        }
+        return null;
+    }
+
+    fn cloneFilterDocIdSetAlloc(self: *Index, set: FilterDocIdSet) !FilterDocIdSet {
+        return .{
+            .include = if (set.include) |include| try self.cloneDocIdsAlloc(include) else null,
+            .exclude = try self.cloneDocIdsAlloc(set.exclude),
+        };
+    }
+
+    fn cloneDocIdsAlloc(self: *Index, doc_ids: []const []const u8) ![][]u8 {
+        var out = try self.alloc.alloc([]u8, doc_ids.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |item| self.alloc.free(item);
+            if (out.len > 0) self.alloc.free(out);
+        }
+        for (doc_ids, 0..) |doc_id, i| {
+            out[i] = try self.alloc.dupe(u8, doc_id);
+            initialized += 1;
+        }
+        return out;
     }
 
     pub fn freeDocIds(self: *Index, doc_ids: [][]u8) void {
@@ -5864,20 +7152,38 @@ pub const Index = struct {
     }
 
     fn docIdsForAllFilterValueAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?[][]u8 {
-        if (value == .array) return try self.docIdsForAllFilterArrayAlloc(store, value);
-        return try self.docIdsForFilterValueAlloc(store, value);
+        return try self.docIdsForAllFilterValueWithBindingsAlloc(store, value, &.{});
+    }
+
+    fn docIdsForAllFilterValueWithBindingsAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        bindings: []const FilterBinding,
+    ) anyerror!?[][]u8 {
+        if (value == .array) return try self.docIdsForAllFilterArrayWithBindingsAlloc(store, value, bindings);
+        return try self.docIdsForFilterValueWithBindingsAlloc(store, value, bindings);
     }
 
     fn docIdsForAllFilterArrayAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?[][]u8 {
+        return try self.docIdsForAllFilterArrayWithBindingsAlloc(store, value, &.{});
+    }
+
+    fn docIdsForAllFilterArrayWithBindingsAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        bindings: []const FilterBinding,
+    ) anyerror!?[][]u8 {
         const array = switch (value) {
             .array => |array| array,
-            else => return try self.docIdsForFilterValueAlloc(store, value),
+            else => return try self.docIdsForFilterValueWithBindingsAlloc(store, value, bindings),
         };
         if (array.items.len == 0) return null;
         var out: ?[][]u8 = null;
         errdefer if (out) |ids| self.freeDocIds(ids);
         for (array.items) |item| {
-            const item_ids = (try self.docIdsForFilterValueAlloc(store, item)) orelse return null;
+            const item_ids = (try self.docIdsForFilterValueWithBindingsAlloc(store, item, bindings)) orelse return null;
             if (out) |current| {
                 defer self.freeDocIds(current);
                 defer self.freeDocIds(item_ids);
@@ -5890,15 +7196,24 @@ pub const Index = struct {
     }
 
     fn docIdsForAnyFilterValueAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?[][]u8 {
+        return try self.docIdsForAnyFilterValueWithBindingsAlloc(store, value, &.{});
+    }
+
+    fn docIdsForAnyFilterValueWithBindingsAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        value: std.json.Value,
+        bindings: []const FilterBinding,
+    ) anyerror!?[][]u8 {
         const array = switch (value) {
             .array => |array| array,
-            else => return try self.docIdsForFilterValueAlloc(store, value),
+            else => return try self.docIdsForFilterValueWithBindingsAlloc(store, value, bindings),
         };
         if (array.items.len == 0) return null;
         var out = try self.alloc.alloc([]u8, 0);
         errdefer self.freeDocIds(out);
         for (array.items) |item| {
-            const item_ids = (try self.docIdsForFilterValueAlloc(store, item)) orelse {
+            const item_ids = (try self.docIdsForFilterValueWithBindingsAlloc(store, item, bindings)) orelse {
                 self.freeDocIds(out);
                 return null;
             };
@@ -5989,6 +7304,34 @@ pub const Index = struct {
         return try self.docIdsForScalarFactAlloc(store, spec.role, spec.field, encoded);
     }
 
+    fn resolvedDocSetForTermFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        if (try self.pathTermPredicateAlloc(object)) |predicate| {
+            defer predicate.deinit(self.alloc);
+            return try self.resolvedDocSetForPathTermAlloc(store, predicate.path, predicate.kind, predicate.scalar);
+        }
+        if (object.get("field") == null and object.get("path") == null and object.get("value") == null and object.get("role") == null and object.count() == 1) {
+            var it = object.iterator();
+            const entry = it.next() orelse return null;
+            const spec = self.scalarFieldSpec(entry.key_ptr.*, null) orelse return null;
+            const scalar = (try jsonScalarToStringAlloc(self.alloc, entry.value_ptr.*)) orelse return null;
+            defer self.alloc.free(scalar);
+            const encoded = try token.scalarTokenFromFieldTextAlloc(self.alloc, spec.type, scalar);
+            defer self.alloc.free(encoded);
+            return try self.resolvedDocSetForScalarFactAlloc(store, spec.role, spec.field, encoded);
+        }
+        const field_name = jsonStringValue(object.get("field") orelse return null) orelse return null;
+        const spec = self.scalarFieldSpec(field_name, object.get("role")) orelse return null;
+        const scalar = (try jsonScalarToStringAlloc(self.alloc, object.get("value") orelse return null)) orelse return null;
+        defer self.alloc.free(scalar);
+        const encoded = try token.scalarTokenFromFieldTextAlloc(self.alloc, spec.type, scalar);
+        defer self.alloc.free(encoded);
+        return try self.resolvedDocSetForScalarFactAlloc(store, spec.role, spec.field, encoded);
+    }
+
     fn docIdsForBoolFieldFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?[][]u8 {
         const object = switch (value) {
             .object => |object| object,
@@ -6007,6 +7350,26 @@ pub const Index = struct {
         const encoded = try token.scalarTokenFromFieldTextAlloc(self.alloc, spec.type, if (bool_value) "true" else "false");
         defer self.alloc.free(encoded);
         return try self.docIdsForScalarFactAlloc(store, spec.role, spec.field, encoded);
+    }
+
+    fn resolvedDocSetForBoolFieldFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        const bool_value = switch (object.get("value") orelse return null) {
+            .bool => |actual| actual,
+            else => return null,
+        };
+        const field_name = jsonStringValue(object.get("field") orelse object.get("path") orelse return null) orelse return null;
+        if (object.get("role") == null and isExplicitJsonPointerPath(field_name)) {
+            return try self.resolvedDocSetForPathTermAlloc(store, field_name, .bool, if (bool_value) "true" else "false");
+        }
+        const spec = self.scalarFieldSpec(field_name, object.get("role")) orelse return null;
+        if (value_mod.kindFromFieldType(spec.type) != .boolean) return null;
+        const encoded = try token.scalarTokenFromFieldTextAlloc(self.alloc, spec.type, if (bool_value) "true" else "false");
+        defer self.alloc.free(encoded);
+        return try self.resolvedDocSetForScalarFactAlloc(store, spec.role, spec.field, encoded);
     }
 
     fn docIdsForTermsFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?[][]u8 {
@@ -6080,6 +7443,56 @@ pub const Index = struct {
         return out;
     }
 
+    fn resolvedDocSetForTermsFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        if (object.get("field") != null or object.get("values") != null or object.get("role") != null) {
+            if (try self.pathTermsPredicateAlloc(object)) |predicate| {
+                defer predicate.deinit(self.alloc);
+                return try self.resolvedDocSetForPathTermsAlloc(store, predicate);
+            }
+            const field_name = jsonStringValue(object.get("field") orelse return null) orelse return null;
+            const spec = self.scalarFieldSpec(field_name, object.get("role")) orelse return null;
+            const array = switch (object.get("values") orelse return null) {
+                .array => |array| array,
+                else => return null,
+            };
+            return try self.resolvedDocSetForScalarTermsArrayAlloc(store, spec, array);
+        }
+        if (object.count() != 1) return null;
+        var it = object.iterator();
+        const entry = it.next() orelse return null;
+        const array = switch (entry.value_ptr.*) {
+            .array => |array| array,
+            else => return null,
+        };
+        if (isExplicitJsonPointerPath(entry.key_ptr.*)) {
+            var predicate = (try self.pathTermsPredicateFromArrayAlloc(entry.key_ptr.*, array)) orelse return null;
+            defer predicate.deinit(self.alloc);
+            return try self.resolvedDocSetForPathTermsAlloc(store, predicate);
+        }
+        const spec = self.scalarFieldSpec(entry.key_ptr.*, null) orelse return null;
+        return try self.resolvedDocSetForScalarTermsArrayAlloc(store, spec, array);
+    }
+
+    fn resolvedDocSetForScalarTermsArrayAlloc(self: *Index, store: *docstore_mod.DocStore, spec: ScalarFieldSpec, array: anytype) !?doc_set.ResolvedDocSet {
+        if (array.items.len == 0) return null;
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(self.alloc);
+        for (array.items) |item| {
+            const text = (try jsonScalarToStringAlloc(self.alloc, item)) orelse return null;
+            defer self.alloc.free(text);
+            const encoded = try token.scalarTokenFromFieldTextAlloc(self.alloc, spec.type, text);
+            defer self.alloc.free(encoded);
+            var item_set = (try self.resolvedDocSetForScalarFactAlloc(store, spec.role, spec.field, encoded)) orelse return null;
+            defer item_set.deinit(self.alloc);
+            try self.appendResolvedOrdinals(&ordinals, &item_set);
+        }
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals.items);
+    }
+
     fn docIdsForMatchFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?[][]u8 {
         const FieldMatch = struct {
             field: []const u8,
@@ -6132,6 +7545,37 @@ pub const Index = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    fn resolvedDocSetForMatchFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        const FieldMatch = struct {
+            field: []const u8,
+            text: []const u8,
+            role: ?std.json.Value = null,
+        };
+        const parsed: FieldMatch = blk: {
+            if (object.get("field") != null or object.get("path") != null or object.get("text") != null or object.get("value") != null or object.get("role") != null) {
+                const field_name = jsonStringValue(object.get("field") orelse object.get("path") orelse return null) orelse return null;
+                const text = jsonStringValue(object.get("text") orelse object.get("value") orelse return null) orelse return null;
+                break :blk .{ .field = field_name, .text = text, .role = object.get("role") };
+            }
+            if (object.count() != 1) return null;
+            var it = object.iterator();
+            const entry = it.next() orelse return null;
+            const text = jsonStringValue(entry.value_ptr.*) orelse return null;
+            break :blk .{ .field = entry.key_ptr.*, .text = text };
+        };
+        if (parsed.text.len == 0) return null;
+        if (parsed.role == null and isExplicitJsonPointerPath(parsed.field)) {
+            return try self.resolvedDocSetForPathStringScanAlloc(store, parsed.field, .{ .contains = parsed.text });
+        }
+        const field = self.scalarFieldSpec(parsed.field, parsed.role) orelse return null;
+        if (!rangeFieldAcceptsTerm(field.type)) return null;
+        return try self.resolvedDocSetForScalarStringScanAlloc(store, field.role, field.field, .{ .contains = parsed.text });
+    }
+
     fn docIdsForPathMatchAlloc(self: *Index, store: *docstore_mod.DocStore, path: []const u8, text: []const u8) ![][]u8 {
         if (!(try self.pathProfileHasKind(store, path, .string))) return try self.alloc.alloc([]u8, 0);
         const owned_prefix = if (try self.readyPathPromotionMaterializationIdAlloc(store, path, .string)) |materialization_id| blk: {
@@ -6161,6 +7605,17 @@ pub const Index = struct {
 
     fn docIdsForScalarFactAlloc(self: *Index, store: *docstore_mod.DocStore, role: fact_mod.Role, field: []const u8, scalar_token: []const u8) ![][]u8 {
         return try self.docIdsForIndexedDocFactPrefixAlloc(store, try self.docFactScalarPrefixAlloc(role, field, scalar_token));
+    }
+
+    fn resolvedDocSetForScalarFactAlloc(self: *Index, store: *docstore_mod.DocStore, role: fact_mod.Role, field: []const u8, scalar_token: []const u8) !?doc_set.ResolvedDocSet {
+        const ordinals = try self.ordinalPostingsForPrefixAlloc(store, try self.docFactScalarOrdinalPrefixAlloc(role, field, scalar_token));
+        defer if (ordinals.len > 0) self.alloc.free(ordinals);
+        if (ordinals.len > 0) {
+            return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals);
+        }
+        const legacy_count = try self.countRowsWithPrefix(store, try self.docFactScalarPrefixAlloc(role, field, scalar_token));
+        if (ordinals.len == 0 and legacy_count > 0) return null;
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals);
     }
 
     const PathScalarPredicate = struct {
@@ -6292,6 +7747,15 @@ pub const Index = struct {
         return try self.docIdsForIndexedDocFactPrefixAlloc(store, try self.pathLookupPrefixAlloc(path, kind, scalar));
     }
 
+    fn resolvedDocSetForPathTermAlloc(self: *Index, store: *docstore_mod.DocStore, path: []const u8, kind: pathfact_mod.Kind, scalar: []const u8) !?doc_set.ResolvedDocSet {
+        if (!(try self.pathProfileHasKind(store, path, kind))) return .none;
+        if (try self.readyPathPromotionMaterializationIdAlloc(store, path, kind)) |materialization_id| {
+            defer self.alloc.free(materialization_id);
+            return try self.resolvedDocSetForPathDictionaryTermAlloc(store, path, kind, scalar);
+        }
+        return try self.resolvedDocSetForPathLookupTermAlloc(store, path, kind, scalar);
+    }
+
     fn docIdsForPathTermsAlloc(self: *Index, store: *docstore_mod.DocStore, predicate: PathTermsPredicate) ![][]u8 {
         var out = try self.alloc.alloc([]u8, 0);
         errdefer self.freeDocIds(out);
@@ -6305,7 +7769,19 @@ pub const Index = struct {
         return out;
     }
 
+    fn resolvedDocSetForPathTermsAlloc(self: *Index, store: *docstore_mod.DocStore, predicate: PathTermsPredicate) !?doc_set.ResolvedDocSet {
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(self.alloc);
+        for (predicate.values) |value| {
+            var item_set = (try self.resolvedDocSetForPathTermAlloc(store, value.path, value.kind, value.scalar)) orelse return null;
+            defer item_set.deinit(self.alloc);
+            try self.appendResolvedOrdinals(&ordinals, &item_set);
+        }
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals.items);
+    }
+
     const PathDictionaryStringScan = union(enum) {
+        contains: []const u8,
         prefix: []const u8,
         wildcard: []const u8,
         regexp: []const u8,
@@ -6314,6 +7790,7 @@ pub const Index = struct {
             folded_term: []const u8,
             max_edits: u8,
         },
+        ip_range: IpRangeQuery,
     };
 
     fn docIdsForPathDictionaryTermAlloc(
@@ -6341,6 +7818,37 @@ pub const Index = struct {
             };
         }
         return try self.docIdsForIndexedDocFactPrefixAlloc(store, try self.pathDictionaryPostingsPrefixAlloc(identity, scalar));
+    }
+
+    fn resolvedDocSetForPathDictionaryTermAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        path: []const u8,
+        kind: pathfact_mod.Kind,
+        scalar: []const u8,
+    ) !?doc_set.ResolvedDocSet {
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, kind, "json-scalar-v1", "kind-qualified");
+        if (!(try self.dictionaryRegistryReadyForLayout(store, identity, .lexicon_postings_rows))) return null;
+        if (try self.pathDictionaryFstBytesAlloc(store, identity)) |fst_bytes| {
+            defer self.alloc.free(fst_bytes);
+            if (!(try lexical_mod.fstContains(fst_bytes, scalar))) return .none;
+        } else {
+            const lexicon_key = try self.pathDictionaryLexiconKeyAlloc(identity, scalar);
+            defer self.alloc.free(lexicon_key);
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            _ = txn.get(lexicon_key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+        }
+
+        const legacy_count = try self.countRowsWithPrefix(store, try self.pathDictionaryPostingsPrefixAlloc(identity, scalar));
+        const ordinals = try self.ordinalPostingsForPrefixAlloc(store, try self.pathDictionaryOrdinalPostingsPrefixAlloc(identity, scalar));
+        defer if (ordinals.len > 0) self.alloc.free(ordinals);
+        if (ordinals.len == 0 and legacy_count > 0) return null;
+        if (legacy_count != ordinals.len) return null;
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals);
     }
 
     fn docIdsForPathDictionaryExistsAlloc(
@@ -6377,6 +7885,37 @@ pub const Index = struct {
             return null;
         }
         return out;
+    }
+
+    fn resolvedDocSetForPathDictionaryExistsAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        path: []const u8,
+    ) !?doc_set.ResolvedDocSet {
+        const progress_rows = try self.scanPersistedAdaptiveProgress(store);
+        defer {
+            for (progress_rows) |*progress| progress.deinit(self.alloc);
+            if (progress_rows.len > 0) self.alloc.free(progress_rows);
+        }
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(self.alloc);
+        var saw_dictionary = false;
+        for (progress_rows) |progress| {
+            if (progress.lifecycle != .ready) continue;
+            if (!self.adaptiveProgressMatchesCurrentConfig(progress)) continue;
+            var spec = self.adaptiveSpecFromRecommendationAlloc(progress.materialization_id, progress.recommendation) catch continue;
+            defer spec.deinit(self.alloc);
+            const promoted_path = spec.path_promotion_path orelse continue;
+            if (!std.mem.eql(u8, promoted_path, path)) continue;
+            const promoted_kind = spec.path_promotion_kind orelse continue;
+            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, promoted_kind, "json-scalar-v1", "kind-qualified");
+            var item_set = (try self.resolvedDocSetForPathDictionaryAllPostingsAlloc(store, identity)) orelse return null;
+            defer item_set.deinit(self.alloc);
+            saw_dictionary = true;
+            try self.appendResolvedOrdinals(&ordinals, &item_set);
+        }
+        if (!saw_dictionary) return null;
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals.items);
     }
 
     fn docIdsForPathDictionaryStringScanAlloc(
@@ -6451,6 +7990,68 @@ pub const Index = struct {
         return try self.docIdsForDictionaryLabelsAlloc(store, identity, labels.items);
     }
 
+    fn resolvedDocSetForPathDictionaryRangeAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        spec: PathRangePredicate,
+        kind: pathfact_mod.Kind,
+    ) !?doc_set.ResolvedDocSet {
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, spec.path, kind, "json-scalar-v1", "kind-qualified");
+        if (!(try self.dictionaryRegistryReadyForLayout(store, identity, .lexicon_postings_rows))) return null;
+        if (try self.pathDictionaryFstBytesAlloc(store, identity)) |fst_bytes| {
+            defer self.alloc.free(fst_bytes);
+            const labels = if (spec.kind == .term)
+                try lexical_mod.fstLabelsInRangeAlloc(self.alloc, fst_bytes, spec.min_term, spec.max_term, spec.inclusive_min, spec.inclusive_max)
+            else blk: {
+                const all = try lexical_mod.fstLabelsInRangeAlloc(self.alloc, fst_bytes, null, null, true, false);
+                var filtered = std.ArrayListUnmanaged([]u8).empty;
+                errdefer {
+                    for (filtered.items) |label| self.alloc.free(label);
+                    filtered.deinit(self.alloc);
+                }
+                for (all) |label| {
+                    if (self.pathDictionaryLabelMatchesRange(label, spec)) {
+                        try filtered.append(self.alloc, label);
+                    } else {
+                        self.alloc.free(label);
+                    }
+                }
+                self.alloc.free(all);
+                break :blk try filtered.toOwnedSlice(self.alloc);
+            };
+            defer {
+                for (labels) |label| self.alloc.free(label);
+                if (labels.len > 0) self.alloc.free(labels);
+            }
+            return try self.resolvedDocSetForDictionaryLabelsAlloc(store, identity, labels);
+        }
+        const lexicon_prefix = try self.pathDictionaryLexiconPrefixAlloc(identity);
+        defer self.alloc.free(lexicon_prefix);
+        var labels = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (labels.items) |label| self.alloc.free(label);
+            labels.deinit(self.alloc);
+        }
+        var saw_dictionary = false;
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(lexicon_prefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, lexicon_prefix)) break;
+                saw_dictionary = true;
+                const label_component = token.componentAt(entry.key, lexicon_prefix.len) catch continue;
+                if (label_component.next != entry.key.len) continue;
+                if (!self.pathDictionaryLabelMatchesRange(label_component.payload, spec)) continue;
+                try labels.append(self.alloc, try self.alloc.dupe(u8, label_component.payload));
+            }
+        }
+        if (!saw_dictionary) return null;
+        return try self.resolvedDocSetForDictionaryLabelsAlloc(store, identity, labels.items);
+    }
+
     fn pathDictionaryLabelMatchesRange(self: *Index, label: []const u8, spec: PathRangePredicate) bool {
         _ = self;
         return switch (spec.kind) {
@@ -6507,6 +8108,49 @@ pub const Index = struct {
         }
         if (!saw_dictionary) return null;
         return try self.docIdsForDictionaryLabelsAlloc(store, identity, labels.items);
+    }
+
+    fn resolvedDocSetForPathDictionaryLabelScanAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        identity: lexical_mod.DictionaryIdentity,
+        scan: PathDictionaryStringScan,
+    ) !?doc_set.ResolvedDocSet {
+        if (!(try self.dictionaryRegistryReadyForLayout(store, identity, .lexicon_postings_rows))) return null;
+        if (try self.pathDictionaryFstBytesAlloc(store, identity)) |fst_bytes| {
+            defer self.alloc.free(fst_bytes);
+            const labels = try self.pathDictionaryFstLabelsForScanAlloc(fst_bytes, scan);
+            defer {
+                for (labels) |label| self.alloc.free(label);
+                if (labels.len > 0) self.alloc.free(labels);
+            }
+            return try self.resolvedDocSetForDictionaryLabelsAlloc(store, identity, labels);
+        }
+        const lexicon_prefix = try self.pathDictionaryLexiconPrefixAlloc(identity);
+        defer self.alloc.free(lexicon_prefix);
+        var labels = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (labels.items) |label| self.alloc.free(label);
+            labels.deinit(self.alloc);
+        }
+        var saw_dictionary = false;
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(lexicon_prefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, lexicon_prefix)) break;
+                saw_dictionary = true;
+                const label_component = token.componentAt(entry.key, lexicon_prefix.len) catch continue;
+                if (label_component.next != entry.key.len) continue;
+                if (!(try self.pathDictionaryLabelMatchesScan(label_component.payload, scan))) continue;
+                try labels.append(self.alloc, try self.alloc.dupe(u8, label_component.payload));
+            }
+        }
+        if (!saw_dictionary) return null;
+        return try self.resolvedDocSetForDictionaryLabelsAlloc(store, identity, labels.items);
     }
 
     fn pathDictionaryFstBytesAlloc(
@@ -6571,6 +8215,7 @@ pub const Index = struct {
         scan: PathDictionaryStringScan,
     ) ![][]u8 {
         const labels = switch (scan) {
+            .contains => try lexical_mod.fstLabelsInRangeAlloc(self.alloc, fst_bytes, null, null, true, false),
             .prefix => |prefix| try lexical_mod.fstLabelsWithPrefixAlloc(self.alloc, fst_bytes, prefix),
             .wildcard => |pattern| blk: {
                 const literal_prefix = wildcardLiteralPrefix(pattern);
@@ -6591,6 +8236,7 @@ pub const Index = struct {
                 defer automaton.deinit();
                 break :blk try lexical_mod.fstLabelsMatchingAutomatonAlloc(self.alloc, fst_bytes, automaton.automaton(), fuzzy.literal_prefix);
             },
+            .ip_range => try lexical_mod.fstLabelsInRangeAlloc(self.alloc, fst_bytes, null, null, true, false),
         };
         errdefer {
             for (labels) |label| self.alloc.free(label);
@@ -6611,6 +8257,7 @@ pub const Index = struct {
 
     fn pathDictionaryLabelMatchesScan(self: *Index, label: []const u8, scan: PathDictionaryStringScan) !bool {
         return switch (scan) {
+            .contains => |text| containsCaseInsensitive(label, text),
             .prefix => |prefix| std.mem.startsWith(u8, label, prefix),
             .wildcard => |pattern| wildcardMatch(pattern, label),
             .regexp => |pattern| blk: {
@@ -6620,6 +8267,7 @@ pub const Index = struct {
             },
             .fuzzy => |fuzzy| std.mem.startsWith(u8, label, fuzzy.literal_prefix) and
                 try fuzzyMatchesScalar(self.alloc, label, fuzzy.folded_term, fuzzy.max_edits),
+            .ip_range => |query| ipRangeQueryMatches(query, label),
         };
     }
 
@@ -6659,6 +8307,34 @@ pub const Index = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    fn resolvedDocSetForPathDictionaryAllPostingsAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        identity: lexical_mod.DictionaryIdentity,
+    ) !?doc_set.ResolvedDocSet {
+        if (!(try self.dictionaryRegistryReadyForLayout(store, identity, .lexicon_postings_rows))) return null;
+        const lexicon_prefix = try self.pathDictionaryLexiconPrefixAlloc(identity);
+        defer self.alloc.free(lexicon_prefix);
+        var labels = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (labels.items) |label| self.alloc.free(label);
+            labels.deinit(self.alloc);
+        }
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(lexicon_prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, lexicon_prefix)) break;
+            const label_component = token.componentAt(entry.key, lexicon_prefix.len) catch continue;
+            if (label_component.next != entry.key.len) continue;
+            try labels.append(self.alloc, try self.alloc.dupe(u8, label_component.payload));
+        }
+        if (labels.items.len == 0) return null;
+        return try self.resolvedDocSetForDictionaryLabelsAlloc(store, identity, labels.items);
+    }
+
     fn docIdsForDictionaryLabelsAlloc(
         self: *Index,
         store: *docstore_mod.DocStore,
@@ -6675,6 +8351,216 @@ pub const Index = struct {
             out = next;
         }
         return out;
+    }
+
+    fn resolvedDocSetForDictionaryLabelsAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        identity: lexical_mod.DictionaryIdentity,
+        labels: []const []u8,
+    ) !?doc_set.ResolvedDocSet {
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(self.alloc);
+        for (labels) |label| {
+            const legacy_count = try self.countRowsWithPrefix(store, try self.pathDictionaryPostingsPrefixAlloc(identity, label));
+            const item_ordinals = try self.ordinalPostingsForPrefixAlloc(store, try self.pathDictionaryOrdinalPostingsPrefixAlloc(identity, label));
+            defer if (item_ordinals.len > 0) self.alloc.free(item_ordinals);
+            if (item_ordinals.len == 0 and legacy_count > 0) return null;
+            if (legacy_count != item_ordinals.len) return null;
+            for (item_ordinals) |ordinal| {
+                if (containsOrdinal(ordinals.items, ordinal)) continue;
+                try ordinals.append(self.alloc, ordinal);
+            }
+        }
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals.items);
+    }
+
+    fn resolvedDocSetForPathLookupTermAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        path: []const u8,
+        kind: pathfact_mod.Kind,
+        scalar: []const u8,
+    ) !?doc_set.ResolvedDocSet {
+        const legacy_count = try self.countRowsWithPrefix(store, try self.pathLookupPrefixAlloc(path, kind, scalar));
+        const ordinals = try self.ordinalPostingsForPrefixAlloc(store, try self.pathLookupOrdinalPrefixAlloc(path, kind, scalar));
+        defer if (ordinals.len > 0) self.alloc.free(ordinals);
+        if (ordinals.len == 0 and legacy_count > 0) return null;
+        if (legacy_count != ordinals.len) return null;
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals);
+    }
+
+    fn resolvedDocSetForPathLookupExistsAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        path: []const u8,
+    ) !?doc_set.ResolvedDocSet {
+        const legacy_ids = try self.docIdsForIndexedPathLookupPathPrefixAlloc(store, try self.pathLookupPathPrefixAlloc(path));
+        defer self.freeDocIds(legacy_ids);
+        const prefix = try self.pathLookupOrdinalPathPrefixAlloc(path);
+        defer self.alloc.free(prefix);
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(self.alloc);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const kind_component = token.componentAt(entry.key, prefix.len) catch continue;
+            const value_component = token.componentAt(entry.key, kind_component.next) catch continue;
+            const ordinal_component = token.componentAt(entry.key, value_component.next) catch continue;
+            if (ordinal_component.next != entry.key.len or ordinal_component.payload.len != @sizeOf(doc_set.DocOrdinal)) continue;
+            const ordinal = std.mem.readInt(u32, ordinal_component.payload[0..4], .big);
+            if (containsOrdinal(ordinals.items, ordinal)) continue;
+            try ordinals.append(self.alloc, ordinal);
+        }
+        if (ordinals.items.len == 0 and legacy_ids.len > 0) return null;
+        if (ordinals.items.len != legacy_ids.len) return null;
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals.items);
+    }
+
+    fn resolvedDocSetForPathLookupStringScanAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        path: []const u8,
+        scan: PathDictionaryStringScan,
+    ) !?doc_set.ResolvedDocSet {
+        const legacy_ids = try self.docIdsForPathLookupStringScanAlloc(store, path, scan);
+        defer self.freeDocIds(legacy_ids);
+        const prefix = try self.pathLookupOrdinalKindPrefixAlloc(path, .string);
+        defer self.alloc.free(prefix);
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(self.alloc);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const value_component = token.componentAt(entry.key, prefix.len) catch continue;
+            const ordinal_component = token.componentAt(entry.key, value_component.next) catch continue;
+            if (ordinal_component.next != entry.key.len or ordinal_component.payload.len != @sizeOf(doc_set.DocOrdinal)) continue;
+            if (!(try self.pathDictionaryLabelMatchesScan(value_component.payload, scan))) continue;
+            const ordinal = std.mem.readInt(u32, ordinal_component.payload[0..4], .big);
+            if (containsOrdinal(ordinals.items, ordinal)) continue;
+            try ordinals.append(self.alloc, ordinal);
+        }
+        if (ordinals.items.len == 0 and legacy_ids.len > 0) return null;
+        if (ordinals.items.len != legacy_ids.len) return null;
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals.items);
+    }
+
+    fn resolvedDocSetForPathLookupRangeAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        spec: PathRangePredicate,
+        kind: pathfact_mod.Kind,
+    ) !?doc_set.ResolvedDocSet {
+        const legacy_ids = try self.docIdsForPathLookupRangeAlloc(store, spec, kind);
+        defer self.freeDocIds(legacy_ids);
+        const prefix = try self.pathLookupOrdinalKindPrefixAlloc(spec.path, kind);
+        defer self.alloc.free(prefix);
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(self.alloc);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const value_component = token.componentAt(entry.key, prefix.len) catch continue;
+            const ordinal_component = token.componentAt(entry.key, value_component.next) catch continue;
+            if (ordinal_component.next != entry.key.len or ordinal_component.payload.len != @sizeOf(doc_set.DocOrdinal)) continue;
+            if (!self.pathDictionaryLabelMatchesRange(value_component.payload, spec)) continue;
+            const ordinal = std.mem.readInt(u32, ordinal_component.payload[0..4], .big);
+            if (containsOrdinal(ordinals.items, ordinal)) continue;
+            try ordinals.append(self.alloc, ordinal);
+        }
+        if (ordinals.items.len == 0 and legacy_ids.len > 0) return null;
+        if (ordinals.items.len != legacy_ids.len) return null;
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals.items);
+    }
+
+    fn docIdsForPathLookupStringScanAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        path: []const u8,
+        scan: PathDictionaryStringScan,
+    ) ![][]u8 {
+        const prefix = try self.pathLookupKindPrefixAlloc(path, .string);
+        defer self.alloc.free(prefix);
+        var out = std.ArrayListUnmanaged([]u8).empty;
+        errdefer freeDocIdList(self.alloc, &out);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const value_component = token.componentAt(entry.key, prefix.len) catch continue;
+            const doc_component = token.componentAt(entry.key, value_component.next) catch continue;
+            if (doc_component.next != entry.key.len) continue;
+            if (!(try self.pathDictionaryLabelMatchesScan(value_component.payload, scan))) continue;
+            if (containsDocId(out.items, doc_component.payload)) continue;
+            try out.append(self.alloc, try self.alloc.dupe(u8, doc_component.payload));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn docIdsForPathLookupRangeAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        spec: PathRangePredicate,
+        kind: pathfact_mod.Kind,
+    ) ![][]u8 {
+        const prefix = try self.pathLookupKindPrefixAlloc(spec.path, kind);
+        defer self.alloc.free(prefix);
+        var out = std.ArrayListUnmanaged([]u8).empty;
+        errdefer freeDocIdList(self.alloc, &out);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const value_component = token.componentAt(entry.key, prefix.len) catch continue;
+            const doc_component = token.componentAt(entry.key, value_component.next) catch continue;
+            if (doc_component.next != entry.key.len) continue;
+            if (!self.pathDictionaryLabelMatchesRange(value_component.payload, spec)) continue;
+            if (containsDocId(out.items, doc_component.payload)) continue;
+            try out.append(self.alloc, try self.alloc.dupe(u8, doc_component.payload));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn appendResolvedOrdinals(
+        self: *Index,
+        out: *std.ArrayListUnmanaged(doc_set.DocOrdinal),
+        set: *const doc_set.ResolvedDocSet,
+    ) !void {
+        switch (set.*) {
+            .none => {},
+            .ordinals => |ordinals| {
+                for (ordinals) |ordinal| {
+                    if (containsOrdinal(out.items, ordinal)) continue;
+                    try out.append(self.alloc, ordinal);
+                }
+            },
+            .ordinal_bitmap => |*bitmap| {
+                var iter = bitmap.iterator();
+                while (iter.next()) |ordinal| {
+                    if (containsOrdinal(out.items, ordinal)) continue;
+                    try out.append(self.alloc, ordinal);
+                }
+            },
+            .all, .doc_keys => return error.UnexpectedResolvedDocSetShape,
+        }
     }
 
     fn docIdsForPathExistsAlloc(self: *Index, store: *docstore_mod.DocStore, path: []const u8) ![][]u8 {
@@ -6715,6 +8601,16 @@ pub const Index = struct {
             try out.append(self.alloc, try self.alloc.dupe(u8, doc_component.payload));
         }
         return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn resolvedDocSetForPathStringScanAlloc(self: *Index, store: *docstore_mod.DocStore, path: []const u8, scan: PathDictionaryStringScan) !?doc_set.ResolvedDocSet {
+        if (!(try self.pathProfileHasKind(store, path, .string))) return .none;
+        if (try self.readyPathPromotionMaterializationIdAlloc(store, path, .string)) |materialization_id| {
+            defer self.alloc.free(materialization_id);
+            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, path, .string, "json-scalar-v1", "kind-qualified");
+            return try self.resolvedDocSetForPathDictionaryLabelScanAlloc(store, identity, scan);
+        }
+        return try self.resolvedDocSetForPathLookupStringScanAlloc(store, path, scan);
     }
 
     fn docIdsForPathStringWildcardAlloc(self: *Index, store: *docstore_mod.DocStore, path: []const u8, pattern: []const u8) !?[][]u8 {
@@ -6871,6 +8767,20 @@ pub const Index = struct {
             try out.append(self.alloc, try self.alloc.dupe(u8, doc_component.payload));
         }
         return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn resolvedDocSetForPathRangeAlloc(self: *Index, store: *docstore_mod.DocStore, spec: PathRangePredicate) !?doc_set.ResolvedDocSet {
+        const path_kind: pathfact_mod.Kind = switch (spec.kind) {
+            .numeric => .number,
+            .term => .string,
+            .date => .string,
+        };
+        if (!(try self.pathProfileHasKind(store, spec.path, path_kind))) return .none;
+        if (try self.readyPathPromotionMaterializationIdAlloc(store, spec.path, path_kind)) |materialization_id| {
+            defer self.alloc.free(materialization_id);
+            return try self.resolvedDocSetForPathDictionaryRangeAlloc(store, spec, path_kind);
+        }
+        return try self.resolvedDocSetForPathLookupRangeAlloc(store, spec, path_kind);
     }
 
     fn pathProfileExists(self: *Index, store: *docstore_mod.DocStore, path: []const u8) !bool {
@@ -7453,6 +9363,44 @@ pub const Index = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    fn resolvedDocSetForPrefixFilterAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        prefix_value: std.json.Value,
+        sibling_field_value: ?std.json.Value,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        if (pathPrefixPredicate(prefix_value, sibling_field_value)) |predicate| {
+            return try self.resolvedDocSetForPathStringScanAlloc(store, predicate.path, .{ .prefix = predicate.prefix });
+        }
+        const FieldPrefix = struct {
+            field: []const u8,
+            prefix: []const u8,
+            role: ?std.json.Value = null,
+        };
+        const parsed: FieldPrefix = switch (prefix_value) {
+            .object => |object| blk: {
+                if (object.get("field") != null or object.get("value") != null or object.get("prefix") != null or object.get("role") != null) {
+                    const field_name = jsonStringValue(object.get("field") orelse return null) orelse return null;
+                    const prefix_text = jsonStringValue(object.get("value") orelse object.get("prefix") orelse return null) orelse return null;
+                    break :blk .{ .field = field_name, .prefix = prefix_text, .role = object.get("role") };
+                }
+                if (object.count() != 1) return null;
+                var it = object.iterator();
+                const entry = it.next() orelse return null;
+                const prefix_text = jsonStringValue(entry.value_ptr.*) orelse return null;
+                break :blk .{ .field = entry.key_ptr.*, .prefix = prefix_text };
+            },
+            .string => |prefix_text| blk: {
+                const field_name = jsonStringValue(sibling_field_value orelse return null) orelse return null;
+                break :blk .{ .field = field_name, .prefix = prefix_text };
+            },
+            else => return null,
+        };
+        const field = self.scalarFieldSpec(parsed.field, parsed.role) orelse return null;
+        if (!rangeFieldAcceptsTerm(field.type)) return null;
+        return try self.resolvedDocSetForScalarPrefixAlloc(store, field.role, field.field, parsed.prefix);
+    }
+
     fn docIdsForWildcardFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?[][]u8 {
         const FieldWildcard = struct {
             field: []const u8,
@@ -7515,6 +9463,50 @@ pub const Index = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    fn resolvedDocSetForWildcardFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        if (pathPatternPredicate(object, "pattern")) |predicate| {
+            const literal_prefix = wildcardLiteralPrefix(predicate.text);
+            if (literal_prefix.len == 0) {
+                if (!wildcardPatternHasMeta(predicate.text)) return try self.resolvedDocSetForPathTermAlloc(store, predicate.path, .string, predicate.text);
+                return null;
+            }
+            return try self.resolvedDocSetForPathStringScanAlloc(store, predicate.path, .{ .wildcard = predicate.text });
+        }
+        const FieldWildcard = struct {
+            field: []const u8,
+            pattern: []const u8,
+            role: ?std.json.Value = null,
+        };
+        const parsed: FieldWildcard = blk: {
+            if (object.get("field") != null or object.get("value") != null or object.get("pattern") != null or object.get("role") != null) {
+                const field_name = jsonStringValue(object.get("field") orelse return null) orelse return null;
+                const pattern = jsonStringValue(object.get("pattern") orelse object.get("value") orelse return null) orelse return null;
+                break :blk .{ .field = field_name, .pattern = pattern, .role = object.get("role") };
+            }
+            if (object.count() != 1) return null;
+            var it = object.iterator();
+            const entry = it.next() orelse return null;
+            const pattern = jsonStringValue(entry.value_ptr.*) orelse return null;
+            break :blk .{ .field = entry.key_ptr.*, .pattern = pattern };
+        };
+        const field = self.scalarFieldSpec(parsed.field, parsed.role) orelse return null;
+        if (!rangeFieldAcceptsTerm(field.type)) return null;
+        const literal_prefix = wildcardLiteralPrefix(parsed.pattern);
+        if (literal_prefix.len == 0) {
+            if (!wildcardPatternHasMeta(parsed.pattern)) {
+                const encoded = try token.scalarTokenFromFieldTextAlloc(self.alloc, field.type, parsed.pattern);
+                defer self.alloc.free(encoded);
+                return try self.resolvedDocSetForScalarFactAlloc(store, field.role, field.field, encoded);
+            }
+            return null;
+        }
+        return try self.resolvedDocSetForScalarStringScanAlloc(store, field.role, field.field, .{ .wildcard = parsed.pattern });
+    }
+
     fn docIdsForRegexpFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?[][]u8 {
         const FieldRegexp = struct {
             field: []const u8,
@@ -7571,6 +9563,40 @@ pub const Index = struct {
             try out.append(self.alloc, try self.alloc.dupe(u8, doc_component.payload));
         }
         return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn resolvedDocSetForRegexpFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        if (pathPatternPredicate(object, "pattern")) |predicate| {
+            if (regexpLiteralPrefix(predicate.text).len == 0) return null;
+            return try self.resolvedDocSetForPathStringScanAlloc(store, predicate.path, .{ .regexp = predicate.text });
+        }
+        const FieldRegexp = struct {
+            field: []const u8,
+            pattern: []const u8,
+            role: ?std.json.Value = null,
+        };
+        const parsed: FieldRegexp = blk: {
+            if (object.get("field") != null or object.get("value") != null or object.get("pattern") != null or object.get("role") != null) {
+                const field_name = jsonStringValue(object.get("field") orelse return null) orelse return null;
+                const pattern = jsonStringValue(object.get("pattern") orelse object.get("value") orelse return null) orelse return null;
+                break :blk .{ .field = field_name, .pattern = pattern, .role = object.get("role") };
+            }
+            if (object.count() != 1) return null;
+            var it = object.iterator();
+            const entry = it.next() orelse return null;
+            const pattern = jsonStringValue(entry.value_ptr.*) orelse return null;
+            break :blk .{ .field = entry.key_ptr.*, .pattern = pattern };
+        };
+        const field = self.scalarFieldSpec(parsed.field, parsed.role) orelse return null;
+        if (!rangeFieldAcceptsTerm(field.type)) return null;
+        if (regexpLiteralPrefix(parsed.pattern).len == 0) return null;
+        var compiled = regex_mod.compile(self.alloc, parsed.pattern) catch return null;
+        defer compiled.deinit();
+        return try self.resolvedDocSetForScalarStringScanAlloc(store, field.role, field.field, .{ .regexp = .{ .pattern = parsed.pattern, .compiled = &compiled } });
     }
 
     fn docIdsForFuzzyFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?[][]u8 {
@@ -7639,10 +9665,81 @@ pub const Index = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    fn resolvedDocSetForFuzzyFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        const object = switch (value) {
+            .object => |object| object,
+            else => return null,
+        };
+        if (pathFuzzyPredicate(object)) |predicate| {
+            if (predicate.query.prefix_len == 0) return null;
+            const prefix_len: usize = @intCast(predicate.query.prefix_len);
+            if (predicate.query.term.len < prefix_len) return null;
+            const literal_prefix = predicate.query.term[0..prefix_len];
+            const folded_term = try asciiLowerAlloc(self.alloc, predicate.query.term);
+            defer self.alloc.free(folded_term);
+            return try self.resolvedDocSetForPathStringScanAlloc(store, predicate.path, .{ .fuzzy = .{ .literal_prefix = literal_prefix, .folded_term = folded_term, .max_edits = predicate.query.max_edits } });
+        }
+        const FieldFuzzy = struct {
+            field: []const u8,
+            term: []const u8,
+            max_edits: u8,
+            prefix_len: u8,
+            role: ?std.json.Value = null,
+        };
+        const parsed: FieldFuzzy = blk: {
+            if (object.get("field") != null or object.get("query") != null or object.get("value") != null or object.get("role") != null) {
+                const field_name = jsonStringValue(object.get("field") orelse return null) orelse return null;
+                var parsed_query = FuzzyQuery{
+                    .term = jsonStringValue(object.get("query") orelse object.get("value") orelse return null) orelse return null,
+                    .max_edits = 1,
+                    .prefix_len = 0,
+                };
+                if (!parseFuzzyOptions(object, &parsed_query)) return null;
+                break :blk .{ .field = field_name, .term = parsed_query.term, .max_edits = parsed_query.max_edits, .prefix_len = parsed_query.prefix_len, .role = object.get("role") };
+            }
+            if (object.count() != 1) return null;
+            var it = object.iterator();
+            const entry = it.next() orelse return null;
+            const query = parseFuzzyQuery(entry.value_ptr.*) orelse return null;
+            break :blk .{ .field = entry.key_ptr.*, .term = query.term, .max_edits = query.max_edits, .prefix_len = query.prefix_len };
+        };
+        if (parsed.prefix_len == 0) return null;
+        const prefix_len: usize = @intCast(parsed.prefix_len);
+        if (parsed.term.len < prefix_len) return null;
+        const field = self.scalarFieldSpec(parsed.field, parsed.role) orelse return null;
+        if (!rangeFieldAcceptsTerm(field.type)) return null;
+        const literal_prefix = parsed.term[0..prefix_len];
+        const folded_term = try asciiLowerAlloc(self.alloc, parsed.term);
+        defer self.alloc.free(folded_term);
+        return try self.resolvedDocSetForScalarStringScanAlloc(store, field.role, field.field, .{ .fuzzy = .{ .literal_prefix = literal_prefix, .folded_term = folded_term, .max_edits = parsed.max_edits } });
+    }
+
     fn docIdsForExistsFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?[][]u8 {
         if (pathFromExistsFilter(value)) |path| return try self.docIdsForPathExistsAlloc(store, path);
         const spec = self.existsFieldSpec(value) orelse return null;
         return try self.docIdsForIndexedDocFactPrefixAlloc(store, try self.docFactFieldPrefixAlloc(spec.role, spec.field));
+    }
+
+    fn resolvedDocSetForExistsFilterAlloc(self: *Index, store: *docstore_mod.DocStore, value: std.json.Value) anyerror!?doc_set.ResolvedDocSet {
+        if (pathFromExistsFilter(value)) |path| {
+            if (!(try self.pathProfileExists(store, path))) return .none;
+            if (try self.readyPathPromotionMaterializationIdAlloc(store, path, null)) |materialization_id| {
+                defer self.alloc.free(materialization_id);
+                return try self.resolvedDocSetForPathDictionaryExistsAlloc(store, path);
+            }
+            return try self.resolvedDocSetForPathLookupExistsAlloc(store, path);
+        }
+        const spec = self.existsFieldSpec(value) orelse return null;
+        return try self.resolvedDocSetForFieldExistsAlloc(store, spec.role, spec.field);
+    }
+
+    fn resolvedDocSetForFieldExistsAlloc(self: *Index, store: *docstore_mod.DocStore, role: fact_mod.Role, field: []const u8) !?doc_set.ResolvedDocSet {
+        const legacy_count = try self.countRowsWithPrefix(store, try self.docFactFieldPrefixAlloc(role, field));
+        const ordinals = try self.ordinalPostingsForPrefixAlloc(store, try self.docFactFieldOrdinalPrefixAlloc(role, field));
+        defer if (ordinals.len > 0) self.alloc.free(ordinals);
+        if (ordinals.len == 0 and legacy_count > 0) return null;
+        if (legacy_count != ordinals.len) return null;
+        return try doc_set.fromOrdinalsAlloc(self.alloc, ordinals);
     }
 
     fn docIdsForIndexedDocFactPrefixAlloc(self: *Index, store: *docstore_mod.DocStore, owned_prefix: []u8) ![][]u8 {
@@ -7659,6 +9756,25 @@ pub const Index = struct {
             const doc_component = token.componentAt(entry.key, owned_prefix.len) catch continue;
             if (doc_component.next != entry.key.len) continue;
             try out.append(self.alloc, try self.alloc.dupe(u8, doc_component.payload));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn ordinalPostingsForPrefixAlloc(self: *Index, store: *docstore_mod.DocStore, owned_prefix: []u8) ![]doc_set.DocOrdinal {
+        defer self.alloc.free(owned_prefix);
+        var out = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        errdefer out.deinit(self.alloc);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(owned_prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, owned_prefix)) break;
+            const ordinal_component = token.componentAt(entry.key, owned_prefix.len) catch continue;
+            if (ordinal_component.next != entry.key.len or ordinal_component.payload.len != @sizeOf(doc_set.DocOrdinal)) continue;
+            const ordinal = std.mem.readInt(u32, ordinal_component.payload[0..4], .big);
+            try out.append(self.alloc, ordinal);
         }
         return try out.toOwnedSlice(self.alloc);
     }
@@ -7710,10 +9826,17 @@ pub const Index = struct {
     fn unionDocIdsAlloc(self: *Index, left: [][]u8, right: [][]u8) ![][]u8 {
         var out = std.ArrayListUnmanaged([]u8).empty;
         errdefer freeDocIdList(self.alloc, &out);
-        for (left) |doc_id| try out.append(self.alloc, try self.alloc.dupe(u8, doc_id));
-        for (right) |doc_id| {
-            if (containsDocId(out.items, doc_id)) continue;
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+        for (left) |doc_id| {
+            if (seen.contains(doc_id)) continue;
             try out.append(self.alloc, try self.alloc.dupe(u8, doc_id));
+            try seen.put(self.alloc, out.items[out.items.len - 1], {});
+        }
+        for (right) |doc_id| {
+            if (seen.contains(doc_id)) continue;
+            try out.append(self.alloc, try self.alloc.dupe(u8, doc_id));
+            try seen.put(self.alloc, out.items[out.items.len - 1], {});
         }
         return try out.toOwnedSlice(self.alloc);
     }
@@ -7728,9 +9851,16 @@ pub const Index = struct {
     fn intersectDocIdsAlloc(self: *Index, left: [][]u8, right: [][]u8) ![][]u8 {
         var out = std.ArrayListUnmanaged([]u8).empty;
         errdefer freeDocIdList(self.alloc, &out);
+        var right_set = std.StringHashMapUnmanaged(void).empty;
+        defer right_set.deinit(self.alloc);
+        try right_set.ensureTotalCapacity(self.alloc, @intCast(right.len));
+        for (right) |doc_id| try right_set.put(self.alloc, doc_id, {});
+        var emitted = std.StringHashMapUnmanaged(void).empty;
+        defer emitted.deinit(self.alloc);
         for (left) |doc_id| {
-            if (!containsDocId(right, doc_id)) continue;
+            if (!right_set.contains(doc_id) or emitted.contains(doc_id)) continue;
             try out.append(self.alloc, try self.alloc.dupe(u8, doc_id));
+            try emitted.put(self.alloc, out.items[out.items.len - 1], {});
         }
         return try out.toOwnedSlice(self.alloc);
     }
@@ -7951,6 +10081,7 @@ pub const Index = struct {
         txn: anytype,
         request: DocFactBucketFoldRequest,
         law_id: law_mod.Id,
+        generation: ?u64,
     ) ![]FoldEntry {
         if (request.kind == .histogram and request.histogram_interval <= 0) return error.InvalidAlgebraicConfig;
         if (request.op != .count and request.measure == null) return error.InvalidAlgebraicConfig;
@@ -7976,6 +10107,7 @@ pub const Index = struct {
         var entry_opt = try cursor.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (!try self.docFactKeyVisibleAtGenerationTxn(txn, entry.key, prefix, generation)) continue;
             var facts = fact_mod.decodeListAlloc(self.alloc, entry.value) catch |err| switch (err) {
                 error.InvalidAlgebraicFact => continue,
                 else => return err,
@@ -8073,6 +10205,7 @@ pub const Index = struct {
         txn: anytype,
         request: PathFactBucketFoldRequest,
         law_id: law_mod.Id,
+        generation: ?u64,
     ) ![]FoldEntry {
         if (request.kind == .histogram and request.histogram_interval <= 0) return error.InvalidAlgebraicConfig;
         if (request.op != .count and request.measure_path == null) return error.InvalidAlgebraicConfig;
@@ -8085,6 +10218,7 @@ pub const Index = struct {
         var entry_opt = try cursor.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (!try self.docFactKeyVisibleAtGenerationTxn(txn, entry.key, prefix, generation)) continue;
             var projection = pathfact_mod.decodeProjectionAlloc(self.alloc, entry.value) catch |err| switch (err) {
                 error.InvalidPathFactList => continue,
                 else => return err,
@@ -8870,7 +11004,7 @@ pub const Index = struct {
             .time_bucket = mat.bucket,
             .measure = mat.measure,
         };
-        return try self.scanDerivedJoinFoldEntriesTxn(txn, join_cfg, request, law_id);
+        return try self.scanDerivedJoinFoldEntriesTxn(txn, join_cfg, request, law_id, null);
     }
 
     fn expressionRawValueForMaterializationTxn(
@@ -9059,6 +11193,18 @@ pub const Index = struct {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             count += 1;
             if (count >= limit) break;
+        }
+        return count;
+    }
+
+    fn countRowsWithPrefixTxn(_: *Index, txn: anytype, prefix: []const u8) !usize {
+        var count: usize = 0;
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            count += 1;
         }
         return count;
     }
@@ -9907,8 +12053,9 @@ pub const Index = struct {
                 if (try self.dictionaryRegistryOwnedByMaterialization(store, identity, materialization_id)) {
                     const lexicon_cost = try self.countRowsAndBytesWithPrefix(store, try self.pathDictionaryLexiconPrefixAlloc(identity));
                     const postings_cost = try self.countRowsAndBytesWithPrefix(store, try self.pathDictionaryPostingsDictionaryPrefixAlloc(identity));
-                    tensor_rows = saturatedAdd(tensor_rows, saturatedAdd(lexicon_cost.rows, postings_cost.rows));
-                    storage_bytes = saturatedAdd(storage_bytes, saturatedAdd(lexicon_cost.bytes, postings_cost.bytes));
+                    const ordinal_postings_cost = try self.countRowsAndBytesWithPrefix(store, try self.pathDictionaryOrdinalPostingsDictionaryPrefixAlloc(identity));
+                    tensor_rows = saturatedAdd(tensor_rows, saturatedAdd(lexicon_cost.rows, saturatedAdd(postings_cost.rows, ordinal_postings_cost.rows)));
+                    storage_bytes = saturatedAdd(storage_bytes, saturatedAdd(lexicon_cost.bytes, saturatedAdd(postings_cost.bytes, ordinal_postings_cost.bytes)));
 
                     const fst_cost = try self.countRowsAndBytesWithPrefix(store, try self.pathDictionaryFstKeyAlloc(identity));
                     tensor_rows = saturatedAdd(tensor_rows, fst_cost.rows);
@@ -10716,6 +12863,7 @@ pub const Index = struct {
                 const posting_key = try self.pathDictionaryPostingsKeyAlloc(identity, item.value, item.doc_key);
                 defer self.alloc.free(posting_key);
                 try txn.put(posting_key, "");
+                try self.writePathDictionaryOrdinalPostingIfAvailableTxn(&txn, identity, item.value, item.doc_key);
             }
             if (next_cursor_key.len > 0) self.alloc.free(next_cursor_key);
             next_cursor_key = try self.alloc.dupe(u8, item.key);
@@ -11009,6 +13157,13 @@ pub const Index = struct {
             if (!std.mem.startsWith(u8, row.key, postings_prefix)) break;
             try keys.append(self.alloc, try self.alloc.dupe(u8, row.key));
         }
+        const ordinal_postings_prefix = try self.pathDictionaryOrdinalPostingsDictionaryPrefixAlloc(identity);
+        defer self.alloc.free(ordinal_postings_prefix);
+        entry_opt = try cursor.seekAtOrAfter(ordinal_postings_prefix);
+        while (entry_opt) |row| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, ordinal_postings_prefix)) break;
+            try keys.append(self.alloc, try self.alloc.dupe(u8, row.key));
+        }
         const fst_key = try self.pathDictionaryFstKeyAlloc(identity);
         defer self.alloc.free(fst_key);
         try keys.append(self.alloc, try self.alloc.dupe(u8, fst_key));
@@ -11163,7 +13318,7 @@ pub const Index = struct {
         spec: AdaptiveMaterializationSpec,
         sign: i8,
     ) !void {
-        const scan = try self.joinScanBoundsAlloc(join_cfg, changed_side.opposite(), join_id, changed_fact, changed_side);
+        const scan = try self.joinScanBoundsPreferOrdinalAlloc(txn, join_cfg, changed_side.opposite(), join_id, changed_fact, changed_side);
         defer scan.deinit(self.alloc);
         var cursor = try txn.openCursor();
         defer cursor.close();
@@ -11657,6 +13812,19 @@ pub const Index = struct {
         return try self.keyAlloc(&.{ "docfact_scalar", @tagName(role), field });
     }
 
+    fn docFactScalarOrdinalKeyAlloc(self: *Index, role: fact_mod.Role, field: []const u8, scalar: []const u8, ordinal: doc_set.DocOrdinal) ![]u8 {
+        const ordinal_component = ordinalComponent(ordinal);
+        return try self.keyAlloc(&.{ "docfact_scalar_ord", @tagName(role), field, scalar, ordinal_component[0..] });
+    }
+
+    fn docFactScalarOrdinalPrefixAlloc(self: *Index, role: fact_mod.Role, field: []const u8, scalar: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "docfact_scalar_ord", @tagName(role), field, scalar });
+    }
+
+    fn docFactScalarOrdinalFieldPrefixAlloc(self: *Index, role: fact_mod.Role, field: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "docfact_scalar_ord", @tagName(role), field });
+    }
+
     fn docFactFieldKeyAlloc(self: *Index, role: fact_mod.Role, field: []const u8, doc_key: []const u8) ![]u8 {
         return try self.keyAlloc(&.{ "docfact_field", @tagName(role), field, doc_key });
     }
@@ -11665,8 +13833,26 @@ pub const Index = struct {
         return try self.keyAlloc(&.{ "docfact_field", @tagName(role), field });
     }
 
+    fn docFactFieldOrdinalKeyAlloc(self: *Index, role: fact_mod.Role, field: []const u8, ordinal: doc_set.DocOrdinal) ![]u8 {
+        const ordinal_component = ordinalComponent(ordinal);
+        return try self.keyAlloc(&.{ "docfact_field_ord", @tagName(role), field, ordinal_component[0..] });
+    }
+
+    fn docFactFieldOrdinalPrefixAlloc(self: *Index, role: fact_mod.Role, field: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "docfact_field_ord", @tagName(role), field });
+    }
+
     fn pathFactKey(self: *Index, doc_key: []const u8) ![]u8 {
         return try self.keyAlloc(&.{ "pathfact", doc_key });
+    }
+
+    fn pathFactOrdinalKey(self: *Index, ordinal: doc_set.DocOrdinal) ![]u8 {
+        const ordinal_component = ordinalComponent(ordinal);
+        return try self.keyAlloc(&.{ "pathfact_ord", ordinal_component[0..] });
+    }
+
+    fn pathFactOrdinalPrefixAlloc(self: *Index) ![]u8 {
+        return try self.keyAlloc(&.{"pathfact_ord"});
     }
 
     fn pathLookupKeyAlloc(self: *Index, path: []const u8, kind: pathfact_mod.Kind, value: []const u8, doc_key: []const u8) ![]u8 {
@@ -11675,6 +13861,23 @@ pub const Index = struct {
 
     fn pathLookupPrefixAlloc(self: *Index, path: []const u8, kind: pathfact_mod.Kind, value: []const u8) ![]u8 {
         return try self.keyAlloc(&.{ "path_lookup", path, kind.tag(), value });
+    }
+
+    fn pathLookupOrdinalKeyAlloc(self: *Index, path: []const u8, kind: pathfact_mod.Kind, value: []const u8, ordinal: doc_set.DocOrdinal) ![]u8 {
+        const ordinal_component = ordinalComponent(ordinal);
+        return try self.keyAlloc(&.{ "path_lookup_ord", path, kind.tag(), value, ordinal_component[0..] });
+    }
+
+    fn pathLookupOrdinalPrefixAlloc(self: *Index, path: []const u8, kind: pathfact_mod.Kind, value: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "path_lookup_ord", path, kind.tag(), value });
+    }
+
+    fn pathLookupOrdinalKindPrefixAlloc(self: *Index, path: []const u8, kind: pathfact_mod.Kind) ![]u8 {
+        return try self.keyAlloc(&.{ "path_lookup_ord", path, kind.tag() });
+    }
+
+    fn pathLookupOrdinalPathPrefixAlloc(self: *Index, path: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "path_lookup_ord", path });
     }
 
     fn pathLookupKindPrefixAlloc(self: *Index, path: []const u8, kind: pathfact_mod.Kind) ![]u8 {
@@ -11735,6 +13938,25 @@ pub const Index = struct {
         return try self.keyAlloc(&.{ "postings", identity_key });
     }
 
+    fn pathDictionaryOrdinalPostingsKeyAlloc(self: *Index, identity: lexical_mod.DictionaryIdentity, label: []const u8, ordinal: doc_set.DocOrdinal) ![]u8 {
+        const identity_key = try identity.keyAlloc(self.alloc);
+        defer self.alloc.free(identity_key);
+        const ordinal_component = ordinalComponent(ordinal);
+        return try self.keyAlloc(&.{ "postings_ord", identity_key, label, ordinal_component[0..] });
+    }
+
+    fn pathDictionaryOrdinalPostingsPrefixAlloc(self: *Index, identity: lexical_mod.DictionaryIdentity, label: []const u8) ![]u8 {
+        const identity_key = try identity.keyAlloc(self.alloc);
+        defer self.alloc.free(identity_key);
+        return try self.keyAlloc(&.{ "postings_ord", identity_key, label });
+    }
+
+    fn pathDictionaryOrdinalPostingsDictionaryPrefixAlloc(self: *Index, identity: lexical_mod.DictionaryIdentity) ![]u8 {
+        const identity_key = try identity.keyAlloc(self.alloc);
+        defer self.alloc.free(identity_key);
+        return try self.keyAlloc(&.{ "postings_ord", identity_key });
+    }
+
     fn pathDictionaryFstKeyAlloc(self: *Index, identity: lexical_mod.DictionaryIdentity) ![]u8 {
         const identity_key = try identity.keyAlloc(self.alloc);
         defer self.alloc.free(identity_key);
@@ -11759,12 +13981,45 @@ pub const Index = struct {
         return try self.keyAlloc(&.{ "jf", join_cfg.name, side.tag() });
     }
 
+    fn joinSideFactOrdinalPrefixAlloc(self: *Index, join_cfg: JoinConfig, side: join_mod.Side) ![]u8 {
+        return try self.keyAlloc(&.{ "jf_ord", join_cfg.name, side.tag() });
+    }
+
+    fn joinSideFactPrefixPreferOrdinalAlloc(self: *Index, txn: anytype, join_cfg: JoinConfig, side: join_mod.Side) ![]u8 {
+        const legacy = try self.joinSideFactPrefixAlloc(join_cfg, side);
+        errdefer self.alloc.free(legacy);
+        const ordinal = try self.joinSideFactOrdinalPrefixAlloc(join_cfg, side);
+        errdefer self.alloc.free(ordinal);
+        const legacy_count = try self.countRowsWithPrefixTxn(txn, legacy);
+        const ordinal_count = try self.countRowsWithPrefixTxn(txn, ordinal);
+        if (legacy_count == ordinal_count) {
+            self.alloc.free(legacy);
+            return ordinal;
+        }
+        self.alloc.free(ordinal);
+        return legacy;
+    }
+
     fn adaptiveTensorPrefixAlloc(self: *Index, materialization_id: []const u8) ![]u8 {
         return try token.canonicalTupleAlloc(self.alloc, &.{ "\x00\x00__algebraic__", self.name, tensor_mod.namespace_version, "tensor", materialization_id });
     }
 
     fn docJoinFactRefKeyAlloc(self: *Index, doc_key: []const u8, join_cfg: JoinConfig, side: join_mod.Side, fact_key: []const u8) ![]u8 {
         return try self.keyAlloc(&.{ "docjf", doc_key, join_cfg.name, side.tag(), fact_key });
+    }
+
+    fn docJoinFactRefPrefixAlloc(self: *Index, doc_key: []const u8, join_cfg: JoinConfig, side: join_mod.Side) ![]u8 {
+        return try self.keyAlloc(&.{ "docjf", doc_key, join_cfg.name, side.tag() });
+    }
+
+    fn docJoinFactOrdinalRefKeyAlloc(self: *Index, ordinal: doc_set.DocOrdinal, join_cfg: JoinConfig, side: join_mod.Side, fact_key: []const u8) ![]u8 {
+        const ordinal_component = ordinalComponent(ordinal);
+        return try self.keyAlloc(&.{ "docjf_ord", ordinal_component[0..], join_cfg.name, side.tag(), fact_key });
+    }
+
+    fn docJoinFactOrdinalRefPrefixAlloc(self: *Index, ordinal: doc_set.DocOrdinal, join_cfg: JoinConfig, side: join_mod.Side) ![]u8 {
+        const ordinal_component = ordinalComponent(ordinal);
+        return try self.keyAlloc(&.{ "docjf_ord", ordinal_component[0..], join_cfg.name, side.tag() });
     }
 
     fn symbolKeyAlloc(self: *Index, id: []const u8) ![]u8 {
@@ -12558,10 +14813,12 @@ pub const Index = struct {
             const scalar_key = try self.docFactScalarKeyAlloc(fact.role, fact.field, fact.scalar, doc_key);
             defer self.alloc.free(scalar_key);
             try txn.put(scalar_key, "");
+            try self.writeDocFactScalarOrdinalIfAvailableTxn(txn, fact.role, fact.field, fact.scalar, doc_key);
 
             const field_key = try self.docFactFieldKeyAlloc(fact.role, fact.field, doc_key);
             defer self.alloc.free(field_key);
             try txn.put(field_key, "");
+            try self.writeDocFactFieldOrdinalIfAvailableTxn(txn, fact.role, fact.field, doc_key);
         }
     }
 
@@ -12596,6 +14853,7 @@ pub const Index = struct {
                     error.NotFound => {},
                     else => return err,
                 };
+                try self.deleteDocFactScalarOrdinalIfAvailableTxn(txn, old_fact.role, old_fact.field, old_fact.scalar, doc_key);
             }
             if (!docFactListContainsField(new_facts, old_fact.role, old_fact.field)) {
                 const field_key = try self.docFactFieldKeyAlloc(old_fact.role, old_fact.field, doc_key);
@@ -12604,6 +14862,7 @@ pub const Index = struct {
                     error.NotFound => {},
                     else => return err,
                 };
+                try self.deleteDocFactFieldOrdinalIfAvailableTxn(txn, old_fact.role, old_fact.field, doc_key);
             }
         }
         for (new_facts) |new_fact| {
@@ -12611,11 +14870,13 @@ pub const Index = struct {
                 const scalar_key = try self.docFactScalarKeyAlloc(new_fact.role, new_fact.field, new_fact.scalar, doc_key);
                 defer self.alloc.free(scalar_key);
                 try txn.put(scalar_key, "");
+                try self.writeDocFactScalarOrdinalIfAvailableTxn(txn, new_fact.role, new_fact.field, new_fact.scalar, doc_key);
             }
             if (!docFactListContainsField(old_facts, new_fact.role, new_fact.field)) {
                 const field_key = try self.docFactFieldKeyAlloc(new_fact.role, new_fact.field, doc_key);
                 defer self.alloc.free(field_key);
                 try txn.put(field_key, "");
+                try self.writeDocFactFieldOrdinalIfAvailableTxn(txn, new_fact.role, new_fact.field, doc_key);
             }
         }
     }
@@ -12628,6 +14889,7 @@ pub const Index = struct {
                 error.NotFound => {},
                 else => return err,
             };
+            try self.deleteDocFactScalarOrdinalIfAvailableTxn(txn, fact.role, fact.field, fact.scalar, doc_key);
 
             const field_key = try self.docFactFieldKeyAlloc(fact.role, fact.field, doc_key);
             defer self.alloc.free(field_key);
@@ -12635,7 +14897,68 @@ pub const Index = struct {
                 error.NotFound => {},
                 else => return err,
             };
+            try self.deleteDocFactFieldOrdinalIfAvailableTxn(txn, fact.role, fact.field, doc_key);
         }
+    }
+
+    fn writeDocFactScalarOrdinalIfAvailableTxn(
+        self: *Index,
+        txn: anytype,
+        role: fact_mod.Role,
+        field: []const u8,
+        scalar: []const u8,
+        doc_key: []const u8,
+    ) !void {
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) orelse return;
+        const key = try self.docFactScalarOrdinalKeyAlloc(role, field, scalar, ordinal);
+        defer self.alloc.free(key);
+        try txn.put(key, "");
+    }
+
+    fn deleteDocFactScalarOrdinalIfAvailableTxn(
+        self: *Index,
+        txn: anytype,
+        role: fact_mod.Role,
+        field: []const u8,
+        scalar: []const u8,
+        doc_key: []const u8,
+    ) !void {
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) orelse return;
+        const key = try self.docFactScalarOrdinalKeyAlloc(role, field, scalar, ordinal);
+        defer self.alloc.free(key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    fn writeDocFactFieldOrdinalIfAvailableTxn(
+        self: *Index,
+        txn: anytype,
+        role: fact_mod.Role,
+        field: []const u8,
+        doc_key: []const u8,
+    ) !void {
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) orelse return;
+        const key = try self.docFactFieldOrdinalKeyAlloc(role, field, ordinal);
+        defer self.alloc.free(key);
+        try txn.put(key, "");
+    }
+
+    fn deleteDocFactFieldOrdinalIfAvailableTxn(
+        self: *Index,
+        txn: anytype,
+        role: fact_mod.Role,
+        field: []const u8,
+        doc_key: []const u8,
+    ) !void {
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) orelse return;
+        const key = try self.docFactFieldOrdinalKeyAlloc(role, field, ordinal);
+        defer self.alloc.free(key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
     }
 
     fn writePathFacts(self: *Index, txn: anytype, doc_key: []const u8, root: std.json.Value, maintenance_context: ?*BatchMaintenanceContext) !void {
@@ -12646,6 +14969,7 @@ pub const Index = struct {
         const path_key = try self.pathFactKey(doc_key);
         defer self.alloc.free(path_key);
         try txn.put(path_key, encoded);
+        try self.writePathFactOrdinalIfAvailableTxn(txn, doc_key, encoded);
         try self.writePathFactLookupRows(txn, doc_key, projection.facts);
         if (self.shouldMaintainPathProfiles()) {
             try self.applyPathProfileDelta(txn, projection.profiles, 1);
@@ -12653,11 +14977,34 @@ pub const Index = struct {
         try self.applyReadyPathPromotionDelta(txn, doc_key, projection.facts, 1, maintenance_context);
     }
 
+    fn writePathFactOrdinalIfAvailableTxn(self: *Index, txn: anytype, doc_key: []const u8, payload: []const u8) !void {
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) orelse return;
+        const key = try self.pathFactOrdinalKey(ordinal);
+        defer self.alloc.free(key);
+        try txn.put(key, payload);
+    }
+
+    fn deletePathFactOrdinalIfAvailableTxn(self: *Index, txn: anytype, doc_key: []const u8) !void {
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) orelse return;
+        const key = try self.pathFactOrdinalKey(ordinal);
+        defer self.alloc.free(key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
     fn writePathFactLookupRows(self: *Index, txn: anytype, doc_key: []const u8, facts: []const pathfact_mod.Fact) !void {
+        const ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key);
         for (facts) |fact| {
             const lookup_key = try self.pathLookupKeyAlloc(fact.path, fact.kind, fact.value, doc_key);
             defer self.alloc.free(lookup_key);
             try txn.put(lookup_key, "");
+            if (ordinal) |doc_ordinal| {
+                const ordinal_key = try self.pathLookupOrdinalKeyAlloc(fact.path, fact.kind, fact.value, doc_ordinal);
+                defer self.alloc.free(ordinal_key);
+                try txn.put(ordinal_key, "");
+            }
         }
     }
 
@@ -12674,6 +15021,7 @@ pub const Index = struct {
         try self.updatePathFactLookupRowsCoalesced(txn, doc_key, old_facts, new_facts);
         if (!std.mem.eql(u8, old_payload, new_payload)) {
             try txn.put(path_key, new_payload);
+            try self.writePathFactOrdinalIfAvailableTxn(txn, doc_key, new_payload);
         }
     }
 
@@ -12684,6 +15032,7 @@ pub const Index = struct {
         old_facts: []const pathfact_mod.Fact,
         new_facts: []const pathfact_mod.Fact,
     ) !void {
+        const ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key);
         for (old_facts) |old_fact| {
             if (pathFactListContainsExact(new_facts, old_fact)) continue;
             const lookup_key = try self.pathLookupKeyAlloc(old_fact.path, old_fact.kind, old_fact.value, doc_key);
@@ -12692,12 +15041,25 @@ pub const Index = struct {
                 error.NotFound => {},
                 else => return err,
             };
+            if (ordinal) |doc_ordinal| {
+                const ordinal_key = try self.pathLookupOrdinalKeyAlloc(old_fact.path, old_fact.kind, old_fact.value, doc_ordinal);
+                defer self.alloc.free(ordinal_key);
+                txn.delete(ordinal_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            }
         }
         for (new_facts) |new_fact| {
             if (pathFactListContainsExact(old_facts, new_fact)) continue;
             const lookup_key = try self.pathLookupKeyAlloc(new_fact.path, new_fact.kind, new_fact.value, doc_key);
             defer self.alloc.free(lookup_key);
             try txn.put(lookup_key, "");
+            if (ordinal) |doc_ordinal| {
+                const ordinal_key = try self.pathLookupOrdinalKeyAlloc(new_fact.path, new_fact.kind, new_fact.value, doc_ordinal);
+                defer self.alloc.free(ordinal_key);
+                try txn.put(ordinal_key, "");
+            }
         }
     }
 
@@ -12713,6 +15075,7 @@ pub const Index = struct {
                 error.NotFound => {},
                 else => return err,
             };
+            try self.deletePathFactOrdinalIfAvailableTxn(txn, doc_key);
             return;
         };
         defer projection.deinit(self.alloc);
@@ -12725,9 +15088,11 @@ pub const Index = struct {
             error.NotFound => {},
             else => return err,
         };
+        try self.deletePathFactOrdinalIfAvailableTxn(txn, doc_key);
     }
 
     fn deletePathFactLookupRows(self: *Index, txn: anytype, doc_key: []const u8, facts: []const pathfact_mod.Fact) !void {
+        const ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key);
         for (facts) |fact| {
             const lookup_key = try self.pathLookupKeyAlloc(fact.path, fact.kind, fact.value, doc_key);
             defer self.alloc.free(lookup_key);
@@ -12735,6 +15100,14 @@ pub const Index = struct {
                 error.NotFound => {},
                 else => return err,
             };
+            if (ordinal) |doc_ordinal| {
+                const ordinal_key = try self.pathLookupOrdinalKeyAlloc(fact.path, fact.kind, fact.value, doc_ordinal);
+                defer self.alloc.free(ordinal_key);
+                txn.delete(ordinal_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            }
         }
     }
 
@@ -12938,6 +15311,7 @@ pub const Index = struct {
             const posting_key = try self.pathDictionaryPostingsKeyAlloc(identity, fact.value, doc_key);
             defer self.alloc.free(posting_key);
             try txn.put(posting_key, "");
+            try self.writePathDictionaryOrdinalPostingIfAvailableTxn(txn, identity, fact.value, doc_key);
             try self.rebuildOrDeferPathDictionaryFstTxn(txn, spec, maintenance_context);
         }
     }
@@ -12965,6 +15339,7 @@ pub const Index = struct {
                 error.NotFound => {},
                 else => return err,
             };
+            try self.deletePathDictionaryOrdinalPostingIfAvailableTxn(txn, identity, fact.value, doc_key);
             const postings_prefix = try self.pathDictionaryPostingsPrefixAlloc(identity, fact.value);
             defer self.alloc.free(postings_prefix);
             if (!(try self.prefixHasAnyTxn(txn, postings_prefix))) {
@@ -12977,6 +15352,35 @@ pub const Index = struct {
             }
             try self.rebuildOrDeferPathDictionaryFstTxn(txn, spec, maintenance_context);
         }
+    }
+
+    fn writePathDictionaryOrdinalPostingIfAvailableTxn(
+        self: *Index,
+        txn: anytype,
+        identity: lexical_mod.DictionaryIdentity,
+        label: []const u8,
+        doc_key: []const u8,
+    ) !void {
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) orelse return;
+        const key = try self.pathDictionaryOrdinalPostingsKeyAlloc(identity, label, ordinal);
+        defer self.alloc.free(key);
+        try txn.put(key, "");
+    }
+
+    fn deletePathDictionaryOrdinalPostingIfAvailableTxn(
+        self: *Index,
+        txn: anytype,
+        identity: lexical_mod.DictionaryIdentity,
+        label: []const u8,
+        doc_key: []const u8,
+    ) !void {
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) orelse return;
+        const key = try self.pathDictionaryOrdinalPostingsKeyAlloc(identity, label, ordinal);
+        defer self.alloc.free(key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
     }
 
     fn rebuildOrDeferPathDictionaryFstTxn(
@@ -13357,7 +15761,7 @@ pub const Index = struct {
         sign: i8,
         maintenance_context: ?*BatchMaintenanceContext,
     ) !void {
-        const stored = try self.collectDocJoinSideFactRefsForDocAlloc(txn, doc_key, join_cfg, side);
+        const stored = try self.collectDocJoinSideFactRefsForDocPreferOrdinalAlloc(txn, doc_key, join_cfg, side);
         defer {
             for (stored) |*item| item.deinit(self.alloc);
             if (stored.len > 0) self.alloc.free(stored);
@@ -13367,20 +15771,64 @@ pub const Index = struct {
             defer fact.deinit(self.alloc);
             try self.applyJoinFoldsForChangedFact(txn, join_cfg, side, item.join_id, fact, sign, maintenance_context);
             if (sign < 0) {
-                txn.delete(item.key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-                if (item.ref_key) |ref_key| {
-                    var deleted_ref = true;
-                    txn.delete(ref_key) catch |err| switch (err) {
-                        error.NotFound => deleted_ref = false,
-                        else => return err,
-                    };
-                    if (deleted_ref) self.doc_join_fact_ref_delete_count += 1;
-                }
+                try self.deleteJoinFactRowsForDoc(txn, doc_key, join_cfg, side, item.join_id, fact, item.key);
+                try self.deleteDocJoinFactRef(txn, doc_key, join_cfg, side, item.key);
             }
         }
+    }
+
+    fn deleteJoinFactRowsForDoc(
+        self: *Index,
+        txn: anytype,
+        doc_key: []const u8,
+        join_cfg: JoinConfig,
+        side: join_mod.Side,
+        join_id: []const u8,
+        fact: ProjectedFact,
+        legacy_key: []const u8,
+    ) !void {
+        txn.delete(legacy_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) orelse return;
+        const ordinal_key = try self.joinFactOrdinalKeyAlloc(join_cfg, side, join_id, fact, ordinal);
+        defer self.alloc.free(ordinal_key);
+        txn.delete(ordinal_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    fn collectDocJoinSideFactRefsForDocPreferOrdinalAlloc(
+        self: *Index,
+        txn: anytype,
+        doc_key: []const u8,
+        join_cfg: JoinConfig,
+        side: join_mod.Side,
+    ) ![]StoredJoinFact {
+        const legacy = try self.collectDocJoinSideFactRefsForDocAlloc(txn, doc_key, join_cfg, side);
+        errdefer {
+            for (legacy) |*item| item.deinit(self.alloc);
+            if (legacy.len > 0) self.alloc.free(legacy);
+        }
+
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) orelse return legacy;
+        const ordinal_refs = try self.collectDocJoinSideFactRefsForDocOrdinalAlloc(txn, ordinal, join_cfg, side);
+        errdefer {
+            for (ordinal_refs) |*item| item.deinit(self.alloc);
+            if (ordinal_refs.len > 0) self.alloc.free(ordinal_refs);
+        }
+
+        if (storedJoinFactSlicesEquivalent(legacy, ordinal_refs)) {
+            for (legacy) |*item| item.deinit(self.alloc);
+            if (legacy.len > 0) self.alloc.free(legacy);
+            return ordinal_refs;
+        }
+
+        for (ordinal_refs) |*item| item.deinit(self.alloc);
+        if (ordinal_refs.len > 0) self.alloc.free(ordinal_refs);
+        return legacy;
     }
 
     fn collectDocJoinSideFactRefsForDocAlloc(
@@ -13390,8 +15838,28 @@ pub const Index = struct {
         join_cfg: JoinConfig,
         side: join_mod.Side,
     ) ![]StoredJoinFact {
-        const prefix = try self.keyAlloc(&.{ "docjf", doc_key, join_cfg.name, side.tag() });
+        const prefix = try self.docJoinFactRefPrefixAlloc(doc_key, join_cfg, side);
         defer self.alloc.free(prefix);
+        return try self.collectDocJoinSideFactRefsWithPrefixAlloc(txn, prefix);
+    }
+
+    fn collectDocJoinSideFactRefsForDocOrdinalAlloc(
+        self: *Index,
+        txn: anytype,
+        ordinal: doc_set.DocOrdinal,
+        join_cfg: JoinConfig,
+        side: join_mod.Side,
+    ) ![]StoredJoinFact {
+        const prefix = try self.docJoinFactOrdinalRefPrefixAlloc(ordinal, join_cfg, side);
+        defer self.alloc.free(prefix);
+        return try self.collectDocJoinSideFactRefsWithPrefixAlloc(txn, prefix);
+    }
+
+    fn collectDocJoinSideFactRefsWithPrefixAlloc(
+        self: *Index,
+        txn: anytype,
+        prefix: []const u8,
+    ) ![]StoredJoinFact {
         var out = std.ArrayListUnmanaged(StoredJoinFact).empty;
         errdefer {
             for (out.items) |*item| item.deinit(self.alloc);
@@ -13595,20 +16063,25 @@ pub const Index = struct {
         maintenance_context: ?*BatchMaintenanceContext,
     ) !void {
         const side: join_mod.Side = if (left) .left else .right;
-        const prepared = (try self.prepareJoinFact(txn, root, join_cfg, side, doc_key)) orelse return;
-        defer self.alloc.free(prepared.key);
-        defer self.alloc.free(prepared.join_id);
-        defer self.alloc.free(prepared.payload);
+        var prepared = (try self.prepareJoinFact(txn, root, join_cfg, side, doc_key)) orelse return;
+        defer prepared.deinit(self.alloc);
         var fact = try ProjectedFact.decode(self.alloc, prepared.payload);
         defer fact.deinit(self.alloc);
 
         if (sign > 0) {
             try txn.put(prepared.key, prepared.payload);
+            if (prepared.ordinal_key) |ordinal_key| try txn.put(ordinal_key, prepared.payload);
             try self.putDocJoinFactRef(txn, doc_key, join_cfg, side, prepared);
             try self.applyJoinFoldsForChangedFact(txn, join_cfg, side, prepared.join_id, fact, 1, maintenance_context);
         } else {
             try self.applyJoinFoldsForChangedFact(txn, join_cfg, side, prepared.join_id, fact, -1, maintenance_context);
             try txn.delete(prepared.key);
+            if (prepared.ordinal_key) |ordinal_key| {
+                txn.delete(ordinal_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+            }
             try self.deleteDocJoinFactRef(txn, doc_key, join_cfg, side, prepared.key);
         }
     }
@@ -13617,6 +16090,15 @@ pub const Index = struct {
         join_id: []u8,
         key: []u8,
         payload: []u8,
+        ordinal_key: ?[]u8 = null,
+
+        fn deinit(self: *PreparedJoinFact, alloc: Allocator) void {
+            alloc.free(self.join_id);
+            alloc.free(self.key);
+            alloc.free(self.payload);
+            if (self.ordinal_key) |key| alloc.free(key);
+            self.* = undefined;
+        }
     };
 
     fn prepareJoinFact(
@@ -13648,7 +16130,13 @@ pub const Index = struct {
             },
             else => return err,
         };
-        return .{ .join_id = join_id, .key = key, .payload = payload };
+        errdefer self.alloc.free(key);
+        const ordinal_key = if (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) |ordinal|
+            try self.joinFactOrdinalKeyAlloc(join_cfg, side, join_id, fact, ordinal)
+        else
+            null;
+        errdefer if (ordinal_key) |owned| self.alloc.free(owned);
+        return .{ .join_id = join_id, .key = key, .payload = payload, .ordinal_key = ordinal_key };
     }
 
     fn applyJoinSideAppendOnlyPreaggregated(
@@ -13662,13 +16150,12 @@ pub const Index = struct {
         maintenance_context: ?*BatchMaintenanceContext,
     ) !void {
         const side: join_mod.Side = if (left) .left else .right;
-        const prepared = (try self.prepareJoinFactAppendOnly(txn, root, join_cfg, side, doc_key)) orelse return;
-        defer self.alloc.free(prepared.key);
-        defer self.alloc.free(prepared.join_id);
-        defer self.alloc.free(prepared.payload);
+        var prepared = (try self.prepareJoinFactAppendOnly(txn, root, join_cfg, side, doc_key)) orelse return;
+        defer prepared.deinit(self.alloc);
         var fact = try ProjectedFact.decode(self.alloc, prepared.payload);
         defer fact.deinit(self.alloc);
         try txn.put(prepared.key, prepared.payload);
+        if (prepared.ordinal_key) |ordinal_key| try txn.put(ordinal_key, prepared.payload);
         try self.putDocJoinFactRef(txn, doc_key, join_cfg, side, prepared);
         try self.applyJoinFoldsForChangedFactAppendOnly(txn, accumulator, join_cfg, side, prepared.join_id, fact, maintenance_context);
     }
@@ -13686,6 +16173,11 @@ pub const Index = struct {
         const encoded = try token.canonicalTupleAlloc(self.alloc, &.{ "jfr1", prepared.key, prepared.join_id, prepared.payload });
         defer self.alloc.free(encoded);
         try txn.put(ref_key, encoded);
+        if (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) |ordinal| {
+            const ordinal_ref_key = try self.docJoinFactOrdinalRefKeyAlloc(ordinal, join_cfg, side, prepared.key);
+            defer self.alloc.free(ordinal_ref_key);
+            try txn.put(ordinal_ref_key, encoded);
+        }
         self.doc_join_fact_ref_write_count += 1;
     }
 
@@ -13705,6 +16197,14 @@ pub const Index = struct {
             else => return err,
         };
         if (deleted_ref) self.doc_join_fact_ref_delete_count += 1;
+        if (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) |ordinal| {
+            const ordinal_ref_key = try self.docJoinFactOrdinalRefKeyAlloc(ordinal, join_cfg, side, fact_key);
+            defer self.alloc.free(ordinal_ref_key);
+            txn.delete(ordinal_ref_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
     }
 
     fn prepareJoinFactAppendOnly(
@@ -13736,7 +16236,13 @@ pub const Index = struct {
             },
             else => return err,
         };
-        return .{ .join_id = join_id, .key = key, .payload = payload };
+        errdefer self.alloc.free(key);
+        const ordinal_key = if (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) |ordinal|
+            try self.joinFactOrdinalKeyAlloc(join_cfg, side, join_id, fact, ordinal)
+        else
+            null;
+        errdefer if (ordinal_key) |owned| self.alloc.free(owned);
+        return .{ .join_id = join_id, .key = key, .payload = payload, .ordinal_key = ordinal_key };
     }
 
     fn applyJoinFoldsForChangedFact(
@@ -13749,7 +16255,7 @@ pub const Index = struct {
         sign: i8,
         maintenance_context: ?*BatchMaintenanceContext,
     ) !void {
-        const scan = try self.joinScanBoundsAlloc(join_cfg, changed_side.opposite(), join_id, changed_fact, changed_side);
+        const scan = try self.joinScanBoundsPreferOrdinalAlloc(txn, join_cfg, changed_side.opposite(), join_id, changed_fact, changed_side);
         defer scan.deinit(self.alloc);
         var adaptive_specs: []AdaptiveMaterializationSpec = &.{};
         if (maintenance_context == null) {
@@ -13861,7 +16367,7 @@ pub const Index = struct {
         changed_fact: ProjectedFact,
         maintenance_context: ?*BatchMaintenanceContext,
     ) !void {
-        const scan = try self.joinScanBoundsAlloc(join_cfg, changed_side.opposite(), join_id, changed_fact, changed_side);
+        const scan = try self.joinScanBoundsPreferOrdinalAlloc(txn, join_cfg, changed_side.opposite(), join_id, changed_fact, changed_side);
         defer scan.deinit(self.alloc);
         var adaptive_specs: []AdaptiveMaterializationSpec = &.{};
         if (maintenance_context == null) {
@@ -13944,6 +16450,7 @@ pub const Index = struct {
         join_cfg: JoinConfig,
         request: DerivedJoinFoldRequest,
         law_id: law_mod.Id,
+        generation: ?u64,
     ) ![]FoldEntry {
         var encoded_constraints = std.ArrayListUnmanaged(EncodedDerivedConstraint).empty;
         defer {
@@ -13958,7 +16465,7 @@ pub const Index = struct {
             });
         }
 
-        const left_prefix = try self.keyAlloc(&.{ "jf", join_cfg.name, join_mod.Side.left.tag() });
+        const left_prefix = try self.joinSideFactPrefixPreferOrdinalAlloc(txn, join_cfg, .left);
         defer self.alloc.free(left_prefix);
         var accumulator = DerivedJoinFoldAccumulator{};
         defer accumulator.deinit(self.alloc);
@@ -13968,10 +16475,11 @@ pub const Index = struct {
         var entry_opt = try cursor.seekAtOrAfter(left_prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, left_prefix)) break;
+            if (!try self.joinFactKeyVisibleAtGenerationTxn(txn, entry.key, generation)) continue;
             const join_id_component = token.componentAt(entry.key, left_prefix.len) catch continue;
             var left_fact = ProjectedFact.decode(self.alloc, entry.value) catch continue;
             defer left_fact.deinit(self.alloc);
-            try self.scanDerivedJoinFoldMatchesTxn(txn, join_cfg, request, law_id, encoded_constraints.items, join_id_component.payload, left_fact, &accumulator);
+            try self.scanDerivedJoinFoldMatchesTxn(txn, join_cfg, request, law_id, encoded_constraints.items, join_id_component.payload, left_fact, generation, &accumulator);
         }
 
         return try accumulator.entriesAlloc(self.alloc);
@@ -13986,9 +16494,10 @@ pub const Index = struct {
         constraints: []const EncodedDerivedConstraint,
         join_id: []const u8,
         left_fact: ProjectedFact,
+        generation: ?u64,
         accumulator: *DerivedJoinFoldAccumulator,
     ) !void {
-        const scan = try self.joinScanBoundsAlloc(join_cfg, .right, join_id, left_fact, .left);
+        const scan = try self.joinScanBoundsPreferOrdinalAlloc(txn, join_cfg, .right, join_id, left_fact, .left);
         defer scan.deinit(self.alloc);
         var cursor = try txn.openCursor();
         defer cursor.close();
@@ -13996,6 +16505,7 @@ pub const Index = struct {
         var entry_opt = try cursor.seekAtOrAfter(scan.start);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, scan.prefix)) break;
+            if (!try self.joinFactKeyVisibleAtGenerationTxn(txn, entry.key, generation)) continue;
             if (scan.max_time_key) |max_key| {
                 const time_component = token.componentAt(entry.key, scan.prefix.len) catch continue;
                 if (std.mem.order(u8, time_component.payload, max_key) == .gt) break;
@@ -14322,6 +16832,38 @@ pub const Index = struct {
         };
     }
 
+    fn joinFactOrdinalKeyAlloc(
+        self: *Index,
+        join_cfg: JoinConfig,
+        side: join_mod.Side,
+        join_id: []const u8,
+        fact: ProjectedFact,
+        ordinal: doc_set.DocOrdinal,
+    ) ![]u8 {
+        const ordinal_component = ordinalComponent(ordinal);
+        const mode = join_mod.temporalMode(join_cfg.temporal_bucket, join_cfg.temporal_window_seconds);
+        return switch (mode) {
+            .none => try self.keyAlloc(&.{ "jf_ord", join_cfg.name, side.tag(), join_id, "e", ordinal_component[0..] }),
+            .bucket => blk: {
+                const bucket_start = try self.joinFactBucketAlloc(join_cfg, side, fact);
+                defer self.alloc.free(bucket_start);
+                break :blk try self.keyAlloc(&.{ "jf_ord", join_cfg.name, side.tag(), join_id, "b", bucket_start, ordinal_component[0..] });
+            },
+            .window => blk: {
+                const time_key = try self.joinFactTimeKeyAlloc(join_cfg, side, fact);
+                defer self.alloc.free(time_key);
+                break :blk try self.keyAlloc(&.{ "jf_ord", join_cfg.name, side.tag(), join_id, "w", time_key, ordinal_component[0..] });
+            },
+            .bucket_window => blk: {
+                const bucket_start = try self.joinFactBucketAlloc(join_cfg, side, fact);
+                defer self.alloc.free(bucket_start);
+                const time_key = try self.joinFactTimeKeyAlloc(join_cfg, side, fact);
+                defer self.alloc.free(time_key);
+                break :blk try self.keyAlloc(&.{ "jf_ord", join_cfg.name, side.tag(), join_id, "bw", bucket_start, time_key, ordinal_component[0..] });
+            },
+        };
+    }
+
     fn joinScanBoundsAlloc(
         self: *Index,
         join_cfg: JoinConfig,
@@ -14330,7 +16872,42 @@ pub const Index = struct {
         changed_fact: ProjectedFact,
         changed_side: join_mod.Side,
     ) !JoinScanBounds {
-        const prefix = try self.joinMatchPrefixAlloc(join_cfg, scan_side, join_id, changed_fact, changed_side);
+        return try self.joinScanBoundsForNamespaceAlloc("jf", join_cfg, scan_side, join_id, changed_fact, changed_side);
+    }
+
+    fn joinScanBoundsPreferOrdinalAlloc(
+        self: *Index,
+        txn: anytype,
+        join_cfg: JoinConfig,
+        scan_side: join_mod.Side,
+        join_id: []const u8,
+        changed_fact: ProjectedFact,
+        changed_side: join_mod.Side,
+    ) !JoinScanBounds {
+        var legacy = try self.joinScanBoundsForNamespaceAlloc("jf", join_cfg, scan_side, join_id, changed_fact, changed_side);
+        errdefer legacy.deinit(self.alloc);
+        var ordinal = try self.joinScanBoundsForNamespaceAlloc("jf_ord", join_cfg, scan_side, join_id, changed_fact, changed_side);
+        errdefer ordinal.deinit(self.alloc);
+        const legacy_count = try self.countRowsWithPrefixTxn(txn, legacy.prefix);
+        const ordinal_count = try self.countRowsWithPrefixTxn(txn, ordinal.prefix);
+        if (legacy_count == ordinal_count) {
+            legacy.deinit(self.alloc);
+            return ordinal;
+        }
+        ordinal.deinit(self.alloc);
+        return legacy;
+    }
+
+    fn joinScanBoundsForNamespaceAlloc(
+        self: *Index,
+        namespace: []const u8,
+        join_cfg: JoinConfig,
+        scan_side: join_mod.Side,
+        join_id: []const u8,
+        changed_fact: ProjectedFact,
+        changed_side: join_mod.Side,
+    ) !JoinScanBounds {
+        const prefix = try self.joinMatchPrefixForNamespaceAlloc(namespace, join_cfg, scan_side, join_id, changed_fact, changed_side);
         errdefer self.alloc.free(prefix);
 
         const mode = join_mod.temporalMode(join_cfg.temporal_bucket, join_cfg.temporal_window_seconds);
@@ -14359,19 +16936,31 @@ pub const Index = struct {
         changed_fact: ProjectedFact,
         changed_side: join_mod.Side,
     ) ![]u8 {
+        return try self.joinMatchPrefixForNamespaceAlloc("jf", join_cfg, scan_side, join_id, changed_fact, changed_side);
+    }
+
+    fn joinMatchPrefixForNamespaceAlloc(
+        self: *Index,
+        namespace: []const u8,
+        join_cfg: JoinConfig,
+        scan_side: join_mod.Side,
+        join_id: []const u8,
+        changed_fact: ProjectedFact,
+        changed_side: join_mod.Side,
+    ) ![]u8 {
         const mode = join_mod.temporalMode(join_cfg.temporal_bucket, join_cfg.temporal_window_seconds);
         return switch (mode) {
-            .none => try self.keyAlloc(&.{ "jf", join_cfg.name, scan_side.tag(), join_id, "e" }),
+            .none => try self.keyAlloc(&.{ namespace, join_cfg.name, scan_side.tag(), join_id, "e" }),
             .bucket => blk: {
                 const bucket_start = try self.joinFactBucketAlloc(join_cfg, changed_side, changed_fact);
                 defer self.alloc.free(bucket_start);
-                break :blk try self.keyAlloc(&.{ "jf", join_cfg.name, scan_side.tag(), join_id, "b", bucket_start });
+                break :blk try self.keyAlloc(&.{ namespace, join_cfg.name, scan_side.tag(), join_id, "b", bucket_start });
             },
-            .window => try self.keyAlloc(&.{ "jf", join_cfg.name, scan_side.tag(), join_id, "w" }),
+            .window => try self.keyAlloc(&.{ namespace, join_cfg.name, scan_side.tag(), join_id, "w" }),
             .bucket_window => blk: {
                 const bucket_start = try self.joinFactBucketAlloc(join_cfg, changed_side, changed_fact);
                 defer self.alloc.free(bucket_start);
-                break :blk try self.keyAlloc(&.{ "jf", join_cfg.name, scan_side.tag(), join_id, "bw", bucket_start });
+                break :blk try self.keyAlloc(&.{ namespace, join_cfg.name, scan_side.tag(), join_id, "bw", bucket_start });
             },
         };
     }
@@ -14841,6 +17430,24 @@ const IpCidr = struct {
     network: [4]u8,
     prefix_len: u8,
 };
+
+const IpRangeQuery = struct {
+    cidr: ?IpCidr = null,
+    exact_ip: ?[4]u8 = null,
+};
+
+fn ipRangeQuery(text: []const u8) ?IpRangeQuery {
+    if (parseIpCidr(text)) |cidr| return .{ .cidr = cidr };
+    if (parseIPv4(text)) |exact_ip| return .{ .exact_ip = exact_ip };
+    return null;
+}
+
+fn ipRangeQueryMatches(query: IpRangeQuery, text: []const u8) bool {
+    const candidate = parseIPv4(text) orelse return false;
+    if (query.cidr) |cidr| return ipInRange(candidate, cidr.network, cidr.prefix_len);
+    if (query.exact_ip) |wanted| return std.mem.eql(u8, wanted[0..], candidate[0..]);
+    return false;
+}
 
 fn parseIpCidr(cidr: []const u8) ?IpCidr {
     const slash_pos = std.mem.indexOfScalar(u8, cidr, '/') orelse return null;
@@ -16476,6 +19083,27 @@ test "algebraic adaptive backfill materializes schemaless path recommendations" 
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"10.5\"}}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"12.5\"}}" },
     };
+    const doc_keys = [_][]const u8{ "o1", "o2", "o3" };
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &identity_writes,
+        doc_keys[0..],
+        &.{},
+    );
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
+
     try idx.applyBatch(&store, .{ .documents = docs[0..] });
 
     try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(&store) > 0);
@@ -16516,7 +19144,118 @@ test "algebraic adaptive backfill materializes schemaless path recommendations" 
     const identity = lexical_mod.DictionaryIdentity.canonicalScalar(idx.name, "/meta/score_text", .string, "json-scalar-v1", "kind-qualified");
     try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryLexiconKeyAlloc(identity, "10.5")));
     try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "10.5")));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryOrdinalPostingsPrefixAlloc(identity, "10.5")));
     try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryFstKeyAlloc(identity)));
+    var resolved_term_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"term":{"path":"/meta/score_text","value":"10.5"}}
+    )).?;
+    defer resolved_term_filter.deinit(idx.alloc);
+    switch (resolved_term_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var resolved_term_range_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"term_range":{"path":"/meta/score_text","min":"10","max":"11","inclusive_min":true,"inclusive_max":false}}
+    )).?;
+    defer resolved_term_range_filter.deinit(idx.alloc);
+    switch (resolved_term_range_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var resolved_terms_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"terms":{"path":"/meta/score_text","values":["10.5","12.5"]}}
+    )).?;
+    defer resolved_terms_filter.deinit(idx.alloc);
+    switch (resolved_terms_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 3), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 3), ordinals[2]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var resolved_match_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"match":{"path":"/meta/score_text","text":"10"}}
+    )).?;
+    defer resolved_match_filter.deinit(idx.alloc);
+    switch (resolved_match_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var resolved_prefix_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"prefix":{"path":"/meta/score_text","value":"10"}}
+    )).?;
+    defer resolved_prefix_filter.deinit(idx.alloc);
+    switch (resolved_prefix_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var resolved_wildcard_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"wildcard":{"path":"/meta/score_text","pattern":"10*"}}
+    )).?;
+    defer resolved_wildcard_filter.deinit(idx.alloc);
+    switch (resolved_wildcard_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var resolved_regexp_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"regexp":{"path":"/meta/score_text","pattern":"10.*"}}
+    )).?;
+    defer resolved_regexp_filter.deinit(idx.alloc);
+    switch (resolved_regexp_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var resolved_fuzzy_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"fuzzy":{"path":"/meta/score_text","query":"10.6","prefix_length":2,"max_edits":1}}
+    )).?;
+    defer resolved_fuzzy_filter.deinit(idx.alloc);
+    switch (resolved_fuzzy_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var resolved_exists_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"exists":{"path":"/meta/score_text"}}
+    )).?;
+    defer resolved_exists_filter.deinit(idx.alloc);
+    switch (resolved_exists_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 3), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 3), ordinals[2]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const term_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"term":{"path":"/meta/score_text","value":"10.5"}}
@@ -16654,6 +19393,89 @@ test "algebraic adaptive backfill materializes schemaless path recommendations" 
         else => return err,
     };
     deleted_registry_txn.abort();
+}
+
+test "algebraic resolved doc filters honor identity generation for explicit ids" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "materializations": []
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_generation_ids", cfg);
+    defer idx.close();
+
+    var create_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (create_identity.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        create_identity.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &create_identity,
+        &.{"doc:a"},
+        &.{},
+    );
+    try store.putBatchWithReplay(null, create_identity.items, &.{}, null);
+
+    try idx.applyBatch(&store, .{ .documents = &.{.{
+        .key = "doc:a",
+        .action = .upsert,
+        .cleaned_value = "{\"name\":\"alpha\"}",
+    }} });
+
+    var delete_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (delete_identity.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        delete_identity.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        2,
+        &delete_identity,
+        &.{},
+        &.{"doc:a"},
+    );
+    try store.putBatchWithReplay(null, delete_identity.items, &.{}, null);
+
+    var visible_at_create = (try idx.resolvedDocFilterForFilterJsonAtGenerationAlloc(&store,
+        \\{"ids":["doc:a"]}
+    , 1)).?;
+    defer visible_at_create.deinit(idx.alloc);
+    switch (visible_at_create.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    var hidden_at_delete = (try idx.resolvedDocFilterForFilterJsonAtGenerationAlloc(&store,
+        \\{"ids":["doc:a"]}
+    , 2)).?;
+    defer hidden_at_delete.deinit(idx.alloc);
+    try std.testing.expectEqual(@as(?usize, 0), hidden_at_delete.include.estimatedCardinality());
 }
 
 test "algebraic adaptive path promotion defers fst rebuild until backfill completion" {
@@ -16947,6 +19769,26 @@ test "algebraic promoted datetime path dictionary supports date ranges" {
         .{ .key = "e2", .action = .upsert, .cleaned_value = "{\"published_at\":\"2026-01-03T12:00:00Z\"}" },
         .{ .key = "e3", .action = .upsert, .cleaned_value = "{\"published_at\":\"2026-01-05T12:00:00Z\"}" },
     };
+    const doc_keys = [_][]const u8{ "e1", "e2", "e3" };
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &identity_writes,
+        doc_keys[0..],
+        &.{},
+    );
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
     try idx.applyBatch(&store, .{ .documents = docs[0..] });
     try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(&store) > 0);
     const recommendation = try adaptive_mod.pathPromotionRecommendationAlloc(alloc, "/published_at", "string", "stable_datetime_string_path");
@@ -16961,12 +19803,36 @@ test "algebraic promoted datetime path dictionary supports date ranges" {
     try std.testing.expectEqual(@as(u64, 0), status_value.dictionary_registry_owned_by_other_count);
     try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryFstKeyAlloc(identity)));
 
+    var resolved_date_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"date_range":{"path":"/published_at","start":"2026-01-03T00:00:00Z","end":"2026-01-05T00:00:00Z","inclusive_start":true,"inclusive_end":false}}
+    )).?;
+    defer resolved_date_filter.deinit(idx.alloc);
+    switch (resolved_date_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
     const date_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"date_range":{"path":"/published_at","start":"2026-01-03T00:00:00Z","end":"2026-01-05T00:00:00Z","inclusive_start":true,"inclusive_end":false}}
     )).?;
     defer idx.freeDocIds(date_ids);
     try std.testing.expectEqual(@as(usize, 1), date_ids.len);
     try std.testing.expectEqualStrings("e2", date_ids[0]);
+
+    var resolved_standard_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"range":{"/published_at":{"gte":"2026-01-03","lt":"2026-01-05"}}}
+    )).?;
+    defer resolved_standard_filter.deinit(idx.alloc);
+    switch (resolved_standard_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const standard_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"range":{"/published_at":{"gte":"2026-01-03","lt":"2026-01-05"}}}
@@ -17603,6 +20469,32 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"region\":\"east\",\"published\":false,\"ip\":\"10.2.3.4\",\"score\":3.0,\"created_at\":\"2026-01-03T00:00:00Z\",\"event_time\":\"2026-02-03T00:00:00Z\",\"amount\":20,\"flag\":false,\"code\":\"beta\",\"location\":{\"lat\":40.7128,\"lon\":-74.0060}}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"region\":\"west\",\"published\":true,\"ip\":\"192.168.1.10\",\"score\":9.0,\"created_at\":\"2026-01-04T00:00:00Z\",\"event_time\":\"2026-02-04T00:00:00Z\",\"amount\":30,\"flag\":true,\"code\":\"alpine\",\"location\":{\"lat\":34.0522,\"lon\":-118.2437}}" },
     };
+    const doc_keys = [_][]const u8{ "o1", "o2", "o3" };
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &identity_writes,
+        doc_keys[0..],
+        &.{},
+    );
+    for (docs) |doc| {
+        try identity_writes.append(alloc, .{
+            .key = try internal_keys.documentKeyAlloc(alloc, doc.key),
+            .value = try alloc.dupe(u8, doc.cleaned_value orelse "{}"),
+        });
+    }
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
     try idx.applyBatch(&store, .{ .documents = docs[0..] });
 
     const alice_lookup_token = try idx.constraintTokenAlloc(alloc, "customer", "alice");
@@ -17616,10 +20508,136 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     const published_lookup_token = try token.scalarTokenFromFieldTextAlloc(alloc, "boolean", "true");
     defer alloc.free(published_lookup_token);
     try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.docFactScalarPrefixAlloc(.group, "published", published_lookup_token)));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.docFactScalarOrdinalPrefixAlloc(.group, "published", published_lookup_token)));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.pathLookupPrefixAlloc("/customer", .string, "alice")));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.pathLookupOrdinalPrefixAlloc("/customer", .string, "alice")));
+    var published_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"bool_field":{"field":"published","value":true}}
+    )).?;
+    defer published_resolved.deinit(idx.alloc);
+    switch (published_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 3), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var path_customer_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"term":{"/customer":"alice"}}
+    )).?;
+    defer path_customer_resolved.deinit(idx.alloc);
+    switch (path_customer_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var path_customer_match_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"match":{"/customer":"ali"}}
+    )).?;
+    defer path_customer_match_resolved.deinit(idx.alloc);
+    switch (path_customer_match_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var path_score_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"range":{"/score":{"gte":7.0}}}
+    )).?;
+    defer path_score_range_resolved.deinit(idx.alloc);
+    switch (path_score_range_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expect(containsOrdinal(ordinals, 1));
+            try std.testing.expect(containsOrdinal(ordinals, 3));
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var path_location_exists_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"exists":"/location"}
+    )).?;
+    defer path_location_exists_resolved.deinit(idx.alloc);
+    switch (path_location_exists_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 3), ordinals.len);
+            try std.testing.expect(containsOrdinal(ordinals, 1));
+            try std.testing.expect(containsOrdinal(ordinals, 2));
+            try std.testing.expect(containsOrdinal(ordinals, 3));
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var path_ip_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"ip_range":{"field":"/ip","cidr":"10.0.0.0/8"}}
+    )).?;
+    defer path_ip_resolved.deinit(idx.alloc);
+    switch (path_ip_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var ip_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"ip_range":{"field":"ip","cidr":"10.0.0.0/8"}}
+    )).?;
+    defer ip_range_resolved.deinit(idx.alloc);
+    switch (ip_range_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var ip_exact_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"ip_range":{"field":"ip","cidr":"192.168.1.10"}}
+    )).?;
+    defer ip_exact_resolved.deinit(idx.alloc);
+    switch (ip_exact_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 3), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    var customer_terms_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"terms":{"customer":["alice","bob"]}}
+    )).?;
+    defer customer_terms_resolved.deinit(idx.alloc);
+    switch (customer_terms_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 3), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 3), ordinals[2]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
     const flag_lookup_token = try token.scalarTokenFromFieldTextAlloc(alloc, "boolean", "true");
     defer alloc.free(flag_lookup_token);
     try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.docFactScalarPrefixAlloc(.measure, "flag", flag_lookup_token)));
     try std.testing.expectEqual(@as(u64, 3), try idx.countRowsWithPrefix(&store, try idx.docFactFieldPrefixAlloc(.time, "event_time")));
+    try std.testing.expectEqual(@as(u64, 3), try idx.countRowsWithPrefix(&store, try idx.docFactFieldOrdinalPrefixAlloc(.time, "event_time")));
+    var event_time_exists_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"exists":{"field":"event_time","role":"time"}}
+    )).?;
+    defer event_time_exists_resolved.deinit(idx.alloc);
+    switch (event_time_exists_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 3), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 3), ordinals[2]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const alice = [_]ir.Constraint{.{ .field = "customer", .value = "alice" }};
     const alice_ids = try idx.docIdsForConstraintsAlloc(&store, alice[0..]);
@@ -17627,6 +20645,16 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expectEqual(@as(usize, 2), alice_ids.len);
     try std.testing.expect(containsDocId(alice_ids, "o1"));
     try std.testing.expect(containsDocId(alice_ids, "o2"));
+    var alice_resolved = (try idx.resolvedDocSetForConstraintsAlloc(&store, alice[0..])).?;
+    defer alice_resolved.deinit(idx.alloc);
+    switch (alice_resolved) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const west_alice = [_]ir.Constraint{
         .{ .field = "customer", .value = "alice" },
@@ -17636,11 +20664,23 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     defer idx.freeDocIds(west_alice_ids);
     try std.testing.expectEqual(@as(usize, 1), west_alice_ids.len);
     try std.testing.expectEqualStrings("o1", west_alice_ids[0]);
+    var west_alice_resolved = (try idx.resolvedDocSetForConstraintsAlloc(&store, west_alice[0..])).?;
+    defer west_alice_resolved.deinit(idx.alloc);
+    switch (west_alice_resolved) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const missing = [_]ir.Constraint{.{ .field = "customer", .value = "carol" }};
     const missing_ids = try idx.docIdsForConstraintsAlloc(&store, missing[0..]);
     defer idx.freeDocIds(missing_ids);
     try std.testing.expectEqual(@as(usize, 0), missing_ids.len);
+    var missing_resolved = (try idx.resolvedDocSetForConstraintsAlloc(&store, missing[0..])).?;
+    defer missing_resolved.deinit(idx.alloc);
+    try std.testing.expectEqual(@as(?usize, 0), missing_resolved.estimatedCardinality());
 
     const filter_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"bool":{"must":[{"term":{"customer":"alice"}},{"term":{"region":"west"}}]}}
@@ -17648,6 +20688,18 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     defer idx.freeDocIds(filter_ids);
     try std.testing.expectEqual(@as(usize, 1), filter_ids.len);
     try std.testing.expectEqualStrings("o1", filter_ids[0]);
+
+    var filter_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"bool":{"must":[{"term":{"customer":"alice"}},{"term":{"region":"west"}}]}}
+    )).?;
+    defer filter_resolved.deinit(idx.alloc);
+    switch (filter_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const disjunct_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"disjuncts":[{"term":{"region":"east"}},{"bool_field":{"field":"published","value":true}}]}
@@ -17657,6 +20709,20 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(disjunct_ids, "o1"));
     try std.testing.expect(containsDocId(disjunct_ids, "o2"));
     try std.testing.expect(containsDocId(disjunct_ids, "o3"));
+
+    var disjunct_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"disjuncts":[{"term":{"region":"east"}},{"bool_field":{"field":"published","value":true}}]}
+    )).?;
+    defer disjunct_resolved.deinit(idx.alloc);
+    switch (disjunct_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 3), ordinals.len);
+            try std.testing.expect(containsOrdinal(ordinals, 1));
+            try std.testing.expect(containsOrdinal(ordinals, 2));
+            try std.testing.expect(containsOrdinal(ordinals, 3));
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const filter_alias_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"bool":{"filter":{"term":{"region":"west"}},"must":{"terms":{"customer":["alice","bob"]}}}}
@@ -17699,6 +20765,12 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     )).?;
     defer idx.freeDocIds(match_none_ids);
     try std.testing.expectEqual(@as(usize, 0), match_none_ids.len);
+
+    var match_none_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"match_none":{}}
+    )).?;
+    defer match_none_resolved.deinit(idx.alloc);
+    try std.testing.expectEqual(@as(?usize, 0), match_none_resolved.include.estimatedCardinality());
 
     var match_none_set = (try idx.docIdSetForFilterJsonAlloc(&store,
         \\{"bool":{"must":[{"match_none":{}},{"term":{"customer":"alice"}}]}}
@@ -17747,6 +20819,17 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     defer idx.freeDocIds(numeric_range_ids);
     try std.testing.expectEqual(@as(usize, 1), numeric_range_ids.len);
     try std.testing.expectEqualStrings("o1", numeric_range_ids[0]);
+    var numeric_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"numeric_range":{"field":"score","min":7.5,"max":9.0,"inclusive_min":true,"inclusive_max":false}}
+    )).?;
+    defer numeric_range_resolved.deinit(idx.alloc);
+    switch (numeric_range_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const standard_numeric_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"range":{"score":{"gte":7.5,"lt":9.0}}}
@@ -17754,6 +20837,17 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     defer idx.freeDocIds(standard_numeric_range_ids);
     try std.testing.expectEqual(@as(usize, 1), standard_numeric_range_ids.len);
     try std.testing.expectEqualStrings("o1", standard_numeric_range_ids[0]);
+    var standard_numeric_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"range":{"score":{"gte":7.5,"lt":9.0}}}
+    )).?;
+    defer standard_numeric_range_resolved.deinit(idx.alloc);
+    switch (standard_numeric_range_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const measure_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"numeric_range":{"field":"amount","role":"measure","min":20.0,"inclusive_min":true}}
@@ -17762,6 +20856,18 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expectEqual(@as(usize, 2), measure_range_ids.len);
     try std.testing.expect(containsDocId(measure_range_ids, "o2"));
     try std.testing.expect(containsDocId(measure_range_ids, "o3"));
+    var measure_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"numeric_range":{"field":"amount","role":"measure","min":20.0,"inclusive_min":true}}
+    )).?;
+    defer measure_range_resolved.deinit(idx.alloc);
+    switch (measure_range_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expect(containsOrdinal(ordinals, 2));
+            try std.testing.expect(containsOrdinal(ordinals, 3));
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const standard_measure_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"range":{"amount":{"role":"measure","gte":20.0}}}
@@ -17770,6 +20876,18 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expectEqual(@as(usize, 2), standard_measure_range_ids.len);
     try std.testing.expect(containsDocId(standard_measure_range_ids, "o2"));
     try std.testing.expect(containsDocId(standard_measure_range_ids, "o3"));
+    var standard_measure_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"range":{"amount":{"role":"measure","gte":20.0}}}
+    )).?;
+    defer standard_measure_range_resolved.deinit(idx.alloc);
+    switch (standard_measure_range_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expect(containsOrdinal(ordinals, 2));
+            try std.testing.expect(containsOrdinal(ordinals, 3));
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const measure_term_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"term":{"field":"amount","role":"measure","value":20}}
@@ -17800,6 +20918,18 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     defer idx.freeDocIds(measure_match_ids);
     try std.testing.expectEqual(@as(usize, 1), measure_match_ids.len);
     try std.testing.expectEqualStrings("o3", measure_match_ids[0]);
+
+    var measure_match_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"match":{"field":"code","role":"measure","text":"PIN"}}
+    )).?;
+    defer measure_match_resolved.deinit(idx.alloc);
+    switch (measure_match_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 3), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const term_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"term_range":{"field":"customer","min":"alice","max":"carol","inclusive_min":false,"inclusive_max":false}}
@@ -17837,6 +20967,18 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expectEqual(@as(usize, 1), geo_bbox_ids.len);
     try std.testing.expectEqualStrings("o1", geo_bbox_ids[0]);
 
+    var geo_bbox_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"geo_bbox":{"field":"/location","min_lat":37.70,"min_lon":-122.50,"max_lat":37.80,"max_lon":-122.30}}
+    )).?;
+    defer geo_bbox_resolved.deinit(idx.alloc);
+    switch (geo_bbox_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
     const geo_distance_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"geo_distance":{"path":"/location","lat":37.7749,"lon":-122.4194,"radius_meters":2000}}
     )).?;
@@ -17844,12 +20986,36 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expectEqual(@as(usize, 1), geo_distance_ids.len);
     try std.testing.expectEqualStrings("o1", geo_distance_ids[0]);
 
+    var geo_distance_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"geo_distance":{"path":"/location","lat":37.7749,"lon":-122.4194,"radius_meters":2000}}
+    )).?;
+    defer geo_distance_resolved.deinit(idx.alloc);
+    switch (geo_distance_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
     const geo_shape_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"geo_shape":{"path":"/location","relation":"intersects","polygons":[[{"lat":37.0,"lon":-123.0},{"lat":38.0,"lon":-123.0},{"lat":38.0,"lon":-122.0},{"lat":37.0,"lon":-122.0}]]}}
     )).?;
     defer idx.freeDocIds(geo_shape_ids);
     try std.testing.expectEqual(@as(usize, 1), geo_shape_ids.len);
     try std.testing.expectEqualStrings("o1", geo_shape_ids[0]);
+
+    var geo_shape_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"geo_shape":{"path":"/location","relation":"intersects","polygons":[[{"lat":37.0,"lon":-123.0},{"lat":38.0,"lon":-123.0},{"lat":38.0,"lon":-122.0},{"lat":37.0,"lon":-122.0}]]}}
+    )).?;
+    defer geo_shape_resolved.deinit(idx.alloc);
+    switch (geo_shape_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const geo_shape_within_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"geo_shape":{"field":"/location","relation":"within","polygon":[{"lat":33.0,"lon":-125.0},{"lat":38.0,"lon":-125.0},{"lat":38.0,"lon":-117.0},{"lat":33.0,"lon":-117.0}]}}
@@ -17883,6 +21049,19 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(prefix_ids, "o1"));
     try std.testing.expect(containsDocId(prefix_ids, "o2"));
 
+    var prefix_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"prefix":{"customer":"ali"}}
+    )).?;
+    defer prefix_resolved.deinit(idx.alloc);
+    switch (prefix_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
     const alternate_prefix_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"prefix":"bo","field":"customer"}
     )).?;
@@ -17898,6 +21077,19 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(measure_prefix_ids, "o1"));
     try std.testing.expect(containsDocId(measure_prefix_ids, "o3"));
 
+    var measure_prefix_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"prefix":{"field":"code","role":"measure","value":"alp"}}
+    )).?;
+    defer measure_prefix_resolved.deinit(idx.alloc);
+    switch (measure_prefix_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expect(containsOrdinal(ordinals, 1));
+            try std.testing.expect(containsOrdinal(ordinals, 3));
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
     const wildcard_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"wildcard":{"customer":"a*e"}}
     )).?;
@@ -17905,6 +21097,19 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expectEqual(@as(usize, 2), wildcard_ids.len);
     try std.testing.expect(containsDocId(wildcard_ids, "o1"));
     try std.testing.expect(containsDocId(wildcard_ids, "o2"));
+
+    var wildcard_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"wildcard":{"customer":"a*e"}}
+    )).?;
+    defer wildcard_resolved.deinit(idx.alloc);
+    switch (wildcard_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     const measure_wildcard_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"wildcard":{"field":"code","role":"measure","pattern":"alp*e"}}
@@ -17925,6 +21130,19 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(regexp_ids, "o1"));
     try std.testing.expect(containsDocId(regexp_ids, "o2"));
 
+    var regexp_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"regexp":{"customer":"ali.*"}}
+    )).?;
+    defer regexp_resolved.deinit(idx.alloc);
+    switch (regexp_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
     const measure_regexp_ids = (try idx.docIdsForFilterJsonAlloc(&store,
         \\{"regexp":{"field":"code","role":"measure","pattern":"alp.*e"}}
     )).?;
@@ -17943,6 +21161,19 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expectEqual(@as(usize, 2), fuzzy_ids.len);
     try std.testing.expect(containsDocId(fuzzy_ids, "o1"));
     try std.testing.expect(containsDocId(fuzzy_ids, "o2"));
+
+    var fuzzy_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"fuzzy":{"customer":{"query":"alixe","max_edits":1,"prefix_length":1}}}
+    )).?;
+    defer fuzzy_resolved.deinit(idx.alloc);
+    switch (fuzzy_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     try std.testing.expect((try idx.docIdsForFilterJsonAlloc(&store,
         \\{"fuzzy":{"customer":{"query":"alixe","max_edits":1}}}
@@ -18020,6 +21251,195 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(filter_set.include.?, "o3"));
     try std.testing.expectEqual(@as(usize, 1), filter_set.exclude.len);
     try std.testing.expectEqualStrings("o3", filter_set.exclude[0]);
+
+    var west_binding_set = (try idx.docIdSetForFilterJsonAlloc(&store,
+        \\{"term":{"region":"west"}}
+    )).?;
+    defer west_binding_set.deinit(&idx);
+    var alice_binding_set = (try idx.docIdSetForFilterJsonAlloc(&store,
+        \\{"term":{"customer":"alice"}}
+    )).?;
+    defer alice_binding_set.deinit(&idx);
+    const filter_bindings = [_]Index.FilterBinding{
+        .{ .name = "west", .set = west_binding_set },
+        .{ .name = "alice", .set = alice_binding_set },
+    };
+    var ref_filter_set = (try idx.docIdSetForFilterJsonWithBindingsAlloc(
+        &store,
+        \\{"bool":{"must":[{"ref":"west"},{"ref":"alice"}],"must_not":{"ids":["o2"]}}}
+    ,
+        filter_bindings[0..],
+    )).?;
+    defer ref_filter_set.deinit(&idx);
+    try std.testing.expect(ref_filter_set.include != null);
+    try std.testing.expectEqual(@as(usize, 1), ref_filter_set.include.?.len);
+    try std.testing.expectEqualStrings("o1", ref_filter_set.include.?[0]);
+    try std.testing.expectEqual(@as(usize, 1), ref_filter_set.exclude.len);
+    try std.testing.expectEqualStrings("o2", ref_filter_set.exclude[0]);
+
+    var resolved_west_binding = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"term":{"region":"west"}}
+    )).?;
+    defer resolved_west_binding.deinit(idx.alloc);
+    var resolved_alice_binding = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"term":{"customer":"alice"}}
+    )).?;
+    defer resolved_alice_binding.deinit(idx.alloc);
+    var resolved_not_bob_binding = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"bool":{"must_not":[{"term":{"customer":"bob"}}]}}
+    )).?;
+    defer resolved_not_bob_binding.deinit(idx.alloc);
+    const resolved_filter_bindings = [_]Index.ResolvedFilterBinding{
+        .{ .name = "west", .filter = resolved_west_binding },
+        .{ .name = "alice", .filter = resolved_alice_binding },
+        .{ .name = "not_bob", .filter = resolved_not_bob_binding },
+    };
+    var manual_complete_binding = doc_set.ResolvedDocFilter{
+        .include = try doc_set.cloneDocKeysAlloc(idx.alloc, &.{ "o1", "o3" }),
+    };
+    defer manual_complete_binding.deinit(idx.alloc);
+    const manual_complete_bindings = [_]Index.ResolvedFilterBinding{
+        .{ .name = "manual", .filter = manual_complete_binding },
+        .{ .name = "alice", .filter = resolved_alice_binding },
+    };
+    var resolved_mixed_ref_filter = (try idx.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+        &store,
+        \\{"bool":{"must":[{"ref":"manual"},{"ref":"alice"}]}}
+    ,
+        null,
+        manual_complete_bindings[0..],
+    )).?;
+    defer resolved_mixed_ref_filter.deinit(idx.alloc);
+    switch (resolved_mixed_ref_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    var manual_partial_binding = doc_set.ResolvedDocFilter{
+        .include = try doc_set.cloneDocKeysAlloc(idx.alloc, &.{ "o1", "missing" }),
+    };
+    defer manual_partial_binding.deinit(idx.alloc);
+    const manual_partial_bindings = [_]Index.ResolvedFilterBinding{
+        .{ .name = "manual", .filter = manual_partial_binding },
+        .{ .name = "alice", .filter = resolved_alice_binding },
+    };
+    try std.testing.expect((try idx.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+        &store,
+        \\{"bool":{"must":[{"ref":"manual"},{"ref":"alice"}]}}
+    ,
+        null,
+        manual_partial_bindings[0..],
+    )) == null);
+
+    var resolved_ref_filter = (try idx.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+        &store,
+        \\{"bool":{"must":[{"ref":"west"},{"ref":"alice"}],"must_not":{"ids":["o2"]}}}
+    ,
+        null,
+        resolved_filter_bindings[0..],
+    )).?;
+    defer resolved_ref_filter.deinit(idx.alloc);
+    switch (resolved_ref_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    switch (resolved_ref_filter.exclude) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    var resolved_excluding_ref_filter = (try idx.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+        &store,
+        \\{"bool":{"must":[{"ref":"not_bob"},{"ref":"west"}]}}
+    ,
+        null,
+        resolved_filter_bindings[0..],
+    )).?;
+    defer resolved_excluding_ref_filter.deinit(idx.alloc);
+    switch (resolved_excluding_ref_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 3), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    switch (resolved_excluding_ref_filter.exclude) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 3), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    var resolved_effective_ref_set = (try idx.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+        &store,
+        \\{"bool":{"should":[{"ref":"not_bob"}],"minimum_should_match":1}}
+    ,
+        null,
+        resolved_filter_bindings[0..],
+    )).?;
+    defer resolved_effective_ref_set.deinit(idx.alloc);
+    switch (resolved_effective_ref_set.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    try std.testing.expectEqual(@as(?usize, 0), resolved_effective_ref_set.exclude.estimatedCardinality());
+
+    var resolved_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"bool":{"must":[{"term":{"region":"west"}}],"must_not":[{"term":{"customer":"bob"}}]}}
+    )).?;
+    defer resolved_filter.deinit(idx.alloc);
+    switch (resolved_filter.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 2), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 3), ordinals[1]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    switch (resolved_filter.exclude) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 3), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    var exclusion_only_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+        \\{"bool":{"must_not":[{"term":{"customer":"bob"}}]}}
+    )).?;
+    defer exclusion_only_resolved.deinit(idx.alloc);
+    switch (exclusion_only_resolved.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 3), ordinals.len);
+            try std.testing.expect(containsOrdinal(ordinals, 1));
+            try std.testing.expect(containsOrdinal(ordinals, 2));
+            try std.testing.expect(containsOrdinal(ordinals, 3));
+        },
+        .all => {},
+        else => return error.ExpectedOrdinalDocSet,
+    }
+    switch (exclusion_only_resolved.exclude) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 3), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
 
     var range_exclusion_set = (try idx.docIdSetForFilterJsonAlloc(&store,
         \\{"bool":{"must_not":[{"numeric_range":{"field":"score","min":8.0}}]}}
@@ -18215,6 +21635,27 @@ test "algebraic index maintains composite equi join aggregate" {
         .{ .key = "order2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"tenant_id\":\"t1\",\"customer_id\":\"c1\",\"amount\":5}" },
         .{ .key = "both_shape", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"tenant_id\":\"t1\",\"customer_id\":\"c1\",\"id\":\"c1\",\"region\":\"east\",\"amount\":100}" },
     };
+    const doc_keys = [_][]const u8{ "cust1", "order1", "order2", "both_shape" };
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &identity_writes,
+        doc_keys[0..],
+        &.{},
+    );
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
+
     try idx.applyBatch(&store, .{ .documents = docs[0..] });
     const region_token = try idx.constraintTokenAlloc(alloc, "region", "west");
     defer alloc.free(region_token);
@@ -18229,6 +21670,14 @@ test "algebraic index maintains composite equi join aggregate" {
     const expr = Index.materializationExpression(idx.config().materializations[mat_idx], .sum);
     try std.testing.expectEqual(@as(usize, 1), try idx.rebuildMaterializedExpressionFromMaterialization(&store, expr, "sum_by_region"));
     try std.testing.expectEqual(@as(f64, 130), (try idx.numericValue(&store, "sum_by_region", group)).?);
+    try std.testing.expectEqual(
+        try idx.countRowsWithPrefix(&store, try idx.joinSideFactPrefixAlloc(idx.config().joins[0], .left)),
+        try idx.countRowsWithPrefix(&store, try idx.joinSideFactOrdinalPrefixAlloc(idx.config().joins[0], .left)),
+    );
+    try std.testing.expectEqual(
+        try idx.countRowsWithPrefix(&store, try idx.joinSideFactPrefixAlloc(idx.config().joins[0], .right)),
+        try idx.countRowsWithPrefix(&store, try idx.joinSideFactOrdinalPrefixAlloc(idx.config().joins[0], .right)),
+    );
 
     var ref_read_txn = try store.beginReadTxn();
     var ref_cursor = try ref_read_txn.openCursor();
@@ -18236,17 +21685,26 @@ test "algebraic index maintains composite equi join aggregate" {
     defer alloc.free(docjf_prefix);
     const docjf_before = try ref_cursor.seekAtOrAfter(docjf_prefix);
     try std.testing.expect(docjf_before != null and std.mem.startsWith(u8, docjf_before.?.key, docjf_prefix));
+    const cust1_ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &ref_read_txn, "cust1")) orelse return error.TestUnexpectedResult;
+    const docjf_ord_prefix = try idx.docJoinFactOrdinalRefPrefixAlloc(cust1_ordinal, idx.config().joins[0], .right);
+    defer alloc.free(docjf_ord_prefix);
+    const docjf_ord_before = try ref_cursor.seekAtOrAfter(docjf_ord_prefix);
+    try std.testing.expect(docjf_ord_before != null and std.mem.startsWith(u8, docjf_ord_before.?.key, docjf_ord_prefix));
     ref_cursor.close();
     ref_read_txn.abort();
 
     const deletes = [_][]const u8{"cust1"};
     try idx.applyBatch(&store, .{ .deleted_keys = deletes[0..] });
     try std.testing.expect((try idx.numericValue(&store, "sum_by_region", group)) == null);
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.joinSideFactPrefixAlloc(idx.config().joins[0], .right)));
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.joinSideFactOrdinalPrefixAlloc(idx.config().joins[0], .right)));
 
     ref_read_txn = try store.beginReadTxn();
     ref_cursor = try ref_read_txn.openCursor();
     const docjf_after = try ref_cursor.seekAtOrAfter(docjf_prefix);
     try std.testing.expect(docjf_after == null or !std.mem.startsWith(u8, docjf_after.?.key, docjf_prefix));
+    const docjf_ord_after = try ref_cursor.seekAtOrAfter(docjf_ord_prefix);
+    try std.testing.expect(docjf_ord_after == null or !std.mem.startsWith(u8, docjf_ord_after.?.key, docjf_ord_prefix));
     ref_cursor.close();
     ref_read_txn.abort();
 }
@@ -20649,6 +24107,157 @@ test "algebraic distributed derived join partials merge canonical axes across sh
         found_west = true;
     }
     try std.testing.expect(found_west);
+}
+
+test "algebraic derived join tensor reads subtract identity tombstones at generation" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "mixed",
+        \\  "group_fields": [
+        \\    {"name":"kind","path":"kind","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"},
+        \\    {"name":"region","path":"region","type":"string"}
+        \\  ],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "joins": [
+        \\    {"name":"orders_customers","left_fields":["customer"],"right_fields":["customer"],"left_type_field":"kind","left_type_value":"order","right_type_field":"kind","right_type_value":"customer","max_fanout":8}
+        \\  ],
+        \\  "materializations": []
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_derived_join_generation", cfg);
+    defer idx.close();
+
+    const doc_keys = [_][]const u8{ "c1", "c2", "o1", "o2", "o3" };
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        1,
+        &identity_writes,
+        doc_keys[0..],
+        &.{},
+    );
+    try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\",\"region\":\"west\"}" },
+        .{ .key = "c2", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c2\",\"region\":\"east\"}" },
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":10}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":20}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"amount\":7}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const o2_ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "o2")) orelse return error.TestUnexpectedResult;
+        try doc_identity.markDeletedTxn(alloc, &txn, o2_ordinal, "o2");
+        try txn.commit();
+    }
+
+    const request = DerivedJoinFoldRequest{
+        .join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
+        .op = .sum,
+        .group_by = &.{"region"},
+        .measure = "amount",
+    };
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+    const east_token = try idx.constraintTokenAlloc(alloc, "region", "east");
+    defer alloc.free(east_token);
+    const east_group = try token.canonicalTupleAlloc(alloc, &.{east_token});
+    defer alloc.free(east_group);
+
+    const live_entries = (try idx.scanDerivedJoinFoldEntriesAtGeneration(&store, request, 4)).?;
+    defer {
+        for (live_entries) |*entry| entry.deinit(alloc);
+        if (live_entries.len > 0) alloc.free(live_entries);
+    }
+    var saw_live_west = false;
+    var saw_live_east = false;
+    for (live_entries) |entry| {
+        if (std.mem.eql(u8, entry.group_key, west_group)) {
+            saw_live_west = true;
+            try std.testing.expectEqual(@as(f64, 10), try algebra.parseF64(entry.value));
+        } else if (std.mem.eql(u8, entry.group_key, east_group)) {
+            saw_live_east = true;
+            try std.testing.expectEqual(@as(f64, 7), try algebra.parseF64(entry.value));
+        }
+    }
+    try std.testing.expect(saw_live_west);
+    try std.testing.expect(saw_live_east);
+
+    const join_access_fragments = [_]ir.TensorFragment{ .slice, .join };
+    const join_fact_output_dims = [_]ir.Dimension{ .src, .dst, .scalar, .time, .bucket };
+    const join_access_paths = [_]ir.PhysicalAccessPath{.{
+        .owner = "orders_customers",
+        .layout = .join_fact_rows,
+        .fragments = join_access_fragments[0..],
+        .output_dims = join_fact_output_dims[0..],
+    }};
+    const metadata = try derivedJoinFoldMetadataAlloc(alloc, request);
+    defer alloc.free(metadata);
+    const step_inputs = [_]ir.TensorProgramRef{.{ .step = 0 }};
+    const steps = [_]ir.TensorProgramStep{
+        .{ .expr = .{
+            .fragment = .slice,
+            .output_dims = join_fact_output_dims[0..],
+            .semantic_id = "orders_customers",
+            .owner = "orders_customers",
+            .layout = .join_fact_rows,
+        } },
+        .{
+            .expr = .{
+                .fragment = .join,
+                .input_dims = join_fact_output_dims[0..],
+                .output_dims = &distributed_bucket_scalar_output_dims,
+                .semantic_id = "sum_by_region",
+                .law_id = .sum,
+                .metadata = metadata,
+            },
+            .inputs = step_inputs[0..],
+        },
+    };
+    const program = ir.TensorProgram{
+        .steps = steps[0..],
+        .output = .{ .step = 1 },
+    };
+    const live_partials = (try idx.scanDistributedPartialsForTensorProgramAtGeneration(&store, join_access_paths[0..], program, 4)) orelse return error.TestUnexpectedResult;
+    defer distributed_mod.freePartials(alloc, live_partials);
+    var saw_partial_west = false;
+    var saw_partial_east = false;
+    for (live_partials) |partial| {
+        if (std.mem.eql(u8, partial.canonical_axis, west_group)) {
+            saw_partial_west = true;
+            try std.testing.expectEqual(@as(f64, 10), try algebra.parseF64(partial.value));
+        } else if (std.mem.eql(u8, partial.canonical_axis, east_group)) {
+            saw_partial_east = true;
+            try std.testing.expectEqual(@as(f64, 7), try algebra.parseF64(partial.value));
+        }
+    }
+    try std.testing.expect(saw_partial_west);
+    try std.testing.expect(saw_partial_east);
 }
 
 test "algebraic derived join fold rejects unbounded fanout" {

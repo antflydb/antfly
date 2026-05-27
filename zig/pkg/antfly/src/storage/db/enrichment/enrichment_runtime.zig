@@ -587,18 +587,67 @@ fn workerChunkCacheKey(
     alloc: Allocator,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) ![]u8 {
-    return try std.fmt.allocPrint(
-        alloc,
-        "{s}\x1f{s}\x1f{s}\x1f{d}\x1f{d}\x1f{s}",
-        .{
-            request.doc_key,
-            request.source_field,
-            request.source_template,
-            request.chunk_size,
-            request.chunk_overlap,
-            request.chunker_json,
-        },
-    );
+    var chunk_size: [@sizeOf(u32)]u8 = undefined;
+    var chunk_overlap: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &chunk_size, request.chunk_size, .big);
+    std.mem.writeInt(u32, &chunk_overlap, request.chunk_overlap, .big);
+    return try workerChunkCacheTupleKeyAlloc(alloc, &.{
+        request.doc_key,
+        request.source_field,
+        request.source_template,
+        &chunk_size,
+        &chunk_overlap,
+        request.chunker_json,
+    });
+}
+
+fn workerChunkCacheTupleKeyAlloc(alloc: Allocator, components: []const []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    for (components) |component| {
+        if (component.len > std.math.maxInt(u32)) return error.KeyComponentTooLarge;
+        var len_buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(component.len), .big);
+        try out.appendSlice(alloc, &len_buf);
+        try out.appendSlice(alloc, component);
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+test "enrichment worker chunk cache keys preserve embedded separators" {
+    const alloc = std.testing.allocator;
+
+    const left = try workerChunkCacheKey(alloc, .{
+        .kind = .chunk_text,
+        .index_name = "idx",
+        .artifact_name = "artifact",
+        .embedding_name = "embedding",
+        .doc_key = "doc\x1ffield",
+        .source_field = "field",
+        .source_template = "{{body}}",
+        .chunk_size = 64,
+        .chunk_overlap = 8,
+        .chunker_json = "{\"mode\":\"a\"}",
+    });
+    defer alloc.free(left);
+
+    const right = try workerChunkCacheKey(alloc, .{
+        .kind = .chunk_text,
+        .index_name = "idx",
+        .artifact_name = "artifact",
+        .embedding_name = "embedding",
+        .doc_key = "doc",
+        .source_field = "field\x1ffield",
+        .source_template = "{{body}}",
+        .chunk_size = 64,
+        .chunk_overlap = 8,
+        .chunker_json = "{\"mode\":\"a\"}",
+    });
+    defer alloc.free(right);
+
+    try std.testing.expect(!std.mem.eql(u8, left, right));
 }
 
 fn getOrCreateRequestChunks(

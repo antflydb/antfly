@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const metadata_api = @import("api.zig");
+const metadata_reconciler = @import("reconciler.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_transition_state = @import("transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
@@ -247,7 +248,7 @@ pub const MetadataHttpClient = struct {
             routes.Routes.internal_split_suffix,
         });
         defer self.alloc.free(path);
-        try self.postNoContent(base_uri, path, body);
+        try self.requestWithBody(base_uri, .POST, path, body, null, null, error.DocIdentityNamespaceMismatch);
     }
 
     pub fn requestTableMerge(
@@ -262,7 +263,7 @@ pub const MetadataHttpClient = struct {
             routes.Routes.internal_merge_suffix,
         });
         defer self.alloc.free(path);
-        try self.postNoContent(base_uri, path, body);
+        try self.requestWithBody(base_uri, .POST, path, body, null, null, error.DocIdentityNamespaceMismatch);
     }
 
     fn getJson(self: *MetadataHttpClient, comptime T: type, base_uri: []const u8, path: []const u8) !std.json.Parsed(T) {
@@ -422,6 +423,50 @@ test "metadata http client retries transient connection close on fetch status" {
     try std.testing.expectEqual(@as(usize, 2), flaky.attempts);
 }
 
+test "metadata http client preserves split merge doc identity conflicts" {
+    const ConflictExecutor = struct {
+        split_calls: usize = 0,
+        merge_calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            if (std.mem.endsWith(u8, req.uri, "/internal/v1/tables/docs/split")) {
+                self.split_calls += 1;
+            } else if (std.mem.endsWith(u8, req.uri, "/internal/v1/tables/docs/merge")) {
+                self.merge_calls += 1;
+            } else {
+                return error.TestUnexpectedResult;
+            }
+            return .{
+                .status = 409,
+                .body = try alloc.dupe(u8, "doc identity namespace mismatch"),
+            };
+        }
+    };
+
+    var executor = ConflictExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        client.requestTableSplit("http://127.0.0.1:9000", "docs", "{\"split_key\":\"doc:m\"}"),
+    );
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        client.requestTableMerge("http://127.0.0.1:9000", "docs", "{\"donor_group_id\":11,\"receiver_group_id\":10}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), executor.split_calls);
+    try std.testing.expectEqual(@as(usize, 1), executor.merge_calls);
+}
+
 test "metadata http client round-trips server endpoints" {
     const metadata_http_server = @import("http_server.zig");
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
@@ -480,6 +525,28 @@ test "metadata http client round-trips server endpoints" {
                 .reseed_exact_cutover_path = @constCast("/internal/v1/tables/docs/replication-sources/0/reseed-exact-cutover"),
             },
         };
+        const merged_group_statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{
+                .group_id = 10,
+                .doc_identity = .{
+                    .namespace_table_id = 1,
+                    .namespace_shard_id = 10,
+                    .namespace_range_id = 10,
+                    .allocated_ordinals = 1,
+                    .complete = true,
+                },
+            },
+            .{
+                .group_id = 11,
+                .doc_identity = .{
+                    .namespace_table_id = 1,
+                    .namespace_shard_id = 10,
+                    .namespace_range_id = 10,
+                    .allocated_ordinals = 1,
+                    .complete = true,
+                },
+            },
+        };
 
         fn iface(self: *@This()) metadata_http_server.AdminSource {
             return .{
@@ -530,6 +597,7 @@ test "metadata http client round-trips server endpoints" {
                 .merge_transitions = @constCast(merge_transitions[0..]),
                 .replication_source_statuses = @constCast(replication_source_statuses[0..]),
                 .replication_source_action_hints = @constCast(replication_source_action_hints[0..]),
+                .merged_group_statuses = @constCast(merged_group_statuses[0..]),
             };
         }
 
@@ -677,4 +745,65 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
     try std.testing.expectEqual(@as(usize, 1), source.split_count);
     try std.testing.expectEqual(@as(usize, 1), source.merge_count);
+}
+
+test "metadata http client round-trips range doc identity fields" {
+    const RangeExecutor = struct {
+        fn executor(_: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            const body =
+                if (std.mem.endsWith(u8, req.uri, routes.Routes.admin_snapshot))
+                    \\{"status":{"metadata_group_id":77,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0}},"tables":[],"ranges":[{"group_id":11,"range_id":1100,"table_id":1,"doc_identity_shard_id":10,"doc_identity_range_id":1000,"start_key":"m","end_key":null}],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
+                else if (std.mem.endsWith(u8, req.uri, "/metadata/v1/tables/1/ranges"))
+                    \\[{"group_id":11,"range_id":1100,"table_id":1,"doc_identity_shard_id":10,"doc_identity_range_id":1000,"start_key":"m","end_key":null}]
+                else
+                    return error.TestUnexpectedResult;
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, body),
+            };
+        }
+    };
+
+    var executor = RangeExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+
+    var snapshot = try client.fetchSnapshot("http://127.0.0.1:9000");
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.value.ranges.len);
+    try std.testing.expectEqual(@as(u64, 10), snapshot.value.ranges[0].doc_identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 1000), snapshot.value.ranges[0].doc_identity_range_id);
+
+    var ranges = try client.listTableRanges("http://127.0.0.1:9000", 1);
+    defer ranges.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ranges.value.len);
+    try std.testing.expectEqual(@as(u64, 10), metadata_table_manager.rangeDocIdentityShardId(ranges.value[0]));
+    try std.testing.expectEqual(@as(u64, 1000), metadata_table_manager.rangeDocIdentityRangeId(ranges.value[0]));
+}
+
+test "metadata http client parses legacy range records without doc identity fields" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseJson([]metadata_table_manager.RangeRecord, alloc,
+        \\[
+        \\  {"group_id":42,"range_id":4200,"table_id":7,"start_key":"","end_key":null},
+        \\  {"group_id":43,"range_id":4300,"table_id":7,"doc_identity_shard_id":42,"doc_identity_range_id":4200,"start_key":"m","end_key":null}
+        \\]
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.len);
+    try std.testing.expectEqual(@as(u64, 0), parsed.value[0].doc_identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 0), parsed.value[0].doc_identity_range_id);
+    try std.testing.expectEqual(@as(u64, 42), metadata_table_manager.rangeDocIdentityShardId(parsed.value[0]));
+    try std.testing.expectEqual(@as(u64, 4200), metadata_table_manager.rangeDocIdentityRangeId(parsed.value[0]));
+    try std.testing.expectEqual(@as(u64, 42), metadata_table_manager.rangeDocIdentityShardId(parsed.value[1]));
+    try std.testing.expectEqual(@as(u64, 4200), metadata_table_manager.rangeDocIdentityRangeId(parsed.value[1]));
 }

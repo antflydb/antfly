@@ -24,6 +24,7 @@ const docstore_mod = @import("../docstore.zig");
 const shard_mod = @import("../shard.zig");
 const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
+const doc_identity_mod = @import("doc_identity.zig");
 
 pub const GeoPoint = struct {
     lon: f64,
@@ -922,6 +923,7 @@ pub const SearchRequest = struct {
     filter_query_json: []const u8 = "",
     exclusion_query_json: []const u8 = "",
     full_text_queries: []const NamedFullTextQuery = &.{},
+    doc_filter_bindings: []const NamedDocFilterBinding = &.{},
     dense: ?DenseKnnQuery = null,
     sparse: ?SparseKnnQuery = null,
     dense_queries: []const NamedDenseQuery = &.{},
@@ -949,8 +951,27 @@ pub const SearchRequest = struct {
     filter_doc_ids: []const []const u8 = &.{},
     filter_doc_ids_positive: bool = false,
     exclude_doc_ids: []const []const u8 = &.{},
+    // Internal execution hook. Public callers should use raw document IDs,
+    // filter JSON, or named bindings instead of constructing this pointer.
+    resolved_doc_filter: ?*const anyopaque = null,
+    // Internal text-index execution hook. This is request-local state used to
+    // avoid converting text-native doc nums through shard ordinals and back.
+    resolved_text_doc_filter: ?*const anyopaque = null,
+    resolved_doc_filter_owned: bool = false,
+    resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
+    identity_read_generation: ?u64 = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+};
+
+pub const ResolvedDocFilterWireContext = struct {
+    namespace: doc_identity_mod.Namespace,
+    identity_read_generation: u64,
+};
+
+pub const NamedDocFilterBinding = struct {
+    name: []const u8,
+    filter_query_json: []const u8,
 };
 
 pub const NamedGraphInputSet = struct {
@@ -997,6 +1018,7 @@ pub const MergeConfig = struct {
 
 pub const SearchHit = struct {
     id: []u8,
+    doc_ordinal: ?u32 = null,
     score: ?f32 = null,
     stored_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
@@ -1005,6 +1027,7 @@ pub const SearchHit = struct {
     pub fn clone(self: SearchHit, alloc: Allocator) !SearchHit {
         var cloned = SearchHit{
             .id = try alloc.dupe(u8, self.id),
+            .doc_ordinal = self.doc_ordinal,
             .score = self.score,
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
             .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
@@ -1074,6 +1097,7 @@ pub const SearchResult = struct {
     hits: []SearchHit,
     total_hits: u32,
     total_hits_relation: TotalHitsRelation = .exact,
+    identity_read_generation: ?u64 = null,
     graph_results: []GraphSearchResult = &.{},
 
     pub fn deinit(self: *SearchResult) void {
@@ -1230,10 +1254,51 @@ pub const TextMergeStats = struct {
     max_pending_bytes: u64 = 0,
 };
 
+pub const DocIdentityStats = struct {
+    namespace_table_id: u64 = 0,
+    namespace_shard_id: u64 = 0,
+    namespace_range_id: u64 = 0,
+    next_ordinal: u32 = 1,
+    allocated_ordinals: u64 = 0,
+    ordinal_capacity_remaining: u64 = 0,
+    ordinal_capacity_exhausted: bool = false,
+    rebuild_required: bool = false,
+    state_rows: u64 = 0,
+    live_ordinals: u64 = 0,
+    tombstone_ordinals: u64 = 0,
+    min_created_generation: u64 = 0,
+    max_created_generation: u64 = 0,
+    min_deleted_generation: u64 = 0,
+    max_deleted_generation: u64 = 0,
+    scanned_primary_docs: u64 = 0,
+    primary_docs_missing_ordinals: u64 = 0,
+    primary_docs_missing_identity_state: u64 = 0,
+    primary_docs_with_tombstone_ordinals: u64 = 0,
+    complete: bool = false,
+};
+
+pub const DocSetPlanningStats = struct {
+    resolved_set_count: u64 = 0,
+    all_set_count: u64 = 0,
+    none_set_count: u64 = 0,
+    doc_key_list_count: u64 = 0,
+    ordinal_list_count: u64 = 0,
+    ordinal_bitmap_count: u64 = 0,
+    doc_key_list_docs: u64 = 0,
+    ordinal_list_docs: u64 = 0,
+    ordinal_bitmap_docs: u64 = 0,
+    missing_ordinal_coverage_count: u64 = 0,
+    bitmap_promotion_count: u64 = 0,
+    unsupported_filter_shape_count: u64 = 0,
+    stale_identity_generation_rejection_count: u64 = 0,
+};
+
 pub const DBStats = struct {
     doc_count: u64 = 0,
     index_count: u32 = 0,
     indexes: []DBIndexStats = &.{},
+    doc_identity: DocIdentityStats = .{},
+    doc_set_planning: DocSetPlanningStats = .{},
     enrichment: EnrichmentStats = .{},
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},

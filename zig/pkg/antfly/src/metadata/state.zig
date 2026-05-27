@@ -570,7 +570,10 @@ const GroupStatusMergeState = struct {
     replay_caught_up: bool = false,
     cutover_ready: bool = false,
     reads_ready_after_cutover: bool = false,
+    doc_identity_reassignment_active: bool = false,
     last_voter_store_id: u64 = 0,
+    doc_identity: metadata_table_manager.RuntimeDocIdentityStatusReport = .{},
+    doc_identity_namespace_conflict: bool = false,
 };
 
 pub fn mergeHealthyGroupStatuses(
@@ -642,7 +645,7 @@ pub fn mergeHealthyGroupStatuses(
 
         for (store.runtime_statuses) |runtime_status| {
             if (!storeHasPlacement(placement_intents, runtime_status.group_id, store.node_id)) continue;
-            if (runtime_status.doc_count == 0 and runtime_status.disk_bytes == 0) continue;
+            if (runtime_status.doc_count == 0 and runtime_status.disk_bytes == 0 and !runtimeDocIdentityHasFacts(runtime_status.doc_identity)) continue;
             const entry = try indexes.getOrPut(alloc, runtime_status.group_id);
             if (!entry.found_existing) {
                 entry.value_ptr.* = states.items.len;
@@ -678,6 +681,7 @@ pub fn mergeHealthyGroupStatuses(
                     state.observed_voter_count = voter_count;
                 }
             }
+            mergeRuntimeDocIdentity(state, runtime_status.doc_identity);
         }
     }
 
@@ -705,6 +709,10 @@ pub fn mergeHealthyGroupStatuses(
             .replay_caught_up = state.replay_caught_up,
             .cutover_ready = state.cutover_ready,
             .reads_ready_after_cutover = state.reads_ready_after_cutover,
+            .doc_identity_reassignment_active = state.doc_identity_reassignment_active,
+            .doc_identity_lifecycle = metadata_reconciler.doc_identity_lifecycle_unknown,
+            .doc_identity = state.doc_identity,
+            .doc_identity_namespace_conflict = state.doc_identity_namespace_conflict,
         };
         if (!state.ambiguous_leader) {
             if (state.latest_leader) |leader| {
@@ -719,13 +727,112 @@ pub fn mergeHealthyGroupStatuses(
             }
         }
     }
+    overlayDocIdentityNamespaceExpectations(merged, ranges);
     overlayTransitionObservationReadiness(merged, split_transitions, merge_transitions, split_observations, merge_observations);
     overlayRestoreReadiness(merged, tables, ranges, placement_intents, restore_progresses);
+    refreshDocIdentityLifecycles(merged);
     return merged;
 }
 
 pub fn freeMergedGroupStatuses(alloc: std.mem.Allocator, statuses: []metadata_reconciler.MergedGroupStatus) void {
     alloc.free(statuses);
+}
+
+fn mergeRuntimeDocIdentity(
+    state: *GroupStatusMergeState,
+    incoming: metadata_table_manager.RuntimeDocIdentityStatusReport,
+) void {
+    if (!runtimeDocIdentityHasFacts(incoming)) return;
+    if (!runtimeDocIdentityHasFacts(state.doc_identity)) {
+        state.doc_identity = incoming;
+        return;
+    }
+    if (runtimeDocIdentityHasOrdinalRows(state.doc_identity) and runtimeDocIdentityHasOrdinalRows(incoming) and
+        !runtimeDocIdentitySameNamespace(state.doc_identity, incoming))
+    {
+        state.doc_identity_namespace_conflict = true;
+    }
+    state.doc_identity.rebuild_required = state.doc_identity.rebuild_required or incoming.rebuild_required;
+    state.doc_identity.ordinal_capacity_exhausted = state.doc_identity.ordinal_capacity_exhausted or incoming.ordinal_capacity_exhausted;
+    state.doc_identity.complete = state.doc_identity.complete and incoming.complete;
+    state.doc_identity.allocated_ordinals = @max(state.doc_identity.allocated_ordinals, incoming.allocated_ordinals);
+    state.doc_identity.state_rows = @max(state.doc_identity.state_rows, incoming.state_rows);
+    state.doc_identity.live_ordinals = @max(state.doc_identity.live_ordinals, incoming.live_ordinals);
+    state.doc_identity.tombstone_ordinals = @max(state.doc_identity.tombstone_ordinals, incoming.tombstone_ordinals);
+    state.doc_identity.primary_docs_missing_ordinals = @max(state.doc_identity.primary_docs_missing_ordinals, incoming.primary_docs_missing_ordinals);
+    state.doc_identity.primary_docs_missing_identity_state = @max(state.doc_identity.primary_docs_missing_identity_state, incoming.primary_docs_missing_identity_state);
+    state.doc_identity.primary_docs_with_tombstone_ordinals = @max(state.doc_identity.primary_docs_with_tombstone_ordinals, incoming.primary_docs_with_tombstone_ordinals);
+}
+
+fn runtimeDocIdentityHasFacts(stats: metadata_table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.namespace_table_id != 0 or
+        stats.namespace_shard_id != 0 or
+        stats.namespace_range_id != 0 or
+        stats.next_ordinal != 1 or
+        stats.allocated_ordinals != 0 or
+        stats.ordinal_capacity_remaining != 0 or
+        stats.ordinal_capacity_exhausted or
+        stats.rebuild_required or
+        stats.state_rows != 0 or
+        stats.live_ordinals != 0 or
+        stats.tombstone_ordinals != 0 or
+        stats.min_created_generation != 0 or
+        stats.max_created_generation != 0 or
+        stats.min_deleted_generation != 0 or
+        stats.max_deleted_generation != 0 or
+        stats.scanned_primary_docs != 0 or
+        stats.primary_docs_missing_ordinals != 0 or
+        stats.primary_docs_missing_identity_state != 0 or
+        stats.primary_docs_with_tombstone_ordinals != 0 or
+        stats.complete;
+}
+
+fn runtimeDocIdentityHasOrdinalRows(stats: metadata_table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.next_ordinal != 1 or
+        stats.allocated_ordinals != 0 or
+        stats.state_rows != 0 or
+        stats.live_ordinals != 0 or
+        stats.tombstone_ordinals != 0;
+}
+
+fn runtimeDocIdentityHasNamespace(stats: metadata_table_manager.RuntimeDocIdentityStatusReport) bool {
+    return stats.namespace_table_id != 0 or
+        stats.namespace_shard_id != 0 or
+        stats.namespace_range_id != 0;
+}
+
+fn runtimeDocIdentitySameNamespace(
+    left: metadata_table_manager.RuntimeDocIdentityStatusReport,
+    right: metadata_table_manager.RuntimeDocIdentityStatusReport,
+) bool {
+    return left.namespace_table_id == right.namespace_table_id and
+        left.namespace_shard_id == right.namespace_shard_id and
+        left.namespace_range_id == right.namespace_range_id;
+}
+
+fn overlayDocIdentityNamespaceExpectations(
+    merged: []metadata_reconciler.MergedGroupStatus,
+    ranges: []const metadata_table_manager.RangeRecord,
+) void {
+    for (merged) |*status| {
+        const range = findRangeForGroup(ranges, status.group_id) orelse continue;
+        markDocIdentityRebuildRequiredOnNamespaceMismatch(status, range);
+    }
+}
+
+fn markDocIdentityRebuildRequiredOnNamespaceMismatch(
+    status: *metadata_reconciler.MergedGroupStatus,
+    range: metadata_table_manager.RangeRecord,
+) void {
+    if (!runtimeDocIdentityHasNamespace(status.doc_identity)) return;
+    if (status.doc_identity.namespace_table_id == range.table_id and
+        status.doc_identity.namespace_shard_id == metadata_table_manager.rangeDocIdentityShardId(range) and
+        status.doc_identity.namespace_range_id == metadata_table_manager.rangeDocIdentityRangeId(range)) return;
+    status.doc_identity.rebuild_required = true;
+}
+
+fn refreshDocIdentityLifecycles(merged: []metadata_reconciler.MergedGroupStatus) void {
+    for (merged) |*status| metadata_reconciler.refreshDocIdentityLifecycle(status);
 }
 
 fn storeHasPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
@@ -918,6 +1025,7 @@ fn applyMergeObservationReadiness(
     status.replay_caught_up = observation.replay_caught_up;
     status.cutover_ready = observation.cutover_ready;
     status.reads_ready_after_cutover = observation.receiver_ready_for_reads;
+    status.doc_identity_reassignment_active = status.doc_identity_reassignment_active or observation.allow_doc_identity_reassignment;
 }
 
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: transition_state.SplitTransitionRecord) !transition_state.SplitTransitionRecord {
@@ -939,6 +1047,7 @@ fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTran
         .receiver_group_id = record.receiver_group_id,
         .phase = record.phase,
         .rollback_reason = if (record.rollback_reason) |value| try alloc.dupe(u8, value) else null,
+        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
     };
 }
 
@@ -1324,6 +1433,279 @@ test "metadata state merges healthy group status and prefers leader readiness" {
     try std.testing.expect(merged[0].reads_ready_after_cutover);
 }
 
+test "metadata state merges runtime document identity facts into group status" {
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 7021, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 11 },
+    };
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .runtime_statuses = @constCast((&[_]metadata_table_manager.RuntimeGroupStatusReport{
+                .{
+                    .table_id = 70,
+                    .table_name = "docs",
+                    .group_id = 7021,
+                    .doc_identity = .{
+                        .namespace_table_id = 70,
+                        .namespace_shard_id = 7021,
+                        .namespace_range_id = 9001,
+                        .next_ordinal = 12,
+                        .allocated_ordinals = 11,
+                        .live_ordinals = 10,
+                        .tombstone_ordinals = 1,
+                        .complete = true,
+                    },
+                },
+            })[0..]),
+        },
+    };
+
+    const merged = try mergeHealthyGroupStatuses(std.testing.allocator, &.{}, &.{}, &placements, &.{}, &stores, &.{}, &.{}, &.{}, &.{});
+    defer freeMergedGroupStatuses(std.testing.allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expectEqual(@as(u64, 7021), merged[0].group_id);
+    try std.testing.expectEqual(@as(u64, 70), merged[0].doc_identity.namespace_table_id);
+    try std.testing.expectEqual(@as(u64, 7021), merged[0].doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(@as(u64, 9001), merged[0].doc_identity.namespace_range_id);
+    try std.testing.expectEqual(@as(u32, 12), merged[0].doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 11), merged[0].doc_identity.allocated_ordinals);
+    try std.testing.expect(!merged[0].doc_identity_namespace_conflict);
+    try std.testing.expectEqualStrings(metadata_reconciler.doc_identity_lifecycle_ready, merged[0].doc_identity_lifecycle);
+}
+
+test "metadata state marks doc identity rebuild required on range namespace mismatch" {
+    const ranges = [_]metadata_table_manager.RangeRecord{
+        .{
+            .group_id = 7031,
+            .range_id = 9101,
+            .table_id = 70,
+            .start_key = "doc:a",
+            .end_key = "doc:m",
+        },
+        .{
+            .group_id = 7032,
+            .range_id = 9102,
+            .table_id = 70,
+            .start_key = "doc:m",
+            .end_key = "doc:z",
+        },
+        .{
+            .group_id = 7033,
+            .range_id = 9103,
+            .table_id = 70,
+            .start_key = "doc:z",
+            .end_key = null,
+        },
+    };
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 7031, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 11 },
+        .{ .record = .{ .group_id = 7032, .replica_id = 2, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 11 },
+        .{ .record = .{ .group_id = 7033, .replica_id = 3, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 11 },
+    };
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .runtime_statuses = @constCast((&[_]metadata_table_manager.RuntimeGroupStatusReport{
+                .{
+                    .table_id = 70,
+                    .table_name = "docs",
+                    .group_id = 7031,
+                    .doc_identity = .{
+                        .namespace_table_id = 70,
+                        .namespace_shard_id = 7031,
+                        .namespace_range_id = 9101,
+                        .next_ordinal = 12,
+                        .allocated_ordinals = 11,
+                    },
+                },
+                .{
+                    .table_id = 70,
+                    .table_name = "docs",
+                    .group_id = 7032,
+                    .doc_identity = .{
+                        .namespace_table_id = 70,
+                        .namespace_shard_id = 7032,
+                        .namespace_range_id = 8001,
+                        .next_ordinal = 8,
+                        .allocated_ordinals = 7,
+                    },
+                },
+                .{
+                    .table_id = 70,
+                    .table_name = "docs",
+                    .group_id = 7033,
+                    .doc_identity = .{
+                        .namespace_table_id = 70,
+                        .namespace_shard_id = 9999,
+                        .namespace_range_id = 9999,
+                        .complete = true,
+                    },
+                },
+            })[0..]),
+        },
+    };
+
+    const merged = try mergeHealthyGroupStatuses(std.testing.allocator, &.{}, &ranges, &placements, &.{}, &stores, &.{}, &.{}, &.{}, &.{});
+    defer freeMergedGroupStatuses(std.testing.allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
+    const first = findMergedGroupStatus(merged, 7031).?;
+    const second = findMergedGroupStatus(merged, 7032).?;
+    const third = findMergedGroupStatus(merged, 7033).?;
+    try std.testing.expect(!first.doc_identity.rebuild_required);
+    try std.testing.expect(second.doc_identity.rebuild_required);
+    try std.testing.expect(third.doc_identity.rebuild_required);
+    try std.testing.expectEqualStrings(metadata_reconciler.doc_identity_lifecycle_rebuild_required, second.doc_identity_lifecycle);
+    try std.testing.expectEqualStrings(metadata_reconciler.doc_identity_lifecycle_rebuild_required, third.doc_identity_lifecycle);
+
+    const preserved_split_ranges = [_]metadata_table_manager.RangeRecord{
+        .{
+            .group_id = 7031,
+            .range_id = 9101,
+            .table_id = 70,
+            .start_key = "doc:a",
+            .end_key = "doc:m",
+        },
+        .{
+            .group_id = 7032,
+            .range_id = 9102,
+            .table_id = 70,
+            .start_key = "doc:m",
+            .end_key = "doc:z",
+            .doc_identity_shard_id = 7031,
+            .doc_identity_range_id = 9101,
+        },
+    };
+    const preserved_split_stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .runtime_statuses = @constCast((&[_]metadata_table_manager.RuntimeGroupStatusReport{
+                .{
+                    .table_id = 70,
+                    .table_name = "docs",
+                    .group_id = 7032,
+                    .doc_identity = .{
+                        .namespace_table_id = 70,
+                        .namespace_shard_id = 7031,
+                        .namespace_range_id = 9101,
+                        .next_ordinal = 8,
+                        .allocated_ordinals = 7,
+                    },
+                },
+            })[0..]),
+        },
+    };
+    const preserved_split_merged = try mergeHealthyGroupStatuses(std.testing.allocator, &.{}, &preserved_split_ranges, &placements, &.{}, &preserved_split_stores, &.{}, &.{}, &.{}, &.{});
+    defer freeMergedGroupStatuses(std.testing.allocator, preserved_split_merged);
+
+    try std.testing.expectEqual(@as(usize, 1), preserved_split_merged.len);
+    try std.testing.expect(!preserved_split_merged[0].doc_identity.rebuild_required);
+    try std.testing.expectEqualStrings(metadata_reconciler.doc_identity_lifecycle_preserving, preserved_split_merged[0].doc_identity_lifecycle);
+}
+
+test "metadata state classifies mixed-version doc identity lifecycle reports" {
+    const ranges = [_]metadata_table_manager.RangeRecord{
+        .{
+            .group_id = 7041,
+            .range_id = 9201,
+            .table_id = 70,
+            .start_key = "doc:a",
+            .end_key = "doc:m",
+        },
+        .{
+            .group_id = 7042,
+            .range_id = 9202,
+            .table_id = 70,
+            .start_key = "doc:m",
+            .end_key = "doc:t",
+            .doc_identity_shard_id = 7041,
+            .doc_identity_range_id = 9201,
+        },
+        .{
+            .group_id = 7043,
+            .range_id = 9203,
+            .table_id = 70,
+            .start_key = "doc:t",
+            .end_key = null,
+        },
+    };
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 7041, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 11 },
+        .{ .record = .{ .group_id = 7042, .replica_id = 2, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 11 },
+        .{ .record = .{ .group_id = 7043, .replica_id = 3, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 11 },
+    };
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{
+                .{
+                    .group_id = 7041,
+                    .updated_at_millis = 10,
+                    .local_voter = true,
+                    .voter_count = 1,
+                },
+            })[0..]),
+            .runtime_statuses = @constCast((&[_]metadata_table_manager.RuntimeGroupStatusReport{
+                .{
+                    .table_id = 70,
+                    .table_name = "docs",
+                    .group_id = 7042,
+                    .doc_identity = .{
+                        .namespace_table_id = 70,
+                        .namespace_shard_id = 7041,
+                        .namespace_range_id = 9201,
+                    },
+                },
+                .{
+                    .table_id = 70,
+                    .table_name = "docs",
+                    .group_id = 7043,
+                    .doc_identity = .{
+                        .namespace_table_id = 70,
+                        .namespace_shard_id = 9999,
+                        .namespace_range_id = 9999,
+                        .complete = true,
+                    },
+                },
+            })[0..]),
+        },
+    };
+
+    const merged = try mergeHealthyGroupStatuses(std.testing.allocator, &.{}, &ranges, &placements, &.{}, &stores, &.{}, &.{}, &.{}, &.{});
+    defer freeMergedGroupStatuses(std.testing.allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
+    const old_node = findMergedGroupStatus(merged, 7041).?;
+    const preserved_split = findMergedGroupStatus(merged, 7042).?;
+    const stale_namespace = findMergedGroupStatus(merged, 7043).?;
+
+    try std.testing.expect(!old_node.doc_identity.rebuild_required);
+    try std.testing.expectEqualStrings(metadata_reconciler.doc_identity_lifecycle_unknown, old_node.doc_identity_lifecycle);
+
+    try std.testing.expect(!preserved_split.doc_identity.rebuild_required);
+    try std.testing.expectEqualStrings(metadata_reconciler.doc_identity_lifecycle_preserving, preserved_split.doc_identity_lifecycle);
+
+    try std.testing.expect(stale_namespace.doc_identity.rebuild_required);
+    try std.testing.expectEqualStrings(metadata_reconciler.doc_identity_lifecycle_rebuild_required, stale_namespace.doc_identity_lifecycle);
+}
+
 test "metadata state prefers leader-qualified transition observation over follower heartbeat readiness" {
     const stores = [_]metadata_table_manager.StoreRecord{
         .{
@@ -1399,6 +1781,81 @@ test "metadata state prefers leader-qualified transition observation over follow
     try std.testing.expect(merged[0].replay_caught_up);
     try std.testing.expect(merged[0].cutover_ready);
     try std.testing.expect(merged[0].reads_ready_after_cutover);
+}
+
+test "metadata state carries merge doc identity reassignment observation" {
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 22,
+            .node_id = 2,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{
+                .{
+                    .group_id = 7104,
+                    .doc_count = 20,
+                    .disk_bytes = 200,
+                    .empty = false,
+                    .updated_at_millis = 300,
+                    .local_leader = false,
+                },
+            })[0..]),
+        },
+    };
+
+    const merge_transitions = [_]transition_state.MergeTransitionRecord{
+        .{
+            .transition_id = 9102,
+            .donor_group_id = 7103,
+            .receiver_group_id = 7104,
+            .phase = .replay_deltas,
+            .allow_doc_identity_reassignment = true,
+        },
+    };
+    const receiver_status: data.MergeTransitionStatus = .{
+        .phase = .cutover_ready,
+        .donor_group_id = 7103,
+        .receiver_group_id = 7104,
+        .receiver_accepts_donor_range = true,
+        .bootstrapped = true,
+        .replay_required = true,
+        .replay_caught_up = true,
+        .cutover_ready = true,
+        .receiver_ready_for_reads = true,
+        .donor_delta_sequence = 4,
+        .receiver_delta_sequence = 4,
+        .allow_doc_identity_reassignment = true,
+    };
+    const merge_observations = [_]metadata_reconciler.MergeRuntimeObservation{
+        .{
+            .transition_id = 9102,
+            .observation = .{
+                .donor = receiver_status,
+                .receiver = receiver_status,
+                .receiver_local_leader = true,
+            },
+        },
+    };
+
+    const merged = try mergeHealthyGroupStatuses(
+        std.testing.allocator,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &stores,
+        &.{},
+        &merge_transitions,
+        &.{},
+        &merge_observations,
+    );
+    defer freeMergedGroupStatuses(std.testing.allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expect(merged[0].readiness_from_leader);
+    try std.testing.expect(merged[0].doc_identity_reassignment_active);
+    try std.testing.expectEqualStrings(metadata_reconciler.doc_identity_lifecycle_reassigning, merged[0].doc_identity_lifecycle);
 }
 
 test "metadata state conservatively aggregates readiness across healthy peers without leader truth" {

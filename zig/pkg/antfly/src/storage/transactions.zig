@@ -93,6 +93,11 @@ pub const TxnSummary = struct {
     finalized_at: u64,
 };
 
+pub const ResolutionExtraBatch = struct {
+    writes: []const docstore.KVPair = &.{},
+    deletes: []const []const u8 = &.{},
+};
+
 const TxnRecord = struct {
     status: TxnStatus,
     begin_timestamp: u64,
@@ -119,6 +124,18 @@ pub const TxnManager = struct {
     alloc: Allocator,
     trace_writer: ?tracing.AntflyTraceWriter = null,
     shard_id: []const u8 = "local",
+
+    pub const RecoveryExtraBatchHooks = struct {
+        ctx: ?*anyopaque = null,
+        build: ?*const fn (
+            ctx: ?*anyopaque,
+            manager: *TxnManager,
+            txn_id: TxnId,
+            status: TxnStatus,
+            timestamp: u64,
+        ) anyerror!ResolutionExtraBatch = null,
+        cleanup: ?*const fn (ctx: ?*anyopaque, batch: ResolutionExtraBatch) void = null,
+    };
 
     pub fn init(alloc: Allocator, store: anytype) !TxnManager {
         const runtime_store = try initRuntimeStore(alloc, store);
@@ -232,6 +249,16 @@ pub const TxnManager = struct {
     /// should treat that as a protocol inconsistency / torn-state signal rather
     /// than a retryable OCC conflict.
     pub fn resolveIntents(self: *TxnManager, txn_id: TxnId, status: TxnStatus, timestamp: u64) !void {
+        try self.resolveIntentsWithExtraBatch(txn_id, status, timestamp, .{});
+    }
+
+    pub fn resolveIntentsWithExtraBatch(
+        self: *TxnManager,
+        txn_id: TxnId,
+        status: TxnStatus,
+        timestamp: u64,
+        extra_batch: ResolutionExtraBatch,
+    ) !void {
         const rec_key = makeRecordKey(txn_id);
         var record = try self.loadTransactionRecord(txn_id);
         applyResolveDecision(&record, status, timestamp) catch |err| {
@@ -310,6 +337,8 @@ pub const TxnManager = struct {
         const rec_val = try self.encodeRecord(record);
         defer self.alloc.free(rec_val);
         try writes.append(self.alloc, .{ .key = &rec_key, .value = rec_val });
+        try writes.appendSlice(self.alloc, extra_batch.writes);
+        try deletes.appendSlice(self.alloc, extra_batch.deletes);
 
         try self.applyBatch(writes.items, deletes.items);
 
@@ -326,6 +355,33 @@ pub const TxnManager = struct {
                 .timestamp = timestamp,
                 .reason = if (status == .committed) "committed" else "aborted",
             });
+        }
+    }
+
+    pub fn collectIntentDocumentKeys(
+        self: *TxnManager,
+        alloc: Allocator,
+        txn_id: TxnId,
+        upserts: *std.ArrayListUnmanaged([]const u8),
+        deletes: *std.ArrayListUnmanaged([]const u8),
+    ) !void {
+        var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
+        @memcpy(intent_prefix_buf[0..intents_prefix.len], intents_prefix);
+        @memcpy(intent_prefix_buf[intents_prefix.len..][0..16], &txn_id);
+        intent_prefix_buf[intents_prefix.len + 16] = ':';
+        const scan_prefix = intent_prefix_buf[0 .. intents_prefix.len + 17];
+
+        const intent_entries = try self.scanPrefix(alloc, scan_prefix);
+        defer backend_scan.freeResults(alloc, intent_entries);
+
+        for (intent_entries) |entry| {
+            const user_key = entry.key[intents_prefix.len + 17 ..];
+            const owned_key = try alloc.dupe(u8, user_key);
+            if (entry.value.len > 0 and entry.value[0] == 1) {
+                try deletes.append(alloc, owned_key);
+            } else {
+                try upserts.append(alloc, owned_key);
+            }
         }
     }
 
@@ -415,6 +471,15 @@ pub const TxnManager = struct {
     }
 
     pub fn recoverTransactions(self: *TxnManager, cutoff_timestamp: u64, resolution_timestamp: u64) !RecoveryStats {
+        return try self.recoverTransactionsWithExtraBatchHooks(cutoff_timestamp, resolution_timestamp, .{});
+    }
+
+    pub fn recoverTransactionsWithExtraBatchHooks(
+        self: *TxnManager,
+        cutoff_timestamp: u64,
+        resolution_timestamp: u64,
+        extra_hooks: RecoveryExtraBatchHooks,
+    ) !RecoveryStats {
         var stats: RecoveryStats = .{};
         const records = try self.scanPrefix(self.alloc, records_prefix);
         defer backend_scan.freeResults(self.alloc, records);
@@ -450,7 +515,16 @@ pub const TxnManager = struct {
                     .aborted => if (record.finalized_at > 0) record.finalized_at else resolution_timestamp,
                     .pending => unreachable,
                 };
-                try self.resolveIntents(txn_id, record.status, resolve_ts);
+                var extra_batch: ResolutionExtraBatch = .{};
+                var extra_batch_initialized = false;
+                defer if (extra_batch_initialized) {
+                    if (extra_hooks.cleanup) |cleanup| cleanup(extra_hooks.ctx, extra_batch);
+                };
+                if (extra_hooks.build) |build| {
+                    extra_batch = try build(extra_hooks.ctx, self, txn_id, record.status, resolve_ts);
+                    extra_batch_initialized = true;
+                }
+                try self.resolveIntentsWithExtraBatch(txn_id, record.status, resolve_ts, extra_batch);
                 stats.resolved_finalized += 1;
             }
 
@@ -1395,6 +1469,81 @@ test "recoverTransactions resolves committed orphaned intents and cleans old rec
     try std.testing.expectEqualStrings("committed", doc);
     try std.testing.expectEqual(@as(?u64, 2_000), try ttl.readTimestamp(&store, alloc, "doc:orphan_commit"));
     try std.testing.expectError(TxnError.TxnNotFound, mgr.getTransactionStatus(txn_id));
+}
+
+test "recoverTransactions appends extra resolution batch for committed orphaned intents" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-recover-committed-extra");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+
+    var mgr = try TxnManager.init(alloc, &store);
+    defer mgr.deinit();
+    const txn_id: TxnId = .{ 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16 };
+    try mgr.initTransaction(txn_id, 1_000);
+    try mgr.writeIntents(txn_id, &.{
+        .{ .key = "doc:orphan_extra", .value = "committed" },
+    }, &.{});
+
+    const committed = TxnRecord{
+        .status = .committed,
+        .begin_timestamp = 1_000,
+        .commit_version = 2_000,
+        .created_at = 1_000,
+        .finalized_at = 2_000,
+    };
+    try mgr.saveTransactionRecord(makeRecordKey(txn_id), committed);
+
+    const Hook = struct {
+        const extra_key = "\x00\x00__metadata__:txn-extra";
+        const extra_value = "seen";
+
+        fn build(
+            ctx: ?*anyopaque,
+            manager: *TxnManager,
+            hook_txn_id: TxnId,
+            status: TxnStatus,
+            timestamp: u64,
+        ) anyerror!ResolutionExtraBatch {
+            _ = manager;
+            _ = hook_txn_id;
+            _ = timestamp;
+            try std.testing.expectEqual(TxnStatus.committed, status);
+            const hook_alloc: *Allocator = @ptrCast(@alignCast(ctx.?));
+            const writes = try hook_alloc.alloc(docstore.KVPair, 1);
+            errdefer hook_alloc.free(writes);
+            writes[0] = .{
+                .key = try hook_alloc.dupe(u8, extra_key),
+                .value = try hook_alloc.dupe(u8, extra_value),
+            };
+            return .{ .writes = writes };
+        }
+
+        fn cleanup(ctx: ?*anyopaque, batch: ResolutionExtraBatch) void {
+            const hook_alloc: *Allocator = @ptrCast(@alignCast(ctx.?));
+            for (batch.writes) |item| {
+                hook_alloc.free(@constCast(item.key));
+                hook_alloc.free(@constCast(item.value));
+            }
+            if (batch.writes.len > 0) hook_alloc.free(@constCast(batch.writes));
+        }
+    };
+
+    var hook_alloc = alloc;
+    const stats = try mgr.recoverTransactionsWithExtraBatchHooks(3_000, 4_000, .{
+        .ctx = &hook_alloc,
+        .build = Hook.build,
+        .cleanup = Hook.cleanup,
+    });
+    try std.testing.expectEqual(@as(u64, 1), stats.resolved_finalized);
+    try std.testing.expectEqual(@as(u64, 1), stats.cleaned_records);
+
+    const extra = try store.get(alloc, Hook.extra_key);
+    defer alloc.free(extra);
+    try std.testing.expectEqualStrings(Hook.extra_value, extra);
 }
 
 test "recoverTransactions cleans aborted orphaned intents and old record" {

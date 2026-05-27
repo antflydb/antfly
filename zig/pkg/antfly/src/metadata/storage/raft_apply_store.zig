@@ -1534,7 +1534,7 @@ pub const RaftApplyStore = struct {
 };
 
 const transition_magic = "afmd1";
-const runtime_status_record_version: u16 = 2;
+const runtime_status_record_version: u16 = 4;
 
 const TransitionTag = enum(u8) {
     upsert_node = 1,
@@ -2162,6 +2162,8 @@ fn appendRuntimeGroupStatusRecord(
     try out.append(alloc, if (record.async_startup_active) 1 else 0);
     try out.append(alloc, if (record.async_dense_catch_up_active) 1 else 0);
     try out.append(alloc, if (record.async_bulk_coalescing_active) 1 else 0);
+    try appendRuntimeDocIdentityStatusRecord(alloc, out, record.doc_identity);
+    try appendRuntimeDocSetPlanningStatusRecord(alloc, out, record.doc_set_planning);
     try appendInt(alloc, out, u32, @intCast(record.indexes.len));
     for (record.indexes) |index| try appendRuntimeIndexStatusRecord(alloc, out, index);
 }
@@ -2172,7 +2174,7 @@ fn readRuntimeGroupStatusRecord(
     pos: *usize,
 ) !metadata.RuntimeGroupStatusReport {
     const version = try readInt(encoded, pos, u16);
-    if (version != 1 and version != runtime_status_record_version) return error.InvalidMetadataTransitionEncoding;
+    if (version != 1 and version != 2 and version != 3 and version != runtime_status_record_version) return error.InvalidMetadataTransitionEncoding;
     const table_id = try readInt(encoded, pos, u64);
     const table_name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(table_name);
@@ -2210,6 +2212,8 @@ fn readRuntimeGroupStatusRecord(
     pos.* += 1;
     const async_bulk_coalescing_active = encoded[pos.*] != 0;
     pos.* += 1;
+    const doc_identity = if (version >= 3) try readRuntimeDocIdentityStatusRecord(encoded, pos) else metadata.RuntimeDocIdentityStatusReport{};
+    const doc_set_planning = if (version >= 3) try readRuntimeDocSetPlanningStatusRecord(encoded, pos, version) else metadata.RuntimeDocSetPlanningStatusReport{};
     const runtime_index_count = try readInt(encoded, pos, u32);
     const indexes = try alloc.alloc(metadata.RuntimeIndexStatusReport, runtime_index_count);
     var initialized: usize = 0;
@@ -2245,7 +2249,131 @@ fn readRuntimeGroupStatusRecord(
         .async_startup_active = async_startup_active,
         .async_dense_catch_up_active = async_dense_catch_up_active,
         .async_bulk_coalescing_active = async_bulk_coalescing_active,
+        .doc_identity = doc_identity,
+        .doc_set_planning = doc_set_planning,
         .indexes = indexes,
+    };
+}
+
+fn appendRuntimeDocIdentityStatusRecord(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: metadata.RuntimeDocIdentityStatusReport,
+) !void {
+    try appendInt(alloc, out, u64, record.namespace_table_id);
+    try appendInt(alloc, out, u64, record.namespace_shard_id);
+    try appendInt(alloc, out, u64, record.namespace_range_id);
+    try appendInt(alloc, out, u32, record.next_ordinal);
+    try appendInt(alloc, out, u64, record.allocated_ordinals);
+    try appendInt(alloc, out, u64, record.ordinal_capacity_remaining);
+    try out.append(alloc, if (record.ordinal_capacity_exhausted) 1 else 0);
+    try out.append(alloc, if (record.rebuild_required) 1 else 0);
+    try appendInt(alloc, out, u64, record.state_rows);
+    try appendInt(alloc, out, u64, record.live_ordinals);
+    try appendInt(alloc, out, u64, record.tombstone_ordinals);
+    try appendInt(alloc, out, u64, record.min_created_generation);
+    try appendInt(alloc, out, u64, record.max_created_generation);
+    try appendInt(alloc, out, u64, record.min_deleted_generation);
+    try appendInt(alloc, out, u64, record.max_deleted_generation);
+    try appendInt(alloc, out, u64, record.scanned_primary_docs);
+    try appendInt(alloc, out, u64, record.primary_docs_missing_ordinals);
+    try appendInt(alloc, out, u64, record.primary_docs_missing_identity_state);
+    try appendInt(alloc, out, u64, record.primary_docs_with_tombstone_ordinals);
+    try out.append(alloc, if (record.complete) 1 else 0);
+}
+
+fn readRuntimeDocIdentityStatusRecord(
+    encoded: []const u8,
+    pos: *usize,
+) !metadata.RuntimeDocIdentityStatusReport {
+    const namespace_table_id = try readInt(encoded, pos, u64);
+    const namespace_shard_id = try readInt(encoded, pos, u64);
+    const namespace_range_id = try readInt(encoded, pos, u64);
+    const next_ordinal = try readInt(encoded, pos, u32);
+    const allocated_ordinals = try readInt(encoded, pos, u64);
+    const ordinal_capacity_remaining = try readInt(encoded, pos, u64);
+    if (pos.* + 2 > encoded.len) return error.InvalidMetadataTransitionEncoding;
+    const ordinal_capacity_exhausted = encoded[pos.*] != 0;
+    pos.* += 1;
+    const rebuild_required = encoded[pos.*] != 0;
+    pos.* += 1;
+    const state_rows = try readInt(encoded, pos, u64);
+    const live_ordinals = try readInt(encoded, pos, u64);
+    const tombstone_ordinals = try readInt(encoded, pos, u64);
+    const min_created_generation = try readInt(encoded, pos, u64);
+    const max_created_generation = try readInt(encoded, pos, u64);
+    const min_deleted_generation = try readInt(encoded, pos, u64);
+    const max_deleted_generation = try readInt(encoded, pos, u64);
+    const scanned_primary_docs = try readInt(encoded, pos, u64);
+    const primary_docs_missing_ordinals = try readInt(encoded, pos, u64);
+    const primary_docs_missing_identity_state = try readInt(encoded, pos, u64);
+    const primary_docs_with_tombstone_ordinals = try readInt(encoded, pos, u64);
+    if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+    const complete = encoded[pos.*] != 0;
+    pos.* += 1;
+    return .{
+        .namespace_table_id = namespace_table_id,
+        .namespace_shard_id = namespace_shard_id,
+        .namespace_range_id = namespace_range_id,
+        .next_ordinal = next_ordinal,
+        .allocated_ordinals = allocated_ordinals,
+        .ordinal_capacity_remaining = ordinal_capacity_remaining,
+        .ordinal_capacity_exhausted = ordinal_capacity_exhausted,
+        .rebuild_required = rebuild_required,
+        .state_rows = state_rows,
+        .live_ordinals = live_ordinals,
+        .tombstone_ordinals = tombstone_ordinals,
+        .min_created_generation = min_created_generation,
+        .max_created_generation = max_created_generation,
+        .min_deleted_generation = min_deleted_generation,
+        .max_deleted_generation = max_deleted_generation,
+        .scanned_primary_docs = scanned_primary_docs,
+        .primary_docs_missing_ordinals = primary_docs_missing_ordinals,
+        .primary_docs_missing_identity_state = primary_docs_missing_identity_state,
+        .primary_docs_with_tombstone_ordinals = primary_docs_with_tombstone_ordinals,
+        .complete = complete,
+    };
+}
+
+fn appendRuntimeDocSetPlanningStatusRecord(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: metadata.RuntimeDocSetPlanningStatusReport,
+) !void {
+    try appendInt(alloc, out, u64, record.resolved_set_count);
+    try appendInt(alloc, out, u64, record.all_set_count);
+    try appendInt(alloc, out, u64, record.none_set_count);
+    try appendInt(alloc, out, u64, record.doc_key_list_count);
+    try appendInt(alloc, out, u64, record.ordinal_list_count);
+    try appendInt(alloc, out, u64, record.ordinal_bitmap_count);
+    try appendInt(alloc, out, u64, record.doc_key_list_docs);
+    try appendInt(alloc, out, u64, record.ordinal_list_docs);
+    try appendInt(alloc, out, u64, record.ordinal_bitmap_docs);
+    try appendInt(alloc, out, u64, record.missing_ordinal_coverage_count);
+    try appendInt(alloc, out, u64, record.bitmap_promotion_count);
+    try appendInt(alloc, out, u64, record.unsupported_filter_shape_count);
+    try appendInt(alloc, out, u64, record.stale_identity_generation_rejection_count);
+}
+
+fn readRuntimeDocSetPlanningStatusRecord(
+    encoded: []const u8,
+    pos: *usize,
+    version: u16,
+) !metadata.RuntimeDocSetPlanningStatusReport {
+    return .{
+        .resolved_set_count = try readInt(encoded, pos, u64),
+        .all_set_count = try readInt(encoded, pos, u64),
+        .none_set_count = try readInt(encoded, pos, u64),
+        .doc_key_list_count = try readInt(encoded, pos, u64),
+        .ordinal_list_count = try readInt(encoded, pos, u64),
+        .ordinal_bitmap_count = try readInt(encoded, pos, u64),
+        .doc_key_list_docs = try readInt(encoded, pos, u64),
+        .ordinal_list_docs = try readInt(encoded, pos, u64),
+        .ordinal_bitmap_docs = try readInt(encoded, pos, u64),
+        .missing_ordinal_coverage_count = try readInt(encoded, pos, u64),
+        .bitmap_promotion_count = try readInt(encoded, pos, u64),
+        .unsupported_filter_shape_count = try readInt(encoded, pos, u64),
+        .stale_identity_generation_rejection_count = if (version >= 4) try readInt(encoded, pos, u64) else 0,
     };
 }
 
@@ -2573,6 +2701,10 @@ fn appendRangeRecord(
     try out.appendSlice(alloc, record.restore_location);
     try appendInt(alloc, out, u32, @intCast(record.restore_snapshot_path.len));
     try out.appendSlice(alloc, record.restore_snapshot_path);
+    const range_id = if (record.range_id == 0) record.group_id else record.range_id;
+    try appendInt(alloc, out, u64, range_id);
+    try appendInt(alloc, out, u64, record.doc_identity_shard_id);
+    try appendInt(alloc, out, u64, record.doc_identity_range_id);
 }
 
 fn appendSplitTransitionRecord(
@@ -2623,6 +2755,7 @@ fn appendMergeTransitionRecord(
     } else {
         try out.append(alloc, 0);
     }
+    try out.append(alloc, if (record.allow_doc_identity_reassignment) 1 else 0);
 }
 
 fn appendReconcileLeaseRecord(
@@ -2846,11 +2979,26 @@ fn readRangeRecord(
     else
         try alloc.dupe(u8, "");
     errdefer alloc.free(restore_snapshot_path);
+    const range_id = if (pos.* < encoded.len)
+        try readInt(encoded, pos, u64)
+    else
+        group_id;
+    const doc_identity_shard_id = if (pos.* < encoded.len)
+        try readInt(encoded, pos, u64)
+    else
+        0;
+    const doc_identity_range_id = if (pos.* < encoded.len)
+        try readInt(encoded, pos, u64)
+    else
+        0;
     return .{
         .group_id = group_id,
+        .range_id = if (range_id == 0) group_id else range_id,
         .table_id = table_id,
         .start_key = start_key,
         .end_key = end_key,
+        .doc_identity_shard_id = doc_identity_shard_id,
+        .doc_identity_range_id = doc_identity_range_id,
         .restore_backup_id = restore_backup_id,
         .restore_location = restore_location,
         .restore_snapshot_path = restore_snapshot_path,
@@ -3084,12 +3232,18 @@ fn readMergeTransitionRecord(
     const phase: metadata.TransitionPhase = @enumFromInt(encoded[pos.*]);
     pos.* += 1;
     const rollback_reason = try readOptionalString(alloc, encoded, pos);
+    const allow_doc_identity_reassignment = if (pos.* < encoded.len) blk: {
+        const value = encoded[pos.*] != 0;
+        pos.* += 1;
+        break :blk value;
+    } else false;
     return .{
         .transition_id = transition_id,
         .donor_group_id = donor_group_id,
         .receiver_group_id = receiver_group_id,
         .phase = phase,
         .rollback_reason = rollback_reason,
+        .allow_doc_identity_reassignment = allow_doc_identity_reassignment,
     };
 }
 
@@ -3296,6 +3450,7 @@ test "metadata raft apply store projects transition records from committed entri
             .donor_group_id = 31,
             .receiver_group_id = 30,
             .phase = .replay_deltas,
+            .allow_doc_identity_reassignment = true,
         },
     });
     defer std.testing.allocator.free(merge_cmd);
@@ -3327,6 +3482,7 @@ test "metadata raft apply store projects transition records from committed entri
         try std.testing.expectEqualStrings("slow-peer", splits[0].rollback_reason.?);
         try std.testing.expectEqual(@as(usize, 1), merges.len);
         try std.testing.expectEqual(@as(u64, 601), merges[0].transition_id);
+        try std.testing.expect(merges[0].allow_doc_identity_reassignment);
     }
 
     const remove_cmd = try encodeTransitionCommand(std.testing.allocator, .{
@@ -3359,6 +3515,7 @@ test "metadata raft apply store projects transition records from committed entri
         try std.testing.expectEqual(@as(usize, 0), splits.len);
         try std.testing.expectEqual(@as(usize, 1), merges.len);
         try std.testing.expectEqual(@as(u64, 601), merges[0].transition_id);
+        try std.testing.expect(merges[0].allow_doc_identity_reassignment);
     }
 }
 
@@ -3677,9 +3834,12 @@ test "metadata raft apply store projects table and range records from committed 
     const range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_range = .{
             .group_id = 4101,
+            .range_id = 4101,
             .table_id = 41,
             .start_key = "doc:a",
             .end_key = "doc:z",
+            .doc_identity_shard_id = 4001,
+            .doc_identity_range_id = 9001,
         },
     });
     defer std.testing.allocator.free(range_cmd);
@@ -3712,6 +3872,8 @@ test "metadata raft apply store projects table and range records from committed 
     try std.testing.expectEqualStrings("[\"seed\"]", tables[0].replication_sources_json);
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
     try std.testing.expectEqual(@as(u64, 4101), ranges[0].group_id);
+    try std.testing.expectEqual(@as(u64, 4001), ranges[0].doc_identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 9001), ranges[0].doc_identity_range_id);
     try std.testing.expectEqualStrings("doc:a", ranges[0].start_key);
 }
 
@@ -4658,6 +4820,72 @@ test "metadata state machine projects transitions through metadata apply store" 
     try std.testing.expectEqual(@as(usize, 1), splits.len);
     try std.testing.expectEqual(@as(u64, 701), splits[0].transition_id);
     try std.testing.expectEqual(@as(u64, 12), sink.last_index);
+}
+
+test "metadata raft apply store runtime status codec preserves document identity telemetry" {
+    const alloc = std.testing.allocator;
+
+    var runtime_statuses = [_]metadata.RuntimeGroupStatusReport{.{
+        .table_id = 1,
+        .table_name = "docs",
+        .group_id = 10,
+        .store_id = 20,
+        .node_id = 30,
+        .source = "background_refresh",
+        .freshness = "fresh",
+        .doc_identity = .{
+            .namespace_table_id = 1,
+            .namespace_shard_id = 10,
+            .namespace_range_id = 1001,
+            .next_ordinal = 44,
+            .allocated_ordinals = 43,
+            .ordinal_capacity_remaining = 123,
+            .rebuild_required = true,
+            .state_rows = 42,
+            .live_ordinals = 40,
+            .tombstone_ordinals = 2,
+            .min_created_generation = 11,
+            .max_created_generation = 17,
+            .min_deleted_generation = 15,
+            .max_deleted_generation = 18,
+            .scanned_primary_docs = 41,
+            .primary_docs_missing_ordinals = 1,
+            .primary_docs_with_tombstone_ordinals = 1,
+            .complete = true,
+        },
+        .doc_set_planning = .{
+            .resolved_set_count = 9,
+            .ordinal_list_count = 8,
+            .ordinal_list_docs = 7,
+            .missing_ordinal_coverage_count = 6,
+            .stale_identity_generation_rejection_count = 5,
+        },
+    }};
+
+    const encoded = try encodeStoreRecord(alloc, .{
+        .store_id = 20,
+        .node_id = 30,
+        .runtime_statuses = runtime_statuses[0..],
+    });
+    defer alloc.free(encoded);
+
+    const decoded = try decodeStoreRecord(alloc, encoded);
+    defer metadata_table_manager.freeStore(alloc, decoded);
+
+    try std.testing.expectEqual(@as(usize, 1), decoded.runtime_statuses.len);
+    const status = decoded.runtime_statuses[0];
+    try std.testing.expectEqual(@as(u64, 1), status.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(@as(u64, 10), status.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(@as(u64, 1001), status.doc_identity.namespace_range_id);
+    try std.testing.expectEqual(@as(u32, 44), status.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 43), status.doc_identity.allocated_ordinals);
+    try std.testing.expect(status.doc_identity.rebuild_required);
+    try std.testing.expect(status.doc_identity.complete);
+    try std.testing.expectEqual(@as(u64, 9), status.doc_set_planning.resolved_set_count);
+    try std.testing.expectEqual(@as(u64, 8), status.doc_set_planning.ordinal_list_count);
+    try std.testing.expectEqual(@as(u64, 7), status.doc_set_planning.ordinal_list_docs);
+    try std.testing.expectEqual(@as(u64, 6), status.doc_set_planning.missing_ordinal_coverage_count);
+    try std.testing.expectEqual(@as(u64, 5), status.doc_set_planning.stale_identity_generation_rejection_count);
 }
 
 test "metadata apply store replay is idempotent when applied watermark lags WAL state" {

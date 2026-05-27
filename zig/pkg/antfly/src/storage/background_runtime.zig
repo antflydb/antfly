@@ -262,12 +262,13 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         _ = self.reapCompleted(8);
 
         const entry = try self.alloc.create(Entry);
-        errdefer self.alloc.destroy(entry);
-
         entry.* = .{
             .job = job,
-            .future = try self.io_impl.io().concurrent(runEntry, .{entry}),
+            .future = undefined,
         };
+        errdefer self.alloc.destroy(entry);
+
+        entry.future = try self.io_impl.io().concurrent(runEntry, .{entry});
         errdefer {
             _ = entry.future.await(self.io_impl.io());
             entry.deinitJobOnce();
@@ -425,6 +426,46 @@ test "backend runtime durable lane runs inline jobs" {
 
     try std.testing.expect(ctx.ran);
     try std.testing.expect(ctx.deinit_called);
+}
+
+test "backend runtime threaded durable lane sees initialized jobs" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const Ctx = struct {
+        ran: std.atomic.Value(bool) = .init(false),
+        deinit_called: std.atomic.Value(bool) = .init(false),
+    };
+    const Fns = struct {
+        fn run(ptr: *anyopaque) !void {
+            const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+            ctx.ran.store(true, .release);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+            ctx.deinit_called.store(true, .release);
+        }
+    };
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+
+    var ctxs: [64]Ctx = [_]Ctx{.{}} ** 64;
+    for (&ctxs) |*ctx| {
+        try handle.ptr().durable_jobs.submit(.{
+            .owner_id = 77,
+            .class = .commit_durable,
+            .ptr = ctx,
+            .run = Fns.run,
+            .deinit = Fns.deinit,
+        });
+    }
+    handle.ptr().durable_jobs.drainOwner(77);
+
+    for (&ctxs) |*ctx| {
+        try std.testing.expect(ctx.ran.load(.acquire));
+        try std.testing.expect(ctx.deinit_called.load(.acquire));
+    }
 }
 
 test "backend runtime allocates stable nonzero owner ids" {

@@ -1586,6 +1586,13 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, data_runtime_test_mod, true, true);
 
+    const data_storage_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/data_storage_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, data_storage_test_mod, true, true);
+
     const usermgr_storage_lib_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
@@ -1930,6 +1937,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     capi_mod.addImport("antfly-zig", lib_mod);
+    capi_mod.addImport("structlog", structlog_mod);
 
     const capi_lib = b.addLibrary(.{
         .linkage = .dynamic,
@@ -1940,6 +1948,26 @@ pub fn build(b: *std.Build) void {
 
     const capi_step = b.step("capi", "Build the Zig C API shared library");
     capi_step.dependOn(&install_capi_lib.step);
+
+    const capi_default_filters = [_][]const u8{
+        "capi execute graph queries honors identity read generation",
+        "capi search rejects stale identity generation before readable lease hook",
+        "capi search json returns stamped identity generation",
+        "packed dense response exposes public ids not doc ordinals",
+        "dense response identity generation footer",
+        "capi aggregate hits rejects stale identity generation before aggregation materialization",
+    };
+    const capi_tests = b.addTest(.{
+        .root_module = capi_mod,
+        .filters = selectTestFilters(b, &capi_default_filters),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_capi_tests = b.addRunArtifact(capi_tests);
+    const capi_test_step = b.step("capi-test", "Run C API tests");
+    capi_test_step.dependOn(&run_capi_tests.step);
 
     // Tests
     const lib_regex_tests = b.addTest(.{
@@ -2609,6 +2637,8 @@ pub fn build(b: *std.Build) void {
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
+        "data runtime local split fallback preserves source identity namespace",
+        "data runtime local merge fallback derives receiver identity namespace from catalog",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
     };
@@ -2623,6 +2653,25 @@ pub fn build(b: *std.Build) void {
     const run_lib_data_runtime_tests = b.addRunArtifact(lib_data_runtime_tests);
     const lib_data_runtime_test_step = b.step("lib-data-runtime-test", "Run focused data runtime tests");
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
+
+    const lib_data_storage_default_filters = [_][]const u8{
+        "db split sync coordinator allocates destination identity namespace",
+        "db split status rejects stale destination identity namespace",
+        "db merge coordinator opt-in applies configured receiver identity namespace",
+        "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
+        "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
+    };
+    const lib_data_storage_tests = b.addTest(.{
+        .root_module = data_storage_test_mod,
+        .filters = selectTestFilters(b, &lib_data_storage_default_filters),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_data_storage_tests = b.addRunArtifact(lib_data_storage_tests);
+    const lib_data_storage_test_step = b.step("lib-data-storage-test", "Run focused data storage tests");
+    lib_data_storage_test_step.dependOn(&run_lib_data_storage_tests.step);
 
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -2746,6 +2795,34 @@ pub fn build(b: *std.Build) void {
     const lib_db_query_step = b.step("lib-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
 
+    const lib_db_result_shape_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "dedupeSearchHitsById uses ordinals when hit page is complete",
+            "applyStoredSearchPatternFilters resolves native doc id constraints to hit ordinals",
+            "applyStoredSearchPatternFilters uses hit ordinals for resolved doc filters",
+            "applyStoredSearchPatternFilters fails closed without resolved ordinal projection",
+            "applyStoredSearchPatternFilters fails closed when ordinal projection is unsupported",
+            "native dense constraints fail closed without ordinal vector mapping",
+            "buildPatternDocumentHits preserves resolved binding ordinals",
+            "executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents",
+            "executeSearchGraphWithSets preserves node ordinals",
+            "cloneNamedSetAsResult preserves hit ordinals",
+            "fuseNamedSets preserves source hit ordinals",
+            "fuseNamedSets deduplicates aliases by ordinal when complete",
+            "fuseNamedSets drops conflicting source hit ordinals",
+            "applyGraphUnion deduplicates by ordinals when hit pages are complete",
+            "applyGraphIntersection uses ordinals when hit pages are complete",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_db_result_shape_tests = b.addRunArtifact(lib_db_result_shape_tests);
+    const lib_db_result_shape_step = b.step("lib-db-result-shape-test", "Run focused DB query doc id boundary tests");
+    lib_db_result_shape_step.dependOn(&run_lib_db_result_shape_tests.step);
+
     const lib_db_reopen_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -2853,6 +2930,8 @@ pub fn build(b: *std.Build) void {
     lib_metadata_sim_core_test_step.dependOn(&run_lib_metadata_sim_core_tests.step);
 
     const lib_metadata_sim_smoke_default_filters = [_][]const u8{
+        "metadata sim split runtime preserves source identity namespace",
+        "metadata sim merge runtime records doc identity reassignment opt-in",
         "metadata http cluster simulation drives table placement convergence",
         "metadata http cluster simulation drives split intent through the control loop",
     };
@@ -3002,6 +3081,7 @@ pub fn build(b: *std.Build) void {
         "auto bulk max-window session rolls without a following write",
         "auto bulk group writes release leases so idle finish can publish",
         "auto bulk max-window rolls publish all threshold aligned docs",
+        "provisioned table write source seeds doc identity namespace from table range",
         "provisioned table write source cached runtime status does not fetch catalog coverage",
         "managed startup catch-up uses provided indexes json without catalog fetch",
         "api http server serves table batch transforms",
@@ -3068,6 +3148,337 @@ pub fn build(b: *std.Build) void {
     const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
 
+    const lib_api_docid_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "api table reads reject stale doc identity before multigroup fanout",
+            "distributed table reads reject stale doc identity before multigroup fanout",
+            "api public table query rejects only top-level internal fields",
+            "api query contract rejects doc identity control fields when with relaxes schema",
+            "api query contract public parser rejects internal shard doc identity controls",
+            "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
+            "distributed graph rejects doc identity rebuild before cross-range fanout",
+            "distributed graph rejects unstamped result refs before cross-range fanout",
+            "distributed graph edge reader carries identity generation",
+            "query merge preserves common identity read generation",
+            "query encoder does not expose internal doc ordinals",
+            "graph edge local read rejects stale identity generation",
+            "catalog doc identity readiness checks table range health",
+            "catalog resolved filter validation accepts preserved split identity domains",
+            "metadata merge request validation rejects incompatible doc identity namespaces",
+            "metadata merge validation handles rolling mixed-version doc identity status fixtures",
+            "metadata split request validation rejects stale doc identity namespace",
+            "metadata reconciler does not automatically split ordinal exhausted doc identity",
+            "metadata state classifies mixed-version doc identity lifecycle reports",
+            "metadata state marks doc identity rebuild required on range namespace mismatch",
+            "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
+            "metadata http server serves status and filtered admin routes",
+            "metadata http server maps source split merge doc identity conflicts",
+            "metadata http client preserves split merge doc identity conflicts",
+            "metadata http client parses legacy range records without doc identity fields",
+            "metadata http client round-trips range doc identity fields",
+            "metadata http client round-trips server endpoints",
+            "table workflow doc identity guards reject active transition intents",
+            "table workflow doc identity lifecycle handles mixed-version transition status",
+            "metadata reconciler doc identity guards block new planning during active reassignment",
+            "metadata reconciler does not upsert desired split with stale doc identity namespace",
+            "metadata reconciler allows explicit merge with doc identity reassignment opt-in",
+            "replay batcher tuple map keys preserve embedded delimiters",
+            "db chunk cache keys preserve embedded separators",
+            "enrichment worker chunk cache keys preserve embedded separators",
+            "search request text stats keys preserve embedded separators",
+            "merge distributed background text stats keys preserve embedded separators",
+            "graph edge local read rejects stale identity namespace",
+            "dense metadata keys preserve embedded index separators",
+            "dense metadata lookups read legacy textual rows",
+            "distributed txn participant ids preserve embedded group markers",
+            "distributed join unmatched worker pages group-local right hits",
+            "distributed join follow-up pagination requires stamped identity request",
+            "distributed join group-local hit pagination reuses structured search generation",
+            "distributed right join unmatched tracking uses ordinal identity keys",
+            "distributed join unmatched worker prefers local search results over query envelopes",
+            "distributed join rejects doc identity rebuild before right-table fanout",
+            "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
+            "internal worker doc identity exchange audit covers every boundary",
+            "internal group write routes map shard doc identity mismatch to conflict",
+            "internal group join routes map doc identity mismatch to conflict",
+            "internal group read routes map doc identity mismatch to conflict",
+            "api http client preserves group doc identity conflicts",
+            "aggregation context rejects non-current identity generation",
+            "aggregation full-result rerun can reuse snapped result identity generation",
+            "explicit text stats requests preserve identity generation",
+            "explicit text stats requests carry resolved doc filters and apply exact projection",
+            "explicit text stats requests reject stale identity generation",
+            "algebraic partial request fails closed when lifecycle is stale",
+            "algebraic partial request accepts current identity generation and rejects stale",
+            "provisioned distributed aggregations collect path terms nested cardinality",
+            "algebraic distributed planner selects identity-stamped derived join tensor program",
+            "algebraic derived join tensor reads subtract identity tombstones at generation",
+            "planner rejects rebuild-required schema lifecycle state",
+            "algebraic adaptive progress marks rebuild required on schema drift",
+            "db vector symbolic filters fail closed when algebraic lifecycle is stale",
+            "remote simple vector query uses vector worker route",
+            "encode query request serializes internal resolved doc filters with wire context",
+            "simple vector shard request carries serializable resolved doc filter",
+            "api http server maps public query doc identity mismatch to unavailable",
+            "api http server maps retrieval agent doc identity mismatch to unavailable",
+            "api http server query builder maps doc identity mismatch to unavailable",
+            "api http server surfaces structured doc identity conflicts for transaction commits",
+            "internal group vector worker rejects unsupported identity generation",
+            "internal group graph expand rejects unsupported identity generation",
+            "distributed graph expand request preserves algebraic semiring planning flag",
+            "batch identity metadata delete observes buffered resurrection state",
+            "identity validation accepts missing canonical rows but rejects conflicts",
+            "identity allocation rejects canonical row conflicts before reserving ordinal",
+            "batch identity metadata fails closed at ordinal capacity",
+            "identity namespace reassignment preserves snapshot generations and rejects stale writers",
+            "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
+            "db stats flag document identity ordinal capacity exhaustion",
+            "db stats expose document identity coverage and tombstones",
+            "db allocates final document ordinal with all index families present",
+            "db lsm primary compaction preserves doc identity ordinals",
+            "db rejects new document writes at ordinal exhaustion for every sync level",
+            "db transaction intent writes reject new documents at ordinal exhaustion",
+            "db restore snapshot rejects invalid doc identity metadata",
+            "db deferred restore rejects strict doc identity namespace mismatch",
+            "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard",
+            "db incomplete deferred restore import recovers before runtime repair",
+            "export and import preserves doc identity metadata",
+            "import rejects doc identity metadata with invalid canonical ids",
+            "import rejects doc identity namespace mismatch unless preserving existing namespace",
+            "db resolved doc-set projection honors identity read generation",
+            "db doc set planning stats record ordinal bitmap promotion",
+            "db search requests default to current identity generation snapshot",
+            "db validates internal resolved doc filter wire namespace and generation",
+            "db explicit doc-id filter resolution honors identity generation",
+            "doc filter wire round-trips ordinal and doc-key filters",
+            "doc filter wire rejects old required-field fixtures but tolerates additive fields",
+            "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
+            "dense vector id ignores ordinal metadata for a different doc",
+            "dense metadata prefetch includes legacy ordinal vector ids",
+            "db dense index stores stable vector ids with ordinal filter mappings",
+            "db dense artifact rebuild preserves stable vector ids distinct from ordinals",
+            "db sparse index keeps physical doc nums distinct from doc identity ordinals",
+            "db sparse hits resolve doc ordinals through identity not sparse doc nums",
+            "native dense constraints fail closed without ordinal vector mapping",
+            "native constraints fail closed when resolved ordinals cannot be represented",
+            "native sparse constraints fail closed without ordinal doc num mapper",
+            "native sparse constraints map resolved ordinals to physical doc nums",
+            "match_all candidate ordinal lookup uses identity read generation",
+            "match_all consumes resolved ordinal filters without doc id projection",
+            "native constraints pass identity generation to doc-set id projection",
+            "native constraints pass identity read generation to live doc filtering",
+            "native constraints treat resolved all-doc exclusion as empty candidates",
+            "native sparse constraints keep explicit doc ids when identity coverage is incomplete",
+            "text resolved doc filter projection passes identity generation to live filtering",
+            "text native constraints fall back for mixed ordinal sidecar coverage",
+            "text native constraints fail closed when resolved ordinals cannot be projected",
+            "text native constraints treat resolved all-doc exclusion as empty candidates",
+            "segment doc ordinal sidecar roundtrip and merge preserve live order",
+            "db text compaction preserves ordinal filters across reopen",
+            "structured filter doc set cache returns owned clones",
+            "structured filter doc set cache separates shared namespace generation keys",
+            "cache invalidates ownership move prefix without reviving pinned generations",
+            "applyGraphUnion deduplicates by ordinals when hit pages are complete",
+            "applyGraphIntersection uses ordinals when hit pages are complete",
+            "query merge preserves single-result doc ordinals",
+            "fuseNamedSets deduplicates aliases by ordinal when complete",
+            "graph result_ref fails closed when unbounded resolved doc-set cannot project",
+            "graph result_ref uses complete node doc-set when hits are paged",
+            "graph query result doc-set resolution receives identity generation",
+            "provisioned direct read db opens reject stale identity namespace",
+            "provisioned query runtime db rejects stale identity namespace",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const api_transactions_docid_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_transactions_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_transactions_docid_test_mod, true, true);
+    const api_table_writes_docid_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_table_writes_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_table_writes_docid_test_mod, true, true);
+    const api_table_reads_docid_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_table_reads_docid_test_mod, true, true);
+    const api_public_table_http_docid_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_public_table_http_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_public_table_http_docid_test_mod, true, true);
+    const raft_transition_runtime_docid_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft_transition_runtime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, raft_transition_runtime_docid_test_mod, true, true);
+    const api_transactions_docid_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{
+            "transaction read snapshot map keys preserve embedded delimiters",
+            "transaction session commit response includes retry hints for doc identity availability conflicts",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const api_table_writes_docid_tests = b.addTest(.{
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{
+            "provisioned table write source rejects stale doc identity namespace before write",
+            "bound table write source backs up and restores a local table",
+            "provisioned table restore rejects mismatched doc identity namespace",
+            "provisioned restore repair open rejects stale doc identity namespace",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const api_table_reads_docid_tests = b.addTest(.{
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &.{
+            "provisioned read cache invalidates repeated ownership moves with pinned leases",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const api_public_table_http_docid_tests = b.addTest(.{
+        .root_module = api_public_table_http_docid_test_mod,
+        .filters = &.{
+            "public table batch handler maps doc identity unavailable errors",
+            "public table query handler maps doc identity unavailable errors",
+            "public table query view handler maps doc identity unavailable errors",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const raft_transition_runtime_docid_tests = b.addTest(.{
+        .root_module = raft_transition_runtime_docid_test_mod,
+        .filters = &.{
+            "transition runtime fails closed when doc identity reassignment callback is missing",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const lib_serverless_docid_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "serverless query module compiles",
+            "search plan rejects internal doc identity controls",
+            "serverless graph plans reject internal doc identity controls",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_docid_tests = b.addRunArtifact(lib_api_docid_tests);
+    const run_lib_serverless_docid_tests = b.addRunArtifact(lib_serverless_docid_tests);
+    const run_api_transactions_docid_tests = b.addRunArtifact(api_transactions_docid_tests);
+    const run_api_table_writes_docid_tests = b.addRunArtifact(api_table_writes_docid_tests);
+    const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
+    const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
+    const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
+    const lib_docid_lifecycle_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "metadata reconciler does not automatically split ordinal exhausted doc identity",
+            "metadata state classifies mixed-version doc identity lifecycle reports",
+            "metadata state marks doc identity rebuild required on range namespace mismatch",
+            "metadata merge validation handles rolling mixed-version doc identity status fixtures",
+            "metadata split request validation rejects stale doc identity namespace",
+            "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
+            "table workflow doc identity guards reject active transition intents",
+            "metadata reconciler doc identity guards block new planning during active reassignment",
+            "metadata reconciler does not upsert desired split with stale doc identity namespace",
+            "metadata reconciler allows explicit merge with doc identity reassignment opt-in",
+            "distributed join follow-up pagination requires stamped identity request",
+            "distributed join group-local hit pagination reuses structured search generation",
+            "distributed join rejects doc identity rebuild before right-table fanout",
+            "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
+            "distributed graph rejects doc identity rebuild before cross-range fanout",
+            "distributed graph rejects unstamped result refs before cross-range fanout",
+            "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
+            "internal worker doc identity exchange audit covers every boundary",
+            "aggregation context rejects non-current identity generation",
+            "aggregation full-result rerun can reuse snapped result identity generation",
+            "explicit text stats requests preserve identity generation",
+            "explicit text stats requests reject stale identity generation",
+            "structured filter doc set cache separates shared namespace generation keys",
+            "cache invalidates ownership move prefix without reviving pinned generations",
+            "db text compaction preserves ordinal filters across reopen",
+            "db lsm primary compaction preserves doc identity ordinals",
+            "db allocates final document ordinal with all index families present",
+            "identity namespace reassignment preserves snapshot generations and rejects stale writers",
+            "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
+            "index manager split handoff preserves interleaved write and query summaries",
+            "db stats flag document identity ordinal capacity exhaustion",
+            "db rejects new document writes at ordinal exhaustion for every sync level",
+            "db transaction intent writes reject new documents at ordinal exhaustion",
+            "db search requests default to current identity generation snapshot",
+            "db validates internal resolved doc filter wire namespace and generation",
+            "db resolved doc-set projection honors identity read generation",
+            "doc filter wire rejects old required-field fixtures but tolerates additive fields",
+            "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_docid_lifecycle_tests = b.addRunArtifact(lib_docid_lifecycle_tests);
+    const docid_lifecycle_test_step = b.step("docid-lifecycle-test", "Run focused DOCID lifecycle and distributed snapshot hardening tests");
+    docid_lifecycle_test_step.dependOn(&run_lib_docid_lifecycle_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_api_transactions_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_api_table_reads_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_api_table_writes_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+
+    const docid_operational_hardening_test_step = b.step("docid-operational-hardening-test", "Run extended DOCID lifecycle, metadata chaos, and compaction hardening tests");
+    docid_operational_hardening_test_step.dependOn(docid_lifecycle_test_step);
+    docid_operational_hardening_test_step.dependOn(lib_metadata_transition_chaos_test_step);
+    docid_operational_hardening_test_step.dependOn(lib_metadata_public_chaos_test_step);
+    docid_operational_hardening_test_step.dependOn(lib_lsm_backend_chaos_test_step);
+
+    const lib_api_docid_test_step = b.step("lib-api-docid-test", "Run focused API DOCID boundary tests");
+    lib_api_docid_test_step.dependOn(&run_lib_api_docid_tests.step);
+    lib_api_docid_test_step.dependOn(&run_lib_serverless_docid_tests.step);
+    lib_api_docid_test_step.dependOn(&run_api_transactions_docid_tests.step);
+    lib_api_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
+    lib_api_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
+    lib_api_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
+    lib_api_docid_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
+    lib_api_docid_test_step.dependOn(&run_lib_data_storage_tests.step);
+    lib_api_docid_test_step.dependOn(&run_lib_data_runtime_tests.step);
+    lib_api_docid_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
+    lib_api_docid_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
+    lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
+    lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
+    lib_api_docid_test_step.dependOn(lib_metadata_public_chaos_test_step);
+    lib_api_docid_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+
     const lib_api_swarm_backup_restore_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -3116,6 +3527,8 @@ pub fn build(b: *std.Build) void {
             "metadata reconciler",
             "metadata transition state",
             "metadata server module compiles",
+            "metadata merge request validation rejects incompatible doc identity namespaces",
+            "metadata split request validation rejects stale doc identity namespace",
             "metadata transition actions",
             "placement planner",
             "metadata control loop proposes desired transitions through the service seam",
@@ -3127,10 +3540,12 @@ pub fn build(b: *std.Build) void {
             "metadata transition driver ",
             "metadata storage module compiles",
             "table workflow can build desired topology through the control loop seam",
+            "table workflow doc identity guards reject active transition intents",
             "table workflow can remove a table topology from desired state",
             "table workflow can reconcile projected local placement intents",
             "metadata raft apply store ",
             "metadata state machine projects transitions through metadata apply store",
+            "table provisioner restore rejects mismatched doc identity namespace",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3401,11 +3816,15 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
     unit_test_step.dependOn(&run_embedded_tests.step);
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
+    unit_test_step.dependOn(&run_capi_tests.step);
     unit_test_step.dependOn(&run_lib_db_tests.step);
+    unit_test_step.dependOn(&run_lib_db_result_shape_tests.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
     unit_test_step.dependOn(&run_lib_data_runtime_tests.step);
+    unit_test_step.dependOn(&run_lib_data_storage_tests.step);
     unit_test_step.dependOn(&run_lib_metadata_logic_tests.step);
     unit_test_step.dependOn(&run_lib_metadata_service_tests.step);
+    unit_test_step.dependOn(&run_lib_api_docid_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_public_api_parity_tests.step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
@@ -4011,6 +4430,33 @@ pub fn build(b: *std.Build) void {
     run_db_split_bench_repeat.addArgs(&.{ "--samples", "5" });
     const db_split_bench_repeat_step = b.step("db-split-bench-repeat", "Benchmark DB split preparation old vs current with repeated samples");
     db_split_bench_repeat_step.dependOn(&run_db_split_bench_repeat.step);
+
+    const docid_doc_set_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/storage/docid_doc_set_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const docid_doc_set_bench_root_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/docid_doc_set_bench_root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    docid_doc_set_bench_mod.addImport("docid_doc_set_bench_root", docid_doc_set_bench_root_mod);
+
+    const docid_doc_set_bench = b.addExecutable(.{
+        .name = "docid_doc_set_bench",
+        .root_module = docid_doc_set_bench_mod,
+    });
+    b.installArtifact(docid_doc_set_bench);
+
+    const run_docid_doc_set_bench = b.addRunArtifact(docid_doc_set_bench);
+    if (b.args) |args| {
+        run_docid_doc_set_bench.addArgs(args);
+    } else {
+        run_docid_doc_set_bench.addArgs(&.{ "--samples", "1", "--repeats", "16", "--small", "32", "--medium", "1024", "--large", "16384" });
+    }
+    const docid_doc_set_bench_step = b.step("docid-doc-set-bench", "Benchmark DOCID doc-set representations against sparse id baselines");
+    docid_doc_set_bench_step.dependOn(&run_docid_doc_set_bench.step);
 
     const backend_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/backend_bench.zig"),
@@ -4841,6 +5287,8 @@ pub fn build(b: *std.Build) void {
     replay_bench_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
     replay_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     replay_bench_root_mod.addImport("antfly_regex", regex_mod);
+    replay_bench_root_mod.addImport("antfly_reranking", reranking_mod);
+    replay_bench_root_mod.addImport("antfly_scraping", scraping_mod);
     replay_bench_root_mod.addImport("antfly_platform", platform_mod);
     addSnowballModule(b, replay_bench_root_mod);
     replay_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
@@ -4918,6 +5366,52 @@ pub fn build(b: *std.Build) void {
     }
     const batch_bench_step = b.step("batch-bench", "Benchmark overwrite-heavy batch writes and bulk-session coalescing");
     batch_bench_step.dependOn(&run_batch_bench.step);
+
+    const docid_write_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/storage/docid_write_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    docid_write_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
+
+    const docid_write_bench = b.addExecutable(.{
+        .name = "docid_write_bench",
+        .root_module = docid_write_bench_mod,
+    });
+    b.installArtifact(docid_write_bench);
+
+    const run_docid_write_bench = b.addRunArtifact(docid_write_bench);
+    if (b.args) |args| {
+        run_docid_write_bench.addArgs(args);
+    } else {
+        run_docid_write_bench.addArgs(&.{ "--docs", "512", "--batch-size", "128", "--body-repeat", "1" });
+    }
+    const docid_write_bench_step = b.step("docid-write-bench", "Benchmark DOCID write-path identity metadata overhead across sync levels");
+    docid_write_bench_step.dependOn(&run_docid_write_bench.step);
+
+    const docid_query_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/storage/docid_query_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    docid_query_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
+
+    const docid_query_bench = b.addExecutable(.{
+        .name = "docid_query_bench",
+        .root_module = docid_query_bench_mod,
+    });
+    b.installArtifact(docid_query_bench);
+
+    const run_docid_query_bench = b.addRunArtifact(docid_query_bench);
+    if (b.args) |args| {
+        run_docid_query_bench.addArgs(args);
+    } else {
+        run_docid_query_bench.addArgs(&.{ "--docs", "4096", "--queries", "16", "--repeats", "8", "--filter-size", "256", "--limit", "32" });
+    }
+    const docid_query_bench_step = b.step("docid-query-bench", "Benchmark real DB query shapes with public IDs, ordinal doc sets, and sparse-ID projection");
+    docid_query_bench_step.dependOn(&run_docid_query_bench.step);
+    const build_docid_query_bench_step = b.step("docid-query-bench-build", "Build docid_query_bench without running it");
+    build_docid_query_bench_step.dependOn(&docid_query_bench.step);
 
     const algebraic_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/algebraic_bench.zig"),

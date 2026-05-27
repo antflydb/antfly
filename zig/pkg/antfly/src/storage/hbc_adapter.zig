@@ -820,6 +820,9 @@ pub const Cache = struct {
         self.mutex.lockExclusive();
         defer self.mutex.unlockExclusive();
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = vector_id };
+        if (self.vector_cache.get(key)) |existing| {
+            if (existing.vector.ptr == vector_data.ptr and existing.vector.len == vector_data.len) return existing.vector;
+        }
         _ = self.removeVectorLocked(key, false);
         const bytes = estimateVectorCacheBytes(vector_data);
         const admission = self.admitLocked(.vector, namespace, key, bytes, false) orelse {
@@ -2926,6 +2929,9 @@ pub const HBCIndex = struct {
     }
 
     fn cacheVectorLocalLocked(self: *HBCIndex, vector_id: u64, vector_data: []const f32) ![]const f32 {
+        if (self.vector_cache.get(vector_id)) |existing| {
+            if (existing.vector.ptr == vector_data.ptr and existing.vector.len == vector_data.len) return existing.vector;
+        }
         const reserved_slot = self.ensureLocalVectorCacheCapacityLocked(vector_id);
         self.invalidateLocalVectorCacheLocked(vector_id);
         const copied = try self.alloc.dupe(f32, vector_data);
@@ -3207,6 +3213,18 @@ pub const HBCIndex = struct {
         if (self.bypass_external_vector_cache) return vector_data;
         if (self.bulk_ingest_session_depth > 0) return vector_data;
         if (self.active_searches.load(.acquire) > 1) return vector_data;
+        return try self.cacheVectorRetained(vector_id, vector_data);
+    }
+
+    pub fn cacheVectorForWarmup(self: *HBCIndex, vector_id: u64, vector_data: []const f32) ![]const f32 {
+        if (!self.cache_enabled) return vector_data;
+        if (!self.retained_vector_cache_enabled) return vector_data;
+        if (self.bypass_external_vector_cache) return vector_data;
+        if (self.active_searches.load(.acquire) > 1) return vector_data;
+        return try self.cacheVectorRetained(vector_id, vector_data);
+    }
+
+    fn cacheVectorRetained(self: *HBCIndex, vector_id: u64, vector_data: []const f32) ![]const f32 {
         if (self.shared_cache) |cache| {
             if (self.config.max_cached_vectors == 0) return vector_data;
             return try cache.cacheVector(self.cache_namespace, vector_id, vector_data);
