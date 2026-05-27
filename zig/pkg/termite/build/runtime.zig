@@ -656,7 +656,6 @@ pub fn configureMetal(
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
-    module.linkFramework("MetalPerformanceShadersGraph", .{});
     module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.termite_root, "src/backends/metal_kernels.m")), .flags = &.{"-fobjc-arc"} });
 }
 

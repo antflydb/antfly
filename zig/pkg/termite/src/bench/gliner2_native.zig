@@ -652,7 +652,6 @@ const MetalAudit = struct {
     host_download_bytes: u64 = 0,
     mps_standalone: u64 = 0,
     mps_active: u64 = 0,
-    mpsgraph: u64 = 0,
     planned_layers: u64 = 0,
     layer_count: u64 = 0,
     fused_ffn: u64 = 0,
@@ -710,7 +709,6 @@ fn buildMetalAudit(cfg: BenchConfig, before: ops.BackendDebugTimingSnapshot, aft
         .host_download_bytes = deltaU64(a.metal_tensor_host_mirror_download_bytes, b.metal_tensor_host_mirror_download_bytes),
         .mps_standalone = deltaU64(a.metal_runtime_mps_dense_linear_standalone_calls, b.metal_runtime_mps_dense_linear_standalone_calls),
         .mps_active = deltaU64(a.metal_runtime_mps_dense_linear_active_frame_calls, b.metal_runtime_mps_dense_linear_active_frame_calls),
-        .mpsgraph = deltaU64(a.metal_runtime_mpsgraph_ffn_calls, b.metal_runtime_mpsgraph_ffn_calls),
         .planned_layers = perIter(layer_successes_total, cfg.measure_iters),
         .layer_count = layer_count,
         .fused_ffn = perIter(ffn_fused_total, cfg.measure_iters),
@@ -1011,7 +1009,7 @@ fn runBenchmark(
 
     if (cfg.format == .csv) {
         std.debug.print(
-            "{s},{s},{},{},{},{},{},{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{s},{},{},{},{},{},{},{},{}",
+            "{s},{s},{},{},{},{},{},{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{s},{},{},{},{},{},{},{}",
             .{
                 @tagName(cfg.backend),
                 @tagName(cfg.quant),
@@ -1033,7 +1031,6 @@ fn runBenchmark(
                 metal_audit.host_downloads,
                 metal_audit.mps_standalone,
                 metal_audit.mps_active,
-                metal_audit.mpsgraph,
                 metal_audit.planned_layers,
                 metal_audit.layer_count,
                 metal_audit.fused_ffn,
@@ -1140,14 +1137,13 @@ fn runBenchmark(
     );
     if (cfg.backend == .metal) {
         std.debug.print(
-            "gliner2_metal_audit resident_frame={s} interpreter_fallbacks={} host_downloads={} mps_standalone={} mps_active={} mpsgraph={} planned_layers={} layer_count={} fused_ffn={} packed_qkv={} packed_qkv_fallbacks={} relative_qk_pair={} relative_qk_pair_fallbacks={} command_plan_reused={s} graph_plan_reuses={} frame_begins={} frame_submits={} frame_gpu_ms={d:.3} frame_wait_ms={d:.3}\n",
+            "gliner2_metal_audit resident_frame={s} interpreter_fallbacks={} host_downloads={} mps_standalone={} mps_active={} planned_layers={} layer_count={} fused_ffn={} packed_qkv={} packed_qkv_fallbacks={} relative_qk_pair={} relative_qk_pair_fallbacks={} command_plan_reused={s} graph_plan_reuses={} frame_begins={} frame_submits={} frame_gpu_ms={d:.3} frame_wait_ms={d:.3}\n",
             .{
                 yesNo(metal_audit.resident_frame),
                 metal_audit.interpreter_fallbacks,
                 metal_audit.host_downloads,
                 metal_audit.mps_standalone,
                 metal_audit.mps_active,
-                metal_audit.mpsgraph,
                 metal_audit.planned_layers,
                 metal_audit.layer_count,
                 metal_audit.fused_ffn,
@@ -1261,7 +1257,7 @@ fn runScenario(allocator: std.mem.Allocator, cfg: BenchConfig) !void {
 
 fn printCsvHeader() void {
     std.debug.print(
-        "backend,quant,batch,seq_len,num_labels,layers,hidden,intermediate,warmup_iters,measure_iters,avg_ms,min_ms,encoder_ms,head_ms,logits_to_f32_ms,resident_frame,interpreter_fallbacks,host_downloads,mps_standalone,mps_active,mpsgraph,planned_layers,layer_count,fused_ffn,packed_qkv,packed_qkv_fallbacks,relative_qk_pair,relative_qk_pair_fallbacks,command_plan_reused,frame_gpu_ms,frame_wait_ms,graph_plan_reuses,frame_begins,frame_submits,host_downloads_total,layer_fallbacks,ffn_fallbacks,plan_successes,plan_failures,deberta_attention_gemm,deberta_attention_gemm_fallbacks,deberta_attention_legacy,encoder_embeddings_ms,encoder_relative_pos_ms,encoder_qkv_ms,encoder_relative_qk_ms,encoder_attention_ms,encoder_attn_output_ms,encoder_ffn_intermediate_ms,encoder_ffn_output_ms,head_start_end_mlp_ms,head_gather_concat_relu_ms,head_out_project_ms,head_label_projection_ms,head_logits_ms\n",
+        "backend,quant,batch,seq_len,num_labels,layers,hidden,intermediate,warmup_iters,measure_iters,avg_ms,min_ms,encoder_ms,head_ms,logits_to_f32_ms,resident_frame,interpreter_fallbacks,host_downloads,mps_standalone,mps_active,planned_layers,layer_count,fused_ffn,packed_qkv,packed_qkv_fallbacks,relative_qk_pair,relative_qk_pair_fallbacks,command_plan_reused,frame_gpu_ms,frame_wait_ms,graph_plan_reuses,frame_begins,frame_submits,host_downloads_total,layer_fallbacks,ffn_fallbacks,plan_successes,plan_failures,deberta_attention_gemm,deberta_attention_gemm_fallbacks,deberta_attention_legacy,encoder_embeddings_ms,encoder_relative_pos_ms,encoder_qkv_ms,encoder_relative_qk_ms,encoder_attention_ms,encoder_attn_output_ms,encoder_ffn_intermediate_ms,encoder_ffn_output_ms,head_start_end_mlp_ms,head_gather_concat_relu_ms,head_out_project_ms,head_label_projection_ms,head_logits_ms\n",
         .{},
     );
 }
