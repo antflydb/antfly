@@ -2750,7 +2750,7 @@ pub const BackendHandle = struct {
     pub fn open(allocator: Allocator, root_dir: []const u8, options: Options) !BackendHandle {
         const backend = try allocator.create(Backend);
         errdefer allocator.destroy(backend);
-        try recovery_mod.openInto(Backend, backend, allocator, root_dir, options.backend, options);
+        backend.* = try Backend.open(allocator, root_dir, options);
         return .{
             .allocator = allocator,
             .backend = backend,
