@@ -141,7 +141,7 @@ fn parseBackendChoice(value: []const u8) ?reranker.BackendChoice {
 
 fn printUsage() void {
     print(
-        \\usage: eval-reranker-checkpoint <model-dir> <jsonl_or_dir> [split] [--head-dir DIR|--head FILE] [--backend auto|blas|mlx] [--max-examples N]
+        \\usage: eval-reranker-checkpoint <model-dir> <jsonl_or_dir> [split] [--head-dir DIR|--head FILE] [--backend auto|native|mlx] [--max-examples N]
         \\example: eval-reranker-checkpoint /tmp/bge-reranker /tmp/rerank train --head-dir /tmp/out --backend mlx --max-examples 128
         \\
     , .{});

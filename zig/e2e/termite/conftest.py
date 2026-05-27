@@ -18,14 +18,14 @@ Usage:
     # Against a running server:
     TERMITE_URL=http://localhost:8080 uv run --project e2e/termite pytest e2e/termite
 
-    # Start server automatically (termite-zig):
-    TERMITE_BIN=./pkg/termite/zig-out/bin/termite uv run --project e2e/termite pytest e2e/termite
+    # Start server automatically:
+    ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/termite pytest e2e/termite
 
     # Custom models directory:
     TERMITE_MODELS_DIR=/path/to/models uv run --project e2e/termite pytest e2e/termite
 
-    # Lazily pull missing models with a local termite binary (opt-in):
-    TERMITE_DOWNLOAD=1 uv run --project e2e/termite pytest e2e/termite
+    # Lazily pull missing models with a local antfly binary (opt-in):
+    ANTFLY_INFERENCE_DOWNLOAD=1 uv run --project e2e/termite pytest e2e/termite
 
     # Against termite-cloud:
     TERMITE_URL=https://termite.example.com TERMITE_TOKEN=... uv run --project e2e/termite pytest e2e/termite
@@ -40,7 +40,7 @@ import time
 import pytest
 import requests
 
-from .models import bootstrap_models_for_listing, maybe_pull_missing_model, models_dir, termite_bin
+from .models import bootstrap_models_for_listing, inference_command, maybe_pull_missing_model, models_dir
 
 API_PREFIX = "/ml/v1"
 
@@ -77,10 +77,10 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
 class TermiteServer:
     """Manages a local termite server process."""
 
-    def __init__(self, binary: str, models_path: str, host: str, port: int):
+    def __init__(self, command_prefix: list[str], models_path: str, host: str, port: int):
         self.url = f"http://{host}:{port}"
         self.proc = subprocess.Popen(
-            [binary, "run", "--host", host, "--port", str(port), "--models-dir", models_path],
+            [*command_prefix, "run", "--host", host, "--port", str(port), "--models-dir", models_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
@@ -107,7 +107,7 @@ def base_url():
     """Return the base URL of the Termite server under test.
 
     If TERMITE_URL is set, use it directly (external server).
-    Otherwise, start a local server from TERMITE_BIN.
+    Otherwise, start a local server from ANTFLY_BIN.
     """
     url = os.environ.get("TERMITE_URL")
     if url:
@@ -117,17 +117,15 @@ def base_url():
         yield url
         return
 
-    binary = os.environ.get("TERMITE_BIN")
-    if not binary:
-        try:
-            binary = termite_bin()
-        except RuntimeError:
-            pytest.skip("Set TERMITE_URL or TERMITE_BIN to run E2E tests")
+    try:
+        command_prefix = inference_command()
+    except RuntimeError:
+        pytest.skip("Set TERMITE_URL or ANTFLY_BIN to run E2E tests")
 
     models_path = str(models_dir())
 
     port = find_free_port()
-    server = TermiteServer(binary, models_path, "127.0.0.1", port)
+    server = TermiteServer(command_prefix, models_path, "127.0.0.1", port)
     yield server.url
     server.stop()
 
@@ -288,5 +286,5 @@ def openai_client(base_url):
 
 def pytest_configure(config):
     """Model downloads are handled lazily by the request helpers when enabled."""
-    if os.environ.get("TERMITE_DOWNLOAD") == "1":
-        print("TERMITE_DOWNLOAD=1: missing E2E models will be fetched with `termite pull` on demand")
+    if os.environ.get("ANTFLY_INFERENCE_DOWNLOAD") == "1":
+        print("ANTFLY_INFERENCE_DOWNLOAD=1: missing E2E models will be fetched with `antfly inference pull` on demand")

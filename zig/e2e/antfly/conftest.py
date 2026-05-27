@@ -1505,12 +1505,12 @@ def clipclap_model_available():
         pytest.skip(f"Antfly binary not found for model download: {binary}")
 
     subprocess.run(
-        [binary, "termite", "pull", "hf:antflydb/clipclap:gguf:Q4_K", "--tasks", "embed"],
+        [binary, "inference", "pull", "hf:antflydb/clipclap:gguf:Q4_K", "--tasks", "embed"],
         cwd=REPO_ROOT,
         check=True,
     )
     if not model_dir.exists():
-        raise RuntimeError(f"termite pull finished but did not create {model_dir}")
+        raise RuntimeError(f"antfly inference pull finished but did not create {model_dir}")
     if not _clipclap_gguf_available(model_dir):
         raise RuntimeError(f"ClipClap GGUF files are missing from {model_dir}")
     return model_dir

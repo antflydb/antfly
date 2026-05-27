@@ -500,7 +500,7 @@ fn usageError() error{InvalidArguments} {
         \\  --recursive-init NAME
         \\  --teacher-top-k N
         \\  --teacher-temperature F
-        \\  --backend auto|mlx|blas
+        \\  --backend auto|mlx|native
         \\  --split NAME
         \\  --dry-run
         \\

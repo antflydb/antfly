@@ -100,7 +100,7 @@ fn parseBackendChoice(value: []const u8) ?reranker_head.BackendChoice {
 
 fn usage() error{InvalidArguments}!void {
     print(
-        \\usage: train-eval-reranker-lora-surrogate-cached <model-dir> <adapter-dir> <head-dir-or-file> <train-cache-json> <eval-cache-json> <out-dir> [--backend auto|blas|mlx] [--max-examples N] [--epochs N] [--learning-rate LR] [--layer-name NAME]
+        \\usage: train-eval-reranker-lora-surrogate-cached <model-dir> <adapter-dir> <head-dir-or-file> <train-cache-json> <eval-cache-json> <out-dir> [--backend auto|native|mlx] [--max-examples N] [--epochs N] [--learning-rate LR] [--layer-name NAME]
         \\example: train-eval-reranker-lora-surrogate-cached /tmp/bge-reranker /tmp/adapter /tmp/head /tmp/train_cache.json /tmp/eval_cache.json /tmp/out --epochs 2 --learning-rate 0.0005
         \\
     , .{});

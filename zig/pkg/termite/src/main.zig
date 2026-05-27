@@ -55,7 +55,6 @@ fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !RunConfig {
 pub fn main(init: std.process.Init) !void {
     const allocator = platform.allocator.processAllocator(std.heap.smp_allocator);
 
-    // Collect args
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);
     var args_buf: [64][]const u8 = undefined;
     var args_len: usize = 0;
@@ -68,58 +67,71 @@ pub fn main(init: std.process.Init) !void {
     const args = args_buf[0..args_len];
 
     if (args.len < 2) {
-        printUsage();
+        printUsage("termite");
         return;
     }
 
-    const command = args[1];
-    if (std.mem.eql(u8, command, "run")) {
+    return try runFromArgs(init, allocator, "termite", args[1..]);
+}
+
+pub fn runFromArgs(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    usage_name: []const u8,
+    args: []const []const u8,
+) !void {
+    if (args.len == 0) {
+        printUsage(usage_name);
+        return;
+    }
+
+    const command = args[0];
+    const command_args = args[1..];
+    if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
+        printUsage(usage_name);
+    } else if (std.mem.eql(u8, command, "run")) {
         if (build_options.skip_openapi) {
             print("termite run is unavailable when built with -Dskip-openapi=true\n", .{});
             return;
         }
-        try runServer(allocator, init.io, args[2..]);
+        try runServer(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "embed")) {
-        try termite.native_embed.main(allocator, init.io, args[2..]);
+        try termite.native_embed.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "classify")) {
-        try termite.native_classify.main(allocator, init.io, args[2..]);
+        try termite.native_classify.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "generate")) {
-        try termite.native_generate.main(allocator, init.io, args[2..]);
+        try termite.native_generate.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "compile-artifact")) {
-        try termite.native_compile.main(allocator, init.io, args[2..]);
+        try termite.native_compile.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "export")) {
-        try termite.native_export.main(allocator, init.io, args[2..]);
+        try termite.native_export.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "quantize")) {
-        try termite.native_quantize.main(allocator, init.io, args[2..]);
+        try termite.native_quantize.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "run-artifact")) {
-        try termite.native_run_artifact.main(allocator, init.io, args[2..]);
+        try termite.native_run_artifact.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "transcribe")) {
-        try termite.native_transcribe.main(allocator, init.io, args[2..]);
+        try termite.native_transcribe.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "read")) {
-        try termite.native_read.main(allocator, init.io, args[2..]);
+        try termite.native_read.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "recognize")) {
-        try termite.native_recognize.main(allocator, init.io, args[2..]);
+        try termite.native_recognize.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "extract")) {
-        try termite.native_extract.main(allocator, init.io, args[2..]);
+        try termite.native_extract.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "compare")) {
-        try termite.compare_generate.main(allocator, init.io, args[2..]);
+        try termite.compare_generate.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "finetune")) {
-        try termite.finetune_cli.main(init, args[2..]);
-    } else if (std.mem.eql(u8, command, "cuda-info")) {
-        try termite.cuda_info.main(allocator, init.io, args[2..]);
-    } else if (std.mem.eql(u8, command, "bench-cuda")) {
-        try termite.cuda_microbench.main(allocator, init.io, args[2..]);
+        try termite.finetune_cli.main(init, command_args);
     } else if (std.mem.eql(u8, command, "smoke")) {
-        try termite.native_smoke.main(allocator, init.io, args[2..]);
+        try termite.native_smoke.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "list")) {
-        try listModels(allocator, init.io, args[2..]);
+        try listModels(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "pull")) {
-        try pullModel(allocator, init.io, args[2..]);
+        try pullModel(allocator, init.io, usage_name, command_args);
     } else if (std.mem.eql(u8, command, "version")) {
         printVersion();
     } else {
         print("unknown command: {s}\n", .{command});
-        printUsage();
+        printUsage(usage_name);
     }
 }
 
@@ -209,9 +221,9 @@ fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     }
 }
 
-fn pullModel(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, args: []const []const u8) !void {
     if (args.len == 0) {
-        print("usage: termite pull <owner/name|hf:owner/name>[:gguf|:gguf:Q4_K_M|:mmproj] [--token <hf-token>] [--models-dir <dir>] [--tasks <task1,task2>] [--capabilities <cap1,cap2>]\n", .{});
+        print("usage: {s} pull <owner/name|hf:owner/name>[:gguf|:gguf:Q4_K_M|:mmproj] [--token <hf-token>] [--models-dir <dir>] [--tasks <task1,task2>] [--capabilities <cap1,cap2>]\n", .{usage_name});
         return;
     }
     const ref = args[0];
@@ -264,9 +276,9 @@ fn printVersion() void {
     });
 }
 
-fn printUsage() void {
+fn printUsage(usage_name: []const u8) void {
     print(
-        \\Usage: termite <command> [options]
+        \\Usage: {s} <command> [options]
         \\
         \\Commands:
         \\  run       Start the inference server
@@ -284,8 +296,6 @@ fn printUsage() void {
         \\  compare   Compare inference backends or implementations
         \\  finetune  Run fine-tuning recipes, datasets, adapters, train/eval, and workflows
         \\  smoke     Run a native GGUF/SafeTensors smoke test
-        \\  cuda-info Inspect CUDA Driver API availability and optionally run a kernel smoke
-        \\  bench-cuda Benchmark CUDA Q4_K CLIP/CLAP kernel shapes and optional ClipCLAP text embed
         \\  list      List available models
         \\  pull      Download a model from HuggingFace Hub
         \\  version   Print version information
@@ -303,7 +313,7 @@ fn printUsage() void {
         \\  variants          <model-ref>:gguf, <model-ref>:gguf:Q4_K_M, <model-ref>:mmproj
         \\                    default :gguf now prefers smaller GGUF quants; use :gguf:Q... for larger files
         \\
-    , .{});
+    , .{usage_name});
 }
 
 test "run config parses shared scraping fields and ignores api_url" {

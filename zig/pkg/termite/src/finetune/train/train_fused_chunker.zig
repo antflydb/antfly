@@ -31,7 +31,7 @@
 //   --seed <n>              Random seed (default: 42)
 //   --lora-rank <n>         LoRA rank (default: 0 = disabled)
 //   --intermediate-size <n> ModernBERT intermediate_size (default: 1152)
-//   --backend blas|mlx|auto Select compute backend (default: auto)
+//   --backend native|mlx|auto Select compute backend (default: auto)
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -236,7 +236,7 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, val, "auto")) {
                 backend = .auto;
             } else {
-                print("error: unknown backend '{s}': expected blas, mlx, or auto\n", .{val});
+                print("error: unknown backend '{s}': expected native, mlx, or auto\n", .{val});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, arg, "--grad-accum")) {
@@ -539,7 +539,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
         }
     } else blas_backend.computeBackend();
 
-    print("backend: {s}\n", .{if (use_mlx) "mlx" else "blas"});
+    print("backend: {s}\n", .{if (use_mlx) "mlx" else "native"});
 
     // ------------------------------------------------------------------
     // 2a. Tokenizer loading
@@ -1497,7 +1497,7 @@ fn printUsage() void {
         \\  --seed <n>                Random seed (default: 42)
         \\  --lora-rank <n>           LoRA rank (default: 0 = disabled)
         \\  --intermediate-size <n>   ModernBERT intermediate_size (default: 1152)
-        \\  --backend blas|mlx|auto   Compute backend (default: auto)
+        \\  --backend native|mlx|auto   Compute backend (default: auto)
         \\  --grad-accum <n>          Gradient accumulation steps (default: 1)
         \\  --schedule-free           Use Schedule-Free AdamW
         \\  --neftune-alpha <f>       NEFTune noise magnitude (default: 0.0=disabled)

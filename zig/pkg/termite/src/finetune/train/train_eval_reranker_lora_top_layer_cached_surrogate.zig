@@ -119,7 +119,7 @@ fn parseBackendChoice(value: []const u8) ?reranker_head.BackendChoice {
 
 fn usage() error{InvalidArguments}!void {
     print(
-        \\usage: train-eval-reranker-lora-top-layer-cached-surrogate <model-dir> <adapter-dir> <head-dir-or-file> <train-top-layer-cache-json> <eval-top-layer-cache-json> <out-dir> [--backend auto|blas|mlx] [--max-examples N] [--epochs N] [--learning-rate LR] [--layer-name NAME]
+        \\usage: train-eval-reranker-lora-top-layer-cached-surrogate <model-dir> <adapter-dir> <head-dir-or-file> <train-top-layer-cache-json> <eval-top-layer-cache-json> <out-dir> [--backend auto|native|mlx] [--max-examples N] [--epochs N] [--learning-rate LR] [--layer-name NAME]
         \\note: for BERT/RoBERTa families, omitting --layer-name uses the exact cached full replayed top-layer block path when available; passing --layer-name keeps single-layer targeting.
         \\example: train-eval-reranker-lora-top-layer-cached-surrogate /tmp/bge-reranker /tmp/adapter /tmp/head /tmp/train_top_cache.json /tmp/eval_top_cache.json /tmp/out --epochs 2 --learning-rate 0.0005
         \\

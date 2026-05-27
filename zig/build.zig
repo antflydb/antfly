@@ -30,6 +30,11 @@ const makeLmdbModule = antfly_storage_build.makeLmdbModule;
 const makeRootBuildOptions = antfly_storage_build.makeRootBuildOptions;
 const selectTestFilters = antfly_tests_build.selectTestFilters;
 
+const BuildEdition = enum {
+    full,
+    inference,
+};
+
 const snowball_languages = [_][]const u8{
     "danish",
     "dutch",
@@ -111,7 +116,6 @@ const DelegatedPackageStep = struct {
 };
 
 const DelegatedTermiteBuildSteps = struct {
-    termite_install: *std.Build.Step,
     termite_test: *std.Build.Step,
 };
 
@@ -214,20 +218,7 @@ fn addDelegatedTermiteBuildSteps(
             test_step = delegated.step;
         }
     }
-    const install_run = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "build",
-        "install",
-        "--prefix",
-        b.install_path,
-    });
-    install_run.setCwd(b.path("pkg/termite"));
-    addDelegatedTermiteOptions(b, install_run, enable_mlx, mlx_root, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
-    forwardBuildArgs(b, install_run);
-    const termite_install_step = b.step("install-termite", "Build and install the top-level Termite CLI");
-    termite_install_step.dependOn(&install_run.step);
     return .{
-        .termite_install = termite_install_step,
         .termite_test = test_step.?,
     };
 }
@@ -1024,6 +1015,7 @@ pub fn build(b: *std.Build) void {
     const lmdb_evented_async_io = b.option(bool, "lmdb_evented_async_io", "Use std.Io.Evented for the Zig LMDB async_io backend") orelse false;
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
+    const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
@@ -1929,7 +1921,7 @@ pub fn build(b: *std.Build) void {
         .name = "antfly-zig",
         .root_module = lib_mod,
     });
-    b.installArtifact(lib);
+    _ = lib;
 
     const capi_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
@@ -2152,7 +2144,6 @@ pub fn build(b: *std.Build) void {
         lib_image_bench.root_module.linkSystemLibrary("spng", .{});
         lib_image_bench.root_module.link_libc = true;
     }
-    b.installArtifact(lib_image_bench);
     const run_lib_image_bench = b.addRunArtifact(lib_image_bench);
     if (b.args) |args| {
         run_lib_image_bench.addArgs(args);
@@ -2195,7 +2186,6 @@ pub fn build(b: *std.Build) void {
         .name = "lib-pdf-bench",
         .root_module = pdf_bench_mod,
     });
-    b.installArtifact(lib_pdf_bench);
     const run_lib_pdf_bench = b.addRunArtifact(lib_pdf_bench);
     if (b.args) |args| {
         run_lib_pdf_bench.addArgs(args);
@@ -4322,7 +4312,6 @@ pub fn build(b: *std.Build) void {
         .name = "lmdb_bench_c",
         .root_module = lmdb_bench_mod_c,
     });
-    b.installArtifact(lmdb_bench_c);
 
     const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
     const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, antfly_version);
@@ -4340,7 +4329,6 @@ pub fn build(b: *std.Build) void {
         .name = "lmdb_bench_zig",
         .root_module = lmdb_bench_mod_zig,
     });
-    b.installArtifact(lmdb_bench_zig);
 
     const run_lmdb_bench_c = b.addRunArtifact(lmdb_bench_c);
     run_lmdb_bench_c.addArgs(&.{ "--cycles", "8", "--keys", "512", "--dups", "32", "--named-keys", "128" });
@@ -4398,7 +4386,6 @@ pub fn build(b: *std.Build) void {
         .name = "split_bench",
         .root_module = split_bench_mod,
     });
-    b.installArtifact(split_bench);
 
     const run_split_bench = b.addRunArtifact(split_bench);
     const split_bench_step = b.step("split-bench", "Benchmark median-key selection and split range copy");
@@ -4420,7 +4407,6 @@ pub fn build(b: *std.Build) void {
         .name = "db_split_bench",
         .root_module = db_split_bench_mod,
     });
-    b.installArtifact(db_split_bench);
 
     const run_db_split_bench = b.addRunArtifact(db_split_bench);
     const db_split_bench_step = b.step("db-split-bench", "Benchmark DB split preparation old vs current");
@@ -4447,7 +4433,6 @@ pub fn build(b: *std.Build) void {
         .name = "docid_doc_set_bench",
         .root_module = docid_doc_set_bench_mod,
     });
-    b.installArtifact(docid_doc_set_bench);
 
     const run_docid_doc_set_bench = b.addRunArtifact(docid_doc_set_bench);
     if (b.args) |args| {
@@ -4468,7 +4453,6 @@ pub fn build(b: *std.Build) void {
         .name = "backend_bench",
         .root_module = backend_bench_mod,
     });
-    b.installArtifact(backend_bench);
 
     const run_backend_bench = b.addRunArtifact(backend_bench);
     if (b.args) |args| {
@@ -4489,7 +4473,6 @@ pub fn build(b: *std.Build) void {
         .name = "lsm_backend_bench",
         .root_module = lsm_backend_bench_mod,
     });
-    b.installArtifact(lsm_backend_bench);
 
     const run_lsm_backend_bench = b.addRunArtifact(lsm_backend_bench);
     if (b.args) |args| {
@@ -4523,7 +4506,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_storage_read_bench",
         .root_module = hbc_storage_read_bench_mod,
     });
-    b.installArtifact(hbc_storage_read_bench);
 
     const run_hbc_storage_read_bench = b.addRunArtifact(hbc_storage_read_bench);
     if (b.args) |args| {
@@ -4558,7 +4540,6 @@ pub fn build(b: *std.Build) void {
         .name = "lsm_write_bench",
         .root_module = lsm_write_bench_mod,
     });
-    b.installArtifact(lsm_write_bench);
 
     const run_lsm_write_bench = b.addRunArtifact(lsm_write_bench);
     if (b.args) |args| {
@@ -4587,7 +4568,6 @@ pub fn build(b: *std.Build) void {
         .name = "lsm_write_bench_compare",
         .root_module = lsm_write_bench_compare_mod,
     });
-    b.installArtifact(lsm_write_bench_compare);
 
     const run_lsm_write_bench_compare = b.addRunArtifact(lsm_write_bench_compare);
     if (b.args) |args| {
@@ -4621,7 +4601,6 @@ pub fn build(b: *std.Build) void {
         .name = "text_segment_write_bench",
         .root_module = text_segment_write_bench_mod,
     });
-    b.installArtifact(text_segment_write_bench);
 
     const run_text_segment_write_bench = b.addRunArtifact(text_segment_write_bench);
     if (b.args) |args| {
@@ -4648,7 +4627,6 @@ pub fn build(b: *std.Build) void {
         .name = "lsm_backend_bench_compare",
         .root_module = lsm_backend_bench_compare_mod,
     });
-    b.installArtifact(lsm_backend_bench_compare);
 
     const run_lsm_backend_bench_compare = b.addRunArtifact(lsm_backend_bench_compare);
     if (b.args) |args| {
@@ -4675,7 +4653,6 @@ pub fn build(b: *std.Build) void {
         .name = "regex_bench",
         .root_module = regex_bench_mod,
     });
-    b.installArtifact(regex_bench);
 
     const run_regex_bench = b.addRunArtifact(regex_bench);
     if (b.args) |args| {
@@ -4700,7 +4677,6 @@ pub fn build(b: *std.Build) void {
         .name = "wal_bench",
         .root_module = wal_bench_mod,
     });
-    b.installArtifact(wal_bench);
 
     const run_wal_bench = b.addRunArtifact(wal_bench);
     const wal_bench_step = b.step("wal-bench", "Benchmark WAL append throughput with and without group commit");
@@ -4800,7 +4776,6 @@ pub fn build(b: *std.Build) void {
         .name = "derived_log_bench",
         .root_module = derived_log_bench_mod,
     });
-    b.installArtifact(derived_log_bench);
 
     const run_derived_log_bench = b.addRunArtifact(derived_log_bench);
     const derived_log_bench_step = b.step("derived-log-bench", "Benchmark derived log throughput with and without group commit");
@@ -4887,7 +4862,6 @@ pub fn build(b: *std.Build) void {
         .name = "json_bench",
         .root_module = json_bench_mod,
     });
-    b.installArtifact(json_bench);
 
     const run_json_bench = b.addRunArtifact(json_bench);
     if (b.args) |args| {
@@ -4908,7 +4882,6 @@ pub fn build(b: *std.Build) void {
         .name = "bench",
         .root_module = bench_mod,
     });
-    b.installArtifact(bench);
 
     const run_bench = b.addRunArtifact(bench);
     const bench_step = b.step("bench", "Run benchmarks");
@@ -4940,7 +4913,6 @@ pub fn build(b: *std.Build) void {
         .name = "quickstart_bench",
         .root_module = quickstart_bench_mod,
     });
-    b.installArtifact(quickstart_bench);
 
     const run_quickstart_bench = b.addRunArtifact(quickstart_bench);
     if (b.args) |args| {
@@ -4960,7 +4932,6 @@ pub fn build(b: *std.Build) void {
         .name = "compat_runner",
         .root_module = compat_mod,
     });
-    b.installArtifact(compat);
 
     const run_compat = b.addRunArtifact(compat);
     run_compat.addArg("compat/cases");
@@ -5041,7 +5012,6 @@ pub fn build(b: *std.Build) void {
         .name = "storage_fixture_promote",
         .root_module = storage_fixture_promote_mod,
     });
-    b.installArtifact(storage_fixture_promote);
 
     const run_storage_fixture_promote = b.addRunArtifact(storage_fixture_promote);
     if (b.args) |args| {
@@ -5064,7 +5034,6 @@ pub fn build(b: *std.Build) void {
         .name = "merge_cycle_bench",
         .root_module = merge_cycle_mod,
     });
-    b.installArtifact(merge_cycle);
 
     const run_merge_cycle = b.addRunArtifact(merge_cycle);
     const merge_cycle_step = b.step("merge-cycle", "Run the merge-cycle benchmark");
@@ -5081,7 +5050,6 @@ pub fn build(b: *std.Build) void {
         .name = "merge_cost_bench",
         .root_module = merge_cost_mod,
     });
-    b.installArtifact(merge_cost);
 
     const run_merge_cost = b.addRunArtifact(merge_cost);
     const merge_cost_step = b.step("merge-cost", "Run the direct merge cost benchmark");
@@ -5098,7 +5066,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_parity",
         .root_module = hbc_parity_mod,
     });
-    b.installArtifact(hbc_parity);
 
     const run_hbc_parity = b.addRunArtifact(hbc_parity);
     const hbc_parity_step = b.step("hbc-parity", "Run the deterministic HBC parity harness");
@@ -5115,7 +5082,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_bench",
         .root_module = hbc_bench_mod,
     });
-    b.installArtifact(hbc_bench);
 
     const run_hbc_bench = b.addRunArtifact(hbc_bench);
     if (b.args) |args| {
@@ -5135,7 +5101,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_write_bench",
         .root_module = hbc_write_bench_mod,
     });
-    b.installArtifact(hbc_write_bench);
 
     const run_hbc_write_bench = b.addRunArtifact(hbc_write_bench);
     if (b.args) |args| {
@@ -5180,7 +5145,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_read_bench",
         .root_module = hbc_read_bench_mod,
     });
-    b.installArtifact(hbc_read_bench);
 
     const run_hbc_read_bench = b.addRunArtifact(hbc_read_bench);
     if (b.args) |args| {
@@ -5222,7 +5186,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_isolate",
         .root_module = hbc_isolate_mod,
     });
-    b.installArtifact(hbc_isolate);
 
     const run_hbc_isolate = b.addRunArtifact(hbc_isolate);
     if (b.args) |args| {
@@ -5249,7 +5212,6 @@ pub fn build(b: *std.Build) void {
         .name = "dense_stack_bench",
         .root_module = dense_stack_bench_mod,
     });
-    b.installArtifact(dense_stack_bench);
 
     const run_dense_stack_bench = b.addRunArtifact(dense_stack_bench);
     if (b.args) |args| {
@@ -5297,7 +5259,6 @@ pub fn build(b: *std.Build) void {
         .name = "replay_bench",
         .root_module = replay_bench_mod,
     });
-    b.installArtifact(replay_bench);
 
     const run_replay_bench = b.addRunArtifact(replay_bench);
     if (b.args) |args| {
@@ -5358,7 +5319,6 @@ pub fn build(b: *std.Build) void {
         .name = "batch_bench",
         .root_module = batch_bench_mod,
     });
-    b.installArtifact(batch_bench);
 
     const run_batch_bench = b.addRunArtifact(batch_bench);
     if (b.args) |args| {
@@ -5378,7 +5338,6 @@ pub fn build(b: *std.Build) void {
         .name = "docid_write_bench",
         .root_module = docid_write_bench_mod,
     });
-    b.installArtifact(docid_write_bench);
 
     const run_docid_write_bench = b.addRunArtifact(docid_write_bench);
     if (b.args) |args| {
@@ -5400,7 +5359,6 @@ pub fn build(b: *std.Build) void {
         .name = "docid_query_bench",
         .root_module = docid_query_bench_mod,
     });
-    b.installArtifact(docid_query_bench);
 
     const run_docid_query_bench = b.addRunArtifact(docid_query_bench);
     if (b.args) |args| {
@@ -5440,7 +5398,6 @@ pub fn build(b: *std.Build) void {
         .name = "algebraic_bench",
         .root_module = algebraic_bench_mod,
     });
-    b.installArtifact(algebraic_bench);
 
     const run_algebraic_bench = b.addRunArtifact(algebraic_bench);
     if (b.args) |args| {
@@ -5467,7 +5424,6 @@ pub fn build(b: *std.Build) void {
         .name = "algebraic_summary",
         .root_module = algebraic_summary_mod,
     });
-    b.installArtifact(algebraic_summary);
     const run_algebraic_summary = b.addRunArtifact(algebraic_summary);
     if (b.args) |args| {
         run_algebraic_summary.addArgs(args);
@@ -5616,7 +5572,6 @@ pub fn build(b: *std.Build) void {
         .name = "rw_lock_bench",
         .root_module = rw_lock_bench_mod,
     });
-    b.installArtifact(rw_lock_bench);
 
     const run_rw_lock_bench = b.addRunArtifact(rw_lock_bench);
     if (b.args) |args| {
@@ -5636,7 +5591,6 @@ pub fn build(b: *std.Build) void {
         .name = "open_bench",
         .root_module = open_bench_mod,
     });
-    b.installArtifact(open_bench);
 
     const run_open_bench = b.addRunArtifact(open_bench);
     if (b.args) |args| {
@@ -5656,7 +5610,6 @@ pub fn build(b: *std.Build) void {
         .name = "artifact_rebuild_bench",
         .root_module = artifact_rebuild_bench_mod,
     });
-    b.installArtifact(artifact_rebuild_bench);
 
     const run_artifact_rebuild_bench = b.addRunArtifact(artifact_rebuild_bench);
     if (b.args) |args| {
@@ -5678,7 +5631,6 @@ pub fn build(b: *std.Build) void {
         .name = "provisioned_warmup_bench",
         .root_module = provisioned_warmup_bench_mod,
     });
-    b.installArtifact(provisioned_warmup_bench);
 
     const run_provisioned_warmup_bench = b.addRunArtifact(provisioned_warmup_bench);
     if (b.args) |args| {
@@ -5733,7 +5685,6 @@ pub fn build(b: *std.Build) void {
         .name = "public_query_guardrail",
         .root_module = public_query_guardrail_mod,
     });
-    b.installArtifact(public_query_guardrail);
 
     const run_public_query_guardrail = b.addRunArtifact(public_query_guardrail);
     if (b.args) |args| {
@@ -5775,7 +5726,6 @@ pub fn build(b: *std.Build) void {
         .name = "raft_apply_bench",
         .root_module = raft_apply_bench_mod,
     });
-    b.installArtifact(raft_apply_bench);
 
     const run_raft_apply_bench = b.addRunArtifact(raft_apply_bench);
     if (b.args) |args| {
@@ -5796,7 +5746,6 @@ pub fn build(b: *std.Build) void {
         .name = "managed_host_wal_bench",
         .root_module = managed_host_wal_bench_mod,
     });
-    b.installArtifact(managed_host_wal_bench);
 
     const run_managed_host_wal_bench = b.addRunArtifact(managed_host_wal_bench);
     if (b.args) |args| {
@@ -5820,7 +5769,6 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
-    b.installArtifact(dense_profile_summary);
 
     const run_dense_profile_summary = b.addRunArtifact(dense_profile_summary);
     if (b.args) |args| {
@@ -5840,7 +5788,6 @@ pub fn build(b: *std.Build) void {
         .name = "lmdb_commit_compare",
         .root_module = lmdb_commit_compare_mod,
     });
-    b.installArtifact(lmdb_commit_compare);
 
     const run_lmdb_commit_compare = b.addRunArtifact(lmdb_commit_compare);
     if (b.args) |args| {
@@ -5860,7 +5807,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_split_bench",
         .root_module = hbc_split_bench_mod,
     });
-    b.installArtifact(hbc_split_bench);
 
     const run_hbc_split_bench = b.addRunArtifact(hbc_split_bench);
     if (b.args) |args| {
@@ -5880,7 +5826,6 @@ pub fn build(b: *std.Build) void {
         .name = "sparse_split_bench",
         .root_module = sparse_split_bench_mod,
     });
-    b.installArtifact(sparse_split_bench);
 
     const run_sparse_split_bench = b.addRunArtifact(sparse_split_bench);
     if (b.args) |args| {
@@ -5901,7 +5846,6 @@ pub fn build(b: *std.Build) void {
         .name = "rabitq_bench",
         .root_module = rabitq_bench_mod,
     });
-    b.installArtifact(rabitq_bench);
 
     const run_rabitq_bench = b.addRunArtifact(rabitq_bench);
     if (b.args) |args| {
@@ -5921,7 +5865,6 @@ pub fn build(b: *std.Build) void {
         .name = "recall_harness",
         .root_module = recall_harness_mod,
     });
-    b.installArtifact(recall_harness);
 
     const run_recall_harness = b.addRunArtifact(recall_harness);
     if (b.args) |args| {
@@ -5930,19 +5873,42 @@ pub fn build(b: *std.Build) void {
     const recall_harness_step = b.step("recall-harness", "Run Zig recall suites against exported vector datasets");
     recall_harness_step.dependOn(&run_recall_harness.step);
 
-    const antfly_main_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    antfly_main_mod.addImport("antfly-zig", lib_mod);
-    antfly_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    antfly_main_mod.addImport("httpx", httpx_mod);
-    antfly_main_mod.addImport("antfly_vellum", vellum_mod);
-    antfly_main_mod.addImport("raft_engine", raft_engine_mod);
-    antfly_main_mod.addImport("structlog", structlog_mod);
-    antfly_main_mod.addImport("antfly_platform", platform_mod);
-    antfly_main_mod.addOptions("build_options", build_options);
+    const antfly_main_mod = if (edition == .full) blk: {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("antfly-zig", lib_mod);
+        mod.addImport("antfly-client", antfly_client_pkg_mod);
+        mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_vellum", vellum_mod);
+        mod.addImport("raft_engine", raft_engine_mod);
+        mod.addImport("structlog", structlog_mod);
+        mod.addImport("antfly_platform", platform_mod);
+        mod.addOptions("build_options", build_options);
+        break :blk mod;
+    } else blk: {
+        const termite_cli_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/termite/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        termite_cli_mod.addImport("termite", termite_server_mod);
+        termite_cli_mod.addImport("build_options", termite_build_options_mod);
+        termite_cli_mod.addImport("antfly_platform", platform_mod);
+        termite_cli_mod.addImport("structlog", structlog_mod);
+
+        const mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/inference_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("termite_cli", termite_cli_mod);
+        mod.addImport("antfly_platform", platform_mod);
+        mod.addImport("structlog", structlog_mod);
+        break :blk mod;
+    };
 
     const antfly_main = b.addExecutable(.{
         .name = "antfly",
@@ -5955,7 +5921,9 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "share/antfly/antfarm",
     });
     b.getInstallStep().dependOn(&install_antfly.step);
-    b.getInstallStep().dependOn(&install_antfarm_assets.step);
+    if (edition == .full) {
+        b.getInstallStep().dependOn(&install_antfarm_assets.step);
+    }
 
     const run_antfly = b.addRunArtifact(antfly_main);
     if (b.args) |args| {
@@ -5963,9 +5931,6 @@ pub fn build(b: *std.Build) void {
     }
     const antfly_step = b.step("antfly", "Run the top-level Antfly CLI");
     antfly_step.dependOn(&run_antfly.step);
-    const install_antfly_step = b.step("install-antfly", "Build and install the top-level Antfly CLI");
-    install_antfly_step.dependOn(&install_antfly.step);
-    install_antfly_step.dependOn(&install_antfarm_assets.step);
 
     const run_recall_harness_default = b.addRunArtifact(recall_harness);
     run_recall_harness_default.addArgs(&.{
@@ -6004,7 +5969,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_trace",
         .root_module = hbc_trace_mod,
     });
-    b.installArtifact(hbc_trace);
 
     const run_hbc_trace = b.addRunArtifact(hbc_trace);
     if (b.args) |args| {
@@ -6025,7 +5989,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_leaf_debug",
         .root_module = hbc_leaf_debug_mod,
     });
-    b.installArtifact(hbc_leaf_debug);
 
     const run_hbc_leaf_debug = b.addRunArtifact(hbc_leaf_debug);
     if (b.args) |args| {

@@ -702,7 +702,7 @@ fn setupFastSmokeCase(
                 .train_path = assets.train_path,
                 .eval_path = assets.eval_path,
                 .labels = assets.labels,
-                .backend = "blas",
+                .backend = "native",
                 .max_examples = 2,
                 .eval_max_examples = 1,
                 .max_seq_len = 16,
@@ -1315,7 +1315,7 @@ fn buildGliner2LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
         entity_types,
         train_cache_path,
         recipe.dataset.train_split orelse "train",
-        recipe.backend orelse "blas",
+        recipe.backend orelse "native",
         try fmtInt(allocator, recipe.dataset.max_examples orelse 128),
         try fmtInt(allocator, recipe.dataset.max_seq_len orelse 256),
         "8",
@@ -1329,7 +1329,7 @@ fn buildGliner2LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
             entity_types,
             eval_cache_path,
             recipe.dataset.eval_split orelse "eval",
-            recipe.backend orelse "blas",
+            recipe.backend orelse "native",
             try fmtInt(allocator, recipe.dataset.eval_max_examples orelse evalMaxExamples(recipe) orelse 128),
             try fmtInt(allocator, recipe.dataset.max_seq_len orelse 256),
             "8",
@@ -1339,7 +1339,7 @@ fn buildGliner2LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     try steps.append(allocator, .{ .name = "train-eval", .argv = try argv(allocator, &.{
         "train-eval-gliner2-lora-bundle", model_path,                                                           bootstrap_dir,    train_cache_path,                                             eval_cache_path, trained_dir,
         "--lr",                           try fmtFloat(allocator, recipe.optimizer.learning_rate orelse 0.001), "--max-examples", try fmtInt(allocator, recipe.dataset.max_examples orelse 32), "--epochs",      try fmtInt(allocator, recipe.optimizer.epochs orelse 1),
-        "--backend",                      recipe.backend orelse "blas",
+        "--backend",                      recipe.backend orelse "native",
     }) });
     if (recipe.artifacts.materialized_dir) |out_dir| {
         try steps.append(allocator, .{ .name = "materialize", .argv = try argv(allocator, &.{
@@ -2726,7 +2726,7 @@ fn runDirectPrepareGliner2TopLayerBoundaryCache(allocator: std.mem.Allocator, io
     const entity_types_csv = argv_in[3];
     const out_path = argv_in[4];
     const split = if (argv_in.len >= 6) argv_in[5] else null;
-    const backend_arg = if (argv_in.len >= 7) argv_in[6] else "blas";
+    const backend_arg = if (argv_in.len >= 7) argv_in[6] else "native";
     const max_examples = if (argv_in.len >= 8) try std.fmt.parseUnsigned(usize, argv_in[7], 10) else 128;
     const max_length = if (argv_in.len >= 9) try std.fmt.parseUnsigned(usize, argv_in[8], 10) else 256;
     const max_span_width = if (argv_in.len >= 10) try std.fmt.parseUnsigned(usize, argv_in[9], 10) else 8;
@@ -3603,7 +3603,7 @@ fn runOptimizerBackedQwen2Sft(
     const trained_dir_config = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir;
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
-    const backend_kind: qwen2_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "blas", "mlx")) .mlx else .native;
+    const backend_kind: qwen2_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "native", "mlx")) .mlx else .native;
     const max_examples = recipe.dataset.max_examples orelse 32;
     const max_seq_len = recipe.dataset.max_seq_len orelse 512;
     const family = recipe.model.family orelse try inferFamily(recipe);
@@ -3825,7 +3825,7 @@ fn runOptimizerBackedGemmaDpo(
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
     const reference_path = recipe.model.reference_path orelse base_model_dir;
-    const backend_kind: gemma4_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "blas", "mlx")) .mlx else .native;
+    const backend_kind: gemma4_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "native", "mlx")) .mlx else .native;
     const max_examples = recipe.dataset.max_examples orelse 32;
     const max_seq_len = recipe.dataset.max_seq_len orelse 512;
     try validateGemmaAdapterOptions(adapter);
@@ -4007,7 +4007,7 @@ fn runOptimizerBackedQwen2Dpo(
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
     const reference_path = recipe.model.reference_path orelse base_model_dir;
-    const backend_kind: qwen2_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "blas", "mlx")) .mlx else .native;
+    const backend_kind: qwen2_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "native", "mlx")) .mlx else .native;
     const max_examples = recipe.dataset.max_examples orelse 32;
     const max_seq_len = recipe.dataset.max_seq_len orelse 512;
     const family = recipe.model.family orelse try inferFamily(recipe);
@@ -4244,7 +4244,7 @@ fn runOptimizerBackedGemmaGrpo(
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
     const reference_path = recipe.model.reference_path orelse base_model_dir;
-    const backend_kind: gemma4_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "blas", "mlx")) .mlx else .native;
+    const backend_kind: gemma4_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "native", "mlx")) .mlx else .native;
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
     const group_size = recipe.grpo.group_size orelse 2;
     const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
@@ -4494,7 +4494,7 @@ fn runOptimizerBackedQwen2Grpo(
     const trained_dir = trained_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     defer if (trained_dir_config == null) allocator.free(trained_dir);
     const reference_path = recipe.model.reference_path orelse base_model_dir;
-    const backend_kind: qwen2_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "blas", "mlx")) .mlx else .native;
+    const backend_kind: qwen2_real_autodiff.BackendKind = if (std.mem.eql(u8, recipe.backend orelse "native", "mlx")) .mlx else .native;
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
     const group_size = recipe.grpo.group_size orelse 2;
     const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;

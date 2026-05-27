@@ -755,12 +755,12 @@ fn writeRunOutputs(
             .use_schedule_free = ctx.use_schedule_free,
         },
         .backend_policy = .{
-            .selected = if (ctx.use_mlx) "mlx" else "blas",
-            .preferred = if (build_options.enable_mlx) "mlx" else "blas",
+            .selected = if (ctx.use_mlx) "mlx" else "native",
+            .preferred = if (build_options.enable_mlx) "mlx" else "native",
         },
         .distributed = .{
             .enabled = false,
-            .backend = if (ctx.use_mlx) "mlx" else "blas",
+            .backend = if (ctx.use_mlx) "mlx" else "native",
             .rank = 0,
             .world_size = 1,
             .primary_rank = 0,
@@ -778,12 +778,12 @@ fn writeRunOutputs(
         .artifact_family_version = finetune.artifact_family_version,
         .task = "gemma4_lora_train_eval",
         .backend_policy = .{
-            .selected = if (ctx.use_mlx) "mlx" else "blas",
-            .preferred = if (build_options.enable_mlx) "mlx" else "blas",
+            .selected = if (ctx.use_mlx) "mlx" else "native",
+            .preferred = if (build_options.enable_mlx) "mlx" else "native",
         },
         .distributed = .{
             .enabled = false,
-            .backend = if (ctx.use_mlx) "mlx" else "blas",
+            .backend = if (ctx.use_mlx) "mlx" else "native",
             .rank = 0,
             .world_size = 1,
             .primary_rank = 0,
@@ -821,7 +821,7 @@ fn usageError() error{InvalidArguments} {
         \\  --grad-accum <u32>                  Gradient accumulation steps (default: 1)
         \\  --llrd-decay <f32>                  Surrogate-only layer-wise LR decay (default: 1.0)
         \\  --schedule-free                     Surrogate-only schedule-free AdamW
-        \\  --backend auto|mlx|blas             Compute backend for gradient math (default: auto)
+        \\  --backend auto|mlx|native             Compute backend for gradient math (default: auto)
         \\  --gguf-projector <path>             Required for multimodal autodiff examples; path to Gemma4 projector GGUF
         \\
         \\example: train-eval-gemma4-lora-bundle /tmp/gemma4-base /tmp/gemma4-lora /tmp/gemma4_inputs.json /tmp/out \

@@ -151,7 +151,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             backend_ptr = &mlx_cb_storage;
         }
     }
-    std.debug.print("backend: {s}\n", .{if (use_mlx) "mlx" else "blas"});
+    std.debug.print("backend: {s}\n", .{if (use_mlx) "mlx" else "native"});
 
     // Initialize MLX distributed context if world_size > 1.
     const MlxDistCtxT = if (build_options.enable_mlx) ?mlx_mod.DistributedContext else void;
@@ -278,8 +278,8 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             .use_schedule_free = use_schedule_free,
         },
         .backend_policy = .{
-            .selected = if (use_mlx) "mlx" else "blas",
-            .preferred = if (build_options.enable_mlx) "mlx" else "blas",
+            .selected = if (use_mlx) "mlx" else "native",
+            .preferred = if (build_options.enable_mlx) "mlx" else "native",
         },
         .distributed = .{
             .enabled = world_size > 1,
@@ -298,8 +298,8 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
         .artifact_family_version = gliner2.artifact_family_version,
         .task = "gliner2_lora_train_eval",
         .backend_policy = .{
-            .selected = if (use_mlx) "mlx" else "blas",
-            .preferred = if (build_options.enable_mlx) "mlx" else "blas",
+            .selected = if (use_mlx) "mlx" else "native",
+            .preferred = if (build_options.enable_mlx) "mlx" else "native",
         },
         .distributed = .{
             .enabled = world_size > 1,
@@ -330,7 +330,7 @@ fn usageError() error{InvalidArguments} {
         \\  --grad-accum <u32>            Gradient accumulation steps (default: 1)
         \\  --llrd-decay <f32>            Layer-wise LR decay factor (default: 1.0=disabled)
         \\  --schedule-free               Use Schedule-Free AdamW optimizer (default: off)
-        \\  --backend auto|mlx|blas       Compute backend for gradient math (default: auto)
+        \\  --backend auto|mlx|native       Compute backend for gradient math (default: auto)
         \\
         \\Distributed (multi-GPU via MLX):
         \\  Set MLX_WORLD_SIZE=N before launching to enable DDP gradient averaging.

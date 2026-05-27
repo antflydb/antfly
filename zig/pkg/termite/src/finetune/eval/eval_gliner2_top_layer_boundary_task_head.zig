@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
 
     const model_dir = args.next() orelse return usage();
     const summary_path = args.next() orelse return usage();
-    const backend = parseBackend(args.next() orelse "blas") orelse return error.InvalidBackend;
+    const backend = parseBackend(args.next() orelse "native") orelse return error.InvalidBackend;
     const task_head_input = args.next();
 
     var summary = try gliner2_boundary.loadCachedBoundarySummary(allocator, summary_path);
@@ -65,7 +65,7 @@ fn parseBackend(value: []const u8) ?text_encoder_boundary.BackendChoice {
 fn usage() error{InvalidArguments}!void {
     std.debug.print(
         \\usage: eval-gliner2-top-layer-boundary-task-head <model_dir> <boundary_summary.json> [backend] [boundary_task_head.json|boundary_task_head_dir]
-        \\example: eval-gliner2-top-layer-boundary-task-head /tmp/gliner2_base /tmp/gliner2_boundary.json blas /tmp/gliner2_boundary_task_head
+        \\example: eval-gliner2-top-layer-boundary-task-head /tmp/gliner2_base /tmp/gliner2_boundary.json native /tmp/gliner2_boundary_task_head
         \\
     , .{});
     return error.InvalidArguments;

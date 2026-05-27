@@ -26,7 +26,7 @@ Pull-request CI runs fast required checks:
 
 - `zig build check-snowball`
 - `zig build unit-test`
-- `zig build -Doptimize=ReleaseFast install-antfly install-termite`
+- `zig build -Doptimize=ReleaseFast install -Dedition=full`
 - shared release-binary smoke checks
 - `e2e-base`
 - TLA checks when relevant files change
@@ -156,13 +156,13 @@ external-service, model, browser, or slow integration coverage. Run the same
 base tier locally with the release binaries:
 
 ```sh
-zig build -Doptimize=ReleaseFast install-antfly install-termite
+zig build -Doptimize=ReleaseFast install -Dedition=full
 
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest -q \
   -m "not objectstore_integration and not swarm_integration and not real_model and not postgres_integration and not slow" \
   e2e/antfly
 
-TERMITE_BIN=./zig-out/bin/termite uv run --project e2e/termite pytest -q \
+ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/termite pytest -q \
   -m "not slow and not multimodal and not model_integration and not browser_integration" \
   e2e/termite
 ```
@@ -174,7 +174,7 @@ long-running scenarios so they stay in `e2e-full`.
 Run the Antfly product E2E suite:
 
 ```sh
-zig build install-antfly
+zig build install -Dedition=full
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest -q e2e/antfly
 ```
 
@@ -227,24 +227,24 @@ export GOOGLE_CLOUD_PROJECT=my-project
 Run the Termite product E2E suite:
 
 ```sh
-zig build install-termite
-TERMITE_BIN=./zig-out/bin/termite uv run --project e2e/termite pytest -q e2e/termite
+zig build install -Dedition=inference
+ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/termite pytest -q e2e/termite
 ```
 
-The Termite fixtures can also target an already-running service:
+The Inference fixtures can also target an already-running service:
 
 ```sh
 TERMITE_URL=http://127.0.0.1:8080 uv run --project e2e/termite pytest -q e2e/termite
 TERMITE_URL=https://termite.example.com TERMITE_TOKEN=... uv run --project e2e/termite pytest -q e2e/termite
 ```
 
-Common Termite E2E environment variables:
+Common inference E2E environment variables:
 
-- `TERMITE_BIN`: local Termite binary to auto-start.
+- `ANTFLY_BIN`: local Antfly binary to auto-start via `antfly inference run`.
 - `TERMITE_URL`: existing Termite API endpoint.
 - `TERMITE_TOKEN`: bearer token for remote Termite endpoints.
 - `TERMITE_MODELS_DIR`: model directory override.
-- `TERMITE_DOWNLOAD=1`: allow model downloads when tests request unavailable models.
+- `ANTFLY_INFERENCE_DOWNLOAD=1`: allow model downloads through `antfly inference pull` when tests request unavailable models.
 - `RUN_LARGE_MODEL_TESTS=1`: opt into large-model tests.
 
 Many E2E tests skip cleanly when required binaries, services, local PostgreSQL,

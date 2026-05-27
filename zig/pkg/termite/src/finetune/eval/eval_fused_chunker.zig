@@ -25,7 +25,7 @@
 //   --hidden-size <n>    Hidden size (default: 768)
 //   --max-seq-len <n>    Max seq len (default: 384)
 //   --max-chunks <n>     Max chunks per sample (default: 32)
-//   --backend blas|mlx|auto  Compute backend (default: auto)
+//   --backend native|mlx|auto  Compute backend (default: auto)
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -253,7 +253,7 @@ fn printUsage() void {
         \\  --hidden-size <n>        Hidden size (default: 768)
         \\  --max-seq-len <n>        Max seq len (default: 384)
         \\  --max-chunks <n>         Max chunks per sample (default: 32)
-        \\  --backend blas|mlx|auto  Compute backend (default: auto)
+        \\  --backend native|mlx|auto  Compute backend (default: auto)
         \\
     , .{});
 }
@@ -340,7 +340,7 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, value, "auto")) {
                 backend = .auto;
             } else {
-                print("error: unknown backend '{s}': expected blas, mlx, or auto\n", .{value});
+                print("error: unknown backend '{s}': expected native, mlx, or auto\n", .{value});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -415,7 +415,7 @@ pub fn main(init: std.process.Init) !void {
         }
     } else blas_backend.computeBackend();
 
-    print("backend: {s}\n", .{if (use_mlx) "mlx" else "blas"});
+    print("backend: {s}\n", .{if (use_mlx) "mlx" else "native"});
 
     // Set up trainer (owns the boundary head weights)
     const config = FusedTrainingConfig{

@@ -113,7 +113,7 @@ fn parseBackendChoice(value: []const u8) ?reranker_head.BackendChoice {
 
 fn printUsage() void {
     print(
-        \\usage: train-eval-reranker-head <model-dir> <train-jsonl-or-dir> <eval-jsonl-or-dir> <out-dir> [train-split] [eval-split] [--backend auto|blas|mlx] [--max-examples N] [--epochs N] [--learning-rate LR]
+        \\usage: train-eval-reranker-head <model-dir> <train-jsonl-or-dir> <eval-jsonl-or-dir> <out-dir> [train-split] [eval-split] [--backend auto|native|mlx] [--max-examples N] [--epochs N] [--learning-rate LR]
         \\example: train-eval-reranker-head /tmp/bge-reranker /tmp/train /tmp/eval /tmp/out train eval --backend mlx --max-examples 128 --epochs 2 --learning-rate 0.0005
         \\
     , .{});

@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "metadata")) return try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "swarm")) return try cmd.swarm.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "termite")) return try cmd.termite.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "inference")) return try cmd.termite.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
 
     // CLI client subcommands — these talk to a remote Antfly server via HTTP
@@ -107,7 +107,7 @@ fn printUsage(argv0: []const u8) void {
         \\  data
         \\  metadata
         \\  swarm
-        \\  termite
+        \\  inference
         \\  serverless
         \\
         \\client subcommands:

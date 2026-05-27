@@ -17,8 +17,8 @@
 Models are stored in the flat default Termite layout:
     models/{owner}/{name}/
 
-When TERMITE_DOWNLOAD=1 is set, the E2E harness can lazily fetch missing models
-by shelling out to `termite pull` instead of using huggingface_hub directly.
+When ANTFLY_INFERENCE_DOWNLOAD=1 is set, the E2E harness can lazily fetch missing models
+by shelling out to `antfly inference pull` instead of using huggingface_hub directly.
 Set TERMITE_MODELS_DIR to control where models are stored.
 """
 
@@ -26,15 +26,13 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_TERMITE_BIN_CANDIDATES = (
-    REPO_ROOT / "pkg" / "termite" / "zig-out" / "bin" / "termite",
-    REPO_ROOT / "zig-out" / "bin" / "termite",
+DEFAULT_ANTFLY_BIN_CANDIDATES = (
+    REPO_ROOT / "zig-out" / "bin" / "antfly",
 )
 
 MODEL_TASKS = (
@@ -249,8 +247,8 @@ def models_dir() -> Path:
     return directory
 
 
-def termite_download_enabled() -> bool:
-    return os.environ.get("TERMITE_DOWNLOAD") == "1"
+def inference_download_enabled() -> bool:
+    return os.environ.get("ANTFLY_INFERENCE_DOWNLOAD") == "1"
 
 
 def run_large_model_tests() -> bool:
@@ -258,19 +256,16 @@ def run_large_model_tests() -> bool:
     return value != "" and value not in {"0", "false", "False"}
 
 
-def termite_bin() -> str:
-    explicit = os.environ.get("TERMITE_PULL_BIN") or os.environ.get("TERMITE_BIN")
+def inference_command() -> list[str]:
+    explicit = os.environ.get("ANTFLY_BIN")
     if explicit:
-        return str(Path(explicit).expanduser().resolve())
-    for candidate in DEFAULT_TERMITE_BIN_CANDIDATES:
+        return [str(Path(explicit).expanduser().resolve()), "inference"]
+    for candidate in DEFAULT_ANTFLY_BIN_CANDIDATES:
         if candidate.exists():
-            return str(candidate)
-    discovered = shutil.which("termite")
-    if discovered:
-        return discovered
+            return [str(candidate), "inference"]
     raise RuntimeError(
-        "TERMITE_DOWNLOAD=1 requires a termite binary. "
-        "Set TERMITE_PULL_BIN or TERMITE_BIN, or build pkg/termite/zig-out/bin/termite."
+        "ANTFLY_INFERENCE_DOWNLOAD=1 requires an antfly inference binary. "
+        "Set ANTFLY_BIN, or build zig-out/bin/antfly with `zig build install -Dedition=inference`."
     )
 
 
@@ -341,13 +336,13 @@ def spec_for_name(name: str, task_hint: str | None = None) -> ModelSpec | None:
 
 
 def ensure_model(spec: ModelSpec) -> Path:
-    """Download a model with `termite pull` if not already present."""
+    """Download a model with `antfly inference pull` if not already present."""
 
     if (existing := find_local_model_path(spec.request_name, spec.task)) is not None:
         return existing
 
     command = [
-        termite_bin(),
+        *inference_command(),
         "pull",
         spec.pull_ref,
         "--tasks",
@@ -361,7 +356,7 @@ def ensure_model(spec: ModelSpec) -> Path:
 
     resolved = find_local_model_path(spec.request_name, spec.task)
     if resolved is None:
-        raise RuntimeError(f"termite pull finished but could not locate {spec.request_name} in {models_dir()}")
+        raise RuntimeError(f"antfly inference pull finished but could not locate {spec.request_name} in {models_dir()}")
     return resolved
 
 
@@ -541,7 +536,7 @@ def response_indicates_missing_model(response) -> bool:
 
 
 def maybe_pull_missing_model(path: str, payload: dict | None, response) -> bool:
-    if not termite_download_enabled():
+    if not inference_download_enabled():
         return False
     if not response_indicates_missing_model(response):
         return False
@@ -583,7 +578,7 @@ def _env_model_specs() -> list[ModelSpec]:
 
 
 def bootstrap_models_for_listing(listing: dict) -> bool:
-    if not termite_download_enabled():
+    if not inference_download_enabled():
         return False
 
     planned: list[ModelSpec] = []

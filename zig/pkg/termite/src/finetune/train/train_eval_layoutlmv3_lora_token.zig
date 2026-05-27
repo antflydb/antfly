@@ -138,7 +138,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             backend_ptr = &mlx_cb_storage;
         }
     }
-    std.debug.print("backend: {s}\n", .{if (use_mlx) "mlx" else "blas"});
+    std.debug.print("backend: {s}\n", .{if (use_mlx) "mlx" else "native"});
 
     // Initialize MLX distributed context if world_size > 1.
     const MlxDistCtxT = if (build_options.enable_mlx) ?mlx_mod.DistributedContext else void;
@@ -273,8 +273,8 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             .use_schedule_free = use_schedule_free,
         },
         .backend_policy = .{
-            .selected = if (use_mlx) "mlx" else "blas",
-            .preferred = if (build_options.enable_mlx) "mlx" else "blas",
+            .selected = if (use_mlx) "mlx" else "native",
+            .preferred = if (build_options.enable_mlx) "mlx" else "native",
         },
         .distributed = .{
             .enabled = world_size > 1,
@@ -300,8 +300,8 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
         .artifact_family_version = finetune.artifact_family_version,
         .task = "layoutlmv3_lora_token_train_eval",
         .backend_policy = .{
-            .selected = if (use_mlx) "mlx" else "blas",
-            .preferred = if (build_options.enable_mlx) "mlx" else "blas",
+            .selected = if (use_mlx) "mlx" else "native",
+            .preferred = if (build_options.enable_mlx) "mlx" else "native",
         },
         .distributed = .{
             .enabled = world_size > 1,
@@ -358,7 +358,7 @@ fn buildCombinedTokenLabelVocab(
 
 fn usageError() error{InvalidArguments} {
     std.debug.print(
-        \\usage: train-eval-layoutlmv3-lora-token <base_model_dir> <adapter_model_dir> <train_jsonl_or_dir> <val_jsonl_or_dir> <out_dir> [max_train_examples] [learning_rate] [max_val_examples] [epochs] [layer_name|@layoutlmv3_token_top1|@layoutlmv3_token_top3|@layoutlmv3_sequence_top3] [--max-grad-norm F] [--llrd-decay F] [--grad-accum N] [--schedule-free] [--backend auto|mlx|blas]
+        \\usage: train-eval-layoutlmv3-lora-token <base_model_dir> <adapter_model_dir> <train_jsonl_or_dir> <val_jsonl_or_dir> <out_dir> [max_train_examples] [learning_rate] [max_val_examples] [epochs] [layer_name|@layoutlmv3_token_top1|@layoutlmv3_token_top3|@layoutlmv3_sequence_top3] [--max-grad-norm F] [--llrd-decay F] [--grad-accum N] [--schedule-free] [--backend auto|mlx|native]
         \\example: train-eval-layoutlmv3-lora-token /tmp/layoutlmv3_base /tmp/layoutlmv3_lora /tmp/train.jsonl /tmp/val.jsonl /tmp/layoutlmv3_tok 128 0.001 64 4 @layoutlmv3_token_top3 --max-grad-norm 1.0 --llrd-decay 0.9 --grad-accum 4 --schedule-free --backend mlx
         \\
     , .{});

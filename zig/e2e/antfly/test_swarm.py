@@ -263,7 +263,7 @@ def embedded_swarm_runtime():
     if not _model_exists(models_dir, model_name):
         pytest.skip(
             "Termite generator model not found under "
-            f"{models_dir}. Pull it with: termite pull hf:{_normalize_model_ref_for_path(model_name)}"
+            f"{models_dir}. Pull it with: antfly inference pull hf:{_normalize_model_ref_for_path(model_name)}"
         )
 
     termite_budget_mb = {

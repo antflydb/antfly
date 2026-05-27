@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prefetch the curated Termite E2E model set with `termite pull`."""
+"""Prefetch the curated inference E2E model set with `antfly inference pull`."""
 
 from .models import prefetch_curated_models
 

@@ -67,7 +67,7 @@ pub fn run(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
     defer args.deinit();
 
-    const argv0 = args.next() orelse "antfly termite";
+    const argv0 = args.next() orelse "antfly inference";
     return try runFromIterator(init, argv0, &args);
 }
 
@@ -109,10 +109,6 @@ pub fn runFromIterator(
         return try termite.compare_generate.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "finetune")) {
         return try termite.finetune_cli.main(init, try collectArgs(alloc, args));
-    } else if (std.mem.eql(u8, command, "cuda-info")) {
-        return try termite.cuda_info.main(alloc, io, try collectArgs(alloc, args));
-    } else if (std.mem.eql(u8, command, "bench-cuda")) {
-        return try termite.cuda_microbench.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "smoke")) {
         return try termite.native_smoke.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "list")) {
@@ -156,7 +152,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         }
     }
 
-    std.debug.print("termite (embedded)\n", .{});
+    std.debug.print("antfly inference\n", .{});
     std.debug.print("models: {s}\n", .{models_dir});
     std.debug.print("listening on {s}:{d}\n", .{ host, port });
 
@@ -230,7 +226,7 @@ fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iter
 
 fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const ref = args.next() orelse {
-        std.debug.print("usage: antfly termite pull <model-ref> [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>]\n", .{});
+        std.debug.print("usage: antfly inference pull <model-ref> [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>]\n", .{});
         return;
     };
 
@@ -306,7 +302,7 @@ fn printVersion() void {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: antfly termite <command> [options]
+        \\usage: antfly inference <command> [options]
         \\
         \\Commands:
         \\  run         Start the inference server (default)
@@ -323,8 +319,6 @@ fn printUsage() void {
         \\  extract     Run structured extraction
         \\  compare     Compare generation outputs
         \\  finetune    Run LoRA finetuning
-        \\  cuda-info   Print CUDA runtime information
-        \\  bench-cuda  Run CUDA microbenchmarks
         \\  smoke       Run a model smoke test
         \\  list        List available models
         \\  pull        Download a model from HuggingFace Hub
