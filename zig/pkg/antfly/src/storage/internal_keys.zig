@@ -27,6 +27,7 @@ pub const chunk_record_kind: u8 = 0x30;
 pub const derived_embedding_kind: u8 = 0x31;
 pub const graph_edge_record_kind: u8 = 0x32;
 pub const asset_state_kind: u8 = 0x33;
+pub const graph_asset_state_kind: u8 = 0x34;
 
 pub const replay_key_len: usize = 1 + 1 + @sizeOf(u64);
 pub const replay_meta_init_key = [_]u8{ replay_namespace, 0xff, 0x01 };

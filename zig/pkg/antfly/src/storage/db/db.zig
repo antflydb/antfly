@@ -2570,7 +2570,7 @@ pub const DB = struct {
     }
 
     fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
-        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null) return;
+        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return;
 
         const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
         errdefer self.runtime_alloc.destroy(append_ctx);
@@ -10755,12 +10755,17 @@ fn artifactContentTypeAlloc(self: *DB, alloc: Allocator, kind: types.ArtifactKin
 }
 
 fn assetPayloadJsonValue(alloc: Allocator, content_type: []const u8, raw: []const u8) !std.json.Value {
-    if (std.mem.eql(u8, content_type, "application/json")) {
+    if (assetContentTypeIsJson(content_type)) {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
         defer parsed.deinit();
         return try cloneJsonValue(alloc, parsed.value);
     }
     return .{ .string = try alloc.dupe(u8, raw) };
+}
+
+fn assetContentTypeIsJson(content_type: []const u8) bool {
+    const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, content_type, ';')) |semi| content_type[0..semi] else content_type, &std.ascii.whitespace);
+    return std.mem.eql(u8, media_type, "application/json") or std.mem.endsWith(u8, media_type, "+json");
 }
 
 fn projectLookupStoredBytes(self: *DB, alloc: Allocator, doc_key: []const u8, raw: []const u8, opts: types.LookupOptions) ![]u8 {
@@ -11702,7 +11707,17 @@ fn computeAssetRequestDerived(
     if (state_key != null and state_value != null) {
         const existing_state = try db.core.getStoreValue(alloc, state_key.?);
         defer if (existing_state) |value| alloc.free(value);
-        if (existing_state != null and std.mem.eql(u8, existing_state.?, state_value.?)) return;
+        if (existing_state != null and std.mem.eql(u8, existing_state.?, state_value.?)) {
+            const existing_asset = try db.core.getStoreValue(alloc, key);
+            defer if (existing_asset) |value| alloc.free(value);
+            if (existing_asset) |value| {
+                try artifact_writes.append(alloc, .{
+                    .key = try alloc.dupe(u8, key),
+                    .value = try alloc.dupe(u8, value),
+                });
+                return;
+            }
+        }
     }
 
     const value = if (producer_cfg.type == .copy) source_text.? else blk: {
@@ -11775,6 +11790,68 @@ fn assetStateValueAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     return try alloc.dupe(u8, &digest);
+}
+
+fn graphAssetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8, artifact_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.graph_asset_state_kind);
+    try internal_keys.appendEncodedComponent(&list, alloc, index_name);
+    try internal_keys.appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, writes: []const docstore_mod.KVPair) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendU32Big(&out, alloc, @intCast(writes.len));
+    for (writes) |write| {
+        try appendU32Big(&out, alloc, @intCast(write.key.len));
+        try out.appendSlice(alloc, write.key);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn loadGraphAssetStateKeysAlloc(alloc: Allocator, store: *docstore_mod.DocStore, state_key: []const u8) !?[][]const u8 {
+    const raw = store.get(alloc, state_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    var pos: usize = 0;
+    const count = readU32Big(raw, &pos) catch return null;
+    const keys = try alloc.alloc([]const u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (keys[0..initialized]) |key| alloc.free(@constCast(key));
+        alloc.free(keys);
+    }
+    for (keys) |*key| {
+        const len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+        if (len > raw.len - pos) return error.InvalidGraphAssetState;
+        key.* = try alloc.dupe(u8, raw[pos..][0..len]);
+        pos += len;
+        initialized += 1;
+    }
+    return keys;
+}
+
+fn readU32Big(bytes: []const u8, pos: *usize) !u32 {
+    if (bytes.len - pos.* < @sizeOf(u32)) return error.EndOfStream;
+    const value = std.mem.readInt(u32, bytes[pos.*..][0..@sizeOf(u32)], .big);
+    pos.* += @sizeOf(u32);
+    return value;
+}
+
+fn appendU32Big(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: u32) !void {
+    const be = std.mem.nativeToBig(u32, value);
+    try out.appendSlice(alloc, std.mem.asBytes(&be));
+}
+
+fn freeOwnedConstKeySlice(alloc: Allocator, keys: []const []const u8) void {
+    for (keys) |key| alloc.free(@constCast(key));
+    if (keys.len > 0) alloc.free(keys);
 }
 
 fn computeChunkRequest(
@@ -12440,6 +12517,8 @@ fn appendPrecomputedGraphSourceArtifacts(
             const graph_writes = try graphWritesFromArtifactValueAlloc(self.alloc, graph_entry.config.name, artifact_ref.document_id, artifact_write.value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
             defer freeGraphWrites(self.alloc, graph_writes);
 
+            var graph_store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+            defer graph_store_writes.deinit(self.alloc);
             for (graph_writes) |write| {
                 const key = try internal_keys.graphEdgeArtifactKeyAlloc(self.alloc, write.source, write.index_name, write.edge_type, write.target);
                 var key_owned = true;
@@ -12450,20 +12529,46 @@ fn appendPrecomputedGraphSourceArtifacts(
                 try owned_graph_artifact_writes.append(self.alloc, .{ .key = key, .value = payload });
                 key_owned = false;
                 payload_owned = false;
+                try graph_store_writes.append(self.alloc, .{ .key = key, .value = payload });
                 try store_writes.append(self.alloc, .{ .key = key, .value = payload });
                 try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, key);
             }
 
-            const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, artifact_ref.document_id, graph_entry.config.name);
-            defer docstore_mod.DocStore.freeResults(self.alloc, existing);
-            for (existing) |entry| {
-                if (containsStoreWriteKey(store_writes.items, entry.key)) continue;
-                if (containsOwnedKey(owned_delete_keys.items, entry.key)) continue;
-                const owned_key = try self.alloc.dupe(u8, entry.key);
-                try owned_delete_keys.append(self.alloc, owned_key);
-                try delete_keys.append(self.alloc, owned_key);
-                try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, entry.key);
+            const state_key = try graphAssetStateKeyAlloc(self.alloc, artifact_ref.document_id, graph_entry.config.name, artifact_ref.name);
+            defer self.alloc.free(state_key);
+            if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
+                defer freeOwnedConstKeySlice(self.alloc, previous_keys);
+                for (previous_keys) |previous_key| {
+                    if (containsStoreWriteKey(graph_store_writes.items, previous_key)) continue;
+                    if (containsOwnedKey(owned_delete_keys.items, previous_key)) continue;
+                    const owned_key = try self.alloc.dupe(u8, previous_key);
+                    try owned_delete_keys.append(self.alloc, owned_key);
+                    try delete_keys.append(self.alloc, owned_key);
+                    try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, previous_key);
+                }
+            } else {
+                const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, artifact_ref.document_id, graph_entry.config.name);
+                defer docstore_mod.DocStore.freeResults(self.alloc, existing);
+                for (existing) |entry| {
+                    if (containsStoreWriteKey(graph_store_writes.items, entry.key)) continue;
+                    if (containsOwnedKey(owned_delete_keys.items, entry.key)) continue;
+                    const owned_key = try self.alloc.dupe(u8, entry.key);
+                    try owned_delete_keys.append(self.alloc, owned_key);
+                    try delete_keys.append(self.alloc, owned_key);
+                    try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, entry.key);
+                }
             }
+
+            const state_value = try encodeGraphAssetStateKeysAlloc(self.alloc, graph_store_writes.items);
+            var state_value_owned = true;
+            errdefer if (state_value_owned) self.alloc.free(state_value);
+            const state_key_owned = try self.alloc.dupe(u8, state_key);
+            var state_key_owned_flag = true;
+            errdefer if (state_key_owned_flag) self.alloc.free(state_key_owned);
+            try owned_graph_artifact_writes.append(self.alloc, .{ .key = state_key_owned, .value = state_value });
+            state_value_owned = false;
+            state_key_owned_flag = false;
+            try store_writes.append(self.alloc, .{ .key = state_key_owned, .value = state_value });
         }
     }
 }
@@ -15708,14 +15813,10 @@ fn materializeGraphSourceArtifactsForIndex(
         defer artifact_ref.deinit(alloc);
         if (artifact_ref.kind != .asset or !std.mem.eql(u8, artifact_ref.name, source.artifact_name)) continue;
 
-        const existing = try collectGraphArtifactsForDocIndex(alloc, store, artifact_ref.document_id, index_name);
-        defer docstore_mod.DocStore.freeResults(alloc, existing);
-
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
-        defer deletes.deinit(alloc);
-        for (existing) |entry| {
-            try deletes.append(alloc, entry.key);
-            try appendUniqueOwnedKey(alloc, &changed, entry.key);
+        defer {
+            for (deletes.items) |key| alloc.free(@constCast(key));
+            deletes.deinit(alloc);
         }
 
         const raw = store.get(alloc, artifact_key) catch |err| switch (err) {
@@ -15751,6 +15852,34 @@ fn materializeGraphSourceArtifactsForIndex(
                 try appendUniqueOwnedKey(alloc, &changed, key);
             }
         }
+
+        const state_key = try graphAssetStateKeyAlloc(alloc, artifact_ref.document_id, index_name, artifact_ref.name);
+        defer alloc.free(state_key);
+        if (try loadGraphAssetStateKeysAlloc(alloc, store, state_key)) |previous_keys| {
+            defer freeOwnedConstKeySlice(alloc, previous_keys);
+            for (previous_keys) |previous_key| {
+                if (containsStoreWriteKey(writes.items, previous_key)) continue;
+                try deletes.append(alloc, try alloc.dupe(u8, previous_key));
+                try appendUniqueOwnedKey(alloc, &changed, previous_key);
+            }
+        } else {
+            const existing = try collectGraphArtifactsForDocIndex(alloc, store, artifact_ref.document_id, index_name);
+            defer docstore_mod.DocStore.freeResults(alloc, existing);
+            for (existing) |entry| {
+                if (containsStoreWriteKey(writes.items, entry.key)) continue;
+                try deletes.append(alloc, try alloc.dupe(u8, entry.key));
+                try appendUniqueOwnedKey(alloc, &changed, entry.key);
+            }
+        }
+
+        const state_value = try encodeGraphAssetStateKeysAlloc(alloc, writes.items);
+        var state_value_owned = true;
+        defer if (state_value_owned) alloc.free(state_value);
+        try writes.append(alloc, .{
+            .key = try alloc.dupe(u8, state_key),
+            .value = state_value,
+        });
+        state_value_owned = false;
 
         if (writes.items.len > 0 or deletes.items.len > 0) {
             try store.putBatch(writes.items, deletes.items);
@@ -16135,7 +16264,7 @@ fn freeGraphRenderedJsonValue(alloc: Allocator, value: *std.json.Value) void {
 fn jsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
     return switch (value) {
         .string => value.string,
-        .object => jsonStringField(value, "document_id") orelse jsonStringField(value, "doc_key") orelse jsonStringField(value, "key") orelse if (value.object.get("doc_ref")) |doc_ref| jsonEndpointDocumentId(doc_ref) else null,
+        .object => jsonStringField(value, "document_id") orelse jsonStringField(value, "doc_key") orelse jsonStringField(value, "key") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse if (value.object.get("doc_ref")) |doc_ref| jsonEndpointDocumentId(doc_ref) else null,
         else => null,
     };
 }
@@ -16146,7 +16275,8 @@ fn jsonEndpointDocumentIdResolved(value: std.json.Value, artifact_value: std.jso
 
 fn resolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
     if (value != .object) return null;
-    const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "local_id") orelse return null;
+    if (jsonIntegerField(value, "entity_index")) |entity_index| return graphArtifactEntityAtIndex(artifact_value, entity_index);
+    const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse return null;
     return findGraphArtifactEntity(artifact_value, entity_id);
 }
 
@@ -16166,10 +16296,28 @@ fn findGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []const u8
     };
 }
 
+fn graphArtifactEntityAtIndex(artifact_value: std.json.Value, entity_index: i64) ?std.json.Value {
+    if (entity_index < 0 or artifact_value != .object) return null;
+    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
+    if (entities != .array) return null;
+    const index: usize = @intCast(entity_index);
+    if (index >= entities.array.items.len) return null;
+    return entities.array.items[index];
+}
+
 fn jsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
     if (value != .object) return null;
     const found = value.object.get(field) orelse return null;
     return if (found == .string) found.string else null;
+}
+
+fn jsonIntegerField(value: std.json.Value, field: []const u8) ?i64 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return switch (found) {
+        .integer => found.integer,
+        else => null,
+    };
 }
 
 fn jsonFloatField(value: std.json.Value, field: []const u8) ?f64 {

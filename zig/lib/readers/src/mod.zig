@@ -366,7 +366,7 @@ fn CloudReaderState(comptime provider: Provider) type {
                 .http = http,
                 .base_url = try alloc.dupe(u8, cfg.base_url orelse switch (provider) {
                     .openai => "https://api.openai.com/v1",
-                    .vertex => "https://generativelanguage.googleapis.com/v1beta",
+                    .vertex => "https://aiplatform.googleapis.com/v1",
                     else => unreachable,
                 }),
                 .model = try alloc.dupe(u8, cfg.model orelse switch (provider) {
@@ -388,6 +388,8 @@ fn CloudReaderState(comptime provider: Provider) type {
                     state.project_id = try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path);
                 }
             }
+            if (provider == .vertex and state.project_id == null) return error.InvalidReaderConfig;
+            if (provider == .vertex and state.location == null) state.location = try alloc.dupe(u8, "us-central1");
             return .{ .ptr = state, .vtable = &.{ .read = read, .deinit = deinit } };
         }
 
@@ -493,7 +495,12 @@ fn CloudReaderState(comptime provider: Provider) type {
             const Body = struct { contents: []const @TypeOf(contents[0]) };
             const body = try httpx.json.Json.stringify(alloc, Body{ .contents = &contents });
             defer alloc.free(body);
-            const url = try std.fmt.allocPrint(alloc, "{s}/models/{s}:generateContent", .{ self.base_url, self.model });
+            const url = try std.fmt.allocPrint(alloc, "{s}/projects/{s}/locations/{s}/publishers/google/models/{s}:generateContent", .{
+                self.base_url,
+                self.project_id.?,
+                self.location.?,
+                self.model,
+            });
             defer alloc.free(url);
             var headers = std.ArrayList([2][]const u8).empty;
             defer headers.deinit(alloc);
@@ -564,11 +571,34 @@ fn appendVertexImagePart(alloc: Allocator, parts: *std.json.Array, url: []const 
     var obj = std.json.ObjectMap.empty;
     errdefer obj.deinit(alloc);
     if (std.mem.startsWith(u8, url, "data:")) {
-        try obj.put(alloc, "inlineData", .{ .string = url });
+        const parsed = parseDataUriImage(url) orelse return error.InvalidReaderConfig;
+        var inline_data = std.json.ObjectMap.empty;
+        errdefer inline_data.deinit(alloc);
+        try inline_data.put(alloc, "mimeType", .{ .string = parsed.mime_type });
+        try inline_data.put(alloc, "data", .{ .string = parsed.data });
+        try obj.put(alloc, "inlineData", .{ .object = inline_data });
     } else {
-        try obj.put(alloc, "fileData", .{ .string = url });
+        var file_data = std.json.ObjectMap.empty;
+        errdefer file_data.deinit(alloc);
+        try file_data.put(alloc, "fileUri", .{ .string = url });
+        try obj.put(alloc, "fileData", .{ .object = file_data });
     }
     try parts.append(.{ .object = obj });
+}
+
+const DataUriImage = struct {
+    mime_type: []const u8,
+    data: []const u8,
+};
+
+fn parseDataUriImage(url: []const u8) ?DataUriImage {
+    if (!std.mem.startsWith(u8, url, "data:")) return null;
+    const comma = std.mem.indexOfScalar(u8, url, ',') orelse return null;
+    const meta = url["data:".len..comma];
+    if (!std.mem.endsWith(u8, meta, ";base64")) return null;
+    const mime_type = meta[0 .. meta.len - ";base64".len];
+    if (mime_type.len == 0) return null;
+    return .{ .mime_type = mime_type, .data = url[comma + 1 ..] };
 }
 
 fn singleTextResult(alloc: Allocator, text: []const u8) ![]Result {
@@ -635,7 +665,7 @@ test "vertex reader exchanges service account credentials and sends bearer auth"
         .{ .method = .POST, .path = "/token", .respond = .{
             .body = "{\"access_token\":\"vertex-token\",\"expires_in\":3600,\"token_type\":\"Bearer\"}",
         } },
-        .{ .method = .POST, .path = "/models/gemini-test:generateContent", .assert_request = expectVertexBearer, .respond = .{
+        .{ .method = .POST, .path = "/projects/proj-from-json/locations/us-central1/publishers/google/models/gemini-test:generateContent", .assert_request = expectVertexBearer, .respond = .{
             .body = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"read from vertex\"}]}}]}",
         } },
     });

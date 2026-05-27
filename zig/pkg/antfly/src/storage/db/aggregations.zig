@@ -159,6 +159,22 @@ pub fn deinitResults(alloc: Allocator, results: []SearchAggregationResult) void 
     if (results.len > 0) alloc.free(results);
 }
 
+pub fn cloneSearchAggregationResultLabelsDeep(alloc: Allocator, result: *SearchAggregationResult) !void {
+    if (!result.owns_labels) {
+        result.name = try alloc.dupe(u8, result.name);
+        errdefer alloc.free(result.name);
+        result.field = try alloc.dupe(u8, result.field);
+        errdefer alloc.free(result.field);
+        result.type = try alloc.dupe(u8, result.type);
+        result.owns_labels = true;
+    }
+    for (result.buckets) |*bucket| {
+        for (bucket.aggregations) |*child| {
+            try cloneSearchAggregationResultLabelsDeep(alloc, child);
+        }
+    }
+}
+
 pub const Context = struct {
     index_manager: ?*index_manager_mod.IndexManager = null,
     doc_store: ?*docstore_mod.DocStore = null,

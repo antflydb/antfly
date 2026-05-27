@@ -67,6 +67,7 @@ pub const Config = struct {
     dense_embedder: ?embedder_mod.DenseEmbedder = null,
     sparse_embedder: ?embedder_mod.SparseEmbedder = null,
     asset_producer: ?asset_producer_mod.Producer = null,
+    enable_without_producers: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
@@ -784,6 +785,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
                 .asset_producer = config.asset_producer,
+                .enable_without_producers = config.enable_without_producers,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
                 .clock = config.clock,
@@ -827,7 +829,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn waitForApplied(self: *@This(), sequence: u64) !void {
-        if (self.config.dense_embedder == null and self.config.sparse_embedder == null and self.config.asset_producer == null) return;
+        if (self.config.dense_embedder == null and self.config.sparse_embedder == null and self.config.asset_producer == null and !self.config.enable_without_producers) return;
 
         const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.replay_source, self.applied_sequence);
         defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
@@ -881,7 +883,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn stats(self: *@This()) types.EnrichmentStats {
         return .{
-            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null or self.config.asset_producer != null,
+            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null or self.config.asset_producer != null or self.config.enable_without_producers,
             .lease_owned = true,
             .has_lease = true,
             .acquisition_count = 0,
@@ -979,7 +981,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         config: Config,
     ) !EnrichmentRuntime {
         const io_impl = backend_runtime.io_impl;
-        if ((config.dense_embedder != null or config.sparse_embedder != null or config.asset_producer != null) and io_impl == null) return error.MissingBackendRuntimeIo;
+        if ((config.dense_embedder != null or config.sparse_embedder != null or config.asset_producer != null or config.enable_without_producers) and io_impl == null) return error.MissingBackendRuntimeIo;
         var runtime_store = try initRuntimeStore(alloc, store);
         errdefer runtime_store.deinit();
         var runtime = EnrichmentRuntime{
@@ -999,6 +1001,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
                 .asset_producer = config.asset_producer,
+                .enable_without_producers = config.enable_without_producers,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
                 .clock = config.clock,
@@ -1146,7 +1149,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
 
         const ownership_stats = self.ownership.stats();
         return .{
-            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null or self.config.asset_producer != null,
+            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null or self.config.asset_producer != null or self.config.enable_without_producers,
             .lease_owned = ownership_stats.lease_owned,
             .has_lease = ownership_stats.has_lease,
             .acquisition_count = ownership_stats.acquisition_count,
@@ -1421,7 +1424,10 @@ fn processAsset(
     defer runtime.alloc.free(key);
 
     if (producer_cfg.type == .copy) {
-        if (try shouldSkipAssetArtifact(runtime, key, source_text)) return;
+        if (try shouldSkipAssetArtifact(runtime, key, source_text)) {
+            try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
+            return;
+        }
         try storePutWithRetry(runtime, key, source_text);
         try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
         try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
@@ -1433,7 +1439,17 @@ fn processAsset(
     defer runtime.alloc.free(state_key);
     const state_value = try assetStateValueAlloc(runtime.alloc, source_text, source_parts_json, request.producer_json);
     defer runtime.alloc.free(state_value);
-    if (try shouldSkipAssetProducer(runtime, state_key, state_value)) return;
+    if (try shouldSkipAssetProducer(runtime, state_key, state_value)) {
+        const existing = storeGetAlloc(runtime, key) catch |err| switch (err) {
+            std.mem.Allocator.Error.OutOfMemory => return err,
+            else => null,
+        };
+        if (existing) |value| {
+            defer runtime.alloc.free(value);
+            try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
+            return;
+        }
+    }
 
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
     const produced = try producer.produce(runtime.alloc, .{
@@ -1493,21 +1509,41 @@ fn materializeGraphAssetForRuntime(
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
         }
 
-        const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
-        defer runtime.alloc.free(prefix);
-        const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
-        defer backend_scan.freeResults(runtime.alloc, existing);
-
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer {
             for (deletes.items) |key| runtime.alloc.free(@constCast(key));
             deletes.deinit(runtime.alloc);
         }
-        for (existing) |entry| {
-            if (runtimeContainsKVKey(writes.items, entry.key)) continue;
-            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
-            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, entry.key);
+
+        const state_key = try graphAssetStateKeyAlloc(runtime.alloc, request.doc_key, graph_entry.config.name, artifact_name);
+        defer runtime.alloc.free(state_key);
+        if (try loadGraphAssetStateKeysAlloc(runtime, state_key)) |previous_keys| {
+            defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
+            for (previous_keys) |previous_key| {
+                if (runtimeContainsKVKey(writes.items, previous_key)) continue;
+                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+            }
+        } else {
+            const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
+            defer runtime.alloc.free(prefix);
+            const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
+            defer backend_scan.freeResults(runtime.alloc, existing);
+            for (existing) |entry| {
+                if (runtimeContainsKVKey(writes.items, entry.key)) continue;
+                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
+                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, entry.key);
+            }
         }
+
+        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, writes.items);
+        var state_owned = true;
+        defer if (state_owned) runtime.alloc.free(state_value);
+        try writes.append(runtime.alloc, .{
+            .key = try runtime.alloc.dupe(u8, state_key),
+            .value = state_value,
+        });
+        state_owned = false;
 
         if (writes.items.len > 0 or deletes.items.len > 0) {
             try storePutBatchWithRetry(runtime, writes.items, deletes.items);
@@ -1895,7 +1931,7 @@ fn runtimeFreeGraphRenderedJsonValue(alloc: Allocator, value: *std.json.Value) v
 fn runtimeJsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
     return switch (value) {
         .string => value.string,
-        .object => runtimeJsonStringField(value, "document_id") orelse runtimeJsonStringField(value, "doc_key") orelse runtimeJsonStringField(value, "key") orelse if (value.object.get("doc_ref")) |doc_ref| runtimeJsonEndpointDocumentId(doc_ref) else null,
+        .object => runtimeJsonStringField(value, "document_id") orelse runtimeJsonStringField(value, "doc_key") orelse runtimeJsonStringField(value, "key") orelse runtimeJsonStringField(value, "id") orelse runtimeJsonStringField(value, "local_id") orelse if (value.object.get("doc_ref")) |doc_ref| runtimeJsonEndpointDocumentId(doc_ref) else null,
         else => null,
     };
 }
@@ -1906,7 +1942,8 @@ fn runtimeJsonEndpointDocumentIdResolved(value: std.json.Value, artifact_value: 
 
 fn runtimeResolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
     if (value != .object) return null;
-    const entity_id = runtimeJsonStringField(value, "entity_id") orelse runtimeJsonStringField(value, "local_id") orelse return null;
+    if (runtimeJsonIntegerField(value, "entity_index")) |entity_index| return runtimeGraphArtifactEntityAtIndex(artifact_value, entity_index);
+    const entity_id = runtimeJsonStringField(value, "entity_id") orelse runtimeJsonStringField(value, "id") orelse runtimeJsonStringField(value, "local_id") orelse return null;
     return runtimeFindGraphArtifactEntity(artifact_value, entity_id);
 }
 
@@ -1926,10 +1963,28 @@ fn runtimeFindGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []c
     };
 }
 
+fn runtimeGraphArtifactEntityAtIndex(artifact_value: std.json.Value, entity_index: i64) ?std.json.Value {
+    if (entity_index < 0 or artifact_value != .object) return null;
+    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
+    if (entities != .array) return null;
+    const index: usize = @intCast(entity_index);
+    if (index >= entities.array.items.len) return null;
+    return entities.array.items[index];
+}
+
 fn runtimeJsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
     if (value != .object) return null;
     const found = value.object.get(field) orelse return null;
     return if (found == .string) found.string else null;
+}
+
+fn runtimeJsonIntegerField(value: std.json.Value, field: []const u8) ?i64 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return switch (found) {
+        .integer => found.integer,
+        else => null,
+    };
 }
 
 fn runtimeJsonFloatField(value: std.json.Value, field: []const u8) ?f64 {
@@ -3124,6 +3179,69 @@ fn assetStateValueAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     return try alloc.dupe(u8, &digest);
+}
+
+fn graphAssetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8, artifact_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.graph_asset_state_kind);
+    try internal_keys.appendEncodedComponent(&list, alloc, index_name);
+    try internal_keys.appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, writes: []const KVPair) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendU32Big(&out, alloc, @intCast(writes.len));
+    for (writes) |write| {
+        try appendU32Big(&out, alloc, @intCast(write.key.len));
+        try out.appendSlice(alloc, write.key);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8) !?[][]const u8 {
+    const alloc = runtime.alloc;
+    const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer alloc.free(raw);
+    var pos: usize = 0;
+    const count = readU32Big(raw, &pos) catch return null;
+    const keys = try alloc.alloc([]const u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (keys[0..initialized]) |key| alloc.free(@constCast(key));
+        alloc.free(keys);
+    }
+    for (keys) |*key| {
+        const len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+        if (len > raw.len - pos) return error.InvalidGraphAssetState;
+        key.* = try alloc.dupe(u8, raw[pos..][0..len]);
+        pos += len;
+        initialized += 1;
+    }
+    return keys;
+}
+
+fn readU32Big(bytes: []const u8, pos: *usize) !u32 {
+    if (bytes.len - pos.* < @sizeOf(u32)) return error.EndOfStream;
+    const value = std.mem.readInt(u32, bytes[pos.*..][0..@sizeOf(u32)], .big);
+    pos.* += @sizeOf(u32);
+    return value;
+}
+
+fn appendU32Big(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: u32) !void {
+    const be = std.mem.nativeToBig(u32, value);
+    try out.appendSlice(alloc, std.mem.asBytes(&be));
+}
+
+fn freeOwnedConstKeySlice(alloc: Allocator, keys: []const []const u8) void {
+    for (keys) |key| alloc.free(@constCast(key));
+    if (keys.len > 0) alloc.free(keys);
 }
 
 fn recordArtifactBytes(runtime: *EnrichmentRuntime, kind: enrichment_artifact_codec.Kind, byte_count: usize) void {

@@ -4707,6 +4707,8 @@ test "canonical structure schemas map field objects to extraction fields" {
 }
 
 const CanonicalExtractionEntity = struct {
+    id: []const u8,
+    local_id: []const u8,
     label: []const u8,
     text: []const u8,
     start: ?i64 = null,
@@ -4754,7 +4756,10 @@ fn buildCanonicalEntityExtractionResponse(
     for (all_entities, 0..) |entities, i| {
         const out_entities = try alloc.alloc(CanonicalExtractionEntity, entities.len);
         for (entities, 0..) |entity, entity_index| {
+            const entity_id = try std.fmt.allocPrint(alloc, "e{d}", .{entity_index});
             out_entities[entity_index] = .{
+                .id = entity_id,
+                .local_id = entity_id,
                 .label = entity.label,
                 .text = entity.text,
                 .start = @intCast(entity.start),

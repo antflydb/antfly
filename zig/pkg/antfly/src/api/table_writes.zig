@@ -6634,6 +6634,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
         dense: ?db_embedder.DenseEmbedder = null,
         sparse: ?db_embedder.SparseEmbedder = null,
         asset_runtime: ?*asset_producer_runtime.Runtime = null,
+        generated: bool = false,
 
         fn deinit(self: @This(), allocator: std.mem.Allocator) void {
             if (self.dense) |owned| owned.deinit(allocator);
@@ -6645,7 +6646,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
         }
 
         fn enabled(self: @This()) bool {
-            return self.dense != null or self.sparse != null or self.asset_runtime != null;
+            return self.dense != null or self.sparse != null or self.asset_runtime != null or self.generated;
         }
 
         fn config(self: @This()) db_mod.enrichment_runtime.Config {
@@ -6653,6 +6654,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
                 .dense_embedder = self.dense,
                 .sparse_embedder = self.sparse,
                 .asset_producer = if (self.asset_runtime) |runtime| runtime.ownedProducer() else null,
+                .enable_without_producers = self.generated,
             };
         }
     };
@@ -6681,6 +6683,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
                 .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .local_termite_provider = local_provider, .secret_store = store, .remote_content = remote }),
                 .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .local_termite_provider = local_provider, .secret_store = store, .remote_content = remote }),
                 .asset_runtime = asset_runtime,
+                .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
             };
         }
     }.run;
@@ -6905,6 +6908,35 @@ fn indexesJsonNeedsAssetProducer(alloc: std.mem.Allocator, indexes_json: []const
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
     return try jsonValueNeedsAssetProducer(alloc, parsed.value);
+}
+
+fn indexesJsonHasGeneratedEnrichment(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
+    if (indexes_json.len == 0) return false;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    return jsonValueHasGeneratedEnrichment(parsed.value);
+}
+
+fn jsonValueHasGeneratedEnrichment(value: std.json.Value) bool {
+    switch (value) {
+        .object => |object| {
+            if (object.get("kind")) |kind| {
+                if (kind == .string and (std.mem.eql(u8, kind.string, "asset") or std.mem.eql(u8, kind.string, "chunk"))) return true;
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (jsonValueHasGeneratedEnrichment(entry.value_ptr.*)) return true;
+            }
+            return false;
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (jsonValueHasGeneratedEnrichment(item)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
 }
 
 fn jsonValueNeedsAssetProducer(alloc: std.mem.Allocator, value: std.json.Value) !bool {
