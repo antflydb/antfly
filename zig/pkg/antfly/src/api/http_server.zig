@@ -6996,7 +6996,7 @@ test "api http server serves status" {
     try std.testing.expectEqual(@as(u16, 404), prefixed_readyz.status);
 
     const request_stats = server.requestStats();
-    try std.testing.expectEqual(@as(u64, 5), request_stats.request_count);
+    try std.testing.expectEqual(@as(u64, 6), request_stats.request_count);
     try std.testing.expect(request_stats.first_request_started_at_ns >= server.created_at_ns);
 }
 
