@@ -20,26 +20,9 @@ const compaction_mod = @import("compaction.zig");
 const runtime_mod = @import("runtime.zig");
 const storage_io = @import("storage_io.zig");
 
-const open_path_gate_count = 128;
-var open_path_gates: [open_path_gate_count]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** open_path_gate_count;
-
-fn lockHostOpenPathGate(root_dir: []const u8) *std.atomic.Mutex {
-    const hash = std.hash.Wyhash.hash(0, root_dir);
-    const gate = &open_path_gates[@intCast(hash % open_path_gate_count)];
-    while (!gate.tryLock()) std.atomic.spinLoopHint();
-    return gate;
-}
-
 pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !BackendType {
     var backend = BackendType.init(allocator, backend_options);
     backend.root_dir = try allocator.dupe(u8, root_dir);
-
-    // Host storage can race same-path recovery with create-table/read/write opens.
-    const host_open_gate = if (backend_options.storage == null)
-        lockHostOpenPathGate(backend.root_dir.?)
-    else
-        null;
-    defer if (host_open_gate) |gate| gate.unlock();
 
     if (backend_options.storage) |storage| {
         backend.storage = storage;
