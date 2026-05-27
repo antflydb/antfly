@@ -126,25 +126,6 @@ pub const SearchAggregationResult = struct {
     }
 };
 
-pub fn cloneSearchAggregationResultLabelsDeep(alloc: Allocator, result: *SearchAggregationResult) !void {
-    if (!result.owns_labels) {
-        const name = try alloc.dupe(u8, result.name);
-        errdefer alloc.free(name);
-        const field = try alloc.dupe(u8, result.field);
-        errdefer alloc.free(field);
-        const agg_type = try alloc.dupe(u8, result.type);
-        errdefer alloc.free(agg_type);
-
-        result.name = name;
-        result.field = field;
-        result.type = agg_type;
-        result.owns_labels = true;
-    }
-    for (result.buckets) |*bucket| {
-        for (bucket.aggregations) |*child| try cloneSearchAggregationResultLabelsDeep(alloc, child);
-    }
-}
-
 pub const DistributedBackgroundTextStats = struct {
     aggregation_name: []const u8,
     field: []const u8,

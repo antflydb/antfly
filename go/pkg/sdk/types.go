@@ -136,23 +136,29 @@ type (
 	ChainCondition                     = oapi.ChainCondition
 
 	// Chat/Agent types (used by retrieval agent)
-	ChatMessage        = oapi.ChatMessage
-	ChatMessageRole    = oapi.ChatMessageRole
-	ChatToolCall       = oapi.ChatToolCall
-	ChatToolResult     = oapi.ChatToolResult
-	ChatToolName       = oapi.ChatToolName
-	ChatToolsConfig    = oapi.ChatToolsConfig
-	FetchConfig        = oapi.FetchConfig
-	WebSearchConfig    = oapi.WebSearchConfig
-	FilterSpec         = oapi.FilterSpec
-	FilterSpecOperator = oapi.FilterSpecOperator
-	AgentDecision      = oapi.AgentDecision
-	AgentQuestion      = oapi.AgentQuestion
-	AgentQuestionKind  = oapi.AgentQuestionKind
-	AgentStatus        = oapi.AgentStatus
-	AgentStep          = oapi.AgentStep
-	AgentStepKind      = oapi.AgentStepKind
-	AgentStepStatus    = oapi.AgentStepStatus
+	ChatMessage         = oapi.ChatMessage
+	ChatMessageContent  = oapi.ChatMessageContent
+	ChatMessageRole     = oapi.ChatMessageRole
+	ContentPart         = oapi.ContentPart
+	TextContentPart     = oapi.TextContentPart
+	ImageURL            = oapi.ImageURL
+	ImageURLContentPart = oapi.ImageURLContentPart
+	MediaContentPart    = oapi.MediaContentPart
+	ToolCall            = oapi.ToolCall
+	ToolCallFunction    = oapi.ToolCallFunction
+	ChatToolName        = oapi.ChatToolName
+	ChatToolsConfig     = oapi.ChatToolsConfig
+	FetchConfig         = oapi.FetchConfig
+	WebSearchConfig     = oapi.WebSearchConfig
+	FilterSpec          = oapi.FilterSpec
+	FilterSpecOperator  = oapi.FilterSpecOperator
+	AgentDecision       = oapi.AgentDecision
+	AgentQuestion       = oapi.AgentQuestion
+	AgentQuestionKind   = oapi.AgentQuestionKind
+	AgentStatus         = oapi.AgentStatus
+	AgentStep           = oapi.AgentStep
+	AgentStepKind       = oapi.AgentStepKind
+	AgentStepStatus     = oapi.AgentStepStatus
 
 	// Query Builder types
 	QueryBuilderRequest = oapi.QueryBuilderRequest

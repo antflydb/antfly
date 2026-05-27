@@ -846,11 +846,11 @@ fn localTermiteGenerateMessages(
 }
 
 const LocalGenerateMessages = struct {
-    messages: []termite.pipelines.generation.Message,
+    messages: []termite.pipelines.GenerationMessage,
     owned_texts: std.ArrayListUnmanaged([]u8) = .empty,
     owned_media: std.ArrayListUnmanaged([]u8) = .empty,
     owned_slices: std.ArrayListUnmanaged([]const []const u8) = .empty,
-    owned_parts: std.ArrayListUnmanaged([]termite.pipelines.generation.Message.ContentPart) = .empty,
+    owned_parts: std.ArrayListUnmanaged([]termite.pipelines.GenerationMessage.ContentPart) = .empty,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.owned_texts.items) |text| alloc.free(text);
@@ -871,7 +871,7 @@ fn convertLocalGenerateMessages(
     messages: []const antfly.inference.ChatMessage,
 ) !LocalGenerateMessages {
     var out = LocalGenerateMessages{
-        .messages = try alloc.alloc(termite.pipelines.generation.Message, messages.len),
+        .messages = try alloc.alloc(termite.pipelines.GenerationMessage, messages.len),
     };
     errdefer out.deinit(alloc);
 
@@ -885,7 +885,7 @@ fn convertLocalGenerateMessage(
     alloc: std.mem.Allocator,
     owner: *LocalGenerateMessages,
     message: antfly.inference.ChatMessage,
-) !termite.pipelines.generation.Message {
+) !termite.pipelines.GenerationMessage {
     const role = message.role.toSlice();
     const content = message.content orelse {
         const text = try alloc.dupe(u8, "");
@@ -908,14 +908,14 @@ fn convertLocalGenerateParts(
     owner: *LocalGenerateMessages,
     role: []const u8,
     parts: []const antfly.inference.ContentPart,
-) !termite.pipelines.generation.Message {
+) !termite.pipelines.GenerationMessage {
     var text_buf = std.ArrayListUnmanaged(u8).empty;
     errdefer text_buf.deinit(alloc);
     var images = std.ArrayListUnmanaged([]const u8).empty;
     errdefer images.deinit(alloc);
     var audio = std.ArrayListUnmanaged([]const u8).empty;
     errdefer audio.deinit(alloc);
-    var out_parts = std.ArrayListUnmanaged(termite.pipelines.generation.Message.ContentPart).empty;
+    var out_parts = std.ArrayListUnmanaged(termite.pipelines.GenerationMessage.ContentPart).empty;
     errdefer out_parts.deinit(alloc);
 
     for (parts) |part| {

@@ -34,6 +34,7 @@ pub const GenerateResult = types.GenerateResult;
 pub const RerankResult = types.RerankResult;
 pub const ChatMessage = types.ChatMessage;
 pub const Role = types.Role;
+pub const ContentPart = types.ContentPart;
 
 test "inference module compiles" {
     _ = types;
