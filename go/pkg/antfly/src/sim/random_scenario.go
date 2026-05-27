@@ -513,10 +513,41 @@ func (r *randomScenarioRunner) writeDoc(ctx context.Context) error {
 }
 
 func (r *randomScenarioRunner) requestReconcile(ctx context.Context) error {
-	if err := r.h.TableManager().EnqueueReallocationRequest(ctx); err != nil {
-		return err
+	deadline := r.h.Clock().Now().Add(30 * time.Second)
+	var lastErr error
+	for !r.h.Clock().Now().After(deadline) {
+		if len(r.cfg.MetadataIDs) > 1 {
+			if _, err := r.h.WaitForMetadataLeader(2 * time.Second); err != nil {
+				lastErr = err
+				continue
+			}
+		}
+		if err := r.h.TableManager().EnqueueReallocationRequest(ctx); err != nil {
+			if !isTransientMetadataUnavailable(err) {
+				return err
+			}
+			lastErr = err
+			if advanceErr := r.h.Advance(500 * time.Millisecond); advanceErr != nil {
+				return advanceErr
+			}
+			continue
+		}
+		if err := r.h.ReconcileOnce(ctx); err != nil {
+			if !isTransientMetadataUnavailable(err) {
+				return err
+			}
+			lastErr = err
+			if advanceErr := r.h.Advance(500 * time.Millisecond); advanceErr != nil {
+				return advanceErr
+			}
+			continue
+		}
+		return nil
 	}
-	return r.h.ReconcileOnce(ctx)
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("reallocate did not complete within 30s")
 }
 
 func (r *randomScenarioRunner) crashStore() error {

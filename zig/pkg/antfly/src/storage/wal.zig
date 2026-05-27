@@ -727,7 +727,7 @@ pub const WAL = struct {
         const baseline_ns = if (avg_commit_ns > 0)
             avgCommitWindowNs(avg_commit_ns)
         else
-            50 * std.time.ns_per_us;
+            initialCommitWindowNs(self.group_commit_window_ns);
         return @min(self.group_commit_window_ns, baseline_ns);
     }
 
@@ -976,6 +976,11 @@ fn avgCommitWindowNs(avg_commit_ns: u64) u64 {
     const min_window = 25 * std.time.ns_per_us;
     const max_window = 250 * std.time.ns_per_us;
     return std.math.clamp(avg_commit_ns / 2, min_window, max_window);
+}
+
+fn initialCommitWindowNs(configured_window_ns: u64) u64 {
+    const max_initial_window = 2 * std.time.ns_per_ms;
+    return @min(configured_window_ns, max_initial_window);
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
@@ -2529,11 +2534,11 @@ test "wal group commit uses injected virtual clock" {
 
     const lsn = try wal.append("virtual-time");
     try std.testing.expectEqual(@as(u64, 1), lsn);
-    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_us), runtime.clock().nowNs());
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), runtime.clock().nowNs());
 
     const stats = wal.statsSnapshot();
-    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_us), stats.total_coalesce_ns);
-    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_us), stats.total_wait_ns);
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), stats.total_coalesce_ns);
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), stats.total_wait_ns);
 }
 
 test "wal can reopen on modeled storage device" {
