@@ -1586,6 +1586,96 @@ test "identity namespace reassignment rewrites canonical states" {
     try std.testing.expect(state_b.canonical_doc_id != canonicalDocIdForNamespace(old_namespace, "doc:b"));
 }
 
+test "identity namespace reassignment preserves snapshot generations and rejects stale writers" {
+    const mem_backend = @import("../mem_backend.zig");
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const old_namespace = Namespace{ .table_id = 17, .shard_id = 171, .range_id = 1701 };
+    var initial_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &initial_writes);
+    try appendBatchIdentityMetadataForNamespaceAlloc(
+        alloc,
+        &store,
+        old_namespace,
+        10,
+        &initial_writes,
+        &.{ "doc:a", "doc:b" },
+        &.{},
+    );
+    try store.putBatchWithReplay(null, initial_writes.items, &.{}, null);
+
+    var delete_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &delete_writes);
+    try appendBatchIdentityMetadataForNamespaceAlloc(
+        alloc,
+        &store,
+        old_namespace,
+        11,
+        &delete_writes,
+        &.{},
+        &.{"doc:b"},
+    );
+    try store.putBatchWithReplay(null, delete_writes.items, &.{}, null);
+
+    var before_reassign_txn = try store.beginProbeTxn();
+    const ordinal_a = (try lookupOrdinalTxn(alloc, &before_reassign_txn, "doc:a")).?;
+    const ordinal_b = (try lookupOrdinalTxn(alloc, &before_reassign_txn, "doc:b")).?;
+    before_reassign_txn.abort();
+
+    const new_namespace = Namespace{ .table_id = 17, .shard_id = 172, .range_id = 1702 };
+    try reassignNamespaceAlloc(alloc, &store, new_namespace);
+    try std.testing.expect((try (loadNamespaceFromStore(&store))).?.eql(new_namespace));
+    try std.testing.expectError(error.IdentityNamespaceMismatch, loadOrInitNamespaceWithPolicy(&store, old_namespace, false, .reject));
+    try std.testing.expect((try loadOrInitNamespaceWithPolicy(&store, old_namespace, false, .use_existing)).eql(new_namespace));
+
+    var visible_at_10 = try visibleDocSetFromStoreAlloc(alloc, &store, 10);
+    defer visible_at_10.deinit(alloc);
+    try std.testing.expect(visible_at_10.containsOrdinal(ordinal_a));
+    try std.testing.expect(visible_at_10.containsOrdinal(ordinal_b));
+
+    var visible_at_11 = try visibleDocSetFromStoreAlloc(alloc, &store, 11);
+    defer visible_at_11.deinit(alloc);
+    try std.testing.expect(visible_at_11.containsOrdinal(ordinal_a));
+    try std.testing.expect(!visible_at_11.containsOrdinal(ordinal_b));
+
+    var verify_txn = try store.beginProbeTxn();
+    defer verify_txn.abort();
+    var resolved_snapshot = try resolvedDocSetForIdsAtGenerationTxn(alloc, &verify_txn, &.{ "doc:a", "doc:b" }, 10);
+    defer resolved_snapshot.deinit(alloc);
+    try std.testing.expect(resolved_snapshot.containsOrdinal(ordinal_a));
+    try std.testing.expect(resolved_snapshot.containsOrdinal(ordinal_b));
+    var resolved_current = try resolvedDocSetForIdsTxn(alloc, &verify_txn, &.{ "doc:a", "doc:b" });
+    defer resolved_current.deinit(alloc);
+    try std.testing.expect(resolved_current.containsOrdinal(ordinal_a));
+    try std.testing.expect(!resolved_current.containsOrdinal(ordinal_b));
+
+    const state_a = (try lookupStateTxn(&verify_txn, ordinal_a)).?;
+    const state_b = (try lookupStateTxn(&verify_txn, ordinal_b)).?;
+    try std.testing.expectEqual(canonicalDocIdForNamespace(new_namespace, "doc:a"), state_a.canonical_doc_id);
+    try std.testing.expectEqual(canonicalDocIdForNamespace(new_namespace, "doc:b"), state_b.canonical_doc_id);
+    try std.testing.expectEqual(@as(?DocOrdinal, null), try lookupCanonicalOrdinalTxn(&verify_txn, canonicalDocIdForNamespace(old_namespace, "doc:a")));
+    try std.testing.expectEqual(@as(?DocOrdinal, null), try lookupCanonicalOrdinalTxn(&verify_txn, canonicalDocIdForNamespace(old_namespace, "doc:b")));
+
+    var stale_writer_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &stale_writer_writes);
+    try std.testing.expectError(error.IdentityNamespaceMismatch, appendBatchIdentityMetadataForNamespaceAlloc(
+        alloc,
+        &store,
+        old_namespace,
+        12,
+        &stale_writer_writes,
+        &.{"doc:c"},
+        &.{},
+    ));
+    try std.testing.expectEqual(@as(usize, 0), stale_writer_writes.items.len);
+}
+
 test "identity validation accepts missing canonical rows but rejects conflicts" {
     const mem_backend = @import("../mem_backend.zig");
     const alloc = std.testing.allocator;
@@ -1996,6 +2086,58 @@ test "batch identity metadata fails closed at ordinal capacity" {
 
     const stats = try fastStatsFromStore(&store);
     try std.testing.expectEqual(std.math.maxInt(DocOrdinal), stats.next_ordinal);
+}
+
+test "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment" {
+    const mem_backend = @import("../mem_backend.zig");
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const last_allocatable: DocOrdinal = std.math.maxInt(DocOrdinal) - 1;
+    const namespace = Namespace{ .table_id = 29, .shard_id = 291, .range_id = 2901 };
+    var seed_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &seed_writes);
+    try appendNamespaceWrite(alloc, &seed_writes, namespace);
+    try appendNextOrdinalWrite(alloc, &seed_writes, last_allocatable);
+    try store.putBatchWithReplay(null, seed_writes.items, &.{}, null);
+
+    var final_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &final_writes);
+    try appendBatchIdentityMetadataForNamespaceAlloc(
+        alloc,
+        &store,
+        namespace,
+        100,
+        &final_writes,
+        &.{"doc:last"},
+        &.{},
+    );
+    try store.putBatchWithReplay(null, final_writes.items, &.{}, null);
+
+    const moved_namespace = Namespace{ .table_id = 29, .shard_id = 292, .range_id = 2902 };
+    try reassignNamespaceAlloc(alloc, &store, moved_namespace);
+    try validateStoreAlloc(alloc, &store);
+
+    const stats = try fastStatsFromStore(&store);
+    try std.testing.expectEqual(std.math.maxInt(DocOrdinal), stats.next_ordinal);
+    try std.testing.expectEqual(@as(u64, last_allocatable), stats.allocated_ordinals);
+
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(?DocOrdinal, last_allocatable), try lookupOrdinalTxn(alloc, &txn, "doc:last"));
+    const state = (try lookupStateTxn(&txn, last_allocatable)).?;
+    try std.testing.expectEqual(canonicalDocIdForNamespace(moved_namespace, "doc:last"), state.canonical_doc_id);
+    try std.testing.expectEqual(@as(?DocOrdinal, last_allocatable), try lookupCanonicalOrdinalTxn(&txn, state.canonical_doc_id));
+    try std.testing.expectEqual(@as(?DocOrdinal, null), try lookupCanonicalOrdinalTxn(&txn, canonicalDocIdForNamespace(namespace, "doc:last")));
+
+    var live = try liveDocSetFromStoreAlloc(alloc, &store);
+    defer live.deinit(alloc);
+    try std.testing.expect(live.containsOrdinal(last_allocatable));
 }
 
 test "validate store rejects invalid ordinal generation history" {

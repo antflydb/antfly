@@ -6380,7 +6380,7 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
         defer runtime.deinit();
 
-        var txn = try runtime.beginProbe();
+        var txn = try runtime.beginRead();
         defer txn.abort();
 
         const keys = [_][]const u8{ "doc:002", "doc:003", "doc:004", "doc:005" };

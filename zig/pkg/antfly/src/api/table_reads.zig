@@ -17811,6 +17811,97 @@ test "provisioned read cache keys entries by identity namespace" {
     try std.testing.expectEqual(@as(u64, 7102), lease2.db.core.identity_namespace.range_id);
 }
 
+test "provisioned read cache invalidates repeated ownership moves with pinned leases" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-read-cache-ownership-moves";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const CatalogState = struct {
+        range_id: u64,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = @import("tables.zig").default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .range_id = self.range_id,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog_state = CatalogState{ .range_id = 7201 };
+    var cache = ProvisionedTableReadCache.init(alloc);
+    defer cache.deinit();
+
+    var first = try cache.getOrOpen(path, catalog_state.iface(), 7001, 1, "docs");
+    defer first.release();
+    try std.testing.expectEqual(@as(u64, 7201), first.db.core.identity_namespace.range_id);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+
+    cache.invalidateTable("docs");
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cache.retired_entries.items.len);
+    try std.testing.expect(cache.getIfPresent(7001, 1, .{ .table_id = 7, .shard_id = 7001, .range_id = 7201 }, "docs") == null);
+
+    catalog_state.range_id = 7202;
+    var second = try cache.getOrOpen(path, catalog_state.iface(), 7001, 1, "docs");
+    defer second.release();
+    try std.testing.expectEqual(@as(u64, 7202), second.db.core.identity_namespace.range_id);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cache.retired_entries.items.len);
+
+    cache.invalidateTable("docs");
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), cache.retired_entries.items.len);
+
+    catalog_state.range_id = 7203;
+    var third = try cache.getOrOpen(path, catalog_state.iface(), 7001, 1, "docs");
+    defer third.release();
+    try std.testing.expectEqual(@as(u64, 7203), third.db.core.identity_namespace.range_id);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), cache.retired_entries.items.len);
+
+    first.release();
+    try std.testing.expectEqual(@as(usize, 1), cache.retired_entries.items.len);
+    second.release();
+    try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+}
+
 test "graph edge local read rejects stale identity generation" {
     const alloc = std.testing.allocator;
     const root = "/tmp/antfly-api-graph-edge-stale-identity-generation";

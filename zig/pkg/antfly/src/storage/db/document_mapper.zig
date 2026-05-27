@@ -170,6 +170,7 @@ const ExtractedTextFields = struct {
     fields: []const introducer_mod.TextField,
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    typed_fields: ?[]const introducer_mod.TypedFieldValue = null,
 };
 
 pub fn buildTextSegmentFromDocuments(
@@ -344,10 +345,11 @@ pub fn buildTextProjectionBatchFromSource(
     defer text_docs.deinit(arena);
 
     for (source_docs) |doc| {
+        const extraction_root = doc.typed_source orelse doc.root;
         const extracted = if (schema == null and doc.schema_less_fast_projection)
             ExtractedTextFields{ .fields = doc.schema_less_text_fields }
         else
-            try extractTextFieldsFromValue(arena, doc.root, text_analysis, schema, observed_field_analyzers);
+            try extractTextFieldsFromValue(arena, extraction_root, text_analysis, schema, observed_field_analyzers);
         if (extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0) continue;
 
         try text_docs.append(arena, .{
@@ -357,8 +359,8 @@ pub fn buildTextProjectionBatchFromSource(
             .text_fields = extracted.fields,
             .recursive_typed_fields = extracted.recursive_typed_fields,
             .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,
-            .typed_fields = if (doc.typed_source == null) &.{} else null,
-            .typed_source = doc.typed_source,
+            .typed_fields = extracted.typed_fields orelse if (doc.typed_source == null) &.{} else null,
+            .typed_source = if (extracted.typed_fields == null) doc.typed_source else null,
         });
     }
 
@@ -1447,10 +1449,7 @@ fn extractTextFieldsFromValue(
         };
     }
 
-    return .{
-        .fields = try extractStringFieldsNoSchema(alloc, root.object),
-        .recursive_typed_fields = true,
-    };
+    return try extractSchemaLessTextAndTypedFields(alloc, root.object, text_analysis);
 }
 
 fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
@@ -1729,6 +1728,84 @@ fn extractStringFieldsNoSchema(alloc: Allocator, object: std.json.ObjectMap) ![]
     defer fields.deinit(alloc);
     try collectStringFieldsNoSchema(alloc, &fields, .{ .object = object }, "");
     return try alloc.dupe(introducer_mod.TextField, fields.items);
+}
+
+fn extractSchemaLessTextAndTypedFields(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+) !ExtractedTextFields {
+    var text_fields = std.ArrayListUnmanaged(introducer_mod.TextField).empty;
+    defer text_fields.deinit(alloc);
+    var typed_fields = std.ArrayListUnmanaged(introducer_mod.TypedFieldValue).empty;
+    defer typed_fields.deinit(alloc);
+    var path = std.ArrayListUnmanaged(u8).empty;
+    defer path.deinit(alloc);
+
+    try collectSchemaLessTextAndTypedFieldsRecursive(
+        alloc,
+        .{ .object = object },
+        &path,
+        &text_fields,
+        &typed_fields,
+        text_analysis,
+    );
+
+    return .{
+        .fields = if (text_fields.items.len > 0) try alloc.dupe(introducer_mod.TextField, text_fields.items) else &.{},
+        .typed_fields = if (typed_fields.items.len > 0) try alloc.dupe(introducer_mod.TypedFieldValue, typed_fields.items) else &.{},
+    };
+}
+
+fn collectSchemaLessTextAndTypedFieldsRecursive(
+    alloc: Allocator,
+    value: std.json.Value,
+    path: *std.ArrayListUnmanaged(u8),
+    text_fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    typed_fields: *std.ArrayListUnmanaged(introducer_mod.TypedFieldValue),
+    text_analysis: introducer_mod.TextAnalysisConfig,
+) !void {
+    if (path.items.len > 0) {
+        if (try introducer_mod.detectTypedFieldProjectionValue(alloc, path.items, value, text_analysis)) |typed_field| {
+            try typed_fields.append(alloc, typed_field);
+            if (value == .object and typed_field.value_type == .geo_point) return;
+        }
+    }
+
+    switch (value) {
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (entry.key_ptr.*.len > 0 and entry.key_ptr.*[0] == '_') continue;
+                const old_len = try pushProjectionPath(alloc, path, entry.key_ptr.*);
+                defer path.shrinkRetainingCapacity(old_len);
+                try collectSchemaLessTextAndTypedFieldsRecursive(
+                    alloc,
+                    entry.value_ptr.*,
+                    path,
+                    text_fields,
+                    typed_fields,
+                    text_analysis,
+                );
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                try collectSchemaLessTextAndTypedFieldsRecursive(
+                    alloc,
+                    item,
+                    path,
+                    text_fields,
+                    typed_fields,
+                    text_analysis,
+                );
+            }
+        },
+        .string => |text| {
+            if (path.items.len > 0) try appendSchemaLessStringTextFields(alloc, text_fields, path.items, text);
+        },
+        else => {},
+    }
 }
 
 fn canUseSchemaLessRawTextFastPath(data: []const u8, opts: TextProjectionOptions) bool {

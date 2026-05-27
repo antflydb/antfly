@@ -57,6 +57,16 @@ pub const SparseWrite = struct {
     doc_num: ?u32 = null,
 };
 
+pub const OrdinalDocNumLookup = struct {
+    doc_nums: []const u32,
+    missing_ordinals: []const u32,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.doc_nums);
+        alloc.free(self.missing_ordinals);
+    }
+};
+
 pub const BatchOptions = struct {
     defer_term_range_updates: bool = false,
     backend_batch_options: backend_types.BatchOptions = .{},
@@ -122,6 +132,7 @@ const SearchCandidate = struct {
 
 const SearchProfile = struct {
     filter_resolve_ns: u64 = 0,
+    filter_forward_ns: u64 = 0,
     segment_seek_ns: u64 = 0,
     segment_decode_ns: u64 = 0,
     delta_chunk_ns: u64 = 0,
@@ -133,7 +144,15 @@ const SearchProfile = struct {
     segment_chunks: usize = 0,
     delta_chunks: usize = 0,
     scored_docs: usize = 0,
+    filter_forward_docs: usize = 0,
+    filter_forward_path: bool = false,
     results: usize = 0,
+};
+
+const ForwardScoreEntry = struct {
+    doc_num: u32,
+    score: f32,
+    doc_id: ?[]u8,
 };
 
 pub const SearchConstraints = struct {
@@ -639,6 +658,33 @@ fn segmentTermPayload(data: []const u8, term_id: u32) !?[]const u8 {
         pos += segment_dir_entry_len;
     }
     return null;
+}
+
+fn forEachSegmentTermPayload(
+    segment: []const u8,
+    context: anytype,
+    comptime func: fn (@TypeOf(context), u32, []const u8) anyerror!void,
+) !void {
+    if (segment.len < segment_header_len) return error.InvalidSparseSegment;
+    if (!std.mem.eql(u8, segment[0..segment_magic.len], segment_magic)) return error.InvalidSparseSegment;
+    const version = std.mem.readInt(u32, segment[segment_magic.len..][0..4], .little);
+    if (version != SEGMENT_FORMAT_VERSION) return error.InvalidSparseSegment;
+    const term_count = std.mem.readInt(u32, segment[segment_magic.len + 4 ..][0..4], .little);
+    const dir_start = segment_header_len;
+    const dir_len = @as(usize, term_count) * segment_dir_entry_len;
+    if (dir_start + dir_len > segment.len) return error.InvalidSparseSegment;
+
+    var pos = dir_start;
+    for (0..term_count) |_| {
+        const term_id = std.mem.readInt(u32, segment[pos..][0..4], .little);
+        const offset = std.mem.readInt(u64, segment[pos + 8 ..][0..8], .little);
+        const len = std.mem.readInt(u32, segment[pos + 16 ..][0..4], .little);
+        const start: usize = @intCast(offset);
+        const end = start + @as(usize, len);
+        if (end > segment.len) return error.InvalidSparseSegment;
+        try func(context, term_id, segment[start..end]);
+        pos += segment_dir_entry_len;
+    }
 }
 
 fn forEachSegmentChunk(
@@ -1510,6 +1556,295 @@ pub const SparseIndex = struct {
         return manager.reserve(.sparse_apply_working_set, estimated) catch null;
     }
 
+    pub const SegmentCompactionOptions = struct {
+        min_segments: usize = 32,
+        max_segments: usize = 128,
+    };
+
+    pub const SegmentCompactionSource = struct {
+        id: u64,
+        data: []u8,
+    };
+
+    pub const SegmentCompactionTask = struct {
+        sources: []SegmentCompactionSource,
+        docmaps: [][]u8,
+        buffer_reservation: ?resource_manager_mod.Reservation = null,
+
+        pub fn deinit(self: *SegmentCompactionTask, alloc: Allocator) void {
+            if (self.buffer_reservation) |*reservation| reservation.release();
+            for (self.sources) |source| alloc.free(source.data);
+            alloc.free(self.sources);
+            for (self.docmaps) |docmap| alloc.free(docmap);
+            alloc.free(self.docmaps);
+            self.* = undefined;
+        }
+    };
+
+    pub const SegmentCompactionResult = struct {
+        data: ?[]u8 = null,
+        source_segments: u64 = 0,
+        postings: u64 = 0,
+
+        pub fn deinit(self: *SegmentCompactionResult, alloc: Allocator) void {
+            if (self.data) |data| alloc.free(data);
+            self.* = undefined;
+        }
+    };
+
+    fn segmentIdFromKey(key: []const u8) ?u64 {
+        if (key.len != 9 or key[0] != key_segment) return null;
+        return std.mem.readInt(u64, key[1..][0..8], .big);
+    }
+
+    pub fn segmentCount(self: *SparseIndex) !usize {
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+        return try self.segmentCountTxn(&txn);
+    }
+
+    fn segmentCountTxn(self: *SparseIndex, txn: anytype) !usize {
+        _ = self;
+        var count: usize = 0;
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var maybe_entry = try cur.seekAtOrAfter(taggedPrefix(key_segment));
+        while (maybe_entry) |entry| {
+            if (entry.key.len == 0 or entry.key[0] != key_segment) break;
+            count += 1;
+            maybe_entry = try cur.next();
+        }
+        return count;
+    }
+
+    fn reserveSparseSegmentCompactionBuffers(
+        self: *SparseIndex,
+        source_bytes: u64,
+        source_segments: usize,
+    ) !?resource_manager_mod.Reservation {
+        const manager = self.resource_manager orelse return null;
+        const output_bytes = source_bytes;
+        const segment_overhead = std.math.mul(u64, @as(u64, @intCast(source_segments)), 1024) catch return error.ResourceBudgetExceeded;
+        const source_and_output = std.math.add(u64, source_bytes, output_bytes) catch return error.ResourceBudgetExceeded;
+        const reservation_bytes = std.math.add(u64, source_and_output, segment_overhead) catch return error.ResourceBudgetExceeded;
+        return try manager.reserve(.sparse_apply_working_set, reservation_bytes);
+    }
+
+    pub fn beginSegmentCompactionTask(
+        self: *SparseIndex,
+        alloc: Allocator,
+        options: SegmentCompactionOptions,
+    ) !?SegmentCompactionTask {
+        const min_segments = @max(@as(usize, 2), options.min_segments);
+        const max_segments = @max(min_segments, options.max_segments);
+
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+
+        const total_segments = try self.segmentCountTxn(&txn);
+        if (total_segments < min_segments) return null;
+
+        var sources = std.ArrayListUnmanaged(SegmentCompactionSource).empty;
+        errdefer {
+            for (sources.items) |source| alloc.free(source.data);
+            sources.deinit(alloc);
+        }
+
+        var source_bytes: u64 = 0;
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var maybe_segment = try cur.seekAtOrAfter(taggedPrefix(key_segment));
+        while (maybe_segment) |entry| {
+            if (entry.key.len == 0 or entry.key[0] != key_segment) break;
+            const id = segmentIdFromKey(entry.key) orelse return error.InvalidSparseSegment;
+            const data = try alloc.dupe(u8, entry.value);
+            sources.append(alloc, .{ .id = id, .data = data }) catch |err| {
+                alloc.free(data);
+                return err;
+            };
+            source_bytes = std.math.add(u64, source_bytes, @intCast(data.len)) catch return error.ResourceBudgetExceeded;
+            if (sources.items.len >= max_segments) break;
+            maybe_segment = try cur.next();
+        }
+        if (sources.items.len < min_segments) {
+            for (sources.items) |source| alloc.free(source.data);
+            sources.deinit(alloc);
+            return null;
+        }
+
+        var docmaps = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (docmaps.items) |docmap| alloc.free(docmap);
+            docmaps.deinit(alloc);
+        }
+        var docmap_cur = try txn.openCursor();
+        defer docmap_cur.close();
+        var maybe_docmap = try docmap_cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
+        while (maybe_docmap) |entry| {
+            if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
+            const data = try alloc.dupe(u8, entry.value);
+            docmaps.append(alloc, data) catch |err| {
+                alloc.free(data);
+                return err;
+            };
+            source_bytes = std.math.add(u64, source_bytes, @intCast(data.len)) catch return error.ResourceBudgetExceeded;
+            maybe_docmap = try docmap_cur.next();
+        }
+
+        var reservation = try self.reserveSparseSegmentCompactionBuffers(source_bytes, sources.items.len);
+        errdefer if (reservation) |*held| held.release();
+
+        const owned_sources = try sources.toOwnedSlice(alloc);
+        errdefer {
+            for (owned_sources) |source| alloc.free(source.data);
+            alloc.free(owned_sources);
+        }
+        const owned_docmaps = try docmaps.toOwnedSlice(alloc);
+        errdefer {
+            for (owned_docmaps) |docmap| alloc.free(docmap);
+            alloc.free(owned_docmaps);
+        }
+
+        return .{
+            .sources = owned_sources,
+            .docmaps = owned_docmaps,
+            .buffer_reservation = reservation,
+        };
+    }
+
+    pub fn executeSegmentCompactionTask(
+        alloc: Allocator,
+        task: *const SegmentCompactionTask,
+        chunk_size: u32,
+    ) !SegmentCompactionResult {
+        var doc_ids = std.AutoHashMapUnmanaged(u32, []const u8).empty;
+        defer doc_ids.deinit(alloc);
+
+        const DocMapContext = struct {
+            alloc: Allocator,
+            doc_ids: *std.AutoHashMapUnmanaged(u32, []const u8),
+
+            fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
+                if (entry.doc_num > std.math.maxInt(u32)) return false;
+                const doc_num: u32 = @intCast(entry.doc_num);
+                try ctx.doc_ids.put(ctx.alloc, doc_num, entry.doc_id);
+                return false;
+            }
+        };
+
+        for (task.docmaps) |docmap| {
+            var ctx = DocMapContext{ .alloc = alloc, .doc_ids = &doc_ids };
+            _ = try forEachDocMapEntry(docmap, &ctx, DocMapContext.visit);
+        }
+
+        var postings = std.ArrayListUnmanaged(BulkPosting).empty;
+        defer postings.deinit(alloc);
+
+        const PayloadContext = struct {
+            alloc: Allocator,
+            doc_ids: *const std.AutoHashMapUnmanaged(u32, []const u8),
+            postings: *std.ArrayListUnmanaged(BulkPosting),
+
+            fn visit(ctx: *@This(), term_id: u32, payload: []const u8) !void {
+                var pos: usize = 0;
+                while (pos < payload.len) {
+                    if (pos + 8 > payload.len) return error.InvalidSparseSegment;
+                    const chunk_len = std.mem.readInt(u32, payload[pos..][0..4], .little);
+                    const range_len = std.mem.readInt(u32, payload[pos + 4 ..][0..4], .little);
+                    pos += 8;
+                    const chunk_end = pos + @as(usize, chunk_len);
+                    const range_end = chunk_end + @as(usize, range_len);
+                    if (range_end > payload.len) return error.InvalidSparseSegment;
+
+                    const decoded = try decodeChunk(ctx.alloc, payload[pos..chunk_end]);
+                    defer ctx.alloc.free(decoded.doc_nums);
+                    defer ctx.alloc.free(decoded.weights);
+                    for (decoded.doc_nums, 0..) |doc_num, i| {
+                        const doc_id = ctx.doc_ids.get(doc_num) orelse continue;
+                        try ctx.postings.append(ctx.alloc, .{
+                            .term_id = term_id,
+                            .doc_num = doc_num,
+                            .weight = decoded.weights[i],
+                            .doc_id = doc_id,
+                        });
+                    }
+                    pos = range_end;
+                }
+            }
+        };
+
+        var payload_ctx = PayloadContext{
+            .alloc = alloc,
+            .doc_ids = &doc_ids,
+            .postings = &postings,
+        };
+        for (task.sources) |source| {
+            try forEachSegmentTermPayload(source.data, &payload_ctx, PayloadContext.visit);
+        }
+
+        if (postings.items.len == 0) {
+            return .{ .data = null, .source_segments = @intCast(task.sources.len), .postings = 0 };
+        }
+
+        std.mem.sort(BulkPosting, postings.items, {}, struct {
+            fn lessThan(_: void, a: BulkPosting, b: BulkPosting) bool {
+                if (a.term_id != b.term_id) return a.term_id < b.term_id;
+                return a.doc_num < b.doc_num;
+            }
+        }.lessThan);
+
+        const merged = try encodeSegmentFromSortedPostings(alloc, postings.items, chunk_size);
+        return .{
+            .data = merged,
+            .source_segments = @intCast(task.sources.len),
+            .postings = @intCast(postings.items.len),
+        };
+    }
+
+    pub fn finishSegmentCompactionTask(
+        self: *SparseIndex,
+        task: *const SegmentCompactionTask,
+        result: *SegmentCompactionResult,
+    ) !bool {
+        if (task.sources.len < 2) return false;
+
+        var txn = try self.beginBatchTxn(.{});
+        errdefer txn.abort();
+
+        for (task.sources) |source| {
+            var key_buf: [16]u8 = undefined;
+            const current = txn.get(segmentKey(&key_buf, source.id)) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            if (!std.mem.eql(u8, current, source.data)) return false;
+        }
+
+        if (result.data) |data| {
+            const segment_id = self.next_segment_id;
+            self.next_segment_id += 1;
+            var key_buf: [16]u8 = undefined;
+            try txnAppendPut(&txn, self.dbi, segmentKey(&key_buf, segment_id), data);
+            try persistNextSegmentId(self, &txn);
+        }
+
+        for (task.sources) |source| {
+            var key_buf: [16]u8 = undefined;
+            txnDelete(&txn, self.dbi, segmentKey(&key_buf, source.id)) catch {};
+        }
+
+        try txn.commit();
+        return true;
+    }
+
+    pub fn compactSegmentsWithOptions(self: *SparseIndex, alloc: Allocator, options: SegmentCompactionOptions) !bool {
+        var task = (try self.beginSegmentCompactionTask(alloc, options)) orelse return false;
+        defer task.deinit(alloc);
+        var result = try executeSegmentCompactionTask(alloc, &task, self.chunk_size);
+        defer result.deinit(alloc);
+        return try self.finishSegmentCompactionTask(&task, &result);
+    }
+
     fn tryBulkAppend(self: *SparseIndex, writes: []const SparseWrite, deletes: []const []const u8, options: BatchOptions) !bool {
         if (deletes.len != 0) return false;
 
@@ -1619,6 +1954,11 @@ pub const SparseIndex = struct {
         defer self.alloc.free(docmap_data);
         var docmap_key_buf: [16]u8 = undefined;
         try txnAppendPut(&txn, self.dbi, docMapSegmentKey(&docmap_key_buf, segment_id), docmap_data);
+        for (bulk_docs.items) |doc| {
+            const write = writes[doc.write_idx];
+            var rev_key_buf: [16]u8 = undefined;
+            try txnAppendPut(&txn, self.dbi, revKey(&rev_key_buf, doc.doc_num), write.doc_id);
+        }
         self.write_profile.fwd_rev_put_ns += elapsedSince(phase_start_ns);
 
         phase_start_ns = nowNs();
@@ -2426,6 +2766,15 @@ pub const SparseIndex = struct {
         }
         if (wanted.count() == 0) return;
 
+        for (candidates) |*candidate| {
+            if (!wanted.contains(candidate.doc_num)) continue;
+            var rev_buf: [256]u8 = undefined;
+            const doc_id = txnGet(txn, self.dbi, revKey(&rev_buf, candidate.doc_num)) catch continue;
+            candidate.doc_id = try alloc.dupe(u8, doc_id);
+            _ = wanted.remove(candidate.doc_num);
+            if (wanted.count() == 0) return;
+        }
+
         const LookupContext = struct {
             alloc: Allocator,
             wanted: *std.AutoHashMapUnmanaged(u32, usize),
@@ -2455,14 +2804,6 @@ pub const SparseIndex = struct {
             };
             if (try forEachDocMapEntry(entry.value, &ctx, LookupContext.visit)) return;
             maybe_entry = try cur.next();
-        }
-
-        for (candidates) |*candidate| {
-            if (candidate.doc_id != null) continue;
-            if (!wanted.contains(candidate.doc_num)) continue;
-            var rev_buf: [256]u8 = undefined;
-            const doc_id = txnGet(txn, self.dbi, revKey(&rev_buf, candidate.doc_num)) catch continue;
-            candidate.doc_id = try alloc.dupe(u8, doc_id);
         }
     }
 
@@ -2545,6 +2886,194 @@ pub const SparseIndex = struct {
         return decodeChunkRangeMeta(data);
     }
 
+    fn scoreFwdDataAgainstQuery(
+        data: []const u8,
+        query_weights: *const std.AutoHashMapUnmanaged(u32, f32),
+    ) !f32 {
+        const parsed = try parseFwdDocNumAndTermCount(data);
+        const term_count: usize = @intCast(parsed.term_count);
+        const terms_start = parsed.terms_start;
+        const weights_start = terms_start + term_count * 4;
+        if (data.len < weights_start + term_count * 4) return error.InvalidChunk;
+
+        var score: f32 = 0;
+        for (0..term_count) |i| {
+            const term_pos = terms_start + i * 4;
+            const term_id = std.mem.readInt(u32, data[term_pos..][0..4], .little);
+            const query_weight = query_weights.get(term_id) orelse continue;
+            const weight_pos = weights_start + i * 4;
+            const bits = std.mem.readInt(u32, data[weight_pos..][0..4], .little);
+            const doc_weight: f32 = @bitCast(bits);
+            score += query_weight * doc_weight;
+        }
+        return score;
+    }
+
+    fn appendForwardScoreIfMatch(
+        self: *SparseIndex,
+        alloc: Allocator,
+        txn: anytype,
+        entries: *std.ArrayListUnmanaged(ForwardScoreEntry),
+        query_weights: *const std.AutoHashMapUnmanaged(u32, f32),
+        doc_num: u32,
+        doc_id: []const u8,
+        fwd_data: []const u8,
+    ) !void {
+        if (self.docNumDeleted(txn, doc_num)) return;
+        const score = try scoreFwdDataAgainstQuery(fwd_data, query_weights);
+        if (score <= 0) return;
+        try entries.append(alloc, .{
+            .doc_num = doc_num,
+            .score = score,
+            .doc_id = try alloc.dupe(u8, doc_id),
+        });
+    }
+
+    fn maybeSearchFilterDriven(
+        self: *SparseIndex,
+        alloc: Allocator,
+        txn: anytype,
+        query_vec: *const SparseVector,
+        k: u32,
+        filter_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
+        direct_filter_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
+        exclude_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
+        direct_exclude_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
+        profile: ?*SearchProfile,
+    ) !?[]SearchResult {
+        if (k == 0 or query_vec.indices.len == 0) return try alloc.alloc(SearchResult, 0);
+        if (filter_doc_nums.count() == 0 and direct_filter_doc_nums.count() == 0) return null;
+
+        const filter_estimate = if (filter_doc_nums.count() == 0)
+            direct_filter_doc_nums.count()
+        else if (direct_filter_doc_nums.count() == 0)
+            filter_doc_nums.count()
+        else
+            @min(filter_doc_nums.count(), direct_filter_doc_nums.count());
+        // Forward-vector scoring wins only when the native positive filter is
+        // genuinely selective. Medium and broad filters are faster through the
+        // postings path because postings skip non-matching query terms without
+        // loading every filtered document vector.
+        const max_filter_docs = @min(@max(@as(usize, 128), @as(usize, k) * 32), @as(usize, 4096));
+        if (filter_estimate > max_filter_docs) return null;
+
+        var query_weights = std.AutoHashMapUnmanaged(u32, f32).empty;
+        defer query_weights.deinit(alloc);
+        try query_weights.ensureTotalCapacity(alloc, @intCast(query_vec.indices.len));
+        for (query_vec.indices, 0..) |term_id, i| {
+            const gop = try query_weights.getOrPut(alloc, term_id);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += query_vec.values[i];
+        }
+
+        var selected = std.ArrayListUnmanaged(u32).empty;
+        defer selected.deinit(alloc);
+        var wanted = std.AutoHashMapUnmanaged(u32, void).empty;
+        defer wanted.deinit(alloc);
+
+        const first = if (filter_doc_nums.count() > 0 and (direct_filter_doc_nums.count() == 0 or filter_doc_nums.count() <= direct_filter_doc_nums.count()))
+            filter_doc_nums
+        else
+            direct_filter_doc_nums;
+        const second = if (first == filter_doc_nums) direct_filter_doc_nums else filter_doc_nums;
+        var filter_it = first.iterator();
+        while (filter_it.next()) |entry| {
+            const doc_num = entry.key_ptr.*;
+            if (second.count() > 0 and !second.contains(doc_num)) continue;
+            if (exclude_doc_nums.contains(doc_num)) continue;
+            if (direct_exclude_doc_nums.contains(doc_num)) continue;
+            if (self.docNumDeleted(txn, doc_num)) continue;
+            try selected.append(alloc, doc_num);
+            try wanted.put(alloc, doc_num, {});
+        }
+        if (selected.items.len == 0) return try alloc.alloc(SearchResult, 0);
+        if (selected.items.len > max_filter_docs) return null;
+
+        var entries = std.ArrayListUnmanaged(ForwardScoreEntry).empty;
+        defer {
+            for (entries.items) |entry| {
+                if (entry.doc_id) |doc_id| alloc.free(doc_id);
+            }
+            entries.deinit(alloc);
+        }
+
+        const score_start_ns = if (profile != null) nowNs() else 0;
+        for (selected.items) |doc_num| {
+            if (!wanted.contains(doc_num)) continue;
+            var rev_buf: [256]u8 = undefined;
+            const doc_id = txnGet(txn, self.dbi, revKey(&rev_buf, doc_num)) catch continue;
+            if (doc_id.len + 1 > 256) continue;
+            var fwd_buf: [256]u8 = undefined;
+            const fwd_data = txnGet(txn, self.dbi, fwdKey(&fwd_buf, doc_id)) catch continue;
+            try self.appendForwardScoreIfMatch(alloc, txn, &entries, &query_weights, doc_num, doc_id, fwd_data);
+            _ = wanted.remove(doc_num);
+        }
+
+        if (wanted.count() > 0) {
+            const LookupContext = struct {
+                alloc: Allocator,
+                index: *SparseIndex,
+                txn: @TypeOf(txn),
+                wanted: *std.AutoHashMapUnmanaged(u32, void),
+                query_weights: *const std.AutoHashMapUnmanaged(u32, f32),
+                entries: *std.ArrayListUnmanaged(ForwardScoreEntry),
+
+                fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
+                    if (entry.doc_num > std.math.maxInt(u32)) return false;
+                    const doc_num: u32 = @intCast(entry.doc_num);
+                    if (!ctx.wanted.contains(doc_num)) return false;
+                    try ctx.index.appendForwardScoreIfMatch(ctx.alloc, ctx.txn, ctx.entries, ctx.query_weights, doc_num, entry.doc_id, entry.fwd_data);
+                    _ = ctx.wanted.remove(doc_num);
+                    return ctx.wanted.count() == 0;
+                }
+            };
+
+            var cur = try txn.openCursor();
+            defer cur.close();
+            var maybe_entry = try cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
+            while (maybe_entry) |entry| {
+                if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
+                var ctx = LookupContext{
+                    .alloc = alloc,
+                    .index = self,
+                    .txn = txn,
+                    .wanted = &wanted,
+                    .query_weights = &query_weights,
+                    .entries = &entries,
+                };
+                if (try forEachDocMapEntry(entry.value, &ctx, LookupContext.visit)) break;
+                maybe_entry = try cur.next();
+            }
+        }
+        if (profile) |p| {
+            p.filter_forward_ns += nowNs() - score_start_ns;
+            p.filter_forward_docs = selected.items.len;
+            p.scored_docs = entries.items.len;
+            p.filter_forward_path = true;
+        }
+
+        std.mem.sort(ForwardScoreEntry, entries.items, {}, struct {
+            fn cmp(_: void, a: ForwardScoreEntry, b: ForwardScoreEntry) bool {
+                return a.score > b.score;
+            }
+        }.cmp);
+
+        const n = @min(@as(usize, @intCast(k)), entries.items.len);
+        if (n == 0) return try alloc.alloc(SearchResult, 0);
+        var results = try alloc.alloc(SearchResult, n);
+        errdefer alloc.free(results);
+        for (entries.items[0..n], 0..) |*entry, i| {
+            results[i] = .{
+                .doc_id = entry.doc_id.?,
+                .doc_num = entry.doc_num,
+                .score = entry.score,
+            };
+            entry.doc_id = null;
+        }
+        if (profile) |p| p.results = n;
+        return results;
+    }
+
     /// Search for top-k documents matching a sparse query vector.
     /// DAAT: accumulate scores per doc, then extract top-k.
     pub fn search(self: *SparseIndex, alloc: Allocator, query_vec: *const SparseVector, k: u32) ![]SearchResult {
@@ -2581,6 +3110,45 @@ pub const SparseIndex = struct {
         var direct_exclude_doc_nums = try self.docNumSetFromSliceAlloc(alloc, constraints.exclude_doc_nums);
         defer direct_exclude_doc_nums.deinit(alloc);
         if (profile_enabled) profile.filter_resolve_ns = nowNs() - filter_start_ns;
+
+        if (try self.maybeSearchFilterDriven(
+            alloc,
+            &txn,
+            query_vec,
+            k,
+            &filter_doc_nums,
+            &direct_filter_doc_nums,
+            &exclude_doc_nums,
+            &direct_exclude_doc_nums,
+            if (profile_enabled) &profile else null,
+        )) |results| {
+            if (profile_enabled) {
+                std.log.info(
+                    "antfly_bench_sparse_search k={d} terms={d} results={d} scored_docs={d} total_ms={d} filter_ms={d} filter_forward_ms={d} filter_forward_docs={d} segment_seek_ms={d} segment_decode_ms={d} delta_chunk_ms={d} score_collect_ms={d} sort_ms={d} hydrate_ms={d} segment_entries={d} segment_chunks={d} delta_chunks={d} filter_forward={}",
+                    .{
+                        k,
+                        query_vec.indices.len,
+                        profile.results,
+                        profile.scored_docs,
+                        (nowNs() - total_start_ns) / std.time.ns_per_ms,
+                        profile.filter_resolve_ns / std.time.ns_per_ms,
+                        profile.filter_forward_ns / std.time.ns_per_ms,
+                        profile.filter_forward_docs,
+                        profile.segment_seek_ns / std.time.ns_per_ms,
+                        profile.segment_decode_ns / std.time.ns_per_ms,
+                        profile.delta_chunk_ns / std.time.ns_per_ms,
+                        profile.score_collect_ns / std.time.ns_per_ms,
+                        profile.sort_ns / std.time.ns_per_ms,
+                        profile.hydrate_ns / std.time.ns_per_ms,
+                        profile.segment_entries,
+                        profile.segment_chunks,
+                        profile.delta_chunks,
+                        profile.filter_forward_path,
+                    },
+                );
+            }
+            return results;
+        }
 
         // Accumulate scores: docNum → score
         var scores = std.AutoHashMapUnmanaged(u32, f32).empty;
@@ -2620,20 +3188,19 @@ pub const SparseIndex = struct {
             }
         };
 
-        for (query_vec.indices, 0..) |term_id, qi| {
-            if (profile_enabled) profile.terms += 1;
-            const query_weight = query_vec.values[qi];
-            const segment_seek_start_ns = if (profile_enabled) nowNs() else 0;
-            var segment_cur = try txn.openCursor();
-            defer segment_cur.close();
-            var maybe_segment = try segment_cur.seekAtOrAfter(taggedPrefix(key_segment));
-            if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_seek_start_ns;
-            while (maybe_segment) |segment_entry| {
-                if (segment_entry.key.len == 0 or segment_entry.key[0] != key_segment) break;
-                if (profile_enabled) profile.segment_entries += 1;
+        if (profile_enabled) profile.terms = query_vec.indices.len;
+        const segment_seek_start_ns = if (profile_enabled) nowNs() else 0;
+        var segment_cur = try txn.openCursor();
+        defer segment_cur.close();
+        var maybe_segment = try segment_cur.seekAtOrAfter(taggedPrefix(key_segment));
+        if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_seek_start_ns;
+        while (maybe_segment) |segment_entry| {
+            if (segment_entry.key.len == 0 or segment_entry.key[0] != key_segment) break;
+            if (profile_enabled) profile.segment_entries += 1;
+            for (query_vec.indices, 0..) |term_id, qi| {
                 var ctx = AccumulateContext{
                     .alloc = alloc,
-                    .query_weight = query_weight,
+                    .query_weight = query_vec.values[qi],
                     .scores = &scores,
                     .filter_doc_nums = &filter_doc_nums,
                     .direct_filter_doc_nums = &direct_filter_doc_nums,
@@ -2645,11 +3212,14 @@ pub const SparseIndex = struct {
                 const segment_decode_start_ns = if (profile_enabled) nowNs() else 0;
                 try forEachSegmentChunk(alloc, segment_entry.value, term_id, &ctx, AccumulateContext.visit);
                 if (profile_enabled) profile.segment_decode_ns += nowNs() - segment_decode_start_ns;
-                const segment_next_start_ns = if (profile_enabled) nowNs() else 0;
-                maybe_segment = try segment_cur.next();
-                if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_next_start_ns;
             }
+            const segment_next_start_ns = if (profile_enabled) nowNs() else 0;
+            maybe_segment = try segment_cur.next();
+            if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_next_start_ns;
+        }
 
+        for (query_vec.indices, 0..) |term_id, qi| {
+            const query_weight = query_vec.values[qi];
             // Check term metadata
             var meta_key_buf: [256]u8 = undefined;
             const mk = invMetaKey(&meta_key_buf, term_id);
@@ -2713,7 +3283,7 @@ pub const SparseIndex = struct {
             for (results[0..valid]) |result| alloc.free(result.doc_id);
         }
 
-        const candidate_batch_size = @max(@as(usize, 256), @as(usize, n) * 8);
+        const candidate_batch_size = @max(@as(usize, 32), @as(usize, n) * 2);
         var cursor: usize = 0;
         const hydrate_start_ns = if (profile_enabled) nowNs() else 0;
         while (cursor < entries.items.len and valid < n) {
@@ -2886,6 +3456,32 @@ pub const SparseIndex = struct {
         }
 
         return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn docNumsForOrdinalDocNumsAlloc(self: *SparseIndex, alloc: Allocator, txn: anytype, ordinals: []const u32) !OrdinalDocNumLookup {
+        _ = self;
+        _ = txn;
+        var out = std.ArrayListUnmanaged(u32).empty;
+        errdefer out.deinit(alloc);
+        var seen = std.AutoHashMapUnmanaged(u32, void).empty;
+        defer seen.deinit(alloc);
+
+        const sorted = try alloc.dupe(u32, ordinals);
+        defer alloc.free(sorted);
+        std.mem.sort(u32, sorted, {}, std.sort.asc(u32));
+
+        var previous: ?u32 = null;
+        for (sorted) |ordinal| {
+            if (previous != null and previous.? == ordinal) continue;
+            previous = ordinal;
+            const gop = try seen.getOrPut(alloc, ordinal);
+            if (!gop.found_existing) try out.append(alloc, ordinal);
+        }
+
+        return .{
+            .doc_nums = try out.toOwnedSlice(alloc),
+            .missing_ordinals = try alloc.alloc(u32, 0),
+        };
     }
 
     /// Free search results.
@@ -3921,6 +4517,51 @@ test "sparse bulk append accounts resource working set" {
     const resource_stats = manager.snapshot().slices[@intFromEnum(resource_manager_mod.Slice.sparse_apply_working_set)];
     try std.testing.expectEqual(@as(u64, 0), resource_stats.used_bytes);
     try std.testing.expect(resource_stats.peak_bytes > 0);
+}
+
+test "sparse segment compaction preserves bulk search results" {
+    const alloc = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "s2-bulk-compact");
+    defer cleanupTmp(path);
+
+    var idx = try SparseIndex.open(alloc, path, .{ .chunk_size = 2 });
+    defer idx.close();
+
+    for (0..4) |batch_idx| {
+        const doc_a = try std.fmt.allocPrint(alloc, "doc-{d}-a", .{batch_idx});
+        defer alloc.free(doc_a);
+        const doc_b = try std.fmt.allocPrint(alloc, "doc-{d}-b", .{batch_idx});
+        defer alloc.free(doc_b);
+        const writes = [_]SparseWrite{
+            .{ .doc_id = doc_a, .vec = .{ .indices = &.{ 7, 9 }, .values = &.{ 1.0, 0.25 } } },
+            .{ .doc_id = doc_b, .vec = .{ .indices = &.{7}, .values = &.{0.5} } },
+        };
+        try idx.batchWithOptions(&writes, &.{}, .{
+            .defer_term_range_updates = true,
+            .backend_batch_options = .{ .mode = .bulk_ingest },
+            .prefer_bulk_build = true,
+            .assume_new_doc_ids = true,
+        });
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), try idx.segmentCount());
+
+    const query = SparseVector{ .indices = &.{7}, .values = &.{1.0} };
+    const before = try idx.search(alloc, &query, 20);
+    defer SparseIndex.freeResults(alloc, before);
+    try std.testing.expectEqual(@as(usize, 8), before.len);
+
+    try std.testing.expect(try idx.compactSegmentsWithOptions(alloc, .{ .min_segments = 2, .max_segments = 16 }));
+    try std.testing.expectEqual(@as(usize, 1), try idx.segmentCount());
+
+    const after = try idx.search(alloc, &query, 20);
+    defer SparseIndex.freeResults(alloc, after);
+    try std.testing.expectEqual(before.len, after.len);
+    for (before, 0..) |hit, i| {
+        try std.testing.expectEqualStrings(hit.doc_id, after[i].doc_id);
+        try std.testing.expectApproxEqAbs(hit.score, after[i].score, 0.01);
+    }
 }
 
 test "sparse batch delete removes from posting lists" {

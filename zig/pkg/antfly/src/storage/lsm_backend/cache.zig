@@ -1051,3 +1051,30 @@ test "cache distinguishes reused paths by run id" {
     defer retained_second.release();
     try std.testing.expectEqualStrings("second", try retained_second.runState().get(.{ .name = "ns" }, "key"));
 }
+
+test "cache invalidates ownership move prefix without reviving pinned generations" {
+    const allocator = std.testing.allocator;
+    var cache = Cache.init(allocator, 1024 * 1024);
+    defer cache.deinit();
+
+    var old_state: State = .{};
+    try old_state.upsert(allocator, .{ .name = "ns" }, "doc", "old-owner", false);
+    var old_handle = try cache.putRunState("/tmp/group-9/table-1/range-91/run.tbl", 91, 7, old_state);
+
+    var new_state: State = .{};
+    try new_state.upsert(allocator, .{ .name = "ns" }, "doc", "new-owner", false);
+    var new_handle = try cache.putRunState("/tmp/group-10/table-1/range-92/run.tbl", 92, 8, new_state);
+    defer new_handle.release();
+
+    cache.invalidatePrefix("/tmp/group-9/table-1");
+    try std.testing.expect(cache.retainRunState("/tmp/group-9/table-1/range-91/run.tbl", 91, 7) == null);
+    try std.testing.expect(cache.retainRunState("/tmp/group-9/table-1/range-91/run.tbl", 91, 8) == null);
+
+    var retained_new = cache.retainRunState("/tmp/group-10/table-1/range-92/run.tbl", 92, 8) orelse return error.ExpectedCacheHit;
+    defer retained_new.release();
+    try std.testing.expectEqualStrings("new-owner", try retained_new.runState().get(.{ .name = "ns" }, "doc"));
+
+    try std.testing.expectEqual(@as(usize, 2), cache.entryCount());
+    old_handle.release();
+    try std.testing.expectEqual(@as(usize, 1), cache.entryCount());
+}

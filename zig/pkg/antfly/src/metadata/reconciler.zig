@@ -995,6 +995,7 @@ fn docIdentityNamespaceReadyForAutomaticSplit(status: MergedGroupStatus) bool {
     if (status.doc_identity_reassignment_active) return false;
     if (status.doc_identity_namespace_conflict) return false;
     if (status.doc_identity.rebuild_required) return false;
+    if (status.doc_identity.ordinal_capacity_exhausted) return false;
     return true;
 }
 
@@ -2296,6 +2297,76 @@ test "metadata reconciler does not automatically split stale doc identity namesp
                     .next_ordinal = 201,
                     .allocated_ordinals = 200,
                     .live_ordinals = 200,
+                },
+            }})[0..]),
+        },
+    };
+
+    var lookup = TestMedianKeyLookup{ .median_key = "doc:m" };
+    var reconciler = Reconciler.initWithConfig(std.testing.allocator, .{
+        .max_shard_size_bytes = 100,
+        .max_shards_per_table = 8,
+        .median_key_lookup = lookup.iface(),
+    });
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .stores = &stores,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
+}
+
+test "metadata reconciler does not automatically split ordinal exhausted doc identity" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 417, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 4171,
+        .range_id = 9001,
+        .table_id = 417,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+
+    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const updated_at_ns = now_ms * std.time.ns_per_ms;
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 1,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .failure_domain = "rack-a",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 4171,
+                .doc_count = 200,
+                .disk_bytes = 200,
+                .empty = false,
+                .updated_at_millis = now_ms,
+                .local_leader = true,
+            }})[0..]),
+            .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{.{
+                .table_id = 417,
+                .table_name = "docs",
+                .group_id = 4171,
+                .updated_at_ns = updated_at_ns,
+                .doc_identity = .{
+                    .namespace_table_id = 417,
+                    .namespace_shard_id = 4171,
+                    .namespace_range_id = 9001,
+                    .next_ordinal = std.math.maxInt(u32),
+                    .allocated_ordinals = std.math.maxInt(u32) - 1,
+                    .live_ordinals = 200,
+                    .ordinal_capacity_exhausted = true,
                 },
             }})[0..]),
         },

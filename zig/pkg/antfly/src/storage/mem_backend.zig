@@ -167,6 +167,7 @@ pub const Backend = struct {
     allocator: Allocator,
     open_options: backend_types.OpenOptions,
     state: State = .{},
+    mutex: std.atomic.Mutex = .unlocked,
 
     const BoundStore = struct {
         backend: *Backend,
@@ -300,6 +301,8 @@ pub const Backend = struct {
         state: State,
 
         fn open(backend: *Backend, namespace: backend_types.Namespace, read_only: bool) !BoundTxn {
+            lockBackend(backend);
+            defer backend.mutex.unlock();
             return .{
                 .allocator = backend.allocator,
                 .backend = if (read_only) null else backend,
@@ -315,6 +318,8 @@ pub const Backend = struct {
 
         pub fn commit(self: *@This()) !void {
             const backend = self.backend orelse return error.ReadOnly;
+            lockBackend(backend);
+            defer backend.mutex.unlock();
             var old_state = backend.state;
             backend.state = self.state;
             self.state = .{};
@@ -350,6 +355,8 @@ pub const Backend = struct {
         state: State,
 
         fn open(backend: *Backend, read_only: bool) !NamespaceTxn {
+            lockBackend(backend);
+            defer backend.mutex.unlock();
             return .{
                 .allocator = backend.allocator,
                 .backend = if (read_only) null else backend,
@@ -364,6 +371,8 @@ pub const Backend = struct {
 
         pub fn commit(self: *@This()) !void {
             const backend = self.backend orelse return error.ReadOnly;
+            lockBackend(backend);
+            defer backend.mutex.unlock();
             var old_state = backend.state;
             backend.state = self.state;
             self.state = .{};
@@ -394,7 +403,9 @@ pub const Backend = struct {
     }
 
     pub fn close(self: *Backend) void {
+        lockBackend(self);
         self.state.deinit(self.allocator);
+        self.mutex.unlock();
         self.* = undefined;
     }
 
@@ -445,6 +456,10 @@ pub const Backend = struct {
         });
     }
 };
+
+fn lockBackend(backend: *Backend) void {
+    while (!backend.mutex.tryLock()) std.Thread.yield() catch {};
+}
 
 fn identityNamespace(namespace: backend_types.Namespace) !backend_types.Namespace {
     return namespace;

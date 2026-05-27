@@ -956,6 +956,20 @@ pub const IndexManager = struct {
         index: sparse_mod.SparseIndex,
     };
 
+    pub const SparseCompactionTask = struct {
+        index_name: []u8,
+        chunk_size: u32,
+        task: sparse_mod.SparseIndex.SegmentCompactionTask,
+
+        pub fn deinit(self: *SparseCompactionTask, alloc: Allocator) void {
+            self.task.deinit(alloc);
+            alloc.free(self.index_name);
+            self.* = undefined;
+        }
+    };
+
+    pub const SparseCompactionResult = sparse_mod.SparseIndex.SegmentCompactionResult;
+
     pub const GraphIndex = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
@@ -3225,6 +3239,15 @@ pub const IndexManager = struct {
         return rebuilt;
     }
 
+    pub fn copyGraphSplitDestinationFrom(self: *IndexManager, src: *IndexManager, lower: []const u8, upper: []const u8) !usize {
+        var copied: usize = 0;
+        for (src.graph_indexes.items) |*src_entry| {
+            const dest_entry = self.graphIndex(src_entry.config.name) orelse return error.IndexNotFound;
+            copied += try src_entry.index.copyOwnedOutgoingEdgesTo(&dest_entry.index, self.alloc, lower, upper);
+        }
+        return copied;
+    }
+
     pub fn pruneTextSplitRange(self: *IndexManager, split_key: []const u8) !void {
         for (self.text_indexes.items) |*entry| {
             const plan = try entry.persistent.classifyActiveSegmentsForSplit(self.alloc, split_key);
@@ -3962,6 +3985,41 @@ pub const IndexManager = struct {
             };
             defer result.deinit(self.alloc);
             _ = try self.finishTextMergeTask(&task, &result);
+            completed += 1;
+        }
+        return completed;
+    }
+
+    pub fn beginSparseCompactionTask(self: *IndexManager) !?SparseCompactionTask {
+        for (self.sparse_indexes.items) |*entry| {
+            var task = (try entry.index.beginSegmentCompactionTask(self.alloc, .{})) orelse continue;
+            errdefer task.deinit(self.alloc);
+            return .{
+                .index_name = try self.alloc.dupe(u8, entry.config.name),
+                .chunk_size = entry.index.chunk_size,
+                .task = task,
+            };
+        }
+        return null;
+    }
+
+    pub fn executeSparseCompactionTask(alloc: Allocator, task: *const SparseCompactionTask) !SparseCompactionResult {
+        return try sparse_mod.SparseIndex.executeSegmentCompactionTask(alloc, &task.task, task.chunk_size);
+    }
+
+    pub fn finishSparseCompactionTask(self: *IndexManager, task: *const SparseCompactionTask, result: *SparseCompactionResult) !bool {
+        const entry = self.findSparseIndexEntry(task.index_name) orelse return false;
+        return try entry.index.finishSegmentCompactionTask(&task.task, result);
+    }
+
+    pub fn runSparseCompactionScheduler(self: *IndexManager, max_steps: usize) !usize {
+        var completed: usize = 0;
+        while (completed < max_steps) {
+            var task = (try self.beginSparseCompactionTask()) orelse break;
+            defer task.deinit(self.alloc);
+            var result = try executeSparseCompactionTask(self.alloc, &task);
+            defer result.deinit(self.alloc);
+            _ = try self.finishSparseCompactionTask(&task, &result);
             completed += 1;
         }
         return completed;
@@ -5474,7 +5532,8 @@ pub const IndexManager = struct {
     }
 
     fn beginTextMergeTaskForEntry(self: *IndexManager, entry: *TextIndex) !?TextMergeTask {
-        const snap = entry.persistent.snapshot();
+        const snap = entry.persistent.acquireSnapshot();
+        defer snap.release();
         if (snap.segments.len < 2) return null;
         const now_ns = platform_time.monotonicNs();
 
@@ -5600,7 +5659,8 @@ pub const IndexManager = struct {
     }
 
     fn textMergeSourceStillCurrent(_: *IndexManager, entry: *TextIndex, task: *const TextMergeTask) !bool {
-        const snap = entry.persistent.snapshot();
+        const snap = entry.persistent.acquireSnapshot();
+        defer snap.release();
         for (task.source) |source| {
             const seg = findSegmentById(snap, source.id) orelse return false;
             if (source.deleted) |expected| {
@@ -5793,6 +5853,7 @@ pub const IndexManager = struct {
         const flush_batch = struct {
             fn run(
                 manager: *IndexManager,
+                doc_store: *docstore_mod.DocStore,
                 sparse_entry: *SparseIndex,
                 rebuild: backfill_state_mod.RebuildState,
                 writes_buf: *std.ArrayListUnmanaged(sparse_mod.SparseWrite),
@@ -5801,6 +5862,7 @@ pub const IndexManager = struct {
                 doc_count: *u64,
             ) !void {
                 if (writes_buf.items.len == 0) return;
+                try manager.assignSparseWriteDocNumsFromIdentity(doc_store, sparse_entry, writes_buf.items);
                 try sparse_entry.index.batchWithOptions(writes_buf.items, &.{}, .{
                     .defer_term_range_updates = true,
                 });
@@ -5847,12 +5909,12 @@ pub const IndexManager = struct {
             });
             sparse_vec_owned = false;
             if (writes.items.len >= backfill_batch_size) {
-                try flush_batch(self, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
+                try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
             }
         }
 
         if (writes.items.len > 0) {
-            try flush_batch(self, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
+            try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
@@ -6703,7 +6765,6 @@ pub const IndexManager = struct {
         skip: ?*const SparseSplitHandoff,
         batch_options: StoreBatchOptions,
     ) !void {
-        _ = store;
         const ReplayProfile = struct {
             scan_ns: u64 = 0,
             extract_ns: u64 = 0,
@@ -6766,6 +6827,9 @@ pub const IndexManager = struct {
             .prefer_bulk_build = batch_options.mode == .bulk_ingest,
             .assume_new_doc_ids = batch_options.mode == .bulk_ingest,
         };
+        if (store) |doc_store| {
+            try self.assignSparseWriteDocNumsFromIdentity(doc_store, entry, sparse_writes.items);
+        }
         const max_sparse_writes_per_txn: usize = if (batch_options.mode == .bulk_ingest) 16 * 1024 else 256;
         var start: usize = 0;
         while (start < sparse_writes.items.len) {
@@ -6794,6 +6858,29 @@ pub const IndexManager = struct {
                     nsToMs(profile.batch_ns),
                 },
             );
+        }
+    }
+
+    fn assignSparseWriteDocNumsFromIdentity(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *SparseIndex,
+        writes: []sparse_mod.SparseWrite,
+    ) !void {
+        if (entry.chunk_name != null or writes.len == 0) return;
+
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+
+        const doc_ids = try self.alloc.alloc([]const u8, writes.len);
+        defer self.alloc.free(doc_ids);
+        for (writes, 0..) |write, i| doc_ids[i] = write.doc_id;
+
+        const ordinals = try doc_identity.lookupOrdinalsTxnAlloc(self.alloc, &txn, doc_ids);
+        defer self.alloc.free(ordinals);
+        for (ordinals, 0..) |maybe_ordinal, i| {
+            const ordinal = maybe_ordinal orelse continue;
+            writes[i].doc_num = ordinal;
         }
     }
 
@@ -6868,22 +6955,50 @@ pub const IndexManager = struct {
         var doc_num_ns: u64 = 0;
         const entry = self.findSparseIndexEntry(index_name) orelse return error.IndexNotFound;
 
-        const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var txn = try store.beginProbeTxn();
-        defer txn.abort();
-        if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
         const sparse_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var sparse_txn = try entry.index.beginReadTxn();
         defer sparse_txn.abort();
         if (bench_profile) sparse_txn_ns = platform_time.monotonicNs() - sparse_txn_start_ns;
 
         if (entry.chunk_name == null) {
+            var fast_lookup = try entry.index.docNumsForOrdinalDocNumsAlloc(alloc, &sparse_txn, ordinals);
+            defer fast_lookup.deinit(alloc);
+            if (fast_lookup.missing_ordinals.len == 0) {
+                const out = try alloc.dupe(u32, fast_lookup.doc_nums);
+                if (bench_profile) {
+                    std.log.info(
+                        "antfly_bench_sparse_ordinal_projection total_us={d} runtime_store_us={d} primary_txn_us={d} sparse_txn_us={d} doc_id_us={d} doc_num_us={d} ordinals={d} doc_nums={d}",
+                        .{
+                            (platform_time.monotonicNs() - total_start_ns) / 1000,
+                            runtime_store_ns / 1000,
+                            primary_txn_ns / 1000,
+                            sparse_txn_ns / 1000,
+                            doc_id_ns / 1000,
+                            doc_num_ns / 1000,
+                            ordinals.len,
+                            out.len,
+                        },
+                    );
+                }
+                return out;
+            }
+
+            const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            var txn = try store.beginProbeTxn();
+            defer txn.abort();
+            if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
             const doc_id_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const parent_doc_ids = try lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc, &txn, ordinals);
+            const parent_doc_ids = try lookupSparseProjectionDocIdsForOrdinalsAlloc(alloc, &txn, fast_lookup.missing_ordinals);
             defer alloc.free(parent_doc_ids);
             if (bench_profile) doc_id_ns = platform_time.monotonicNs() - doc_id_start_ns;
             const doc_num_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const out = try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, parent_doc_ids);
+            const fallback_doc_nums = try entry.index.docNumsForDocIdsAlloc(alloc, &sparse_txn, parent_doc_ids);
+            defer alloc.free(fallback_doc_nums);
+            var out = std.ArrayListUnmanaged(u32).empty;
+            errdefer out.deinit(alloc);
+            try out.appendSlice(alloc, fast_lookup.doc_nums);
+            try out.appendSlice(alloc, fallback_doc_nums);
+            const out_slice = try out.toOwnedSlice(alloc);
             if (bench_profile) {
                 doc_num_ns = platform_time.monotonicNs() - doc_num_start_ns;
                 std.log.info(
@@ -6896,12 +7011,17 @@ pub const IndexManager = struct {
                         doc_id_ns / 1000,
                         doc_num_ns / 1000,
                         ordinals.len,
-                        out.len,
+                        out_slice.len,
                     },
                 );
             }
-            return out;
+            return out_slice;
         }
+
+        const primary_txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        if (bench_profile) primary_txn_ns = platform_time.monotonicNs() - primary_txn_start_ns;
 
         const runtime_store_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var runtime_store = try initRuntimeStore(self.alloc, store);
@@ -8914,6 +9034,7 @@ pub const IndexManager = struct {
             }
             if (sparse_writes.items.len > 0) {
                 const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+                try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
                 try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
                     .defer_term_range_updates = true,
                     .backend_batch_options = batch_options,
@@ -8934,6 +9055,7 @@ pub const IndexManager = struct {
         }
         if (pending_artifact_loads.items.len == 0 and sparse_writes.items.len > 0) {
             const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
             try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
                 .defer_term_range_updates = true,
                 .backend_batch_options = batch_options,
@@ -10073,7 +10195,26 @@ fn openTextPersistentIndexWithRetry(
     const max_attempts: usize = 6;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
+        std.log.info(
+            "full_text persistent open begin attempt={d} path={s} main_backend={s} wal_backend={s} main_lsm_storage={any} wal_storage={any} read_only={any} main_read_only={any} wal_read_only={any}",
+            .{
+                attempt + 1,
+                std.mem.span(opts.path),
+                @tagName(opts.main_backend),
+                @tagName(opts.resolvedWalBackend()),
+                opts.main_lsm_storage != null,
+                opts.wal_storage != null,
+                opts.read_only,
+                opts.main_lsm_options.backend.read_only,
+                opts.wal_lsm_options.backend.read_only,
+            },
+        );
         return persistent_mod.PersistentIndex.open(alloc, opts) catch |err| {
+            std.log.warn("full_text persistent open attempt failed attempt={d} path={s} err={s}", .{
+                attempt + 1,
+                std.mem.span(opts.path),
+                @errorName(err),
+            });
             if (!isTransientTextPersistentOpenError(err) or attempt + 1 >= max_attempts) return err;
             sleepBeforeTextPersistentOpenRetry(attempt);
             continue;
@@ -12463,6 +12604,49 @@ test "index manager sim workloads stay green" {
     try runIndexManagerReplayCase(alloc, "index-manager-default", 0xA17F_D101, 8);
     try runIndexManagerReplayCase(alloc, "index-manager-split-heavy", 0xA17F_D102, 10);
     try runIndexManagerCrashCase(alloc, "index-manager-crash-default", 0xA17F_D201, 6);
+}
+
+test "index manager split handoff preserves interleaved write and query summaries" {
+    const alloc = std.testing.allocator;
+    const actions = [_]IndexManagerSimAction{
+        .{ .add_doc = .mixed_alpha_beta },
+        .{ .add_doc = .left_gamma },
+        .split_handoff,
+        .{ .add_doc = .mixed_alpha_beta },
+        .reopen,
+        .{ .add_doc = .right_beta },
+        .{ .add_doc = .left_alpha },
+    };
+
+    var source_path_buf: [256]u8 = undefined;
+    var dest_path_buf: [256]u8 = undefined;
+    const source_path = indexManagerTmpPathWithSuffix(&source_path_buf, "deterministic-split-src");
+    const dest_path = indexManagerTmpPathWithSuffix(&dest_path_buf, "deterministic-split-dst");
+    defer cleanupIndexManagerDir(source_path);
+    defer cleanupIndexManagerDir(dest_path);
+
+    var modeled_device = storage_sim.ModeledDevice.init(alloc);
+    defer modeled_device.deinit();
+    const backend_options = db_config.IndexBackendOptions{
+        .text_main_backend = .lsm,
+        .text_lsm_storage = modeled_device.storage(),
+        .dense_storage_backend = .lsm,
+        .dense_lsm_storage = modeled_device.storage(),
+        .graph_reverse_backend = .lsm,
+        .graph_lsm_storage = modeled_device.storage(),
+    };
+
+    var runtime = try IndexManagerSimRuntime.initWithOptions(alloc, source_path, dest_path, backend_options);
+    defer runtime.deinit();
+    for (actions, 0..) |action, step| {
+        try runtime.applyReplayAction(action, step);
+        const actual = try runtime.summary(alloc);
+        try expectIndexManagerSummaryEqual("deterministic-split-step", try expectedIndexManagerSummary(actions[0 .. step + 1]), actual);
+    }
+
+    try modeled_device.device().crash();
+    try runtime.reopen();
+    try expectIndexManagerSummaryEqual("deterministic-split-reopen", try expectedIndexManagerSummary(&actions), try runtime.summary(alloc));
 }
 
 test "index manager replay fixtures stay green" {

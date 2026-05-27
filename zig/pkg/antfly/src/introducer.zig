@@ -260,6 +260,9 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
     var field_indices = std.StringHashMapUnmanaged(u16).empty;
     defer field_indices.deinit(alloc);
 
+    var analyzer_cache = std.StringHashMapUnmanaged(*const analysis_mod.Analyzer).empty;
+    defer analyzer_cache.deinit(alloc);
+
     var doc_ordinals = std.ArrayListUnmanaged(u32).empty;
     defer doc_ordinals.deinit(alloc);
     var has_doc_ordinal = false;
@@ -275,7 +278,13 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
         typed_fields.deinit(alloc);
     }
 
+    var doc_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer doc_arena_state.deinit();
+
     for (docs, 0..) |text_doc, doc_idx| {
+        _ = doc_arena_state.reset(.retain_capacity);
+        const doc_alloc = doc_arena_state.allocator();
+
         const stored_attach_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
         try seg_writer.addStoredDocBorrowed(text_doc.id, text_doc.stored_data);
         if (profile) |p| p.stored_doc_attach_ns +|= platform_time.monotonicNs() - stored_attach_start_ns;
@@ -284,97 +293,94 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
         has_doc_ordinal = has_doc_ordinal or doc_ordinal != 0;
         try doc_ordinals.append(alloc, doc_ordinal);
 
-        var token_batches = std.ArrayListUnmanaged([]analysis_mod.Token).empty;
-        defer {
-            for (token_batches.items) |tokens| analysis_mod.Analyzer.freeTokens(alloc, tokens);
-            token_batches.deinit(alloc);
-        }
-
-        var field_maps = std.StringHashMapUnmanaged(FieldAcc).empty;
-        defer {
-            var field_it = field_maps.iterator();
-            while (field_it.next()) |entry| {
-                var term_it = entry.value_ptr.term_map.valueIterator();
-                while (term_it.next()) |term_acc| term_acc.positions.deinit(alloc);
-                entry.value_ptr.term_map.deinit(alloc);
+        if (!hasDuplicateTextFieldNames(text_doc.text_fields)) {
+            for (text_doc.text_fields) |tf| {
+                try addSingleTextFieldToBuilders(
+                    alloc,
+                    doc_alloc,
+                    &field_builders,
+                    &field_indices,
+                    &seg_writer,
+                    &analyzer_cache,
+                    @intCast(doc_idx),
+                    tf,
+                    default_analyzer,
+                    text_analysis,
+                    profile,
+                );
             }
-            field_maps.deinit(alloc);
-        }
+        } else {
+            var field_maps = std.StringHashMapUnmanaged(FieldAcc).empty;
 
-        for (text_doc.text_fields) |tf| {
-            if (profile) |p| p.text_field_count +|= 1;
-            const analyzer = tf.analyzer orelse resolveFieldAnalyzer(tf.field_name, text_analysis) orelse default_analyzer;
-            const analyzer_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
-            const tokens = try analyzer.analyze(alloc, tf.text);
-            if (profile) |p| {
-                p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
-                p.token_count +|= @intCast(tokens.len);
-            }
-            if (tokens.len == 0) {
-                analysis_mod.Analyzer.freeTokens(alloc, tokens);
-                continue;
-            }
-            token_batches.append(alloc, tokens) catch |err| {
-                analysis_mod.Analyzer.freeTokens(alloc, tokens);
-                return err;
-            };
-
-            const term_accum_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
-            const field_gop = try field_maps.getOrPut(alloc, tf.field_name);
-            if (!field_gop.found_existing) {
-                field_gop.key_ptr.* = tf.field_name;
-                field_gop.value_ptr.* = .{};
-            }
-            const base_position = field_gop.value_ptr.token_offset;
-
-            for (tokens) |tok| {
-                const gop = try field_gop.value_ptr.term_map.getOrPut(alloc, tok.term);
-                if (!gop.found_existing) {
-                    gop.key_ptr.* = tok.term;
-                    gop.value_ptr.* = .{ .freq = 0, .positions = .empty };
+            for (text_doc.text_fields) |tf| {
+                if (profile) |p| p.text_field_count +|= 1;
+                const analyzer = try cachedFieldAnalyzer(alloc, &analyzer_cache, tf, default_analyzer, text_analysis);
+                const analyzer_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+                const tokens = try analyzer.analyze(doc_alloc, tf.text);
+                if (profile) |p| {
+                    p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
+                    p.token_count +|= @intCast(tokens.len);
                 }
-                gop.value_ptr.freq += 1;
-                try gop.value_ptr.positions.append(alloc, base_position + tok.position);
+                if (tokens.len == 0) {
+                    continue;
+                }
+
+                const term_accum_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+                const field_gop = try field_maps.getOrPut(doc_alloc, tf.field_name);
+                if (!field_gop.found_existing) {
+                    field_gop.key_ptr.* = tf.field_name;
+                    field_gop.value_ptr.* = .{};
+                }
+                const base_position = field_gop.value_ptr.token_offset;
+
+                for (tokens) |tok| {
+                    const gop = try field_gop.value_ptr.term_map.getOrPut(doc_alloc, tok.term);
+                    if (!gop.found_existing) {
+                        gop.key_ptr.* = tok.term;
+                        gop.value_ptr.* = .{ .freq = 0, .positions = .empty };
+                    }
+                    gop.value_ptr.freq += 1;
+                    try gop.value_ptr.positions.append(doc_alloc, base_position + tok.position);
+                }
+                field_gop.value_ptr.token_offset += @intCast(tokens.len);
+                if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
             }
-            field_gop.value_ptr.token_offset += @intCast(tokens.len);
-            if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
+
+            const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+            var field_it = field_maps.iterator();
+            while (field_it.next()) |field_entry| {
+                // Convert to TermHit slice
+                var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
+
+                var it = field_entry.value_ptr.term_map.iterator();
+                while (it.next()) |entry| {
+                    try hits.append(doc_alloc, .{
+                        .term = entry.key_ptr.*,
+                        .freq = entry.value_ptr.freq,
+                        .norm = field_entry.value_ptr.token_offset,
+                        .positions = entry.value_ptr.positions.items,
+                    });
+                    if (profile) |p| p.term_hit_count +|= 1;
+                }
+
+                if (hits.items.len == 0) continue;
+
+                const field_name = field_entry.key_ptr.*;
+                const builder_gop = try field_builders.getOrPut(alloc, field_name);
+                if (!builder_gop.found_existing) {
+                    builder_gop.key_ptr.* = field_name;
+                    builder_gop.value_ptr.* = inverted.InvertedIndexBuilder.init(alloc, .{});
+                }
+                try builder_gop.value_ptr.addDocument(@intCast(doc_idx), hits.items);
+
+                const field_index_gop = try field_indices.getOrPut(alloc, field_name);
+                if (!field_index_gop.found_existing) {
+                    field_index_gop.key_ptr.* = field_name;
+                    field_index_gop.value_ptr.* = try seg_writer.addField(field_name);
+                }
+            }
+            if (profile) |p| p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
         }
-
-        const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
-        var field_it = field_maps.iterator();
-        while (field_it.next()) |field_entry| {
-            // Convert to TermHit slice
-            var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
-            defer hits.deinit(alloc);
-
-            var it = field_entry.value_ptr.term_map.iterator();
-            while (it.next()) |entry| {
-                try hits.append(alloc, .{
-                    .term = entry.key_ptr.*,
-                    .freq = entry.value_ptr.freq,
-                    .norm = field_entry.value_ptr.token_offset,
-                    .positions = entry.value_ptr.positions.items,
-                });
-                if (profile) |p| p.term_hit_count +|= 1;
-            }
-
-            if (hits.items.len == 0) continue;
-
-            const field_name = field_entry.key_ptr.*;
-            const builder_gop = try field_builders.getOrPut(alloc, field_name);
-            if (!builder_gop.found_existing) {
-                builder_gop.key_ptr.* = field_name;
-                builder_gop.value_ptr.* = inverted.InvertedIndexBuilder.init(alloc, .{});
-            }
-            try builder_gop.value_ptr.addDocument(@intCast(doc_idx), hits.items);
-
-            const field_index_gop = try field_indices.getOrPut(alloc, field_name);
-            if (!field_index_gop.found_existing) {
-                field_index_gop.key_ptr.* = field_name;
-                field_index_gop.value_ptr.* = try seg_writer.addField(field_name);
-            }
-        }
-        if (profile) |p| p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
 
         var doc_options = options;
         doc_options.recursive_typed_fields = doc_options.recursive_typed_fields or text_doc.recursive_typed_fields;
@@ -463,6 +469,142 @@ const FieldAcc = struct {
     token_offset: u32 = 0,
     term_map: std.StringHashMapUnmanaged(TermAcc) = .empty,
 };
+
+fn hasDuplicateTextFieldNames(fields: []const TextField) bool {
+    for (fields, 0..) |field, i| {
+        for (fields[0..i]) |prev| {
+            if (std.mem.eql(u8, prev.field_name, field.field_name)) return true;
+        }
+    }
+    return false;
+}
+
+fn cachedFieldAnalyzer(
+    alloc: Allocator,
+    cache: *std.StringHashMapUnmanaged(*const analysis_mod.Analyzer),
+    field: TextField,
+    default_analyzer: *const analysis_mod.Analyzer,
+    text_analysis: TextAnalysisConfig,
+) !*const analysis_mod.Analyzer {
+    if (field.analyzer) |analyzer| return analyzer;
+    const gop = try cache.getOrPut(alloc, field.field_name);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = field.field_name;
+        gop.value_ptr.* = resolveFieldAnalyzer(field.field_name, text_analysis) orelse default_analyzer;
+    }
+    return gop.value_ptr.*;
+}
+
+fn addSingleTextFieldToBuilders(
+    alloc: Allocator,
+    doc_alloc: Allocator,
+    field_builders: *std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder),
+    field_indices: *std.StringHashMapUnmanaged(u16),
+    seg_writer: *segment_mod.SegmentWriter,
+    analyzer_cache: *std.StringHashMapUnmanaged(*const analysis_mod.Analyzer),
+    doc_idx: u32,
+    field: TextField,
+    default_analyzer: *const analysis_mod.Analyzer,
+    text_analysis: TextAnalysisConfig,
+    profile: ?*BuildTextProfile,
+) !void {
+    if (profile) |p| p.text_field_count +|= 1;
+    const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
+    const analyzer_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    const tokens = try analyzer.analyze(doc_alloc, field.text);
+    if (profile) |p| {
+        p.analyzer_ns +|= platform_time.monotonicNs() - analyzer_start_ns;
+        p.token_count +|= @intCast(tokens.len);
+    }
+    if (tokens.len == 0) return;
+
+    const term_accum_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    if (tokens.len <= 64 and tokenTermsAreUnique(tokens)) {
+        if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
+
+        const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+        const positions = try doc_alloc.alloc(u32, tokens.len);
+        var hits = try doc_alloc.alloc(inverted.InvertedIndexBuilder.TermHit, tokens.len);
+        const norm: u32 = @intCast(tokens.len);
+        for (tokens, 0..) |tok, i| {
+            positions[i] = tok.position;
+            hits[i] = .{
+                .term = tok.term,
+                .freq = 1,
+                .norm = norm,
+                .positions = positions[i .. i + 1],
+            };
+        }
+        if (profile) |p| {
+            p.term_hit_count +|= @intCast(hits.len);
+            p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
+        }
+        try addFieldHitsToBuilder(alloc, field_builders, field_indices, seg_writer, doc_idx, field.field_name, hits);
+        return;
+    }
+
+    var field_acc = FieldAcc{};
+    for (tokens) |tok| {
+        const gop = try field_acc.term_map.getOrPut(doc_alloc, tok.term);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = tok.term;
+            gop.value_ptr.* = .{ .freq = 0, .positions = .empty };
+        }
+        gop.value_ptr.freq += 1;
+        try gop.value_ptr.positions.append(doc_alloc, tok.position);
+    }
+    field_acc.token_offset = @intCast(tokens.len);
+    if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
+
+    const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
+    var it = field_acc.term_map.iterator();
+    while (it.next()) |entry| {
+        try hits.append(doc_alloc, .{
+            .term = entry.key_ptr.*,
+            .freq = entry.value_ptr.freq,
+            .norm = field_acc.token_offset,
+            .positions = entry.value_ptr.positions.items,
+        });
+        if (profile) |p| p.term_hit_count +|= 1;
+    }
+    if (profile) |p| p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
+    if (hits.items.len == 0) return;
+
+    try addFieldHitsToBuilder(alloc, field_builders, field_indices, seg_writer, doc_idx, field.field_name, hits.items);
+}
+
+fn tokenTermsAreUnique(tokens: []const analysis_mod.Token) bool {
+    for (tokens, 0..) |token, i| {
+        for (tokens[0..i]) |prev| {
+            if (std.mem.eql(u8, token.term, prev.term)) return false;
+        }
+    }
+    return true;
+}
+
+fn addFieldHitsToBuilder(
+    alloc: Allocator,
+    field_builders: *std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder),
+    field_indices: *std.StringHashMapUnmanaged(u16),
+    seg_writer: *segment_mod.SegmentWriter,
+    doc_idx: u32,
+    field_name: []const u8,
+    hits: []const inverted.InvertedIndexBuilder.TermHit,
+) !void {
+    const builder_gop = try field_builders.getOrPut(alloc, field_name);
+    if (!builder_gop.found_existing) {
+        builder_gop.key_ptr.* = field_name;
+        builder_gop.value_ptr.* = inverted.InvertedIndexBuilder.init(alloc, .{});
+    }
+    try builder_gop.value_ptr.addDocument(doc_idx, hits);
+
+    const field_index_gop = try field_indices.getOrPut(alloc, field_name);
+    if (!field_index_gop.found_existing) {
+        field_index_gop.key_ptr.* = field_name;
+        field_index_gop.value_ptr.* = try seg_writer.addField(field_name);
+    }
+}
 
 const TypedFieldCollector = struct {
     value_type: ?typed_dv.ValueType = null,
@@ -631,6 +773,20 @@ fn appendTypedFieldProjectionValue(
         .value_type = detected.value_type,
         .value = try cloneTypedValue(alloc, detected.value),
     });
+}
+
+pub fn detectTypedFieldProjectionValue(
+    alloc: Allocator,
+    field_name: []const u8,
+    value: std.json.Value,
+    text_analysis: TextAnalysisConfig,
+) !?TypedFieldValue {
+    const detected = detectTypedValue(field_name, value, text_analysis) orelse return null;
+    return .{
+        .field_name = try alloc.dupe(u8, field_name),
+        .value_type = detected.value_type,
+        .value = try cloneTypedValue(alloc, detected.value),
+    };
 }
 
 fn cloneTypedValue(alloc: Allocator, value: typed_dv.TypedValue) !typed_dv.TypedValue {

@@ -1291,11 +1291,10 @@ fn chooseMultiGetPlan(keys: []const []const u8, context: MultiGetContext) MultiG
     if (keys.len < 2) return .point;
     if (!keysAreStrictlySorted(keys)) return .point;
 
-    // Live/current-tip batches hold the backend lock while they observe mutable
-    // state. Until we have a real run/block cost model, keep those reads on the
-    // point path; sorted key order is not enough evidence that the table layout
-    // is scan-friendly, especially for HBC artifact payload reads.
-    if (context == .current_live) return .point;
+    // Probe batches are exact key lookups, not range scans. Sorted key order is
+    // not enough evidence that the table layout is scan-friendly, especially
+    // for public source hydration and HBC artifact payload reads.
+    if (context != .snapshot) return .point;
 
     if (isCursorFriendlyExactBatch(keys)) return .cursor;
     if (keys.len >= min_sorted_by_run_keys and context == .snapshot) return .sorted_by_run;
@@ -2141,13 +2140,47 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 const end = @min(offset + max_current_batch_read_keys_per_backend_lock, keys.len);
                 const plan = chooseMultiGetPlan(keys[offset..end], if (self.stable_point_view) .stable_probe else .current_live);
                 recordMultiGetPlan(self.backend, plan);
-                const chunk_result = blk: {
+                const chunk_result = if (self.stable_point_view) blk: {
+                    try self.ensureStablePointViewLoaded();
+                    break :blk switch (plan) {
+                        .sorted_by_run => try readManySortedByRunFromSnapshot(
+                            self.backend,
+                            &self.empty_state,
+                            &.{},
+                            self.runs,
+                            self.l0_groups,
+                            self.levels,
+                            self.allocator,
+                            &self.held_blocks,
+                            &self.held_values,
+                            self.namespace,
+                            keys[offset..end],
+                            values[offset..end],
+                            false,
+                        ),
+                        .cursor, .point => try readManySortedPointFromSnapshot(
+                            self.backend,
+                            &self.empty_state,
+                            &.{},
+                            self.runs,
+                            self.l0_groups,
+                            self.levels,
+                            self.allocator,
+                            &self.held_blocks,
+                            &self.held_values,
+                            self.namespace,
+                            keys[offset..end],
+                            values[offset..end],
+                            false,
+                        ),
+                    };
+                } else blk: {
                     const locked = lockBackend(BackendType, self.backend);
                     defer unlockBackend(BackendType, self.backend, locked);
                     break :blk switch (plan) {
                         .cursor => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, keys[offset..end], values[offset..end]),
                         .sorted_by_run => try readManyCurrentSortedPointByRunLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, keys[offset..end], values[offset..end]),
-                        .point => try readManyCurrentPointLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, keys[offset..end], values[offset..end]),
+                        .point => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, keys[offset..end], values[offset..end]),
                     };
                 };
                 result.add(chunk_result);

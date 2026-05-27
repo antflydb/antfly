@@ -185,6 +185,7 @@ fn validateSplitIntentDocIdentity(current: metadata_reconciler.CurrentMetadataSt
     if (source.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;
+    if (source.doc_identity.ordinal_capacity_exhausted) return error.DocIdentityNamespaceMismatch;
 }
 
 fn validateMergeIntentDocIdentity(current: metadata_reconciler.CurrentMetadataState, intent: table_manager.MergeIntent) !void {
@@ -316,6 +317,15 @@ test "table workflow doc identity guards reject active transition intents" {
     statuses[0].doc_identity.rebuild_required = true;
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateSplitIntentDocIdentity(current, .{
         .transition_id = 5,
+        .table_id = 9,
+        .source_group_id = 91,
+        .destination_group_id = 93,
+        .split_key = "doc:m",
+    }));
+    statuses[0].doc_identity.rebuild_required = false;
+    statuses[0].doc_identity.ordinal_capacity_exhausted = true;
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateSplitIntentDocIdentity(current, .{
+        .transition_id = 6,
         .table_id = 9,
         .source_group_id = 91,
         .destination_group_id = 93,

@@ -3239,7 +3239,11 @@ pub fn build(b: *std.Build) void {
             "catalog doc identity readiness checks table range health",
             "catalog resolved filter validation accepts preserved split identity domains",
             "metadata merge request validation rejects incompatible doc identity namespaces",
+            "metadata merge validation handles rolling mixed-version doc identity status fixtures",
             "metadata split request validation rejects stale doc identity namespace",
+            "metadata reconciler does not automatically split ordinal exhausted doc identity",
+            "metadata state classifies mixed-version doc identity lifecycle reports",
+            "metadata state marks doc identity rebuild required on range namespace mismatch",
             "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
             "metadata http server serves status and filtered admin routes",
             "metadata http server maps source split merge doc identity conflicts",
@@ -3300,8 +3304,12 @@ pub fn build(b: *std.Build) void {
             "identity validation accepts missing canonical rows but rejects conflicts",
             "identity allocation rejects canonical row conflicts before reserving ordinal",
             "batch identity metadata fails closed at ordinal capacity",
+            "identity namespace reassignment preserves snapshot generations and rejects stale writers",
+            "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
             "db stats flag document identity ordinal capacity exhaustion",
             "db stats expose document identity coverage and tombstones",
+            "db allocates final document ordinal with all index families present",
+            "db lsm primary compaction preserves doc identity ordinals",
             "db rejects new document writes at ordinal exhaustion for every sync level",
             "db transaction intent writes reject new documents at ordinal exhaustion",
             "db restore snapshot rejects invalid doc identity metadata",
@@ -3317,6 +3325,8 @@ pub fn build(b: *std.Build) void {
             "db validates internal resolved doc filter wire namespace and generation",
             "db explicit doc-id filter resolution honors identity generation",
             "doc filter wire round-trips ordinal and doc-key filters",
+            "doc filter wire rejects old required-field fixtures but tolerates additive fields",
+            "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
             "dense vector id ignores ordinal metadata for a different doc",
             "dense metadata prefetch includes legacy ordinal vector ids",
             "db dense index stores stable vector ids with ordinal filter mappings",
@@ -3341,6 +3351,7 @@ pub fn build(b: *std.Build) void {
             "db text compaction preserves ordinal filters across reopen",
             "structured filter doc set cache returns owned clones",
             "structured filter doc set cache separates shared namespace generation keys",
+            "cache invalidates ownership move prefix without reviving pinned generations",
             "applyGraphUnion deduplicates by ordinals when hit pages are complete",
             "applyGraphIntersection uses ordinals when hit pages are complete",
             "query merge preserves single-result doc ordinals",
@@ -3368,6 +3379,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, api_table_writes_docid_test_mod, true, true);
+    const api_table_reads_docid_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_table_reads_docid_test_mod, true, true);
     const api_public_table_http_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_public_table_http_test_root.zig"),
         .target = target,
@@ -3398,6 +3415,16 @@ pub fn build(b: *std.Build) void {
             "bound table write source backs up and restores a local table",
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned restore repair open rejects stale doc identity namespace",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const api_table_reads_docid_tests = b.addTest(.{
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &.{
+            "provisioned read cache invalidates repeated ownership moves with pinned leases",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3442,12 +3469,77 @@ pub fn build(b: *std.Build) void {
     const run_lib_serverless_docid_tests = b.addRunArtifact(lib_serverless_docid_tests);
     const run_api_transactions_docid_tests = b.addRunArtifact(api_transactions_docid_tests);
     const run_api_table_writes_docid_tests = b.addRunArtifact(api_table_writes_docid_tests);
+    const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
+    const lib_docid_lifecycle_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "metadata reconciler does not automatically split ordinal exhausted doc identity",
+            "metadata state classifies mixed-version doc identity lifecycle reports",
+            "metadata state marks doc identity rebuild required on range namespace mismatch",
+            "metadata merge validation handles rolling mixed-version doc identity status fixtures",
+            "metadata split request validation rejects stale doc identity namespace",
+            "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
+            "table workflow doc identity guards reject active transition intents",
+            "metadata reconciler doc identity guards block new planning during active reassignment",
+            "metadata reconciler does not upsert desired split with stale doc identity namespace",
+            "metadata reconciler allows explicit merge with doc identity reassignment opt-in",
+            "distributed join follow-up pagination requires stamped identity request",
+            "distributed join group-local hit pagination reuses structured search generation",
+            "distributed join rejects doc identity rebuild before right-table fanout",
+            "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
+            "distributed graph rejects doc identity rebuild before cross-range fanout",
+            "distributed graph rejects unstamped result refs before cross-range fanout",
+            "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
+            "internal worker doc identity exchange audit covers every boundary",
+            "aggregation context rejects non-current identity generation",
+            "aggregation full-result rerun can reuse snapped result identity generation",
+            "explicit text stats requests preserve identity generation",
+            "explicit text stats requests reject stale identity generation",
+            "structured filter doc set cache separates shared namespace generation keys",
+            "cache invalidates ownership move prefix without reviving pinned generations",
+            "db text compaction preserves ordinal filters across reopen",
+            "db lsm primary compaction preserves doc identity ordinals",
+            "db allocates final document ordinal with all index families present",
+            "identity namespace reassignment preserves snapshot generations and rejects stale writers",
+            "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
+            "index manager split handoff preserves interleaved write and query summaries",
+            "db stats flag document identity ordinal capacity exhaustion",
+            "db rejects new document writes at ordinal exhaustion for every sync level",
+            "db transaction intent writes reject new documents at ordinal exhaustion",
+            "db search requests default to current identity generation snapshot",
+            "db validates internal resolved doc filter wire namespace and generation",
+            "db resolved doc-set projection honors identity read generation",
+            "doc filter wire rejects old required-field fixtures but tolerates additive fields",
+            "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_docid_lifecycle_tests = b.addRunArtifact(lib_docid_lifecycle_tests);
+    const docid_lifecycle_test_step = b.step("docid-lifecycle-test", "Run focused DOCID lifecycle and distributed snapshot hardening tests");
+    docid_lifecycle_test_step.dependOn(&run_lib_docid_lifecycle_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_api_transactions_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_api_table_reads_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_api_table_writes_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+
+    const docid_operational_hardening_test_step = b.step("docid-operational-hardening-test", "Run extended DOCID lifecycle, metadata chaos, and compaction hardening tests");
+    docid_operational_hardening_test_step.dependOn(docid_lifecycle_test_step);
+    docid_operational_hardening_test_step.dependOn(lib_metadata_transition_chaos_test_step);
+    docid_operational_hardening_test_step.dependOn(lib_metadata_public_chaos_test_step);
+    docid_operational_hardening_test_step.dependOn(lib_lsm_backend_chaos_test_step);
+
     const lib_api_docid_test_step = b.step("lib-api-docid-test", "Run focused API DOCID boundary tests");
     lib_api_docid_test_step.dependOn(&run_lib_api_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_serverless_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_api_transactions_docid_tests.step);
+    lib_api_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
     lib_api_docid_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);

@@ -456,12 +456,24 @@ pub const SparseSearchExecutor = struct {
         doc_id: []const u8,
         generation: ?u64,
     ) anyerror!?doc_set.DocOrdinal = null,
+    lookup_doc_ordinals: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror![]?doc_set.DocOrdinal = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
         req: types.SearchRequest,
         key: []const u8,
     ) anyerror![]u8,
+    load_projected_documents: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 = null,
     postprocess: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -2174,6 +2186,7 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
     const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
+    if (patternFilterValueHasRole(parsed.value)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
     return try collectSearchQueryResolvedDocSetAlloc(alloc, arena_alloc, executor, text_entry, search_query);
@@ -2267,6 +2280,7 @@ fn collectStructuredFilterTextDocNumsAlloc(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
     const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
+    if (patternFilterValueHasRole(parsed.value)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
     const snapshot = text_entry.persistent.snapshot();
@@ -2311,10 +2325,14 @@ fn resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(
     var resolved = try doc_set.fromOrdinalsAlloc(alloc, ordinals);
     errdefer resolved.deinit(alloc);
 
-    const live_filter = executor.live_filter_doc_set orelse return resolved;
-    const filtered = try live_filter(executor.ctx, alloc, &resolved, executor.identity_read_generation);
-    resolved.deinit(alloc);
-    return filtered;
+    var live_owned: ?doc_set.ResolvedDocSet = null;
+    defer if (live_owned) |*owned| owned.deinit(alloc);
+    const live_set = try maybeLiveFilterResolvedDocSetAlloc(alloc, &resolved, executor, &live_owned);
+    if (live_set != &resolved) {
+        resolved.deinit(alloc);
+        return try doc_set.cloneAlloc(alloc, live_set);
+    }
+    return resolved;
 }
 
 fn collectStructuredFilterResolvedDocSetCachedAlloc(
@@ -2645,9 +2663,16 @@ fn patternBoolFilterToSearchQuery(
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !search_mod.SearchQuery {
     if (value != .object) return error.InvalidArgument;
+    const has_must = value.object.get("must") != null or value.object.get("filter") != null;
+    const has_should = value.object.get("should") != null;
+    const only_must_not = !has_must and !has_should and value.object.get("must_not") != null;
     return .{ .bool_query = .{
         .must = if (value.object.get("must")) |must|
             try patternFilterArrayToSearchQueries(alloc, must, text_analysis, runtime_schema)
+        else if (value.object.get("filter")) |filter|
+            try patternFilterArrayToSearchQueries(alloc, filter, text_analysis, runtime_schema)
+        else if (only_must_not)
+            &.{.{ .match_all = {} }}
         else
             &.{},
         .should = if (value.object.get("should")) |should|
@@ -2658,7 +2683,7 @@ fn patternBoolFilterToSearchQuery(
             try patternFilterArrayToSearchQueries(alloc, must_not, text_analysis, runtime_schema)
         else
             &.{},
-        .min_should = if (value.object.get("should") != null) 1 else 0,
+        .min_should = if (!has_must and has_should) 1 else 0,
     } };
 }
 
@@ -2722,6 +2747,26 @@ fn singleFieldString(value: std.json.Value, value_key: []const u8) !FieldString 
     const entry = it.next() orelse return error.InvalidArgument;
     if (entry.value_ptr.* != .string) return error.InvalidArgument;
     return .{ .field = entry.key_ptr.*, .value = entry.value_ptr.string };
+}
+
+fn patternFilterValueHasRole(value: std.json.Value) bool {
+    return switch (value) {
+        .object => |object| {
+            if (object.get("role") != null) return true;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (patternFilterValueHasRole(entry.value_ptr.*)) return true;
+            }
+            return false;
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (patternFilterValueHasRole(item)) return true;
+            }
+            return false;
+        },
+        else => false,
+    };
 }
 
 fn exactTermFilterFieldAlloc(
@@ -4823,10 +4868,18 @@ pub fn searchSparse(
     sparse: types.SparseKnnQuery,
     executor: SparseSearchExecutor,
 ) !types.SearchResult {
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const total_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    var constraint_ns: u64 = 0;
+    var index_search_ns: u64 = 0;
+    var hit_build_ns: u64 = 0;
+    var postprocess_ns: u64 = 0;
+    var page_ns: u64 = 0;
     const entry = (try executor.sparse_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
     const chunk_backed = entry.chunk_name != null;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
     const paging = componentPaging(req);
+    const constraint_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
@@ -4839,6 +4892,7 @@ pub fn searchSparse(
         .project_ordinals_to_doc_ids = false,
         .apply_live_all_docs = true,
     });
+    if (bench_query_profile) constraint_ns = platform_time.monotonicNs() - constraint_start_ns;
     defer native_constraints.deinit(alloc);
     const unresolved_stored_filters =
         (req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
@@ -4865,16 +4919,23 @@ pub fn searchSparse(
             .graph_results = &.{},
         };
     }
+    const index_search_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     const raw_hits = try entry.index.searchConstrained(alloc, &query, effective_k, .{
         .filter_doc_ids = native_constraints.filter_doc_ids,
         .exclude_doc_ids = native_constraints.exclude_doc_ids,
         .filter_doc_nums = native_constraints.filter_doc_nums,
         .exclude_doc_nums = native_constraints.exclude_doc_nums,
     });
+    if (bench_query_profile) index_search_ns = platform_time.monotonicNs() - index_search_start_ns;
     defer sparse_mod.SparseIndex.freeResults(alloc, raw_hits);
 
     const start: u32 = if (full_candidate_window) 0 else @min(paging.offset, @as(u32, @intCast(raw_hits.len)));
     const end: u32 = if (full_candidate_window) @intCast(raw_hits.len) else @min(start + paging.limit, @as(u32, @intCast(raw_hits.len)));
+    const sparse_doc_nums_are_ordinals =
+        !chunk_backed and
+        native_constraints.positive_filter and
+        native_constraints.filter_doc_nums.len > 0 and
+        native_constraints.filter_doc_ids.len == 0;
 
     var hits = try alloc.alloc(types.SearchHit, end - start);
     var initialized: usize = 0;
@@ -4886,34 +4947,128 @@ pub fn searchSparse(
         }
     }
 
+    var batch_doc_ordinals: []?doc_set.DocOrdinal = &.{};
+    defer if (batch_doc_ordinals.len > 0) alloc.free(batch_doc_ordinals);
+    if (!chunk_backed and !sparse_doc_nums_are_ordinals) {
+        if (executor.lookup_doc_ordinals) |lookup_many| {
+            const selected = raw_hits[@intCast(start)..@intCast(end)];
+            if (selected.len > 0) {
+                const doc_ids = try alloc.alloc([]const u8, selected.len);
+                defer alloc.free(doc_ids);
+                for (selected, 0..) |hit, i| doc_ids[i] = hit.doc_id;
+                batch_doc_ordinals = try lookup_many(executor.ctx, alloc, doc_ids, req.identity_read_generation);
+                if (batch_doc_ordinals.len != selected.len) return error.InvalidDocIdentity;
+            }
+        }
+    }
+
+    const hit_build_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
         hits[i] = .{
             .id = try alloc.dupe(u8, hit.doc_id),
             .doc_ordinal = if (chunk_backed)
                 try sparseHitParentOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation)
+            else if (sparse_doc_nums_are_ordinals and hit.doc_num != null)
+                hit.doc_num.?
+            else if (batch_doc_ordinals.len > 0)
+                batch_doc_ordinals[i]
             else
                 try sparseHitOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation),
             .score = hit.score,
-            .stored_data = if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents) and !unresolved_stored_filters)
-                try executor.load_projected_document(executor.ctx, alloc, postprocess_req, hit.doc_id)
-            else
-                null,
+            .stored_data = null,
         };
         initialized += 1;
     }
+    if (bench_query_profile) hit_build_ns = platform_time.monotonicNs() - hit_build_start_ns;
 
     owns_hits = false;
+    const postprocess_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var result = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
         .alloc = alloc,
         .hits = hits,
         .total_hits = @intCast(raw_hits.len),
         .graph_results = &.{},
     }, chunk_backed);
+    if (bench_query_profile) postprocess_ns = platform_time.monotonicNs() - postprocess_start_ns;
     errdefer result.deinit();
     if (unresolved_stored_filters) {
+        const page_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
         result = try pageSearchResultInPlace(alloc, result, paging);
+        if (bench_query_profile) page_ns = platform_time.monotonicNs() - page_start_ns;
+    }
+    if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
+        const load_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+        try loadMissingProjectedSparseHitDocuments(alloc, postprocess_req, executor, result.hits);
+        if (bench_query_profile) hit_build_ns += platform_time.monotonicNs() - load_start_ns;
+    }
+    if (bench_query_profile) {
+        std.log.info(
+            "antfly_bench_sparse_query total_us={d} constraint_us={d} index_search_us={d} hit_build_us={d} postprocess_us={d} page_us={d} raw_hits={d} returned_hits={d} filter_doc_nums={d} exclude_doc_nums={d}",
+            .{
+                nsToUs(platform_time.monotonicNs() - total_start_ns),
+                nsToUs(constraint_ns),
+                nsToUs(index_search_ns),
+                nsToUs(hit_build_ns),
+                nsToUs(postprocess_ns),
+                nsToUs(page_ns),
+                raw_hits.len,
+                result.hits.len,
+                native_constraints.filter_doc_nums.len,
+                native_constraints.exclude_doc_nums.len,
+            },
+        );
     }
     return result;
+}
+
+fn loadMissingProjectedSparseHitDocuments(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: SparseSearchExecutor,
+    hits: []types.SearchHit,
+) !void {
+    var missing_count: usize = 0;
+    for (hits) |hit| {
+        if (hit.stored_data == null) missing_count += 1;
+    }
+    if (missing_count == 0) return;
+
+    if (executor.load_projected_documents) |load_many| {
+        const keys = try alloc.alloc([]const u8, missing_count);
+        defer alloc.free(keys);
+        var key_count: usize = 0;
+        for (hits) |hit| {
+            if (hit.stored_data != null) continue;
+            keys[key_count] = hit.id;
+            key_count += 1;
+        }
+
+        var loaded = try load_many(executor.ctx, alloc, req, keys);
+        defer freeOptionalOwnedBytes(alloc, loaded);
+        if (loaded.len != keys.len) return error.InvalidSearchResult;
+
+        var loaded_index: usize = 0;
+        for (hits) |*hit| {
+            if (hit.stored_data != null) continue;
+            const stored = loaded[loaded_index] orelse return error.StoredDocMissing;
+            hit.stored_data = stored;
+            loaded[loaded_index] = null;
+            loaded_index += 1;
+        }
+        return;
+    }
+
+    for (hits) |*hit| {
+        if (hit.stored_data != null) continue;
+        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+    }
+}
+
+fn freeOptionalOwnedBytes(alloc: Allocator, values: []?[]u8) void {
+    for (values) |value| {
+        if (value) |bytes| alloc.free(bytes);
+    }
+    alloc.free(values);
 }
 
 fn pageSearchResultInPlace(
@@ -6838,6 +6993,16 @@ test "structured filter doc set cache separates shared namespace generation keys
     const cached = cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_a, 7) orelse return error.TestUnexpectedResult;
     try std.testing.expect(cached.containsOrdinal(9));
     try std.testing.expect(cached.containsOrdinal(10));
+
+    var next_generation_source = try doc_set.fromOrdinalsAlloc(alloc, &.{11});
+    defer next_generation_source.deinit(alloc);
+    try cache.putSharedCloneAlloc(alloc, "{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_a, 8, &next_generation_source);
+    const cached_generation_7 = cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_a, 7) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cached_generation_7.containsOrdinal(9));
+    try std.testing.expect(!cached_generation_7.containsOrdinal(11));
+    const cached_generation_8 = cache.getShared("{\"term\":{\"field\":\"status\",\"value\":\"open\"}}", namespace_a, 8) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cached_generation_8.containsOrdinal(11));
+    try std.testing.expect(!cached_generation_8.containsOrdinal(9));
 }
 
 test "composed search carries resolved doc sets for graph attachment" {

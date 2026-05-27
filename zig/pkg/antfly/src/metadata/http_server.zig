@@ -2084,6 +2084,7 @@ fn validateSplitDocIdentityCompatibility(
     if (source.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;
+    if (source.doc_identity.ordinal_capacity_exhausted) return error.DocIdentityNamespaceMismatch;
 }
 
 fn validateSplitRequestDocIdentity(source: AdminSource, table_name: []const u8, req: SplitRequest) !void {
@@ -3532,6 +3533,59 @@ test "metadata merge request validation rejects incompatible doc identity namesp
     );
 }
 
+test "metadata merge validation handles rolling mixed-version doc identity status fixtures" {
+    var statuses = [_]metadata_reconciler.MergedGroupStatus{
+        .{
+            .group_id = 101,
+            // Old binaries report no ordinal rows. Merge validation must not
+            // require a namespace until both sides advertise DOCID metadata.
+            .doc_identity = .{},
+        },
+        .{
+            .group_id = 102,
+            .doc_identity = .{
+                .namespace_table_id = 10,
+                .namespace_shard_id = 102,
+                .namespace_range_id = 1002,
+                .next_ordinal = 12,
+                .allocated_ordinals = 11,
+            },
+        },
+    };
+    const snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metadata_epoch = 2, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        .merged_group_statuses = @constCast(statuses[0..]),
+    };
+
+    try validateMergeDocIdentityCompatibility(&snapshot, 101, 102, false);
+
+    statuses[0].doc_identity_reassignment_active = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateMergeDocIdentityCompatibility(&snapshot, 101, 102, true),
+    );
+    statuses[0].doc_identity_reassignment_active = false;
+
+    statuses[0].doc_identity = .{
+        .namespace_table_id = 10,
+        .namespace_shard_id = 101,
+        .namespace_range_id = 1001,
+        .next_ordinal = 3,
+        .allocated_ordinals = 2,
+    };
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateMergeDocIdentityCompatibility(&snapshot, 101, 102, false),
+    );
+    try validateMergeDocIdentityCompatibility(&snapshot, 101, 102, true);
+}
+
 test "metadata split request validation rejects stale doc identity namespace" {
     var statuses = [_]metadata_reconciler.MergedGroupStatus{.{
         .group_id = 91,
@@ -3573,6 +3627,12 @@ test "metadata split request validation rejects stale doc identity namespace" {
     );
     statuses[0].doc_identity_namespace_conflict = false;
     statuses[0].doc_identity_reassignment_active = true;
+    try std.testing.expectError(
+        error.DocIdentityNamespaceMismatch,
+        validateSplitDocIdentityCompatibility(&snapshot, 91),
+    );
+    statuses[0].doc_identity_reassignment_active = false;
+    statuses[0].doc_identity.ordinal_capacity_exhausted = true;
     try std.testing.expectError(
         error.DocIdentityNamespaceMismatch,
         validateSplitDocIdentityCompatibility(&snapshot, 91),

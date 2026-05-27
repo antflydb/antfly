@@ -1044,6 +1044,32 @@ pub const GraphIndex = struct {
         return try self.rebuildReverseFromOwnedOutgoingEdgesResume(alloc, lower, upper, null);
     }
 
+    pub fn copyOwnedOutgoingEdgesTo(self: *GraphIndex, dest: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8) !usize {
+        const range_lower_owned = if (lower.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, lower) else null;
+        defer if (range_lower_owned) |key| alloc.free(key);
+        const range_upper_owned = if (upper.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, upper) else null;
+        defer if (range_upper_owned) |key| alloc.free(key);
+        const range_lower = range_lower_owned orelse "";
+        const range_upper = range_upper_owned orelse "";
+
+        const pairs = try self.mainStoreScanRange(alloc, range_lower, range_upper);
+        defer backend_scan.freeResults(alloc, pairs);
+
+        var batch = try dest.beginWriteOutgoingBatch();
+        errdefer batch.abort();
+        var copied: usize = 0;
+        for (pairs) |pair| {
+            var parsed = (try parseOutgoingEdgeKeyAlloc(alloc, pair.key)) orelse continue;
+            defer parsed.deinit(alloc);
+            if (!std.mem.eql(u8, parsed.index_name, self.index_name)) continue;
+            if (!std.mem.eql(u8, dest.index_name, self.index_name)) continue;
+            try batch.put(pair.key, pair.value);
+            copied += 1;
+        }
+        try batch.commit();
+        return copied;
+    }
+
     pub fn rebuildReverseFromOwnedOutgoingEdgesResume(
         self: *GraphIndex,
         alloc: Allocator,
