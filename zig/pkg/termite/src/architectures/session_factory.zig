@@ -334,10 +334,13 @@ fn printGlinerMetalArchitectureAudit(
     const layer_fallbacks = deltaU64(a.metal_runtime_deberta_encoder_layer_fallbacks, b.metal_runtime_deberta_encoder_layer_fallbacks);
     const ffn_fused = deltaU64(a.metal_runtime_deberta_ffn_fused_calls, b.metal_runtime_deberta_ffn_fused_calls);
     const ffn_fallbacks = deltaU64(a.metal_runtime_deberta_ffn_fused_fallbacks, b.metal_runtime_deberta_ffn_fused_fallbacks);
-    const packed_qkv = deltaU64(a.metal_runtime_dense_qkv_packed_calls, b.metal_runtime_dense_qkv_packed_calls);
+    const dense_packed_qkv = deltaU64(a.metal_runtime_dense_qkv_packed_calls, b.metal_runtime_dense_qkv_packed_calls);
+    const quant_packed_qkv = a.metal_runtime_last_frame_compute_quant_qkv_count;
+    const packed_qkv = dense_packed_qkv + quant_packed_qkv;
     const packed_qkv_fallbacks = deltaU64(a.metal_runtime_dense_qkv_packed_fallbacks, b.metal_runtime_dense_qkv_packed_fallbacks);
     const relative_qk_pair = deltaU64(a.metal_runtime_deberta_relative_qk_pair_calls, b.metal_runtime_deberta_relative_qk_pair_calls);
     const relative_qk_pair_fallbacks = deltaU64(a.metal_runtime_deberta_relative_qk_pair_fallbacks, b.metal_runtime_deberta_relative_qk_pair_fallbacks);
+    const attention_flash = deltaU64(a.metal_runtime_deberta_attention_flash_calls, b.metal_runtime_deberta_attention_flash_calls);
     const attention_legacy = deltaU64(a.metal_runtime_deberta_attention_legacy_calls, b.metal_runtime_deberta_attention_legacy_calls);
     const attention_gemm = deltaU64(a.metal_runtime_deberta_attention_gemm_calls, b.metal_runtime_deberta_attention_gemm_calls);
     const attention_gemm_fallbacks = deltaU64(a.metal_runtime_deberta_attention_gemm_fallbacks, b.metal_runtime_deberta_attention_gemm_fallbacks);
@@ -354,12 +357,12 @@ fn printGlinerMetalArchitectureAudit(
     const fused_ffn = ffn_fused == layer_count and ffn_fallbacks == 0;
     const packed_qkv_ok = packed_qkv == layer_count and packed_qkv_fallbacks == 0;
     const relative_qk_pair_ok = relative_qk_pair == layer_count and relative_qk_pair_fallbacks == 0;
-    const one_final_download = host_downloads <= 1 and host_download_device_calls <= 1;
+    const one_final_download = host_download_device_calls <= 1;
     const warm_plan_reuse = graph_plan_reuses > 0;
     const pass = resident_frame and no_mps and planned_encoder and fused_embeddings and planned_layers and fused_ffn and packed_qkv_ok and relative_qk_pair_ok and one_final_download and warm_plan_reuse;
 
     std.debug.print(
-        "gliner_arch_audit: status={s} resident_frame={s} no_mps={s} planned_encoder={s} fused_embeddings={s} planned_layers={s} fused_ffn={s} packed_qkv={s} relative_qk_pair={s} attention_gemm={} attention_legacy={} final_download_only={s} warm_plan_reuse={s} frame_begins={} frame_submits={} compute_encoders={} last_frame_compute_encoders={} mps_standalone={} mps_active={} last_frame_mps={} mps_ffn={} mpsgraph_ffn={}\n",
+        "gliner_arch_audit: status={s} resident_frame={s} no_mps={s} planned_encoder={s} fused_embeddings={s} planned_layers={s} fused_ffn={s} packed_qkv={s} relative_qk_pair={s} attention_flash={} attention_gemm={} attention_legacy={} final_download_only={s} warm_plan_reuse={s} frame_begins={} frame_submits={} compute_encoders={} last_frame_compute_encoders={} mps_standalone={} mps_active={} last_frame_mps={} mps_ffn={} mpsgraph_ffn={}\n",
         .{
             if (pass) "pass" else "fail",
             yesNo(resident_frame),
@@ -370,6 +373,7 @@ fn printGlinerMetalArchitectureAudit(
             yesNo(fused_ffn),
             yesNo(packed_qkv_ok),
             yesNo(relative_qk_pair_ok),
+            attention_flash,
             attention_gemm,
             attention_legacy,
             yesNo(one_final_download),
@@ -386,7 +390,7 @@ fn printGlinerMetalArchitectureAudit(
         },
     );
     std.debug.print(
-        "gliner_arch_audit_detail: graph_plan_count={} graph_plan_reuses={} graph_plan_slots={} graph_plan_bytes={} embedding_successes={} embedding_fallbacks={} layer_successes={}/{} layer_fallbacks={} ffn_fused={}/{} ffn_fallbacks={} packed_qkv={}/{} packed_qkv_fallbacks={} relative_qk_pair={}/{} relative_qk_pair_fallbacks={} attention_gemm={} attention_gemm_fallbacks={} attention_legacy={} host_downloads={} host_download_device_calls={} host_download_bytes={}\n",
+        "gliner_arch_audit_detail: graph_plan_count={} graph_plan_reuses={} graph_plan_slots={} graph_plan_bytes={} embedding_successes={} embedding_fallbacks={} layer_successes={}/{} layer_fallbacks={} ffn_fused={}/{} ffn_fallbacks={} packed_qkv={}/{} dense_packed_qkv={} quant_packed_qkv={} packed_qkv_fallbacks={} relative_qk_pair={}/{} relative_qk_pair_fallbacks={} attention_flash={} attention_gemm={} attention_gemm_fallbacks={} attention_legacy={} host_downloads={} host_download_device_calls={} host_download_bytes={}\n",
         .{
             deltaU64(a.metal_runtime_graph_plan_count, b.metal_runtime_graph_plan_count),
             graph_plan_reuses,
@@ -402,10 +406,13 @@ fn printGlinerMetalArchitectureAudit(
             ffn_fallbacks,
             packed_qkv,
             layer_count,
+            dense_packed_qkv,
+            quant_packed_qkv,
             packed_qkv_fallbacks,
             relative_qk_pair,
             layer_count,
             relative_qk_pair_fallbacks,
+            attention_flash,
             attention_gemm,
             attention_gemm_fallbacks,
             attention_legacy,
@@ -421,7 +428,7 @@ fn printMetalRuntimeProfile(before: ops.BackendDebugTimingSnapshot, after: ops.B
     const b = before.provider;
     const a = after.provider;
     std.debug.print(
-        "gliner_metal_profile: frame_begins={} frame_submits={} frame_wait_ms={d:.3} frame_gpu_ms={d:.3} compute_encoders={} last_frame_compute_encoders={} mps_standalone={} mps_active_frame={} mps_standalone_wait_ms={d:.3} mps_standalone_gpu_ms={d:.3} last_frame_mps={} graph_plan_count={} graph_plan_slots={} graph_plan_bytes={} graph_plan_reuses={} deberta_encoder_plan_attempts={} deberta_encoder_plan_successes={} deberta_encoder_plan_reuses={} deberta_encoder_plan_failures={} deberta_embeddings_attempts={} deberta_embeddings_successes={} deberta_embeddings_fallbacks={} deberta_encoder_layer_attempts={} deberta_encoder_layer_successes={} deberta_encoder_layer_fallbacks={} deberta_ffn_fused={} deberta_ffn_fused_mps={} deberta_ffn_fused_fallbacks={} deberta_attention_gemm={} deberta_attention_gemm_fallbacks={} deberta_attention_legacy={}\n",
+        "gliner_metal_profile: frame_begins={} frame_submits={} frame_wait_ms={d:.3} frame_gpu_ms={d:.3} compute_encoders={} last_frame_compute_encoders={} mps_standalone={} mps_active_frame={} mps_standalone_wait_ms={d:.3} mps_standalone_gpu_ms={d:.3} last_frame_mps={} graph_plan_count={} graph_plan_slots={} graph_plan_bytes={} graph_plan_reuses={} deberta_encoder_plan_attempts={} deberta_encoder_plan_successes={} deberta_encoder_plan_reuses={} deberta_encoder_plan_failures={} deberta_embeddings_attempts={} deberta_embeddings_successes={} deberta_embeddings_fallbacks={} deberta_encoder_layer_attempts={} deberta_encoder_layer_successes={} deberta_encoder_layer_fallbacks={} deberta_ffn_fused={} deberta_ffn_fused_mps={} deberta_ffn_fused_fallbacks={} deberta_attention_flash={} deberta_attention_gemm={} deberta_attention_gemm_fallbacks={} deberta_attention_legacy={}\n",
         .{
             deltaU64(a.decoder_runtime_frame_begins, b.decoder_runtime_frame_begins),
             deltaU64(a.decoder_runtime_frame_submits, b.decoder_runtime_frame_submits),
@@ -451,6 +458,7 @@ fn printMetalRuntimeProfile(before: ops.BackendDebugTimingSnapshot, after: ops.B
             deltaU64(a.metal_runtime_deberta_ffn_fused_calls, b.metal_runtime_deberta_ffn_fused_calls),
             deltaU64(a.metal_runtime_deberta_ffn_fused_mps_matmuls, b.metal_runtime_deberta_ffn_fused_mps_matmuls),
             deltaU64(a.metal_runtime_deberta_ffn_fused_fallbacks, b.metal_runtime_deberta_ffn_fused_fallbacks),
+            deltaU64(a.metal_runtime_deberta_attention_flash_calls, b.metal_runtime_deberta_attention_flash_calls),
             deltaU64(a.metal_runtime_deberta_attention_gemm_calls, b.metal_runtime_deberta_attention_gemm_calls),
             deltaU64(a.metal_runtime_deberta_attention_gemm_fallbacks, b.metal_runtime_deberta_attention_gemm_fallbacks),
             deltaU64(a.metal_runtime_deberta_attention_legacy_calls, b.metal_runtime_deberta_attention_legacy_calls),

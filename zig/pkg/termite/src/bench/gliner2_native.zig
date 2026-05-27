@@ -660,6 +660,7 @@ const MetalAudit = struct {
     packed_qkv_fallbacks: u64 = 0,
     relative_qk_pair: u64 = 0,
     relative_qk_pair_fallbacks: u64 = 0,
+    attention_flash: u64 = 0,
     attention_legacy: u64 = 0,
     attention_gemm: u64 = 0,
     attention_gemm_fallbacks: u64 = 0,
@@ -697,6 +698,7 @@ fn buildMetalAudit(cfg: BenchConfig, before: ops.BackendDebugTimingSnapshot, aft
     const ffn_fused_total = deltaU64(a.metal_runtime_deberta_ffn_fused_calls, b.metal_runtime_deberta_ffn_fused_calls);
     const packed_qkv_total = deltaU64(a.metal_runtime_dense_qkv_packed_calls, b.metal_runtime_dense_qkv_packed_calls);
     const relative_qk_pair_total = deltaU64(a.metal_runtime_deberta_relative_qk_pair_calls, b.metal_runtime_deberta_relative_qk_pair_calls);
+    const attention_flash_total = deltaU64(a.metal_runtime_deberta_attention_flash_calls, b.metal_runtime_deberta_attention_flash_calls);
     const attention_legacy_total = deltaU64(a.metal_runtime_deberta_attention_legacy_calls, b.metal_runtime_deberta_attention_legacy_calls);
     const attention_gemm_total = deltaU64(a.metal_runtime_deberta_attention_gemm_calls, b.metal_runtime_deberta_attention_gemm_calls);
     const layer_count: u64 = @intCast(cfg.num_layers);
@@ -718,6 +720,7 @@ fn buildMetalAudit(cfg: BenchConfig, before: ops.BackendDebugTimingSnapshot, aft
         .packed_qkv_fallbacks = deltaU64(a.metal_runtime_dense_qkv_packed_fallbacks, b.metal_runtime_dense_qkv_packed_fallbacks),
         .relative_qk_pair = perIter(relative_qk_pair_total, cfg.measure_iters),
         .relative_qk_pair_fallbacks = deltaU64(a.metal_runtime_deberta_relative_qk_pair_fallbacks, b.metal_runtime_deberta_relative_qk_pair_fallbacks),
+        .attention_flash = perIter(attention_flash_total, cfg.measure_iters),
         .attention_legacy = perIter(attention_legacy_total, cfg.measure_iters),
         .attention_gemm = perIter(attention_gemm_total, cfg.measure_iters),
         .attention_gemm_fallbacks = deltaU64(a.metal_runtime_deberta_attention_gemm_fallbacks, b.metal_runtime_deberta_attention_gemm_fallbacks),
@@ -1060,8 +1063,9 @@ fn runBenchmark(
             },
         );
         std.debug.print(
-            ",{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3}\n",
+            ",{},{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3}\n",
             .{
+                metal_audit.attention_flash,
                 metal_audit.attention_gemm,
                 metal_audit.attention_gemm_fallbacks,
                 metal_audit.attention_legacy,
@@ -1261,7 +1265,7 @@ fn runScenario(allocator: std.mem.Allocator, cfg: BenchConfig) !void {
 
 fn printCsvHeader() void {
     std.debug.print(
-        "backend,quant,batch,seq_len,num_labels,layers,hidden,intermediate,warmup_iters,measure_iters,avg_ms,min_ms,encoder_ms,head_ms,logits_to_f32_ms,resident_frame,interpreter_fallbacks,host_downloads,mps_standalone,mps_active,mpsgraph,planned_layers,layer_count,fused_ffn,packed_qkv,packed_qkv_fallbacks,relative_qk_pair,relative_qk_pair_fallbacks,command_plan_reused,frame_gpu_ms,frame_wait_ms,graph_plan_reuses,frame_begins,frame_submits,host_downloads_total,layer_fallbacks,ffn_fallbacks,plan_successes,plan_failures,deberta_attention_gemm,deberta_attention_gemm_fallbacks,deberta_attention_legacy,encoder_embeddings_ms,encoder_relative_pos_ms,encoder_qkv_ms,encoder_relative_qk_ms,encoder_attention_ms,encoder_attn_output_ms,encoder_ffn_intermediate_ms,encoder_ffn_output_ms,head_start_end_mlp_ms,head_gather_concat_relu_ms,head_out_project_ms,head_label_projection_ms,head_logits_ms\n",
+        "backend,quant,batch,seq_len,num_labels,layers,hidden,intermediate,warmup_iters,measure_iters,avg_ms,min_ms,encoder_ms,head_ms,logits_to_f32_ms,resident_frame,interpreter_fallbacks,host_downloads,mps_standalone,mps_active,mpsgraph,planned_layers,layer_count,fused_ffn,packed_qkv,packed_qkv_fallbacks,relative_qk_pair,relative_qk_pair_fallbacks,command_plan_reused,frame_gpu_ms,frame_wait_ms,graph_plan_reuses,frame_begins,frame_submits,host_downloads_total,layer_fallbacks,ffn_fallbacks,plan_successes,plan_failures,deberta_attention_flash,deberta_attention_gemm,deberta_attention_gemm_fallbacks,deberta_attention_legacy,encoder_embeddings_ms,encoder_relative_pos_ms,encoder_qkv_ms,encoder_relative_qk_ms,encoder_attention_ms,encoder_attn_output_ms,encoder_ffn_intermediate_ms,encoder_ffn_output_ms,head_start_end_mlp_ms,head_gather_concat_relu_ms,head_out_project_ms,head_label_projection_ms,head_logits_ms\n",
         .{},
     );
 }

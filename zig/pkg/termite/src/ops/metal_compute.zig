@@ -1825,6 +1825,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn linearTensorTransBToF32(
+        allocator: std.mem.Allocator,
         tensor: *const tensor_mod.Tensor,
         input: []const f32,
         rows: usize,
@@ -1866,34 +1867,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             },
             .f16 => {
+                const weight = try allocator.alloc(f32, out_dim * in_dim);
+                defer allocator.free(weight);
                 const src_bytes: [*]const u8 = tensor.data.ptr;
-                for (0..rows) |r| {
-                    for (0..out_dim) |o| {
-                        var acc: f32 = 0.0;
-                        const weight_row = o * in_dim;
-                        for (0..in_dim) |i| {
-                            const offset = (weight_row + i) * 2;
-                            const half: f16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
-                            acc += input[r * in_dim + i] * @as(f32, @floatCast(half));
-                        }
-                        output[r * out_dim + o] = acc;
-                    }
+                for (0..weight.len) |i| {
+                    const offset = i * 2;
+                    const half: f16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
+                    weight[i] = @floatCast(half);
                 }
+                native.sgemmTransBSync(rows, out_dim, in_dim, 1.0, input, weight, 0.0, output);
             },
             .bf16 => {
+                const weight = try allocator.alloc(f32, out_dim * in_dim);
+                defer allocator.free(weight);
                 const src_bytes: [*]const u8 = tensor.data.ptr;
-                for (0..rows) |r| {
-                    for (0..out_dim) |o| {
-                        var acc: f32 = 0.0;
-                        const weight_row = o * in_dim;
-                        for (0..in_dim) |i| {
-                            const offset = (weight_row + i) * 2;
-                            const bits: u16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
-                            acc += input[r * in_dim + i] * @as(f32, @bitCast(@as(u32, bits) << 16));
-                        }
-                        output[r * out_dim + o] = acc;
-                    }
+                for (0..weight.len) |i| {
+                    const offset = i * 2;
+                    const bits: u16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
+                    weight[i] = @bitCast(@as(u32, bits) << 16);
                 }
+                native.sgemmTransBSync(rows, out_dim, in_dim, 1.0, input, weight, 0.0, output);
             },
             else => return error.UnsupportedTensorType,
         }
@@ -7227,11 +7220,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (request.total == 0 or request.hidden_size == 0) return null;
         if (request.input_ids.len != request.total or request.attention_mask.len != request.total) return null;
 
-        var weight_probe = try self.ownedMetalTensorFromCt(request.word_embeddings);
+        var weight_probe = self.ownedMetalTensorFromCt(request.word_embeddings) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
         defer weight_probe.deinit();
-        var gamma_probe = try self.ownedMetalTensorFromCt(request.layer_norm_weight);
+        var gamma_probe = self.ownedMetalTensorFromCt(request.layer_norm_weight) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
         defer gamma_probe.deinit();
-        var beta_probe = try self.ownedMetalTensorFromCt(request.layer_norm_bias);
+        var beta_probe = self.ownedMetalTensorFromCt(request.layer_norm_bias) catch |err| switch (err) {
+            error.UnsupportedTensorType => return null,
+            else => return err,
+        };
         defer beta_probe.deinit();
         if (weight_probe.ndim() != 2 or gamma_probe.ndim() != 1 or beta_probe.ndim() != 1) return null;
         if (@as(usize, @intCast(weight_probe.dim(1))) != request.hidden_size) return null;
@@ -7382,7 +7384,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .row_ids = zeros,
             .rows = request.num_labels,
             .dim = request.hidden_size,
-        })) orelse return null;
+        })) orelse blk: {
+            const pos_data = try toFloat32Op(ctx, pos_w, self.allocator);
+            defer self.allocator.free(pos_data);
+            if (pos_data.len < request.hidden_size) return error.InvalidTensorShape;
+            const pos_broadcast = try self.allocator.alloc(f32, request.num_labels * request.hidden_size);
+            defer self.allocator.free(pos_broadcast);
+            for (0..request.num_labels) |i| {
+                @memcpy(
+                    pos_broadcast[i * request.hidden_size ..][0..request.hidden_size],
+                    pos_data[0..request.hidden_size],
+                );
+            }
+            const pos_shape = [_]i32{ @intCast(request.num_labels), @intCast(request.hidden_size) };
+            var pos_mt = try self.deviceTensorFromF32Slice(pos_broadcast, &pos_shape);
+            errdefer pos_mt.deinit();
+            break :blk try self.ctFromOwnedMetalTensor(pos_mt);
+        };
         defer freeOp(ctx, pos_ct);
 
         const gate_dim = try std.math.mul(usize, request.hidden_size, 3);
@@ -7481,8 +7499,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const input_buf = toBuf(input);
         const gamma_buf = toBuf(gamma);
         const beta_buf = toBuf(beta);
-        if (input_buf.quantized_storage != null or gamma_buf.quantized_storage != null or beta_buf.quantized_storage != null) return error.UnsupportedTensorType;
-        if (!disableRuntimeElementwise()) {
+        const has_quantized = bufHasAnyQuantizedStorage(input_buf) or
+            bufHasAnyQuantizedStorage(gamma_buf) or
+            bufHasAnyQuantizedStorage(beta_buf);
+        if (!has_quantized and !disableRuntimeElementwise()) {
             if (input_buf.metal_tensor) |*input_metal| {
                 if (input_metal.isDevice() and input_metal.ndim() == 2 and @as(usize, @intCast(input_metal.dim(1))) == dim and
                     bufElemCount(gamma_buf) == dim and bufElemCount(beta_buf) == dim)
@@ -7502,9 +7522,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
-        const input_data = try hostSliceForBuf(input_buf);
-        const gamma_data = try hostSliceForBuf(gamma_buf);
-        const beta_data = try hostSliceForBuf(beta_buf);
+        const input_owned = if (bufHasAnyQuantizedStorage(input_buf)) try toFloat32Op(ctx, input, self.allocator) else null;
+        defer if (input_owned) |data| self.allocator.free(data);
+        const gamma_owned = if (bufHasAnyQuantizedStorage(gamma_buf)) try toFloat32Op(ctx, gamma, self.allocator) else null;
+        defer if (gamma_owned) |data| self.allocator.free(data);
+        const beta_owned = if (bufHasAnyQuantizedStorage(beta_buf)) try toFloat32Op(ctx, beta, self.allocator) else null;
+        defer if (beta_owned) |data| self.allocator.free(data);
+        const input_data = input_owned orelse try hostSliceForBuf(input_buf);
+        const gamma_data = gamma_owned orelse try hostSliceForBuf(gamma_buf);
+        const beta_data = beta_owned orelse try hostSliceForBuf(beta_buf);
         const output = try self.allocator.dupe(f32, input_data);
         errdefer self.allocator.free(output);
         activations_mod.layerNorm(output, gamma_data, beta_data, dim, eps);
@@ -7658,7 +7684,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const input_data = try hostSliceForBuf(input_buf);
         if (input_data.len != rows * in_dim) return error.InvalidTensorShape;
-
         const output = try self.allocator.alloc(f32, rows * out_dim);
         errdefer self.allocator.free(output);
 
@@ -7687,7 +7712,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             gpu_hosted_store_mod.touchLazyWeight(self.data, entry);
             try gpu_hosted_store_mod.ensureHostLazyWeightLoadedSimple(self.data, entry);
             const loaded = entry.host_loaded orelse return error.UnsupportedTensorType;
-            try linearTensorTransBToF32(&loaded.tensor, input_data, rows, in_dim, out_dim, output);
+            try linearTensorTransBToF32(self.allocator, &loaded.tensor, input_data, rows, in_dim, out_dim, output);
         } else {
             const weight_data = try hostSliceForBuf(weight_buf);
             if (weight_data.len != out_dim * in_dim) return error.InvalidTensorShape;
@@ -17267,6 +17292,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return (self.preparedLinearMatmulFormatForLinearSlot(slot, in_dim, out_dim) orelse return false) == .f32;
     }
 
+    fn linearSlotPreparedForDebertaFrame(
+        self: *MetalCompute,
+        slot: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) bool {
+        const format = self.preparedLinearMatmulFormatForLinearSlot(slot, in_dim, out_dim) orelse return false;
+        return switch (format) {
+            .unknown => false,
+            else => true,
+        };
+    }
+
     fn debertaEncoderPlanFrameOp(
         ctx: *anyopaque,
         request: *const ops.DebertaEncoderFramePlanRequest,
@@ -17297,12 +17335,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             {
                 return false;
             }
-            if (!self.linearSlotPreparedForDenseFrame(layer.q_linear_slot, request.hidden_size, request.hidden_size)) return false;
-            if (!self.linearSlotPreparedForDenseFrame(layer.k_linear_slot, request.hidden_size, request.hidden_size)) return false;
-            if (!self.linearSlotPreparedForDenseFrame(layer.v_linear_slot, request.hidden_size, request.hidden_size)) return false;
-            if (!self.linearSlotPreparedForDenseFrame(layer.attention_output_linear_slot, request.hidden_size, request.hidden_size)) return false;
-            if (!self.linearSlotPreparedForDenseFrame(layer.intermediate_linear_slot, request.hidden_size, request.intermediate_size)) return false;
-            if (!self.linearSlotPreparedForDenseFrame(layer.output_linear_slot, request.intermediate_size, request.hidden_size)) return false;
+            if (!self.linearSlotPreparedForDebertaFrame(layer.q_linear_slot, request.hidden_size, request.hidden_size)) return false;
+            if (!self.linearSlotPreparedForDebertaFrame(layer.k_linear_slot, request.hidden_size, request.hidden_size)) return false;
+            if (!self.linearSlotPreparedForDebertaFrame(layer.v_linear_slot, request.hidden_size, request.hidden_size)) return false;
+            if (!self.linearSlotPreparedForDebertaFrame(layer.attention_output_linear_slot, request.hidden_size, request.hidden_size)) return false;
+            if (!self.linearSlotPreparedForDebertaFrame(layer.intermediate_linear_slot, request.hidden_size, request.intermediate_size)) return false;
+            if (!self.linearSlotPreparedForDebertaFrame(layer.output_linear_slot, request.intermediate_size, request.hidden_size)) return false;
         }
 
         self.active_deberta_encoder_frame_plan_key = plan_key;
@@ -17386,7 +17424,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer attn_out_mt.deinit();
         var hidden_mt = try self.ownedDeviceMetalTensorFromCt(request.hidden);
         defer hidden_mt.deinit();
-        const attn_normed_output_mt = (try metal_runtime.tryApplyDenseRuntimeLinearLayerNorm(
+        const attn_normed_output_mt = (try metal_runtime.tryApplyQuantizedRuntimeLinearLayerNorm(
+            self.provider_impl,
+            request.layer.attention_output_linear_slot,
+            request.layer.attention_layer_norm_slot,
+            attn_out_mt,
+            hidden_mt,
+            rows,
+            request.hidden_size,
+            request.hidden_size,
+            request.norm_eps,
+        )) orelse (try metal_runtime.tryApplyDenseRuntimeLinearLayerNorm(
             self.provider_impl,
             request.layer.attention_output_linear_slot,
             request.layer.attention_layer_norm_slot,
@@ -17403,7 +17451,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         var attn_normed_mt = try self.ownedDeviceMetalTensorFromCt(attn_normed);
         defer attn_normed_mt.deinit();
-        const output_mt = (try metal_runtime.tryApplyDenseRuntimeFfnLayerNorm(
+        const output_mt = (try metal_runtime.tryApplyQuantizedRuntimeFfnLayerNorm(
+            self.provider_impl,
+            request.layer.intermediate_linear_slot,
+            request.layer.output_linear_slot,
+            request.layer.output_layer_norm_slot,
+            attn_normed_mt,
+            attn_normed_mt,
+            rows,
+            request.hidden_size,
+            request.intermediate_size,
+            request.norm_eps,
+            .gelu,
+        )) orelse (try metal_runtime.tryApplyDenseRuntimeFfnLayerNorm(
             self.provider_impl,
             request.layer.intermediate_linear_slot,
             request.layer.output_linear_slot,
@@ -18177,6 +18237,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_deberta_ffn_fused_calls = runtime_stats.deberta_ffn_fused_calls;
         stats.metal_runtime_deberta_ffn_fused_mps_matmuls = runtime_stats.deberta_ffn_fused_mps_matmuls;
         stats.metal_runtime_deberta_ffn_fused_fallbacks = runtime_stats.deberta_ffn_fused_fallbacks;
+        stats.metal_runtime_deberta_attention_flash_calls = runtime_stats.deberta_attention_flash_calls;
         stats.metal_runtime_deberta_attention_legacy_calls = runtime_stats.deberta_attention_legacy_calls;
         stats.metal_runtime_deberta_attention_gemm_calls = runtime_stats.deberta_attention_gemm_calls;
         stats.metal_runtime_deberta_attention_gemm_fallbacks = runtime_stats.deberta_attention_gemm_fallbacks;

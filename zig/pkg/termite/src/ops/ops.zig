@@ -408,6 +408,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_deberta_ffn_fused_calls: u64 = 0,
     metal_runtime_deberta_ffn_fused_mps_matmuls: u64 = 0,
     metal_runtime_deberta_ffn_fused_fallbacks: u64 = 0,
+    metal_runtime_deberta_attention_flash_calls: u64 = 0,
     metal_runtime_deberta_attention_legacy_calls: u64 = 0,
     metal_runtime_deberta_attention_gemm_calls: u64 = 0,
     metal_runtime_deberta_attention_gemm_fallbacks: u64 = 0,
