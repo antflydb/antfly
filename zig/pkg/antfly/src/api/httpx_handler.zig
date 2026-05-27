@@ -313,6 +313,37 @@ pub const AntflyApiHandler = struct {
         return ctx.json(public_status);
     }
 
+    pub fn getCluster(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const metadata_status = try self.api_server.source.status();
+        var public_status = try cluster.fromMetadataStatus(alloc, metadata_status);
+        defer public_status.deinit(alloc);
+        public_status.auth_enabled = self.api_server.cfg.auth_enabled;
+        public_status.swarm_mode = self.api_server.cfg.swarm_mode;
+        if (self.api_server.cfg.secret_store) |secret_store| {
+            _ = secret_store.refreshIfChanged() catch |err| {
+                std.log.warn("secret store status refresh skipped err={}", .{err});
+            };
+            cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+        }
+        var snapshot_opt = try self.api_server.source.cachedAdminSnapshot();
+        if (snapshot_opt == null) {
+            snapshot_opt = try self.api_server.source.adminSnapshot();
+        }
+        if (snapshot_opt) |*snapshot| {
+            defer self.api_server.source.freeAdminSnapshot(snapshot);
+            var topology = try cluster.topologyFromStatusAndSnapshot(alloc, public_status, snapshot);
+            defer topology.deinit(alloc);
+            return ctx.json(topology);
+        }
+        var topology = try cluster.topologyFromStatus(alloc, public_status);
+        defer topology.deinit(alloc);
+        return ctx.json(topology);
+    }
+
     pub fn listSecrets(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);

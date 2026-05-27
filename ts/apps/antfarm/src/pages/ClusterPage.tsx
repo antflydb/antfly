@@ -370,7 +370,7 @@ const ClusterPage: React.FC = () => {
               <HealthBadge health={cluster.health} />
             </div>
             <DashboardPageDescription>
-              Monitor node health, shard placement, and table distribution.
+              Monitor data node health, range placement, and table distribution.
             </DashboardPageDescription>
           </div>
           <DashboardPageActions>
@@ -403,9 +403,9 @@ const ClusterPage: React.FC = () => {
       </div>
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <StatCard label="Nodes" value={storeList.length} icon={<Network className="w-4 h-4" />} />
+        <StatCard label="Data Nodes" value={storeList.length} icon={<Network className="w-4 h-4" />} />
         <StatCard label="Tables" value={uniqueTables} icon={<Database className="w-4 h-4" />} />
-        <StatCard label="Shards" value={totalShards} />
+        <StatCard label="Ranges" value={totalShards} />
         {totalDisk > 0 && <StatCard label="Disk" value={formatBytes(totalDisk)} />}
       </div>
 
@@ -440,7 +440,7 @@ const ClusterPage: React.FC = () => {
       {tableRows.length > 0 ? (
         <div className="space-y-3">
           <div className="flex items-center justify-between">
-            <h3 className="text-sm font-medium text-muted-foreground">Shard Distribution</h3>
+            <h3 className="text-sm font-medium text-muted-foreground">Range Distribution</h3>
             <ShardLegend />
           </div>
 

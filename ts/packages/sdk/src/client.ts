@@ -63,7 +63,11 @@ type SuccessMessage = {
   message?: string;
 };
 
-function apiErrorMessage(error: unknown, fallback: string): string {
+type ClusterTopology = paths["/api/v1/cluster"]["get"]["responses"][200]["content"]["application/json"];
+
+function apiErrorMessage(error: unknown, fallback = "unknown error"): string {
+  if (!error) return fallback;
+  if (typeof error === "string") return error.trim() || fallback;
   if (error && typeof error === "object") {
     const fields = error as {
       error?: unknown;
@@ -74,8 +78,17 @@ function apiErrorMessage(error: unknown, fallback: string): string {
     for (const value of [fields.error, fields.detail, fields.message, fields.title]) {
       if (typeof value === "string" && value.trim()) return value;
     }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return fallback;
+    }
   }
-  return fallback;
+  return String(error);
+}
+
+function errorMessage(error: unknown): string {
+  return apiErrorMessage(error);
 }
 
 export class AntflyClient {
@@ -160,7 +173,16 @@ export class AntflyClient {
    */
   async getStatus() {
     const { data, error } = await this.client.GET("/api/v1/status");
-    if (error) throw new Error(`Failed to get status: ${error.error}`);
+    if (error) throw new Error(`Failed to get status: ${errorMessage(error)}`);
+    return data;
+  }
+
+  /**
+   * Get cluster topology and data placement status.
+   */
+  async getClusterStatus(): Promise<ClusterTopology | undefined> {
+    const { data, error } = await this.client.GET("/api/v1/cluster");
+    if (error) throw new Error(`Failed to get cluster: ${errorMessage(error)}`);
     return data;
   }
 
