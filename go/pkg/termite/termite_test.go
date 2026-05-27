@@ -74,7 +74,7 @@ func TestAPIHandlerServesRootOperationalRoutesOutsideMLPrefix(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
-		assert.True(t, w.Code == http.StatusOK || w.Code == http.StatusServiceUnavailable, "%s returned %d", path, w.Code)
+		assert.Equal(t, http.StatusOK, w.Code, path)
 	}
 
 	for _, path := range []string{"/ml/v1/healthz", "/ml/v1/readyz"} {
