@@ -2425,6 +2425,14 @@ pub const DataServer = struct {
                         err,
                     });
                 };
+                if (self.data_raft_apply) |apply_sm| {
+                    _ = self.write_source.transferAdoptableWriteCacheEntriesTo(&apply_sm.write_source, table_name) catch |err| {
+                        std.log.warn("failed to transfer provisioned write cache to raft apply table={s} err={}", .{
+                            table_name,
+                            err,
+                        });
+                    };
+                }
                 self.syncDataRaftFromRemoteMetadata() catch |err| {
                     std.log.warn("failed to sync data raft placement after structural change table={s} err={}", .{
                         table_name,
