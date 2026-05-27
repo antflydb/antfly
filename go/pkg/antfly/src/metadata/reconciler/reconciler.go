@@ -469,6 +469,23 @@ func (r *Reconciler) computeSplitStateActions(current CurrentClusterState, desir
 				continue
 			}
 		}
+		if shardStatus.State == store.ShardState_PreMerge {
+			if liveStatus := currentShardStatuses[shardID]; liveStatus != nil && liveStatus.MergeState != nil {
+				action := r.computeMergeStatePhaseActionWithDesired(
+					shardID,
+					liveStatus,
+					liveStatus.MergeState,
+					currentShardStatuses,
+					desired.Shards,
+				)
+				if action != nil {
+					actions = append(actions, *action)
+				}
+				if liveStatus.MergeState.GetPhase() != db.MergeState_PHASE_NONE {
+					continue
+				}
+			}
+		}
 
 		// Check for zero-downtime split state transitions (based on Raft-replicated SplitState)
 		if splitState := shardStatus.SplitState; splitState != nil {
