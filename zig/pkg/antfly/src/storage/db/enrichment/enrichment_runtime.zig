@@ -1410,18 +1410,33 @@ fn processAsset(
     var producer_cfg = try asset_producer_mod.parseProducerConfig(runtime.alloc, request.producer_json);
     defer producer_cfg.deinit(runtime.alloc);
 
-    const source_text = try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request) orelse return;
+    const artifact_name = requestArtifactName(request);
+    const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact_name);
+    defer runtime.alloc.free(key);
+
+    const source_text = try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request) orelse {
+        const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
+        defer runtime.alloc.free(state_key);
+        try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
+        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        return;
+    };
     defer runtime.alloc.free(@constCast(source_text));
+    if (source_text.len == 0) {
+        const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
+        defer runtime.alloc.free(state_key);
+        try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
+        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        return;
+    }
 
     const source_parts_json = if (producer_cfg.type != .copy and request.source_template.len > 0)
         try renderSourcePartsJson(runtime.alloc, runtime.config, raw, request)
     else
         null;
     defer if (source_parts_json) |value| runtime.alloc.free(value);
-
-    const artifact_name = requestArtifactName(request);
-    const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact_name);
-    defer runtime.alloc.free(key);
 
     if (producer_cfg.type == .copy) {
         if (try shouldSkipAssetArtifact(runtime, key, source_text)) {
@@ -1547,6 +1562,52 @@ fn materializeGraphAssetForRuntime(
 
         if (writes.items.len > 0 or deletes.items.len > 0) {
             try storePutBatchWithRetry(runtime, writes.items, deletes.items);
+        }
+    }
+}
+
+fn materializeGraphAssetDeleteForRuntime(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    window: *GeneratedReplayWindow,
+) !void {
+    if (!runtime.index_manager.hasGraphIndexes()) return;
+    const artifact_name = requestArtifactName(request);
+
+    for (runtime.index_manager.graphIndexes()) |graph_entry| {
+        const source = graph_entry.artifact_source orelse continue;
+        if (!std.mem.eql(u8, source.artifact_name, artifact_name)) continue;
+
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (deletes.items) |key| runtime.alloc.free(@constCast(key));
+            deletes.deinit(runtime.alloc);
+        }
+
+        const state_key = try graphAssetStateKeyAlloc(runtime.alloc, request.doc_key, graph_entry.config.name, artifact_name);
+        defer runtime.alloc.free(state_key);
+        if (try loadGraphAssetStateKeysAlloc(runtime, state_key)) |previous_keys| {
+            defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
+            for (previous_keys) |previous_key| {
+                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+            }
+        } else {
+            const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
+            defer runtime.alloc.free(prefix);
+            const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
+            defer backend_scan.freeResults(runtime.alloc, existing);
+            for (existing) |entry| {
+                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
+                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, entry.key);
+            }
+        }
+
+        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, &.{});
+        defer runtime.alloc.free(state_value);
+        const writes = [_]KVPair{.{ .key = state_key, .value = state_value }};
+        if (writes.len > 0 or deletes.items.len > 0) {
+            try storePutBatchWithRetry(runtime, &writes, deletes.items);
         }
     }
 }

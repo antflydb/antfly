@@ -6914,10 +6914,10 @@ fn indexesJsonHasGeneratedEnrichment(alloc: std.mem.Allocator, indexes_json: []c
     if (indexes_json.len == 0) return false;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
-    return jsonValueHasGeneratedEnrichment(parsed.value);
+    return try jsonValueHasGeneratedEnrichment(alloc, parsed.value);
 }
 
-fn jsonValueHasGeneratedEnrichment(value: std.json.Value) bool {
+fn jsonValueHasGeneratedEnrichment(alloc: std.mem.Allocator, value: std.json.Value) anyerror!bool {
     switch (value) {
         .object => |object| {
             if (object.get("kind")) |kind| {
@@ -6925,21 +6925,32 @@ fn jsonValueHasGeneratedEnrichment(value: std.json.Value) bool {
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (jsonValueHasGeneratedEnrichment(entry.value_ptr.*)) return true;
+                if (try jsonValueHasGeneratedEnrichment(alloc, entry.value_ptr.*)) return true;
             }
             return false;
         },
         .array => |array| {
             for (array.items) |item| {
-                if (jsonValueHasGeneratedEnrichment(item)) return true;
+                if (try jsonValueHasGeneratedEnrichment(alloc, item)) return true;
             }
             return false;
+        },
+        .string => |raw| {
+            return try jsonStringHasGeneratedEnrichment(alloc, raw);
         },
         else => return false,
     }
 }
 
-fn jsonValueNeedsAssetProducer(alloc: std.mem.Allocator, value: std.json.Value) !bool {
+fn jsonStringHasGeneratedEnrichment(alloc: std.mem.Allocator, raw: []const u8) anyerror!bool {
+    const trimmed = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    if (!jsonStringLooksStructured(trimmed)) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch return false;
+    defer parsed.deinit();
+    return try jsonValueHasGeneratedEnrichment(alloc, parsed.value);
+}
+
+fn jsonValueNeedsAssetProducer(alloc: std.mem.Allocator, value: std.json.Value) anyerror!bool {
     switch (value) {
         .object => |object| {
             if (try objectIsModelBackedAssetEnrichment(alloc, object)) return true;
@@ -6955,8 +6966,25 @@ fn jsonValueNeedsAssetProducer(alloc: std.mem.Allocator, value: std.json.Value) 
             }
             return false;
         },
+        .string => |raw| {
+            return try jsonStringNeedsAssetProducer(alloc, raw);
+        },
         else => return false,
     }
+}
+
+fn jsonStringNeedsAssetProducer(alloc: std.mem.Allocator, raw: []const u8) anyerror!bool {
+    const trimmed = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    if (!jsonStringLooksStructured(trimmed)) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch return false;
+    defer parsed.deinit();
+    return try jsonValueNeedsAssetProducer(alloc, parsed.value);
+}
+
+fn jsonStringLooksStructured(trimmed: []const u8) bool {
+    return trimmed.len >= 2 and
+        ((trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') or
+            (trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']'));
 }
 
 fn objectIsModelBackedAssetEnrichment(alloc: std.mem.Allocator, object: std.json.ObjectMap) !bool {
@@ -6973,6 +7001,35 @@ fn objectIsModelBackedAssetEnrichment(alloc: std.mem.Allocator, object: std.json
     var producer_cfg = asset_producer_mod.parseProducerConfig(alloc, producer_json) catch return false;
     defer producer_cfg.deinit(alloc);
     return producer_cfg.type != .copy;
+}
+
+test "provisioning detects model backed graph shorthand assets inside config_json strings" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try indexesJsonNeedsAssetProducer(alloc,
+        \\[{
+        \\  "name":"relations_graph",
+        \\  "kind":"graph",
+        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"body\",\"producer_json\":{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\"}}}}"
+        \\}]
+    ));
+}
+
+test "provisioning does not require asset producer for copy graph shorthand assets inside config_json strings" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(!(try indexesJsonNeedsAssetProducer(alloc,
+        \\[{
+        \\  "name":"relations_graph",
+        \\  "kind":"graph",
+        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"}}"
+        \\}]
+    )));
+    try std.testing.expect(try indexesJsonHasGeneratedEnrichment(alloc,
+        \\[{
+        \\  "name":"relations_graph",
+        \\  "kind":"graph",
+        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"}}"
+        \\}]
+    ));
 }
 
 fn drainManagedDbBeforeClose(db: *db_mod.DB) !void {

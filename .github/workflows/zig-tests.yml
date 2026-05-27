@@ -285,7 +285,7 @@ jobs:
           ANTFLY_BIN: ./zig-out/bin/antfly
         run: |
           chmod +x ./zig-out/bin/antfly ./zig-out/bin/termite
-          uv run --project e2e/antfly pytest -q \
+          uv run --project e2e/antfly pytest -q -x \
             -m "not objectstore_integration and not swarm_integration and not real_model and not postgres_integration and not slow" \
             e2e/antfly
 
@@ -294,7 +294,7 @@ jobs:
         env:
           TERMITE_BIN: ./zig-out/bin/termite
         run: |
-          uv run --project e2e/termite pytest -q \
+          uv run --project e2e/termite pytest -q -x \
             -m "not slow and not multimodal and not model_integration and not browser_integration" \
             e2e/termite
 
@@ -348,13 +348,13 @@ jobs:
           ANTFLY_BIN: ./zig-out/bin/antfly
         run: |
           chmod +x ./zig-out/bin/antfly ./zig-out/bin/termite
-          uv run --project e2e/antfly pytest -q e2e/antfly
+          uv run --project e2e/antfly pytest -q -x e2e/antfly
 
       - name: Run Termite full E2E
         working-directory: zig
         env:
           TERMITE_BIN: ./zig-out/bin/termite
-        run: uv run --project e2e/termite pytest -q e2e/termite
+        run: uv run --project e2e/termite pytest -q -x e2e/termite
 
   tla-verify:
     needs: changes

@@ -23,6 +23,16 @@ const storage_io = @import("storage_io.zig");
 pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !BackendType {
     var backend = BackendType.init(allocator, backend_options);
     backend.root_dir = try allocator.dupe(u8, root_dir);
+    std.log.info(
+        "lsm backend open begin root={s} read_only={any} create_if_missing={any} wal_enabled={any} storage_provided={any}",
+        .{
+            root_dir,
+            options.read_only,
+            options.create_if_missing,
+            backend.options.wal_enabled,
+            backend_options.storage != null,
+        },
+    );
 
     if (backend_options.storage) |storage| {
         backend.storage = storage;
@@ -44,21 +54,45 @@ pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const 
         &backend.runs,
         &backend.obsolete_paths,
     );
+    std.log.info(
+        "lsm backend open manifest loaded root={s} loaded={any} runs={d} obsolete_paths={d} next_run_id={d}",
+        .{
+            backend.root_dir.?,
+            loaded_manifest,
+            backend.runs.items.len,
+            backend.obsolete_paths.items.len,
+            backend.next_run_id,
+        },
+    );
     if (!loaded_manifest and options.create_if_missing) {
         try repository_mod.ensureOpenDirsWithStorage(backend.storage.?, root_dir);
+        std.log.info("lsm backend open ensured dirs root={s}", .{backend.root_dir.?});
     }
     {
         const locked = runtime_mod.lockBackend(BackendType, &backend);
         defer runtime_mod.unlockBackend(BackendType, &backend, locked);
 
         if (@hasDecl(BackendType, "replayWalIntoMutable")) {
+            std.log.info("lsm backend open wal replay begin root={s}", .{backend.root_dir.?});
             try backend.replayWalIntoMutable();
+            std.log.info(
+                "lsm backend open wal replay done root={s} mutable_entries={d} immutable_memtables={d}",
+                .{
+                    backend.root_dir.?,
+                    backend.mutable.entries.items.len,
+                    if (@hasField(BackendType, "immutable_memtables")) backend.immutable_memtables.items.len else 0,
+                },
+            );
         }
         compaction_mod.sortRuns(backend.runs.items);
     }
     if (@hasDecl(BackendType, "refreshMaintenanceDebtHint")) {
         backend.refreshMaintenanceDebtHint();
     }
+    std.log.info(
+        "lsm backend open done root={s} runs={d} mutable_entries={d}",
+        .{ backend.root_dir.?, backend.runs.items.len, backend.mutable.entries.items.len },
+    );
     return backend;
 }
 

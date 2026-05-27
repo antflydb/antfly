@@ -3531,9 +3531,16 @@ pub const DB = struct {
                 });
                 try appendUniqueOwnedKey(self.alloc, &changed_graph_artifact_keys, write.key);
             }
+            for (precomputed_generated.artifact_delete_keys) |key| {
+                try delete_keys.append(self.alloc, key);
+                if (internal_keys.isAssetArtifactKey(key)) {
+                    try appendUniqueOwnedKey(self.alloc, &changed_graph_artifact_keys, key);
+                }
+            }
             try appendPrecomputedGraphSourceArtifacts(
                 self,
                 precomputed_generated.artifact_writes,
+                precomputed_generated.artifact_delete_keys,
                 &materialized_graph_artifact_writes,
                 &store_writes,
                 &delete_keys,
@@ -11674,13 +11681,22 @@ fn computeAssetRequestDerived(
     doc_value: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
 ) !void {
     var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
     defer producer_cfg.deinit(alloc);
 
+    const artifact_name = requestArtifactName(request);
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", artifact_name);
+    defer alloc.free(key);
+
     const source_text = try extractAssetSourceValue(alloc, db, doc_value, request);
     if (source_text == null or source_text.?.len == 0) {
         if (source_text) |s| alloc.free(s);
+        try artifact_delete_keys.append(alloc, try alloc.dupe(u8, key));
+        const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
+        errdefer alloc.free(state_key);
+        try artifact_delete_keys.append(alloc, state_key);
         return;
     }
     defer alloc.free(source_text.?);
@@ -11691,11 +11707,8 @@ fn computeAssetRequestDerived(
         null;
     defer if (source_parts_json) |value| alloc.free(value);
 
-    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
-    defer alloc.free(key);
-
     const state_key = if (producer_cfg.type != .copy)
-        try assetStateKeyAlloc(alloc, request.doc_key, requestArtifactName(request))
+        try assetStateKeyAlloc(alloc, request.doc_key, artifact_name)
     else
         null;
     defer if (state_key) |value| alloc.free(value);
@@ -12282,6 +12295,11 @@ fn prepareGeneratedEnrichments(
         }
         artifact_writes.deinit(self.alloc);
     }
+    var artifact_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (artifact_delete_keys.items) |key| self.alloc.free(@constCast(key));
+        artifact_delete_keys.deinit(self.alloc);
+    }
     var documents = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
     errdefer {
         var tmp = derived_types.DerivedBatch{ .documents = documents.items };
@@ -12358,7 +12376,7 @@ fn prepareGeneratedEnrichments(
             }
 
             switch (request.kind) {
-                .asset => try computeAssetRequestDerived(self.alloc, self, cleaned, request, &artifact_writes),
+                .asset => try computeAssetRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &artifact_delete_keys),
                 .chunk_text => try computeChunkRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &documents, &chunk_cache),
                 .dense_embedding => computeDenseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache) catch |err| switch (err) {
                     error.MissingDenseEmbedder => try planned.append(self.alloc, try enrichment_types.requestToRef(self.alloc, request)),
@@ -12374,6 +12392,7 @@ fn prepareGeneratedEnrichments(
 
     return .{
         .artifact_writes = try artifact_writes.toOwnedSlice(self.alloc),
+        .artifact_delete_keys = try artifact_delete_keys.toOwnedSlice(self.alloc),
         .documents = try documents.toOwnedSlice(self.alloc),
         .dense_embeddings = try dense_embeddings.toOwnedSlice(self.alloc),
         .sparse_embeddings = try sparse_embeddings.toOwnedSlice(self.alloc),
@@ -12468,6 +12487,7 @@ const GeneratedPrecomputeMode = enum {
 
 const PrecomputedGeneratedBatch = struct {
     artifact_writes: []types.BatchWrite = &.{},
+    artifact_delete_keys: []const []const u8 = &.{},
     documents: []const derived_types.DerivedDocument = &.{},
     dense_embeddings: []const derived_types.DerivedDenseEmbeddingWrite = &.{},
     sparse_embeddings: []const derived_types.DerivedSparseEmbeddingWrite = &.{},
@@ -12479,6 +12499,8 @@ const PrecomputedGeneratedBatch = struct {
             alloc.free(@constCast(write.value));
         }
         if (self.artifact_writes.len > 0) alloc.free(self.artifact_writes);
+        for (self.artifact_delete_keys) |key| alloc.free(key);
+        if (self.artifact_delete_keys.len > 0) alloc.free(self.artifact_delete_keys);
 
         var derived_batch = derived_types.DerivedBatch{
             .documents = self.documents,
@@ -12494,6 +12516,7 @@ const PrecomputedGeneratedBatch = struct {
 fn appendPrecomputedGraphSourceArtifacts(
     self: *DB,
     artifact_writes: []const types.BatchWrite,
+    artifact_delete_keys: []const []const u8,
     owned_graph_artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
     delete_keys: *std.ArrayListUnmanaged([]const u8),
@@ -12503,22 +12526,40 @@ fn appendPrecomputedGraphSourceArtifacts(
     if (!self.core.hasGraphIndexes()) return;
 
     for (artifact_writes) |artifact_write| {
-        if (!internal_keys.isAssetArtifactKey(artifact_write.key)) continue;
-        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(self.alloc, artifact_write.key)) orelse continue;
-        defer artifact_ref.deinit(self.alloc);
-        if (artifact_ref.kind != .asset) continue;
+        try appendPrecomputedGraphSourceArtifactKey(self, artifact_write.key, artifact_write.value, owned_graph_artifact_writes, store_writes, delete_keys, owned_delete_keys, changed_artifact_keys);
+    }
+    for (artifact_delete_keys) |artifact_key| {
+        try appendPrecomputedGraphSourceArtifactKey(self, artifact_key, null, owned_graph_artifact_writes, store_writes, delete_keys, owned_delete_keys, changed_artifact_keys);
+    }
+}
 
-        for (self.core.graphIndexes()) |graph_entry| {
-            const source = graph_entry.artifact_source orelse continue;
-            if (!std.mem.eql(u8, source.artifact_name, artifact_ref.name)) continue;
+fn appendPrecomputedGraphSourceArtifactKey(
+    self: *DB,
+    artifact_key: []const u8,
+    artifact_value: ?[]const u8,
+    owned_graph_artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+    changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    if (!internal_keys.isAssetArtifactKey(artifact_key)) return;
+    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(self.alloc, artifact_key)) orelse return;
+    defer artifact_ref.deinit(self.alloc);
+    if (artifact_ref.kind != .asset) return;
 
+    for (self.core.graphIndexes()) |graph_entry| {
+        const source = graph_entry.artifact_source orelse continue;
+        if (!std.mem.eql(u8, source.artifact_name, artifact_ref.name)) continue;
+
+        var graph_store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer graph_store_writes.deinit(self.alloc);
+
+        if (artifact_value) |value| {
             const raw_doc = try batchDocumentValueForGraphSource(self.alloc, self.core.store, store_writes.items, artifact_ref.document_id);
-            defer if (raw_doc) |value| self.alloc.free(value);
-            const graph_writes = try graphWritesFromArtifactValueAlloc(self.alloc, graph_entry.config.name, artifact_ref.document_id, artifact_write.value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
+            defer if (raw_doc) |doc_value| self.alloc.free(doc_value);
+            const graph_writes = try graphWritesFromArtifactValueAlloc(self.alloc, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
             defer freeGraphWrites(self.alloc, graph_writes);
-
-            var graph_store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-            defer graph_store_writes.deinit(self.alloc);
             for (graph_writes) |write| {
                 const key = try internal_keys.graphEdgeArtifactKeyAlloc(self.alloc, write.source, write.index_name, write.edge_type, write.target);
                 var key_owned = true;
@@ -12533,43 +12574,43 @@ fn appendPrecomputedGraphSourceArtifacts(
                 try store_writes.append(self.alloc, .{ .key = key, .value = payload });
                 try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, key);
             }
-
-            const state_key = try graphAssetStateKeyAlloc(self.alloc, artifact_ref.document_id, graph_entry.config.name, artifact_ref.name);
-            defer self.alloc.free(state_key);
-            if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
-                defer freeOwnedConstKeySlice(self.alloc, previous_keys);
-                for (previous_keys) |previous_key| {
-                    if (containsStoreWriteKey(graph_store_writes.items, previous_key)) continue;
-                    if (containsOwnedKey(owned_delete_keys.items, previous_key)) continue;
-                    const owned_key = try self.alloc.dupe(u8, previous_key);
-                    try owned_delete_keys.append(self.alloc, owned_key);
-                    try delete_keys.append(self.alloc, owned_key);
-                    try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, previous_key);
-                }
-            } else {
-                const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, artifact_ref.document_id, graph_entry.config.name);
-                defer docstore_mod.DocStore.freeResults(self.alloc, existing);
-                for (existing) |entry| {
-                    if (containsStoreWriteKey(graph_store_writes.items, entry.key)) continue;
-                    if (containsOwnedKey(owned_delete_keys.items, entry.key)) continue;
-                    const owned_key = try self.alloc.dupe(u8, entry.key);
-                    try owned_delete_keys.append(self.alloc, owned_key);
-                    try delete_keys.append(self.alloc, owned_key);
-                    try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, entry.key);
-                }
-            }
-
-            const state_value = try encodeGraphAssetStateKeysAlloc(self.alloc, graph_store_writes.items);
-            var state_value_owned = true;
-            errdefer if (state_value_owned) self.alloc.free(state_value);
-            const state_key_owned = try self.alloc.dupe(u8, state_key);
-            var state_key_owned_flag = true;
-            errdefer if (state_key_owned_flag) self.alloc.free(state_key_owned);
-            try owned_graph_artifact_writes.append(self.alloc, .{ .key = state_key_owned, .value = state_value });
-            state_value_owned = false;
-            state_key_owned_flag = false;
-            try store_writes.append(self.alloc, .{ .key = state_key_owned, .value = state_value });
         }
+
+        const state_key = try graphAssetStateKeyAlloc(self.alloc, artifact_ref.document_id, graph_entry.config.name, artifact_ref.name);
+        defer self.alloc.free(state_key);
+        if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
+            defer freeOwnedConstKeySlice(self.alloc, previous_keys);
+            for (previous_keys) |previous_key| {
+                if (containsStoreWriteKey(graph_store_writes.items, previous_key)) continue;
+                if (containsOwnedKey(owned_delete_keys.items, previous_key)) continue;
+                const owned_key = try self.alloc.dupe(u8, previous_key);
+                try owned_delete_keys.append(self.alloc, owned_key);
+                try delete_keys.append(self.alloc, owned_key);
+                try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, previous_key);
+            }
+        } else {
+            const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, artifact_ref.document_id, graph_entry.config.name);
+            defer docstore_mod.DocStore.freeResults(self.alloc, existing);
+            for (existing) |entry| {
+                if (containsStoreWriteKey(graph_store_writes.items, entry.key)) continue;
+                if (containsOwnedKey(owned_delete_keys.items, entry.key)) continue;
+                const owned_key = try self.alloc.dupe(u8, entry.key);
+                try owned_delete_keys.append(self.alloc, owned_key);
+                try delete_keys.append(self.alloc, owned_key);
+                try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, entry.key);
+            }
+        }
+
+        const state_value = try encodeGraphAssetStateKeysAlloc(self.alloc, graph_store_writes.items);
+        var state_value_owned = true;
+        errdefer if (state_value_owned) self.alloc.free(state_value);
+        const state_key_owned = try self.alloc.dupe(u8, state_key);
+        var state_key_owned_flag = true;
+        errdefer if (state_key_owned_flag) self.alloc.free(state_key_owned);
+        try owned_graph_artifact_writes.append(self.alloc, .{ .key = state_key_owned, .value = state_value });
+        state_value_owned = false;
+        state_key_owned_flag = false;
+        try store_writes.append(self.alloc, .{ .key = state_key_owned, .value = state_value });
     }
 }
 
@@ -13379,20 +13420,51 @@ fn collectAndDeleteEnrichmentArtifactsForDocContext(
     doc_key: []const u8,
     deleted: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    const prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
-    defer alloc.free(prefix);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var unrecorded_delete_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (unrecorded_delete_keys.items) |key| alloc.free(key);
+        unrecorded_delete_keys.deinit(alloc);
+    }
+
+    const artifact_prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
+    defer alloc.free(artifact_prefix);
+    try collectDeleteKeysForPrefix(alloc, store, artifact_prefix, &deletes, deleted, &unrecorded_delete_keys);
+
+    const asset_state_prefix = try internal_keys.assetStateRootPrefixAlloc(alloc, doc_key);
+    defer alloc.free(asset_state_prefix);
+    try collectDeleteKeysForPrefix(alloc, store, asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
+
+    const graph_asset_state_prefix = try internal_keys.graphAssetStateRootPrefixAlloc(alloc, doc_key);
+    defer alloc.free(graph_asset_state_prefix);
+    try collectDeleteKeysForPrefix(alloc, store, graph_asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
+
+    if (deletes.items.len > 0) {
+        try store.putBatch(&.{}, deletes.items);
+    }
+}
+
+fn collectDeleteKeysForPrefix(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    prefix: []const u8,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    recorded: ?*std.ArrayListUnmanaged([]u8),
+    unrecorded: *std.ArrayListUnmanaged([]u8),
+) !void {
     const existing = try store.scanPrefix(alloc, prefix);
     defer docstore_mod.DocStore.freeResults(alloc, existing);
-    if (existing.len == 0) return;
-
-    var deletes = try alloc.alloc([]const u8, existing.len);
-    defer alloc.free(deletes);
-    for (existing, 0..) |entry, i| {
-        const duped = try alloc.dupe(u8, entry.key);
-        deletes[i] = duped;
-        try deleted.append(alloc, duped);
+    for (existing) |entry| {
+        const owned = try alloc.dupe(u8, entry.key);
+        errdefer alloc.free(owned);
+        try deletes.append(alloc, owned);
+        if (recorded) |out| {
+            try out.append(alloc, owned);
+        } else {
+            try unrecorded.append(alloc, owned);
+        }
     }
-    try store.putBatch(&.{}, deletes);
 }
 
 fn collectGraphArtifactsForDocIndex(
@@ -23229,6 +23301,56 @@ test "db graph relation artifact materializer replaces stale document edges" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
 }
 
+test "db graph relation artifact materializer deletes edges when asset source disappears" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"}}]}}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"relations removed\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, asset_key));
+
+    const stale_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+    defer alloc.free(stale_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
+}
+
 test "db graph artifact source lifecycle reuses and protects asset enrichments" {
     const alloc = std.testing.allocator;
 
@@ -23936,6 +24058,22 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
     try std.testing.expectEqual(@as(usize, 2), fake.generator_calls);
     try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
     try std.testing.expectEqual(@as(usize, 1), fake.transcriber_calls);
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "generated_title_v1");
+    defer alloc.free(asset_key);
+    const state_key = try assetStateKeyAlloc(alloc, "doc:a", "generated_title_v1");
+    defer alloc.free(state_key);
+    const stored_asset = try db.core.store.get(alloc, asset_key);
+    alloc.free(stored_asset);
+    const stored_state = try db.core.store.get(alloc, state_key);
+    alloc.free(stored_state);
+
+    try db.batch(.{
+        .deletes = &.{"doc:a"},
+        .sync_level = .write,
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, asset_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
 }
 
 test "db extractEnrichments exposes cleaned writes and special fields" {
