@@ -4,3 +4,4 @@ self-hosted-runner:
     - arc-antfly-heavy
     - arc-antfly-docker
     - arc-antfly-publish
+    - arc-antfly-publish-arm64

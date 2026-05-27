@@ -65,20 +65,30 @@ type SuccessMessage = {
 
 type ClusterTopology = paths["/api/v1/cluster"]["get"]["responses"][200]["content"]["application/json"];
 
-function errorMessage(error: unknown): string {
-  if (!error) return "unknown error";
-  if (typeof error === "string") return error;
-  if (typeof error === "object") {
-    const record = error as Record<string, unknown>;
-    const detail = record.error ?? record.message ?? record.detail;
-    if (typeof detail === "string" && detail.length > 0) return detail;
+function apiErrorMessage(error: unknown, fallback = "unknown error"): string {
+  if (!error) return fallback;
+  if (typeof error === "string") return error.trim() || fallback;
+  if (error && typeof error === "object") {
+    const fields = error as {
+      error?: unknown;
+      detail?: unknown;
+      message?: unknown;
+      title?: unknown;
+    };
+    for (const value of [fields.error, fields.detail, fields.message, fields.title]) {
+      if (typeof value === "string" && value.trim()) return value;
+    }
     try {
       return JSON.stringify(error);
     } catch {
-      return "unserializable error";
+      return fallback;
     }
   }
   return String(error);
+}
+
+function errorMessage(error: unknown): string {
+  return apiErrorMessage(error);
 }
 
 export class AntflyClient {
@@ -582,7 +592,9 @@ export class AntflyClient {
         params: { path: { tableName } },
         body: config,
       });
-      if (error) throw new Error(`Failed to create table: ${error.error}`);
+      if (error) {
+        throw new Error(`Failed to create table: ${apiErrorMessage(error, "unknown error")}`);
+      }
       return data;
     },
 
