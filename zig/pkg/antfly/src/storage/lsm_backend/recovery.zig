@@ -31,7 +31,13 @@ fn lockHostOpenPathGate(root_dir: []const u8) *std.atomic.Mutex {
 }
 
 pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !BackendType {
-    var backend = BackendType.init(allocator, backend_options);
+    var backend: BackendType = undefined;
+    try openInto(BackendType, &backend, allocator, root_dir, options, backend_options);
+    return backend;
+}
+
+pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !void {
+    backend.* = BackendType.init(allocator, backend_options);
     backend.root_dir = try allocator.dupe(u8, root_dir);
 
     // Host storage can race same-path recovery with create-table/read/write opens.
@@ -50,7 +56,7 @@ pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const 
         backend.storage_owner = owned;
         backend.storage = owned.storage();
     }
-    errdefer cleanup(BackendType, &backend, false);
+    errdefer cleanup(BackendType, backend, false);
 
     const loaded_manifest = try repository_mod.loadManifestIfPresentWithStorage(
         backend.storage.?,
@@ -65,8 +71,8 @@ pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const 
         try repository_mod.ensureOpenDirsWithStorage(backend.storage.?, root_dir);
     }
     {
-        const locked = runtime_mod.lockBackend(BackendType, &backend);
-        defer runtime_mod.unlockBackend(BackendType, &backend, locked);
+        const locked = runtime_mod.lockBackend(BackendType, backend);
+        defer runtime_mod.unlockBackend(BackendType, backend, locked);
 
         if (@hasDecl(BackendType, "replayWalIntoMutable")) {
             try backend.replayWalIntoMutable();
@@ -76,7 +82,6 @@ pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const 
     if (@hasDecl(BackendType, "refreshMaintenanceDebtHint")) {
         backend.refreshMaintenanceDebtHint();
     }
-    return backend;
 }
 
 pub fn close(comptime BackendType: type, backend: *BackendType) void {
