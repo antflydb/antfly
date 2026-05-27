@@ -1555,6 +1555,32 @@ pub const ApiHttpServer = struct {
             }
             return try jsonResponse(self.alloc, public_status);
         }
+        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.cluster)) {
+            const metadata_status = try self.source.status();
+            var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
+            defer public_status.deinit(self.alloc);
+            public_status.auth_enabled = self.cfg.auth_enabled;
+            public_status.swarm_mode = self.cfg.swarm_mode;
+            if (self.cfg.secret_store) |secret_store| {
+                _ = secret_store.refreshIfChanged() catch |err| {
+                    std.log.warn("secret store status refresh skipped err={}", .{err});
+                };
+                cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+            }
+            var snapshot_opt = try self.source.cachedAdminSnapshot();
+            if (snapshot_opt == null) {
+                snapshot_opt = try self.source.adminSnapshot();
+            }
+            if (snapshot_opt) |*snapshot| {
+                defer self.source.freeAdminSnapshot(snapshot);
+                var topology_status = try cluster.topologyFromStatusAndSnapshot(self.alloc, public_status, snapshot);
+                defer topology_status.deinit(self.alloc);
+                return try jsonResponse(self.alloc, topology_status);
+            }
+            var topology_status = try cluster.topologyFromStatus(self.alloc, public_status);
+            defer topology_status.deinit(self.alloc);
+            return try jsonResponse(self.alloc, topology_status);
+        }
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         try self.runSessionMaintenanceOnce();
@@ -6939,6 +6965,15 @@ test "api http server serves status" {
     var parsed = try std.json.parseFromSlice(cluster.ClusterStatus, std.testing.allocator, resp.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(cluster.ClusterHealth.healthy, parsed.value.health);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"data\"") == null);
+
+    var cluster_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.cluster });
+    defer cluster_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), cluster_resp.status);
+    var parsed_cluster = try std.json.parseFromSlice(cluster.ClusterTopology, std.testing.allocator, cluster_resp.body, .{});
+    defer parsed_cluster.deinit();
+    try std.testing.expectEqual(cluster.ClusterHealth.healthy, parsed_cluster.value.health);
+    try std.testing.expectEqual(@as(usize, 0), parsed_cluster.value.data.nodes.len);
 
     var healthz = try server.handle(.{ .method = .GET, .uri = routes.Routes.healthz });
     defer healthz.deinit(std.testing.allocator);
@@ -6961,7 +6996,7 @@ test "api http server serves status" {
     try std.testing.expectEqual(@as(u16, 404), prefixed_readyz.status);
 
     const request_stats = server.requestStats();
-    try std.testing.expectEqual(@as(u64, 5), request_stats.request_count);
+    try std.testing.expectEqual(@as(u64, 6), request_stats.request_count);
     try std.testing.expect(request_stats.first_request_started_at_ns >= server.created_at_ns);
 }
 

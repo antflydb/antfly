@@ -63,6 +63,24 @@ type SuccessMessage = {
   message?: string;
 };
 
+type ClusterTopology = paths["/api/v1/cluster"]["get"]["responses"][200]["content"]["application/json"];
+
+function errorMessage(error: unknown): string {
+  if (!error) return "unknown error";
+  if (typeof error === "string") return error;
+  if (typeof error === "object") {
+    const record = error as Record<string, unknown>;
+    const detail = record.error ?? record.message ?? record.detail;
+    if (typeof detail === "string" && detail.length > 0) return detail;
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return "unserializable error";
+    }
+  }
+  return String(error);
+}
+
 export class AntflyClient {
   private client: Client<paths>;
   private config: AntflyConfig;
@@ -145,7 +163,16 @@ export class AntflyClient {
    */
   async getStatus() {
     const { data, error } = await this.client.GET("/api/v1/status");
-    if (error) throw new Error(`Failed to get status: ${error.error}`);
+    if (error) throw new Error(`Failed to get status: ${errorMessage(error)}`);
+    return data;
+  }
+
+  /**
+   * Get cluster topology and data placement status.
+   */
+  async getClusterStatus(): Promise<ClusterTopology | undefined> {
+    const { data, error } = await this.client.GET("/api/v1/cluster");
+    if (error) throw new Error(`Failed to get cluster: ${errorMessage(error)}`);
     return data;
   }
 

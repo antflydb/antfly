@@ -2073,7 +2073,7 @@ paths:
       summary: Get cluster status
       tags:
         - cluster_management
-      description: Returns the current health and status of all stores and shards in the cluster
+      description: Returns minimal cluster health and runtime status.
       operationId: getStatus
       responses:
         '200':
@@ -2082,6 +2082,33 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ClusterStatus'
+        '401':
+          description: Unauthorized - authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /api/v1/cluster:
+    get:
+      summary: Get cluster topology
+      tags:
+        - cluster_management
+      description: Returns cluster health plus data-node, range, replica, and group topology for dashboard
+        views.
+      operationId: getCluster
+      responses:
+        '200':
+          description: Cluster topology retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterTopology'
         '401':
           description: Unauthorized - authentication required
           content:
@@ -6019,6 +6046,211 @@ components:
           x-omitzero: false
         secret_store:
           $ref: '#/components/schemas/SecretStoreStatus'
+    ClusterTopology:
+      type: object
+      required:
+        - health
+        - data
+      additionalProperties: true
+      properties:
+        health:
+          $ref: '#/components/schemas/ClusterHealth'
+        message:
+          type: string
+          description: Optional message providing details about the health status
+        auth_enabled:
+          type: boolean
+          description: Indicates whether authentication is enabled for the cluster
+          x-omitzero: false
+        swarm_mode:
+          type: boolean
+          description: Indicates whether the cluster is running in single-node swarm mode
+          x-omitzero: false
+        secret_store:
+          $ref: '#/components/schemas/SecretStoreStatus'
+        data:
+          $ref: '#/components/schemas/ClusterDataStatus'
+    ClusterDataStatus:
+      type: object
+      description: Typed Zig status view for table data topology and range placement.
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterDataNodeStatus'
+        ranges:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterDataRangeStatus'
+        replicas:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterDataReplicaStatus'
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterDataGroupStatus'
+    ClusterDataNodeStatus:
+      type: object
+      required:
+        - data_id
+        - node_id
+      properties:
+        data_id:
+          type: integer
+          format: uint64
+        node_id:
+          type: integer
+          format: uint64
+        api_url:
+          type: string
+        raft_url:
+          type: string
+        role:
+          type: string
+        state:
+          type: string
+        health_class:
+          type: string
+        failure_domain:
+          type: string
+        live:
+          type: boolean
+        drain_requested:
+          type: boolean
+        capacity_bytes:
+          type: integer
+          format: uint64
+        available_bytes:
+          type: integer
+          format: uint64
+        lease_pressure:
+          type: integer
+          format: uint32
+        read_load:
+          type: integer
+          format: uint32
+        write_load:
+          type: integer
+          format: uint32
+        active_backfills:
+          type: integer
+          format: uint32
+    ClusterDataRangeStatus:
+      type: object
+      required:
+        - group_id
+        - range_id
+        - table_id
+      properties:
+        group_id:
+          type: integer
+          format: uint64
+        range_id:
+          type: integer
+          format: uint64
+        table_id:
+          type: integer
+          format: uint64
+        table_name:
+          type: string
+        start_key:
+          type: string
+        end_key:
+          type: string
+          nullable: true
+        doc_identity_shard_id:
+          type: integer
+          format: uint64
+        doc_identity_range_id:
+          type: integer
+          format: uint64
+        state:
+          type: string
+        leader_data_id:
+          type: integer
+          format: uint64
+          nullable: true
+        voter_count:
+          type: integer
+          format: uint32
+        doc_count:
+          type: integer
+          format: uint64
+        disk_bytes:
+          type: integer
+          format: uint64
+        empty:
+          type: boolean
+    ClusterDataReplicaStatus:
+      type: object
+      required:
+        - group_id
+        - data_id
+        - node_id
+        - replica_id
+      properties:
+        group_id:
+          type: integer
+          format: uint64
+        data_id:
+          type: integer
+          format: uint64
+        node_id:
+          type: integer
+          format: uint64
+        replica_id:
+          type: integer
+          format: uint64
+        peer_node_ids:
+          type: array
+          items:
+            type: integer
+            format: uint64
+    ClusterDataGroupStatus:
+      type: object
+      required:
+        - group_id
+      properties:
+        group_id:
+          type: integer
+          format: uint64
+        leader_known:
+          type: boolean
+        leader_data_id:
+          type: integer
+          format: uint64
+          nullable: true
+        voter_count_known:
+          type: boolean
+        voter_count:
+          type: integer
+          format: uint32
+        healthy_voter_reports:
+          type: integer
+          format: uint32
+        joint_consensus:
+          type: boolean
+        transition_pending:
+          type: boolean
+        replay_required:
+          type: boolean
+        replay_caught_up:
+          type: boolean
+        cutover_ready:
+          type: boolean
+        reads_ready_after_cutover:
+          type: boolean
+        doc_identity_lifecycle:
+          type: string
+        doc_count:
+          type: integer
+          format: uint64
+        disk_bytes:
+          type: integer
+          format: uint64
+        empty:
+          type: boolean
     SecretStoreStatus:
       type: object
       description: Non-secret status for the local secrets file store, when one is available.
