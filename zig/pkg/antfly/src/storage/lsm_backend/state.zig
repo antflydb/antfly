@@ -419,7 +419,7 @@ pub fn applyState(target: *State, allocator: Allocator, source: anytype) !void {
 }
 
 pub fn sortStateEntries(state: *State) void {
-    std.mem.sort(OwnedEntry, state.entries.items, {}, struct {
+    std.sort.heap(OwnedEntry, state.entries.items, {}, struct {
         fn lessThan(_: void, a: OwnedEntry, b: OwnedEntry) bool {
             const namespace_order = compareNamespace(namespaceOf(a), namespaceOf(b));
             if (namespace_order != .eq) return namespace_order == .lt;
