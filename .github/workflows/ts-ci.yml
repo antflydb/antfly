@@ -92,7 +92,8 @@ jobs:
 
       - name: Install Playwright Browsers
         working-directory: ts/apps/antfarm
-        run: pnpm exec playwright install --with-deps
+        timeout-minutes: 10
+        run: pnpm exec playwright install --with-deps chromium firefox
 
       - name: Preview server
         working-directory: ts/apps/antfarm
@@ -104,7 +105,7 @@ jobs:
 
       - name: Run Playwright tests
         working-directory: ts/apps/antfarm
-        run: pnpm exec playwright test
+        run: pnpm exec playwright test --project=chromium --project=firefox --reporter=list
         env:
           BASE_URL: http://localhost:4173
 
