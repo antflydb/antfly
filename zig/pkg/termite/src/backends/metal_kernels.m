@@ -712,6 +712,7 @@ typedef struct termite_metal_decode_runtime {
     uint64_t last_frame_planned_command_op_count;
     id<MTLComputeCommandEncoder> active_planned_compute_encoder;
     bool active_planned_compute_scope_closed_for_encoder_transition;
+    uint32_t planned_compute_barrier_suppression_depth;
     size_t active_planned_compute_source;
     size_t active_planned_compute_region;
     termite_metal_planned_encoder_range active_planned_compute_ranges[TERMITE_METAL_PLANNED_RANGE_CAPACITY];
@@ -4495,9 +4496,10 @@ static bool termite_metal_coalesce_planned_compute_encoders_enabled(void) {
     return disabled == NULL || disabled[0] == '\0' || strcmp(disabled, "0") == 0;
 }
 
-static bool termite_metal_planned_compute_barriers_enabled(void) {
+static bool termite_metal_planned_compute_barriers_enabled(termite_metal_decode_runtime *runtime) {
     const char *disabled = getenv("TERMITE_METAL_DISABLE_PLANNED_COMPUTE_BARRIERS");
     if (disabled != NULL && disabled[0] != '\0' && strcmp(disabled, "0") != 0) return false;
+    if (runtime != NULL && runtime->planned_compute_barrier_suppression_depth != 0) return false;
     return true;
 }
 
@@ -4578,7 +4580,7 @@ static int termite_metal_decode_runtime_prepare_planned_compute_accesses(
     if (conflict || runtime->active_planned_compute_range_count + access_count > TERMITE_METAL_PLANNED_RANGE_CAPACITY) {
         id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
         if (encoder == nil) return failure_code;
-        if (termite_metal_planned_compute_barriers_enabled()) {
+        if (termite_metal_planned_compute_barriers_enabled(runtime)) {
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             runtime->active_frame_planned_barrier_count += 1;
         }
@@ -5095,11 +5097,25 @@ int termite_metal_decode_runtime_planned_compute_barrier(termite_metal_decode_ru
         if (runtime->active_planned_compute_scope_closed_for_encoder_transition) return 0;
         return -3;
     }
-    if (termite_metal_planned_compute_barriers_enabled()) {
+    if (termite_metal_planned_compute_barriers_enabled(runtime)) {
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         runtime->active_frame_planned_barrier_count += 1;
     }
     termite_metal_decode_runtime_reset_planned_compute_ranges(runtime);
+    return 0;
+}
+
+int termite_metal_decode_runtime_push_planned_compute_barrier_suppression(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL) return -1;
+    if (runtime->planned_compute_barrier_suppression_depth == UINT32_MAX) return -2;
+    runtime->planned_compute_barrier_suppression_depth += 1;
+    return 0;
+}
+
+int termite_metal_decode_runtime_pop_planned_compute_barrier_suppression(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL) return -1;
+    if (runtime->planned_compute_barrier_suppression_depth == 0) return -2;
+    runtime->planned_compute_barrier_suppression_depth -= 1;
     return 0;
 }
 
@@ -33071,6 +33087,7 @@ int termite_metal_decode_runtime_begin_frame(termite_metal_decode_runtime *runti
         runtime->active_planned_compute_encoder = nil;
         termite_metal_decode_runtime_reset_planned_compute_ranges(runtime);
         runtime->active_planned_compute_scope_closed_for_encoder_transition = false;
+        runtime->planned_compute_barrier_suppression_depth = 0;
         runtime->active_planned_compute_source = TERMITE_METAL_COMPUTE_SOURCE_OTHER;
         runtime->active_planned_compute_region = TERMITE_METAL_COMPUTE_REGION_OTHER;
         runtime->active_compute_region = TERMITE_METAL_COMPUTE_REGION_OTHER;
@@ -33133,6 +33150,7 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
     runtime->active_planned_compute_encoder = nil;
     termite_metal_decode_runtime_reset_planned_compute_ranges(runtime);
     runtime->active_planned_compute_scope_closed_for_encoder_transition = false;
+    runtime->planned_compute_barrier_suppression_depth = 0;
     runtime->active_planned_compute_source = TERMITE_METAL_COMPUTE_SOURCE_OTHER;
     runtime->active_planned_compute_region = TERMITE_METAL_COMPUTE_REGION_OTHER;
     runtime->active_compute_region = TERMITE_METAL_COMPUTE_REGION_OTHER;
@@ -33171,6 +33189,7 @@ int termite_metal_decode_runtime_cancel_frame(termite_metal_decode_runtime *runt
     }
     termite_metal_decode_runtime_reset_planned_compute_ranges(runtime);
     runtime->active_planned_compute_scope_closed_for_encoder_transition = false;
+    runtime->planned_compute_barrier_suppression_depth = 0;
     runtime->active_frame_cb = nil;
     runtime->active_frame_compute_encoder_count = 0;
     runtime->active_frame_blit_encoder_count = 0;

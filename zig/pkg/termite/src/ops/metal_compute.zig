@@ -127,6 +127,10 @@ fn metalPrefillTraceRequested() bool {
     return getenvBool("TERMITE_METAL_PREFILL_TRACE");
 }
 
+fn glinerDebertaSuppressPlannedComputeBarriers() bool {
+    return !getenvBool("TERMITE_METAL_GLINER_KEEP_PLANNED_COMPUTE_BARRIERS");
+}
+
 fn traceMetalPrefillFramePlan(comptime fmt: []const u8, args: anytype) void {
     if (!metalPrefillTraceRequested()) return;
     std.debug.print("prefill-trace: metal-prefill-frame-plan " ++ fmt ++ "\n", args);
@@ -17443,6 +17447,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (request.num_attention_heads * request.head_dim != request.hidden_size) return null;
         if (request.relative_unique_count == 0 or request.relative_full_count == 0) return null;
         const rows = try std.math.mul(usize, request.batch, request.seq_len);
+        const runtime = self.provider_impl.raw_decode_runtime;
+        var suppress_planned_barriers = false;
+        if (glinerDebertaSuppressPlannedComputeBarriers() and metal_runtime.hasActiveFrame(runtime)) {
+            metal_runtime.pushPlannedComputeBarrierSuppression(runtime) catch return null;
+            suppress_planned_barriers = true;
+        }
+        defer if (suppress_planned_barriers) {
+            metal_runtime.popPlannedComputeBarrierSuppression(runtime) catch {};
+        };
 
         const layer_scope = self.beginActivePlannedComputeScopeIfPossible(.layer, .layer);
         defer self.endActivePlannedComputeScope(layer_scope);
@@ -18093,6 +18106,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const runtime = self.provider_impl.raw_decode_runtime orelse return false;
         return try self.beginDecoderRuntimeFrame(runtime);
+    }
+
+    fn decoderRuntimePushPlannedComputeBarrierSuppressionOp(ctx: *anyopaque) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (!metal_runtime.hasActiveFrame(runtime)) return false;
+        try metal_runtime.pushPlannedComputeBarrierSuppression(runtime);
+        return true;
+    }
+
+    fn decoderRuntimePopPlannedComputeBarrierSuppressionOp(ctx: *anyopaque) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        try metal_runtime.popPlannedComputeBarrierSuppression(runtime);
     }
 
     fn decoderRuntimeHasActiveFrameOp(ctx: *anyopaque) bool {
@@ -19306,6 +19333,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.debertaEncoderPlanFrame = debertaEncoderPlanFrameOp;
         vt.debertaEncoderLayer = debertaEncoderLayerOp;
         vt.decoderRuntimeBeginFrame = decoderRuntimeBeginFrameOp;
+        vt.decoderRuntimePushPlannedComputeBarrierSuppression = decoderRuntimePushPlannedComputeBarrierSuppressionOp;
+        vt.decoderRuntimePopPlannedComputeBarrierSuppression = decoderRuntimePopPlannedComputeBarrierSuppressionOp;
         vt.decoderRuntimeHasActiveFrame = decoderRuntimeHasActiveFrameOp;
         vt.decoderRuntimeSubmitAndWaitFrame = decoderRuntimeSubmitAndWaitFrameOp;
         vt.decoderRuntimeFlushActiveFrame = decoderRuntimeFlushActiveFrameOp;

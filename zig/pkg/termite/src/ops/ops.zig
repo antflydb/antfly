@@ -775,6 +775,16 @@ pub const ComputeBackend = struct {
         return op(self.ptr, slots);
     }
 
+    pub fn decoderRuntimePushPlannedComputeBarrierSuppression(self: *const ComputeBackend) !bool {
+        const op = self.vtable.decoderRuntimePushPlannedComputeBarrierSuppression orelse return false;
+        return op(self.ptr);
+    }
+
+    pub fn decoderRuntimePopPlannedComputeBarrierSuppression(self: *const ComputeBackend) !void {
+        const op = self.vtable.decoderRuntimePopPlannedComputeBarrierSuppression orelse return;
+        return op(self.ptr);
+    }
+
     pub fn tryConvertDType(self: *const ComputeBackend, tensor: CT, target: GraphDType) !?CT {
         const op = self.vtable.convertDType orelse return null;
         return op(self.ptr, tensor, target);
@@ -801,6 +811,12 @@ pub const ComputeBackend = struct {
         /// Reserve backend-owned graph-plan scratch/storage slots before a
         /// partition executes. Metal maps these to persistent MTLBuffer slots.
         reserveGraphPlanSlots: ?*const fn (ctx: *anyopaque, slots: []const GraphPlanSlot) anyerror!bool = null,
+
+        /// Temporarily suppress planned compute barriers for a backend-owned
+        /// frame whose caller has stronger model-specific ordering knowledge.
+        decoderRuntimePushPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        decoderRuntimePopPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
 
         /// Look up a named weight tensor. Returned tensor is borrowed (do NOT free).

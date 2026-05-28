@@ -137,6 +137,10 @@ fn glinerSessionFrameEnabled() bool {
     return true;
 }
 
+fn glinerSuppressPlannedComputeBarriers() bool {
+    return !platform.env.getenvBool("TERMITE_METAL_GLINER_KEEP_PLANNED_COMPUTE_BARRIERS");
+}
+
 fn glinerDenseQkvScratchEnabled() bool {
     return !platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED");
 }
@@ -5299,10 +5303,15 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const metal_profile_before = if (profile_enabled or audit_enabled) cb.debugTimingSnapshot() else ops.BackendDebugTimingSnapshot{};
             _ = try deberta_arch.preplanMetalDebertaEncoderFrame(&cb, allocator, cfg, batch, seq_len);
             var session_frame_active = false;
+            var session_barriers_suppressed = false;
             if (cb.kind() == .metal and glinerSessionFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
                 _ = reserveGlinerSessionScratch(&cb, batch, seq_len, span_idx, cfg);
                 session_frame_active = try cb.decoderRuntimeBeginFrame();
+                if (session_frame_active and glinerSuppressPlannedComputeBarriers()) {
+                    session_barriers_suppressed = try cb.decoderRuntimePushPlannedComputeBarrierSuppression();
+                }
             }
+            errdefer if (session_barriers_suppressed) cb.decoderRuntimePopPlannedComputeBarrierSuppression() catch {};
             errdefer if (session_frame_active) cb.decoderRuntimeCancelFrame() catch {};
             const encoder_start_ns = glinerProfileNowNs();
             var encoder_profile: deberta_arch.EncoderProfile = .{};
@@ -5325,6 +5334,10 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
 
             var session_frame_wait_ms: f64 = 0.0;
             if (session_frame_active) {
+                if (session_barriers_suppressed) {
+                    try cb.decoderRuntimePopPlannedComputeBarrierSuppression();
+                    session_barriers_suppressed = false;
+                }
                 const frame_wait_start_ns = glinerProfileNowNs();
                 try cb.decoderRuntimeSubmitAndWaitFrame();
                 session_frame_wait_ms = glinerProfileElapsedMs(frame_wait_start_ns);

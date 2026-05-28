@@ -78,6 +78,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zig-global-cache-dir", default="/private/tmp/termite-zig-cache-gliner2-bench/global")
     parser.add_argument("--metal-debug", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--metal-timeout", type=int, default=180)
+    parser.add_argument("--zig-release", choices=("fast", "safe", "small"), default=None)
+    parser.add_argument("--extra-zig-build-arg", action="append", default=[])
     parser.add_argument("--extra-zig-arg", action="append", default=[])
     return parser.parse_args()
 
@@ -257,6 +259,11 @@ def run_zig(
         "-Dmlx=false",
         "-Donnx=false",
         "-Dmetal=true",
+    ]
+    if args.zig_release:
+        cmd.append(f"--release={args.zig_release}")
+    cmd.extend(args.extra_zig_build_arg)
+    cmd.extend([
         "bench-gliner2-e2e",
         "--",
         "--model-dir",
@@ -273,7 +280,7 @@ def run_zig(
         "csv",
         "--text",
         args.text,
-    ]
+    ])
     if graph_runtime:
         cmd.extend(["--graph-runtime", graph_runtime])
     for label in labels:

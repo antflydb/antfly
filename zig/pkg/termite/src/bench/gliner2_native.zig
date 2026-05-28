@@ -30,6 +30,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const platform = @import("antfly_platform");
 
 const termite_internal = @import("termite_internal");
 const deberta_arch = termite_internal.architectures.deberta;
@@ -98,6 +99,10 @@ const BenchConfig = struct {
     matrix: bool = false,
     format: OutputFormat = .text,
 };
+
+fn glinerSuppressPlannedComputeBarriers() bool {
+    return !platform.env.getenvBool("TERMITE_METAL_GLINER_KEEP_PLANNED_COMPUTE_BARRIERS");
+}
 
 fn parseArgs(init: std.process.Init) !BenchConfig {
     var cfg = BenchConfig{};
@@ -828,13 +833,18 @@ fn runForwardTimed(
     const total_start = nowNs();
 
     var session_frame_active = false;
+    var session_barriers_suppressed = false;
     if (cb.kind() == .metal) {
         _ = try deberta_arch.preplanMetalDebertaEncoderFrame(cb, allocator, deberta_cfg, cfg.batch, cfg.seq_len);
         _ = reserveBenchmarkGlinerSessionScratch(cb, cfg, inputs.span_idx);
         if (!cb.decoderRuntimeHasActiveFrame()) {
             session_frame_active = try cb.decoderRuntimeBeginFrame();
+            if (session_frame_active and glinerSuppressPlannedComputeBarriers()) {
+                session_barriers_suppressed = try cb.decoderRuntimePushPlannedComputeBarrierSuppression();
+            }
         }
     }
+    errdefer if (session_barriers_suppressed) cb.decoderRuntimePopPlannedComputeBarrierSuppression() catch {};
     errdefer if (session_frame_active) cb.decoderRuntimeCancelFrame() catch {};
 
     var timing = ForwardTiming{};
@@ -882,6 +892,10 @@ fn runForwardTimed(
     timing.head_profile = head_profile;
 
     if (session_frame_active) {
+        if (session_barriers_suppressed) {
+            try cb.decoderRuntimePopPlannedComputeBarrierSuppression();
+            session_barriers_suppressed = false;
+        }
         try cb.decoderRuntimeSubmitAndWaitFrame();
         session_frame_active = false;
     }

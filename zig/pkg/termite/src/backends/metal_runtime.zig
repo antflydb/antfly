@@ -5668,6 +5668,8 @@ pub extern fn termite_metal_decode_runtime_pop_compute_region(runtime: ?*RawMeta
 pub extern fn termite_metal_decode_runtime_begin_planned_compute_scope(runtime: ?*RawMetalDecodeRuntime, source: usize, region: usize) c_int;
 pub extern fn termite_metal_decode_runtime_planned_compute_barrier(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_end_planned_compute_scope(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_push_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_pop_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_frame_cb_count(runtime: ?*RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_last_frame_gpu_nanos(runtime: ?*RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_memory_snapshot(
@@ -5937,6 +5939,22 @@ pub fn plannedComputeBarrier(runtime: ?*RawMetalDecodeRuntime) FrameError!void {
         -1 => FrameError.RuntimeUnavailable,
         -2 => FrameError.FrameNotActive,
         -3 => FrameError.PlannedScopeNotActive,
+        else => FrameError.SubmissionFailed,
+    };
+}
+
+pub fn pushPlannedComputeBarrierSuppression(runtime: ?*RawMetalDecodeRuntime) FrameError!void {
+    return switch (termite_metal_decode_runtime_push_planned_compute_barrier_suppression(runtime)) {
+        0 => {},
+        -1 => FrameError.RuntimeUnavailable,
+        else => FrameError.SubmissionFailed,
+    };
+}
+
+pub fn popPlannedComputeBarrierSuppression(runtime: ?*RawMetalDecodeRuntime) FrameError!void {
+    return switch (termite_metal_decode_runtime_pop_planned_compute_barrier_suppression(runtime)) {
+        0 => {},
+        -1 => FrameError.RuntimeUnavailable,
         else => FrameError.SubmissionFailed,
     };
 }
