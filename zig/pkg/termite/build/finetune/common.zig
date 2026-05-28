@@ -186,6 +186,7 @@ fn configureNativeTool(ctx: Context, artifact: *std.Build.Step.Compile, enable_m
 
 fn configureSystemBlas(ctx: Context, module: *std.Build.Module) void {
     if (ctx.target.result.os.tag == .macos) {
+        addMacosSdkPaths(ctx, module);
         module.linkFramework("Accelerate", .{});
         return;
     }
@@ -199,6 +200,7 @@ fn configureSystemBlas(ctx: Context, module: *std.Build.Module) void {
 
 fn configureMetal(ctx: Context, module: *std.Build.Module, enable_metal: bool) void {
     if (!enable_metal or ctx.target.result.os.tag != .macos) return;
+    addMacosSdkPaths(ctx, module);
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
@@ -212,4 +214,12 @@ fn configureMlx(ctx: Context, module: *std.Build.Module, enable_mlx: bool) void 
         module.addRPath(.{ .cwd_relative = ctx.b.fmt("{s}/lib", .{root}) });
     }
     module.linkSystemLibrary("mlxc", .{});
+}
+
+fn addMacosSdkPaths(ctx: Context, module: *std.Build.Module) void {
+    if (ctx.target.result.os.tag != .macos) return;
+    const sdk_root = std.zig.system.darwin.getSdk(ctx.b.allocator, ctx.b.graph.io, &ctx.target.result) orelse return;
+    module.addSystemIncludePath(.{ .cwd_relative = ctx.b.fmt("{s}/usr/include", .{sdk_root}) });
+    module.addLibraryPath(.{ .cwd_relative = ctx.b.fmt("{s}/usr/lib", .{sdk_root}) });
+    module.addFrameworkPath(.{ .cwd_relative = ctx.b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
 }

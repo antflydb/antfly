@@ -70,6 +70,14 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
+fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag != .macos) return;
+    const sdk_root = std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
+    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
+    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
+    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+}
+
 fn mlxRootAvailable(b: *std.Build, target: std.Build.ResolvedTarget, root: []const u8) bool {
     if (target.result.os.tag != .macos) return false;
     const header = b.fmt("{s}/include/mlx/c/mlx.h", .{root});
@@ -1246,6 +1254,7 @@ pub fn build(b: *std.Build) void {
     vectorindex_mod.addImport("antfly_vector", vector_mod);
     vectorindex_mod.addImport("antfly_platform", platform_mod);
     if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, vectorindex_mod, target);
         vectorindex_mod.linkFramework("Foundation", .{});
         vectorindex_mod.linkFramework("Metal", .{});
         vectorindex_mod.addCSourceFile(.{ .file = b.path("lib/vectorindex/src/kmeans_metal.m"), .flags = &.{"-fobjc-arc"} });

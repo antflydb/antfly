@@ -617,6 +617,7 @@ pub fn configureSystemBlas(
     blas_root: ?[]const u8,
 ) void {
     if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, module, target);
         module.linkFramework("Accelerate", .{});
         return;
     }
@@ -653,6 +654,7 @@ pub fn configureMetal(
     paths: Paths,
 ) void {
     if (!enable_metal or target.result.os.tag != .macos) return;
+    addMacosSdkPaths(b, module, target);
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
@@ -678,6 +680,14 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
     const io = b.graph.io;
     std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
+}
+
+fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag != .macos) return;
+    const sdk_root = std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
+    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
+    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
+    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
 }
 
 fn pathJoin(b: *std.Build, root: []const u8, relative_path: []const u8) []const u8 {
