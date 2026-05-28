@@ -163,17 +163,19 @@ const BackendState = struct {
         var result = switch (self.provider) {
             .openai => |*provider| blk: {
                 if (self.api_key) |*api_key_ref| {
-                    const auth_header = try self.auth_header_cache.getOwned(self.alloc, alloc, api_key_ref, self.secret_store);
-                    defer alloc.free(auth_header);
-                    try provider.setAuthorizationHeader(auth_header);
+                    if (try optionalBearerAuthHeaderOwned(self, alloc, api_key_ref)) |auth_header| {
+                        defer alloc.free(auth_header);
+                        try provider.setAuthorizationHeader(auth_header);
+                    }
                 }
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .termite => |*provider| blk: {
                 if (self.api_key) |*api_key_ref| {
-                    const auth_header = try self.auth_header_cache.getOwned(self.alloc, alloc, api_key_ref, self.secret_store);
-                    defer alloc.free(auth_header);
-                    try provider.setAuthorizationHeader(auth_header);
+                    if (try optionalBearerAuthHeaderOwned(self, alloc, api_key_ref)) |auth_header| {
+                        defer alloc.free(auth_header);
+                        try provider.setAuthorizationHeader(auth_header);
+                    }
                 }
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
@@ -210,12 +212,63 @@ const BackendState = struct {
     }
 };
 
+fn optionalBearerAuthHeaderOwned(
+    state: *BackendState,
+    alloc: std.mem.Allocator,
+    api_key_ref: *const common_secrets.SecretValue,
+) !?[]u8 {
+    return state.auth_header_cache.getOwned(state.alloc, alloc, api_key_ref, state.secret_store) catch |err| switch (err) {
+        error.SecretNotFound => switch (api_key_ref.*) {
+            .env_var => return null,
+            else => return err,
+        },
+        else => return err,
+    };
+}
+
 fn textContent(message: ChatMessage) ?[]const u8 {
     const content = message.content orelse return "";
     return switch (content) {
         .text => |text| text,
         .parts => null,
     };
+}
+
+test "generating optional env auth is skipped when unset" {
+    const alloc = std.testing.allocator;
+    var api_key = try common_secrets.SecretValue.initConfigOrEnv(alloc, null, "ANTFLY_TEST_GENERATING_MISSING_API_KEY");
+    defer api_key.deinit(alloc);
+
+    var state = BackendState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .api_key = null,
+        .auth_header_cache = .{},
+        .secret_store = null,
+        .provider = undefined,
+    };
+    defer state.auth_header_cache.deinit(alloc);
+
+    const header = try optionalBearerAuthHeaderOwned(&state, alloc, &api_key);
+    try std.testing.expectEqual(@as(?[]u8, null), header);
+}
+
+test "generating explicit missing secret auth remains strict" {
+    const alloc = std.testing.allocator;
+    var api_key = try common_secrets.SecretValue.initConfig(alloc, "secret://missing.generator_key") orelse return error.TestUnexpectedResult;
+    defer api_key.deinit(alloc);
+
+    var state = BackendState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .api_key = null,
+        .auth_header_cache = .{},
+        .secret_store = null,
+        .provider = undefined,
+    };
+    defer state.auth_header_cache.deinit(alloc);
+
+    try std.testing.expectError(error.SecretNotFound, optionalBearerAuthHeaderOwned(&state, alloc, &api_key));
 }
 
 pub fn executeChain(
