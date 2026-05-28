@@ -592,7 +592,7 @@ pub fn runFromIterator(
     // server for compatibility with external clients.
     var antfly_node_cfg = inference.server.NodeConfig{
         .models_dir = resolveAntflyModelsDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
-            antfly.inference_runtime.defaultModelsDir(alloc),
+            antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir),
         .generation_budget_overrides = resolveAntflyBudgetOverrides(cli),
     };
     if (loaded_config) |*cfg| {
@@ -669,6 +669,8 @@ pub fn runFromIterator(
         .bind_port = public_listener.bind_port,
         .enable_data_raft = false,
         .replica_root_dir = resolved.replica_root_dir,
+        .replica_catalog_path = resolved.replica_catalog_path,
+        .snapshot_root_dir = resolved.snapshot_root_dir,
         .store_registration = .{
             .node_id = local_node_id,
             .store_id = 1,
@@ -1354,13 +1356,15 @@ fn resolvePaths(
 ) !ResolvedPaths {
     const local_base = try resolveLocalBaseDir(alloc, cli, cfg);
     defer alloc.free(local_base);
-    const base = try std.fmt.allocPrint(alloc, "{s}/swarm", .{local_base});
-    defer alloc.free(base);
+    const data_base = try std.fmt.allocPrint(alloc, "{s}/data", .{local_base});
+    defer alloc.free(data_base);
+    const metadata_base = try std.fmt.allocPrint(alloc, "{s}/metadata", .{local_base});
+    defer alloc.free(metadata_base);
 
     const replica_root_dir = if (cli.replica_root_dir) |path|
         try normalizeResolvedPathAlloc(alloc, path)
     else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/replicas", .{base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/replicas", .{data_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
@@ -1368,13 +1372,13 @@ fn resolvePaths(
     const replica_catalog_path = if (cli.replica_catalog_path) |path|
         try normalizeResolvedPathAlloc(alloc, path)
     else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/catalog.txt", .{base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/catalog.txt", .{data_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(replica_catalog_path);
     const local_metadata_catalog_path = blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/local-metadata.json", .{base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/local-metadata.json", .{metadata_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
@@ -1382,7 +1386,7 @@ fn resolvePaths(
     const snapshot_root_dir = if (cli.snapshot_root_dir) |path|
         try normalizeResolvedPathAlloc(alloc, path)
     else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{data_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
@@ -1390,13 +1394,13 @@ fn resolvePaths(
     const secret_store_path = if (cli.secret_store_path) |path|
         try normalizeResolvedPathAlloc(alloc, path)
     else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{local_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(secret_store_path);
     const auth_store_root_dir = blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{metadata_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
@@ -1542,7 +1546,7 @@ fn printUsage() void {
         \\  --antfly-combined-budget-mb <n>      Embedded antfly native generation combined budget override
         \\  --antfly-kv-budget-mb <n>            Embedded antfly native generation KV cache budget override
         \\  --antfly-scratch-budget-mb <n>       Embedded antfly native generation scratch budget override
-        \\  --data-dir <path>                     Local storage root for swarm data
+        \\  --data-dir <path>                     Local Antfly data directory root
         \\  --replica-root-dir <path>             Replica root directory
         \\  --replica-catalog-path <path>         Replica catalog file path
         \\  --snapshot-root-dir <path>            Snapshot root directory
@@ -1820,21 +1824,23 @@ test "swarm runtime resolves paths from common storage base dir" {
 
     const resolved = try resolvePaths(alloc, .{}, &cfg);
     defer resolved.deinit(alloc);
-    const expected_base = try normalizeResolvedPathAlloc(alloc, "/tmp/antflydb/swarm");
-    defer alloc.free(expected_base);
-    const expected_replica_root = try std.fs.path.join(alloc, &.{ expected_base, "replicas" });
+    const expected_data_base = try normalizeResolvedPathAlloc(alloc, "/tmp/antflydb/data");
+    defer alloc.free(expected_data_base);
+    const expected_metadata_base = try normalizeResolvedPathAlloc(alloc, "/tmp/antflydb/metadata");
+    defer alloc.free(expected_metadata_base);
+    const expected_replica_root = try std.fs.path.join(alloc, &.{ expected_data_base, "replicas" });
     defer alloc.free(expected_replica_root);
-    const expected_replica_catalog = try std.fs.path.join(alloc, &.{ expected_base, "catalog.txt" });
+    const expected_replica_catalog = try std.fs.path.join(alloc, &.{ expected_data_base, "catalog.txt" });
     defer alloc.free(expected_replica_catalog);
-    const expected_local_metadata = try std.fs.path.join(alloc, &.{ expected_base, "local-metadata.json" });
+    const expected_local_metadata = try std.fs.path.join(alloc, &.{ expected_metadata_base, "local-metadata.json" });
     defer alloc.free(expected_local_metadata);
-    const expected_snapshot_root = try std.fs.path.join(alloc, &.{ expected_base, "snapshots" });
+    const expected_snapshot_root = try std.fs.path.join(alloc, &.{ expected_data_base, "snapshots" });
     defer alloc.free(expected_snapshot_root);
     try std.testing.expectEqualStrings(expected_replica_root, resolved.replica_root_dir);
     try std.testing.expectEqualStrings(expected_replica_catalog, resolved.replica_catalog_path);
     try std.testing.expectEqualStrings(expected_local_metadata, resolved.local_metadata_catalog_path);
     try std.testing.expectEqualStrings(expected_snapshot_root, resolved.snapshot_root_dir);
-    const expected_secret_store = try std.fs.path.join(alloc, &.{ expected_base, "secrets.json" });
+    const expected_secret_store = try normalizeResolvedPathAlloc(alloc, "/tmp/antflydb/secrets.json");
     defer alloc.free(expected_secret_store);
     try std.testing.expectEqualStrings(expected_secret_store, resolved.secret_store_path);
 }
@@ -1866,8 +1872,8 @@ test "swarm runtime data dir overrides common storage base dir" {
 
     const resolved = try resolvePaths(alloc, .{ .data_dir = "/tmp/from-cli" }, &cfg);
     defer resolved.deinit(alloc);
-    try std.testing.expectEqualStrings("/tmp/from-cli/swarm/replicas", resolved.replica_root_dir);
-    try std.testing.expectEqualStrings("/tmp/from-cli/swarm/catalog.txt", resolved.replica_catalog_path);
-    try std.testing.expectEqualStrings("/tmp/from-cli/swarm/local-metadata.json", resolved.local_metadata_catalog_path);
-    try std.testing.expectEqualStrings("/tmp/from-cli/swarm/snapshots", resolved.snapshot_root_dir);
+    try std.testing.expectEqualStrings("/tmp/from-cli/data/replicas", resolved.replica_root_dir);
+    try std.testing.expectEqualStrings("/tmp/from-cli/data/catalog.txt", resolved.replica_catalog_path);
+    try std.testing.expectEqualStrings("/tmp/from-cli/metadata/local-metadata.json", resolved.local_metadata_catalog_path);
+    try std.testing.expectEqualStrings("/tmp/from-cli/data/snapshots", resolved.snapshot_root_dir);
 }

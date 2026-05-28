@@ -27,6 +27,11 @@ pub fn defaultModelsDir(allocator: std.mem.Allocator) []const u8 {
     return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "models" }) catch "./models";
 }
 
+pub fn defaultModelsDirForDataDir(allocator: std.mem.Allocator, data_dir: []const u8) []const u8 {
+    if (platform.env.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value| return value;
+    return std.fs.path.join(allocator, &.{ data_dir, "inference", "models" }) catch defaultModelsDir(allocator);
+}
+
 pub const SpawnedServer = struct {
     base_uri: []u8,
     thread: std.Thread,
