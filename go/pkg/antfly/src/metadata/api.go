@@ -171,9 +171,7 @@ func tableStatusResponse(
 	}
 }
 
-// handleGetStatus returns the current status of all stores and shards
-func (ca *ClusterApi) GetStatus(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+func (ca *ClusterApi) clusterStatus() (ClusterStatus, map[string]any) {
 	stores, shards := ca.ln.tm.Status()
 	health := ClusterHealthHealthy
 	message := ""
@@ -237,19 +235,40 @@ func (ca *ClusterApi) GetStatus(w http.ResponseWriter, r *http.Request) {
 		Message:     message,
 		AuthEnabled: authEnabled,
 		SwarmMode:   ca.ln.config.SwarmMode,
-		AdditionalProperties: map[string]any{
-			"shards":        shards,
-			"stores":        stores,
-			"metadata_info": ca.ln.metadataStore.Info(),
-		},
 	}
+	legacyStatus := map[string]any{
+		"shards":        shards,
+		"stores":        stores,
+		"metadata_info": ca.ln.metadataStore.Info(),
+	}
+	status.AdditionalProperties = legacyStatus
+	return status, legacyStatus
+}
+
+// handleGetStatus returns the current status of all stores and shards.
+func (ca *ClusterApi) GetStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	status, _ := ca.clusterStatus()
 	if err := json.NewEncoder(w).Encode(status); err != nil {
 		ca.ln.logger.Warn("Failed to marshal status", zap.Error(err))
 	}
 }
 
 func (ca *ClusterApi) GetCluster(w http.ResponseWriter, r *http.Request) {
-	ca.GetStatus(w, r)
+	w.Header().Set("Content-Type", "application/json")
+	status, legacyStatus := ca.clusterStatus()
+	topology := ClusterTopology{
+		Health:               status.Health,
+		Message:              status.Message,
+		AuthEnabled:          status.AuthEnabled,
+		SwarmMode:            status.SwarmMode,
+		SecretStore:          status.SecretStore,
+		Data:                 ClusterDataStatus{},
+		AdditionalProperties: legacyStatus,
+	}
+	if err := json.NewEncoder(w).Encode(topology); err != nil {
+		ca.ln.logger.Warn("Failed to marshal cluster topology", zap.Error(err))
+	}
 }
 
 type wrapper struct {
