@@ -1,6 +1,6 @@
 {
   "name": "@antfly/design-system",
-  "version": "0.0.7",
+  "version": "0.1.0",
   "description": "Antfly's shared shadcn/ui component library: primitives, compound components, brand blocks, design tokens, and Aeonik.",
   "author": "Antfly, Inc. <contact@antfly.io>",
   "license": "MIT",
@@ -32,10 +32,22 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./styles.css": "./dist/index.css",
-    "./tokens": "./dist/tokens/index.css",
-    "./theme": "./dist/theme.css",
-    "./dashboard.css": "./dist/dashboard.css",
+    "./styles.css": {
+      "style": "./dist/index.css",
+      "default": "./dist/index.css"
+    },
+    "./tokens": {
+      "style": "./dist/tokens/index.css",
+      "default": "./dist/tokens/index.css"
+    },
+    "./theme": {
+      "style": "./dist/theme.css",
+      "default": "./dist/theme.css"
+    },
+    "./dashboard.css": {
+      "style": "./dist/dashboard.css",
+      "default": "./dist/dashboard.css"
+    },
     "./primitives": {
       "types": "./dist/primitives/index.d.ts",
       "import": "./dist/primitives/index.js"
@@ -52,7 +64,10 @@
       "types": "./dist/charts/index.d.ts",
       "import": "./dist/charts/index.js"
     },
-    "./charts.css": "./dist/charts.css",
+    "./charts.css": {
+      "style": "./dist/charts.css",
+      "default": "./dist/charts.css"
+    },
     "./templates": {
       "types": "./dist/templates/index.d.ts",
       "import": "./dist/templates/index.js"
