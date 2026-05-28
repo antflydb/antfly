@@ -904,6 +904,7 @@ fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !Stor
             if (opts.read_only) lsm_options.backend.create_if_missing = false;
             lsm_options.backend.durability = if (opts.no_sync) .none else lsm_options.backend.durability;
             lsm_options.storage = opts.storage orelse lsm_options.storage;
+            lsm_options.background_executor = null;
             if (debug_open) {
                 std.log.info(
                     "wal lsm backend handle open begin path={s} lsm_storage_provided={any} create_if_missing={any} durability={s}",
@@ -924,6 +925,7 @@ fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !Stor
             var lsm_options = opts.lsm_options;
             lsm_options.backend.durability = .none;
             lsm_options.storage = opts.storage orelse lsm_options.storage;
+            lsm_options.background_executor = null;
             var handle = try lsm_backend.BackendHandle.init(alloc, lsm_options);
             errdefer handle.close();
             break :blk .{ .lsm = handle };
