@@ -5323,8 +5323,11 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             defer cb.free(head_result.logits);
             const head_ms = glinerProfileElapsedMs(head_start_ns);
 
+            var session_frame_wait_ms: f64 = 0.0;
             if (session_frame_active) {
+                const frame_wait_start_ns = glinerProfileNowNs();
                 try cb.decoderRuntimeSubmitAndWaitFrame();
+                session_frame_wait_ms = glinerProfileElapsedMs(frame_wait_start_ns);
                 session_frame_active = false;
             }
 
@@ -5339,8 +5342,8 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                 printGlinerMetalArchitectureAudit(self.backend_type, cfg, metal_profile_before, metal_profile_after);
                 if (profile_enabled) {
                     std.debug.print(
-                        "gliner_session_profile: backend={s} batch={d} seq_len={d} encoder_ms={d:.3} head_ms={d:.3} logits_materialize_ms={d:.3}\n",
-                        .{ @tagName(self.backend_type), batch, seq_len, encoder_ms, head_ms, logits_materialize_ms },
+                        "gliner_session_profile: backend={s} batch={d} seq_len={d} encoder_ms={d:.3} head_ms={d:.3} session_frame_wait_ms={d:.3} logits_materialize_ms={d:.3}\n",
+                        .{ @tagName(self.backend_type), batch, seq_len, encoder_ms, head_ms, session_frame_wait_ms, logits_materialize_ms },
                     );
                     printDebertaEncoderProfile(encoder_profile);
                     printGlinerHeadProfile(head_profile);

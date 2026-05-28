@@ -3803,10 +3803,11 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) { partials[lid] += partials[lid + stride]; partials[width + lid] += partials[width + lid + stride]; partials[2u * width + lid] += partials[2u * width + lid + stride]; partials[3u * width + lid] += partials[3u * width + lid + stride]; } threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    float inv0 = partials[0] > 0.0f ? 1.0f / partials[0] : 0.0f; float inv1 = partials[width] > 0.0f ? 1.0f / partials[width] : 0.0f; float inv2 = partials[2u * width] > 0.0f ? 1.0f / partials[2u * width] : 0.0f; float inv3 = partials[3u * width] > 0.0f ? 1.0f / partials[3u * width] : 0.0f;\n"
            "    for (uint ki = lid; ki < p.seq_len; ki += width) { if (block_m > 0u) { float s = scores[ki]; scores[ki] = s > -3.0e38f ? exp(s - bests[0]) * inv0 : 0.0f; } if (block_m > 1u) { float s = scores[p.seq_len + ki]; scores[p.seq_len + ki] = s > -3.0e38f ? exp(s - bests[1]) * inv1 : 0.0f; } if (block_m > 2u) { float s = scores[2u * p.seq_len + ki]; scores[2u * p.seq_len + ki] = s > -3.0e38f ? exp(s - bests[2]) * inv2 : 0.0f; } if (block_m > 3u) { float s = scores[3u * p.seq_len + ki]; scores[3u * p.seq_len + ki] = s > -3.0e38f ? exp(s - bests[3]) * inv3 : 0.0f; } } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint d = lid; d < p.head_dim; d += width) { if (block_m > 0u) { float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { uint v_base = (b * p.seq_len + ki) * hidden + head_off; accum += scores[ki] * v[v_base + d]; } output[(b * p.seq_len + q0) * hidden + head_off + d] = accum; }\n"
-           "        if (block_m > 1u) { float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { uint v_base = (b * p.seq_len + ki) * hidden + head_off; accum += scores[p.seq_len + ki] * v[v_base + d]; } output[(b * p.seq_len + q0 + 1u) * hidden + head_off + d] = accum; }\n"
-           "        if (block_m > 2u) { float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { uint v_base = (b * p.seq_len + ki) * hidden + head_off; accum += scores[2u * p.seq_len + ki] * v[v_base + d]; } output[(b * p.seq_len + q0 + 2u) * hidden + head_off + d] = accum; }\n"
-           "        if (block_m > 3u) { float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { uint v_base = (b * p.seq_len + ki) * hidden + head_off; accum += scores[3u * p.seq_len + ki] * v[v_base + d]; } output[(b * p.seq_len + q0 + 3u) * hidden + head_off + d] = accum; } }\n"
+           "    for (uint d = lid; d < p.head_dim; d += width) { float accum0 = 0.0f; float accum1 = 0.0f; float accum2 = 0.0f; float accum3 = 0.0f;\n"
+           "        for (uint ki = 0u; ki < p.seq_len; ++ki) { uint v_base = (b * p.seq_len + ki) * hidden + head_off; float vx = v[v_base + d];\n"
+           "            if (block_m > 0u) accum0 += scores[ki] * vx; if (block_m > 1u) accum1 += scores[p.seq_len + ki] * vx; if (block_m > 2u) accum2 += scores[2u * p.seq_len + ki] * vx; if (block_m > 3u) accum3 += scores[3u * p.seq_len + ki] * vx; }\n"
+           "        if (block_m > 0u) output[(b * p.seq_len + q0) * hidden + head_off + d] = accum0; if (block_m > 1u) output[(b * p.seq_len + q0 + 1u) * hidden + head_off + d] = accum1;\n"
+           "        if (block_m > 2u) output[(b * p.seq_len + q0 + 2u) * hidden + head_off + d] = accum2; if (block_m > 3u) output[(b * p.seq_len + q0 + 3u) * hidden + head_off + d] = accum3; }\n"
            "}\n"
            "kernel void termite_deberta_relative_score_gemm_f32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *q_r [[buffer(2)]], device const float *k_r [[buffer(3)]], device float *out [[buffer(4)]], constant termite_metal_deberta_relative_score_gemm_f32_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint width = p.mode == 0u ? p.seq_len : p.rel_len; uint rows_per_bh = p.seq_len * width; uint bh_count = p.batch * p.num_heads; uint total = bh_count * rows_per_bh; if (gid >= total || p.head_dim == 0u || width == 0u) return;\n"
@@ -22235,8 +22236,10 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
         {
             return -16;
         }
-        const BOOL gemm_attention_requested = ((batch == 1 && seq_len >= 384) || (batch >= 2 && batch <= 8 && seq_len >= 256));
-        const BOOL flash4_attention_requested = (batch >= 1 && batch <= 8 && seq_len >= 384 && seq_len <= 512 && head_dim <= 256);
+        const BOOL gemm_attention_requested = getenv("TERMITE_METAL_DISABLE_DEBERTA_GEMM_ATTENTION") == NULL &&
+            ((batch == 1 && seq_len >= 384) || (batch >= 2 && batch <= 8 && seq_len >= 256));
+        const BOOL flash4_attention_requested = getenv("TERMITE_METAL_DISABLE_DEBERTA_FLASH_ATTENTION") == NULL &&
+            batch >= 1 && batch <= 8 && seq_len >= 384 && seq_len <= 512 && head_dim <= 256;
         if (flash4_attention_requested &&
             runtime->disentangled_relative_attention_f32_flash4_pipeline != nil)
         {
@@ -22352,7 +22355,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
             [tg_encoder setBuffer:output_buffer offset:output_offset atIndex:6];
             [tg_encoder setBytes:&params length:sizeof(params) atIndex:7];
             const NSUInteger tg_width = 64u;
-            [tg_encoder setThreadgroupMemoryLength:(seq_len + tg_width) * sizeof(float) atIndex:0];
+            [tg_encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((seq_len + tg_width) * sizeof(float)) atIndex:0];
             [tg_encoder dispatchThreadgroups:MTLSizeMake(seq_len, num_heads, batch)
                        threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
             runtime->deberta_attention_legacy_calls += 1;

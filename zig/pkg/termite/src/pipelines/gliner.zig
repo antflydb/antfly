@@ -26,6 +26,7 @@
 // Matches Go termite's lib/pipelines/gliner.go (GLiNER2 path).
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const Tokenizer = @import("termite_tokenizer").Tokenizer;
 const Tensor = backends.Tensor;
@@ -283,6 +284,8 @@ pub const GlinerPipeline = struct {
         threshold: f32,
         flat_ner: bool,
     ) ![][]Entity {
+        const profile_enabled = glinerPipelineProfileEnabled();
+        const total_start_ns = glinerProfileStart(profile_enabled);
         const alloc = self.allocator;
         const max_width: usize = self.config.max_width;
 
@@ -310,12 +313,14 @@ pub const GlinerPipeline = struct {
 
         var max_seq_len: usize = 0;
         var max_num_words: usize = 0;
+        const prepare_start_ns = glinerProfileStart(profile_enabled);
         for (texts, 0..) |text, i| {
             prepared[i] = try self.prepareGlinerInput(text, labels, label_token);
             prepared_len += 1;
             max_seq_len = @max(max_seq_len, prepared[i].input_ids.len);
             max_num_words = @max(max_num_words, prepared[i].actual_num_words);
         }
+        const prepare_ms = glinerProfileElapsedMs(prepare_start_ns);
 
         if (max_num_words == 0 or max_seq_len == 0) {
             for (results) |*row| {
@@ -329,6 +334,7 @@ pub const GlinerPipeline = struct {
 
         const batch = texts.len;
         const batch_num_spans = max_num_words * max_width;
+        const pack_start_ns = glinerProfileStart(profile_enabled);
         const input_ids_buf = try alloc.alloc(i64, batch * max_seq_len);
         defer alloc.free(input_ids_buf);
         const attention_mask_buf = try alloc.alloc(i64, batch * max_seq_len);
@@ -370,13 +376,16 @@ pub const GlinerPipeline = struct {
         const span_shape = [_]i64{ @intCast(batch), @intCast(batch_num_spans), 2 };
         var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, span_idx_buf);
         defer span_idx_tensor.deinit();
+        const pack_ms = glinerProfileElapsedMs(pack_start_ns);
 
+        const session_start_ns = glinerProfileStart(profile_enabled);
         const outputs = try self.session.run(&.{
             input_ids_tensor,
             attention_mask_tensor,
             words_mask_tensor,
             span_idx_tensor,
         }, alloc);
+        const session_ms = glinerProfileElapsedMs(session_start_ns);
         defer {
             for (outputs) |*o| o.deinit();
             alloc.free(outputs);
@@ -402,6 +411,7 @@ pub const GlinerPipeline = struct {
         }
         if (num_labels_dim > labels.len) num_labels_dim = labels.len;
 
+        const decode_start_ns = glinerProfileStart(profile_enabled);
         for (prepared[0..prepared_len], 0..) |row, i| {
             const row_start = @min(i * row_stride, logits.len);
             const row_end = @min(row_start + row_stride, logits.len);
@@ -416,6 +426,24 @@ pub const GlinerPipeline = struct {
                 flat_ner,
             );
             initialized_results += 1;
+        }
+        const decode_ms = glinerProfileElapsedMs(decode_start_ns);
+        if (profile_enabled) {
+            std.debug.print(
+                "gliner_pipeline_profile: batch={d} labels={d} seq_len={d} num_words={d} max_width={d} prepare_ms={d:.3} pack_ms={d:.3} session_run_ms={d:.3} decode_ms={d:.3} total_ms={d:.3}\n",
+                .{
+                    batch,
+                    labels.len,
+                    max_seq_len,
+                    max_num_words,
+                    max_width,
+                    prepare_ms,
+                    pack_ms,
+                    session_ms,
+                    decode_ms,
+                    glinerProfileElapsedMs(total_start_ns),
+                },
+            );
         }
 
         for (prepared[0..prepared_len]) |*row| row.deinit(alloc);
@@ -670,7 +698,7 @@ pub const GlinerPipeline = struct {
             }.lessThan);
 
             entities.deinit(alloc);
-            return try keep.toOwnedSlice(alloc);
+            return try dedupEntitiesByLabelText(alloc, try keep.toOwnedSlice(alloc));
         }
 
         std.mem.sort(Entity, entities.items, {}, struct {
@@ -679,7 +707,7 @@ pub const GlinerPipeline = struct {
             }
         }.lessThan);
 
-        return try entities.toOwnedSlice(alloc);
+        return try dedupEntitiesByLabelText(alloc, try entities.toOwnedSlice(alloc));
     }
 
     fn extractRelationsSingle(
@@ -1155,6 +1183,63 @@ fn sigmoid(x: f32) f32 {
     return 1.0 / (1.0 + @exp(-x));
 }
 
+fn dedupEntitiesByLabelText(alloc: std.mem.Allocator, input: []Entity) ![]Entity {
+    if (input.len <= 1) return input;
+
+    var keep = std.ArrayListUnmanaged(Entity).empty;
+    errdefer {
+        for (keep.items) |entity| alloc.free(entity.text);
+        keep.deinit(alloc);
+    }
+    keep.ensureTotalCapacity(alloc, input.len) catch |err| {
+        for (input) |entity| alloc.free(entity.text);
+        alloc.free(input);
+        return err;
+    };
+
+    for (input) |entity| {
+        var seen = false;
+        for (keep.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(entity.label, existing.label) and std.ascii.eqlIgnoreCase(entity.text, existing.text)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) {
+            alloc.free(entity.text);
+        } else {
+            keep.appendAssumeCapacity(entity);
+        }
+    }
+
+    alloc.free(input);
+    return try keep.toOwnedSlice(alloc);
+}
+
+fn glinerPipelineProfileEnabled() bool {
+    return platform.env.getenvBool("TERMITE_GLINER_PROFILE") or
+        platform.env.getenvBool("TERMITE_GLINER_PIPELINE_PROFILE");
+}
+
+fn glinerProfileNowNs() u128 {
+    var ts: std.posix.timespec = undefined;
+    return switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => 0,
+    };
+}
+
+fn glinerProfileStart(enabled: bool) u128 {
+    return if (enabled) glinerProfileNowNs() else 0;
+}
+
+fn glinerProfileElapsedMs(start_ns: u128) f64 {
+    if (start_ns == 0) return 0.0;
+    const now = glinerProfileNowNs();
+    if (now <= start_ns) return 0.0;
+    return @as(f64, @floatFromInt(now - start_ns)) / 1.0e6;
+}
+
 fn splitIntoWords(
     alloc: std.mem.Allocator,
     text: []const u8,
@@ -1162,24 +1247,66 @@ fn splitIntoWords(
     starts: *std.ArrayListUnmanaged(usize),
     ends: *std.ArrayListUnmanaged(usize),
 ) !void {
-    var word_start: ?usize = null;
-    for (text, 0..) |c, i| {
-        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
-            if (word_start) |ws| {
-                try words.append(alloc, text[ws..i]);
-                try starts.append(alloc, ws);
-                try ends.append(alloc, i);
-                word_start = null;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (isAsciiWhitespace(text[i])) {
+            i += 1;
+            continue;
+        }
+
+        const start = i;
+        if (startsWithAsciiIgnoreCase(text[i..], "http://") or
+            startsWithAsciiIgnoreCase(text[i..], "https://") or
+            startsWithAsciiIgnoreCase(text[i..], "www."))
+        {
+            i = consumeUntilWhitespace(text, i);
+        } else if (text[i] == '@' and i + 1 < text.len and isAsciiWord(text[i + 1])) {
+            i += 2;
+            while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or text[i] == '_')) i += 1;
+        } else if (isAsciiWord(text[i])) {
+            i += 1;
+            while (i < text.len) {
+                if (isAsciiWord(text[i])) {
+                    i += 1;
+                    continue;
+                }
+                if ((text[i] == '-' or text[i] == '_') and i + 1 < text.len and isAsciiWord(text[i + 1])) {
+                    i += 2;
+                    continue;
+                }
+                break;
             }
         } else {
-            if (word_start == null) word_start = i;
+            i += utf8ScalarLen(text[i..]);
         }
+
+        try words.append(alloc, text[start..i]);
+        try starts.append(alloc, start);
+        try ends.append(alloc, i);
     }
-    if (word_start) |ws| {
-        try words.append(alloc, text[ws..text.len]);
-        try starts.append(alloc, ws);
-        try ends.append(alloc, text.len);
-    }
+}
+
+fn isAsciiWhitespace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0b or c == 0x0c;
+}
+
+fn isAsciiWord(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+fn consumeUntilWhitespace(text: []const u8, start: usize) usize {
+    var i = start;
+    while (i < text.len and !isAsciiWhitespace(text[i])) i += utf8ScalarLen(text[i..]);
+    return i;
+}
+
+fn startsWithAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return haystack.len >= needle.len and std.ascii.eqlIgnoreCase(haystack[0..needle.len], needle);
+}
+
+fn utf8ScalarLen(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+    return std.unicode.utf8ByteSequenceLength(bytes[0]) catch 1;
 }
 
 fn toLower(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -1203,6 +1330,47 @@ test "scoreLabelsFromLogits returns sigmoid of max logit per label" {
 
     try std.testing.expectApproxEqAbs(sigmoid(0.7), scores[0], 1e-6);
     try std.testing.expectApproxEqAbs(sigmoid(1.2), scores[1], 1e-6);
+}
+
+test "gliner splitIntoWords separates punctuation like Python processor" {
+    const alloc = std.testing.allocator;
+    const text = "Apple Inc. hired @alice in San Francisco.";
+    var words = std.ArrayListUnmanaged([]const u8).empty;
+    defer words.deinit(alloc);
+    var starts = std.ArrayListUnmanaged(usize).empty;
+    defer starts.deinit(alloc);
+    var ends = std.ArrayListUnmanaged(usize).empty;
+    defer ends.deinit(alloc);
+
+    try splitIntoWords(alloc, text, &words, &starts, &ends);
+
+    const expected = [_][]const u8{ "Apple", "Inc", ".", "hired", "@alice", "in", "San", "Francisco", "." };
+    try std.testing.expectEqual(expected.len, words.items.len);
+    for (expected, 0..) |want, i| {
+        try std.testing.expectEqualStrings(want, words.items[i]);
+        try std.testing.expectEqualStrings(want, text[starts.items[i]..ends.items[i]]);
+    }
+}
+
+test "gliner dedups repeated entity text per label" {
+    const alloc = std.testing.allocator;
+    var entities = try alloc.alloc(Entity, 4);
+    entities[0] = .{ .text = try alloc.dupe(u8, "Apple Inc."), .label = "organization", .start = 0, .end = 10, .score = 1.0 };
+    entities[1] = .{ .text = try alloc.dupe(u8, "Apple Inc."), .label = "organization", .start = 20, .end = 30, .score = 0.9 };
+    entities[2] = .{ .text = try alloc.dupe(u8, "Apple Inc."), .label = "location", .start = 40, .end = 50, .score = 0.8 };
+    entities[3] = .{ .text = try alloc.dupe(u8, "Cupertino"), .label = "location", .start = 60, .end = 69, .score = 0.7 };
+
+    const deduped = try dedupEntitiesByLabelText(alloc, entities);
+    defer {
+        for (deduped) |entity| alloc.free(entity.text);
+        alloc.free(deduped);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), deduped.len);
+    try std.testing.expectEqual(@as(usize, 0), deduped[0].start);
+    try std.testing.expectEqualStrings("organization", deduped[0].label);
+    try std.testing.expectEqualStrings("location", deduped[1].label);
+    try std.testing.expectEqualStrings("Cupertino", deduped[2].text);
 }
 
 test "gliner supportsClassification checks model type and capabilities" {

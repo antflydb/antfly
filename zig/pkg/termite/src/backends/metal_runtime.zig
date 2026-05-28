@@ -265,6 +265,14 @@ fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     return std.fmt.parseUnsigned(usize, slice, 10) catch null;
 }
 
+fn traceGlinerStages() bool {
+    return getenvBool("TERMITE_METAL_TRACE_GLINER_STAGES");
+}
+
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1.0e6;
+}
+
 fn debugRuntimeTensorFinite(comptime label: []const u8, layer_index: usize, tensor: MetalTensor) void {
     if (!getenvBool("TERMITE_METAL_DEBUG_RUNTIME_TENSOR_FINITE")) return;
     if (getenvUsize("TERMITE_METAL_DEBUG_RUNTIME_TENSOR_LAYER")) |target| {
@@ -1228,6 +1236,8 @@ pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTen
 pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    const trace = traceGlinerStages();
+    const total_start_ns = if (trace) monotonicNowNs() else 0;
     if (request.total == 0 or request.dim == 0) return null;
     if (request.weight.ndim() != 2 or request.gamma.ndim() != 1 or request.beta.ndim() != 1) return null;
     const rows = @as(usize, @intCast(request.weight.dim(0)));
@@ -1235,6 +1245,7 @@ pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype)
     if (@as(usize, @intCast(request.gamma.dim(0))) != request.dim or @as(usize, @intCast(request.beta.dim(0))) != request.dim) return null;
     if (request.ids.len != request.total or request.mask.len != request.total) return null;
 
+    const pack_start_ns = if (trace) monotonicNowNs() else 0;
     const ids_u32 = try std.heap.c_allocator.alloc(u32, request.total);
     defer std.heap.c_allocator.free(ids_u32);
     const mask_u32 = try std.heap.c_allocator.alloc(u32, request.total);
@@ -1248,10 +1259,14 @@ pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype)
     for (request.mask, 0..) |value, i| {
         mask_u32[i] = if (value != 0) 1 else 0;
     }
+    const pack_ns = if (trace) monotonicNowNs() - pack_start_ns else 0;
 
     const shape = [_]i32{ @intCast(request.total), @intCast(request.dim) };
+    const alloc_start_ns = if (trace) monotonicNowNs() else 0;
     var output = try MetalTensor.deviceAllocate(runtime, request.total * request.dim * @sizeOf(f32), .private, &shape);
     errdefer output.deinit();
+    const alloc_ns = if (trace) monotonicNowNs() - alloc_start_ns else 0;
+    const encode_start_ns = if (trace) monotonicNowNs() else 0;
     const rc = if (request.weight.isDevice() and request.gamma.isDevice() and request.beta.isDevice())
         termite_metal_decode_runtime_deberta_embeddings_f32_device(
             runtime,
@@ -1290,7 +1305,22 @@ pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype)
             output.deviceByteOffset(),
         );
     };
+    const encode_ns = if (trace) monotonicNowNs() - encode_start_ns else 0;
     if (rc != 0) return null;
+    if (trace) {
+        std.debug.print(
+            "metal_gliner_stage: deberta_embeddings_runtime total_ms={d:.3} pack_ms={d:.3} alloc_ms={d:.3} encode_ms={d:.3} device_inputs={} total={d} dim={d}\n",
+            .{
+                nsToMs(monotonicNowNs() - total_start_ns),
+                nsToMs(pack_ns),
+                nsToMs(alloc_ns),
+                nsToMs(encode_ns),
+                request.weight.isDevice() and request.gamma.isDevice() and request.beta.isDevice(),
+                request.total,
+                request.dim,
+            },
+        );
+    }
     return output;
 }
 
