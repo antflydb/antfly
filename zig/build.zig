@@ -1310,6 +1310,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    usermgr_mod.link_libc = link_libc;
     usermgr_mod.addImport("antfly_casbin", casbin_mod);
     usermgr_mod.addImport("usermgr_storage", storage_mod);
     const wasm_bloom_mod = b.createModule(.{
