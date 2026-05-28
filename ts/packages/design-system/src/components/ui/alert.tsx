@@ -4,19 +4,25 @@ import type * as React from "react";
 import { cn } from "@/lib/utils";
 
 const alertVariants = cva(
-  "relative w-full rounded-[var(--radius)] px-4 py-3 text-sm grid has-[>svg]:grid-cols-[calc(var(--spacing)*4)_1fr] grid-cols-[0_1fr] has-[>svg]:gap-x-3 gap-y-0.5 items-start [&>svg]:size-4 [&>svg]:translate-y-0.5 [&>svg]:text-current",
+  [
+    // chassis: square, 1.5px bordered, flat. Left border bumped to 4px,
+    // recolored to the semantic state — the only color signal in the component.
+    "relative w-full bg-card text-card-foreground rounded-none border-[1.5px] border-border-strong border-l-4 px-[14px] py-[12px]",
+    // grid: icon column collapses to 0 when no svg present
+    "grid has-[>svg]:grid-cols-[18px_1fr] grid-cols-[0_1fr] has-[>svg]:gap-x-[11px] gap-y-0 items-start",
+    "[&>svg]:size-[18px] [&>svg]:translate-y-[1px]",
+  ].join(" "),
   {
     variants: {
       variant: {
-        default:
-          "bg-primary/10 text-searchaf-11 [&>svg]:text-searchaf-10 *:data-[slot=alert-description]:text-searchaf-10",
+        default: "border-l-foreground [&>svg]:text-foreground *:data-[slot=alert-title]:text-foreground",
         destructive:
-          "bg-danger/10 text-danger-700 [&>svg]:text-danger-600 *:data-[slot=alert-description]:text-danger-600",
-        info: "bg-info/10 text-info-700 [&>svg]:text-info-600 *:data-[slot=alert-description]:text-info-600",
+          "border-l-destructive [&>svg]:text-destructive *:data-[slot=alert-title]:text-destructive",
         success:
-          "bg-success/10 text-success-700 [&>svg]:text-success-600 *:data-[slot=alert-description]:text-success-600",
+          "border-l-success [&>svg]:text-success *:data-[slot=alert-title]:text-success",
         warning:
-          "bg-warning/10 text-warning-700 [&>svg]:text-warning-600 *:data-[slot=alert-description]:text-warning-600",
+          "border-l-warning [&>svg]:text-warning *:data-[slot=alert-title]:text-warning",
+        info: "border-l-info [&>svg]:text-info *:data-[slot=alert-title]:text-info",
       },
     },
     defaultVariants: {
@@ -44,7 +50,11 @@ function AlertTitle({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="alert-title"
-      className={cn("col-start-2 line-clamp-1 min-h-4 font-medium tracking-tight", className)}
+      className={cn(
+        // mono uppercase callout — the loud register inside the chassis
+        "col-start-2 font-mono uppercase tracking-[0.06em] text-[12px] font-bold leading-none mb-[2px]",
+        className
+      )}
       {...props}
     />
   );
@@ -55,7 +65,7 @@ function AlertDescription({ className, ...props }: React.ComponentProps<"div">) 
     <div
       data-slot="alert-description"
       className={cn(
-        "text-muted-foreground col-start-2 grid justify-items-start gap-1 text-sm [&_p]:leading-relaxed",
+        "text-foreground col-start-2 grid justify-items-start gap-1 text-[13px] [&_p]:leading-relaxed",
         className
       )}
       {...props}
