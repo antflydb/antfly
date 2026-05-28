@@ -2663,14 +2663,22 @@ fn patternBoolFilterToSearchQuery(
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !search_mod.SearchQuery {
     if (value != .object) return error.InvalidArgument;
+    var must_out = std.ArrayListUnmanaged(search_mod.SearchQuery).empty;
+    errdefer must_out.deinit(alloc);
+    if (value.object.get("filter")) |filter| {
+        const filter_queries = try patternFilterArrayToSearchQueries(alloc, filter, text_analysis, runtime_schema);
+        try must_out.appendSlice(alloc, filter_queries);
+    }
+    if (value.object.get("must")) |must| {
+        const must_queries = try patternFilterArrayToSearchQueries(alloc, must, text_analysis, runtime_schema);
+        try must_out.appendSlice(alloc, must_queries);
+    }
     const has_must = value.object.get("must") != null or value.object.get("filter") != null;
     const has_should = value.object.get("should") != null;
     const only_must_not = !has_must and !has_should and value.object.get("must_not") != null;
     return .{ .bool_query = .{
-        .must = if (value.object.get("must")) |must|
-            try patternFilterArrayToSearchQueries(alloc, must, text_analysis, runtime_schema)
-        else if (value.object.get("filter")) |filter|
-            try patternFilterArrayToSearchQueries(alloc, filter, text_analysis, runtime_schema)
+        .must = if (must_out.items.len > 0)
+            try must_out.toOwnedSlice(alloc)
         else if (only_must_not)
             &.{.{ .match_all = {} }}
         else
