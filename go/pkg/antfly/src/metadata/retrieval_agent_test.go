@@ -148,7 +148,9 @@ func TestNormalizeRetrievalAgentSessionRequest(t *testing.T) {
 	assert.Equal(t, 3, req.MaxInternalIterations)
 	assert.NotEmpty(t, req.SessionId)
 	if assert.Len(t, req.Messages, 1) {
-		assert.Equal(t, "prior", req.Messages[0].Content)
+		content, err := req.Messages[0].Content.AsChatMessageContent0()
+		assert.NoError(t, err)
+		assert.Equal(t, "prior", content)
 	}
 }
 
