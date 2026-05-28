@@ -96,6 +96,33 @@ fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const
     return run;
 }
 
+const openapi_join_input_paths = [_][]const u8{
+    "../scripts/join_openapi.py",
+    "../scripts/openapi_joiner.py",
+    "../specs/openapi/antfly/audio.yaml",
+    "../specs/openapi/antfly/chunking.yaml",
+    "../specs/openapi/antfly/config.yaml",
+    "../specs/openapi/antfly/embeddings.yaml",
+    "../specs/openapi/antfly/eval.yaml",
+    "../specs/openapi/antfly/generating.yaml",
+    "../specs/openapi/antfly/metadata.yaml",
+    "../specs/openapi/antfly/query.yaml",
+    "../specs/openapi/antfly/reranking.yaml",
+    "../specs/openapi/antfly/websearch.yaml",
+    "../specs/openapi/auth/api.yaml",
+    "../specs/openapi/inference/api.yaml",
+    "../specs/openapi/inference/config.yaml",
+    "../specs/openapi/shared/generating.yaml",
+    "../go/pkg/antfly/lib/schema/openapi.yaml",
+    "../go/pkg/antfly/src/store/db/indexes/openapi.yaml",
+};
+
+fn addOpenApiJoinInputs(b: *std.Build, run: *std.Build.Step.Run) void {
+    for (openapi_join_input_paths) |path| {
+        run.addFileInput(b.path(path));
+    }
+}
+
 const inference_delegated_steps = [_][]const u8{
     "run",
     "finetune",
@@ -717,17 +744,20 @@ fn addYamlOpenApiModule(
 
 fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
     const check = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{"--compare"});
+    addOpenApiJoinInputs(b, check);
     check.addFileArg(b.path("../openapi.yaml"));
     return check;
 }
 
 fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--joined-only"});
+    addOpenApiJoinInputs(b, join);
     return join.addOutputFileArg("openapi.public.joined.yaml");
 }
 
 fn addPrefixedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{});
+    addOpenApiJoinInputs(b, join);
     return join.addOutputFileArg("openapi.public.prefixed.yaml");
 }
 
