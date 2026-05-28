@@ -85,6 +85,7 @@ pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    termite_api_key: ?[]const u8 = null,
 };
 
 pub const QueryTemplateError = error{
@@ -712,7 +713,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         defer embedder_cfg.deinit(alloc);
         if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
         _ = parseEmbedderProvider(embedder_cfg) catch return error.UnsupportedCreateTableRequest;
-        const embedder_json = try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder);
+        const embedder_json = try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.termite_api_key);
         defer alloc.free(embedder_json);
 
         var out = std.ArrayListUnmanaged(u8).empty;
@@ -768,12 +769,11 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         defer embedder_cfg.deinit(alloc);
         _ = try parseEmbedderProvider(embedder_cfg);
         if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
-        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder);
+        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.termite_api_key);
     } else null;
     defer if (embedder_json) |raw| alloc.free(raw);
     if (!external and embedder_json == null and chunker_json == null) return error.InvalidCreateTableRequest;
 
-    _ = options;
     const dims = try resolveDeclaredEmbeddingDimensionsRequired(cfg);
 
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -960,7 +960,12 @@ fn buildManagedEmbeddingEntry(
     errdefer if (truncate.len > 0) alloc.free(truncate);
     const api_key = switch (provider) {
         .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
-        .ollama, .bedrock, .antfly => null,
+        .antfly => try common_secrets.SecretValue.initConfigOrEnv(
+            alloc,
+            embedder_cfg.api_key orelse options.termite_api_key,
+            "ANTFLY_INFERENCE_API_KEY",
+        ),
+        .ollama, .bedrock => null,
     };
     errdefer if (api_key) |*owned_api_key| owned_api_key.deinit(alloc);
 
@@ -1431,6 +1436,12 @@ fn embedWithEntryParts(
 
         var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
         defer provider.deinit();
+        if (entry.api_key) |*api_key_ref| {
+            if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
+                defer alloc.free(auth_header);
+                try provider.setAuthorizationHeader(auth_header);
+            }
+        }
 
         var result = try provider.embedParts(alloc, entry.model, parts);
         defer result.deinit();
@@ -1483,6 +1494,12 @@ fn embedSparseBatchWithEntry(
 
             var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
             defer provider.deinit();
+            if (entry.api_key) |*api_key_ref| {
+                if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
+                    defer alloc.free(auth_header);
+                    try provider.setAuthorizationHeader(auth_header);
+                }
+            }
 
             var result = try provider.embedSparse(alloc, entry.model, texts);
             defer result.deinit();
@@ -1672,6 +1689,12 @@ fn embedBatchWithEntry(
 
             var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
             defer provider.deinit();
+            if (entry.api_key) |*api_key_ref| {
+                if (try optionalBearerAuthHeaderOwned(@constCast(entry), alloc, api_key_ref)) |auth_header| {
+                    defer alloc.free(auth_header);
+                    try provider.setAuthorizationHeader(auth_header);
+                }
+            }
 
             var result = try provider.embedder().embed(alloc, entry.model, texts);
             errdefer result.deinit();
@@ -1903,17 +1926,26 @@ fn stringifyManagedEmbedderConfigAlloc(
     alloc: std.mem.Allocator,
     cfg: embeddings_types.Config,
     raw_value: std.json.Value,
+    termite_api_key: ?[]const u8,
 ) ![]u8 {
     const base_json = try embeddings_types.stringifyAlloc(alloc, cfg);
     defer alloc.free(base_json);
 
     const requests_per_minute = configObjectU32(raw_value, "requests_per_minute");
     const burst = configObjectU32(raw_value, "burst");
-    if (requests_per_minute == null and burst == null) return try alloc.dupe(u8, base_json);
+    const default_termite_api_key = if (cfg.api_key == null and isAntflyProvider(try parseEmbedderProvider(cfg)))
+        termite_api_key
+    else
+        null;
+    if (requests_per_minute == null and burst == null and default_termite_api_key == null) return try alloc.dupe(u8, base_json);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.appendSlice(alloc, base_json[0 .. base_json.len - 1]);
+    if (default_termite_api_key) |api_key| {
+        try out.appendSlice(alloc, ",\"api_key\":");
+        try appendJsonString(alloc, &out, api_key);
+    }
     if (requests_per_minute) |rpm| {
         try out.appendSlice(alloc, ",\"requests_per_minute\":");
         const rpm_json = try std.fmt.allocPrint(alloc, "{d}", .{rpm});

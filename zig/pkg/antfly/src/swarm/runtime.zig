@@ -682,6 +682,7 @@ pub fn runFromIterator(
             .swarm_mode = true,
             .secret_store = &secret_store,
             .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
+            .termite_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
             .user_manager = if (user_manager) |*manager| manager else null,
         },
         .backend_runtime = node_backend_runtime.ptr(),

@@ -60,6 +60,17 @@ func NewChunkingHelper(name string, config ChunkerConfig, logger *zap.Logger) (*
 	}
 
 	switch provider {
+	case ChunkerProviderMock:
+		chunker, err := NewChunker(config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create mock chunker: %w", err)
+		}
+		return &ChunkingHelper{
+			Name:    name,
+			chunker: chunker,
+			logger:  logger,
+		}, nil
+
 	case ChunkerProviderAntfly:
 		antflyConfig, err := config.AsAntflyChunkerConfig()
 		if err != nil {

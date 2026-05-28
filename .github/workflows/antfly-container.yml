@@ -11,11 +11,11 @@ on:
         type: string
 
 env:
-  GAR_LOCATION: us-east5
+  GAR_LOCATION: us-central1
   GAR_PROJECT: antfly-image-artifacts
-  GAR_REPOSITORY: antfly-labs
+  GAR_REPOSITORY: containers
   GAR_IMAGE: antfly
-  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-east5/workerPools/antfly-container-builders
+  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
 
 jobs:
   publish-antfly-docker-image:
