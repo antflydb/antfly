@@ -18,7 +18,7 @@
 // binary response deserialization for embeddings.
 
 const std = @import("std");
-const api = @import("termite_api");
+const api = @import("inference_api");
 const binary = @import("binary.zig");
 
 pub const Binary = binary;
@@ -26,10 +26,10 @@ pub const DenseEmbeddings = binary.DenseEmbeddings;
 pub const SparseEmbeddings = binary.SparseEmbeddings;
 pub const SparseVector = binary.SparseVector;
 
-/// Generated types from the Termite OpenAPI spec.
+/// Generated types from the inference OpenAPI spec.
 pub const Types = api.types;
 
-/// Raw generated client — exposes every Termite API operation.
+/// Raw generated client -- exposes every inference API operation.
 pub const RawClient = api.client.Client;
 
 /// High-level Termite client with convenience helpers.

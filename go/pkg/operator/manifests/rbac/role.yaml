@@ -40,8 +40,8 @@ rules:
   - antflybackups
   - antflyclusters
   - antflyrestores
-  - termitepools
-  - termiteroutes
+  - inferencepools
+  - inferenceproxies
   verbs:
   - create
   - delete
@@ -56,8 +56,8 @@ rules:
   - antflybackups/finalizers
   - antflyclusters/finalizers
   - antflyrestores/finalizers
-  - termitepools/finalizers
-  - termiteroutes/finalizers
+  - inferencepools/finalizers
+  - inferenceproxies/finalizers
   verbs:
   - update
 - apiGroups:
@@ -66,8 +66,8 @@ rules:
   - antflybackups/status
   - antflyclusters/status
   - antflyrestores/status
-  - termitepools/status
-  - termiteroutes/status
+  - inferencepools/status
+  - inferenceproxies/status
   verbs:
   - get
   - patch
@@ -75,7 +75,7 @@ rules:
 - apiGroups:
   - antfly.io
   resources:
-  - externaltermitepools
+  - externalinferencepools
   verbs:
   - get
   - list

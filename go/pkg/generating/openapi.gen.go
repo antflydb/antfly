@@ -270,7 +270,7 @@ type RetryConfig struct {
 
 // TermiteGeneratorConfig Configuration for the Termite generative AI provider.
 type TermiteGeneratorConfig struct {
-	// ApiUrl The URL of the Termite API endpoint.
+	// ApiUrl The URL of the Inference API endpoint.
 	ApiUrl *string `json:"api_url,omitempty"`
 
 	// MaxTokens Maximum number of tokens to generate.
@@ -282,7 +282,7 @@ type TermiteGeneratorConfig struct {
 	// Temperature Controls randomness in generation (0.0-2.0).
 	Temperature *float32 `json:"temperature,omitempty"`
 
-	// Timeout HTTP response timeout in seconds for Termite API calls.
+	// Timeout HTTP response timeout in seconds for Inference API calls.
 	Timeout *int `json:"timeout,omitempty"`
 
 	// TopK Top-k sampling parameter.

@@ -4,13 +4,13 @@ ZIG ?= zig
 ZIG_BUILD_FLAGS ?=
 UV ?= uv
 SCRIPTS_PY := $(UV) run --project ../scripts --locked python
-TERMITE_BIN ?= ./pkg/termite/zig-out/bin/termite
+TERMITE_BIN ?= ./pkg/inference/zig-out/bin/termite
 
 # ====================================================================================
 # Build
 # ====================================================================================
 
-TERMITE_DIR := pkg/termite
+TERMITE_DIR := pkg/inference
 ONNXRUNTIME_ROOT := $(TERMITE_DIR)/onnxruntime
 ONNXRUNTIME_VERSION ?= 1.24.3
 GENAI_VERSION ?= 0.12.1
@@ -45,8 +45,8 @@ clean-onnx: ## Remove downloaded ONNX Runtime files.
 .PHONY: termite-e2e-models
 
 termite-e2e-models: ## Prefetch the curated termite E2E model set with `termite pull`.
-	cd pkg/termite && zig build
-	TERMITE_PULL_BIN=$(TERMITE_BIN) $(if $(TERMITE_MODELS_DIR),TERMITE_MODELS_DIR=$(TERMITE_MODELS_DIR),) $(UV) run --project e2e/termite python e2e/termite/pull_models.py
+	cd pkg/inference && zig build
+	TERMITE_PULL_BIN=$(TERMITE_BIN) $(if $(TERMITE_MODELS_DIR),TERMITE_MODELS_DIR=$(TERMITE_MODELS_DIR),) $(UV) run --project e2e/inference python e2e/inference/pull_models.py
 
 # ====================================================================================
 # TLA+ Verification Commands
@@ -65,7 +65,7 @@ openapi-generate:
 openapi-check:
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py --compare openapi.yaml
 	$(ZIG) build regen-openapi
-	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/openapi/generated pkg/termite/src/api/generated)"
+	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/openapi/generated pkg/inference/src/api/generated)"
 
 snowball-generate:
 	$(ZIG) build regen-snowball

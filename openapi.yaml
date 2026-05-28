@@ -3,7 +3,7 @@ info:
   title: Antfly Public API
   version: v1alpha1
   description: Joined public contract for the Antfly server. Antfly APIs are served under `/api/v1`, auth
-    APIs under `/auth/v1`, and Termite ML APIs under `/ml/v1`.
+    APIs under `/auth/v1`, and inference ML APIs under `/ml/v1`.
 servers:
   - url: /
 tags:
@@ -4811,32 +4811,32 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteEmbedRequest'
+              $ref: '#/components/schemas/InferenceEmbedRequest'
       responses:
         '200':
           description: Embeddings generated successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteEmbedResponse'
+                $ref: '#/components/schemas/InferenceEmbedResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/chunk:
     post:
       summary: Chunk text into smaller segments
@@ -4875,26 +4875,26 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteChunkRequest'
+              $ref: '#/components/schemas/InferenceChunkRequest'
       responses:
         '200':
           description: Text chunked successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteChunkResponse'
+                $ref: '#/components/schemas/InferenceChunkResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/rerank_multimodal:
     post:
       summary: Rerank multimodal documents by relevance
@@ -4915,32 +4915,32 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteRerankMultimodalRequest'
+              $ref: '#/components/schemas/InferenceRerankMultimodalRequest'
       responses:
         '200':
           description: Documents reranked successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteRerankResponse'
+                $ref: '#/components/schemas/InferenceRerankResponse'
         '400':
           description: Invalid request or unsupported model
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '501':
           description: Multimodal reranking contract recognized but encoder path not implemented yet
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/rerank:
     post:
       summary: Rerank prompts by relevance
@@ -4961,7 +4961,7 @@ paths:
         3. Send pre-rendered text strings as `prompts`
 
 
-        This design keeps Termite stateless and allows clients to customize rendering logic.
+        This design keeps inference stateless and allows clients to customize rendering logic.
 
 
         ## Models
@@ -4992,38 +4992,38 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteRerankRequest'
+              $ref: '#/components/schemas/InferenceRerankRequest'
       responses:
         '200':
           description: Prompts reranked successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteRerankResponse'
+                $ref: '#/components/schemas/InferenceRerankResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Reranking service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/generate:
     post:
       summary: Generate text using LLM (OpenAI-compatible)
@@ -5063,7 +5063,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteGenerateRequest'
+              $ref: '#/components/schemas/InferenceGenerateRequest'
       responses:
         '200':
           description: >
@@ -5073,34 +5073,34 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteGenerateResponse'
+                $ref: '#/components/schemas/InferenceGenerateResponse'
             text/event-stream:
               schema:
-                $ref: '#/components/schemas/TermiteGenerateChunk'
+                $ref: '#/components/schemas/InferenceGenerateChunk'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Generation service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/chat/completions:
     post:
       summary: OpenAI Chat Completions endpoint
@@ -5114,7 +5114,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteGenerateRequest'
+              $ref: '#/components/schemas/InferenceGenerateRequest'
       responses:
         '200':
           description: >
@@ -5124,34 +5124,34 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteGenerateResponse'
+                $ref: '#/components/schemas/InferenceGenerateResponse'
             text/event-stream:
               schema:
-                $ref: '#/components/schemas/TermiteGenerateChunk'
+                $ref: '#/components/schemas/InferenceGenerateChunk'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Generation service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/recognize:
     post:
       summary: Recognize named entities
@@ -5190,38 +5190,38 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteRecognizeRequest'
+              $ref: '#/components/schemas/InferenceRecognizeRequest'
       responses:
         '200':
           description: Entities extracted successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteRecognizeResponse'
+                $ref: '#/components/schemas/InferenceRecognizeResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Recognition service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/classify:
     post:
       summary: Zero-shot text classification
@@ -5273,32 +5273,32 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteClassifyRequest'
+              $ref: '#/components/schemas/InferenceClassifyRequest'
       responses:
         '200':
           description: Classification completed successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteClassifyResponse'
+                $ref: '#/components/schemas/InferenceClassifyResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/classify/document:
     post:
       summary: Document classification
@@ -5339,32 +5339,32 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteDocumentClassificationRequest'
+              $ref: '#/components/schemas/InferenceDocumentClassificationRequest'
       responses:
         '200':
           description: Document classification completed successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteDocumentClassificationResponse'
+                $ref: '#/components/schemas/InferenceDocumentClassificationResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model or image not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/classify/document_tokens:
     post:
       summary: Document token classification
@@ -5404,38 +5404,38 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteDocumentTokenClassificationRequest'
+              $ref: '#/components/schemas/InferenceDocumentTokenClassificationRequest'
       responses:
         '200':
           description: Document token classification completed successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteDocumentTokenClassificationResponse'
+                $ref: '#/components/schemas/InferenceDocumentTokenClassificationResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Classification service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/rewrite:
     post:
       summary: Rewrite text using Seq2Seq models
@@ -5469,38 +5469,38 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteRewriteRequest'
+              $ref: '#/components/schemas/InferenceRewriteRequest'
       responses:
         '200':
           description: Text rewritten successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteRewriteResponse'
+                $ref: '#/components/schemas/InferenceRewriteResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Generation service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/read:
     post:
       summary: Read text from images (OCR/document understanding)
@@ -5551,38 +5551,38 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteReadRequest'
+              $ref: '#/components/schemas/InferenceReadRequest'
       responses:
         '200':
           description: Images read successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteReadResponse'
+                $ref: '#/components/schemas/InferenceReadResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Reader service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/transcribe:
     post:
       summary: Transcribe audio to text (speech-to-text)
@@ -5649,38 +5649,38 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteTranscribeRequest'
+              $ref: '#/components/schemas/InferenceTranscribeRequest'
       responses:
         '200':
           description: Audio transcribed successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteTranscribeResponse'
+                $ref: '#/components/schemas/InferenceTranscribeResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Transcription service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/extract:
     post:
       summary: Extract structured data from text
@@ -5757,38 +5757,38 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteExtractRequest'
+              $ref: '#/components/schemas/InferenceExtractRequest'
       responses:
         '200':
           description: Extraction completed successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteExtractResponse'
+                $ref: '#/components/schemas/InferenceExtractResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Extraction service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/models:
     get:
       summary: List available models
@@ -5872,23 +5872,23 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteModelsResponse'
+                $ref: '#/components/schemas/InferenceModelsResponse'
         '400':
           description: Bad request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/version:
     get:
       summary: Get version information
-      description: Returns Termite version, git commit, build time, and Go runtime version.
+      description: Returns inference runtime version, git commit, build time, and Go runtime version.
       operationId: getVersion
       responses:
         '200':
@@ -5896,13 +5896,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteVersionResponse'
+                $ref: '#/components/schemas/InferenceVersionResponse'
         '400':
           description: Bad request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
   /ml/v1/embeddings:
     post:
       summary: Create embeddings (OpenAI-compatible)
@@ -5922,32 +5922,32 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteEmbedRequest'
+              $ref: '#/components/schemas/InferenceEmbedRequest'
       responses:
         '200':
           description: Embedding response
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteEmbedResponse'
+                $ref: '#/components/schemas/InferenceEmbedResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
 components:
   securitySchemes:
     BasicAuth:
@@ -11354,7 +11354,7 @@ components:
         api_url:
           type: string
           format: uri
-          description: The URL of the Termite API endpoint. Can also be set via ANTFLY_TERMITE_URL environment
+          description: The URL of the Inference API endpoint. Can also be set via ANTFLY_TERMITE_URL environment
             variable.
           example: http://localhost:8082
       required:
@@ -11820,7 +11820,7 @@ components:
         api_url:
           type: string
           format: uri
-          description: The URL of the Termite API endpoint.
+          description: The URL of the Inference API endpoint.
         temperature:
           type: number
           format: float
@@ -11841,7 +11841,7 @@ components:
           description: Top-k sampling parameter.
         timeout:
           type: integer
-          description: HTTP response timeout in seconds for Termite API calls.
+          description: HTTP response timeout in seconds for Inference API calls.
           minimum: 1
       required:
         - model
@@ -12161,7 +12161,7 @@ components:
             api_url:
               type: string
               format: uri
-              description: The URL of the Termite API endpoint (e.g., 'http://localhost:8080'). Can also
+              description: The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also
                 be set via ANTFLY_TERMITE_URL environment variable.
               example: http://localhost:8080
             model:
@@ -14525,7 +14525,7 @@ components:
         - model
     TermiteRerankerConfig:
       type: object
-      description: Configuration for the Termite reranking provider.
+      description: Configuration for the inference reranking provider.
       properties:
         model:
           type: string
@@ -14533,7 +14533,7 @@ components:
         url:
           type: string
           format: uri
-          description: The URL of the Termite API endpoint.
+          description: The URL of the Inference API endpoint.
       required:
         - model
     CohereRerankerConfig:
@@ -15073,7 +15073,7 @@ components:
           items:
             type: string
           description: IDs of retrieved documents (for retrieval metrics)
-    TermiteError:
+    InferenceError:
       type: object
       required:
         - error
@@ -15081,7 +15081,7 @@ components:
         error:
           type: string
           description: Error message
-    TermiteTextContentPart:
+    InferenceTextContentPart:
       type: object
       description: Text content for embedding
       required:
@@ -15095,7 +15095,7 @@ components:
         text:
           type: string
           description: Text content to embed
-    TermiteImageURL:
+    InferenceImageURL:
       type: object
       description: Image URL or data URI
       required:
@@ -15105,7 +15105,7 @@ components:
           type: string
           description: URL or data URI (data:image/png;base64,...)
           example: data:image/png;base64,iVBORw0KGgo...
-    TermiteImageURLContentPart:
+    InferenceImageURLContentPart:
       type: object
       description: Image content for embedding (OpenAI-compatible format)
       required:
@@ -15117,8 +15117,8 @@ components:
           enum:
             - image_url
         image_url:
-          $ref: '#/components/schemas/TermiteImageURL'
-    TermiteMediaContentPart:
+          $ref: '#/components/schemas/InferenceImageURL'
+    InferenceMediaContentPart:
       type: object
       description: Inline binary media content (audio, image, etc.)
       required:
@@ -15137,15 +15137,15 @@ components:
         mime_type:
           type: string
           description: MIME type (audio/wav, image/gif, image/png, etc.)
-    TermiteContentPart:
+    InferenceContentPart:
       description: A content part for multimodal input (text, image URL, or inline media)
       oneOf:
-        - $ref: '#/components/schemas/TermiteTextContentPart'
-        - $ref: '#/components/schemas/TermiteImageURLContentPart'
-        - $ref: '#/components/schemas/TermiteMediaContentPart'
-    TermiteEmbedRequest:
+        - $ref: '#/components/schemas/InferenceTextContentPart'
+        - $ref: '#/components/schemas/InferenceImageURLContentPart'
+        - $ref: '#/components/schemas/InferenceMediaContentPart'
+    InferenceEmbedRequest:
       type: object
-      description: OpenAI-compatible embedding request with Termite multimodal content-part extension
+      description: OpenAI-compatible embedding request with inference multimodal content-part extension
       required:
         - model
         - input
@@ -15174,7 +15174,7 @@ components:
             - type: array
               description: Array of multimodal content parts
               items:
-                $ref: '#/components/schemas/TermiteContentPart'
+                $ref: '#/components/schemas/InferenceContentPart'
         encoding_format:
           type: string
           description: Encoding format for the embeddings (only "float" supported)
@@ -15212,7 +15212,7 @@ components:
             - document
             - classification
             - clustering
-    TermiteEmbedResponse:
+    InferenceEmbedResponse:
       type: object
       description: OpenAI-compatible embedding response with a polymorphic `embedding` field for dense
         or sparse vectors
@@ -15231,13 +15231,13 @@ components:
           type: array
           description: List of embedding objects
           items:
-            $ref: '#/components/schemas/TermiteEmbeddingObject'
+            $ref: '#/components/schemas/InferenceEmbeddingObject'
         model:
           type: string
           description: Model used for embedding generation
         usage:
-          $ref: '#/components/schemas/TermiteEmbeddingUsage'
-    TermiteSparseVector:
+          $ref: '#/components/schemas/InferenceEmbeddingUsage'
+    InferenceSparseVector:
       type: object
       description: A sparse vector with parallel index/value arrays, sorted by index ascending
       required:
@@ -15256,12 +15256,12 @@ components:
             type: number
             format: float
           description: Corresponding weights for each index (always positive)
-    TermiteChunk:
+    InferenceChunk:
       description: A chunk of content. Text chunks have mime_type text/plain.
       allOf:
         - oneOf:
-            - $ref: '#/components/schemas/TermiteTextContent'
-            - $ref: '#/components/schemas/TermiteBinaryContent'
+            - $ref: '#/components/schemas/InferenceTextContent'
+            - $ref: '#/components/schemas/InferenceBinaryContent'
         - type: object
           required:
             - id
@@ -15274,9 +15274,9 @@ components:
             mime_type:
               type: string
               description: 'MIME type: text/plain, audio/wav, image/png, etc.'
-    TermiteVADOptions:
+    InferenceVADOptions:
       type: object
-      description: Options for Voice Activity Detection (VAD) based audio segmentation. Termite-specific.
+      description: Options for Voice Activity Detection (VAD) based audio segmentation. inference-specific.
       properties:
         min_silence_duration_ms:
           type: integer
@@ -15293,9 +15293,9 @@ components:
           type: integer
           description: 'Maximum segment duration (ms). Segments longer than this are split. Useful for
             Whisper-compatible chunking. Default: 30000.'
-    TermiteAudioChunkConfig:
+    InferenceAudioChunkConfig:
       type: object
-      description: Audio chunking configuration for Termite, including VAD options.
+      description: Audio chunking configuration for inference, including VAD options.
       properties:
         window_duration_ms:
           type: integer
@@ -15304,13 +15304,13 @@ components:
           type: integer
           description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
         vad:
-          $ref: '#/components/schemas/TermiteVADOptions'
-    TermiteChunkConfig:
+          $ref: '#/components/schemas/InferenceVADOptions'
+    InferenceChunkConfig:
       type: object
       description: >
-        Configuration for chunking requests to Termite API.
+        Configuration for chunking requests to Inference API.
 
-        Combines shared text options with Termite-specific audio/VAD options.
+        Combines shared text options with inference-specific audio/VAD options.
       properties:
         model:
           type: string
@@ -15327,10 +15327,10 @@ components:
           description: Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models
             and VAD audio models.
         text:
-          $ref: '#/components/schemas/TermiteTextChunkOptions'
+          $ref: '#/components/schemas/InferenceTextChunkOptions'
         audio:
-          $ref: '#/components/schemas/TermiteAudioChunkConfig'
-    TermiteChunkRequest:
+          $ref: '#/components/schemas/InferenceAudioChunkConfig'
+    InferenceChunkRequest:
       type: object
       properties:
         input:
@@ -15345,7 +15345,7 @@ components:
           oneOf:
             - type: string
               description: Text to chunk (backward compatible)
-            - $ref: '#/components/schemas/TermiteContentPart'
+            - $ref: '#/components/schemas/InferenceContentPart'
               description: Content part (text or media)
         text:
           type: string
@@ -15353,8 +15353,8 @@ components:
           description: 'DEPRECATED: Use ''input'' instead. Text to chunk.'
           example: This is a long document that needs to be split into smaller chunks...
         config:
-          $ref: '#/components/schemas/TermiteChunkConfig'
-    TermiteChunkResponse:
+          $ref: '#/components/schemas/InferenceChunkConfig'
+    InferenceChunkResponse:
       type: object
       required:
         - object
@@ -15394,21 +15394,21 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteChunkObject'
+            $ref: '#/components/schemas/InferenceChunkObject'
           description: Array of chunk objects
         model:
           type: string
           description: Chunking model actually used (may differ from requested if fallback occurred)
           example: fixed
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
+          $ref: '#/components/schemas/InferenceGenerateUsage'
         cache_hit:
           type: boolean
           description: Whether result was served from cache
-    TermiteChunkObject:
+    InferenceChunkObject:
       description: A chunk result object. Text chunks have mime_type text/plain.
       allOf:
-        - $ref: '#/components/schemas/TermiteChunk'
+        - $ref: '#/components/schemas/InferenceChunk'
         - type: object
           required:
             - object
@@ -15421,7 +15421,7 @@ components:
             index:
               type: integer
               description: Position of this chunk object in the response data array.
-    TermiteRerankRequest:
+    InferenceRerankRequest:
       type: object
       required:
         - model
@@ -15447,7 +15447,7 @@ components:
           example:
             - Introduction to machine learning...
             - Deep learning fundamentals...
-    TermiteRerankMultimodalDocument:
+    InferenceRerankMultimodalDocument:
       type: object
       required:
         - content
@@ -15456,8 +15456,8 @@ components:
           type: string
           description: Optional caller-provided document identifier
         content:
-          $ref: '#/components/schemas/TermiteChatMessageContent'
-    TermiteRerankMultimodalRequest:
+          $ref: '#/components/schemas/InferenceChatMessageContent'
+    InferenceRerankMultimodalRequest:
       type: object
       required:
         - model
@@ -15475,9 +15475,9 @@ components:
         documents:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteRerankMultimodalDocument'
+            $ref: '#/components/schemas/InferenceRerankMultimodalDocument'
           description: Documents expressed as text and image content parts
-    TermiteRerankResponse:
+    InferenceRerankResponse:
       type: object
       required:
         - object
@@ -15493,14 +15493,14 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteRerankObject'
+            $ref: '#/components/schemas/InferenceRerankObject'
           description: Rerank score objects, one per input prompt.
         model:
           type: string
           description: Name of model used for reranking
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteRerankObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceRerankObject:
       type: object
       required:
         - object
@@ -15518,7 +15518,7 @@ components:
           type: number
           format: float
           description: Relevance score for this prompt.
-    TermiteRecognizeEntity:
+    InferenceRecognizeEntity:
       type: object
       required:
         - text
@@ -15548,7 +15548,7 @@ components:
           format: float
           description: Confidence score (0.0 to 1.0)
           example: 0.99
-    TermiteRecognizeRequest:
+    InferenceRecognizeRequest:
       type: object
       required:
         - model
@@ -15604,8 +15604,8 @@ components:
             - works_at
             - located_in
         resolver:
-          $ref: '#/components/schemas/TermiteResolverConfig'
-    TermiteResolverConfig:
+          $ref: '#/components/schemas/InferenceResolverConfig'
+    InferenceResolverConfig:
       type: object
       description: >
         Configuration for entity resolution. When present in a RecognizeRequest,
@@ -15641,7 +15641,7 @@ components:
           type: boolean
           default: true
           description: Whether to track mention provenance for resolved entities
-    TermiteRelation:
+    InferenceRelation:
       type: object
       required:
         - head
@@ -15650,10 +15650,10 @@ components:
         - score
       properties:
         head:
-          $ref: '#/components/schemas/TermiteRecognizeEntity'
+          $ref: '#/components/schemas/InferenceRecognizeEntity'
           description: The subject/head entity in the relationship
         tail:
-          $ref: '#/components/schemas/TermiteRecognizeEntity'
+          $ref: '#/components/schemas/InferenceRecognizeEntity'
           description: The object/tail entity in the relationship
         label:
           type: string
@@ -15664,7 +15664,7 @@ components:
           format: float
           description: Confidence score for the relation (0.0 to 1.0)
           example: 0.95
-    TermiteRecognizeResponse:
+    InferenceRecognizeResponse:
       type: object
       required:
         - object
@@ -15680,14 +15680,14 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteRecognizeObject'
+            $ref: '#/components/schemas/InferenceRecognizeObject'
           description: Recognition result objects, one per input text.
         model:
           type: string
           description: Name of model used for NER
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteRecognizeObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceRecognizeObject:
       type: object
       required:
         - object
@@ -15704,17 +15704,17 @@ components:
         entities:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteRecognizeEntity'
+            $ref: '#/components/schemas/InferenceRecognizeEntity'
           description: Entities recognized for this input text.
         relations:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteRelation'
+            $ref: '#/components/schemas/InferenceRelation'
           description: >
             Relations recognized for this input text. Only present when using
 
             a model with 'relations' capability (GLiNER multitask, REBEL).
-    TermiteRewriteRequest:
+    InferenceRewriteRequest:
       type: object
       required:
         - model
@@ -15731,7 +15731,7 @@ components:
           description: Input texts to rewrite/transform
           example:
             - 'Translate to German: Hello, how are you?'
-    TermiteRewriteResponse:
+    InferenceRewriteResponse:
       type: object
       required:
         - object
@@ -15747,14 +15747,14 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteRewriteObject'
+            $ref: '#/components/schemas/InferenceRewriteObject'
           description: Rewritten text objects, one per input.
         model:
           type: string
           description: Name of model used for rewriting
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteRewriteObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceRewriteObject:
       type: object
       required:
         - object
@@ -15773,7 +15773,7 @@ components:
           items:
             type: string
           description: Rewritten texts for this input, one per beam.
-    TermiteClassifyRequest:
+    InferenceClassifyRequest:
       type: object
       required:
         - model
@@ -15820,7 +15820,7 @@ components:
             If true, allows multiple labels per text (independent scoring).
 
             If false (default), scores are normalized across labels.
-    TermiteClassifyResult:
+    InferenceClassifyResult:
       type: object
       required:
         - label
@@ -15835,7 +15835,7 @@ components:
           format: float
           description: Confidence score (0.0 to 1.0)
           example: 0.95
-    TermiteClassifyResponse:
+    InferenceClassifyResponse:
       type: object
       required:
         - object
@@ -15851,14 +15851,14 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteClassifyObject'
+            $ref: '#/components/schemas/InferenceClassifyObject'
           description: Classification result objects, one per input text.
         model:
           type: string
           description: Name of model used for classification
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteClassifyObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceClassifyObject:
       type: object
       required:
         - object
@@ -15875,10 +15875,10 @@ components:
         classifications:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteClassifyResult'
+            $ref: '#/components/schemas/InferenceClassifyResult'
           description: >
             Classification results for this input text.
-    TermiteDocumentClassificationRequest:
+    InferenceDocumentClassificationRequest:
       type: object
       required:
         - model
@@ -15913,7 +15913,7 @@ components:
           description: Optional tensor prefix inside the safetensors checkpoint
           default: layoutdoc_sequence_head
           example: layoutdoc_sequence_head
-    TermiteDocumentClassificationFeatures:
+    InferenceDocumentClassificationFeatures:
       type: object
       required:
         - num_tokens
@@ -15957,7 +15957,7 @@ components:
         center_darkness:
           type: number
           format: float
-    TermiteDocumentClassificationResult:
+    InferenceDocumentClassificationResult:
       type: object
       required:
         - label
@@ -15968,7 +15968,7 @@ components:
         score:
           type: number
           format: float
-    TermiteDocumentClassificationResponse:
+    InferenceDocumentClassificationResponse:
       type: object
       required:
         - object
@@ -15984,12 +15984,12 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteDocumentClassificationObject'
+            $ref: '#/components/schemas/InferenceDocumentClassificationObject'
         model:
           type: string
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteDocumentClassificationObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceDocumentClassificationObject:
       type: object
       required:
         - object
@@ -16021,16 +16021,16 @@ components:
             num_tokens:
               type: integer
         features:
-          $ref: '#/components/schemas/TermiteDocumentClassificationFeatures'
+          $ref: '#/components/schemas/InferenceDocumentClassificationFeatures'
         best:
           nullable: true
           allOf:
-            - $ref: '#/components/schemas/TermiteDocumentClassificationResult'
+            - $ref: '#/components/schemas/InferenceDocumentClassificationResult'
         scores:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteDocumentClassificationResult'
-    TermiteDocumentTokenBox:
+            $ref: '#/components/schemas/InferenceDocumentClassificationResult'
+    InferenceDocumentTokenBox:
       type: object
       required:
         - text
@@ -16050,7 +16050,7 @@ components:
             - 0
             - 120
             - 24
-    TermiteDocumentTokenClassificationRequest:
+    InferenceDocumentTokenClassificationRequest:
       type: object
       required:
         - model
@@ -16073,13 +16073,13 @@ components:
         tokens:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteDocumentTokenBox'
+            $ref: '#/components/schemas/InferenceDocumentTokenBox'
         prefix:
           type: string
           description: Optional tensor prefix inside the safetensors checkpoint
           default: layoutdoc_token_head
           example: layoutdoc_token_head
-    TermiteDocumentTokenClassificationFeatures:
+    InferenceDocumentTokenClassificationFeatures:
       type: object
       required:
         - text_length
@@ -16109,7 +16109,7 @@ components:
         bbox_phase_sin:
           type: number
           format: float
-    TermiteDocumentTokenClassificationResult:
+    InferenceDocumentTokenClassificationResult:
       type: object
       required:
         - label
@@ -16120,7 +16120,7 @@ components:
         score:
           type: number
           format: float
-    TermiteDocumentTokenClassificationPrediction:
+    InferenceDocumentTokenClassificationPrediction:
       type: object
       required:
         - token_index
@@ -16140,16 +16140,16 @@ components:
           items:
             type: integer
         features:
-          $ref: '#/components/schemas/TermiteDocumentTokenClassificationFeatures'
+          $ref: '#/components/schemas/InferenceDocumentTokenClassificationFeatures'
         best:
           nullable: true
           allOf:
-            - $ref: '#/components/schemas/TermiteDocumentTokenClassificationResult'
+            - $ref: '#/components/schemas/InferenceDocumentTokenClassificationResult'
         scores:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteDocumentTokenClassificationResult'
-    TermiteDocumentTokenClassificationResponse:
+            $ref: '#/components/schemas/InferenceDocumentTokenClassificationResult'
+    InferenceDocumentTokenClassificationResponse:
       type: object
       required:
         - object
@@ -16165,12 +16165,12 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteDocumentTokenClassificationObject'
+            $ref: '#/components/schemas/InferenceDocumentTokenClassificationObject'
         model:
           type: string
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteDocumentTokenClassificationObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceDocumentTokenClassificationObject:
       type: object
       required:
         - object
@@ -16196,8 +16196,8 @@ components:
           type: array
           description: Each result is an array of ClassifyResult sorted by score descending.
           items:
-            $ref: '#/components/schemas/TermiteDocumentTokenClassificationPrediction'
-    TermiteExtractRequest:
+            $ref: '#/components/schemas/InferenceDocumentTokenClassificationPrediction'
+    InferenceExtractRequest:
       type: object
       required:
         - model
@@ -16223,7 +16223,7 @@ components:
         images:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteImageURL'
+            $ref: '#/components/schemas/InferenceImageURL'
           description: >
             Optional images to extract structured data from.
 
@@ -16280,7 +16280,7 @@ components:
           type: boolean
           description: If true, include character offset spans in output
           default: false
-    TermiteExtractFieldValue:
+    InferenceExtractFieldValue:
       type: object
       required:
         - value
@@ -16302,7 +16302,7 @@ components:
           type: integer
           description: Character offset where value ends (only present when include_spans=true)
           example: 10
-    TermiteExtractResponse:
+    InferenceExtractResponse:
       type: object
       required:
         - object
@@ -16318,14 +16318,14 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteExtractObject'
+            $ref: '#/components/schemas/InferenceExtractObject'
           description: Extraction result objects, one per input.
         model:
           type: string
           description: Name of model used for extraction
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteExtractObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceExtractObject:
       type: object
       required:
         - object
@@ -16352,7 +16352,7 @@ components:
             Each instance maps field names to ExtractFieldValue (for ::str fields)
 
             or arrays of ExtractFieldValue (for ::list fields).
-    TermiteReadRequest:
+    InferenceReadRequest:
       type: object
       required:
         - model
@@ -16365,7 +16365,7 @@ components:
         images:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteImageURL'
+            $ref: '#/components/schemas/InferenceImageURL'
           description: >
             Images to read text from. Supports:
 
@@ -16396,7 +16396,7 @@ components:
           description: Maximum tokens to generate
           default: 256
           example: 256
-    TermiteTextRegion:
+    InferenceTextRegion:
       type: object
       required:
         - text
@@ -16418,7 +16418,7 @@ components:
         label:
           type: string
           description: Semantic label from layout analysis (e.g., text, title, table)
-    TermiteReadResult:
+    InferenceReadResult:
       type: object
       required:
         - text
@@ -16444,12 +16444,12 @@ components:
         regions:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteTextRegion'
+            $ref: '#/components/schemas/InferenceTextRegion'
           description: >
             Individual text regions with bounding boxes and recognized text.
 
             Populated by multi-stage OCR models (Surya, PaddleOCR).
-    TermiteReadResponse:
+    InferenceReadResponse:
       type: object
       required:
         - object
@@ -16465,16 +16465,16 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteReadObject'
+            $ref: '#/components/schemas/InferenceReadObject'
           description: Read result objects, one per input image.
         model:
           type: string
           description: Name of model used for reading
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteReadObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceReadObject:
       allOf:
-        - $ref: '#/components/schemas/TermiteReadResult'
+        - $ref: '#/components/schemas/InferenceReadResult'
         - type: object
           required:
             - object
@@ -16487,7 +16487,7 @@ components:
             index:
               type: integer
               description: Original input image index.
-    TermiteTranscribeRequest:
+    InferenceTranscribeRequest:
       type: object
       required:
         - audio
@@ -16504,7 +16504,7 @@ components:
           type: string
           description: Force specific language for transcription (optional, model-dependent)
           example: en
-    TermiteTranscribeResponse:
+    InferenceTranscribeResponse:
       type: object
       required:
         - object
@@ -16520,14 +16520,14 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteTranscribeObject'
+            $ref: '#/components/schemas/InferenceTranscribeObject'
           description: Transcription result objects.
         model:
           type: string
           description: Name of model used for transcription
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteTranscribeObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceTranscribeObject:
       type: object
       required:
         - object
@@ -16549,7 +16549,7 @@ components:
           type: string
           description: Detected or forced language
           example: en
-    TermiteModelInfo:
+    InferenceModelInfo:
       type: object
       description: Information about a model including its capabilities
       properties:
@@ -16564,7 +16564,7 @@ components:
           items:
             type: string
           description: List of input modalities this model accepts, such as `text`, `image`, or `audio`
-    TermiteModelsResponse:
+    InferenceModelsResponse:
       type: object
       required:
         - chunkers
@@ -16581,54 +16581,54 @@ components:
         chunkers:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available chunking models (always includes "fixed")
         rerankers:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available reranking models
         classifiers:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available zero-shot classification models
         embedders:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available embedding models from models_dir/embedders/
         extractors:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available extractor models (models with 'extraction' capability)
         generators:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available generator/LLM models from models_dir/generators/
         recognizers:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available recognizer models from models_dir/recognizers/
         rewriters:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available Seq2Seq rewriter models from models_dir/rewriters/
         readers:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available reader/OCR models from models_dir/readers/
         transcribers:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available transcriber/speech-to-text models from models_dir/transcribers/
-    TermiteTool:
+    InferenceTool:
       type: object
       description: A tool (function) that the model can call
       required:
@@ -16641,8 +16641,8 @@ components:
             - function
           description: The type of tool (currently only "function" is supported)
         function:
-          $ref: '#/components/schemas/TermiteFunctionDefinition'
-    TermiteFunctionDefinition:
+          $ref: '#/components/schemas/InferenceFunctionDefinition'
+    InferenceFunctionDefinition:
       type: object
       description: Definition of a function that can be called by the model
       required:
@@ -16672,7 +16672,7 @@ components:
           type: boolean
           description: Whether to enforce strict parameter validation
           default: false
-    TermiteToolCall:
+    InferenceToolCall:
       type: object
       description: A tool call made by the model
       required:
@@ -16690,8 +16690,8 @@ components:
             - function
           description: The type of tool call (currently only "function")
         function:
-          $ref: '#/components/schemas/TermiteToolCallFunction'
-    TermiteToolCallFunction:
+          $ref: '#/components/schemas/InferenceToolCallFunction'
+    InferenceToolCallFunction:
       type: object
       description: The function called by the model
       required:
@@ -16706,7 +16706,7 @@ components:
           type: string
           description: JSON string of the arguments to the function
           example: '{"location": "San Francisco, CA"}'
-    TermiteToolChoice:
+    InferenceToolChoice:
       description: >
         Controls how the model uses tools. Options:
 
@@ -16741,7 +16741,7 @@ components:
                 name:
                   type: string
                   description: The name of the function to call
-    TermiteRole:
+    InferenceRole:
       type: string
       enum:
         - system
@@ -16749,7 +16749,7 @@ components:
         - assistant
         - tool
       description: The role of a message sender in a conversation
-    TermiteFinishReason:
+    InferenceFinishReason:
       type: string
       enum:
         - stop
@@ -16758,7 +16758,7 @@ components:
         - content_filter
         - function_call
       description: Reason why generation stopped
-    TermiteChatMessageContent:
+    InferenceChatMessageContent:
       description: >
         Message content. Supports two formats:
 
@@ -16771,25 +16771,25 @@ components:
         - type: array
           description: Array of content parts (OpenAI multimodal format)
           items:
-            $ref: '#/components/schemas/TermiteContentPart'
-    TermiteChatMessage:
+            $ref: '#/components/schemas/InferenceContentPart'
+    InferenceChatMessage:
       type: object
       required:
         - role
       properties:
         role:
-          $ref: '#/components/schemas/TermiteRole'
+          $ref: '#/components/schemas/InferenceRole'
         content:
-          $ref: '#/components/schemas/TermiteChatMessageContent'
+          $ref: '#/components/schemas/InferenceChatMessageContent'
         tool_calls:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteToolCall'
+            $ref: '#/components/schemas/InferenceToolCall'
           description: Tool calls made by the assistant (only for role=assistant)
         tool_call_id:
           type: string
           description: ID of the tool call this message is responding to (only for role=tool)
-    TermiteGenerateRequest:
+    InferenceGenerateRequest:
       type: object
       required:
         - model
@@ -16802,7 +16802,7 @@ components:
         messages:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteChatMessage'
+            $ref: '#/components/schemas/InferenceChatMessage'
           description: Conversation messages (OpenAI-compatible format)
         max_tokens:
           type: integer
@@ -16822,7 +16822,7 @@ components:
           default: 1
         top_k:
           type: integer
-          description: Top-k sampling (Termite extension, not in OpenAI API)
+          description: Top-k sampling (inference extension, not in OpenAI API)
           default: 50
         stream:
           type: boolean
@@ -16831,7 +16831,7 @@ components:
         tools:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteTool'
+            $ref: '#/components/schemas/InferenceTool'
           description: >
             List of tools (functions) the model can call.
 
@@ -16861,7 +16861,7 @@ components:
             if count > 0)
           default: 0
         response_format:
-          $ref: '#/components/schemas/TermiteGenerateResponseFormat'
+          $ref: '#/components/schemas/InferenceGenerateResponseFormat'
           description: >
             Structured output control. OpenAI-compatible entry point for requesting JSON output.
 
@@ -16870,18 +16870,18 @@ components:
         grammar:
           type: string
           description: >
-            Termite-native grammar override. When set, this takes precedence over `response_format`.
+            inference-native grammar override. When set, this takes precedence over `response_format`.
 
             Grammar-constrained decoding is currently native-backend only.
         draft_model:
           type: string
           description: >
-            Termite-native speculative decoding extension. Path or model identifier for a smaller draft
+            inference-native speculative decoding extension. Path or model identifier for a smaller draft
             model.
         speculative_k:
           type: integer
           description: >
-            Termite-native speculative decoding extension. Number of draft tokens proposed per verification
+            inference-native speculative decoding extension. Number of draft tokens proposed per verification
             round.
           default: 4
         cache_dtype:
@@ -16893,7 +16893,7 @@ components:
             - fp8
             - int4
           description: >
-            Termite-native KV cache quantization format. Lower precision reduces memory usage but may
+            inference-native KV cache quantization format. Lower precision reduces memory usage but may
 
             affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
         cache_compaction_ratio:
@@ -16902,7 +16902,7 @@ components:
           minimum: 0.0
           maximum: 1.0
           description: >
-            Termite-native KV cache compaction ratio applied after prefill via Attention Matching.
+            inference-native KV cache compaction ratio applied after prefill via Attention Matching.
 
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
 
@@ -16941,24 +16941,24 @@ components:
             - eager
             - compiled
           description: >
-            Termite-native graph execution mode. `eager` keeps the direct runtime path when possible.
+            inference-native graph execution mode. `eager` keeps the direct runtime path when possible.
 
-            `compiled` runs Termite graph planning, partitioning, and backend executor attachment.
+            `compiled` runs inference graph planning, partitioning, and backend executor attachment.
         compiled_target:
           type: string
           enum:
             - partitioned
             - whole-model
           description: >
-            Termite-native compiled graph target. `partitioned` attaches compiled executors to eligible
+            inference-native compiled graph target. `partitioned` attaches compiled executors to eligible
 
             graph partitions. `whole-model` requests a compiled backend only when it can own the full
 
             traced graph shape.
         tool_choice:
-          $ref: '#/components/schemas/TermiteToolChoice'
+          $ref: '#/components/schemas/InferenceToolChoice'
           description: Controls how the model uses tools
-    TermiteGenerateResponseFormat:
+    InferenceGenerateResponseFormat:
       type: object
       required:
         - type
@@ -16971,10 +16971,10 @@ components:
             - json_object
             - json_schema
         json_schema:
-          $ref: '#/components/schemas/TermiteGenerateJsonSchemaConfig'
+          $ref: '#/components/schemas/InferenceGenerateJsonSchemaConfig'
           description: Optional schema payload for `type=json_schema`. Enforced during native constrained
             decoding and validated after generation.
-    TermiteGenerateJsonSchemaConfig:
+    InferenceGenerateJsonSchemaConfig:
       type: object
       properties:
         name:
@@ -16987,7 +16987,7 @@ components:
           type: object
           additionalProperties: true
           description: JSON Schema object
-    TermiteGenerateResponse:
+    InferenceGenerateResponse:
       type: object
       description: OpenAI-compatible chat completion response
       required:
@@ -17017,11 +17017,11 @@ components:
         choices:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteGenerateChoice'
+            $ref: '#/components/schemas/InferenceGenerateChoice'
           description: List of completion choices (currently always 1)
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteGenerateChoice:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceGenerateChoice:
       type: object
       required:
         - index
@@ -17032,20 +17032,20 @@ components:
           type: integer
           description: Index of this choice in the list
         message:
-          $ref: '#/components/schemas/TermiteGenerateMessage'
+          $ref: '#/components/schemas/InferenceGenerateMessage'
         finish_reason:
-          $ref: '#/components/schemas/TermiteFinishReason'
+          $ref: '#/components/schemas/InferenceFinishReason'
         logprobs:
           type: object
           nullable: true
           description: Log probability information (not supported, always null)
-    TermiteGenerateMessage:
+    InferenceGenerateMessage:
       type: object
       required:
         - role
       properties:
         role:
-          $ref: '#/components/schemas/TermiteRole'
+          $ref: '#/components/schemas/InferenceRole'
         content:
           type: string
           nullable: true
@@ -17053,9 +17053,9 @@ components:
         tool_calls:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteToolCall'
+            $ref: '#/components/schemas/InferenceToolCall'
           description: Tool calls made by the model (only present when finish_reason is tool_calls)
-    TermiteGenerateUsage:
+    InferenceGenerateUsage:
       type: object
       required:
         - prompt_tokens
@@ -17071,7 +17071,7 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
-    TermiteGenerateChunk:
+    InferenceGenerateChunk:
       type: object
       description: Streaming generation chunk (SSE event data)
       required:
@@ -17094,8 +17094,8 @@ components:
         choices:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteGenerateChunkChoice'
-    TermiteGenerateChunkChoice:
+            $ref: '#/components/schemas/InferenceGenerateChunkChoice'
+    InferenceGenerateChunkChoice:
       type: object
       required:
         - index
@@ -17104,15 +17104,15 @@ components:
         index:
           type: integer
         delta:
-          $ref: '#/components/schemas/TermiteGenerateDelta'
+          $ref: '#/components/schemas/InferenceGenerateDelta'
         finish_reason:
-          $ref: '#/components/schemas/TermiteFinishReason'
-    TermiteGenerateDelta:
+          $ref: '#/components/schemas/InferenceFinishReason'
+    InferenceGenerateDelta:
       type: object
       description: Delta content for streaming
       properties:
         role:
-          $ref: '#/components/schemas/TermiteRole'
+          $ref: '#/components/schemas/InferenceRole'
         content:
           type: string
           nullable: true
@@ -17120,9 +17120,9 @@ components:
         tool_calls:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteToolCallDelta'
+            $ref: '#/components/schemas/InferenceToolCallDelta'
           description: Tool call deltas for streaming tool calls
-    TermiteToolCallDelta:
+    InferenceToolCallDelta:
       type: object
       description: Incremental tool call data for streaming
       properties:
@@ -17138,8 +17138,8 @@ components:
             - function
           description: The type of tool call (only in first delta)
         function:
-          $ref: '#/components/schemas/TermiteToolCallFunctionDelta'
-    TermiteToolCallFunctionDelta:
+          $ref: '#/components/schemas/InferenceToolCallFunctionDelta'
+    InferenceToolCallFunctionDelta:
       type: object
       description: Incremental function call data for streaming
       properties:
@@ -17149,7 +17149,7 @@ components:
         arguments:
           type: string
           description: Incremental arguments JSON string
-    TermiteConfig:
+    InferenceConfig:
       type: object
       required:
         - api_url
@@ -17157,12 +17157,12 @@ components:
         api_url:
           type: string
           format: uri
-          description: URL of the Termite embedding/chunking service
+          description: URL of the inference embedding/chunking service
           example: http://localhost:8080
         models_dir:
           type: string
           description: >
-            Base directory containing model subdirectories. Termite auto-discovers models from:
+            Base directory containing model subdirectories. Antfly inference auto-discovers models from:
 
             - `{models_dir}/embedders/` - Embedding models (ONNX)
 
@@ -17175,15 +17175,15 @@ components:
             - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
 
 
-            Defaults to ~/.termite/models (set via viper). If not set, only built-in fixed chunking is
-            available.
-          example: ~/.termite/models
+            Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking
+            is available.
+          example: ~/.antfly/inference/models
         content_security:
-          $ref: '#/components/schemas/TermiteContentSecurityConfig'
+          $ref: '#/components/schemas/InferenceContentSecurityConfig'
           description: Security settings for downloading content from URLs (e.g., images for CLIP models).
             Controls allowed hosts, private IP blocking, download limits, and timeouts.
         s3_credentials:
-          $ref: '#/components/schemas/TermiteCredentials'
+          $ref: '#/components/schemas/InferenceCredentials'
           description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
         keep_alive:
           type: string
@@ -17231,7 +17231,7 @@ components:
             Format: `backend` or `backend:device` where device defaults to `auto`.
 
 
-            Termite tries entries in order and uses the first available backend+device
+            Antfly inference tries entries in order and uses the first available backend+device
 
             combination that supports the model.
 
@@ -17312,7 +17312,7 @@ components:
           description: >
             List of model names to preload at startup (Ollama-compatible).
 
-            These models are loaded immediately when Termite starts, avoiding first-request latency.
+            These models are loaded immediately when inference starts, avoiding first-request latency.
 
             Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5").
 
@@ -17373,8 +17373,8 @@ components:
             deployments (e.g., Kubernetes operator) where models are managed externally.
           default: true
         log:
-          $ref: '#/components/schemas/Termiteschemas-Config'
-    TermiteVersionResponse:
+          $ref: '#/components/schemas/Inferenceschemas-Config'
+    InferenceVersionResponse:
       type: object
       required:
         - version
@@ -17384,7 +17384,7 @@ components:
       properties:
         version:
           type: string
-          description: Termite version
+          description: inference version
           example: v1.0.0
         git_commit:
           type: string
@@ -17400,15 +17400,15 @@ components:
           example: go1.25.0
         runtime:
           type: string
-          description: Termite runtime implementation
-          example: termite-zig
+          description: inference runtime implementation
+          example: antfly-inference
         backends:
-          $ref: '#/components/schemas/TermiteBackendCapabilities'
+          $ref: '#/components/schemas/InferenceBackendCapabilities'
         allow_downloads:
           type: boolean
           description: Whether model downloads are allowed in this deployment
           example: true
-    TermiteBackendCapabilities:
+    InferenceBackendCapabilities:
       type: object
       properties:
         native:
@@ -17427,7 +17427,7 @@ components:
           type: boolean
           description: Whether the WASM backend is built into this runtime
           example: false
-    TermiteTextChunkOptions:
+    InferenceTextChunkOptions:
       type: object
       description: Options specific to text chunking.
       properties:
@@ -17442,7 +17442,7 @@ components:
           type: string
           description: Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size
             chunkers.
-    TermiteTextContent:
+    InferenceTextContent:
       type: object
       description: Text content with character offsets.
       required:
@@ -17459,7 +17459,7 @@ components:
         end_char:
           type: integer
           description: Character position in original text where chunk ends (exclusive)
-    TermiteBinaryContent:
+    InferenceBinaryContent:
       type: object
       description: Binary media content with format-specific metadata.
       properties:
@@ -17481,7 +17481,7 @@ components:
         frame_delay_ms:
           type: integer
           description: 'Animation: display delay in milliseconds'
-    TermiteContentSecurityConfig:
+    InferenceContentSecurityConfig:
       type: object
       properties:
         allowed_hosts:
@@ -17533,7 +17533,7 @@ components:
           description: User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some
             servers (e.g., Wikipedia) reject requests without a User-Agent.
           example: AntflyDB/1.0
-    TermiteCredentials:
+    InferenceCredentials:
       type: object
       properties:
         endpoint:
@@ -17560,7 +17560,7 @@ components:
           description: Optional AWS session token for temporary credentials. Supports keystore syntax
             for secret lookup.
           example: your-session-token
-    TermiteLevel:
+    InferenceLevel:
       type: string
       description: Logging verbosity level
       enum:
@@ -17570,7 +17570,7 @@ components:
         - error
       default: info
       example: info
-    TermiteStyle:
+    InferenceStyle:
       type: string
       description: Logging output format style. 'terminal' for colorized console, 'json' for structured
         JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
@@ -17581,15 +17581,15 @@ components:
         - noop
       default: terminal
       example: terminal
-    Termiteschemas-Config:
+    Inferenceschemas-Config:
       type: object
-      description: Logging configuration for Termite services
+      description: Logging configuration for inference services
       properties:
         level:
-          $ref: '#/components/schemas/TermiteLevel'
+          $ref: '#/components/schemas/InferenceLevel'
         style:
-          $ref: '#/components/schemas/TermiteStyle'
-    TermiteEmbeddingObject:
+          $ref: '#/components/schemas/InferenceStyle'
+    InferenceEmbeddingObject:
       type: object
       description: A single embedding result
       required:
@@ -17609,11 +17609,11 @@ components:
               items:
                 type: number
                 format: float
-            - $ref: '#/components/schemas/TermiteSparseVector'
+            - $ref: '#/components/schemas/InferenceSparseVector'
         index:
           type: integer
           description: Index of the input this embedding corresponds to
-    TermiteEmbeddingUsage:
+    InferenceEmbeddingUsage:
       type: object
       description: Token usage information
       required:
@@ -17677,5 +17677,5 @@ x-tagGroups:
       - Permission
       - ApiKey
       - RowFilter
-  - name: Termite
+  - name: Inference
     tags: []

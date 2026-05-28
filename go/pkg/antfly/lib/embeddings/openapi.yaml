@@ -309,7 +309,7 @@ components:
         api_url:
           type: string
           format: uri
-          description: "The URL of the Termite API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable."
+          description: "The URL of the Inference API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable."
           example: "http://localhost:8082"
       required:
         - model

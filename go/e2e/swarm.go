@@ -150,7 +150,7 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 		// Generator models (e.g., Gemma) can take 30+ seconds to load
 		select {
 		case <-termiteReadyC:
-			logger.Info("Termite server ready", zap.String("termite_api", config.Termite.ApiUrl))
+			logger.Info("Inference server ready", zap.String("inference_api", config.Termite.ApiUrl))
 			SetTermiteURL(config.Termite.ApiUrl)
 		case <-time.After(60 * time.Second):
 			cancel()
@@ -210,7 +210,7 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 	}
 
 	logger.Info("Swarm started successfully",
-		zap.String("termite_api", config.Termite.ApiUrl),
+		zap.String("inference_api", config.Termite.ApiUrl),
 		zap.String("metadata_api", metadataAPIURL),
 		zap.String("store_api", storeAPIURL),
 	)

@@ -11,7 +11,7 @@ Observed on 2026-05-11:
 Latest full-suite status:
 
 - Termite E2E is green:
-  - command: `bash go/pkg/termite/scripts/debug_metal_command.sh command --timeout 1800 -- e2e/termite/.venv/bin/pytest -q -s e2e/termite`
+  - command: `bash go/pkg/termite/scripts/debug_metal_command.sh command --timeout 1800 -- e2e/inference/.venv/bin/pytest -q -s e2e/inference`
   - result: `63 passed, 31 skipped in 825.24s (0:13:45)`
   - debug bundle: `go/pkg/termite/.debug/metal-command-20260510-195358`
 - Antfly Python E2E is green:

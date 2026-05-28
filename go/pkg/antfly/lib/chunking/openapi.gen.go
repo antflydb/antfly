@@ -57,7 +57,7 @@ type ChunkerProvider string
 
 // TermiteChunkerConfig defines model for TermiteChunkerConfig.
 type TermiteChunkerConfig struct {
-	// ApiUrl The URL of the Termite API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_TERMITE_URL environment variable.
+	// ApiUrl The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_TERMITE_URL environment variable.
 	ApiUrl string `json:"api_url,omitempty,omitzero"`
 
 	// Audio Options specific to audio chunking.

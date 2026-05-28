@@ -6226,7 +6226,7 @@ type TermiteChunkResponseObject string
 
 // TermiteChunkerConfig defines model for TermiteChunkerConfig.
 type TermiteChunkerConfig struct {
-	// ApiUrl The URL of the Termite API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_TERMITE_URL environment variable.
+	// ApiUrl The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_TERMITE_URL environment variable.
 	ApiUrl string `json:"api_url,omitempty,omitzero"`
 
 	// Audio Options specific to audio chunking.
@@ -6695,7 +6695,7 @@ type TermiteEmbedResponseObject string
 //
 // Models are loaded from the `models/embedders/{name}/` directory.
 type TermiteEmbedderConfig struct {
-	// ApiUrl The URL of the Termite API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable.
+	// ApiUrl The URL of the Inference API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable.
 	ApiUrl string `json:"api_url,omitempty,omitzero"`
 
 	// Model The embedding model name (maps to models/embedders/{name}/ directory).
@@ -7075,7 +7075,7 @@ type TermiteGenerateUsage struct {
 
 // TermiteGeneratorConfig Configuration for the Termite generative AI provider.
 type TermiteGeneratorConfig struct {
-	// ApiUrl The URL of the Termite API endpoint.
+	// ApiUrl The URL of the Inference API endpoint.
 	ApiUrl string `json:"api_url,omitempty,omitzero"`
 
 	// MaxTokens Maximum number of tokens to generate.
@@ -7087,7 +7087,7 @@ type TermiteGeneratorConfig struct {
 	// Temperature Controls randomness in generation (0.0-2.0).
 	Temperature float32 `json:"temperature,omitempty,omitzero"`
 
-	// Timeout HTTP response timeout in seconds for Termite API calls.
+	// Timeout HTTP response timeout in seconds for Inference API calls.
 	Timeout int `json:"timeout,omitempty,omitzero"`
 
 	// TopK Top-k sampling parameter.
@@ -7403,12 +7403,12 @@ type TermiteRerankResponse struct {
 // TermiteRerankResponseObject Object type, always "list"
 type TermiteRerankResponseObject string
 
-// TermiteRerankerConfig Configuration for the Termite reranking provider.
+// TermiteRerankerConfig Configuration for the inference reranking provider.
 type TermiteRerankerConfig struct {
 	// Model The name of the reranking model (e.g., cross-encoder model name).
 	Model string `json:"model"`
 
-	// Url The URL of the Termite API endpoint.
+	// Url The URL of the Inference API endpoint.
 	Url string `json:"url,omitempty,omitzero"`
 }
 

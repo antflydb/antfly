@@ -160,7 +160,7 @@ class EmbeddedTermiteSwarmServer:
         self.public_url = f"http://{host}:{self.public_port}"
         self.url = antfly_public_api_url(self.public_url)
         self.health_url = f"http://{host}:{self.health_port}"
-        self.termite_api_url = termite_public_api_url(self.public_url)
+        self.inference_api_url = termite_public_api_url(self.public_url)
         self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-swarm-e2e-")
         self.root = Path(self.tempdir.name)
         self.log_path = self.root / "server.log"
@@ -208,10 +208,10 @@ class EmbeddedTermiteSwarmServer:
             self.stop()
             logs = _read_log_tail(self.log_path)
             raise RuntimeError(f"Swarm API server failed to start at {self.url}\n{logs}")
-        if not _wait_for_server(self.termite_api_url, timeout_s=120.0, path="/models"):
+        if not _wait_for_server(self.inference_api_url, timeout_s=120.0, path="/models"):
             self.stop()
             logs = _read_log_tail(self.log_path)
-            raise RuntimeError(f"Embedded termite server failed to start at {self.termite_api_url}\n{logs}")
+            raise RuntimeError(f"Embedded termite server failed to start at {self.inference_api_url}\n{logs}")
 
     def debug_logs(self) -> str:
         self.log_file.flush()
@@ -286,12 +286,12 @@ def embedded_swarm_runtime():
         model_name,
         termite_budget_mb=termite_budget_mb,
     )
-    _warm_termite_generator(server.termite_api_url, model_name)
+    _warm_termite_generator(server.inference_api_url, model_name)
     yield {
         "base_url": server.url,
         "public_url": server.public_url,
         "health_url": server.health_url,
-        "termite_api_url": server.termite_api_url,
+        "inference_api_url": server.inference_api_url,
         "model": model_name,
         "models_dir": str(models_dir),
         "termite_budget_mb": termite_budget_mb,

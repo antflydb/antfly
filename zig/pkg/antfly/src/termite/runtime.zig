@@ -20,12 +20,13 @@ const termite = @import("termite_server");
 
 pub const ServerBudgetOverrides = termite.server.BudgetOverrides;
 
-/// Returns ~/.termite/models if $HOME is set, otherwise falls back to ./models.
+/// Returns ~/.antfly/inference/models if $HOME is set, otherwise falls back to ./models.
 pub fn defaultModelsDir(allocator: std.mem.Allocator) []const u8 {
+    if (platform.env.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value| return value;
     if (platform.env.getenv("ANTFLY_TERMITE_MODELS_DIR")) |value| return value;
     if (platform.env.getenv("TERMITE_MODELS_DIR")) |value| return value;
     const home = platform.env.getenv("HOME") orelse return "./models";
-    return std.fs.path.join(allocator, &.{ home, ".termite", "models" }) catch "./models";
+    return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "models" }) catch "./models";
 }
 
 pub const SpawnedServer = struct {
@@ -327,7 +328,7 @@ fn printUsage() void {
         \\Run options:
         \\  --host <addr>    Listen address (default: 127.0.0.1)
         \\  --port <port>    Listen port (default: 8090)
-        \\  --models-dir <dir> Models directory (default: ~/.termite/models)
+        \\  --models-dir <dir> Models directory (default: ~/.antfly/inference/models)
         \\  --host-budget-mb <n>      Native generation host budget override
         \\  --backend-budget-mb <n>   Native generation backend budget override
         \\  --combined-budget-mb <n>  Native generation combined budget override
@@ -336,7 +337,7 @@ fn printUsage() void {
         \\
         \\Pull options:
         \\  --token <token>  HuggingFace API token (or set HF_TOKEN env var)
-        \\  --models-dir <dir> Models directory (default: ~/.termite/models)
+        \\  --models-dir <dir> Models directory (default: ~/.antfly/inference/models)
         \\
     , .{});
 }

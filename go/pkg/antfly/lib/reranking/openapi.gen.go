@@ -88,12 +88,12 @@ type RerankerConfig struct {
 // RerankerProvider The reranking provider to use.
 type RerankerProvider string
 
-// TermiteRerankerConfig Configuration for the Termite reranking provider.
+// TermiteRerankerConfig Configuration for the inference reranking provider.
 type TermiteRerankerConfig struct {
 	// Model The name of the reranking model (e.g., cross-encoder model name).
 	Model string `json:"model"`
 
-	// Url The URL of the Termite API endpoint.
+	// Url The URL of the Inference API endpoint.
 	Url *string `json:"url,omitempty"`
 }
 

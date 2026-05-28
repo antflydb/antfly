@@ -252,7 +252,7 @@ type OpenRouterEmbedderConfig struct {
 //
 // Models are loaded from the `models/embedders/{name}/` directory.
 type TermiteEmbedderConfig struct {
-	// ApiUrl The URL of the Termite API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable.
+	// ApiUrl The URL of the Inference API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable.
 	ApiUrl *string `json:"api_url,omitempty"`
 
 	// Model The embedding model name (maps to models/embedders/{name}/ directory).

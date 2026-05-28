@@ -243,7 +243,7 @@ jobs:
     env:
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
-      TERMITE_HOME: /mnt/cache/antfly/zig/termite
+      ANTFLY_INFERENCE_MODELS_DIR: /mnt/cache/antfly/zig/inference/models
     steps:
       - uses: actions/checkout@v6
         with:
@@ -260,11 +260,10 @@ jobs:
 
       - name: Prepare ARC cache dirs
         run: |
-          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$TERMITE_HOME"
-          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-termite
-          rm -rf ~/.cache ~/.termite
+          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$ANTFLY_INFERENCE_MODELS_DIR"
+          mkdir -p /mnt/cache/antfly/zig/home-cache
+          rm -rf ~/.cache
           ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
-          ln -s /mnt/cache/antfly/zig/home-termite ~/.termite
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
@@ -287,14 +286,14 @@ jobs:
             -m "not objectstore_integration and not swarm_integration and not real_model and not postgres_integration and not slow" \
             e2e/antfly
 
-      - name: Run Termite base E2E
+      - name: Run Inference base E2E
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
         run: |
-          uv run --project e2e/termite pytest -q \
+          uv run --project e2e/inference pytest -q \
             -m "not slow and not multimodal and not model_integration and not browser_integration" \
-            e2e/termite
+            e2e/inference
 
   e2e-full:
     needs: changes
@@ -304,7 +303,7 @@ jobs:
     env:
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
-      TERMITE_HOME: /mnt/cache/antfly/zig/termite
+      ANTFLY_INFERENCE_MODELS_DIR: /mnt/cache/antfly/zig/inference/models
     steps:
       - uses: actions/checkout@v6
         with:
@@ -321,11 +320,10 @@ jobs:
 
       - name: Prepare ARC cache dirs
         run: |
-          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$TERMITE_HOME"
-          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-termite
-          rm -rf ~/.cache ~/.termite
+          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$ANTFLY_INFERENCE_MODELS_DIR"
+          mkdir -p /mnt/cache/antfly/zig/home-cache
+          rm -rf ~/.cache
           ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
-          ln -s /mnt/cache/antfly/zig/home-termite ~/.termite
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
@@ -346,11 +344,11 @@ jobs:
           chmod +x ./zig-out/bin/antfly
           uv run --project e2e/antfly pytest -q e2e/antfly
 
-      - name: Run Termite full E2E
+      - name: Run Inference full E2E
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
-        run: uv run --project e2e/termite pytest -q e2e/termite
+        run: uv run --project e2e/inference pytest -q e2e/inference
 
   tla-verify:
     needs: changes

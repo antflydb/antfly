@@ -237,12 +237,12 @@ components:
 
         **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC
 
-        **Docs:** See Termite documentation
+        **Docs:** See inference documentation
       properties:
         api_url:
           type: string
           format: uri
-          description: "Termite API URL. Falls back to ANTFLY_TERMITE_URL environment variable."
+          description: "Inference API URL. Falls back to ANTFLY_TERMITE_URL environment variable."
         model:
           type: string
           description: "Transcriber model name (e.g., 'openai/whisper-tiny'). If empty, uses default."

@@ -1,0 +1,26 @@
+{
+  "recipe": "dpo",
+  "model": {
+    "path": "/tmp/termite-models/gemma/gemma4-local",
+    "reference_path": "/tmp/termite-models/gemma/gemma4-local",
+    "family": "gemma4",
+    "name": "gemma4-local-fast"
+  },
+  "dataset": {
+    "path": "pkg/inference/testdata/dpo_text_preference.jsonl",
+    "format": "text-preference",
+    "max_examples": 2,
+    "max_seq_len": 128
+  },
+  "adapter": {
+    "rank": 8,
+    "alpha": 32
+  },
+  "preference": {
+    "beta": 0.1
+  },
+  "artifacts": {
+    "root": "/tmp/termite-dpo-text-gemma-fast"
+  },
+  "backend": "blas"
+}

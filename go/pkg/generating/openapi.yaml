@@ -234,7 +234,7 @@ components:
         api_url:
           type: string
           format: uri
-          description: "The URL of the Termite API endpoint."
+          description: "The URL of the Inference API endpoint."
         temperature:
           type: number
           format: float
@@ -255,7 +255,7 @@ components:
           description: "Top-k sampling parameter."
         timeout:
           type: integer
-          description: "HTTP response timeout in seconds for Termite API calls."
+          description: "HTTP response timeout in seconds for Inference API calls."
           minimum: 1
       required:
         - model

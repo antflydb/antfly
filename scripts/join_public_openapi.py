@@ -26,7 +26,7 @@ from openapi_spec_validator import validate_spec
 
 ROOT = Path(__file__).resolve().parent.parent
 JOIN_OPENAPI = ROOT / "scripts/join_openapi.py"
-TERMITE_SPEC = ROOT / "specs/openapi/termite/api.yaml"
+INFERENCE_SPEC = ROOT / "specs/openapi/inference/api.yaml"
 OUTPUT = ROOT / "openapi.yaml"
 
 
@@ -116,20 +116,20 @@ def walk_refs(value: object, rename_schema) -> object:
     return value
 
 
-def termite_schema_name(name: str) -> str:
-    return f"Termite{name}"
+def inference_schema_name(name: str) -> str:
+    return f"Inference{name}"
 
 
-def merge_components(antfly: dict, termite: dict) -> dict:
+def merge_components(antfly: dict, inference: dict) -> dict:
     merged = copy.deepcopy(antfly.get("components", {}))
-    termite_components = copy.deepcopy(termite.get("components", {}))
+    inference_components = copy.deepcopy(inference.get("components", {}))
 
-    termite_schemas = termite_components.pop("schemas", {})
+    inference_schemas = inference_components.pop("schemas", {})
     schemas = merged.setdefault("schemas", {})
-    for name, schema in termite_schemas.items():
-        schemas[termite_schema_name(name)] = walk_refs(schema, termite_schema_name)
+    for name, schema in inference_schemas.items():
+        schemas[inference_schema_name(name)] = walk_refs(schema, inference_schema_name)
 
-    for section, section_map in termite_components.items():
+    for section, section_map in inference_components.items():
         if not isinstance(section_map, dict):
             if section not in merged:
                 merged[section] = copy.deepcopy(section_map)
@@ -140,24 +140,24 @@ def merge_components(antfly: dict, termite: dict) -> dict:
         for name, value in section_map.items():
             if name in target and target[name] != value:
                 raise RuntimeError(f"components/{section}/{name} conflict")
-            target[name] = walk_refs(value, termite_schema_name)
+            target[name] = walk_refs(value, inference_schema_name)
 
     return merged
 
 
 def join_specs() -> dict:
     antfly = join_antfly_spec()
-    termite = load_yaml(TERMITE_SPEC)
+    inference = load_yaml(INFERENCE_SPEC)
 
     paths = {}
     for path, item in antfly.get("paths", {}).items():
         paths[antfly_public_path(path)] = copy.deepcopy(item)
-    for path, item in termite.get("paths", {}).items():
-        paths[prefixed_path("/ml/v1", path)] = walk_refs(item, termite_schema_name)
+    for path, item in inference.get("paths", {}).items():
+        paths[prefixed_path("/ml/v1", path)] = walk_refs(item, inference_schema_name)
 
     tags = []
     seen_tags = set()
-    for item in antfly.get("tags", []) + termite.get("tags", []):
+    for item in antfly.get("tags", []) + inference.get("tags", []):
         name = item.get("name") if isinstance(item, dict) else None
         if not name or name in seen_tags:
             continue
@@ -171,14 +171,14 @@ def join_specs() -> dict:
             "version": antfly.get("info", {}).get("version", "0.1.0"),
             "description": (
                 "Joined public contract for the Antfly server. Antfly APIs are served under "
-                "`/api/v1`, auth APIs under `/auth/v1`, and Termite ML APIs under `/ml/v1`."
+                "`/api/v1`, auth APIs under `/auth/v1`, and inference ML APIs under `/ml/v1`."
             ),
         },
         "servers": [{"url": "/"}],
         "tags": tags,
         "security": copy.deepcopy(antfly.get("security", [])),
         "paths": paths,
-        "components": merge_components(antfly, termite),
+        "components": merge_components(antfly, inference),
         "x-tagGroups": [
             {
                 "name": "Antfly",
@@ -195,10 +195,10 @@ def join_specs() -> dict:
                 "tags": ["User", "Permission", "ApiKey", "RowFilter"],
             },
             {
-                "name": "Termite",
+                "name": "Inference",
                 "tags": [
                     tag.get("name")
-                    for tag in termite.get("tags", [])
+                    for tag in inference.get("tags", [])
                     if isinstance(tag, dict) and tag.get("name")
                 ],
             },

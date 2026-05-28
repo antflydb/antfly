@@ -37,7 +37,7 @@ spec:
         - /manager
         args:
         - --leader-elect
-        - --enable-termite-controllers=true
+        - --enable-inference-controllers=true
         resources:
           limits:
             cpu: 500m

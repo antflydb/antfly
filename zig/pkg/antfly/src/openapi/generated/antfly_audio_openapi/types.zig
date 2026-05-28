@@ -176,9 +176,9 @@ pub const VertexSTTConfig = struct {
     model: ?[]const u8 = null,
 };
 
-/// Configuration for Termite STT (Whisper, Wav2Vec2, HuBERT) provider. Uses local Termite service for speech-to-text inference. **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC **Docs:** See Termite documentation
+/// Configuration for Termite STT (Whisper, Wav2Vec2, HuBERT) provider. Uses local Termite service for speech-to-text inference. **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC **Docs:** See inference documentation
 pub const TermiteSTTConfig = struct {
-    /// Termite API URL. Falls back to ANTFLY_TERMITE_URL environment variable.
+    /// Inference API URL. Falls back to ANTFLY_TERMITE_URL environment variable.
     api_url: ?[]const u8 = null,
     /// Transcriber model name (e.g., 'openai/whisper-tiny'). If empty, uses default.
     model: ?[]const u8 = null,
@@ -303,7 +303,7 @@ pub const STTConfig = struct {
     enable_automatic_punctuation: ?bool = null,
     /// Use enhanced models for better accuracy (costs more).
     use_enhanced: ?bool = null,
-    /// Termite API URL. Falls back to ANTFLY_TERMITE_URL environment variable.
+    /// Inference API URL. Falls back to ANTFLY_TERMITE_URL environment variable.
     api_url: ?[]const u8 = null,
     provider: STTProvider,
 };

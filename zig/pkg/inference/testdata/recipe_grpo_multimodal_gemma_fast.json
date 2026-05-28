@@ -1,0 +1,32 @@
+{
+  "recipe": "grpo",
+  "model": {
+    "path": "/tmp/termite-models/gemma/gemma4-local",
+    "reference_path": "/tmp/termite-models/gemma/gemma4-local",
+    "family": "gemma4",
+    "name": "gemma4-local-multimodal-fast",
+    "projector_path": "/tmp/termite-models/gemma/gemma4-local/mmproj.gguf"
+  },
+  "dataset": {
+    "path": "pkg/inference/testdata/grpo_multimodal_prompts.jsonl",
+    "format": "text-grpo",
+    "max_examples": 1,
+    "max_seq_len": 96
+  },
+  "adapter": {
+    "rank": 8,
+    "alpha": 32
+  },
+  "grpo": {
+    "group_size": 2,
+    "clip_epsilon": 0.2,
+    "kl_coef": 0.04,
+    "normalize_advantage": true,
+    "max_completion_tokens": 2,
+    "reward_mode": "prefix-match"
+  },
+  "artifacts": {
+    "root": "/tmp/termite-grpo-multimodal-gemma-fast"
+  },
+  "backend": "blas"
+}

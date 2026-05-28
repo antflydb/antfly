@@ -31,7 +31,7 @@ components:
 
     TermiteRerankerConfig:
       type: object
-      description: "Configuration for the Termite reranking provider."
+      description: "Configuration for the inference reranking provider."
       properties:
         model:
           type: string
@@ -39,7 +39,7 @@ components:
         url:
           type: string
           format: uri
-          description: "The URL of the Termite API endpoint."
+          description: "The URL of the Inference API endpoint."
       required:
         - model
 

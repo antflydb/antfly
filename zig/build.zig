@@ -17,7 +17,7 @@ const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
 const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
-const termite_runtime_build = @import("pkg/termite/build/runtime.zig");
+const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
 
 const LmdbBackend = antfly_storage_build.LmdbBackend;
 const chainLabeledFilteredTests = antfly_tests_build.chainLabeledFilteredTests;
@@ -96,7 +96,7 @@ fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const
     return run;
 }
 
-const termite_delegated_steps = [_][]const u8{
+const inference_delegated_steps = [_][]const u8{
     "run",
     "finetune",
     "bench-paged-attention",
@@ -115,8 +115,8 @@ const DelegatedPackageStep = struct {
     step: *std.Build.Step,
 };
 
-const DelegatedTermiteBuildSteps = struct {
-    termite_test: *std.Build.Step,
+const DelegatedInferenceBuildSteps = struct {
+    inference_test: *std.Build.Step,
 };
 
 fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) void {
@@ -156,7 +156,7 @@ fn forwardBuildArgs(b: *std.Build, run: *std.Build.Step.Run) void {
     }
 }
 
-fn addDelegatedTermiteOptions(
+fn addDelegatedInferenceOptions(
     b: *std.Build,
     run: *std.Build.Step.Run,
     enable_mlx: bool,
@@ -196,7 +196,7 @@ fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
     return &run.step;
 }
 
-fn addDelegatedTermiteBuildSteps(
+fn addDelegatedInferenceBuildSteps(
     b: *std.Build,
     enable_mlx: bool,
     mlx_root: ?[]const u8,
@@ -207,19 +207,19 @@ fn addDelegatedTermiteBuildSteps(
     cuda_artifacts: []const u8,
     enable_system_blas: bool,
     blas_root: ?[]const u8,
-) DelegatedTermiteBuildSteps {
+) DelegatedInferenceBuildSteps {
     var test_step: ?*std.Build.Step = null;
-    for (termite_delegated_steps) |step_name| {
-        const delegated = addDelegatedPackageStep(b, "termite", "pkg/termite", step_name, "pkg/termite");
+    for (inference_delegated_steps) |step_name| {
+        const delegated = addDelegatedPackageStep(b, "inference", "pkg/inference", step_name, "pkg/inference");
         const run = delegated.run;
-        addDelegatedTermiteOptions(b, run, enable_mlx, mlx_root, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
+        addDelegatedInferenceOptions(b, run, enable_mlx, mlx_root, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
         forwardBuildArgs(b, run);
         if (std.mem.eql(u8, step_name, "test")) {
             test_step = delegated.step;
         }
     }
     return .{
-        .termite_test = test_step.?,
+        .inference_test = test_step.?,
     };
 }
 
@@ -248,7 +248,7 @@ fn detectMlxRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 {
     return null;
 }
 
-fn defaultTermiteOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
+fn defaultInferenceOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
     const platform_str = switch (target.result.os.tag) {
         .macos => "darwin",
         .linux => "linux",
@@ -259,7 +259,7 @@ fn defaultTermiteOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []con
         .x86_64 => "amd64",
         else => "unknown",
     };
-    return b.fmt("pkg/termite/onnxruntime/{s}-{s}", .{ platform_str, arch_str });
+    return b.fmt("pkg/inference/onnxruntime/{s}-{s}", .{ platform_str, arch_str });
 }
 
 fn detectFfmpegPaths(b: *std.Build, target: std.Build.ResolvedTarget) ?FfmpegPaths {
@@ -334,7 +334,7 @@ fn addLocalSentencePieceProtoModule(
     const fixup_tool = b.addExecutable(.{
         .name = "patch_sentencepiece_proto",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/termite/tools/patch_sentencepiece_proto.zig"),
+            .root_source_file = b.path("pkg/inference/tools/patch_sentencepiece_proto.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
         }),
@@ -432,7 +432,7 @@ const AntflyRootImports = struct {
     a2a: *std.Build.Module,
     generating: *std.Build.Module,
     reranking: *std.Build.Module,
-    termite_api: *std.Build.Module,
+    inference_api: *std.Build.Module,
     termite_hf_tokenizer: *std.Build.Module,
     termite_fixed_tokenizer_data: *std.Build.Module,
     termite_chunker: *std.Build.Module,
@@ -489,7 +489,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_a2a", .field = "a2a" },
         .{ .name = "antfly_generating", .field = "generating" },
         .{ .name = "antfly_reranking", .field = "reranking" },
-        .{ .name = "termite_api", .field = "termite_api" },
+        .{ .name = "inference_api", .field = "inference_api" },
         .{ .name = "termite_hf_tokenizer", .field = "termite_hf_tokenizer" },
         .{ .name = "termite_fixed_tokenizer_data", .field = "termite_fixed_tokenizer_data" },
         .{ .name = "termite_chunker", .field = "termite_chunker" },
@@ -907,7 +907,7 @@ fn addOpenApiRegenStep(
     const regen_step = b.step("regen-openapi", "Regenerate checked-in Zig OpenAPI modules");
 
     const antfly_generated_root = "pkg/antfly/src/openapi/generated";
-    const termite_generated_root = "pkg/termite/src/api/generated";
+    const termite_generated_root = "pkg/inference/src/api/generated";
     const runs = [_]*std.Build.Step.Run{
         addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
             .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
@@ -987,7 +987,7 @@ fn addOpenApiRegenStep(
             .{ "../../../generating/openapi.yaml", "antfly_generating_openapi" },
             .{ "../websearch/openapi.yaml", "antfly_websearch_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/termite/api.yaml"), "termite_api", termite_generated_root ++ "/termite_api", "types,server", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", termite_generated_root ++ "/inference_api", "types,server", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
     };
 
@@ -1023,21 +1023,21 @@ pub fn build(b: *std.Build) void {
     if (!link_libc and lmdb_backend == .c) {
         @panic("-Dlink-libc=false requires -Dlmdb_backend=zig");
     }
-    const termite_mlx_option = b.option(bool, "mlx", "Enable MLX termite support when available");
+    const termite_mlx_option = b.option(bool, "mlx", "Enable MLX inference support when available");
     const termite_mlx_requested = if (link_libc)
         termite_mlx_option orelse false
     else
         false;
     const termite_mlx_root_opt = b.option([]const u8, "mlx-root", "Path to MLX C root with include/ and lib/");
-    const termite_onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime support for embedded Termite");
+    const termite_onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime support for embedded inference");
     const termite_enable_onnx = if (link_libc)
         termite_onnx_option orelse false
     else
         false;
-    const termite_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded Termite");
-    const termite_onnx_root = termite_onnx_root_opt orelse defaultTermiteOnnxRoot(b, target);
+    const termite_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded inference");
+    const termite_onnx_root = termite_onnx_root_opt orelse defaultInferenceOnnxRoot(b, target);
     const termite_enable_metal = if (link_libc)
-        b.option(bool, "metal", "Enable Apple Metal kernels for embedded Termite") orelse if (target.result.os.tag == .macos) true else termite_mlx_requested
+        b.option(bool, "metal", "Enable Apple Metal kernels for embedded inference") orelse if (target.result.os.tag == .macos) true else termite_mlx_requested
     else
         false;
     const termite_enable_mlx = termite_enable_metal and termite_mlx_requested;
@@ -1045,7 +1045,7 @@ pub fn build(b: *std.Build) void {
         termite_mlx_root_opt orelse detectMlxRoot(b, target)
     else
         termite_mlx_root_opt;
-    const termite_enable_cuda = b.option(bool, "cuda", "Enable CUDA termite support through the NVIDIA Driver API") orelse false;
+    const termite_enable_cuda = b.option(bool, "cuda", "Enable CUDA inference support through the NVIDIA Driver API") orelse false;
     const termite_cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: portable PTX; fatbin is not implemented yet") orelse "portable";
     if (!std.mem.eql(u8, termite_cuda_artifacts, "portable")) {
         @panic("invalid -Dcuda-artifacts (expected portable; fatbin is not implemented yet)");
@@ -1074,7 +1074,7 @@ pub fn build(b: *std.Build) void {
             @panic("-Donnx=true requires an ONNX Runtime install; pass -Donnx-root=<path>");
         }
     }
-    const delegated_termite_steps = addDelegatedTermiteBuildSteps(
+    const delegated_inference_steps = addDelegatedInferenceBuildSteps(
         b,
         termite_enable_mlx,
         termite_mlx_root,
@@ -1351,7 +1351,7 @@ pub fn build(b: *std.Build) void {
     // Inference dependencies
     const openai_api_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "openai_api", antfly_generated_root ++ "/openai_api", httpx_mod);
 
-    // --- Termite backend detection (must precede module creation) ---
+    // --- Inference backend detection (must precede module creation) ---
     const termite_ffmpeg_paths = if (link_libc) detectFfmpegPaths(b, target) else null;
     const image_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
@@ -1420,12 +1420,12 @@ pub fn build(b: *std.Build) void {
     termite_pjrt_mod.addImport("protobuf", protobuf_mod);
     termite_pjrt_mod.addImport("xla_proto", termite_pjrt_xla_proto_mod);
 
-    const termite_graph = termite_runtime_build.create(.{
+    const termite_graph = inference_runtime_build.create(.{
         .b = b,
         .target = target,
         .optimize = optimize,
         .paths = .{
-            .termite_root = "pkg/termite",
+            .termite_root = "pkg/inference",
             .shared_lib_root = "",
         },
         .backend = .{
@@ -1474,7 +1474,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const termite_build_options_mod = termite_graph.build_options_mod;
-    const termite_api_mod = termite_graph.termite_api_mod;
+    const inference_api_mod = termite_graph.inference_api_mod;
     const termite_hf_tokenizer_mod = termite_graph.termite_hf_tokenizer_mod;
     const termite_fixed_tokenizer_data_mod = termite_graph.termite_fixed_tokenizer_data_mod;
     const termite_chunker_mod = termite_graph.termite_chunker_mod;
@@ -1487,7 +1487,7 @@ pub fn build(b: *std.Build) void {
     });
     transcribing_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     transcribing_mod.addImport("httpx", httpx_mod);
-    transcribing_mod.addImport("termite_api", termite_api_mod);
+    transcribing_mod.addImport("inference_api", inference_api_mod);
     transcribing_mod.addImport("antfly_scraping", scraping_mod);
     const synthesizing_mod = b.createModule(.{
         .root_source_file = b.path("lib/synthesizing/src/mod.zig"),
@@ -1541,7 +1541,7 @@ pub fn build(b: *std.Build) void {
         .a2a = a2a_mod,
         .generating = generating_mod,
         .reranking = reranking_mod,
-        .termite_api = termite_api_mod,
+        .inference_api = inference_api_mod,
         .termite_hf_tokenizer = termite_hf_tokenizer_mod,
         .termite_fixed_tokenizer_data = termite_fixed_tokenizer_data_mod,
         .termite_chunker = termite_chunker_mod,
@@ -1747,7 +1747,7 @@ pub fn build(b: *std.Build) void {
     });
     antfly_embedded_pkg_wasm_mod.addImport("embedded_surface", embedded_wasm_mod);
 
-    // --- Termite WASM modules for unified antfly.wasm ---
+    // --- Inference WASM modules for unified antfly.wasm ---
     const termite_wasm_build_options = b.addOptions();
     termite_wasm_build_options.addOption(bool, "enable_onnx", false);
     termite_wasm_build_options.addOption(bool, "enable_mlx", false);
@@ -1813,7 +1813,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
     });
     const termite_wasm_inference_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/termite/src/wasm_entry.zig"),
+        .root_source_file = b.path("pkg/inference/src/wasm_entry.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSafe,
     });
@@ -1892,7 +1892,7 @@ pub fn build(b: *std.Build) void {
         install_shader_steps[i] = &install_shader.step;
     }
 
-    const install_wasm_step = b.step("install-wasm", "Build and install the unified antfly wasm target (antfly-embedded + termite inference)");
+    const install_wasm_step = b.step("install-wasm", "Build and install the unified antfly wasm target (antfly-embedded + inference runtime)");
     install_wasm_step.dependOn(&install_antfly_wasm.step);
     install_wasm_step.dependOn(&install_antfly_wasm_smoke_run.step);
     install_wasm_step.dependOn(&install_antfly_wasm_client.step);
@@ -4098,7 +4098,7 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("antfly_regex", regex_mod);
     db_test_mod.addImport("raft_engine", raft_engine_mod);
     db_test_mod.addImport("termite_chunker", termite_chunker_mod);
-    db_test_mod.addImport("termite_api", termite_api_mod);
+    db_test_mod.addImport("inference_api", inference_api_mod);
     db_test_mod.addImport("antfly_reranking", reranking_mod);
     db_test_mod.addImport("antfly_scraping", scraping_mod);
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
@@ -5890,7 +5890,7 @@ pub fn build(b: *std.Build) void {
         break :blk mod;
     } else blk: {
         const termite_cli_mod = b.createModule(.{
-            .root_source_file = b.path("pkg/termite/src/main.zig"),
+            .root_source_file = b.path("pkg/inference/src/main.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -5948,7 +5948,7 @@ pub fn build(b: *std.Build) void {
 
     dependOnAll(test_step, &.{
         antfly_test_step,
-        delegated_termite_steps.termite_test,
+        delegated_inference_steps.inference_test,
     });
 
     const hbc_trace_mod = b.createModule(.{

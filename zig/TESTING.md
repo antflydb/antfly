@@ -14,7 +14,7 @@ zig build test
 `zig build test` depends on the default package aggregates:
 
 - `zig build antfly-test`
-- `zig build termite-test`
+- `zig build inference-test`
 
 The default aggregate is intended to be the normal local and CI confidence
 target. It does not fetch external corpora and does not run benchmark or soak
@@ -58,13 +58,13 @@ zig build antfly-test
 - the default recall harness over `testdata/vectorsets`
 - `chaos-test`
 
-Run only the Termite package tests:
+Run only the inference package tests:
 
 ```sh
-zig build termite-test
+zig build inference-test
 ```
 
-`termite-test` delegates to `go/pkg/termite` by running `zig build test` in that
+`inference-test` delegates to `pkg/inference` by running `zig build test` in that
 package with the root build's relevant backend options forwarded.
 
 ## Antfly Tiers
@@ -162,9 +162,9 @@ ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest -q \
   -m "not objectstore_integration and not swarm_integration and not real_model and not postgres_integration and not slow" \
   e2e/antfly
 
-ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/termite pytest -q \
+ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/inference pytest -q \
   -m "not slow and not multimodal and not model_integration and not browser_integration" \
-  e2e/termite
+  e2e/inference
 ```
 
 Unmarked E2E tests are expected to be safe for `e2e-base`. Mark tests that
@@ -224,26 +224,26 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 export GOOGLE_CLOUD_PROJECT=my-project
 ```
 
-Run the Termite product E2E suite:
+Run the inference product E2E suite:
 
 ```sh
 zig build install -Dedition=inference
-ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/termite pytest -q e2e/termite
+ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/inference pytest -q e2e/inference
 ```
 
-The Inference fixtures can also target an already-running service:
+The inference fixtures can also target an already-running service:
 
 ```sh
-TERMITE_URL=http://127.0.0.1:8080 uv run --project e2e/termite pytest -q e2e/termite
-TERMITE_URL=https://termite.example.com TERMITE_TOKEN=... uv run --project e2e/termite pytest -q e2e/termite
+ANTFLY_INFERENCE_URL=http://127.0.0.1:8080 uv run --project e2e/inference pytest -q e2e/inference
+ANTFLY_INFERENCE_URL=https://inference.example.com ANTFLY_INFERENCE_TOKEN=... uv run --project e2e/inference pytest -q e2e/inference
 ```
 
 Common inference E2E environment variables:
 
 - `ANTFLY_BIN`: local Antfly binary to auto-start via `antfly inference run`.
-- `TERMITE_URL`: existing Termite API endpoint.
-- `TERMITE_TOKEN`: bearer token for remote Termite endpoints.
-- `TERMITE_MODELS_DIR`: model directory override.
+- `ANTFLY_INFERENCE_URL`: existing inference API endpoint.
+- `ANTFLY_INFERENCE_TOKEN`: bearer token for remote inference endpoints.
+- `ANTFLY_INFERENCE_MODELS_DIR`: model directory override.
 - `ANTFLY_INFERENCE_DOWNLOAD=1`: allow model downloads through `antfly inference pull` when tests request unavailable models.
 - `RUN_LARGE_MODEL_TESTS=1`: opt into large-model tests.
 
@@ -255,7 +255,7 @@ E2E marker policy:
 - `postgres_integration`: requires local PostgreSQL.
 - `objectstore_integration`: requires S3 or GCS credentials and buckets.
 - `real_model` or `model_integration`: requires local or downloadable model weights.
-- `swarm_integration`: requires a local Antfly swarm plus live Termite model support.
+- `swarm_integration`: requires a local Antfly swarm plus live inference model support.
 - `browser_integration`: requires a browser or WebGPU runtime.
 - `slow`: too long-running for required E2E base CI.
 

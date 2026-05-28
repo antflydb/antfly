@@ -164,7 +164,7 @@ pub const OllamaGeneratorConfig = struct {
 pub const TermiteGeneratorConfig = struct {
     /// The name of the generator model.
     model: []const u8,
-    /// The URL of the Termite API endpoint.
+    /// The URL of the Inference API endpoint.
     api_url: ?[]const u8 = null,
     /// Controls randomness in generation (0.0-2.0).
     temperature: ?f32 = null,
@@ -174,7 +174,7 @@ pub const TermiteGeneratorConfig = struct {
     top_p: ?f32 = null,
     /// Top-k sampling parameter.
     top_k: ?i64 = null,
-    /// HTTP response timeout in seconds for Termite API calls.
+    /// HTTP response timeout in seconds for Inference API calls.
     timeout: ?i64 = null,
 };
 
@@ -296,7 +296,7 @@ pub const GeneratorConfig = struct {
     credentials_path: ?[]const u8 = null,
     /// HTTP response timeout in seconds for Ollama API calls.
     timeout: ?i64 = null,
-    /// The URL of the Termite API endpoint.
+    /// The URL of the Inference API endpoint.
     api_url: ?[]const u8 = null,
     /// Penalty for token frequency (-2.0 to 2.0).
     frequency_penalty: ?f32 = null,

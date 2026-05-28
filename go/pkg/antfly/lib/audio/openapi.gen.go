@@ -261,9 +261,9 @@ type TTSResponse struct {
 //
 // **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC
 //
-// **Docs:** See Termite documentation
+// **Docs:** See inference documentation
 type TermiteSTTConfig struct {
-	// ApiUrl Termite API URL. Falls back to ANTFLY_TERMITE_URL environment variable.
+	// ApiUrl Inference API URL. Falls back to ANTFLY_TERMITE_URL environment variable.
 	ApiUrl string `json:"api_url,omitempty,omitzero"`
 
 	// Model Transcriber model name (e.g., 'openai/whisper-tiny'). If empty, uses default.

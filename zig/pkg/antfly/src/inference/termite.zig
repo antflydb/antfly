@@ -20,7 +20,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const httpx = @import("httpx");
-const termite_api = @import("termite_api");
+const inference_api = @import("inference_api");
 const inference = @import("types.zig");
 const binary = @import("termite_binary.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)

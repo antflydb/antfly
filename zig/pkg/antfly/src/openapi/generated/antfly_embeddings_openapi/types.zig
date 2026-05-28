@@ -149,7 +149,7 @@ pub const OpenRouterEmbedderConfig = struct {
 pub const TermiteEmbedderConfig = struct {
     /// The embedding model name (maps to models/embedders/{name}/ directory).
     model: []const u8,
-    /// The URL of the Termite API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable.
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable.
     api_url: ?[]const u8 = null,
 };
 
@@ -184,7 +184,7 @@ pub const EmbedderConfig = struct {
     strip_new_lines: ?bool = null,
     /// The batch size for embedding requests to optimize throughput.
     batch_size: ?i64 = null,
-    /// The URL of the Termite API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable.
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable.
     api_url: ?[]const u8 = null,
     provider: EmbedderProvider,
     /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and will send binary content (images, audio, etc.) to the provider instead of extracting text. The provider's API is still responsible for accepting the content — this flag just tells Antfly not to strip it. Not needed for models already in the registry (e.g., `multimodalembedding`, `gemini-embedding-2-preview`, `clip-*`, `clipclap`). **Example:** ```json { "provider": "vertex", "model": "some-future-multimodal-model", "multimodal": true } ```

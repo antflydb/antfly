@@ -15,7 +15,7 @@
 const std = @import("std");
 const audio = @import("antfly_audio_openapi");
 const httpx = @import("httpx");
-const termite_api = @import("termite_api");
+const inference_api = @import("inference_api");
 const scraping = @import("antfly_scraping");
 
 const Allocator = std.mem.Allocator;
@@ -310,7 +310,7 @@ const TermiteTranscriberState = struct {
         const url = try std.fmt.allocPrint(alloc, "{s}/transcribe", .{self.api_url});
         defer alloc.free(url);
 
-        const body = try httpx.json.Json.stringify(alloc, termite_api.types.TranscribeRequest{
+        const body = try httpx.json.Json.stringify(alloc, inference_api.types.TranscribeRequest{
             .model = self.model,
             .audio = encoded,
             .language = req.language orelse self.language_code,
@@ -322,7 +322,7 @@ const TermiteTranscriberState = struct {
         if (!resp.ok()) return error.TranscribeRequestFailed;
 
         const payload = resp.body orelse return error.EmptyResponse;
-        var parsed = try std.json.parseFromSlice(termite_api.types.TranscribeResponse, alloc, payload, .{
+        var parsed = try std.json.parseFromSlice(inference_api.types.TranscribeResponse, alloc, payload, .{
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();

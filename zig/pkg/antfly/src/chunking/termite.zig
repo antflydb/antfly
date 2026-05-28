@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
-const termite_api = @import("termite_api");
+const inference_api = @import("inference_api");
 const chunking_types = @import("types.zig");
 const Chunk = @import("chunk.zig").Chunk;
 const http_common = @import("../raft/transport/http_common.zig");
@@ -137,7 +137,7 @@ pub fn freeRemoteChunks(alloc: Allocator, chunks: []RemoteChunk) void {
 }
 
 fn encodeChunkRequest(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput) ![]u8 {
-    const config: termite_api.ChunkConfig = .{
+    const config: inference_api.ChunkConfig = .{
         .model = cfg.model,
         .max_chunks = if (cfg.max_chunks > 0) cfg.max_chunks else null,
         .threshold = cfg.threshold,
@@ -154,7 +154,7 @@ fn encodeChunkRequest(alloc: Allocator, cfg: chunking_types.Config, input: Remot
 
     switch (input) {
         .text => |text| {
-            const request = termite_api.ChunkRequest{
+            const request = inference_api.ChunkRequest{
                 .input = .{ .string = text },
                 .config = config,
             };
@@ -164,8 +164,8 @@ fn encodeChunkRequest(alloc: Allocator, cfg: chunking_types.Config, input: Remot
             const data_b64 = try base64EncodeAlloc(alloc, binary.data);
             defer alloc.free(data_b64);
             const request = struct {
-                input: termite_api.MediaContentPart,
-                config: termite_api.ChunkConfig,
+                input: inference_api.MediaContentPart,
+                config: inference_api.ChunkConfig,
             }{
                 .input = .{
                     .type = "media",

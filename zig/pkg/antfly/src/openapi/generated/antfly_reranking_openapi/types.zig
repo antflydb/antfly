@@ -46,11 +46,11 @@ pub const OllamaRerankerConfig = struct {
     url: ?[]const u8 = null,
 };
 
-/// Configuration for the Termite reranking provider.
+/// Configuration for the inference reranking provider.
 pub const TermiteRerankerConfig = struct {
     /// The name of the reranking model (e.g., cross-encoder model name).
     model: []const u8,
-    /// The URL of the Termite API endpoint.
+    /// The URL of the Inference API endpoint.
     url: ?[]const u8 = null,
 };
 

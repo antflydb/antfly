@@ -28,10 +28,10 @@ zig build regen-openapi
 
 Repo-local specs:
 
-- `../openapi.yaml`: bundled public Antfly and Termite API spec
+- `../openapi.yaml`: bundled public Antfly and inference API spec
 - `../specs/openapi/antfly/metadata.yaml`: Antfly metadata/table API
 - `../specs/openapi/antfly/usermgr.yaml`: Antfly user-management API
-- `../specs/openapi/termite/api.yaml`: Termite public API
+- `../specs/openapi/inference/api.yaml`: inference public API
 - `specs/openai-openapi.yaml`: vendored OpenAI API schema used for types
 
 Some shared provider/config schemas are still read from the sibling
@@ -47,10 +47,10 @@ Generated Antfly and shared API modules live under:
 pkg/antfly/src/openapi/generated/
 ```
 
-The generated Termite API module lives under:
+The generated inference API module lives under:
 
 ```text
-pkg/termite/src/api/generated/termite_api/
+pkg/inference/src/api/generated/inference_api/
 ```
 
 Generated files start with:
@@ -68,12 +68,12 @@ Top-level builds import generated modules directly from the checked-in
 directories. This avoids repeatedly converting YAML to JSON and running
 `openapi-zig` during normal builds.
 
-Standalone Termite builds also use the checked-in `termite_api` module by
+Standalone inference builds also use the checked-in `inference_api` module by
 default. For experiments, the old dynamic codegen path remains available:
 
 ```sh
-cd go/pkg/termite
-zig build -Dtermite-openapi-spec=../../../specs/openapi/termite/api.yaml
+cd pkg/inference
+zig build -Dtermite-openapi-spec=../../../specs/openapi/inference/api.yaml
 ```
 
 ## Updating An API
@@ -88,7 +88,7 @@ Useful checks:
 ```sh
 zig build root-test
 zig build openapi-root-check
-cd go/pkg/termite && zig build test
+cd pkg/inference && zig build test
 ```
 
 `openapi-root-check` verifies that the root `openapi.yaml` matches the
@@ -102,11 +102,11 @@ Antfly public APIs are served under:
 /api/v1/*
 ```
 
-Termite public APIs are served under:
+inference public APIs are served under:
 
 ```text
 /ml/v1/*
 ```
 
-Termite keeps `/embed` and `/embeddings` as aliases over the same
+Inference keeps `/embed` and `/embeddings` as aliases over the same
 `EmbedRequest` / `EmbedResponse` contract.
