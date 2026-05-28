@@ -16,6 +16,7 @@ package ai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -463,9 +464,54 @@ func chatContentToGenKitParts(content *ChatMessageContent) []*ai.Part {
 	for _, contentPart := range contentParts {
 		if textPart, err := contentPart.AsTextContentPart(); err == nil && textPart.Text != "" {
 			parts = append(parts, ai.NewTextPart(textPart.Text))
+			continue
+		}
+		if imagePart, err := contentPart.AsImageURLContentPart(); err == nil && imagePart.ImageUrl.Url != "" {
+			parts = append(parts, ai.NewMediaPart(contentTypeFromMediaURL(imagePart.ImageUrl.Url), imagePart.ImageUrl.Url))
+			continue
+		}
+		if mediaPart, err := contentPart.AsMediaContentPart(); err == nil {
+			if part := mediaContentPartToGenKit(mediaPart); part != nil {
+				parts = append(parts, part)
+			}
 		}
 	}
 	return parts
+}
+
+func mediaContentPartToGenKit(part aimessages.MediaContentPart) *ai.Part {
+	mimeType := ""
+	if part.MimeType != nil {
+		mimeType = *part.MimeType
+	}
+	if part.Url != nil && *part.Url != "" {
+		if mimeType == "" {
+			mimeType = contentTypeFromMediaURL(*part.Url)
+		}
+		return ai.NewMediaPart(mimeType, *part.Url)
+	}
+	if part.Data != nil && len(*part.Data) > 0 {
+		data := base64.StdEncoding.EncodeToString(*part.Data)
+		if mimeType != "" {
+			data = "data:" + mimeType + ";base64," + data
+		}
+		return ai.NewMediaPart(mimeType, data)
+	}
+	return nil
+}
+
+func contentTypeFromMediaURL(value string) string {
+	if !strings.HasPrefix(value, "data:") {
+		return ""
+	}
+	rest := strings.TrimPrefix(value, "data:")
+	if semi := strings.IndexByte(rest, ';'); semi >= 0 {
+		return rest[:semi]
+	}
+	if comma := strings.IndexByte(rest, ','); comma >= 0 {
+		return rest[:comma]
+	}
+	return ""
 }
 
 func chatContentOutput(content *ChatMessageContent) any {

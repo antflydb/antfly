@@ -95,14 +95,17 @@ type ImageURLContentPart struct {
 // ImageURLContentPartType defines model for ImageURLContentPart.Type.
 type ImageURLContentPartType string
 
-// MediaContentPart Inline binary media content for providers that support non-image media parts.
+// MediaContentPart Binary or URL media content for providers that support non-image media parts.
 type MediaContentPart struct {
-	// Data Base64-encoded binary data.
-	Data []byte `json:"data"`
+	// Data Base64-encoded binary data. Use either data or url.
+	Data *[]byte `json:"data,omitempty"`
 
-	// MimeType MIME type such as image/png, audio/wav, or application/pdf.
-	MimeType string               `json:"mime_type"`
+	// MimeType MIME type such as image/png, audio/wav, or application/pdf. Required with data and optional with url when the URL can resolve content type.
+	MimeType *string              `json:"mime_type,omitempty"`
 	Type     MediaContentPartType `json:"type"`
+
+	// Url URL or data URI media reference. Use either url or data.
+	Url *string `json:"url,omitempty"`
 }
 
 // MediaContentPartType defines model for MediaContentPart.Type.
@@ -293,21 +296,22 @@ func (t *ContentPart) UnmarshalJSON(b []byte) error {
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"H4sIAAAAAAAC/5RW32/jNgz+Vwhtj27S4YY9eE9dtwMyXNchvT4dioKx6FiDLWmS3F1Q5H8fKP9IHPmS",
-	"3FtikR/5faRIvYvCNNZo0sGL/F34oqIG48/7CsMDeY9b4r+SfOGUDcpokYtHS/pudcPOGNSmJigqDNB0",
-	"9guRCeuMJRcURbDC6EA68M8fHZUiFz8sD5GXfdjlUcz73mOfCWdq+g7PNZvvMxGMqV8LrOtXJVMGn42p",
-	"gU9h9TuESnlg+4EBOPLWaMlfmU3YWRK58MEpvZ2A+xT6znvlA+rQQUYrBlGBGn+JCOd1j3Udg3RR0Tnc",
-	"iT0rQf+2ypEU+ZdOlZfRyGz+oSLKNSPiFfUbiPeVyoFUqMhBoK8BjAPUEPMAUw42YNGFyMxoeixF/iUR",
-	"mZ176zkZT+0f2jqoxkis0xhXqdcT/htdSAV8mYqz7tvqJOWKgKVlnjjpavCkJTnOhXTbcA38zgdqRCZa",
-	"T05kAofKi65DjupzaJ3jHNPegWZeg6nMZzuIvoapDuftVw1u6Xn96Xt8HkgqnDiwuANSSiuewPP6E7eS",
-	"xIDwvF6lY6J1dep74gW+LSpAHz/kioGXVm9/3aCnX37OFouZRju5Ohxm7ubMKfENKkNplIZQEczMw6Pa",
-	"QWlcgyHlG7N/7VlfU6NDU7+PTXgAeblEPJ5msx4HFZLaphLoWmmCjdLodtCw/ci3NA6sM29KkvMQ+P74",
-	"1lrjAmijb2Lo3mW82lNRuK5pzN9ieW9IF0aSHGKzLSN0AotcbHaB5uZ1oxp6HZQ7GTqrhz+Aj8bOGpsq",
-	"A2ylMsv/8C2LQ9DaWhXIjksry/nNcFKeyPXq0kTyx+nOVej0hufn5u44PaYq81w/73gVuwhzLbkT4yNC",
-	"w9K7YlFhul1TdmWriw7hum37cbDfZ+L8a0FJ0kGVqlsEF/UZE7mokZIDXjbnlYr18YhjusMGiJg1X5gd",
-	"IDRGUn1ON3Tbthkeg1PQP58e/4Iud96NI/7oMquHxmbmyg2pAx9fntcRJDtKLpWFXZQuTRrrqUJHEuZf",
-	"rMtxt3cNAa3vtLrToax3gFrCZ3KNCl2aKvCbQfSndyvo3xLw1D+cM/FGzneRf1rcLm5ZBGNJo1UiFx8W",
-	"t4sPrDqGijXe7/8PAAD//xGcNyyCCwAA",
+	"H4sIAAAAAAAC/5RWzW7jNhB+lQHbo9ZOsUUP6ilNu4CLTVM4m9MiCMbSyGJBkSpJJWsEfvdiSEm2TNX2",
+	"3mxxfr/55uddFKZpjSbtncjfhStqajD8vKvR35NzuCX+W5IrrGy9NFrk4qElfbv6wMro5UYRFDV6aKL8",
+	"QmSitaYl6yUFY4XRnrTnnz9aqkQuflgePC97t8sjn3e9xj4T1ij6Ds01i+8z4Y1RLwUq9SLLNIMvxijg",
+	"V1j9Dr6WDlh+yAAsudbokr9yNn7XksiF81bq7cS4S03fOiedR+2jySDFRqSnxl1KhOO6Q6WCk+gVrcWd",
+	"2DMS9G8nLZUi/xpReR6FzOYfKgJcMyBeUb8h8b5SOZD0NVnw9M2DsYAaQhxgqkEGWrQ+ZGY0PVQi/5qA",
+	"zMq99ByMp/L3nfKyMSWq1MdV6PUJ/43WpwA+T8FZ97Q6CbkmYGg5T5ywGhzpkizHQrpruAZu5zw1IhOd",
+	"IysygUPlRWTIUX0O1DmOMeUONPMYTGE+yyD65qc4nJdfNbilp/Xn79G5p1LiRIHBHSylaYUXeFp/ZiqV",
+	"6BGe1qt0THRWpbonWuC6ogZ04UMu2fCy1dtfN+jol5+zxWKGaCetw27mOmcOif9JZSiN1OBrgpl5eFQ7",
+	"qIxt0Kf5huhf+qyvqdGB1O8jCQ9Gni8lHl6zWY0DCkltEwh+kxrtjovCtWlYfsy3MhZaa15lSdaB5/5x",
+	"Xdsa60Eb/SG47lXG1p6CwnWd8RnK+4F0YUoqYRNDYNkFPDkaxlVgibHQWcWWI/AiF5udp7k53siGXgZE",
+	"T4bR6v4P4KeRcSPZMsCulGb5hq9ZGI5tq2SBrLhsy2oB6x50eJO+jkGhLsEE26ji584qeKspMoiRLFDz",
+	"4jHq9cAfDmB+A53QIGA6O3Cu6qpYEksVWdIFTUDlQHvZy80VXud4dTqX8nPbYpx5U27wNjqveBVWwcy1",
+	"3XIifJTQsKqvWK+Y3gRpdlWni2jhuhvh0yC/z8T5G0eWpL2sZFxfF/EZA7mIkSwHe9mcVgrWp6Mc0807",
+	"mAhRc5vvAKExJalzuKHdds1wwk6N/vn48BfE2Hmjj/ZHlVk8NDYzA2EIHfj5ciMEI9lRcCksrCJ1ZVJf",
+	"jzXy+Ji/s5fjRRIJAZ2LWN1qX6ldGDVfyDbSxzCl50tH9K+3K+gvIHjsz/1MvJJ10fNPi5vFDYNgWtLY",
+	"SpGLj4ubxUdGHX3NGO/3/wUAAP//4X7fTjgMAAA=",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file
