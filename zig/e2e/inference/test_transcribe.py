@@ -14,7 +14,7 @@
 
 """Tests for /api/transcribe (speech-to-text) endpoint.
 
-Matches Go termite's transcriber_test.go patterns.
+Matches Go antfly's transcriber_test.go patterns.
 """
 
 import pytest

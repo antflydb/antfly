@@ -18,11 +18,11 @@
 const build_options = @import("build_options");
 
 pub const backends = @import("backends/backends.zig");
-pub const sentencepiece = @import("termite_tokenizer").sentencepiece;
-pub const hf_tokenizer = @import("termite_hf_tokenizer");
-pub const tokenizer = @import("termite_tokenizer");
-pub const audio = @import("termite_audio");
-pub const chunker = @import("termite_chunker");
+pub const sentencepiece = @import("inference_tokenizer").sentencepiece;
+pub const hf_tokenizer = @import("inference_hf_tokenizer");
+pub const tokenizer = @import("inference_tokenizer");
+pub const audio = @import("inference_audio");
+pub const chunker = @import("inference_chunker");
 pub const pipelines = @import("pipelines/pipelines.zig");
 pub const extractors = @import("extractors/mod.zig");
 pub const server = if (build_options.skip_openapi) struct {} else @import("server/server.zig");
@@ -45,8 +45,8 @@ pub const finetune = @import("finetune/root.zig");
 pub const finetune_cli = @import("finetune/cli/root.zig");
 pub const run = @import("run/root.zig");
 pub const quantize = @import("quantize/root.zig");
-pub const client = if (build_options.skip_openapi) struct {} else @import("termite_client");
-pub const linalg = @import("termite_linalg");
+pub const client = if (build_options.skip_openapi) struct {} else @import("inference_client");
+pub const linalg = @import("inference_linalg");
 pub const native_generate = @import("native_generate.zig");
 pub const native_compile = @import("native_compile.zig");
 pub const native_export = @import("native_export.zig");

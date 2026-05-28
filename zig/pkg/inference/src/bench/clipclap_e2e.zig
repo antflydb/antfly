@@ -22,16 +22,16 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
-const termite = @import("termite_internal");
-const backends = termite.backends;
-const graph_runtime = termite.graph.runtime;
-const graph_executor_stats = termite.graph.executor_stats;
-const native_compute = termite.native_compute.native;
-const model_manager_mod = termite.server.model_manager;
-const embedding_mod = termite.pipelines.embedding;
-const native_backend_guard = termite.native_backend_guard;
-const metal_runtime = termite.metal_runtime;
-const mlx_backend = termite.mlx_backend;
+const inference = @import("inference_internal");
+const backends = inference.backends;
+const graph_runtime = inference.graph.runtime;
+const graph_executor_stats = inference.graph.executor_stats;
+const native_compute = inference.native_compute.native;
+const model_manager_mod = inference.server.model_manager;
+const embedding_mod = inference.pipelines.embedding;
+const native_backend_guard = inference.native_backend_guard;
+const metal_runtime = inference.metal_runtime;
+const mlx_backend = inference.mlx_backend;
 
 const max_file_bytes = 512 * 1024 * 1024;
 
@@ -222,7 +222,7 @@ fn loadBundle(allocator: std.mem.Allocator, io: std.Io, opts: Options) !LoadedBu
     configureBackendPreference(&session_manager, opts.backend);
     session_manager.graph_runtime_strategy = opts.graph_runtime_strategy;
     if (opts.graph_runtime_strategy == null) {
-        graph_executor_stats.printBypass("termite.clipclap_e2e_bench", "embedding_pipeline_direct_runtime");
+        graph_executor_stats.printBypass("inference.clipclap_e2e_bench", "embedding_pipeline_direct_runtime");
     }
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);

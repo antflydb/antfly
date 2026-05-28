@@ -28,7 +28,7 @@
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const manifest_mod = @import("../models/manifest.zig");
-const Tokenizer = @import("termite_tokenizer").Tokenizer;
+const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Tensor = backends.Tensor;
 
 pub const SparseVector = struct {

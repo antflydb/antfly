@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const reranker_data = @import("termite_finetune_data").reranker_data;
+const reranker_data = @import("inference_finetune_data").reranker_data;
 
 test {
     _ = reranker_data;

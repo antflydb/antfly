@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const ops = @import("../ops/ops.zig");
-const tokenizer_mod = @import("termite_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 const gpt_mod = @import("../models/gpt.zig");
 const gemma3_mm = @import("../pipelines/gemma3_multimodal.zig");
 const gemma4_projector = @import("gemma4_projector.zig");

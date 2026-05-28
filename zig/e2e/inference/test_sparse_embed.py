@@ -14,7 +14,7 @@
 
 """Tests for sparse embedding via /embed with SPLADE-style models.
 
-Matches Go termite's sparse_embedders_test.go patterns.
+Matches Go antfly's sparse_embedders_test.go patterns.
 Requires a model with "sparse" capability.
 """
 

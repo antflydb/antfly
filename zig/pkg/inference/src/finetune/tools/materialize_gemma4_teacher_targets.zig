@@ -13,11 +13,11 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite = @import("termite_internal");
+const inference = @import("inference_internal");
 
-const finetune = termite.finetune.gemma4;
-const gemma4_real = termite.finetune.gemma4_real_autodiff;
-const gemma4_mm_real = termite.finetune.gemma4_multimodal_real_autodiff;
+const finetune = inference.finetune.gemma4;
+const gemma4_real = inference.finetune.gemma4_real_autodiff;
+const gemma4_mm_real = inference.finetune.gemma4_multimodal_real_autodiff;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

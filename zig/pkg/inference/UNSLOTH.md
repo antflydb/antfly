@@ -1,6 +1,6 @@
 # Unsloth Dynamic GGUF Support
 
-This tracks the work needed for Termite to run Unsloth Dynamic GGUFs for
+This tracks the work needed for Antfly inference to run Unsloth Dynamic GGUFs for
 Gemma 4, starting with `UD-Q4_K_*` variants of
 `unsloth/gemma-4-26B-A4B-it-GGUF`.
 
@@ -97,9 +97,9 @@ is `blk.1.ffn_gate_up_exps.weight` with shape `[2816, 1408, 128]`.
 ## Work Items
 
 - [x] Document the Unsloth Dynamic target and support matrix.
-- [x] Make `termite pull ...:gguf` auto-selection prefer Unsloth
+- [x] Make `antfly inference pull ...:gguf` auto-selection prefer Unsloth
   `UD-Q4_K_*` files when they are present.
-- [x] Use `termite smoke --inspect-only` as the lightweight GGUF inspection
+- [x] Use `antfly inference smoke --inspect-only` as the lightweight GGUF inspection
   helper. It reports the exact tensor-type histogram, unsupported tensor types,
   missing required tensors, and unmapped GGUF tensor names for a target model
   directory.
@@ -128,19 +128,19 @@ is `blk.1.ffn_gate_up_exps.weight` with shape `[2816, 1408, 128]`.
 
 ## Smoke Recipe
 
-`termite smoke` is the canonical command for this validation. No separate
+`antfly inference smoke` is the canonical command for this validation. No separate
 Unsloth-specific smoke command is needed.
 
 Pull the target GGUF:
 
 ```sh
-termite pull unsloth/gemma-4-26B-A4B-it-GGUF:gguf:UD-Q4_K_M
+antfly inference pull unsloth/gemma-4-26B-A4B-it-GGUF:gguf:UD-Q4_K_M
 ```
 
 Inspect the downloaded model without running generation:
 
 ```sh
-termite smoke ~/.termite/models/unsloth/gemma-4-26B-A4B-it-GGUF "hello" --inspect-only
+antfly inference smoke ~/.antfly/inference/models/unsloth/gemma-4-26B-A4B-it-GGUF "hello" --inspect-only
 ```
 
 Expected inspection conditions:
@@ -154,7 +154,7 @@ Expected inspection conditions:
 Run a short generation smoke:
 
 ```sh
-termite smoke ~/.termite/models/unsloth/gemma-4-26B-A4B-it-GGUF "hello" --max-tokens 4
+antfly inference smoke ~/.antfly/inference/models/unsloth/gemma-4-26B-A4B-it-GGUF "hello" --max-tokens 4
 ```
 
 The default backend is `auto`. Do not force `--backend native` for the normal
@@ -168,7 +168,7 @@ backend budget because the weight file is about 16 GiB and the default Metal
 budget is lower:
 
 ```sh
-termite smoke ~/.termite/models/unsloth/gemma-4-26B-A4B-it-GGUF "hello" \
+antfly inference smoke ~/.antfly/inference/models/unsloth/gemma-4-26B-A4B-it-GGUF "hello" \
   --backend metal --backend-budget-mb 18000 --max-tokens 4
 ```
 
@@ -190,7 +190,7 @@ The smoke still reports packed MoE expert tensors separately as
 `packed_moe_expert_tensors`; those are expected Gemma 4 expert-pack samples,
 not unmapped decoder weights.
 
-The remaining proof gap is the quantized execution assertion. If `termite smoke`
+The remaining proof gap is the quantized execution assertion. If `antfly inference smoke`
 does not print enough runtime counters to prove direct quantized execution for
 this model, add or expose those counters in smoke output before marking the real
 text smoke complete.
@@ -198,7 +198,7 @@ text smoke complete.
 ## Implementation Notes
 
 `UD-Q4_K_*` should be treated as a model-file preference, not a new GGML tensor
-type. Termite support is complete only when the actual tensor types inside the
+type. Antfly inference support is complete only when the actual tensor types inside the
 selected file are understood by the loader and by the execution path chosen at
 runtime.
 

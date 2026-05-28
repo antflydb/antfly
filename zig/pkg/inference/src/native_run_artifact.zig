@@ -29,9 +29,9 @@ const interpreter = @import("graph/interpreter.zig");
 const runtime = @import("runtime/root.zig");
 const ops = @import("ops/ops.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
-const tokenizer_mod = @import("termite_tokenizer");
-const hf_tokenizer = @import("termite_hf_tokenizer");
-const sentencepiece = @import("termite_tokenizer").sentencepiece;
+const tokenizer_mod = @import("inference_tokenizer");
+const hf_tokenizer = @import("inference_hf_tokenizer");
+const sentencepiece = @import("inference_tokenizer").sentencepiece;
 const backends = @import("backends/backends.zig");
 const activations = @import("backends/activations.zig");
 const OnnxSessionOptions = if (build_options.enable_onnx) backends.onnx.SessionOptions else struct {
@@ -799,7 +799,7 @@ pub fn tryRunArtifactFromDir(
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".termite.json")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".inference.json")) continue;
 
         const manifest_path = try std.fs.path.join(allocator, &.{ search_dir, entry.name });
         errdefer allocator.free(manifest_path);
@@ -2955,7 +2955,7 @@ pub fn printUsage() void {
         \\usage: termite run-artifact <artifact-or-manifest> <prompt> [--no-chat-template] [--raw-prompt] [--compare-host]
         \\       termite run-artifact <artifact-or-manifest> [--validate|--dry-run]
         \\
-        \\<artifact-or-manifest> may be a raw artifact path, a .termite.json sidecar,
+        \\<artifact-or-manifest> may be a raw artifact path, a .inference.json sidecar,
         \\or a .termite-package.json package manifest.
         \\Runs an offline artifact for its exact traced shape and prints the top-1
         \\next token without retracing or recompiling. Package manifests resolve the
@@ -2970,16 +2970,16 @@ pub fn printUsage() void {
 }
 
 test "parseArgs accepts artifact path and prompt" {
-    const opts = try parseArgs(&.{ "/tmp/model.onnx.termite.json", "hello", "--raw-prompt", "--compare-host" });
-    try std.testing.expectEqualStrings("/tmp/model.onnx.termite.json", opts.artifact_or_manifest_path);
+    const opts = try parseArgs(&.{ "/tmp/model.onnx.inference.json", "hello", "--raw-prompt", "--compare-host" });
+    try std.testing.expectEqualStrings("/tmp/model.onnx.inference.json", opts.artifact_or_manifest_path);
     try std.testing.expectEqualStrings("hello", opts.prompt.?);
     try std.testing.expect(opts.raw_prompt);
     try std.testing.expect(opts.compare_host);
 }
 
 test "parseArgs accepts validate without prompt" {
-    const opts = try parseArgs(&.{ "/tmp/model.onnx.termite.json", "--validate" });
-    try std.testing.expectEqualStrings("/tmp/model.onnx.termite.json", opts.artifact_or_manifest_path);
+    const opts = try parseArgs(&.{ "/tmp/model.onnx.inference.json", "--validate" });
+    try std.testing.expectEqualStrings("/tmp/model.onnx.inference.json", opts.artifact_or_manifest_path);
     try std.testing.expectEqual(@as(?[]const u8, null), opts.prompt);
     try std.testing.expect(opts.validate);
 }
@@ -2992,9 +2992,9 @@ test "validateArtifact summarizes package manifests" {
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(base_dir);
-    const prefill_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "model.prefill.exec.termite.json" });
+    const prefill_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "model.prefill.exec.inference.json" });
     defer allocator.free(prefill_manifest_path);
-    const decode_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "model.decode.s3.exec.termite.json" });
+    const decode_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "model.decode.s3.exec.inference.json" });
     defer allocator.free(decode_manifest_path);
     const package_path = try std.fs.path.join(allocator, &.{ base_dir, "gpt2.xla.pjrt_executable.inputs.termite-package.json" });
     defer allocator.free(package_path);
@@ -3092,9 +3092,9 @@ test "validateArtifact summarizes backend-owned PJRT package manifests" {
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(base_dir);
-    const prefill_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "model.prefill.exec.termite.json" });
+    const prefill_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "model.prefill.exec.inference.json" });
     defer allocator.free(prefill_manifest_path);
-    const decode_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "model.decode.s3.exec.termite.json" });
+    const decode_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "model.decode.s3.exec.inference.json" });
     defer allocator.free(decode_manifest_path);
     const package_path = try std.fs.path.join(allocator, &.{ base_dir, "gpt2.xla.pjrt_executable.embedded.termite-package.json" });
     defer allocator.free(package_path);
@@ -3201,7 +3201,7 @@ test "findMatchingFullModelPackageManifest resolves matching PJRT package" {
         .pjrt_parameter_mode = compiled_artifact.pjrt_parameter_mode_inputs,
         .artifacts = &.{
             .{
-                .manifest_path = "/tmp/model.prefill.exec.termite.json",
+                .manifest_path = "/tmp/model.prefill.exec.inference.json",
                 .artifact_path = "/tmp/model.prefill.exec",
                 .artifact_role = compiled_artifact.artifact_role_prefill,
                 .seq_len = 2,
@@ -3259,7 +3259,7 @@ test "findMatchingFullModelPackageManifest prefers embedded PJRT package" {
         .pjrt_parameter_mode = compiled_artifact.pjrt_parameter_mode_embedded,
         .artifacts = &.{
             .{
-                .manifest_path = "/tmp/model.prefill.embedded.exec.termite.json",
+                .manifest_path = "/tmp/model.prefill.embedded.exec.inference.json",
                 .artifact_path = "/tmp/model.prefill.embedded.exec",
                 .artifact_role = compiled_artifact.artifact_role_prefill,
                 .seq_len = 2,
@@ -3275,7 +3275,7 @@ test "findMatchingFullModelPackageManifest prefers embedded PJRT package" {
         .pjrt_parameter_mode = compiled_artifact.pjrt_parameter_mode_inputs,
         .artifacts = &.{
             .{
-                .manifest_path = "/tmp/model.prefill.inputs.exec.termite.json",
+                .manifest_path = "/tmp/model.prefill.inputs.exec.inference.json",
                 .artifact_path = "/tmp/model.prefill.inputs.exec",
                 .artifact_role = compiled_artifact.artifact_role_prefill,
                 .seq_len = 2,
@@ -3323,7 +3323,7 @@ test "findMatchingFullModelPackageManifest resolves matching ONNX package" {
         .kind = "onnx_graph",
         .artifacts = &.{
             .{
-                .manifest_path = "/tmp/model.prefill.onnx.termite.json",
+                .manifest_path = "/tmp/model.prefill.onnx.inference.json",
                 .artifact_path = "/tmp/model.prefill.onnx",
                 .artifact_role = compiled_artifact.artifact_role_prefill,
                 .seq_len = 2,

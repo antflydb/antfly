@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const generic = @import("termite_audio");
+const generic = @import("inference_audio");
 
 pub const wav = generic.wav;
 pub const NormalizationType = generic.NormalizationType;

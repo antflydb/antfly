@@ -27,8 +27,8 @@ const native_backend_guard = @import("native_backend_guard.zig");
 const session_factory = @import("architectures/session_factory.zig");
 const transcription = @import("pipelines/transcription.zig");
 const enc_dec_mod = @import("pipelines/encoder_decoder.zig");
-const hf_tokenizer = @import("termite_hf_tokenizer");
-const tokenizer_mod = @import("termite_tokenizer");
+const hf_tokenizer = @import("inference_hf_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 
 const print = std.debug.print;
 

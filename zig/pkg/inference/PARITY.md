@@ -1,4 +1,4 @@
-# Termite Parity
+# Antfly inference Parity
 
 This document tracks parity between the Zig server in this repo and the Go server in `~/go/src/github.com/antflydb/antfly/termite`.
 
@@ -50,25 +50,25 @@ Additional native reranker status:
   - explicit `Xenova/donut-base-finetuned-cord-v2` coverage now passes against a local Zig-pulled snapshot
   - explicit `Xenova/moondream2` coverage now passes against a local Zig-pulled snapshot
   - focused Moondream E2E coverage passed:
-    - `env TERMITE_BIN=./zig-out/bin/termite TERMITE_MODELS_DIR=models TERMITE_MOONDREAM_MODEL=Xenova/moondream2 uv run --project e2e/inference pytest -q e2e/inference/test_read.py -k moondream -rs`
+    - `env ANTFLY_INFERENCE_BIN=./zig-out/bin/antfly inference ANTFLY_INFERENCE_MODELS_DIR=models ANTFLY_INFERENCE_MOONDREAM_MODEL=Xenova/moondream2 uv run --project e2e/inference pytest -q e2e/inference/test_read.py -k moondream -rs`
     - result: `1 passed`
 - A local native-only `safetensors` classifier was pulled with the Zig CLI:
-  - `./zig-out/bin/termite pull hf:cross-encoder/nli-distilroberta-base:native --models-dir models/classifiers`
+  - `./zig-out/bin/antfly inference pull hf:cross-encoder/nli-distilroberta-base:native --models-dir models/classifiers`
   - the resulting model was exercised through `/api/classify` with `models` as the server model root
   - server logs confirmed the path fell through ONNX, selected `mlx`, and returned live classification scores from the native session
 - A local native-only `safetensors` DeBERTa classifier was also pulled with the Zig CLI:
-  - `./zig-out/bin/termite pull hf:MoritzLaurer/mDeBERTa-v3-base-mnli-xnli:native --models-dir models/classifiers`
+  - `./zig-out/bin/antfly inference pull hf:MoritzLaurer/mDeBERTa-v3-base-mnli-xnli:native --models-dir models/classifiers`
   - the resulting model was exercised through `/api/classify` with `models` as the server model root
   - server logs confirmed the path fell through ONNX, selected `mlx`, and returned live classification scores from the native DeBERTa session
 - A local native-only `safetensors` BERT token-classifier recognizer was also pulled with the Zig CLI:
-  - `./zig-out/bin/termite pull hf:dslim/bert-base-NER:native --models-dir models/recognizers`
+  - `./zig-out/bin/antfly inference pull hf:dslim/bert-base-NER:native --models-dir models/recognizers`
   - the resulting model was exercised through `/api/recognize` with `models` as the server model root
   - server logs confirmed the path fell through ONNX, selected `mlx`, and returned live entity spans from the native token-classifier session
   - focused E2E coverage passed:
-    - `TERMITE_URL=http://127.0.0.1:8097 uv run --project e2e/inference pytest -q e2e/inference/test_recognize.py -k native_safetensors_bert_token_classifier -rs`
+    - `ANTFLY_INFERENCE_URL=http://127.0.0.1:8097 uv run --project e2e/inference pytest -q e2e/inference/test_recognize.py -k native_safetensors_bert_token_classifier -rs`
     - result: `1 passed`
 - A local native-only `safetensors` DeBERTa token-classifier recognizer was also pulled with the Zig CLI:
-  - `./zig-out/bin/termite pull hf:mukuls9971/pii-deberta-v3-xsmall:native --models-dir models/recognizers`
+  - `./zig-out/bin/antfly inference pull hf:mukuls9971/pii-deberta-v3-xsmall:native --models-dir models/recognizers`
   - the resulting model was exercised through `/api/recognize` with `models` as the server model root
   - server logs confirmed the path fell through ONNX, selected `mlx`, and returned live entity spans from the native DeBERTa token-classifier session
   - this also validated two raw-Hugging-Face gaps:

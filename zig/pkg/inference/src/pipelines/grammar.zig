@@ -26,7 +26,7 @@
 // would produce an invalid transition.
 
 const std = @import("std");
-const tokenizer_mod = @import("termite_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 
 /// Pre-decoded token byte table. Decodes all vocab tokens once so that
 /// `allowedTokenMask` can look up token bytes without per-call allocation.

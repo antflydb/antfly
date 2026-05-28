@@ -536,7 +536,7 @@ fn findMatchingOnnxWholeModelDecodeArtifact(
     };
     while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".termite.json")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".inference.json")) continue;
 
         const manifest_path = try std.fs.path.join(allocator, &.{ artifact_dir, entry.name });
         errdefer allocator.free(manifest_path);
@@ -671,7 +671,7 @@ test "ONNX whole-model decode artifact lookup rejects ambiguous candidates" {
     defer allocator.free(base_dir);
 
     inline for (.{ "old", "new" }, 0..) |name, idx| {
-        const manifest_path = try std.fs.path.join(allocator, &.{ base_dir, name ++ ".onnx.termite.json" });
+        const manifest_path = try std.fs.path.join(allocator, &.{ base_dir, name ++ ".onnx.inference.json" });
         defer allocator.free(manifest_path);
         try compiled_artifact.writeManifest(allocator, io, manifest_path, .{
             .kind = "onnx_graph",
@@ -718,7 +718,7 @@ test "ONNX whole-model artifact lookup resolves package manifest entries" {
         .kind = "onnx_graph",
         .artifacts = &.{
             .{
-                .manifest_path = "/tmp/model.prefill.onnx.termite.json",
+                .manifest_path = "/tmp/model.prefill.onnx.inference.json",
                 .artifact_path = "/tmp/model.prefill.onnx",
                 .artifact_role = compiled_artifact.artifact_role_prefill,
                 .seq_len = 2,
@@ -726,7 +726,7 @@ test "ONNX whole-model artifact lookup resolves package manifest entries" {
                 .attention_mode = "paged_prefill",
             },
             .{
-                .manifest_path = "/tmp/model.decode.onnx.termite.json",
+                .manifest_path = "/tmp/model.decode.onnx.inference.json",
                 .artifact_path = "/tmp/model.decode.onnx",
                 .artifact_role = compiled_artifact.artifact_role_decode,
                 .seq_len = 2,
@@ -752,7 +752,7 @@ test "ONNX whole-model artifact lookup resolves package manifest entries" {
         allocator.free(prefill.?.manifest_path);
         allocator.free(prefill.?.artifact_path);
     }
-    try std.testing.expectEqualStrings("/tmp/model.prefill.onnx.termite.json", prefill.?.manifest_path);
+    try std.testing.expectEqualStrings("/tmp/model.prefill.onnx.inference.json", prefill.?.manifest_path);
 
     const decode = try findMatchingOnnxWholeModelDecodeArtifact(allocator, base_dir, "/tmp/model");
     try std.testing.expect(decode != null);
@@ -760,7 +760,7 @@ test "ONNX whole-model artifact lookup resolves package manifest entries" {
         allocator.free(decode.?.manifest_path);
         allocator.free(decode.?.artifact_path);
     }
-    try std.testing.expectEqualStrings("/tmp/model.decode.onnx.termite.json", decode.?.manifest_path);
+    try std.testing.expectEqualStrings("/tmp/model.decode.onnx.inference.json", decode.?.manifest_path);
 }
 
 const ArtifactShape = struct {

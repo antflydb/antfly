@@ -31,9 +31,9 @@ const c_file = @import("util/c_file.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 const native_run_artifact = @import("native_run_artifact.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
-const hf_tokenizer = @import("termite_hf_tokenizer");
-const sentencepiece = @import("termite_tokenizer").sentencepiece;
-const tokenizer_mod = @import("termite_tokenizer");
+const hf_tokenizer = @import("inference_hf_tokenizer");
+const sentencepiece = @import("inference_tokenizer").sentencepiece;
+const tokenizer_mod = @import("inference_tokenizer");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
         pub const Client = struct {
@@ -445,7 +445,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     )) return;
 
     if (!graph_mode) {
-        graph_mod.executor_stats.printBypass("termite.generate", "native_generation_direct_decoder_runtime");
+        graph_mod.executor_stats.printBypass("inference.generate", "native_generation_direct_decoder_runtime");
     }
 
     const decoder_runtime_scheduler_override = model.session.backend().usesGpuHostedSession() and enableMlxRawMetalWholeTokenDebug();

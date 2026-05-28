@@ -603,7 +603,7 @@ fn alignOnnxPromptForCompare(
 fn printTokenizationSummary(
     allocator: std.mem.Allocator,
     label: []const u8,
-    tok: @import("termite_tokenizer").Tokenizer,
+    tok: @import("inference_tokenizer").Tokenizer,
     add_bos: bool,
     bos_token: []const u8,
     prompt: []const u8,
@@ -1027,7 +1027,7 @@ fn computeNativeLastLogitsFromEmbeddingsWithMaskMode(
 
 fn buildExpandedPromptInfo(
     allocator: std.mem.Allocator,
-    tok: @import("termite_tokenizer").Tokenizer,
+    tok: @import("inference_tokenizer").Tokenizer,
     add_bos_token: bool,
     bos_token: []const u8,
     rendered_prompt: []const u8,
@@ -1295,7 +1295,7 @@ fn printExpandedPromptDebug(
 fn printTokenIdWindow(
     allocator: std.mem.Allocator,
     label: []const u8,
-    tok: @import("termite_tokenizer").Tokenizer,
+    tok: @import("inference_tokenizer").Tokenizer,
     token_ids: []const i64,
     center: usize,
 ) !void {
@@ -1396,13 +1396,13 @@ fn collectTopLogits(allocator: std.mem.Allocator, logits: []const f32, top_k: us
     return out;
 }
 
-fn printTopLogits(allocator: std.mem.Allocator, tok: @import("termite_tokenizer").Tokenizer, logits: []const f32, top_k: usize) !void {
+fn printTopLogits(allocator: std.mem.Allocator, tok: @import("inference_tokenizer").Tokenizer, logits: []const f32, top_k: usize) !void {
     const entries = try collectTopLogits(allocator, logits, top_k);
     defer allocator.free(entries);
     try printTopLogitsFromEntries(allocator, tok, entries);
 }
 
-fn printTopLogitsFromEntries(allocator: std.mem.Allocator, tok: @import("termite_tokenizer").Tokenizer, entries: []const TopLogit) !void {
+fn printTopLogitsFromEntries(allocator: std.mem.Allocator, tok: @import("inference_tokenizer").Tokenizer, entries: []const TopLogit) !void {
     for (entries, 0..) |entry, rank| {
         const one = [_]i32{entry.id};
         const piece = tok.decode(allocator, &one) catch try allocator.dupe(u8, "");
@@ -1411,7 +1411,7 @@ fn printTopLogitsFromEntries(allocator: std.mem.Allocator, tok: @import("termite
     }
 }
 
-fn printSingleToken(allocator: std.mem.Allocator, label: []const u8, tok: @import("termite_tokenizer").Tokenizer, token_id: i32) !void {
+fn printSingleToken(allocator: std.mem.Allocator, label: []const u8, tok: @import("inference_tokenizer").Tokenizer, token_id: i32) !void {
     const one = [_]i32{token_id};
     const piece = tok.decode(allocator, &one) catch try allocator.dupe(u8, "");
     defer allocator.free(piece);

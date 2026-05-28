@@ -14,7 +14,7 @@
 
 """Tests for /api/chunk endpoint.
 
-Matches Go termite's chunker_test.go patterns.
+Matches Go antfly's chunker_test.go patterns.
 """
 
 from .helpers import assert_openai_list_response

@@ -26,7 +26,7 @@ Add a second-stage learned cleanup model after GLiNER2 detection:
 
 ## Why This Design
 
-The existing GLiNER2 training path in `termite-zig` is span-centric:
+The existing GLiNER2 training path in `antfly-inference-zig` is span-centric:
 - detect spans
 - assign entity labels
 - materialize LoRA adapters
@@ -331,7 +331,7 @@ The desired production deployment shape is:
 4. inference
    - `recognize`
    - `extract`
-   - `termite recognize`
+   - `antfly inference recognize`
    all automatically load and apply the bundled cleanup head
 
 From the user's perspective, this is one GLiNER2 model with built-in cleanup.

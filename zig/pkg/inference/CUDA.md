@@ -1,12 +1,12 @@
-# Termite NVIDIA Inference Plan
+# Antfly inference NVIDIA Inference Plan
 
 ## Goal
 
-Support inference on NVIDIA GPUs while preserving Termite's current portability
+Support inference on NVIDIA GPUs while preserving Antfly inference's current portability
 model:
 
-- A normal Termite build does not require the CUDA toolkit.
-- A normal Termite container does not ship CUDA runtime libraries, cuBLAS,
+- A normal Antfly inference build does not require the CUDA toolkit.
+- A normal Antfly inference container does not ship CUDA runtime libraries, cuBLAS,
   cuDNN, TensorRT, ONNX Runtime, or XLA.
 - The native CUDA path uses only the NVIDIA driver ABI at runtime:
   `libcuda.so.1`, loaded dynamically.
@@ -31,7 +31,7 @@ The current design is based on:
   compute capability can be JIT-compiled by the driver for later GPUs, but
   older PTX will not automatically exploit newer architecture features.
 - OpenXLA PJRT documentation: PJRT is a uniform device API with device-specific
-  plugin implementations. Termite already exposes an `xla` backend choice that
+  plugin implementations. Antfly inference already exposes an `xla` backend choice that
   maps to PJRT when `enable_pjrt` is compiled.
 - OpenXLA XLA:GPU documentation: XLA lowers StableHLO graphs through GPU
   compilation pipelines that can emit GPU kernels, including PTX-oriented code.
@@ -108,9 +108,9 @@ creating another quant selector or model-specific backend path.
 CUDA support is optional and probe-based:
 
 - On startup, try `dlopen("libcuda.so.1")`.
-- Resolve only the CUDA Driver API symbols Termite uses.
+- Resolve only the CUDA Driver API symbols Antfly inference uses.
 - Call `cuInit`, enumerate devices, and select one device.
-- Prefer retaining the device primary context so Termite composes with other
+- Prefer retaining the device primary context so Antfly inference composes with other
   driver users in the same process. Backend-owned contexts are acceptable for
   isolated smoke tests, but not the production default.
 - Use one default stream per CUDA backend instance at first. Add extra streams
@@ -351,7 +351,7 @@ portable `compute_75` PTX.
 ### Phase 1: Capability Probe
 
 - Implement `CudaDriver` dynamic loader.
-- Add `termite cuda-info` or a smoke flag that prints driver version, selected
+- Add `antfly inference cuda-info` or a smoke flag that prints driver version, selected
   device, compute capability, total memory if available, and artifact mode.
 - Test no-CUDA machines: probe returns unavailable without crashing.
 - Test CUDA machines: probe succeeds without CUDA toolkit in the container.
@@ -409,8 +409,8 @@ portable `compute_75` PTX.
 
 - Keep `--backend xla` as PJRT, with CUDA GPU plugin supplied externally.
 - Document required environment variables:
-  - `TERMITE_XLA_PLUGIN`
-  - `TERMITE_PJRT_PLUGIN`
+  - `ANTFLY_INFERENCE_XLA_PLUGIN`
+  - `ANTFLY_INFERENCE_PJRT_PLUGIN`
   - `PJRT_PLUGIN_PATH`
   - `PJRT_PLUGIN`
 - Use XLA first for dense/static graph models and compiled artifact workflows.
@@ -453,7 +453,7 @@ Concrete PJRT work:
 
 - Make `-Dpjrt=true` a real configurable build option if it is intended for
   NVIDIA deployments; today `build.zig` hardcodes `enable_pjrt` false.
-- Add NVIDIA-specific docs for `TERMITE_XLA_PLUGIN`/`PJRT_PLUGIN_PATH`.
+- Add NVIDIA-specific docs for `ANTFLY_INFERENCE_XLA_PLUGIN`/`PJRT_PLUGIN_PATH`.
 - Add a dense graph smoke on a CUDA PJRT plugin once available.
 - Add a clear error when `--backend xla` is requested without a plugin.
 - Keep PJRT artifacts and native CUDA artifacts separate in manifests.

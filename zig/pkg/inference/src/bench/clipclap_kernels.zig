@@ -36,7 +36,7 @@ const native_compute = @import("../ops/native_compute.zig");
 const QuantizedStorage = @import("../models/weight_source.zig").QuantizedStorage;
 const quant_codec = @import("../gguf/quant_codec.zig");
 const tensor_types = @import("../gguf/tensor_types.zig");
-const linalg = @import("termite_linalg");
+const linalg = @import("inference_linalg");
 
 const VEC_LEN = 8;
 const F32xN = @Vector(VEC_LEN, f32);

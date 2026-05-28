@@ -38,8 +38,8 @@ def _first_tool_generator_model(api):
     model = find_tool_model_name(set(generators.keys()))
     if model:
         return model
-    if os.environ.get("TERMITE_TOOL_MODEL"):
-        return os.environ["TERMITE_TOOL_MODEL"]
+    if os.environ.get("ANTFLY_INFERENCE_TOOL_MODEL"):
+        return os.environ["ANTFLY_INFERENCE_TOOL_MODEL"]
     pytest.skip("No tool-capable generator model available for OpenAI SDK tests")
 
 

@@ -13,11 +13,11 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite = @import("termite_internal");
+const inference = @import("inference_internal");
 
-const gliner2 = termite.finetune.gliner2;
-const gliner2_data = termite.finetune.gliner2_data;
-const validation = termite.finetune.gliner2_run_validation;
+const gliner2 = inference.finetune.gliner2;
+const gliner2_data = inference.finetune.gliner2_data;
+const validation = inference.finetune.gliner2_run_validation;
 
 const train_gliner2_autodiff = @import("train/train_gliner2_autodiff.zig");
 const eval_gliner2_autodiff_adapter = @import("tools/eval_gliner2_autodiff_adapter.zig");

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Binary response format parsing for Termite embedding responses.
+// Binary response format parsing for Antfly inference embedding responses.
 //
 // Dense format:  uint64(num_vectors) + uint64(dimension) + float32[num_vectors * dimension]
 // Sparse format: uint64(num_vectors) + per-vector: [uint32(nnz) + int32[nnz] + float32[nnz]]
@@ -56,7 +56,7 @@ fn readF32(data: []const u8) f32 {
     return @bitCast(std.mem.readInt(u32, data[0..4], .little));
 }
 
-/// Deserialize dense embeddings from Termite binary format.
+/// Deserialize dense embeddings from Antfly inference binary format.
 /// Format: uint64(num_vectors) + uint64(dimension) + float32[num_vectors * dimension]
 pub fn deserializeDense(alloc: std.mem.Allocator, data: []const u8) !DenseEmbeddings {
     if (data.len < 16) return error.InvalidBinaryResponse;
@@ -88,7 +88,7 @@ pub fn deserializeDense(alloc: std.mem.Allocator, data: []const u8) !DenseEmbedd
     return .{ .dimension = @intCast(dimension), .vectors = vectors };
 }
 
-/// Deserialize sparse embeddings from Termite binary format.
+/// Deserialize sparse embeddings from Antfly inference binary format.
 /// Format: uint64(num_vectors) + per-vector: [uint32(nnz) + int32[nnz] + float32[nnz]]
 pub fn deserializeSparse(alloc: std.mem.Allocator, data: []const u8) !SparseEmbeddings {
     if (data.len < 8) return error.InvalidBinaryResponse;

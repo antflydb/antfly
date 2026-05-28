@@ -54,7 +54,7 @@ def env_first(*names: str) -> str | None:
 
 
 def api_path(path: str) -> str:
-    """Resolve bare API paths against the current termite prefix."""
+    """Resolve bare API paths against the current antfly prefix."""
 
     if path.startswith(API_PREFIX + "/") or path == API_PREFIX:
         return path
@@ -73,7 +73,7 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            r = requests.get(f"{url}{api_path('/version')}", timeout=2)
+            r = requests.get(f"{url}/readyz", timeout=2)
             if r.ok:
                 return True
         except requests.ConnectionError:
@@ -117,7 +117,7 @@ def base_url():
     If ANTFLY_INFERENCE_URL is set, use it directly (external server).
     Otherwise, start a local server from ANTFLY_BIN.
     """
-    url = env_first("ANTFLY_INFERENCE_URL", "TERMITE_URL")
+    url = env_first("ANTFLY_INFERENCE_URL")
     if url:
         url = url.rstrip("/")
         if not wait_for_server(url, timeout=10):
@@ -143,7 +143,7 @@ def api(base_url):
     """Return a requests.Session configured for the inference API."""
     session = requests.Session()
     session.headers["Content-Type"] = "application/json"
-    token = env_first("ANTFLY_INFERENCE_TOKEN", "TERMITE_TOKEN")
+    token = env_first("ANTFLY_INFERENCE_TOKEN")
     if token:
         session.headers["Authorization"] = f"Bearer {token}"
 
@@ -277,8 +277,8 @@ def api(base_url):
                 payload = r.json()
             return payload
 
-        def version(self):
-            r = self.get("/version")
+        def readyz(self):
+            r = requests.get(f"{self.base_url}/readyz", timeout=10)
             _check(r)
             return r.json()
 

@@ -14,7 +14,7 @@
 
 """Tests for /api/classify endpoint.
 
-Matches Go termite's classifier_test.go patterns.
+Matches Go antfly's classifier_test.go patterns.
 """
 
 import pytest

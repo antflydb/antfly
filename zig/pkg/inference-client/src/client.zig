@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Termite HTTP client wrapper.
+// Antfly inference HTTP client wrapper.
 //
 // Wraps the generated OpenAPI client with convenience methods and
 // binary response deserialization for embeddings.
@@ -32,7 +32,7 @@ pub const Types = api.types;
 /// Raw generated client -- exposes every inference API operation.
 pub const RawClient = api.client.Client;
 
-/// High-level Termite client with convenience helpers.
+/// High-level Antfly inference client with convenience helpers.
 pub const Client = struct {
     raw: RawClient,
     allocator: std.mem.Allocator,
@@ -97,7 +97,7 @@ pub const Client = struct {
         return error.UnexpectedContentType;
     }
 
-    /// List available models on the Termite server.
+    /// List available models on the Antfly inference server.
     pub fn listModels(self: *Client) !api.client.ApiResponse(Types.ModelsResponse) {
         return try self.raw.listModels();
     }

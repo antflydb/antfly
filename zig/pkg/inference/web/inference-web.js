@@ -26,7 +26,7 @@ import { streamRegisterGguf } from './runtime/gguf-stream.js';
 // 1. Direct mode (default): WASM runs on the calling thread. GPU downloads are
 //    async (require flush). Best for simple usage without WebGPU.
 //
-//    const t = new TermiteWeb();
+//    const t = new InferenceWeb();
 //    await t.init();
 //    const model = await t.loadModel(source, config);
 //    const emb = t.embed(model, ids, mask, batch, seq);
@@ -37,7 +37,7 @@ import { streamRegisterGguf } from './runtime/gguf-stream.js';
 //
 //    const gpu = new WebGPUOps();
 //    await gpu.init();
-//    const t = new TermiteWeb();
+//    const t = new InferenceWeb();
 //    await t.init({ gpu, worker: true });
 //    const model = await t.loadModel(source, config);
 //    const emb = await t.embed(model, ids, mask, batch, seq);  // async in worker mode
@@ -136,7 +136,7 @@ function toStreamResponse(source) {
   return null;
 }
 
-export class TermiteWeb {
+export class InferenceWeb {
   constructor() {
     this.wasm = null;
     this.abi = null;
@@ -285,7 +285,7 @@ export class TermiteWeb {
 
   _getAbi() {
     if (!this.abi || !this.wasm) {
-      throw new Error('TermiteWeb direct-mode ABI is not initialized');
+      throw new Error('InferenceWeb direct-mode ABI is not initialized');
     }
     return this.abi;
   }

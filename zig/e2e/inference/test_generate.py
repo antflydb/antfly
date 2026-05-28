@@ -14,7 +14,7 @@
 
 """Tests for /api/generate endpoint.
 
-Matches Go termite's generator_test.go patterns.
+Matches Go antfly's generator_test.go patterns.
 """
 
 import json
@@ -44,9 +44,9 @@ def _first_tool_generator_model(api):
     model = find_tool_model_name(set(generators.keys()))
     if model:
         return model
-    if os.environ.get("TERMITE_TOOL_MODEL"):
-        return os.environ["TERMITE_TOOL_MODEL"]
-    pytest.skip("No tool-capable generator model available; set TERMITE_TOOL_MODEL or place one under models")
+    if os.environ.get("ANTFLY_INFERENCE_TOOL_MODEL"):
+        return os.environ["ANTFLY_INFERENCE_TOOL_MODEL"]
+    pytest.skip("No tool-capable generator model available; set ANTFLY_INFERENCE_TOOL_MODEL or place one under models")
 
 
 def _skip_unloadable_tool_model_response(response):
@@ -85,9 +85,9 @@ def _first_multimodal_generator_model(api):
     model = find_multimodal_generator_model_name(set(generators.keys()))
     if model:
         return model
-    if os.environ.get("TERMITE_MULTIMODAL_GENERATOR_MODEL"):
-        return os.environ["TERMITE_MULTIMODAL_GENERATOR_MODEL"]
-    pytest.skip("No multimodal generator model available; set TERMITE_MULTIMODAL_GENERATOR_MODEL or place one under models")
+    if os.environ.get("ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL"):
+        return os.environ["ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL"]
+    pytest.skip("No multimodal generator model available; set ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL or place one under models")
 
 
 def _assert_chat_completion(resp: dict) -> dict:

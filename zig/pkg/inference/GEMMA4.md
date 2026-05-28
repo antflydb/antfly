@@ -1,16 +1,16 @@
 # Gemma 4
 
-This note tracks Termite's Gemma 4 generation support, especially Google's
+This note tracks Antfly inference's Gemma 4 generation support, especially Google's
 Gemma 4 Multi-Token Prediction (MTP) assistant models.
 
 ## Current Status
 
-Termite supports Gemma 4 as a native decoder family through the shared GPT
+Antfly inference supports Gemma 4 as a native decoder family through the shared GPT
 runtime. The model config already carries Gemma 4-specific metadata such as
 sliding/global attention, shared KV-tail metadata, grouped-query dimensions,
 per-layer embeddings (PLE), MoE metadata, and final logit softcapping.
 
-For MTP, Termite has a generic native speculative decoding path:
+For MTP, Antfly inference has a generic native speculative decoding path:
 
 1. A draft model proposes up to `speculative_k` tokens.
 2. The target model verifies the drafted span in one forward pass.
@@ -22,7 +22,7 @@ This is exposed through the server API with `draft_model` and `speculative_k`.
 The CLI also supports it:
 
 ```sh
-termite generate /path/to/google/gemma-4-E2B-it \
+antfly inference generate /path/to/google/gemma-4-E2B-it \
   "Explain speculative decoding in one paragraph." \
   --draft-model /path/to/google/gemma-4-E2B-it-assistant \
   --speculative-k 4 \
@@ -73,9 +73,9 @@ Sources checked on 2026-05-05:
 
 Confirmed assistant artifact structure:
 
-- `termite pull google/gemma-4-E2B-it-assistant` downloads the official
+- `antfly inference pull google/gemma-4-E2B-it-assistant` downloads the official
   safetensors assistant into
-  `~/.termite/models/google/gemma-4-E2B-it-assistant`.
+  `~/.antfly/inference/models/google/gemma-4-E2B-it-assistant`.
 - `google/gemma-4-E2B-it-assistant` config:
   - `architectures`: `Gemma4AssistantForCausalLM`
   - `model_type`: `gemma4_assistant`
@@ -133,7 +133,7 @@ Runtime findings from implementation:
   - the drafter position id is held constant during an autoregressive MTP draft
     block.
 - The extracted PyTorch drafter captures the output of `text_model.norm`, so
-  Termite now uses final-RMSNorm target hidden states for both target logits and
+  Antfly inference now uses final-RMSNorm target hidden states for both target logits and
   MTP drafter handoff. The older pre-final-RMSNorm handoff is retained only as
   implementation scaffolding for comparison.
 - The public `masked_embedder.py` implementation treats
@@ -142,7 +142,7 @@ Runtime findings from implementation:
   centroid `c`. That matches the current baseline implementation; the inverse
   interpretation is now only a debug experiment.
 
-The current Termite implementation uses the same acceptance/verification
+The current Antfly inference implementation uses the same acceptance/verification
 algorithm. Phase 1 used an independent decoder drafter. Phase 2 now has a
 Gemma-specific MTP draft step that consumes target hidden activations, reads
 target K/V, and chains projected activations. Verification is still target-owned.
@@ -200,7 +200,7 @@ MTP heads instead of independent decoders:
    for `gemma4_assistant` draft configs.
 5. Keep the existing verification path unchanged: done. Target-side verification is
    what preserves output quality and sampling semantics.
-6. Extend telemetry: partially done. `TERMITE_DEBUG_GEMMA4_MTP=1` prints drafted
+6. Extend telemetry: partially done. `ANTFLY_INFERENCE_DEBUG_GEMMA4_MTP=1` prints drafted
    token ids and verifier choices for acceptance debugging.
 7. Move Gemma 4 runtime-specific construction into
    `src/architectures/gemma4_runtime.zig`: done.
@@ -215,10 +215,10 @@ MTP heads instead of independent decoders:
 Current smoke result:
 
 ```sh
-termite generate ~/.termite/models/ggml-org/gemma-4-e2b-it-gguf \
+antfly inference generate ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf \
   "Write one short sentence about databases." \
   --backend metal \
-  --draft-model ~/.termite/models/google/gemma-4-E2B-it-assistant \
+  --draft-model ~/.antfly/inference/models/google/gemma-4-E2B-it-assistant \
   --speculative-k 2 \
   --max-tokens 4 \
   --print-token-ids \
@@ -261,7 +261,7 @@ Official safetensors target status:
 ```text
 bundle: pkg/inference/.debug/metal-command-20260505-170606
 validation: MTL_DEBUG_LAYER=1, MTL_SHADER_VALIDATION=0
-command: termite generate ~/.termite/models/google/gemma-4-E2B-it hi --backend metal --max-tokens 1
+command: antfly inference generate ~/.antfly/inference/models/google/gemma-4-E2B-it hi --backend metal --max-tokens 1
 exit_code=0
 diagnostic-reports: none
 token_ids: 239863
@@ -281,7 +281,7 @@ Official target + official assistant status:
 ```text
 bundle: pkg/inference/.debug/metal-command-20260506-161752
 validation: MTL_DEBUG_LAYER=1, MTL_SHADER_VALIDATION=0
-command: termite generate ~/.termite/models/google/gemma-4-E2B-it hi --backend auto --draft-model ~/.termite/models/google/gemma-4-E2B-it-assistant --speculative-k 2 --max-tokens 4
+command: antfly inference generate ~/.antfly/inference/models/google/gemma-4-E2B-it hi --backend auto --draft-model ~/.antfly/inference/models/google/gemma-4-E2B-it-assistant --speculative-k 2 --max-tokens 4
 exit_code=0
 diagnostic-reports: none
 token_ids: 10979 236888 2088 740
@@ -297,10 +297,10 @@ prefer official target+assistant pairs and the proper Gemma 4 chat template.
 The repo smoke wrapper is
 `scripts/test_metal_gemma4_assistant_speculative.sh`. It uses `--backend auto`
 by default so the normal backend selector can pick Metal when available; set
-`TERMITE_GEMMA4_ASSISTANT_BACKEND=metal` to force Metal for crash/debug runs.
+`ANTFLY_INFERENCE_GEMMA4_ASSISTANT_BACKEND=metal` to force Metal for crash/debug runs.
 The official target currently needs the wrapper's default
-`TERMITE_GEMMA4_ASSISTANT_HOST_BUDGET_MB=12288` and
-`TERMITE_GEMMA4_ASSISTANT_COMBINED_BUDGET_MB=17408` preflight budgets.
+`ANTFLY_INFERENCE_GEMMA4_ASSISTANT_HOST_BUDGET_MB=12288` and
+`ANTFLY_INFERENCE_GEMMA4_ASSISTANT_COMBINED_BUDGET_MB=17408` preflight budgets.
 
 ### Metal GGUF Runtime Status
 
@@ -308,7 +308,7 @@ The Metal GGUF path now routes explicit compiled generation through graph
 execution instead of a separate live whole-model shortcut:
 
 ```sh
-termite generate ~/.termite/models/ggml-org/gemma-4-e2b-it-gguf \
+antfly inference generate ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf \
   hi \
   --backend metal \
   --mode compiled \
@@ -329,7 +329,7 @@ Validator smoke on 2026-05-07:
 ```text
 bundle: pkg/inference/.debug/metal-command-20260507-142101
 validation: MTL_DEBUG_LAYER=1, MTL_SHADER_VALIDATION=0
-command: termite generate ~/.termite/models/ggml-org/gemma-4-e2b-it-gguf hi --backend metal --mode compiled --compiled-target whole-model --max-tokens 4
+command: antfly inference generate ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf hi --backend metal --mode compiled --compiled-target whole-model --max-tokens 4
 exit_code=0
 diagnostic-reports: none
 token_ids: 10979 236888 2088 740
@@ -369,7 +369,7 @@ lifetime/barrier issue is isolated. After reverting, minimal API-validation
 smoke `pkg/inference/.debug/metal-command-20260507-215452` completed with
 `token_ids: 10979` and no new diagnostic reports.
 
-The native Metal GGUF route must not depend on MLX availability when Termite is
+The native Metal GGUF route must not depend on MLX availability when Antfly inference is
 built with both backends enabled. A later 4-token compiled whole-model smoke was
 failing before model execution with `MlxMetalUnavailable`; the long-term fix is
 to keep `.metal` sessions on the native Metal provider/stream path and reserve

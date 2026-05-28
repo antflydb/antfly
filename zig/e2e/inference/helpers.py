@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared helpers for Termite E2E tests."""
+"""Shared helpers for Antfly inference E2E tests."""
 
 import base64
 import io
@@ -57,7 +57,7 @@ TINY_PNG_B64 = (
     "/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
 )
 TINY_PNG_URI = f"data:image/png;base64,{TINY_PNG_B64}"
-_GO_TERMITE_E2E_DIR = Path(__file__).resolve().parents[2] / "antfly" / "termite" / "e2e" / "testdata"
+_GO_ANTFLY_INFERENCE_E2E_DIR = Path(__file__).resolve().parents[2] / "antfly" / "antfly" / "e2e" / "testdata"
 
 
 _FONT_5X7 = {
@@ -505,8 +505,8 @@ def png_file_to_data_uri(path: str | Path) -> str:
 
 
 def load_go_sample_page_fixture() -> tuple[str, list[str]] | None:
-    image_path = _GO_TERMITE_E2E_DIR / "sample-page-1.png"
-    text_path = _GO_TERMITE_E2E_DIR / "sample-page-1.txt"
+    image_path = _GO_ANTFLY_INFERENCE_E2E_DIR / "sample-page-1.png"
+    text_path = _GO_ANTFLY_INFERENCE_E2E_DIR / "sample-page-1.txt"
     if not image_path.exists() or not text_path.exists():
         return None
 
@@ -547,9 +547,9 @@ def can_make_spoken_wav() -> bool:
 
 def make_spoken_wav_uri(text: str, sample_rate: int = 48000) -> str:
     """Generate deterministic spoken WAV audio as a data URI on macOS hosts."""
-    fd_aiff, aiff_path = tempfile.mkstemp(suffix=".aiff", prefix="termite-e2e-")
+    fd_aiff, aiff_path = tempfile.mkstemp(suffix=".aiff", prefix="antfly-e2e-")
     os.close(fd_aiff)
-    fd_wav, wav_path = tempfile.mkstemp(suffix=".wav", prefix="termite-e2e-")
+    fd_wav, wav_path = tempfile.mkstemp(suffix=".wav", prefix="antfly-e2e-")
     os.close(fd_wav)
 
     try:

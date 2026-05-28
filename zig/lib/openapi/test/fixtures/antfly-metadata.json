@@ -3,7 +3,7 @@
   "info": {
     "version": "v1alpha1",
     "title": "Antfly Public API",
-    "description": "Antfly is a distributed key-value store and vector search engine built on a **multi-Raft consensus architecture**.\nIt combines the best of traditional databases with modern AI capabilities to deliver hybrid search at scale.\n\n## What Makes Antfly Unique\n\n### Hybrid Search\n- **BM25 + Vector Similarity**: Full-text search with vector embeddings using Reciprocal Rank Fusion (RRF)\n- **Multimodal**: Index and search text, images, audio, and video\n- **Embedding Providers**: Ollama, OpenAI, AWS Bedrock, Google Gemini, Anthropic\n- **Hardware Acceleration**: SIMD optimizations (AVX2/AVX-512 on x86, NEON on ARM) and SME (Scalable Matrix Extension) for ARM\n\n### Distributed Consensus\n- **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)\n- **Horizontal Sharding**: Data automatically partitioned across shards with configurable replication\n- **Distributed Transactions**: Atomic cross-shard writes using coordinator-based 2PC with intent-based locking\n- **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, aknn)\n\n### AI-Native Features\n- **RAG**: Streaming retrieval-augmented generation with Server-Sent Events\n- **Retrieval Agent**: Intelligent query routing with automatic query generation\n- **Document Chunking**: Semantic chunking service (Termite) with multi-tier caching\n- **Async Enrichment**: Background embedding and summarization with leader-only processing\n- **Multimodal Remote Processing**: Automatic download, processing, and security controls for images, PDFs, and HTML from URLs (http/https/s3/file) with SSRF prevention and content validation\n\n### Developer Experience\n- **Client Libraries**: Auto-generated SDKs for Go, TypeScript, and Python from OpenAPI spec\n- **JSON Schema Extensions**: Custom `x-antfly-*` annotations for indexing\n- **MongoDB-Style Transforms**: In-place updates ($inc, $set, $push) without read-modify-write\n- **Linear Merge**: Stateless import of sorted records from external sources\n- **Template Rendering**: Handlebars templates for custom document rendering\n- **Graph Operations**: Declarative queries with traversals and pathfinding\n- **TTL Support**: Automatic expiration for documents (table-level) and edges (graph index-level)\n\n### Operations & Scalability\n- **Online Shard Splitting**: Automatic reallocation and splitting of shards without downtime\n- **Kubernetes Operator**: Official `antfly-operator` with autoscaling and lifecycle management\n- **Prometheus Metrics**: Built-in monitoring endpoints for observability\n- **Zero-Downtime Upgrades**: Rolling upgrades across Raft consensus groups\n\n### Flexible Indexing\n- **Index Types**: `full_text` (BM25), `embeddings` (vector with RaBitQ), `graph` (relationship traversal)\n- **Enrichers**: `embeddingenricher`, `summarizeenricher`, `pipelineenricher` (async background processing)\n- **Query Processors**: `chunker` (semantic document splitting), `pruner` (result filtering), `reranker` (relevance re-scoring)\n- **Multimodal**: Vision model + embedder or native multimodal embeddings (Gemini)\n- **Pluggable Architecture**: Easy to add custom index types via registry pattern\n",
+    "description": "Antfly is a distributed key-value store and vector search engine built on a **multi-Raft consensus architecture**.\nIt combines the best of traditional databases with modern AI capabilities to deliver hybrid search at scale.\n\n## What Makes Antfly Unique\n\n### Hybrid Search\n- **BM25 + Vector Similarity**: Full-text search with vector embeddings using Reciprocal Rank Fusion (RRF)\n- **Multimodal**: Index and search text, images, audio, and video\n- **Embedding Providers**: Ollama, OpenAI, AWS Bedrock, Google Gemini, Anthropic\n- **Hardware Acceleration**: SIMD optimizations (AVX2/AVX-512 on x86, NEON on ARM) and SME (Scalable Matrix Extension) for ARM\n\n### Distributed Consensus\n- **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)\n- **Horizontal Sharding**: Data automatically partitioned across shards with configurable replication\n- **Distributed Transactions**: Atomic cross-shard writes using coordinator-based 2PC with intent-based locking\n- **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, aknn)\n\n### AI-Native Features\n- **RAG**: Streaming retrieval-augmented generation with Server-Sent Events\n- **Retrieval Agent**: Intelligent query routing with automatic query generation\n- **Document Chunking**: Semantic chunking service (Antfly inference) with multi-tier caching\n- **Async Enrichment**: Background embedding and summarization with leader-only processing\n- **Multimodal Remote Processing**: Automatic download, processing, and security controls for images, PDFs, and HTML from URLs (http/https/s3/file) with SSRF prevention and content validation\n\n### Developer Experience\n- **Client Libraries**: Auto-generated SDKs for Go, TypeScript, and Python from OpenAPI spec\n- **JSON Schema Extensions**: Custom `x-antfly-*` annotations for indexing\n- **MongoDB-Style Transforms**: In-place updates ($inc, $set, $push) without read-modify-write\n- **Linear Merge**: Stateless import of sorted records from external sources\n- **Template Rendering**: Handlebars templates for custom document rendering\n- **Graph Operations**: Declarative queries with traversals and pathfinding\n- **TTL Support**: Automatic expiration for documents (table-level) and edges (graph index-level)\n\n### Operations & Scalability\n- **Online Shard Splitting**: Automatic reallocation and splitting of shards without downtime\n- **Kubernetes Operator**: Official `antfly-operator` with autoscaling and lifecycle management\n- **Prometheus Metrics**: Built-in monitoring endpoints for observability\n- **Zero-Downtime Upgrades**: Rolling upgrades across Raft consensus groups\n\n### Flexible Indexing\n- **Index Types**: `full_text` (BM25), `embeddings` (vector with RaBitQ), `graph` (relationship traversal)\n- **Enrichers**: `embeddingenricher`, `summarizeenricher`, `pipelineenricher` (async background processing)\n- **Query Processors**: `chunker` (semantic document splitting), `pruner` (result filtering), `reranker` (relevance re-scoring)\n- **Multimodal**: Vision model + embedder or native multimodal embeddings (Gemini)\n- **Pluggable Architecture**: Easy to add custom index types via registry pattern\n",
     "contact": {
       "name": "Antfly",
       "url": "https://github.com/antflydb/antfly"
@@ -4031,7 +4031,7 @@
           },
           "reranker": {
             "$ref": "#/components/schemas/RerankerConfig",
-            "description": "Optional reranker configuration to improve result relevance.\n\nRerankers use cross-encoder models that score query-document pairs directly,\nproviding more accurate relevance scores than embedding similarity alone.\n\n**When to use:**\n- Results need high precision (e.g., RAG, question answering)\n- You have semantic or hybrid search results to refine\n- Latency trade-off is acceptable (reranking adds 100-500ms typically)\n\n**Best practice:** Retrieve more results (limit: 50-100) then rerank to final size.\n\nExample:\n```json\n{\n  \"provider\": \"termite\",\n  \"model\": \"cross-encoder/ms-marco-MiniLM-L-6-v2\",\n  \"field\": \"content\"\n}\n```\n"
+            "description": "Optional reranker configuration to improve result relevance.\n\nRerankers use cross-encoder models that score query-document pairs directly,\nproviding more accurate relevance scores than embedding similarity alone.\n\n**When to use:**\n- Results need high precision (e.g., RAG, question answering)\n- You have semantic or hybrid search results to refine\n- Latency trade-off is acceptable (reranking adds 100-500ms typically)\n\n**Best practice:** Retrieve more results (limit: 50-100) then rerank to final size.\n\nExample:\n```json\n{\n  \"provider\": \"antfly\",\n  \"model\": \"cross-encoder/ms-marco-MiniLM-L-6-v2\",\n  \"field\": \"content\"\n}\n```\n"
           },
           "analyses": {
             "$ref": "#/components/schemas/Analyses"
@@ -6049,7 +6049,7 @@
         "enum": [
           "antfly",
           "ollama",
-          "termite",
+          "antfly",
           "cohere",
           "vertex"
         ],
@@ -6080,9 +6080,9 @@
           "model"
         ]
       },
-      "TermiteRerankerConfig": {
+      "AntflyRerankerConfig": {
         "type": "object",
-        "description": "Configuration for the Termite reranking provider.",
+        "description": "Configuration for the Antfly inference reranking provider.",
         "properties": {
           "model": {
             "type": "string",
@@ -6091,7 +6091,7 @@
           "url": {
             "type": "string",
             "format": "uri",
-            "description": "The URL of the Termite API endpoint."
+            "description": "The URL of the Antfly inference API endpoint."
           }
         },
         "required": [
@@ -6193,7 +6193,7 @@
                 "$ref": "#/components/schemas/OllamaRerankerConfig"
               },
               {
-                "$ref": "#/components/schemas/TermiteRerankerConfig"
+                "$ref": "#/components/schemas/AntflyRerankerConfig"
               },
               {
                 "$ref": "#/components/schemas/CohereRerankerConfig"
@@ -6827,9 +6827,9 @@
           "model"
         ]
       },
-      "TermiteGeneratorConfig": {
+      "AntflyGeneratorConfig": {
         "type": "object",
-        "description": "Configuration for the Termite generative AI provider.\n",
+        "description": "Configuration for the Antfly inference generative AI provider.\n",
         "properties": {
           "model": {
             "type": "string",
@@ -6839,7 +6839,7 @@
           "api_url": {
             "type": "string",
             "format": "uri",
-            "description": "The URL of the Termite API endpoint."
+            "description": "The URL of the Antfly inference API endpoint."
           },
           "temperature": {
             "type": "number",
@@ -6865,7 +6865,7 @@
           },
           "timeout": {
             "type": "integer",
-            "description": "HTTP response timeout in seconds for Termite API calls.",
+            "description": "HTTP response timeout in seconds for Antfly inference API calls.",
             "minimum": 1
           }
         },
@@ -7135,7 +7135,7 @@
           "bedrock",
           "anthropic",
           "cohere",
-          "termite",
+          "antfly",
           "mock"
         ],
         "description": "The generative AI provider to use."
@@ -7155,7 +7155,7 @@
                 "$ref": "#/components/schemas/OllamaGeneratorConfig"
               },
               {
-                "$ref": "#/components/schemas/TermiteGeneratorConfig"
+                "$ref": "#/components/schemas/AntflyGeneratorConfig"
               },
               {
                 "$ref": "#/components/schemas/OpenAIGeneratorConfig"
@@ -8490,9 +8490,9 @@
           "input_type": "search_document"
         }
       },
-      "TermiteEmbedderConfig": {
+      "AntflyEmbedderConfig": {
         "type": "object",
-        "description": "Configuration for the Termite embedding provider.\n\nTermite is Antfly's built-in ML service for local embeddings using ONNX models.\nIt provides embedding generation with multi-tier caching (memory + persistent).\n\n**Features:**\n- Local ONNX-based embedding generation\n- L1 memory cache with configurable TTL\n- L2 persistent Pebble database cache\n- Singleflight deduplication for concurrent identical requests\n\n**Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)\n\nModels are loaded from the `models/embedders/{name}/` directory.",
+        "description": "Configuration for the Antfly inference embedding provider.\n\nAntfly inference is Antfly's built-in ML service for local embeddings using ONNX models.\nIt provides embedding generation with multi-tier caching (memory + persistent).\n\n**Features:**\n- Local ONNX-based embedding generation\n- L1 memory cache with configurable TTL\n- L2 persistent Pebble database cache\n- Singleflight deduplication for concurrent identical requests\n\n**Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)\n\nModels are loaded from the `models/embedders/{name}/` directory.",
         "properties": {
           "model": {
             "type": "string",
@@ -8502,7 +8502,7 @@
           "api_url": {
             "type": "string",
             "format": "uri",
-            "description": "The URL of the Termite API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable.",
+            "description": "The URL of the Antfly inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.",
             "example": "http://localhost:8082"
           }
         },
@@ -8510,7 +8510,7 @@
           "model"
         ],
         "example": {
-          "provider": "termite",
+          "provider": "antfly",
           "model": "bge-base-en-v1.5",
           "api_url": "http://localhost:8082"
         }
@@ -8533,7 +8533,7 @@
           "bedrock",
           "cohere",
           "mock",
-          "termite",
+          "antfly",
           "antfly"
         ],
         "description": "The embedding provider to use."
@@ -8565,7 +8565,7 @@
                 "$ref": "#/components/schemas/CohereEmbedderConfig"
               },
               {
-                "$ref": "#/components/schemas/TermiteEmbedderConfig"
+                "$ref": "#/components/schemas/AntflyEmbedderConfig"
               },
               {
                 "$ref": "#/components/schemas/AntflyEmbedderConfig"
@@ -8645,8 +8645,8 @@
           }
         }
       },
-      "TermiteChunkerConfig": {
-        "description": "Configuration for the Termite chunking provider.\n\nTermite is a centralized HTTP service that provides chunking with multi-tier caching.\nThe model name maps to ONNX model directory names (similar to how Ollama works).\n\n**Chunking Models:**\n- fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)\n- Any other name will attempt to load from models/chunkers/{name}/ directory\n\n**Caching:**\n- L1: Memory cache with 2-minute TTL\n- L2: Persistent Pebble database\n- Singleflight deduplication for concurrent identical requests\n",
+      "AntflyChunkerConfig": {
+        "description": "Configuration for the Antfly inference chunking provider.\n\nAntfly inference is a centralized HTTP service that provides chunking with multi-tier caching.\nThe model name maps to ONNX model directory names (similar to how Ollama works).\n\n**Chunking Models:**\n- fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)\n- Any other name will attempt to load from models/chunkers/{name}/ directory\n\n**Caching:**\n- L1: Memory cache with 2-minute TTL\n- L2: Persistent Pebble database\n- Singleflight deduplication for concurrent identical requests\n",
         "allOf": [
           {
             "$ref": "#/components/schemas/ChunkOptions"
@@ -8657,7 +8657,7 @@
               "api_url": {
                 "type": "string",
                 "format": "uri",
-                "description": "The URL of the Termite API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_TERMITE_URL environment variable.",
+                "description": "The URL of the Antfly inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.",
                 "example": "http://localhost:8080"
               },
               "model": {
@@ -8673,7 +8673,7 @@
           }
         ],
         "example": {
-          "provider": "termite",
+          "provider": "antfly",
           "api_url": "http://localhost:8080",
           "model": "fixed",
           "max_chunks": 50,
@@ -8685,7 +8685,7 @@
         }
       },
       "AntflyChunkerConfig": {
-        "description": "Configuration for the local Antfly chunking provider.\n\nThis provider runs chunking directly within the storage node process,\nwithout requiring an external Termite service. It uses simple fixed-size\ntokenizer-based chunking with no caching overhead.\n\n**Use this when:**\n- Running single-node deployments (swarm mode)\n- You don't need embedding/chunk caching across nodes\n- You want minimal setup complexity\n\n**Use Termite instead when:**\n- Running multi-node clusters where caching reduces costs\n- You need ONNX-accelerated chunking models\n- You want persistent chunk/embedding caches\n",
+        "description": "Configuration for the local Antfly chunking provider.\n\nThis provider runs chunking directly within the storage node process,\nwithout requiring an external Antfly inference service. It uses simple fixed-size\ntokenizer-based chunking with no caching overhead.\n\n**Use this when:**\n- Running single-node deployments (swarm mode)\n- You don't need embedding/chunk caching across nodes\n- You want minimal setup complexity\n\n**Use Antfly inference instead when:**\n- Running multi-node clusters where caching reduces costs\n- You need ONNX-accelerated chunking models\n- You want persistent chunk/embedding caches\n",
         "allOf": [
           {
             "$ref": "#/components/schemas/ChunkOptions"
@@ -8705,7 +8705,7 @@
         "type": "string",
         "enum": [
           "mock",
-          "termite",
+          "antfly",
           "antfly"
         ],
         "description": "The chunking provider to use."
@@ -8716,7 +8716,7 @@
           {
             "oneOf": [
               {
-                "$ref": "#/components/schemas/TermiteChunkerConfig"
+                "$ref": "#/components/schemas/AntflyChunkerConfig"
               },
               {
                 "$ref": "#/components/schemas/AntflyChunkerConfig"
@@ -8747,7 +8747,7 @@
           }
         ],
         "example": {
-          "provider": "termite",
+          "provider": "antfly",
           "model": "fixed",
           "text": {
             "target_tokens": 500,

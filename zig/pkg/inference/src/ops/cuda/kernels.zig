@@ -17,7 +17,7 @@ const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
 const driver_mod = @import("driver.zig");
 
-const fill_ptx = @embedFile("artifacts/termite_cuda_kernels.ptx");
+const fill_ptx = @embedFile("artifacts/inference_cuda_kernels.ptx");
 const fill_ptx_z = fill_ptx ++ "\x00";
 
 pub const KernelModule = struct {

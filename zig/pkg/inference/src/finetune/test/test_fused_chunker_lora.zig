@@ -13,5 +13,5 @@
 // limitations under the License.
 
 test {
-    _ = @import("termite_internal").finetune.lora_adapter_set;
+    _ = @import("inference_internal").finetune.lora_adapter_set;
 }

@@ -1,5 +1,5 @@
 {
-  "name": "termite-web-electron",
+  "name": "inference-web-electron",
   "private": true,
   "version": "0.1.0",
   "type": "module",

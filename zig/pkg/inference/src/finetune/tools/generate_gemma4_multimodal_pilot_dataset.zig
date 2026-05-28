@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const compat = @import("termite_internal").io.compat;
+const compat = @import("inference_internal").io.compat;
 
 const prompts = [_][]const u8{
     "Identify the dominant visual property for sample",

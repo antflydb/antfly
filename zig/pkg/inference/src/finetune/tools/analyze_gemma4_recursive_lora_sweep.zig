@@ -13,10 +13,10 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite = @import("termite_internal");
+const inference = @import("inference_internal");
 const platform = @import("antfly_platform");
-const compat = termite.io.compat;
-const c_file = termite.util.c_file;
+const compat = inference.io.compat;
+const c_file = inference.util.c_file;
 
 const Row = struct {
     kind: []const u8,

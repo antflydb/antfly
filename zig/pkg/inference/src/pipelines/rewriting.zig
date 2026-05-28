@@ -26,7 +26,7 @@
 
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
-const tokenizer_mod = @import("termite_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 const enc_dec_mod = @import("encoder_decoder.zig");
 
 pub const RewriteConfig = struct {

@@ -87,7 +87,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     configureBackendPreference(&session_manager, opts.backend);
     session_manager.graph_runtime_strategy = opts.graph_runtime_strategy;
     if (opts.graph_runtime_strategy == null) {
-        graph_executor_stats.printBypass("termite.embed", "embedding_pipeline_direct_runtime");
+        graph_executor_stats.printBypass("inference.embed", "embedding_pipeline_direct_runtime");
     }
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);

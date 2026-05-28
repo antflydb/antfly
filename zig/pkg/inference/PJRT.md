@@ -11,14 +11,14 @@ Current state:
 - `lib/pjrt/proto/xla_proto_stub.zig` now provides real wire encoding for the HLO proto subset used by the current builder; PJRT CPU-plugin tests compile and execute those partition HLOs when the plugin is present.
 - `src/graph/pjrt_executor.zig` compiles HLO through a PJRT client and exposes it through `PartitionExecutor`.
 - `src/graph/pjrt_executor.zig` exposes the shared `ModelExecutor` / `ModelRuntime` whole-model surface. `compiled-target=whole-model` can now attach either offline PJRT phase packages or an inline-compiled traced graph when the shape has one PJRT-owned compute partition. The graph cache owns the immutable `ModelExecutor` plus its per-entry `ModelRuntime` so repeated calls reuse the executable and runtime wrapper. Host-assisted graph input materialization is still present for parts of the ABI, and `ModelRuntime` reports that state ownership explicitly.
-- `compile-artifact --backend xla` emits serialized HLO plus PJRT input/output binding metadata by default. `--xla-artifact-kind executable` compiles that HLO through the configured PJRT plugin at export time, serializes the plugin-native executable, and writes `pjrt_executable` or `pjrt_partition_executable` manifests for load-only attach. Bounded partition executable export is allowed by default; large whole-model executable export is guarded by `TERMITE_PJRT_MAX_EXECUTABLE_EXPORT_HLO_BYTES` because dense embedded-constant HLO can exceed local plugin compile/serialize capacity. `--xla-parameter-mode inputs` is an explicit host-assisted validation mode that emits model parameters as PJRT inputs instead of embedding their f32 values in HLO, and manifests record `pjrt_parameter_mode` so embedded and parameter-input artifacts can coexist without ambiguous lookup.
-- the default artifact root now mirrors the model namespace: `~/.termite/artifacts/<owner>/<model>/xla/...`
-- whole-model PJRT artifact directories now refresh a package manifest (`*.termite-package.json`) that indexes the prefill entry plus compatible decode buckets, and `compile-artifact` prints that package path as part of the result
+- `compile-artifact --backend xla` emits serialized HLO plus PJRT input/output binding metadata by default. `--xla-artifact-kind executable` compiles that HLO through the configured PJRT plugin at export time, serializes the plugin-native executable, and writes `pjrt_executable` or `pjrt_partition_executable` manifests for load-only attach. Bounded partition executable export is allowed by default; large whole-model executable export is guarded by `ANTFLY_INFERENCE_PJRT_MAX_EXECUTABLE_EXPORT_HLO_BYTES` because dense embedded-constant HLO can exceed local plugin compile/serialize capacity. `--xla-parameter-mode inputs` is an explicit host-assisted validation mode that emits model parameters as PJRT inputs instead of embedding their f32 values in HLO, and manifests record `pjrt_parameter_mode` so embedded and parameter-input artifacts can coexist without ambiguous lookup.
+- the default artifact root now mirrors the model namespace: `~/.antfly/inference/artifacts/<owner>/<model>/xla/...`
+- whole-model PJRT artifact directories now refresh a package manifest (`*.antfly-package.json`) that indexes the prefill entry plus compatible decode buckets, and `compile-artifact` prints that package path as part of the result
 - `run-artifact <xla partition manifest>` can now execute bounded `pjrt_partition_hlo` and `pjrt_partition_executable` artifacts through the configured PJRT plugin, materialize external graph inputs from native, and compare partition outputs back to captured native values. The Gemma best-partition executable proof writes a 1.4 MiB plugin-native executable and matches native outputs within float noise.
 - `src/graph/pjrt_artifact_executor.zig` owns PJRT artifact loading and wraps it as a `ModelExecutor`; `run-artifact <xla manifest>` uses that path to run the exact traced prompt shape through `ModelExecutor` / `ModelRuntime`, and `run-artifact <package>` can resolve the matching prefill entry from the package directly. `pjrt_hlo` artifacts still compile HLO through the configured plugin at load time, while `pjrt_executable` artifacts deserialize a plugin-native executable without HLO compile-on-load. `generate --backend xla --compiled-target whole-model` prefers matching plugin-native executables, then parameter-input HLO, then embedded HLO before falling back to inline graph compilation. `--validate` checks the artifact bytes exist without execution.
 - whole-model PJRT attach is now package-first for both prefill and decode bucket discovery; raw sidecar scanning remains as fallback compatibility
 - GPT-2 whole-model PJRT package execution is proven locally through package-backed prefill plus decode buckets; package attach can step through multiple decode buckets instead of stopping at the first decode transition
-- GPT-2 whole-model prefill can now export as `pjrt_hlo`; tracing correctly falls back from absent split Q/K/V weights to fused `c_attn`, and the compiler lowers graph constants. The default dense artifact embeds constants in HLO, so the local proof is export/validate only for HLO. Parameter-input HLO export is available for smaller compile modules, but it still materializes weights from the host at execution time and is not the final backend-owned weight residency model. Executable export is wired, but large dense whole-model executable creation is refused by default once the HLO exceeds `TERMITE_PJRT_MAX_EXECUTABLE_EXPORT_HLO_BYTES`; raise that budget only when the configured plugin has enough compile/serialize capacity.
+- GPT-2 whole-model prefill can now export as `pjrt_hlo`; tracing correctly falls back from absent split Q/K/V weights to fused `c_attn`, and the compiler lowers graph constants. The default dense artifact embeds constants in HLO, so the local proof is export/validate only for HLO. Parameter-input HLO export is available for smaller compile modules, but it still materializes weights from the host at execution time and is not the final backend-owned weight residency model. Executable export is wired, but large dense whole-model executable creation is refused by default once the HLO exceeds `ANTFLY_INFERENCE_PJRT_MAX_EXECUTABLE_EXPORT_HLO_BYTES`; raise that budget only when the configured plugin has enough compile/serialize capacity.
 - PJRT artifact loading now reports its load mode explicitly. The local wrapper binds `PJRT_LoadedExecutable_GetExecutable`, `PJRT_Executable_Serialize`, and `PJRT_Executable_DeserializeAndLoad`; the CPU plugin round-trips a small executable in tests. Plugin-native load-only artifacts are therefore supported as a separate `pjrt_executable` kind, not by changing existing `pjrt_hlo` manifests.
 - PJRT manifests now have semantic binding vocabulary for `input_ids` and past/present KV input/output bindings. `input_ids` maps to the current embedding-id execution path; semantic `present.*` output bindings can populate the retained-buffer cache, and semantic `past_*` inputs can bind retained PJRT buffers back into matching executable input slots. Native XLA artifact export now emits those binding names for whole-model phase artifacts. GPT-2 semantic decode HLO export now validates a real bucketed decode ABI with `input_ids`, 24 `past_key_values.*` inputs, and 24 `present.*` outputs.
 - `PjrtModelRuntime` now owns a retained-buffer cache and clears it on runtime reset/deinit. Artifacts with semantic `present.*` output bindings can retain raw PJRT buffers instead of forcing those outputs through host tensors; a prefill artifact plus decode artifact share that cache, and packages with semantic prefill `present.*` outputs plus decode `past_*` inputs advertise backend-owned decode state.
@@ -67,10 +67,10 @@ Key PJRT differences:
 
 ### Repo Boundaries
 
-- **`antfly-zig/lib/protobuf/`** — Shared protobuf module (already exists). Referenced from termite-zig as `../../lib/protobuf`, same pattern as `openapi`.
-- **`lib/pjrt/`** — New PJRT/HLO library, local to termite-zig (like `lib/ml/` and `lib/jinja/`). Referenced as `lib/pjrt` in `build.zig.zon`.
-- **`termite-zig/src/`** — All backend integration code (`src/ops/`, `src/graph/`, `src/backends/`, `src/pipelines/`, `src/architectures/`).
-- **`termite-zig/build.zig`** + **`build.zig.zon`** — Build flags and dependency wiring.
+- **`antfly-zig/lib/protobuf/`** — Shared protobuf module (already exists). Referenced from antfly-inference-zig as `../../lib/protobuf`, same pattern as `openapi`.
+- **`lib/pjrt/`** — New PJRT/HLO library, local to antfly-inference-zig (like `lib/ml/` and `lib/jinja/`). Referenced as `lib/pjrt` in `build.zig.zon`.
+- **`antfly-inference-zig/src/`** — All backend integration code (`src/ops/`, `src/graph/`, `src/backends/`, `src/pipelines/`, `src/architectures/`).
+- **`antfly-inference-zig/build.zig`** + **`build.zig.zon`** — Build flags and dependency wiring.
 
 ---
 
@@ -136,10 +136,10 @@ HLO proto field numbers (from `xla/service/hlo.proto`):
 - `HloInstructionProto`: name=1, opcode=2, shape=3, operand_ids=6, id=10
 - `ShapeProto`: element_type=2, dimensions=3, layout=4
 
-**Modify `termite-zig/build.zig.zon`** — Add dependencies:
+**Modify `antfly-inference-zig/build.zig.zon`** — Add dependencies:
 ```zig
 .protobuf = .{ .path = "../../lib/protobuf" },  // antfly-zig shared lib
-.pjrt = .{ .path = "lib/pjrt" },                // termite-zig local lib
+.pjrt = .{ .path = "lib/pjrt" },                // antfly-inference-zig local lib
 ```
 
 **Test:** Build simple HLO programs (add, matmul), serialize, verify protobuf bytes.
@@ -393,27 +393,27 @@ Increments 1-2 and 3 can proceed in parallel. Increments 4-5 can proceed in para
 | File | Repo | Change |
 |------|------|--------|
 | `lib/protobuf/` | antfly-zig | DONE — shared protobuf encoder |
-| `lib/pjrt/{build.zig,build.zig.zon,src/root.zig}` | termite-zig | NEW — module scaffold |
-| `lib/pjrt/src/hlo.zig` | termite-zig | NEW — HLO program builder |
-| `lib/pjrt/src/pjrt.zig` | termite-zig | NEW — PJRT client/buffer/executable wrappers |
-| `lib/pjrt/src/pjrt_c_types.zig` | termite-zig | NEW — PJRT C API type definitions |
-| `build.zig` | termite-zig | `-Dtpu` flag, pjrt module import |
-| `build.zig.zon` | termite-zig | Add `protobuf` + `pjrt` path dependencies |
-| `src/ops/ops.zig` | termite-zig | Add `tpu` to `BackendKind` |
-| `src/backends/backends.zig` | termite-zig | Add `tpu` to `BackendType` |
-| `src/graph/partition.zig` | termite-zig | Add `PartitionExecutor` protocol |
-| `src/graph/multi_executor.zig` | termite-zig | Branch on `part.executor` |
-| `src/graph/tpu_compiler.zig` | termite-zig | NEW — Graph IR → HLO translation |
-| `src/graph/tpu_executor.zig` | termite-zig | NEW — PartitionExecutor for TPU |
-| `src/graph/tpu_cache.zig` | termite-zig | NEW — compiled executable caching |
-| `src/graph/tpu_capability.zig` | termite-zig | NEW — op support filter |
-| `src/graph/tpu_mesh.zig` | termite-zig | NEW — TPU topology → DeviceMesh |
-| `src/ops/tpu_compute.zig` | termite-zig | NEW — minimal VTable (DMA + lifecycle) |
-| `src/graph/cache.zig` | termite-zig | Add `compiled_executors` to `CacheEntry` |
-| `src/graph/root.zig` | termite-zig | Export TPU modules |
-| `src/architectures/session_factory.zig` | termite-zig | TPU session creation |
-| `src/pipelines/generation.zig` | termite-zig | TPU partition capabilities + executor wiring |
-| `src/graph/collective_ops.zig` | termite-zig | PJRT-native all-reduce via ICI |
+| `lib/pjrt/{build.zig,build.zig.zon,src/root.zig}` | antfly-inference-zig | NEW — module scaffold |
+| `lib/pjrt/src/hlo.zig` | antfly-inference-zig | NEW — HLO program builder |
+| `lib/pjrt/src/pjrt.zig` | antfly-inference-zig | NEW — PJRT client/buffer/executable wrappers |
+| `lib/pjrt/src/pjrt_c_types.zig` | antfly-inference-zig | NEW — PJRT C API type definitions |
+| `build.zig` | antfly-inference-zig | `-Dtpu` flag, pjrt module import |
+| `build.zig.zon` | antfly-inference-zig | Add `protobuf` + `pjrt` path dependencies |
+| `src/ops/ops.zig` | antfly-inference-zig | Add `tpu` to `BackendKind` |
+| `src/backends/backends.zig` | antfly-inference-zig | Add `tpu` to `BackendType` |
+| `src/graph/partition.zig` | antfly-inference-zig | Add `PartitionExecutor` protocol |
+| `src/graph/multi_executor.zig` | antfly-inference-zig | Branch on `part.executor` |
+| `src/graph/tpu_compiler.zig` | antfly-inference-zig | NEW — Graph IR → HLO translation |
+| `src/graph/tpu_executor.zig` | antfly-inference-zig | NEW — PartitionExecutor for TPU |
+| `src/graph/tpu_cache.zig` | antfly-inference-zig | NEW — compiled executable caching |
+| `src/graph/tpu_capability.zig` | antfly-inference-zig | NEW — op support filter |
+| `src/graph/tpu_mesh.zig` | antfly-inference-zig | NEW — TPU topology → DeviceMesh |
+| `src/ops/tpu_compute.zig` | antfly-inference-zig | NEW — minimal VTable (DMA + lifecycle) |
+| `src/graph/cache.zig` | antfly-inference-zig | Add `compiled_executors` to `CacheEntry` |
+| `src/graph/root.zig` | antfly-inference-zig | Export TPU modules |
+| `src/architectures/session_factory.zig` | antfly-inference-zig | TPU session creation |
+| `src/pipelines/generation.zig` | antfly-inference-zig | TPU partition capabilities + executor wiring |
+| `src/graph/collective_ops.zig` | antfly-inference-zig | PJRT-native all-reduce via ICI |
 
 ## Existing Code to Reuse
 

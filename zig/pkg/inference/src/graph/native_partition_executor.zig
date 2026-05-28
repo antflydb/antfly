@@ -740,7 +740,7 @@ fn clapWindowAttention(
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
     const scores = try allocator.alloc(f32, window_area);
     defer allocator.free(scores);
-    const linalg_prim = @import("termite_linalg").primitives;
+    const linalg_prim = @import("inference_linalg").primitives;
     for (0..num_windows) |win| {
         for (0..num_heads) |head| {
             for (0..window_area) |i| {

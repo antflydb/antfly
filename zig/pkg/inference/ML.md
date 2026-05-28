@@ -1,8 +1,8 @@
-# XLA-like Computation Graph IR for termite-zig
+# XLA-like Computation Graph IR for antfly-inference-zig
 
 ## Context
 
-termite-zig currently uses **eager execution** with a `ComputeBackend` VTable of ~45 fused ops (`src/ops/ops.zig:118-345`). Model architectures (`gpt.zig`, `bert.zig`, etc.) call `cb.linear(...)`, `cb.rmsNorm(...)` directly, and each backend (BLAS, MLX, WASM) implements these ops immediately.
+antfly-inference-zig currently uses **eager execution** with a `ComputeBackend` VTable of ~45 fused ops (`src/ops/ops.zig:118-345`). Model architectures (`gpt.zig`, `bert.zig`, etc.) call `cb.linear(...)`, `cb.rmsNorm(...)` directly, and each backend (BLAS, MLX, WASM) implements these ops immediately.
 
 This works well for inference but prevents:
 - **Graph optimizations** (op fusion, memory planning, dead code elimination)
@@ -14,7 +14,7 @@ This works well for inference but prevents:
 ## GoMLX Patterns to Emulate
 
 ### 1. Buffer Donation (High value)
-GoMLX's `donate []bool` parameter lets compiled executables reuse input buffers for outputs — avoids allocation in the hot path. For termite-zig's decode loop (same-size tensors every step), this is a significant memory optimization. The interpreter should support marking inputs as "donated" so backends can overwrite them.
+GoMLX's `donate []bool` parameter lets compiled executables reuse input buffers for outputs — avoids allocation in the hot path. For antfly-inference-zig's decode loop (same-size tensors every step), this is a significant memory optimization. The interpreter should support marking inputs as "donated" so backends can overwrite them.
 
 ### 2. ErrNotImplemented Fallback (High value, changes the design)
 GoMLX's `InternalFusedOpCaller` pattern is cleaner than pure pattern-matching. Instead of pattern-matching fused ops *after* tracing, GoMLX:
@@ -32,10 +32,10 @@ Per-graph caches for `(dtype, value) → NodeId` prevent duplicate constant node
 GoMLX's `Context` with scoped naming, variable initialization, and train/eval/inference mode flags is essential for training. Without it, managing weights + gradients + optimizer state becomes ad-hoc. Worth designing when we reach Phase 6.
 
 ### 5. Control Flow Ops (Defer)
-GoMLX supports `While`, `If`, `Call` as first-class graph ops. This matters for dynamic-length generation loops inside the graph, but termite-zig currently handles the generation loop outside the model forward pass (in `generation.zig`). Can defer this.
+GoMLX supports `While`, `If`, `Call` as first-class graph ops. This matters for dynamic-length generation loops inside the graph, but antfly-inference-zig currently handles the generation loop outside the model forward pass (in `generation.zig`). Can defer this.
 
 ### 6. Distributed/Sharding (Defer)
-GoMLX's DeviceMesh + ShardingSpec + AutoSharding is powerful for multi-GPU training but premature for termite-zig's single-device inference focus. Worth noting for the future.
+GoMLX's DeviceMesh + ShardingSpec + AutoSharding is powerful for multi-GPU training but premature for antfly-inference-zig's single-device inference focus. Worth noting for the future.
 
 ---
 
@@ -53,7 +53,7 @@ This avoids the false choice between "keep fused ops" and "decompose everything.
 
 **New files in `lib/ml/` — a reusable ML library, no changes to existing code.**
 
-The pure graph IR lives in `lib/ml/` so it's reusable beyond termite (like `lib/jinja/`, `lib/tokenizer/`). Termite-specific bridge code (tracing backend, interpreter that dispatches to `ComputeBackend`) lives in `src/graph/`.
+The pure graph IR lives in `lib/ml/` so it's reusable beyond termite (like `lib/jinja/`, `lib/tokenizer/`). Antfly inference-specific bridge code (tracing backend, interpreter that dispatches to `ComputeBackend`) lives in `src/graph/`.
 
 ### `lib/ml/src/graph/shape.zig`
 - `DType` enum (f32, f16, bf16, i32, i64, bool)
@@ -190,7 +190,7 @@ The KV cache (`runtime/kv/`) and MoE runtime (`runtime/moe/`) are external mutab
 ### Integration with `src/pipelines/generation.zig` ✅
 - `graphForward()` method: trace → fuse pass → cache → interpret
 - Feature-flagged via `graph_cache: ?*GraphCache = null` on `NativeGenerationPipeline`
-- Opt-in via `TERMITE_GRAPH_MODE=1` env var in `native_generate.zig` and `server.zig`
+- Opt-in via `ANTFLY_INFERENCE_GRAPH_MODE=1` env var in `native_generate.zig` and `server.zig`
 - MoE models supported: tracer returns dummy routing so the grouped MoE path is traced; interpreter resolves routing dynamically at execution time via the real backend
 - `TracingCompute.extractGraph()` transfers graph ownership cleanly to cache
 - Verified bit-exact parity: eager vs graph mode on Gemma-3-270M (identical token IDs)
@@ -282,7 +282,7 @@ lib/ml/                         -- Reusable ML library (backend-agnostic)
         memory.zig              -- Liveness analysis, buffer reuse
         fuse.zig                -- Cross-op fusion patterns
 
-src/graph/                      -- Termite-specific bridge (imports lib/ml)
+src/graph/                      -- Antfly inference-specific bridge (imports lib/ml)
   root.zig                      -- Bridge module root
   tracing_compute.zig           -- ComputeBackend VTable impl that builds graph
   interpreter.zig               -- Execute graph via real ComputeBackend

@@ -16,7 +16,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const antfly = @import("../root.zig");
 const group_ids = @import("../common/group_ids.zig");
-const termite = @import("termite_server");
+const inference = @import("inference_server");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 const fs_paths = @import("../common/fs_paths.zig");
@@ -45,12 +45,12 @@ const CliConfig = struct {
     tick_ms: ?u64 = null,
     local_node_id: ?u64 = null,
     auth_enabled: ?bool = null,
-    termite_models_dir: ?[]const u8 = null,
-    termite_host_budget_mb: usize = 0,
-    termite_backend_budget_mb: usize = 0,
-    termite_combined_budget_mb: usize = 0,
-    termite_kv_budget_mb: usize = 0,
-    termite_scratch_budget_mb: usize = 0,
+    inference_models_dir: ?[]const u8 = null,
+    antfly_host_budget_mb: usize = 0,
+    antfly_backend_budget_mb: usize = 0,
+    antfly_combined_budget_mb: usize = 0,
+    antfly_kv_budget_mb: usize = 0,
+    antfly_scratch_budget_mb: usize = 0,
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
@@ -587,20 +587,20 @@ pub fn runFromIterator(
     var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer node_backend_runtime.deinit();
 
-    // Swarm always owns a local Termite node. Antfly-managed embeddings use it
-    // directly, and the public Termite routes are registered on the unified
+    // Swarm always owns a local Antfly node. Antfly-managed embeddings use it
+    // directly, and the public Antfly routes are registered on the unified
     // server for compatibility with external clients.
-    var termite_node_cfg = termite.server.NodeConfig{
-        .models_dir = resolveTermiteModelsDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
-            antfly.termite_runtime.defaultModelsDir(alloc),
-        .generation_budget_overrides = resolveTermiteBudgetOverrides(cli),
+    var antfly_node_cfg = inference.server.NodeConfig{
+        .models_dir = resolveAntflyModelsDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
+            antfly.inference_runtime.defaultModelsDir(alloc),
+        .generation_budget_overrides = resolveAntflyBudgetOverrides(cli),
     };
     if (loaded_config) |*cfg| {
-        if (cfg.effectiveTermiteContentSecurity()) |security| termite_node_cfg.content_security = security.*;
-        if (cfg.termite.s3_credentials) |creds| termite_node_cfg.s3_credentials = creds;
+        if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
+        if (cfg.antfly.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
     }
-    var termite_node = try termite.server.Node.init(alloc, termite_node_cfg);
-    defer termite_node.deinit();
+    var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
+    defer antfly_node.deinit();
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -686,7 +686,7 @@ pub fn runFromIterator(
     }, local_metadata.catalogSource(), local_metadata.statusSource());
     defer data_server.deinit();
 
-    data_server.setLocalTermiteProvider(localTermiteProvider(&termite_node));
+    data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.
     data_server.initApiServer();
@@ -717,7 +717,7 @@ pub fn runFromIterator(
         bind_host,
         bind_port,
         &handler,
-        &termite_node,
+        &antfly_node,
         api_server,
     }) catch |err| {
         std.log.err("swarm startup failed step=spawn_unified_http err={}", .{err});
@@ -766,33 +766,33 @@ pub fn runFromIterator(
     }
 }
 
-fn localTermiteProvider(node: *termite.server.Node) antfly.inference.managed_embedder.LocalTermiteProvider {
+fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_embedder.AntflyProvider {
     return .{
         .ptr = node,
-        .embed_dense_texts = localTermiteEmbedDenseTexts,
-        .embed_sparse_texts = localTermiteEmbedSparseTexts,
-        .rerank_texts = localTermiteRerankTexts,
-        .generate_text = localTermiteGenerateText,
+        .embed_dense_texts = localAntflyEmbedDenseTexts,
+        .embed_sparse_texts = localAntflyEmbedSparseTexts,
+        .rerank_texts = localAntflyRerankTexts,
+        .generate_text = localAntflyGenerateText,
     };
 }
 
-fn localTermiteEmbedDenseTexts(
+fn localAntflyEmbedDenseTexts(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
     model: []const u8,
     texts: []const []const u8,
 ) anyerror![][]f32 {
-    const node: *termite.server.Node = @ptrCast(@alignCast(ptr));
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     return try node.embedDenseTextsDirect(alloc, model, texts);
 }
 
-fn localTermiteEmbedSparseTexts(
+fn localAntflyEmbedSparseTexts(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
     model: []const u8,
     texts: []const []const u8,
 ) anyerror![]antfly.db.embedder.SparseEmbedding {
-    const node: *termite.server.Node = @ptrCast(@alignCast(ptr));
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     const sparse = try node.embedSparseTextsDirect(alloc, model, texts);
     errdefer {
         for (sparse) |*item| item.deinit(alloc);
@@ -810,25 +810,25 @@ fn localTermiteEmbedSparseTexts(
     return out;
 }
 
-fn localTermiteRerankTexts(
+fn localAntflyRerankTexts(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
     model: []const u8,
     query: []const u8,
     documents: []const []const u8,
 ) anyerror![]f32 {
-    const node: *termite.server.Node = @ptrCast(@alignCast(ptr));
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     return try node.rerankTextsDirect(alloc, model, query, documents);
 }
 
-fn localTermiteGenerateText(
+fn localAntflyGenerateText(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
     model: []const u8,
     roles: []const []const u8,
     contents: []const []const u8,
 ) anyerror![]u8 {
-    const node: *termite.server.Node = @ptrCast(@alignCast(ptr));
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     return try node.generateTextDirect(alloc, model, roles, contents);
 }
 
@@ -841,10 +841,10 @@ fn serveUnified(
     bind_host: []const u8,
     bind_port: u16,
     handler: *AntflyApiHandler,
-    termite_node: ?*termite.server.Node,
+    antfly_node: ?*inference.server.Node,
     api_server: *antfly.public_api.http_server.ApiHttpServer,
 ) void {
-    serveUnifiedInner(alloc, bind_host, bind_port, handler, termite_node, api_server) catch |err| {
+    serveUnifiedInner(alloc, bind_host, bind_port, handler, antfly_node, api_server) catch |err| {
         std.debug.print("unified server error: {}\n", .{err});
     };
 }
@@ -854,7 +854,7 @@ fn serveUnifiedInner(
     bind_host: []const u8,
     bind_port: u16,
     handler: *AntflyApiHandler,
-    termite_node: ?*termite.server.Node,
+    antfly_node: ?*inference.server.Node,
     api_server: *antfly.public_api.http_server.ApiHttpServer,
 ) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -868,9 +868,9 @@ fn serveUnifiedInner(
     });
     defer server.deinit();
 
-    // Register termite routes under /ml/v1
-    if (termite_node) |node| {
-        try node.registerRoutesOn(termite.server.public_api_prefix, &server);
+    // Register antfly routes under /ml/v1
+    if (antfly_node) |node| {
+        try node.registerRoutesOn(inference.server.public_api_prefix, &server);
     }
 
     // Register antfly public API routes under /api/v1
@@ -1053,7 +1053,7 @@ fn isAntfarmReservedPath(path: []const u8) bool {
     const reserved = [_][]const u8{
         "/api",
         "/ml",
-        "/termite",
+        "/antfly",
         "/metadata",
         "/internal",
         "/mcp",
@@ -1290,27 +1290,27 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             continue;
         }
         if (std.mem.eql(u8, arg, "--models-dir")) {
-            cfg.termite_models_dir = args.next() orelse return error.InvalidArguments;
+            cfg.inference_models_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--termite-host-budget-mb")) {
-            cfg.termite_host_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--antfly-host-budget-mb")) {
+            cfg.antfly_host_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--termite-backend-budget-mb")) {
-            cfg.termite_backend_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--antfly-backend-budget-mb")) {
+            cfg.antfly_backend_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--termite-combined-budget-mb")) {
-            cfg.termite_combined_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--antfly-combined-budget-mb")) {
+            cfg.antfly_combined_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--termite-kv-budget-mb")) {
-            cfg.termite_kv_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--antfly-kv-budget-mb")) {
+            cfg.antfly_kv_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--termite-scratch-budget-mb")) {
-            cfg.termite_scratch_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--antfly-scratch-budget-mb")) {
+            cfg.antfly_scratch_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -1504,19 +1504,19 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
     return false;
 }
 
-fn resolveTermiteModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
-    if (cli.termite_models_dir) |value| return value;
-    if (cfg) |loaded| return loaded.termite.models_dir;
+fn resolveAntflyModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
+    if (cli.inference_models_dir) |value| return value;
+    if (cfg) |loaded| return loaded.antfly.models_dir;
     return null;
 }
 
-fn resolveTermiteBudgetOverrides(cli: CliConfig) antfly.termite_runtime.ServerBudgetOverrides {
+fn resolveAntflyBudgetOverrides(cli: CliConfig) antfly.inference_runtime.ServerBudgetOverrides {
     return .{
-        .host_limit_bytes = mbToBytes(cli.termite_host_budget_mb),
-        .backend_limit_bytes = mbToBytes(cli.termite_backend_budget_mb),
-        .combined_limit_bytes = mbToBytes(cli.termite_combined_budget_mb),
-        .kv_limit_bytes = mbToBytes(cli.termite_kv_budget_mb),
-        .scratch_limit_bytes = mbToBytes(cli.termite_scratch_budget_mb),
+        .host_limit_bytes = mbToBytes(cli.antfly_host_budget_mb),
+        .backend_limit_bytes = mbToBytes(cli.antfly_backend_budget_mb),
+        .combined_limit_bytes = mbToBytes(cli.antfly_combined_budget_mb),
+        .kv_limit_bytes = mbToBytes(cli.antfly_kv_budget_mb),
+        .scratch_limit_bytes = mbToBytes(cli.antfly_scratch_budget_mb),
     };
 }
 
@@ -1536,12 +1536,12 @@ fn printUsage() void {
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
         \\  --tick-ms <ms>                        Sleep interval while serving (default: 25)
-        \\  --models-dir <path>                   Embedded termite models directory (default: ~/.termite/models)
-        \\  --termite-host-budget-mb <n>          Embedded termite native generation host budget override
-        \\  --termite-backend-budget-mb <n>       Embedded termite native generation backend budget override
-        \\  --termite-combined-budget-mb <n>      Embedded termite native generation combined budget override
-        \\  --termite-kv-budget-mb <n>            Embedded termite native generation KV cache budget override
-        \\  --termite-scratch-budget-mb <n>       Embedded termite native generation scratch budget override
+        \\  --models-dir <path>                   Embedded antfly models directory (default: ~/.antfly/models)
+        \\  --antfly-host-budget-mb <n>          Embedded antfly native generation host budget override
+        \\  --antfly-backend-budget-mb <n>       Embedded antfly native generation backend budget override
+        \\  --antfly-combined-budget-mb <n>      Embedded antfly native generation combined budget override
+        \\  --antfly-kv-budget-mb <n>            Embedded antfly native generation KV cache budget override
+        \\  --antfly-scratch-budget-mb <n>       Embedded antfly native generation scratch budget override
         \\  --data-dir <path>                     Local storage root for swarm data
         \\  --replica-root-dir <path>             Replica root directory
         \\  --replica-catalog-path <path>         Replica catalog file path
@@ -1694,7 +1694,7 @@ test "swarm runtime registers antfarm static routes" {
 test "swarm runtime antfarm path guards keep api routes reserved" {
     try std.testing.expect(isAntfarmReservedPath("/api/v1/tables"));
     try std.testing.expect(isAntfarmReservedPath("/ml/v1/models"));
-    try std.testing.expect(isAntfarmReservedPath("/termite/readyz"));
+    try std.testing.expect(isAntfarmReservedPath("/antfly/readyz"));
     try std.testing.expect(!isAntfarmReservedPath("/models"));
     try std.testing.expect(hasUnsafeStaticPath("../index.html"));
     try std.testing.expect(hasUnsafeStaticPath("%2e%2e/index.html"));
@@ -1730,7 +1730,7 @@ test "parse cli accepts canonical host port and models dir flags" {
     const cfg = try parseCli(&iter);
     try std.testing.expectEqualStrings("127.0.0.1", cfg.bind_host.?);
     try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
-    try std.testing.expectEqualStrings("/tmp/models", cfg.termite_models_dir.?);
+    try std.testing.expectEqualStrings("/tmp/models", cfg.inference_models_dir.?);
     try std.testing.expectEqualStrings("/tmp/antfly-data", cfg.data_dir.?);
 }
 
@@ -1740,13 +1740,13 @@ test "swarm runtime defaults public listener to antfarm port" {
     try std.testing.expectEqual(@as(u16, default_public_port), listener.bind_port);
 }
 
-test "termite config uses cli override before common config" {
+test "antfly config uses cli override before common config" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
         .speech_to_text = antfly.transcribing.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
-        .termite = .{
+        .antfly = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:9000"),
             .models_dir = try alloc.dupe(u8, "/tmp/from-config"),
         },
@@ -1754,11 +1754,11 @@ test "termite config uses cli override before common config" {
     defer cfg.deinit();
 
     const cli = CliConfig{
-        .termite_models_dir = "/tmp/from-cli",
-        .termite_backend_budget_mb = 8192,
+        .inference_models_dir = "/tmp/from-cli",
+        .antfly_backend_budget_mb = 8192,
     };
-    try std.testing.expectEqualStrings("/tmp/from-cli", resolveTermiteModelsDir(cli, &cfg).?);
-    try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), resolveTermiteBudgetOverrides(cli).backend_limit_bytes);
+    try std.testing.expectEqualStrings("/tmp/from-cli", resolveAntflyModelsDir(cli, &cfg).?);
+    try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), resolveAntflyBudgetOverrides(cli).backend_limit_bytes);
 }
 
 test "swarm public api caps keep alive request reuse" {
@@ -1766,42 +1766,42 @@ test "swarm public api caps keep alive request reuse" {
     try std.testing.expect(public_api_max_requests_per_connection < 1000);
 }
 
-test "parse cli accepts termite budget overrides" {
+test "parse cli accepts antfly budget overrides" {
     var argv = [_][*:0]const u8{
-        "--termite-host-budget-mb",
+        "--antfly-host-budget-mb",
         "4096",
-        "--termite-backend-budget-mb",
+        "--antfly-backend-budget-mb",
         "12288",
-        "--termite-combined-budget-mb",
+        "--antfly-combined-budget-mb",
         "16384",
-        "--termite-kv-budget-mb",
+        "--antfly-kv-budget-mb",
         "2048",
-        "--termite-scratch-budget-mb",
+        "--antfly-scratch-budget-mb",
         "1024",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const cfg = try parseCli(&iter);
-    try std.testing.expectEqual(@as(usize, 4096), cfg.termite_host_budget_mb);
-    try std.testing.expectEqual(@as(usize, 12288), cfg.termite_backend_budget_mb);
-    try std.testing.expectEqual(@as(usize, 16384), cfg.termite_combined_budget_mb);
-    try std.testing.expectEqual(@as(usize, 2048), cfg.termite_kv_budget_mb);
-    try std.testing.expectEqual(@as(usize, 1024), cfg.termite_scratch_budget_mb);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.antfly_host_budget_mb);
+    try std.testing.expectEqual(@as(usize, 12288), cfg.antfly_backend_budget_mb);
+    try std.testing.expectEqual(@as(usize, 16384), cfg.antfly_combined_budget_mb);
+    try std.testing.expectEqual(@as(usize, 2048), cfg.antfly_kv_budget_mb);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.antfly_scratch_budget_mb);
 }
 
-test "termite config falls back to common config" {
+test "antfly config falls back to common config" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
         .speech_to_text = antfly.transcribing.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
-        .termite = .{
+        .antfly = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
-            .models_dir = try alloc.dupe(u8, "/tmp/termite-models"),
+            .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
         },
     };
     defer cfg.deinit();
 
-    try std.testing.expectEqualStrings("/tmp/termite-models", resolveTermiteModelsDir(.{}, &cfg).?);
+    try std.testing.expectEqualStrings("/tmp/antfly-models", resolveAntflyModelsDir(.{}, &cfg).?);
 }
 
 test "swarm runtime resolves paths from common storage base dir" {
@@ -1814,7 +1814,7 @@ test "swarm runtime resolves paths from common storage base dir" {
         .storage = .{
             .local_base_dir = try alloc.dupe(u8, "/tmp/antflydb"),
         },
-        .termite = .{},
+        .antfly = .{},
     };
     defer cfg.deinit();
 
@@ -1856,7 +1856,7 @@ test "swarm runtime data dir overrides common storage base dir" {
         .storage = .{
             .local_base_dir = try alloc.dupe(u8, "/tmp/from-config"),
         },
-        .termite = .{},
+        .antfly = .{},
     };
     defer cfg.deinit();
 

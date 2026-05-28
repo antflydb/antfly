@@ -1,6 +1,6 @@
-# termite-zig Roadmap
+# antfly-inference-zig Roadmap
 
-termite-zig is a Zig reimplementation of the Go Termite ML inference service targeting full API parity with all 10 endpoints, plus native MLX/SafeTensors support for Apple Silicon. The Kubernetes operator and proxy stay in Go — only the inference binary is being rewritten.
+antfly-inference-zig is a Zig reimplementation of the Go Antfly inference ML inference service targeting full API parity with all 10 endpoints, plus native MLX/SafeTensors support for Apple Silicon. The Kubernetes operator and proxy stay in Go — only the inference binary is being rewritten.
 
 ## Architecture
 
@@ -149,10 +149,10 @@ The Go binary continues to work — Zig is a drop-in replacement for the inferen
 
 ## Infrastructure Gaps
 
-- [ ] **Result caching**: `ResultCache` and singleflight primitives exist in `src/cache/` but are not wired into any handler. Go termite has per-endpoint TTL caches with singleflight dedup for: embedding, sparse embedding, chunking, reranking, NER, reading, transcription.
-- [ ] **Dense binary serialization**: Go termite defaults to `application/octet-stream` for `/api/embed` (LE float32 arrays). We always return JSON.
+- [ ] **Result caching**: `ResultCache` and singleflight primitives exist in `src/cache/` but are not wired into any handler. Go antfly inference has per-endpoint TTL caches with singleflight dedup for: embedding, sparse embedding, chunking, reranking, NER, reading, transcription.
+- [ ] **Dense binary serialization**: Go antfly inference defaults to `application/octet-stream` for `/api/embed` (LE float32 arrays). We always return JSON.
 - [ ] **Multimodal generation parity**: native multimodal generation is missing for models like Gemma 3; multimodal success coverage and streaming behavior still lag Go termite.
-- [ ] **HuggingFace Hub download**: `termite pull owner/model:variant` — HTTP client for hub.huggingface.co, token auth, variant selection, progress reporting, resume support. (`src/registry/download.zig`)
+- [ ] **HuggingFace Hub download**: `antfly inference pull owner/model:variant` — HTTP client for hub.huggingface.co, token auth, variant selection, progress reporting, resume support. (`src/registry/download.zig`)
 - [ ] **Session pooling**: pool of N sessions per model for concurrent inference. (`src/backends/session_pool.zig`)
 - [ ] **Prometheus metrics**: request latency histograms, cache hit rates, model load/unload events. `/metrics` endpoint. (`src/server/metrics.zig`)
 - [ ] **Request queue + backpressure**: configurable max queue depth, 503 with Retry-After when full.
@@ -181,7 +181,7 @@ Linux x86_64: ONNX + BLAS
 Linux arm64:  ONNX + BLAS
 ```
 
-**Golden file approach:** Run Go termite on same model + inputs, save output. Zig tests compare against golden files (cosine similarity > 0.99 for embeddings, exact match for classification).
+**Golden file approach:** Run Go antfly inference on same model + inputs, save output. Zig tests compare against golden files (cosine similarity > 0.99 for embeddings, exact match for classification).
 
 ---
 

@@ -551,11 +551,11 @@ test "PJRT package selectors resolve prefill and contiguous decode chain" {
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(base_dir);
 
-    const prefill_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "prefill.termite.json" });
+    const prefill_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "prefill.inference.json" });
     defer allocator.free(prefill_manifest_path);
-    const decode3_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "decode.s3.termite.json" });
+    const decode3_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "decode.s3.inference.json" });
     defer allocator.free(decode3_manifest_path);
-    const decode4_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "decode.s4.termite.json" });
+    const decode4_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "decode.s4.inference.json" });
     defer allocator.free(decode4_manifest_path);
 
     const kv_shape = &[_]i64{ 2, 768 };

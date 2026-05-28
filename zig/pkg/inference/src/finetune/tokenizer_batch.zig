@@ -24,8 +24,8 @@
 //   );
 
 const std = @import("std");
-const hf_tokenizer = @import("termite_hf_tokenizer");
-const tokenizer_mod = @import("termite_tokenizer");
+const hf_tokenizer = @import("inference_hf_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 const compat = @import("../io/compat.zig");
 
 const HfTokenizer = hf_tokenizer.HfTokenizer;

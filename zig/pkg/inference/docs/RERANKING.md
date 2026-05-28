@@ -1,6 +1,6 @@
-# Reranking in termite-zig
+# Reranking in antfly-inference-zig
 
-termite-zig supports three reranking approaches: cross-encoder (BERT/RoBERTa native path), late-interaction text reranking (ColBERT), and multimodal late-interaction reranking (ColQwen).
+antfly-inference-zig supports three reranking approaches: cross-encoder (BERT/RoBERTa native path), late-interaction text reranking (ColBERT), and multimodal late-interaction reranking (ColQwen).
 
 ---
 
@@ -26,16 +26,16 @@ Standard cross-encoder inference: tokenize `[CLS] query [SEP] document [SEP]` pa
 Distributed MLX configuration for the native reranker path:
 
 ```
-TERMITE_MLX_DISTRIBUTED_ENABLE=1
-TERMITE_MLX_DISTRIBUTED_MODE=tensor_parallel
-TERMITE_MLX_DISTRIBUTED_BACKEND=ring
-TERMITE_MLX_WORLD_SIZE=<n>
-TERMITE_MLX_RANK=<rank>
-TERMITE_MLX_LOCAL_RANK=<rank>
+ANTFLY_INFERENCE_MLX_DISTRIBUTED_ENABLE=1
+ANTFLY_INFERENCE_MLX_DISTRIBUTED_MODE=tensor_parallel
+ANTFLY_INFERENCE_MLX_DISTRIBUTED_BACKEND=ring
+ANTFLY_INFERENCE_MLX_WORLD_SIZE=<n>
+ANTFLY_INFERENCE_MLX_RANK=<rank>
+ANTFLY_INFERENCE_MLX_LOCAL_RANK=<rank>
 MLX_WORLD_SIZE=<n>
 MLX_RANK=<rank>
 MLX_HOSTFILE=<path>
-TERMITE_MLX_ALLOW_CPU_STREAM_WITHOUT_METAL=1
+ANTFLY_INFERENCE_MLX_ALLOW_CPU_STREAM_WITHOUT_METAL=1
 ```
 
 The current verified local setup is 2-rank ring mode on one host.
@@ -62,8 +62,8 @@ Run a one-shot probe:
 ```bash
 ./zig-out/bin/probe-cross-encoder-rerank \
   /Users/tim/.cache/bge-reranker-base \
-  "what is termite zig" \
-  "termite is a zig inference server with native model runtimes" \
+  "what is antfly inference zig" \
+  "antfly inference is a zig inference server with native model runtimes" \
   --tokenizer-dir /Users/tim/.cache/bge-reranker-base \
   --backend blas
 ```
@@ -79,7 +79,7 @@ That script builds the standalone probe, runs a BLAS baseline, runs a 2-rank MLX
 ### Benchmarking
 
 ```bash
-TERMITE_RERANK_BENCH_REPEAT=8 \
+ANTFLY_INFERENCE_RERANK_BENCH_REPEAT=8 \
 bash ./scripts/benchmark_cross_encoder_rerank.sh
 ```
 
@@ -88,12 +88,12 @@ Runs repeated reranks in-process on one loaded model session for BLAS and 2-rank
 Server-lifecycle benchmark:
 
 ```bash
-TERMITE_BIN=/Users/tim/Documents/af/termite-zig/zig-out/bin/termite \
-TERMITE_RERANK_SERVER_BENCH_REPEAT=4 \
+ANTFLY_INFERENCE_BIN=/Users/tim/Documents/af/antfly-inference-zig/zig-out/bin/termite \
+ANTFLY_INFERENCE_RERANK_SERVER_BENCH_REPEAT=4 \
 bash ./scripts/benchmark_cross_encoder_rerank_server.sh
 ```
 
-Knobs: `TERMITE_RERANK_SERVER_BENCH_REPEAT`, `TERMITE_RERANK_SERVER_REQUEST_TIMEOUT_SECS`, `TERMITE_RERANK_SERVER_STARTUP_SETTLE_MS`
+Knobs: `ANTFLY_INFERENCE_RERANK_SERVER_BENCH_REPEAT`, `ANTFLY_INFERENCE_RERANK_SERVER_REQUEST_TIMEOUT_SECS`, `ANTFLY_INFERENCE_RERANK_SERVER_STARTUP_SETTLE_MS`
 
 ### Performance Results
 
@@ -169,12 +169,12 @@ This makes the reranker compatible with both BERT-style ColBERT checkpoints and 
 The same distributed MLX env contract as the cross-encoder path applies to text late-interaction rerankers:
 
 ```
-TERMITE_MLX_DISTRIBUTED_ENABLE=1
-TERMITE_MLX_DISTRIBUTED_MODE=data_parallel   # or tensor_parallel
-TERMITE_MLX_DISTRIBUTED_BACKEND=ring
-TERMITE_MLX_WORLD_SIZE=<n>
-TERMITE_MLX_RANK=<rank>
-TERMITE_MLX_LOCAL_RANK=<rank>
+ANTFLY_INFERENCE_MLX_DISTRIBUTED_ENABLE=1
+ANTFLY_INFERENCE_MLX_DISTRIBUTED_MODE=data_parallel   # or tensor_parallel
+ANTFLY_INFERENCE_MLX_DISTRIBUTED_BACKEND=ring
+ANTFLY_INFERENCE_MLX_WORLD_SIZE=<n>
+ANTFLY_INFERENCE_MLX_RANK=<rank>
+ANTFLY_INFERENCE_MLX_LOCAL_RANK=<rank>
 ```
 
 The distributed MLX config is plumbed into the native reranker pipeline configuration used by `LoadedModel.rerankingPipeline()`.
@@ -204,14 +204,14 @@ Each document carries `content` in the same format used for generation and embed
 - Image-bearing requests are parsed, validated, resized, normalized, and grid-prepared natively in Zig.
 - Models that do not advertise `colqwen` or `multimodal_late_interaction` are rejected for image-bearing requests.
 - Image-bearing requests execute end to end when the model has a native GPT/Qwen text session plus either a `visual_model` export or native Qwen2-VL vision config.
-  - If a `visual_model` export is present, Termite uses it.
+  - If a `visual_model` export is present, Antfly inference uses it.
   - Otherwise it falls back to the native Qwen2-VL-style vision tower path.
 - Visual-session input contract: `pixel_values` and, when requested by the export, `image_grid_thw`
 - Visual-session output contract: `[1, tokens, hidden]` or `[tokens, hidden]`; `tokens` must match the prepared image token count.
 
-The text side runs through Termite's native GPT/Qwen compute backend and late-interaction scorer. The image side uses either the `visual_model` export or the native Qwen2-VL-style vision/projection fallback.
+The text side runs through Antfly inference's native GPT/Qwen compute backend and late-interaction scorer. The image side uses either the `visual_model` export or the native Qwen2-VL-style vision/projection fallback.
 
-Termite has a distributed-aware multimodal ColQwen wrapper:
+Antfly inference has a distributed-aware multimodal ColQwen wrapper:
 - The probe reports `runtime.distributed.Config`, `uses_distributed_mlx`, and `uses_tensor_parallel_mlx`
 - The served `/rerank_multimodal` path runs through the same wrapper (not free functions)
 
@@ -228,10 +228,10 @@ Defaults:
 
 Override with:
 ```
-TERMITE_COLQWEN_MODEL_DIR=<path>
-TERMITE_COLQWEN_TOKENIZER_DIR=<path>
-TERMITE_COLQWEN_IMAGE_PATH=<path>
-TERMITE_COLQWEN_QUERY=<string>
+ANTFLY_INFERENCE_COLQWEN_MODEL_DIR=<path>
+ANTFLY_INFERENCE_COLQWEN_TOKENIZER_DIR=<path>
+ANTFLY_INFERENCE_COLQWEN_IMAGE_PATH=<path>
+ANTFLY_INFERENCE_COLQWEN_QUERY=<string>
 ```
 
 The verification script rebuilds `probe-colqwen2-rerank`, runs the full native MLX ColQwen2 path, and asserts that the probe reaches `document_encode` and emits a final `score=...` line.

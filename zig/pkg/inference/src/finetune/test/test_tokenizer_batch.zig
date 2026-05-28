@@ -13,5 +13,5 @@
 // limitations under the License.
 
 test {
-    _ = @import("termite_finetune_tokenizer_batch").tokenizer_batch;
+    _ = @import("inference_finetune_tokenizer_batch").tokenizer_batch;
 }

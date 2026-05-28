@@ -43,32 +43,32 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const termite = @import("termite_internal");
+const inference = @import("inference_internal");
 const ml = @import("ml");
-const native_compute = termite.native_compute.native;
-const metal_compute = if (build_options.enable_metal) termite.native_compute.metal else struct {};
-const gpu_hosted_store = termite.native_compute.gpu_hosted_store;
-const metal_runtime = termite.metal_runtime;
-const compat = termite.io.compat;
-const weight_source_mod = termite.models.weight_source;
+const native_compute = inference.native_compute.native;
+const metal_compute = if (build_options.enable_metal) inference.native_compute.metal else struct {};
+const gpu_hosted_store = inference.native_compute.gpu_hosted_store;
+const metal_runtime = inference.metal_runtime;
+const compat = inference.io.compat;
+const weight_source_mod = inference.models.weight_source;
 const SafetensorsSource = weight_source_mod.SafetensorsSource;
 const LoadedWeight = weight_source_mod.LoadedWeight;
-const Tensor = termite.backends.Tensor;
+const Tensor = inference.backends.Tensor;
 const MetalWeightStore = if (build_options.enable_metal) gpu_hosted_store.WeightStore else void;
 
 // MLX backend (Apple Silicon GPU acceleration).
-const mlx_mod = termite.backends.mlx;
+const mlx_mod = inference.backends.mlx;
 const mlx = if (build_options.enable_mlx) mlx_mod else struct {};
-const mlx_compute = if (build_options.enable_mlx) termite.native_compute.mlx else struct {};
+const mlx_compute = if (build_options.enable_mlx) inference.native_compute.mlx else struct {};
 const mlx_c = if (build_options.enable_mlx) mlx_mod.c else struct {};
 
 // Finetune module imports — accessed via the termite internal module tree.
-const gliner2_data = termite.finetune.gliner2_data;
-const gliner2_bundle = termite.finetune.gliner2;
-const gliner2_autodiff = termite.finetune.gliner2_real_autodiff;
-const real_autodiff = termite.finetune.real_autodiff_trainer;
-const run_validation = termite.finetune.gliner2_run_validation;
-const deberta_graph = termite.architectures.deberta_graph;
+const gliner2_data = inference.finetune.gliner2_data;
+const gliner2_bundle = inference.finetune.gliner2;
+const gliner2_autodiff = inference.finetune.gliner2_real_autodiff;
+const real_autodiff = inference.finetune.real_autodiff_trainer;
+const run_validation = inference.finetune.gliner2_run_validation;
+const deberta_graph = inference.architectures.deberta_graph;
 
 const print = std.debug.print;
 

@@ -15,7 +15,7 @@
 // WASM ComputeBackend: SIMD-accelerated CPU inference for browser environments.
 //
 // Uses activations.zig (@Vector → WASM SIMD) for norms/activations and
-// termite_linalg for pure Zig matmul kernels. Optionally
+// inference_linalg for pure Zig matmul kernels. Optionally
 // delegates heavy ops to WebGPU via JS extern imports.
 
 const std = @import("std");
@@ -25,7 +25,7 @@ const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const activations = @import("../backends/activations.zig");
 const tensor_mod = @import("../backends/tensor.zig");
-const linalg = @import("termite_linalg");
+const linalg = @import("inference_linalg");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const tensor_types = @import("../gguf/tensor_types.zig");
 const turboquant = @import("../runtime/kv/turboquant.zig");

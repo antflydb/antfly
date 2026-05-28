@@ -21,21 +21,21 @@ const workflow_commands = [_]common.CommandSpec{
         .name = "run-gliner2-boundary-task-head-smoke-workflow",
         .root_source_file = "src/finetune/train/run_gliner2_boundary_task_head_smoke_workflow.zig",
         .description = "Prepare GLiNER2 boundary caches, train/eval the boundary task head, materialize artifacts, and emit one smoke-workflow report",
-        .imports = &.{ .build_options, .jinja, .ml, .termite_internal, .termite_hf_tokenizer },
+        .imports = &.{ .build_options, .jinja, .ml, .inference_internal, .inference_hf_tokenizer },
         .native_link = .default,
     },
     .{
         .name = "run-gliner2-entity-cleanup-smoke-workflow",
         .root_source_file = "src/finetune/train/run_gliner2_entity_cleanup_smoke_workflow.zig",
         .description = "Prepare GLiNER2 cleanup caches, train/eval the cleanup head, materialize artifacts, and emit one smoke-workflow report",
-        .imports = &.{ .build_options, .jinja, .ml, .termite_internal, .termite_hf_tokenizer },
+        .imports = &.{ .build_options, .jinja, .ml, .inference_internal, .inference_hf_tokenizer },
         .native_link = .default,
     },
     .{
         .name = "gliner2-production-readiness",
         .root_source_file = "src/finetune/run_gliner2_production_readiness.zig",
         .description = "Run the GLiNER2 production-readiness gate: dataset checks, training, artifact validation, semantic eval, and optional materialization",
-        .imports = &.{ .build_options, .ml, .termite_internal, .termite_hf_tokenizer, .protobuf, .termite_linalg },
+        .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer, .protobuf, .inference_linalg },
         .native_link = .default,
     },
     .{
@@ -63,7 +63,7 @@ const workflow_commands = [_]common.CommandSpec{
         .name = "run-layoutlmv3-lora-smoke-workflow",
         .root_source_file = "src/finetune/train/run_layoutlmv3_lora_smoke_workflow.zig",
         .description = "Bootstrap, train, inspect, and materialize a bounded LayoutLMv3 LoRA workflow",
-        .imports = &.{ .build_options, .ml, .termite_internal },
+        .imports = &.{ .build_options, .ml, .inference_internal },
         .native_link = .no_accel,
     },
 };

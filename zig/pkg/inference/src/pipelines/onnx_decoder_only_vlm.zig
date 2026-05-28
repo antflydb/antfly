@@ -21,8 +21,8 @@ const manifest_mod = @import("../models/manifest.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const generation = @import("generation.zig");
 const gemma3_mm = @import("gemma3_multimodal.zig");
-const hf_tokenizer = @import("termite_hf_tokenizer");
-const tokenizer_mod = @import("termite_tokenizer");
+const hf_tokenizer = @import("inference_hf_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 const activations = @import("../backends/activations.zig");
 const onnx_kv_cache = @import("../graph/onnx_kv_cache.zig");
 

@@ -1,7 +1,7 @@
 # Image Support
 
 This file defines the shared image-codec design for `antfly-zig` and
-`termite-zig`.
+`antfly-inference-zig`.
 
 Use it to answer:
 
@@ -14,9 +14,9 @@ Sibling repo references:
 - [`lib/image/src/mod.zig`](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/lib/image/src/mod.zig)
 - [`lib/pdf/src/reader.zig`](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/lib/pdf/src/reader.zig)
 - [`build.zig`](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/build.zig)
-- [`../termite-zig/src/pipelines/image.zig`](/Users/ajroetker/go/src/github.com/antflydb/termite-zig/src/pipelines/image.zig)
-- [`../termite-zig/lib/chunker/src/fixed_multimodal.zig`](/Users/ajroetker/go/src/github.com/antflydb/termite-zig/lib/chunker/src/fixed_multimodal.zig)
-- [`../termite-zig/build.zig`](/Users/ajroetker/go/src/github.com/antflydb/termite-zig/build.zig)
+- [`../antfly-inference-zig/src/pipelines/image.zig`](/Users/ajroetker/go/src/github.com/antflydb/antfly-inference-zig/src/pipelines/image.zig)
+- [`../antfly-inference-zig/lib/chunker/src/fixed_multimodal.zig`](/Users/ajroetker/go/src/github.com/antflydb/antfly-inference-zig/lib/chunker/src/fixed_multimodal.zig)
+- [`../antfly-inference-zig/build.zig`](/Users/ajroetker/go/src/github.com/antflydb/antfly-inference-zig/build.zig)
 
 ## Public Surface
 
@@ -32,7 +32,7 @@ That shared layer should own:
 - PDF-oriented image decode helpers
 - resize / normalize / CHW preprocessing
 
-`termite-zig` should consume that shared layer rather than maintaining a
+`antfly-inference-zig` should consume that shared layer rather than maintaining a
 second decode stack.
 
 ## Supported Formats
@@ -45,7 +45,7 @@ The shared image layer currently supports:
   - GIF decode/frame extraction
   - CCITT fax decode
   - image preprocessing
-- `termite-zig` has already been switched onto the shared `antfly_image` path
+- `antfly-inference-zig` has already been switched onto the shared `antfly_image` path
   for image decode and GIF extraction work
 - image-related `stb_image` usage has been removed from the shared image path
 
@@ -120,7 +120,7 @@ Recommended modules:
 - `gif.zig`
   - pure Zig animated GIF decode and frame composition
 - `bmp.zig`
-  - only if we choose to preserve BMP input parity in `termite-zig`
+  - only if we choose to preserve BMP input parity in `antfly-inference-zig`
 - `processing.zig`
   - shared resize / normalize / CHW routines
 - `ccitt.zig`
@@ -155,18 +155,18 @@ repos.
 
 - JPEG decode
   - needed by PDF `DCTDecode`
-  - needed by termite vision pipelines
+  - needed by antfly inference vision pipelines
 - PNG decode
-  - needed by termite vision pipelines
+  - needed by antfly inference vision pipelines
 - GIF decode with animation frames and delays
-  - needed by termite chunking
+  - needed by antfly inference chunking
 - PNG encode
   - already present and needed for GIF frame chunk output
 
 ### Optional but likely needed for parity
 
 - BMP decode
-  - `termite-zig` currently documents and implements `JPEG/PNG/BMP/GIF`
+  - `antfly-inference-zig` currently documents and implements `JPEG/PNG/BMP/GIF`
     acceptance in its native image decode path
 
 ### Not required for the current migration
@@ -185,7 +185,7 @@ rest of the project does not currently depend on them.
 JPEG is the highest-risk codec in this migration.
 
 For the combined project, baseline-only JPEG support is probably not enough.
-PDF test coverage in `antfly-zig` is currently simple, but `termite-zig`
+PDF test coverage in `antfly-zig` is currently simple, but `antfly-inference-zig`
 accepts arbitrary user-supplied images in vision flows. That means the
 practical first release target should be:
 
@@ -205,7 +205,7 @@ Nice-to-have but not first-blocker:
 
 ## GIF Scope
 
-GIF is the second major risk because termite chunking needs animation semantics,
+GIF is the second major risk because antfly inference chunking needs animation semantics,
 not just single-frame decode.
 
 The shared GIF decoder should cover:
@@ -220,7 +220,7 @@ The shared GIF decoder should cover:
   - previous
 - multi-frame composition onto a logical screen
 
-If disposal logic is wrong, termite frame chunking will silently regress even if
+If disposal logic is wrong, antfly inference frame chunking will silently regress even if
 the decoder appears to work on trivial samples.
 
 ## PNG Scope
@@ -249,7 +249,7 @@ it, so the doc and APIs should keep room for later expansion.
 BMP should be treated as a parity decision, not as an automatic requirement.
 
 Decision: BMP is currently dropped from the shared image layer. The shared
-runtime target is JPEG, PNG, and GIF. `termite-zig` should be treated as having
+runtime target is JPEG, PNG, and GIF. `antfly-inference-zig` should be treated as having
 that narrowed native decode contract unless we later decide to reintroduce BMP
 for a concrete product reason.
 
@@ -273,7 +273,7 @@ needs to be narrowed deliberately and documented.
 - switch `lib/pdf` to the new shared JPEG path
 - add a narrow `lib/pdf` `/JPXDecode` renderer path through shared JPEG 2000
   decode
-- keep `stb_image` alive in termite during this phase
+- keep `stb_image` alive in antfly inference during this phase
 - use `stb_image` and `libjpeg-turbo` as temporary decode oracles in tests
 
 Exit criteria:
@@ -363,32 +363,32 @@ JPEG 2000 production-blocker status, April 2026:
   OpenJPEG-style exponent, and detail-subband precinct assignment uses
   subband-local half-resolution precinct dimensions.
 
-### Phase 2: PNG decode and termite static-image migration
+### Phase 2: PNG decode and antfly inference static-image migration
 
 - add pure Zig PNG decode
-- switch `termite-zig/src/pipelines/image.zig` to shared `antfly_image`
+- switch `antfly-inference-zig/src/pipelines/image.zig` to shared `antfly_image`
 - preserve preprocessing behavior and tensor layout
 - decide explicitly whether BMP support is retained or dropped
 
 Exit criteria:
 
-- termite vision preprocessing does not depend on `stb_image`
+- antfly inference vision preprocessing does not depend on `stb_image`
 - JPEG and PNG inputs produce stable normalized tensors vs current oracle
 
-### Phase 3: GIF decode and termite chunker migration
+### Phase 3: GIF decode and antfly inference chunker migration
 
 - add pure Zig animated GIF decode and frame composition
-- switch `termite-zig/lib/chunker/src/fixed_multimodal.zig`
+- switch `antfly-inference-zig/lib/chunker/src/fixed_multimodal.zig`
 - preserve frame count, frame order, frame delays, and per-frame RGBA output
 
 Exit criteria:
 
-- termite chunker tests pass without `stb_image`
+- antfly inference chunker tests pass without `stb_image`
 - animation disposal and delay corpus passes
 
 ### Phase 4: Remove remaining C hooks
 
-- remove `stb_image_impl.c` from `termite-zig/build.zig`
+- remove `stb_image_impl.c` from `antfly-inference-zig/build.zig`
 - drop image-related include-path and `link_libc` requirements that existed only
   for image decode
 - keep any unrelated C/ObjC build hooks separate from this work
@@ -438,7 +438,7 @@ For checked-in fixtures, store expected:
 Keep and expand samples that exercise actual product paths:
 
 - PDF image XObjects in `antfly-zig`
-- termite vision preprocessing inputs
+- antfly inference vision preprocessing inputs
 - termite GIF chunking inputs
 
 ## Recommended Conformance Data
@@ -627,7 +627,7 @@ But the final acceptance rule should be:
 We should not delete `stb_image` until all of these are true:
 
 - `antfly-zig/lib/image` has pure Zig JPEG decode
-- termite static-image preprocessing uses shared pure Zig decode
+- antfly inference static-image preprocessing uses shared pure Zig decode
 - termite GIF chunking uses shared pure Zig GIF decode
 - image-related C build hooks are removed from both repos
 - a checked conformance corpus exists for JPEG, PNG, and GIF
@@ -639,6 +639,6 @@ We should not delete `stb_image` until all of these are true:
 1. Land this plan and treat `antfly-zig/lib/image` as the shared owner.
 2. Add a corpus manifest and initial fixture directories.
 3. Start with pure Zig JPEG decode plus a strong differential harness.
-4. Add PNG decode and migrate termite static image preprocessing.
-5. Add GIF decode and migrate termite chunking.
+4. Add PNG decode and migrate antfly inference static image preprocessing.
+5. Add GIF decode and migrate antfly inference chunking.
 6. Keep BMP out of scope unless the product surface deliberately adds it back.

@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const hf_tokenizer = @import("termite_hf_tokenizer");
+const hf_tokenizer = @import("inference_hf_tokenizer");
 
 const c_file = @import("../util/c_file.zig");
 const backends = @import("../backends/backends.zig");

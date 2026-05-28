@@ -38,17 +38,13 @@ pub const BackendOptions = struct {
     ffmpeg_paths: ?FfmpegPaths = null,
     link_libc: bool = true,
     skip_openapi: bool = false,
-    termite_version: []const u8 = "0.1.0",
-    git_commit: []const u8 = "unknown",
-    build_time: []const u8 = "unknown",
-    go_version: []const u8 = "n/a",
-    allow_downloads: bool = true,
+    inference_version: []const u8 = "0.1.0",
     enable_native_quant_dispatch_stats: bool = false,
 };
 
 pub const Paths = struct {
     /// Path from the active build.zig directory to pkg/inference.
-    termite_root: []const u8,
+    inference_root: []const u8,
     /// Path from the active build.zig directory to the monorepo root.
     shared_lib_root: []const u8,
 };
@@ -72,7 +68,7 @@ pub const SharedModules = struct {
     onnx_graph: ?*std.Build.Module = null,
     pjrt: ?*std.Build.Module = null,
     inference_api: ?*std.Build.Module = null,
-    termite_client: ?*std.Build.Module = null,
+    inference_client: ?*std.Build.Module = null,
 };
 
 pub const Config = struct {
@@ -107,15 +103,15 @@ pub const Graph = struct {
     onnx_graph_mod: *std.Build.Module,
     pjrt_mod: *std.Build.Module,
     inference_api_mod: *std.Build.Module,
-    termite_client_mod: ?*std.Build.Module,
-    termite_tokenizer_mod: *std.Build.Module,
-    termite_hf_tokenizer_mod: *std.Build.Module,
-    termite_linalg_mod: *std.Build.Module,
-    termite_fixed_tokenizer_data_mod: *std.Build.Module,
-    termite_audio_mod: *std.Build.Module,
-    termite_chunker_mod: *std.Build.Module,
-    termite_mod: *std.Build.Module,
-    termite_internal_mod: *std.Build.Module,
+    inference_client_mod: ?*std.Build.Module,
+    inference_tokenizer_mod: *std.Build.Module,
+    inference_hf_tokenizer_mod: *std.Build.Module,
+    inference_linalg_mod: *std.Build.Module,
+    inference_fixed_tokenizer_data_mod: *std.Build.Module,
+    inference_audio_mod: *std.Build.Module,
+    inference_chunker_mod: *std.Build.Module,
+    inference_mod: *std.Build.Module,
+    inference_internal_mod: *std.Build.Module,
 };
 
 pub fn create(config: Config) Graph {
@@ -188,9 +184,9 @@ pub fn create(config: Config) Graph {
     }).module("pjrt");
 
     const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules);
-    const termite_client_mod = shared.termite_client orelse if (!backend.skip_openapi) blk: {
-        const mod = addOrCreateModule(b, config.register_public_modules, "termite_client", .{
-            .root_source_file = b.path(pathJoin(b, paths.termite_root, "../termite-client/src/root.zig")),
+    const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
+        const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
+            .root_source_file = b.path(pathJoin(b, paths.inference_root, "../inference-client/src/root.zig")),
             .target = target,
             .optimize = optimize,
         });
@@ -199,65 +195,65 @@ pub fn create(config: Config) Graph {
         break :blk mod;
     } else null;
 
-    const termite_tokenizer_mod = addOrCreateModule(b, config.register_public_modules, "termite_tokenizer", .{
+    const inference_tokenizer_mod = addOrCreateModule(b, config.register_public_modules, "inference_tokenizer", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/tokenizer/src/tokenizer.zig")),
         .target = target,
         .optimize = optimize,
     });
-    termite_tokenizer_mod.addImport("protobuf", protobuf_mod);
-    termite_tokenizer_mod.addImport("sentencepiece_proto", sentencepiece_proto_mod);
+    inference_tokenizer_mod.addImport("protobuf", protobuf_mod);
+    inference_tokenizer_mod.addImport("sentencepiece_proto", sentencepiece_proto_mod);
 
-    const termite_hf_tokenizer_mod = addOrCreateModule(b, config.register_public_modules, "termite_hf_tokenizer", .{
+    const inference_hf_tokenizer_mod = addOrCreateModule(b, config.register_public_modules, "inference_hf_tokenizer", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/tokenizer/src/hf_root.zig")),
         .target = target,
         .optimize = optimize,
     });
-    termite_hf_tokenizer_mod.addImport("termite_tokenizer", termite_tokenizer_mod);
+    inference_hf_tokenizer_mod.addImport("inference_tokenizer", inference_tokenizer_mod);
 
-    const termite_linalg_mod = addOrCreateModule(b, config.register_public_modules, "termite_linalg", .{
+    const inference_linalg_mod = addOrCreateModule(b, config.register_public_modules, "inference_linalg", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/linalg/src/mod.zig")),
         .target = target,
         .optimize = optimize,
     });
 
-    const termite_fixed_tokenizer_data_mod = addTokenizerDataModule(b, paths, config.register_public_modules);
+    const inference_fixed_tokenizer_data_mod = addTokenizerDataModule(b, paths, config.register_public_modules);
 
-    const termite_audio_mod = addOrCreateModule(b, config.register_public_modules, "termite_audio", .{
+    const inference_audio_mod = addOrCreateModule(b, config.register_public_modules, "inference_audio", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/audio/src/mod.zig")),
         .target = target,
         .optimize = optimize,
     });
-    termite_audio_mod.addImport("build_options", build_options_mod);
+    inference_audio_mod.addImport("build_options", build_options_mod);
     if (backend.ffmpeg_paths) |ffmpeg_paths| {
-        termite_audio_mod.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
+        inference_audio_mod.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
     }
 
-    const termite_chunker_mod = addOrCreateModule(b, config.register_public_modules, "termite_chunker", .{
+    const inference_chunker_mod = addOrCreateModule(b, config.register_public_modules, "inference_chunker", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/chunker/src/mod.zig")),
         .target = target,
         .optimize = optimize,
     });
-    termite_chunker_mod.addImport("termite_audio", termite_audio_mod);
-    termite_chunker_mod.addImport("termite_hf_tokenizer", termite_hf_tokenizer_mod);
-    termite_chunker_mod.addImport("termite_fixed_tokenizer_data", termite_fixed_tokenizer_data_mod);
-    termite_chunker_mod.addImport("antfly_image", image_mod);
+    inference_chunker_mod.addImport("inference_audio", inference_audio_mod);
+    inference_chunker_mod.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    inference_chunker_mod.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
+    inference_chunker_mod.addImport("antfly_image", image_mod);
 
-    const termite_mod = b.createModule(.{
-        .root_source_file = b.path(pathJoin(b, paths.termite_root, "src/termite.zig")),
+    const inference_mod = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/inference.zig")),
         .target = target,
         .optimize = optimize,
     });
-    addTermiteRootImports(termite_mod, .{
+    addInferenceRootImports(inference_mod, .{
         .build_options_mod = build_options_mod,
         .httpx_mod = httpx_mod,
         .inference_api_mod = inference_api_mod,
-        .termite_audio_mod = termite_audio_mod,
-        .termite_chunker_mod = termite_chunker_mod,
+        .inference_audio_mod = inference_audio_mod,
+        .inference_chunker_mod = inference_chunker_mod,
         .jinja_mod = jinja_mod,
-        .termite_tokenizer_mod = termite_tokenizer_mod,
-        .termite_hf_tokenizer_mod = termite_hf_tokenizer_mod,
-        .termite_linalg_mod = termite_linalg_mod,
-        .termite_fixed_tokenizer_data_mod = termite_fixed_tokenizer_data_mod,
+        .inference_tokenizer_mod = inference_tokenizer_mod,
+        .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
+        .inference_linalg_mod = inference_linalg_mod,
+        .inference_fixed_tokenizer_data_mod = inference_fixed_tokenizer_data_mod,
         .jsonschema_mod = jsonschema_mod,
         .scraping_mod = scraping_mod,
         .image_mod = image_mod,
@@ -268,31 +264,31 @@ pub fn create(config: Config) Graph {
         .pjrt_mod = pjrt_mod,
         .platform_mod = platform_mod,
         .protobuf_mod = protobuf_mod,
-        .termite_client_mod = termite_client_mod,
+        .inference_client_mod = inference_client_mod,
     });
-    configureRuntimeLinks(b, termite_mod, target, backend, paths);
-    termite_mod.link_libc = backend.link_libc;
+    configureRuntimeLinks(b, inference_mod, target, backend, paths);
+    inference_mod.link_libc = backend.link_libc;
 
-    const termite_internal_mod = b.createModule(.{
-        .root_source_file = b.path(pathJoin(b, paths.termite_root, "src/termite_internal.zig")),
+    const inference_internal_mod = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/inference_internal.zig")),
         .target = target,
         .optimize = optimize,
     });
-    termite_internal_mod.addImport("build_options", build_options_mod);
-    termite_internal_mod.addImport("jinja", jinja_mod);
-    termite_internal_mod.addImport("termite_tokenizer", termite_tokenizer_mod);
-    termite_internal_mod.addImport("termite_hf_tokenizer", termite_hf_tokenizer_mod);
-    termite_internal_mod.addImport("termite_fixed_tokenizer_data", termite_fixed_tokenizer_data_mod);
-    termite_internal_mod.addImport("antfly_image", image_mod);
-    termite_internal_mod.addImport("termite_audio", termite_audio_mod);
-    termite_internal_mod.addImport("ml", ml_mod);
-    termite_internal_mod.addImport("pjrt", pjrt_mod);
-    termite_internal_mod.addImport("termite_linalg", termite_linalg_mod);
-    termite_internal_mod.addImport("protobuf", protobuf_mod);
-    termite_internal_mod.addImport("antfly_platform", platform_mod);
-    termite_internal_mod.addImport("onnx_graph", onnx_graph_mod);
+    inference_internal_mod.addImport("build_options", build_options_mod);
+    inference_internal_mod.addImport("jinja", jinja_mod);
+    inference_internal_mod.addImport("inference_tokenizer", inference_tokenizer_mod);
+    inference_internal_mod.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    inference_internal_mod.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
+    inference_internal_mod.addImport("antfly_image", image_mod);
+    inference_internal_mod.addImport("inference_audio", inference_audio_mod);
+    inference_internal_mod.addImport("ml", ml_mod);
+    inference_internal_mod.addImport("pjrt", pjrt_mod);
+    inference_internal_mod.addImport("inference_linalg", inference_linalg_mod);
+    inference_internal_mod.addImport("protobuf", protobuf_mod);
+    inference_internal_mod.addImport("antfly_platform", platform_mod);
+    inference_internal_mod.addImport("onnx_graph", onnx_graph_mod);
 
-    termite_mod.addImport("termite_internal", termite_mod);
+    inference_mod.addImport("inference_internal", inference_mod);
 
     return .{
         .build_options = build_options,
@@ -316,28 +312,28 @@ pub fn create(config: Config) Graph {
         .onnx_graph_mod = onnx_graph_mod,
         .pjrt_mod = pjrt_mod,
         .inference_api_mod = inference_api_mod,
-        .termite_client_mod = termite_client_mod,
-        .termite_tokenizer_mod = termite_tokenizer_mod,
-        .termite_hf_tokenizer_mod = termite_hf_tokenizer_mod,
-        .termite_linalg_mod = termite_linalg_mod,
-        .termite_fixed_tokenizer_data_mod = termite_fixed_tokenizer_data_mod,
-        .termite_audio_mod = termite_audio_mod,
-        .termite_chunker_mod = termite_chunker_mod,
-        .termite_mod = termite_mod,
-        .termite_internal_mod = termite_internal_mod,
+        .inference_client_mod = inference_client_mod,
+        .inference_tokenizer_mod = inference_tokenizer_mod,
+        .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
+        .inference_linalg_mod = inference_linalg_mod,
+        .inference_fixed_tokenizer_data_mod = inference_fixed_tokenizer_data_mod,
+        .inference_audio_mod = inference_audio_mod,
+        .inference_chunker_mod = inference_chunker_mod,
+        .inference_mod = inference_mod,
+        .inference_internal_mod = inference_internal_mod,
     };
 }
 
-pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, termite_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
+pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "termite",
         .root_module = b.createModule(.{
-            .root_source_file = b.path(pathJoin(b, termite_root, "src/main.zig")),
+            .root_source_file = b.path(pathJoin(b, inference_root, "src/main.zig")),
             .target = target,
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport("termite", graph.termite_mod);
+    exe.root_module.addImport("inference", graph.inference_mod);
     exe.root_module.addImport("build_options", graph.build_options_mod);
     exe.root_module.addImport("structlog", graph.structlog_mod);
     exe.root_module.addImport("antfly_platform", graph.platform_mod);
@@ -346,17 +342,17 @@ pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.Re
     return exe;
 }
 
-const TermiteRootImports = struct {
+const InferenceRootImports = struct {
     build_options_mod: *std.Build.Module,
     httpx_mod: *std.Build.Module,
     inference_api_mod: *std.Build.Module,
-    termite_audio_mod: *std.Build.Module,
-    termite_chunker_mod: *std.Build.Module,
+    inference_audio_mod: *std.Build.Module,
+    inference_chunker_mod: *std.Build.Module,
     jinja_mod: *std.Build.Module,
-    termite_tokenizer_mod: *std.Build.Module,
-    termite_hf_tokenizer_mod: *std.Build.Module,
-    termite_linalg_mod: *std.Build.Module,
-    termite_fixed_tokenizer_data_mod: *std.Build.Module,
+    inference_tokenizer_mod: *std.Build.Module,
+    inference_hf_tokenizer_mod: *std.Build.Module,
+    inference_linalg_mod: *std.Build.Module,
+    inference_fixed_tokenizer_data_mod: *std.Build.Module,
     jsonschema_mod: *std.Build.Module,
     scraping_mod: *std.Build.Module,
     image_mod: *std.Build.Module,
@@ -367,20 +363,20 @@ const TermiteRootImports = struct {
     pjrt_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
     protobuf_mod: *std.Build.Module,
-    termite_client_mod: ?*std.Build.Module,
+    inference_client_mod: ?*std.Build.Module,
 };
 
-pub fn addTermiteRootImports(module: *std.Build.Module, imports: TermiteRootImports) void {
+pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRootImports) void {
     module.addImport("build_options", imports.build_options_mod);
     module.addImport("httpx", imports.httpx_mod);
     module.addImport("inference_api", imports.inference_api_mod);
-    module.addImport("termite_audio", imports.termite_audio_mod);
-    module.addImport("termite_chunker", imports.termite_chunker_mod);
+    module.addImport("inference_audio", imports.inference_audio_mod);
+    module.addImport("inference_chunker", imports.inference_chunker_mod);
     module.addImport("jinja", imports.jinja_mod);
-    module.addImport("termite_tokenizer", imports.termite_tokenizer_mod);
-    module.addImport("termite_hf_tokenizer", imports.termite_hf_tokenizer_mod);
-    module.addImport("termite_linalg", imports.termite_linalg_mod);
-    module.addImport("termite_fixed_tokenizer_data", imports.termite_fixed_tokenizer_data_mod);
+    module.addImport("inference_tokenizer", imports.inference_tokenizer_mod);
+    module.addImport("inference_hf_tokenizer", imports.inference_hf_tokenizer_mod);
+    module.addImport("inference_linalg", imports.inference_linalg_mod);
+    module.addImport("inference_fixed_tokenizer_data", imports.inference_fixed_tokenizer_data_mod);
     module.addImport("antfly_jsonschema", imports.jsonschema_mod);
     module.addImport("antfly_scraping", imports.scraping_mod);
     module.addImport("antfly_image", imports.image_mod);
@@ -391,8 +387,8 @@ pub fn addTermiteRootImports(module: *std.Build.Module, imports: TermiteRootImpo
     module.addImport("pjrt", imports.pjrt_mod);
     module.addImport("antfly_platform", imports.platform_mod);
     module.addImport("protobuf", imports.protobuf_mod);
-    if (imports.termite_client_mod) |mod| {
-        module.addImport("termite_client", mod);
+    if (imports.inference_client_mod) |mod| {
+        module.addImport("inference_client", mod);
     }
 }
 
@@ -424,11 +420,7 @@ fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) v
     options.addOption(bool, "link_libc", backend.link_libc);
     options.addOption([]const u8, "wasm_memory_model", backend.wasm_memory_model);
     options.addOption(bool, "skip_openapi", backend.skip_openapi);
-    options.addOption([]const u8, "termite_version", backend.termite_version);
-    options.addOption([]const u8, "git_commit", backend.git_commit);
-    options.addOption([]const u8, "build_time", backend.build_time);
-    options.addOption([]const u8, "go_version", backend.go_version);
-    options.addOption(bool, "allow_downloads", backend.allow_downloads);
+    options.addOption([]const u8, "inference_version", backend.inference_version);
 }
 
 fn addInferenceApiModule(
@@ -465,7 +457,7 @@ fn addInferenceApiModule(
 
     if (spec_path_override == null) {
         const mod = addOrCreateModule(b, register_public_modules, "inference_api", .{
-            .root_source_file = b.path(pathJoin(b, paths.termite_root, "src/api/generated/inference_api/root.zig")),
+            .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/api/generated/inference_api/root.zig")),
             .target = target,
             .optimize = optimize,
         });
@@ -485,7 +477,7 @@ fn addInferenceApiModule(
         "yaml_to_json.py",
     });
     convert.addFileArg(b.path(spec_path_override.?));
-    const json_spec = convert.addOutputFileArg("termite.openapi.json");
+    const json_spec = convert.addOutputFileArg("inference.openapi.json");
     const codegen = b.addRunArtifact(openapi_dep.artifact("openapi-zig"));
     codegen.addArg("--spec");
     codegen.addFileArg(json_spec);
@@ -512,7 +504,7 @@ fn addTokenizerDataModule(b: *std.Build, paths: Paths, register_public_modules: 
         "root.zig",
         "pub const tokenizer_json = @embedFile(\"tokenizer.json\");\n",
     );
-    return addOrCreateModule(b, register_public_modules, "termite_fixed_tokenizer_data", .{
+    return addOrCreateModule(b, register_public_modules, "inference_fixed_tokenizer_data", .{
         .root_source_file = root,
     });
 }
@@ -532,7 +524,7 @@ fn addSentencePieceProtoModule(
     const fixup_tool = b.addExecutable(.{
         .name = "patch_sentencepiece_proto",
         .root_module = b.createModule(.{
-            .root_source_file = b.path(pathJoin(b, paths.termite_root, "tools/patch_sentencepiece_proto.zig")),
+            .root_source_file = b.path(pathJoin(b, paths.inference_root, "tools/patch_sentencepiece_proto.zig")),
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
         }),
@@ -580,7 +572,7 @@ fn createOptionalSharedModule(config: Config, relative_path: []const u8, fallbac
         });
     }
     return config.b.createModule(.{
-        .root_source_file = config.b.path(pathJoin(config.b, config.paths.termite_root, fallback_path)),
+        .root_source_file = config.b.path(pathJoin(config.b, config.paths.inference_root, fallback_path)),
         .target = config.target,
         .optimize = config.optimize,
     });
@@ -657,7 +649,7 @@ pub fn configureMetal(
     module.linkFramework("Metal", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
     module.linkFramework("MetalPerformanceShadersGraph", .{});
-    module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.termite_root, "src/backends/metal_kernels.m")), .flags = &.{"-fobjc-arc"} });
+    module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.inference_root, "src/backends/metal_kernels.m")), .flags = &.{"-fobjc-arc"} });
 }
 
 pub fn configureMlx(

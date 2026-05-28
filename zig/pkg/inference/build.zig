@@ -230,11 +230,7 @@ pub fn build(b: *std.Build) void {
         null
     else
         blas_root_opt;
-    const termite_version = b.option([]const u8, "termite-version", "Version string reported by /api/version and CLI version output") orelse "0.1.0";
-    const git_commit = b.option([]const u8, "git-commit", "Git commit hash reported by /api/version") orelse "unknown";
-    const build_time = b.option([]const u8, "build-time", "Build timestamp reported by /api/version") orelse "unknown";
-    const go_version = b.option([]const u8, "go-version", "Compatibility field for Go termite parity in /api/version") orelse "n/a";
-    const allow_downloads = b.option(bool, "allow-downloads", "Whether /api/version should advertise model downloads as allowed") orelse true;
+    const inference_version = b.option([]const u8, "inference-version", "Version string reported by CLI version output") orelse "0.1.0";
     const enable_native_quant_dispatch_stats = b.option(bool, "enable-native-quant-dispatch-stats", "Enable native quant dispatch counters for benchmark diagnostics") orelse false;
 
     const runtime_graph = runtime_build.create(.{
@@ -242,7 +238,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .paths = .{
-            .termite_root = "",
+            .inference_root = "",
             .shared_lib_root = shared_lib_root,
         },
         .register_public_modules = true,
@@ -263,11 +259,7 @@ pub fn build(b: *std.Build) void {
             .wasm_memory_model = wasm_memory_model,
             .link_libc = link_libc,
             .skip_openapi = skip_openapi,
-            .termite_version = termite_version,
-            .git_commit = git_commit,
-            .build_time = build_time,
-            .go_version = go_version,
-            .allow_downloads = allow_downloads,
+            .inference_version = inference_version,
             .enable_native_quant_dispatch_stats = enable_native_quant_dispatch_stats,
         },
     });
@@ -287,14 +279,14 @@ pub fn build(b: *std.Build) void {
     const prometheus_mod = runtime_graph.prometheus_mod;
     const structlog_mod = runtime_graph.structlog_mod;
     const inference_api_mod = runtime_graph.inference_api_mod;
-    const termite_tokenizer_mod = runtime_graph.termite_tokenizer_mod;
-    const termite_hf_tokenizer_mod = runtime_graph.termite_hf_tokenizer_mod;
-    const termite_linalg_mod = runtime_graph.termite_linalg_mod;
-    const termite_fixed_tokenizer_data_mod = runtime_graph.termite_fixed_tokenizer_data_mod;
-    const termite_audio_mod = runtime_graph.termite_audio_mod;
-    const termite_chunker_mod = runtime_graph.termite_chunker_mod;
-    const client_mod = runtime_graph.termite_client_mod;
-    const termite_internal_mod = runtime_graph.termite_internal_mod;
+    const inference_tokenizer_mod = runtime_graph.inference_tokenizer_mod;
+    const inference_hf_tokenizer_mod = runtime_graph.inference_hf_tokenizer_mod;
+    const inference_linalg_mod = runtime_graph.inference_linalg_mod;
+    const inference_fixed_tokenizer_data_mod = runtime_graph.inference_fixed_tokenizer_data_mod;
+    const inference_audio_mod = runtime_graph.inference_audio_mod;
+    const inference_chunker_mod = runtime_graph.inference_chunker_mod;
+    const client_mod = runtime_graph.inference_client_mod;
+    const inference_internal_mod = runtime_graph.inference_internal_mod;
 
     const exe = runtime_build.addStandaloneExecutable(b, runtime_graph, target, optimize, "", link_libc);
 
@@ -365,7 +357,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     bench_exe.root_module.addImport("build_options", build_options_mod);
-    bench_exe.root_module.addImport("termite_linalg", termite_linalg_mod);
+    bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
     if (enable_system_blas) {
         configureSystemBlas(b, bench_exe.root_module, target, blas_root);
     }
@@ -420,7 +412,7 @@ pub fn build(b: *std.Build) void {
     }
     const training_bench_step = b.step("bench-training", "Run the native training benchmark");
     training_bench_step.dependOn(&run_training_bench.step);
-    linalg_bench_exe.root_module.addImport("termite_linalg", termite_linalg_mod);
+    linalg_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
     const run_linalg_bench = b.addRunArtifact(linalg_bench_exe);
     if (b.args) |args| {
         run_linalg_bench.addArgs(args);
@@ -437,7 +429,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     clipclap_bench_exe.root_module.addImport("build_options", build_options_mod);
-    clipclap_bench_exe.root_module.addImport("termite_linalg", termite_linalg_mod);
+    clipclap_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
     if (enable_system_blas) {
         configureSystemBlas(b, clipclap_bench_exe.root_module, target, blas_root);
     }
@@ -461,13 +453,13 @@ pub fn build(b: *std.Build) void {
     gliner2_bench_exe.root_module.addImport("build_options", build_options_mod);
     gliner2_bench_exe.root_module.addImport("ml", ml_mod);
     gliner2_bench_exe.root_module.addImport("pjrt", pjrt_mod);
-    gliner2_bench_exe.root_module.addImport("termite_linalg", termite_linalg_mod);
-    gliner2_bench_exe.root_module.addImport("termite_hf_tokenizer", termite_hf_tokenizer_mod);
+    gliner2_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    gliner2_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     gliner2_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
-    gliner2_bench_exe.root_module.addImport("termite_audio", termite_audio_mod);
+    gliner2_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     gliner2_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     gliner2_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
-    gliner2_bench_exe.root_module.addImport("termite_internal", termite_internal_mod);
+    gliner2_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     configureNativeTool(b, gliner2_bench_exe, target, enable_system_blas, blas_root, enable_mlx, effective_mlx_root, enable_metal);
     configureOnnxRuntime(b, gliner2_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_gliner2_bench = b.addRunArtifact(gliner2_bench_exe);
@@ -488,13 +480,13 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
     gliner2_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     gliner2_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
-    gliner2_e2e_bench_exe.root_module.addImport("termite_linalg", termite_linalg_mod);
-    gliner2_e2e_bench_exe.root_module.addImport("termite_hf_tokenizer", termite_hf_tokenizer_mod);
+    gliner2_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    gliner2_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     gliner2_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
-    gliner2_e2e_bench_exe.root_module.addImport("termite_audio", termite_audio_mod);
+    gliner2_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     gliner2_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     gliner2_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
-    gliner2_e2e_bench_exe.root_module.addImport("termite_internal", termite_internal_mod);
+    gliner2_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     configureNativeTool(b, gliner2_e2e_bench_exe, target, enable_system_blas, blas_root, enable_mlx, effective_mlx_root, enable_metal);
     configureOnnxRuntime(b, gliner2_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_gliner2_e2e_bench = b.addRunArtifact(gliner2_e2e_bench_exe);
@@ -515,13 +507,13 @@ pub fn build(b: *std.Build) void {
     clipclap_native_bench_exe.root_module.addImport("build_options", build_options_mod);
     clipclap_native_bench_exe.root_module.addImport("ml", ml_mod);
     clipclap_native_bench_exe.root_module.addImport("pjrt", pjrt_mod);
-    clipclap_native_bench_exe.root_module.addImport("termite_linalg", termite_linalg_mod);
-    clipclap_native_bench_exe.root_module.addImport("termite_hf_tokenizer", termite_hf_tokenizer_mod);
+    clipclap_native_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    clipclap_native_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     clipclap_native_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
-    clipclap_native_bench_exe.root_module.addImport("termite_audio", termite_audio_mod);
+    clipclap_native_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     clipclap_native_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_native_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
-    clipclap_native_bench_exe.root_module.addImport("termite_internal", termite_internal_mod);
+    clipclap_native_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     configureNativeTool(b, clipclap_native_bench_exe, target, enable_system_blas, blas_root, enable_mlx, effective_mlx_root, enable_metal);
     configureOnnxRuntime(b, clipclap_native_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_native_bench = b.addRunArtifact(clipclap_native_bench_exe);
@@ -542,13 +534,13 @@ pub fn build(b: *std.Build) void {
     clipclap_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
     clipclap_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     clipclap_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
-    clipclap_e2e_bench_exe.root_module.addImport("termite_linalg", termite_linalg_mod);
-    clipclap_e2e_bench_exe.root_module.addImport("termite_hf_tokenizer", termite_hf_tokenizer_mod);
+    clipclap_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    clipclap_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     clipclap_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
-    clipclap_e2e_bench_exe.root_module.addImport("termite_audio", termite_audio_mod);
+    clipclap_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     clipclap_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
-    clipclap_e2e_bench_exe.root_module.addImport("termite_internal", termite_internal_mod);
+    clipclap_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, enable_mlx, effective_mlx_root, enable_metal);
     configureOnnxRuntime(b, clipclap_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_e2e_bench = b.addRunArtifact(clipclap_e2e_bench_exe);
@@ -567,7 +559,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     audio_bench_exe.root_module.addImport("build_options", build_options_mod);
-    audio_bench_exe.root_module.addImport("termite_audio", termite_audio_mod);
+    audio_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     audio_bench_exe.root_module.link_libc = true;
     const run_audio_bench = b.addRunArtifact(audio_bench_exe);
     if (b.args) |args| {
@@ -585,7 +577,7 @@ pub fn build(b: *std.Build) void {
     } else null;
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/termite.zig"),
+            .root_source_file = b.path("src/inference.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -595,13 +587,13 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("build_options", build_options_mod);
     tests.root_module.addImport("httpx", httpx_mod);
     tests.root_module.addImport("inference_api", inference_api_mod);
-    tests.root_module.addImport("termite_audio", termite_audio_mod);
-    tests.root_module.addImport("termite_chunker", termite_chunker_mod);
+    tests.root_module.addImport("inference_audio", inference_audio_mod);
+    tests.root_module.addImport("inference_chunker", inference_chunker_mod);
     tests.root_module.addImport("jinja", jinja_mod);
-    tests.root_module.addImport("termite_tokenizer", termite_tokenizer_mod);
-    tests.root_module.addImport("termite_hf_tokenizer", termite_hf_tokenizer_mod);
-    tests.root_module.addImport("termite_linalg", termite_linalg_mod);
-    tests.root_module.addImport("termite_fixed_tokenizer_data", termite_fixed_tokenizer_data_mod);
+    tests.root_module.addImport("inference_tokenizer", inference_tokenizer_mod);
+    tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    tests.root_module.addImport("inference_linalg", inference_linalg_mod);
+    tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     tests.root_module.addImport("antfly_jsonschema", antfly_jsonschema_mod);
     tests.root_module.addImport("antfly_scraping", antfly_scraping_mod);
     tests.root_module.addImport("antfly_image", antfly_image_mod);
@@ -611,9 +603,9 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("prometheus", prometheus_mod);
     tests.root_module.addImport("structlog", structlog_mod);
     tests.root_module.addImport("antfly_platform", platform_mod);
-    tests.root_module.addImport("termite_internal", tests.root_module);
+    tests.root_module.addImport("inference_internal", tests.root_module);
     if (client_mod) |mod| {
-        tests.root_module.addImport("termite_client", mod);
+        tests.root_module.addImport("inference_client", mod);
     }
     if (enable_system_blas) {
         configureSystemBlas(b, tests.root_module, target, blas_root);
@@ -631,13 +623,13 @@ pub fn build(b: *std.Build) void {
         .jinja_mod = jinja_mod,
         .ml_mod = ml_mod,
         .onnx_graph_mod = onnx_graph_mod,
-        .termite_internal_mod = termite_internal_mod,
-        .termite_tokenizer_mod = termite_tokenizer_mod,
-        .termite_hf_tokenizer_mod = termite_hf_tokenizer_mod,
+        .inference_internal_mod = inference_internal_mod,
+        .inference_tokenizer_mod = inference_tokenizer_mod,
+        .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
         .antfly_image_mod = antfly_image_mod,
         .pjrt_mod = pjrt_mod,
         .protobuf_mod = protobuf_mod,
-        .termite_linalg_mod = termite_linalg_mod,
+        .inference_linalg_mod = inference_linalg_mod,
         .antfly_platform_mod = platform_mod,
         .enable_system_blas = enable_system_blas,
         .blas_root = blas_root,
@@ -664,7 +656,7 @@ pub fn build(b: *std.Build) void {
     const wasm_compute_tests = b.addTest(.{
         .name = "wasm-compute-tests",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/termite.zig"),
+            .root_source_file = b.path("src/inference.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -673,13 +665,13 @@ pub fn build(b: *std.Build) void {
     wasm_compute_tests.root_module.addImport("build_options", build_options_mod);
     wasm_compute_tests.root_module.addImport("httpx", httpx_mod);
     wasm_compute_tests.root_module.addImport("inference_api", inference_api_mod);
-    wasm_compute_tests.root_module.addImport("termite_audio", termite_audio_mod);
-    wasm_compute_tests.root_module.addImport("termite_chunker", termite_chunker_mod);
+    wasm_compute_tests.root_module.addImport("inference_audio", inference_audio_mod);
+    wasm_compute_tests.root_module.addImport("inference_chunker", inference_chunker_mod);
     wasm_compute_tests.root_module.addImport("jinja", jinja_mod);
-    wasm_compute_tests.root_module.addImport("termite_tokenizer", termite_tokenizer_mod);
-    wasm_compute_tests.root_module.addImport("termite_hf_tokenizer", termite_hf_tokenizer_mod);
-    wasm_compute_tests.root_module.addImport("termite_linalg", termite_linalg_mod);
-    wasm_compute_tests.root_module.addImport("termite_fixed_tokenizer_data", termite_fixed_tokenizer_data_mod);
+    wasm_compute_tests.root_module.addImport("inference_tokenizer", inference_tokenizer_mod);
+    wasm_compute_tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    wasm_compute_tests.root_module.addImport("inference_linalg", inference_linalg_mod);
+    wasm_compute_tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     wasm_compute_tests.root_module.addImport("antfly_jsonschema", antfly_jsonschema_mod);
     wasm_compute_tests.root_module.addImport("antfly_scraping", antfly_scraping_mod);
     wasm_compute_tests.root_module.addImport("antfly_image", antfly_image_mod);
@@ -689,7 +681,7 @@ pub fn build(b: *std.Build) void {
     wasm_compute_tests.root_module.addImport("prometheus", prometheus_mod);
     wasm_compute_tests.root_module.addImport("structlog", structlog_mod);
     if (client_mod) |mod| {
-        wasm_compute_tests.root_module.addImport("termite_client", mod);
+        wasm_compute_tests.root_module.addImport("inference_client", mod);
     }
     if (enable_system_blas) {
         configureSystemBlas(b, wasm_compute_tests.root_module, target, blas_root);
@@ -720,7 +712,7 @@ pub fn build(b: *std.Build) void {
     const web_projector_tests = b.addTest(.{
         .name = "web-projector-tests",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/termite.zig"),
+            .root_source_file = b.path("src/inference.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -729,13 +721,13 @@ pub fn build(b: *std.Build) void {
     web_projector_tests.root_module.addImport("build_options", build_options_mod);
     web_projector_tests.root_module.addImport("httpx", httpx_mod);
     web_projector_tests.root_module.addImport("inference_api", inference_api_mod);
-    web_projector_tests.root_module.addImport("termite_audio", termite_audio_mod);
-    web_projector_tests.root_module.addImport("termite_chunker", termite_chunker_mod);
+    web_projector_tests.root_module.addImport("inference_audio", inference_audio_mod);
+    web_projector_tests.root_module.addImport("inference_chunker", inference_chunker_mod);
     web_projector_tests.root_module.addImport("jinja", jinja_mod);
-    web_projector_tests.root_module.addImport("termite_tokenizer", termite_tokenizer_mod);
-    web_projector_tests.root_module.addImport("termite_hf_tokenizer", termite_hf_tokenizer_mod);
-    web_projector_tests.root_module.addImport("termite_linalg", termite_linalg_mod);
-    web_projector_tests.root_module.addImport("termite_fixed_tokenizer_data", termite_fixed_tokenizer_data_mod);
+    web_projector_tests.root_module.addImport("inference_tokenizer", inference_tokenizer_mod);
+    web_projector_tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    web_projector_tests.root_module.addImport("inference_linalg", inference_linalg_mod);
+    web_projector_tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     web_projector_tests.root_module.addImport("antfly_jsonschema", antfly_jsonschema_mod);
     web_projector_tests.root_module.addImport("antfly_scraping", antfly_scraping_mod);
     web_projector_tests.root_module.addImport("antfly_image", antfly_image_mod);
@@ -745,7 +737,7 @@ pub fn build(b: *std.Build) void {
     web_projector_tests.root_module.addImport("prometheus", prometheus_mod);
     web_projector_tests.root_module.addImport("structlog", structlog_mod);
     if (client_mod) |mod| {
-        web_projector_tests.root_module.addImport("termite_client", mod);
+        web_projector_tests.root_module.addImport("inference_client", mod);
     }
     if (enable_system_blas) {
         configureSystemBlas(b, web_projector_tests.root_module, target, blas_root);
@@ -794,7 +786,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     audio_tests.root_module.addImport("build_options", build_options_mod);
-    audio_tests.root_module.addImport("termite_audio", termite_audio_mod);
+    audio_tests.root_module.addImport("inference_audio", inference_audio_mod);
     audio_tests.root_module.link_libc = true;
     const run_audio_tests = b.addRunArtifact(audio_tests);
     const audio_test_step = b.step("test-audio", "Run shared audio tests");
@@ -1175,9 +1167,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     chunker_tests.root_module.addImport("build_options", build_options_mod);
-    chunker_tests.root_module.addImport("termite_hf_tokenizer", termite_hf_tokenizer_mod);
-    chunker_tests.root_module.addImport("termite_audio", termite_audio_mod);
-    chunker_tests.root_module.addImport("termite_fixed_tokenizer_data", termite_fixed_tokenizer_data_mod);
+    chunker_tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    chunker_tests.root_module.addImport("inference_audio", inference_audio_mod);
+    chunker_tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     chunker_tests.root_module.addImport("antfly_image", antfly_image_mod);
     chunker_tests.root_module.link_libc = true;
     const run_chunker_tests = b.addRunArtifact(chunker_tests);
@@ -1283,12 +1275,12 @@ pub fn build(b: *std.Build) void {
         wasm_onnx_graph_mod.addImport("protobuf", protobuf_mod);
         wasm_onnx_graph_mod.addImport("ml", wasm_ml_mod);
         wasm_tokenizer_mod.addImport("sentencepiece_proto", sentencepiece_proto_mod);
-        wasm_hf_tokenizer_mod.addImport("termite_tokenizer", wasm_tokenizer_mod);
+        wasm_hf_tokenizer_mod.addImport("inference_tokenizer", wasm_tokenizer_mod);
         wasm_lib.root_module.addImport("jinja", wasm_jinja_dep.module("jinja"));
-        wasm_lib.root_module.addImport("termite_audio", wasm_audio_mod);
-        wasm_lib.root_module.addImport("termite_tokenizer", wasm_tokenizer_mod);
-        wasm_lib.root_module.addImport("termite_hf_tokenizer", wasm_hf_tokenizer_mod);
-        wasm_lib.root_module.addImport("termite_linalg", wasm_linalg_mod);
+        wasm_lib.root_module.addImport("inference_audio", wasm_audio_mod);
+        wasm_lib.root_module.addImport("inference_tokenizer", wasm_tokenizer_mod);
+        wasm_lib.root_module.addImport("inference_hf_tokenizer", wasm_hf_tokenizer_mod);
+        wasm_lib.root_module.addImport("inference_linalg", wasm_linalg_mod);
         wasm_lib.root_module.addImport("antfly_image", wasm_image_mod);
         wasm_lib.root_module.addImport("antfly_platform", wasm_platform_mod);
         wasm_lib.root_module.addImport("ml", wasm_ml_mod);
@@ -1301,7 +1293,7 @@ pub fn build(b: *std.Build) void {
         const wasm_step = b.step("wasm", "Build WASM module for browser inference");
         wasm_step.dependOn(&wasm_install.step);
         if (!is_wasm64) {
-            const wasm_compat_install = b.addInstallFile(wasm_lib.getEmittedBin(), "termite.wasm");
+            const wasm_compat_install = b.addInstallFile(wasm_lib.getEmittedBin(), "inference.wasm");
             wasm_step.dependOn(&wasm_compat_install.step);
         }
     }

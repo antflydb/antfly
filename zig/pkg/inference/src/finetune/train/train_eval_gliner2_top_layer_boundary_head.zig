@@ -14,9 +14,9 @@
 
 const std = @import("std");
 const compat = @import("../../io/compat.zig");
-const termite = @import("termite_internal");
-const gliner2_boundary = termite.finetune.gliner2_boundary;
-const reranker = termite.finetune.reranker;
+const inference = @import("inference_internal");
+const gliner2_boundary = inference.finetune.gliner2_boundary;
+const reranker = inference.finetune.reranker;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

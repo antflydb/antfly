@@ -2,7 +2,7 @@
 
 The KV cache stores key and value tensors from the attention layers during inference. Each generated token reuses all previous K/V pairs, so the cache grows linearly with sequence length and becomes the dominant memory consumer for long contexts.
 
-Termite-zig's KV cache lives in `src/runtime/kv/` and provides paged block storage, multiple quantization formats, and post-prefill compaction.
+Antfly inference-zig's KV cache lives in `src/runtime/kv/` and provides paged block storage, multiple quantization formats, and post-prefill compaction.
 
 ## Architecture
 
@@ -204,8 +204,8 @@ Compaction and quantization compose multiplicatively:
 
 ```
 # CLI
-termite generate model/ "prompt" --cache-compaction-ratio 0.1
-termite generate model/ "prompt" --cache-compaction-ratio 0.1 --cache-dtype int8
+antfly inference generate model/ "prompt" --cache-compaction-ratio 0.1
+antfly inference generate model/ "prompt" --cache-compaction-ratio 0.1 --cache-dtype int8
 zig build bench-paged-attention -- --cache-dtype-sweep --head-dim 128
 
 # API (GenerateRequest)

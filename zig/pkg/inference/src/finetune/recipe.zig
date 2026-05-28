@@ -45,7 +45,7 @@ const backends = @import("../backends/backends.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
-const tokenizer_mod = @import("termite_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 const compat = @import("../io/compat.zig");
 const c_file = @import("../util/c_file.zig");
 const command_registry = @import("command_registry.zig");
@@ -2168,7 +2168,7 @@ fn collectStaticMetadata(allocator: std.mem.Allocator, io: std.Io, recipe: Recip
         .backend = .{
             .requested = recipe.backend,
             .build = .{
-                .termite_version = build_options.termite_version,
+                .termite_version = build_options.inference_version,
                 .enable_native = build_options.enable_native,
                 .enable_onnx = build_options.enable_onnx,
                 .enable_mlx = build_options.enable_mlx,

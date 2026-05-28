@@ -27,7 +27,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const backends = @import("../backends/backends.zig");
-const tokenizer_mod = @import("termite_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 const audio = @import("audio.zig");
 
 pub const TranscribeConfig = struct {

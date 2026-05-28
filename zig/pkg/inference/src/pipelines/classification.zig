@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
-const Tokenizer = @import("termite_tokenizer").Tokenizer;
+const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Tensor = backends.Tensor;
 const runtime = @import("../runtime/root.zig");
 
@@ -410,7 +410,7 @@ const FakeClassificationTokenizer = struct {
         try out.appendSlice(allocator, ids);
     }
 
-    fn encodeForModel(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!@import("termite_tokenizer").EncodeResult {
+    fn encodeForModel(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!@import("inference_tokenizer").EncodeResult {
         const tok = Tokenizer{ .ptr = ptr, .vtable = &.{
             .encode = encode,
             .encodeInto = encodeInto,
@@ -424,7 +424,7 @@ const FakeClassificationTokenizer = struct {
         return tok.encodeForGenerationFallback(allocator, text, max_length, true);
     }
 
-    fn encodeGeneration(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize, add_bos_token: bool) anyerror!@import("termite_tokenizer").EncodeResult {
+    fn encodeGeneration(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize, add_bos_token: bool) anyerror!@import("inference_tokenizer").EncodeResult {
         const tok = Tokenizer{ .ptr = ptr, .vtable = &.{
             .encode = encode,
             .encodeInto = encodeInto,
@@ -442,7 +442,7 @@ const FakeClassificationTokenizer = struct {
         return allocator.dupe(u8, "");
     }
 
-    fn specialTokens(_: *anyopaque) @import("termite_tokenizer").SpecialTokens {
+    fn specialTokens(_: *anyopaque) @import("inference_tokenizer").SpecialTokens {
         return .{ .cls_id = 101, .sep_id = 102, .pad_id = 0 };
     }
 

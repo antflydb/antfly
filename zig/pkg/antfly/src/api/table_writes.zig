@@ -204,7 +204,7 @@ pub const ProvisionedTableWriteCache = struct {
     hbc_cache: ?*hbc_mod.Cache = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     open_mutex: std.atomic.Mutex = .unlocked,
@@ -453,12 +453,12 @@ pub const ProvisionedTableWriteCache = struct {
                 manager: ?*resource_manager_mod.ResourceManager,
                 open_mode: ManagedDbOpenMode,
                 runtime: ?*db_mod.background_runtime.BackendRuntime,
-                local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+                antfly_provider: ?managed_embedder.AntflyProvider,
                 secret_store: ?*common_secrets.FileStore,
                 identity_namespace: ?doc_identity.Namespace,
             ) !OpenedDb {
                 var db = if (indexes_json) |managed_indexes_json|
-                    try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity(
+                    try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
                         allocator,
                         db_path,
                         managed_indexes_json,
@@ -468,7 +468,7 @@ pub const ProvisionedTableWriteCache = struct {
                         manager,
                         open_mode,
                         runtime,
-                        local_termite_provider,
+                        antfly_provider,
                         secret_store,
                         null,
                         identity_namespace,
@@ -516,7 +516,7 @@ pub const ProvisionedTableWriteCache = struct {
                 self.resource_manager,
                 mode,
                 self.backend_runtime,
-                self.local_termite_provider,
+                self.antfly_provider,
                 self.secret_store,
                 identity_namespace,
             );
@@ -558,7 +558,7 @@ pub const ProvisionedTableWriteCache = struct {
             self.resource_manager,
             mode,
             self.backend_runtime,
-            self.local_termite_provider,
+            self.antfly_provider,
             self.secret_store,
             identity_namespace,
         );
@@ -2069,7 +2069,7 @@ pub const ProvisionedTableWriteSource = struct {
     local_change_hook: ?LocalChangeHook = null,
     raft_batcher: ?RaftBatcher = null,
     group_lsm_generation: ?table_reads.GroupLsmGenerationSource = null,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
@@ -2096,13 +2096,13 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
-    pub fn withLocalTermiteProvider(
+    pub fn withAntflyProvider(
         self: *ProvisionedTableWriteSource,
-        provider: ?managed_embedder.LocalTermiteProvider,
+        provider: ?managed_embedder.AntflyProvider,
     ) *ProvisionedTableWriteSource {
-        self.local_termite_provider = provider;
-        if (self.write_cache) |cache| cache.local_termite_provider = provider;
-        if (self.startup_write_cache) |cache| cache.local_termite_provider = provider;
+        self.antfly_provider = provider;
+        if (self.write_cache) |cache| cache.antfly_provider = provider;
+        if (self.startup_write_cache) |cache| cache.antfly_provider = provider;
         return self;
     }
 
@@ -2506,7 +2506,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !ProvisionedTableWriteCache.CachedDb {
         _ = alloc;
         if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
-        cache.local_termite_provider = self.local_termite_provider;
+        cache.antfly_provider = self.antfly_provider;
         cache.remote_content = self.remote_content;
         const lsm_root_generation = self.lsmRootGeneration(group_id);
         const identity_namespace = try loadTableIdentityNamespaceForGroup(cache.alloc, self.catalog, table_name, group_id);
@@ -2584,7 +2584,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
-            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity(cache.alloc, path, value, cache.lsm_cache, cache.hbc_cache, lsm_root_generation, cache.resource_manager, mode, cache.backend_runtime, self.local_termite_provider, self.secret_store, cache.remote_content, identity_namespace)
+            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(cache.alloc, path, value, cache.lsm_cache, cache.hbc_cache, lsm_root_generation, cache.resource_manager, mode, cache.backend_runtime, self.antfly_provider, self.secret_store, cache.remote_content, identity_namespace)
         else
             try db_mod.DB.open(cache.alloc, path, .{
                 .lsm_cache = cache.lsm_cache,
@@ -2984,7 +2984,7 @@ pub const ProvisionedTableWriteSource = struct {
             else
                 null;
             uncached_db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity(alloc, path, value, null, null, lsm_root_generation, null, startup_open_mode, self.backend_runtime, self.local_termite_provider, self.secret_store, self.remote_content, identity_namespace)
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(alloc, path, value, null, null, lsm_root_generation, null, startup_open_mode, self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, identity_namespace)
             else
                 try db_mod.DB.open(alloc, path, .{
                     .open_mode = .writer_no_replay,
@@ -3970,7 +3970,7 @@ pub const ProvisionedTableWriteSource = struct {
         indexes_json: []const u8,
     ) !db_mod.DB {
         const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
-        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity(
+        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
             alloc,
             path,
             indexes_json,
@@ -3980,7 +3980,7 @@ pub const ProvisionedTableWriteSource = struct {
             null,
             .restore_repair,
             self.backend_runtime,
-            self.local_termite_provider,
+            self.antfly_provider,
             self.secret_store,
             self.remote_content,
             identity_namespace,
@@ -4198,7 +4198,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer alloc.free(path);
 
             const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
-            var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity(alloc, path, indexes_json, null, null, 0, null, .default, self.backend_runtime, self.local_termite_provider, self.secret_store, self.remote_content, identity_namespace);
+            var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(alloc, path, indexes_json, null, null, 0, null, .default, self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, identity_namespace);
             defer db.close();
             try applyLocalTableSchemaJson(alloc, &db, schema_json);
             std.log.info("provisioned create table local group ready table={s} group_id={d}", .{ table_name, group_id });
@@ -5187,7 +5187,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
 
         var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
-            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity(
+            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
                 cache.write_cache.alloc,
                 path,
                 value,
@@ -5197,7 +5197,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 cache.write_cache.resource_manager,
                 mode,
                 cache.write_cache.backend_runtime,
-                cache.write_cache.local_termite_provider,
+                cache.write_cache.antfly_provider,
                 cache.write_cache.secret_store,
                 cache.write_cache.remote_content,
                 identity_namespace,
@@ -6565,7 +6565,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     identity_namespace: ?doc_identity.Namespace,
 ) !db_mod.DB {
-    return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity(
+    return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
         alloc,
         path,
         indexes_json,
@@ -6582,7 +6582,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
     );
 }
 
-fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
+fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntfly(
     alloc: std.mem.Allocator,
     path: []const u8,
     indexes_json: []const u8,
@@ -6592,11 +6592,11 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
     resource_manager: ?*resource_manager_mod.ResourceManager,
     mode: ManagedDbOpenMode,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+    antfly_provider: ?managed_embedder.AntflyProvider,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !db_mod.DB {
-    return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity(
+    return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
         alloc,
         path,
         indexes_json,
@@ -6606,14 +6606,14 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermite(
         resource_manager,
         mode,
         backend_runtime,
-        local_termite_provider,
+        antfly_provider,
         secret_store,
         remote_content,
         null,
     );
 }
 
-fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity(
+fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
     alloc: std.mem.Allocator,
     path: []const u8,
     indexes_json: []const u8,
@@ -6623,7 +6623,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
     resource_manager: ?*resource_manager_mod.ResourceManager,
     mode: ManagedDbOpenMode,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+    antfly_provider: ?managed_embedder.AntflyProvider,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     identity_namespace: ?doc_identity.Namespace,
@@ -6642,13 +6642,13 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
         fn run(
             allocator: std.mem.Allocator,
             raw_indexes_json: []const u8,
-            local_provider: ?managed_embedder.LocalTermiteProvider,
+            local_provider: ?managed_embedder.AntflyProvider,
             store: ?*common_secrets.FileStore,
             remote: ?*const scraping.RemoteContentConfig,
         ) !EmbedderSet {
             return .{
-                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .local_termite_provider = local_provider, .secret_store = store, .remote_content = remote }),
-                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .local_termite_provider = local_provider, .secret_store = store, .remote_content = remote }),
+                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote }),
+                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote }),
             };
         }
     }.run;
@@ -6656,7 +6656,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
     var embedders = if (mode == .startup_catch_up)
         EmbedderSet{}
     else
-        try createEmbedders(alloc, indexes_json, local_termite_provider, secret_store, remote_content);
+        try createEmbedders(alloc, indexes_json, antfly_provider, secret_store, remote_content);
     errdefer embedders.deinit(alloc);
 
     const openDb = struct {
@@ -6857,7 +6857,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalTermiteAndIdentity
         // request work runs against the stabilized post-reconcile state.
         db.close();
         db_open = false;
-        embedders = try createEmbedders(alloc, indexes_json, local_termite_provider, secret_store, remote_content);
+        embedders = try createEmbedders(alloc, indexes_json, antfly_provider, secret_store, remote_content);
         db = blk: {
             const dense = embedders.dense;
             const sparse = embedders.sparse;

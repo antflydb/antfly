@@ -150,14 +150,14 @@ fn parseProjectorConfig(file: *const gguf_format.File, runtime_cfg: gpt_mod.Conf
     if (!isSupportedProjectorFile(file)) return error.InvalidGgufProjector;
     const view = gguf_metadata.View.init(file);
     const cfg: ProjectorConfig = .{
-        .text_hidden = @intCast(view.getU64("termite.projector.text_hidden_size") orelse return error.InvalidGgufProjector),
-        .vision_hidden = @intCast(view.getU64("termite.projector.vision_hidden_size") orelse return error.InvalidGgufProjector),
-        .intermediate_size = @intCast(view.getU64("termite.projector.vision_feed_forward_length") orelse return error.InvalidGgufProjector),
-        .block_count = @intCast(view.getU64("termite.projector.vision_block_count") orelse return error.InvalidGgufProjector),
-        .head_count = @intCast(view.getU64("termite.projector.vision_attention_head_count") orelse return error.InvalidGgufProjector),
-        .image_size = @intCast(view.getU64("termite.projector.vision_image_size") orelse return error.InvalidGgufProjector),
-        .patch_size = @intCast(view.getU64("termite.projector.vision_patch_size") orelse return error.InvalidGgufProjector),
-        .mm_tokens_per_image = @intCast(view.getU64("termite.projector.mm_tokens_per_image") orelse return error.InvalidGgufProjector),
+        .text_hidden = @intCast(view.getU64("inference.projector.text_hidden_size") orelse return error.InvalidGgufProjector),
+        .vision_hidden = @intCast(view.getU64("inference.projector.vision_hidden_size") orelse return error.InvalidGgufProjector),
+        .intermediate_size = @intCast(view.getU64("inference.projector.vision_feed_forward_length") orelse return error.InvalidGgufProjector),
+        .block_count = @intCast(view.getU64("inference.projector.vision_block_count") orelse return error.InvalidGgufProjector),
+        .head_count = @intCast(view.getU64("inference.projector.vision_attention_head_count") orelse return error.InvalidGgufProjector),
+        .image_size = @intCast(view.getU64("inference.projector.vision_image_size") orelse return error.InvalidGgufProjector),
+        .patch_size = @intCast(view.getU64("inference.projector.vision_patch_size") orelse return error.InvalidGgufProjector),
+        .mm_tokens_per_image = @intCast(view.getU64("inference.projector.mm_tokens_per_image") orelse return error.InvalidGgufProjector),
     };
     if (cfg.text_hidden != runtime_cfg.hidden_size) return error.InvalidGgufProjector;
     if (runtime_cfg.mm_tokens_per_image > 0 and cfg.mm_tokens_per_image != runtime_cfg.mm_tokens_per_image) return error.InvalidGgufProjector;
@@ -490,15 +490,15 @@ test "supports termite gemma3 projector metadata" {
 
     const metadata = [_]gguf_mod.format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "termite-projector" } },
-        .{ .key = "termite.projector.source_architecture", .value = .{ .string = "gemma3" } },
-        .{ .key = "termite.projector.text_hidden_size", .value = .{ .u32 = 4 } },
-        .{ .key = "termite.projector.vision_hidden_size", .value = .{ .u32 = 8 } },
-        .{ .key = "termite.projector.vision_feed_forward_length", .value = .{ .u32 = 16 } },
-        .{ .key = "termite.projector.vision_block_count", .value = .{ .u32 = 3 } },
-        .{ .key = "termite.projector.vision_attention_head_count", .value = .{ .u32 = 4 } },
-        .{ .key = "termite.projector.vision_image_size", .value = .{ .u32 = 224 } },
-        .{ .key = "termite.projector.vision_patch_size", .value = .{ .u32 = 14 } },
-        .{ .key = "termite.projector.mm_tokens_per_image", .value = .{ .u32 = 256 } },
+        .{ .key = "inference.projector.source_architecture", .value = .{ .string = "gemma3" } },
+        .{ .key = "inference.projector.text_hidden_size", .value = .{ .u32 = 4 } },
+        .{ .key = "inference.projector.vision_hidden_size", .value = .{ .u32 = 8 } },
+        .{ .key = "inference.projector.vision_feed_forward_length", .value = .{ .u32 = 16 } },
+        .{ .key = "inference.projector.vision_block_count", .value = .{ .u32 = 3 } },
+        .{ .key = "inference.projector.vision_attention_head_count", .value = .{ .u32 = 4 } },
+        .{ .key = "inference.projector.vision_image_size", .value = .{ .u32 = 224 } },
+        .{ .key = "inference.projector.vision_patch_size", .value = .{ .u32 = 14 } },
+        .{ .key = "inference.projector.mm_tokens_per_image", .value = .{ .u32 = 256 } },
     };
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);

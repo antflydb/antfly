@@ -1,5 +1,5 @@
 {
-  "name": "termite-web-tests",
+  "name": "inference-web-tests",
   "private": true,
   "description": "Test harnesses that exercise the WGSL shaders and WASM bridge from Node.",
   "scripts": {

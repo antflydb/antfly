@@ -22,11 +22,11 @@
 
 const std = @import("std");
 
-const termite = @import("termite_internal");
-const backends = termite.backends;
-const graph_runtime = termite.graph.runtime;
-const model_manager_mod = termite.server.model_manager;
-const native_compute = termite.native_compute.native;
+const inference = @import("inference_internal");
+const backends = inference.backends;
+const graph_runtime = inference.graph.runtime;
+const model_manager_mod = inference.server.model_manager;
+const native_compute = inference.native_compute.native;
 
 const BackendChoice = enum {
     auto,

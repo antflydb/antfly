@@ -16,7 +16,7 @@ const std = @import("std");
 const bert_arch = @import("../architectures/bert.zig");
 const ops = @import("../ops/ops.zig");
 const web_runtime = @import("runtime_state.zig");
-const linalg = @import("termite_linalg");
+const linalg = @import("inference_linalg");
 
 pub fn rerank(
     allocator: std.mem.Allocator,

@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Package marker for termite E2E tests.
+# Package marker for antfly E2E tests.

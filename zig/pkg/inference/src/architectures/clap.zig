@@ -410,7 +410,7 @@ fn fusePatchEmbeddings(
     // libm expf per element on plane*channels (≈ 256K) values for CLAP-large
     // stage 0 fusion.  Width follows linalg.primitives so we line up with
     // expVec's lane count (8 on AVX2/NEON, 16 on AVX-512).
-    const linalg_prim = @import("termite_linalg").primitives;
+    const linalg_prim = @import("inference_linalg").primitives;
     const VEC = linalg_prim.vec_len;
     const Vec = @Vector(VEC, f32);
     const total = plane * channels;
@@ -1649,7 +1649,7 @@ fn windowAttention(
     // (vectorized exp), V projection uses axpyPtrs.  The original loop did
     // all three with per-element scalar arithmetic; this is the hottest
     // inner kernel in CLAP audio Swin attention.
-    const linalg_prim = @import("termite_linalg").primitives;
+    const linalg_prim = @import("inference_linalg").primitives;
     const mask_windows = if (attn_mask) |m| blk: {
         const mask_window_elems = window_area * window_area;
         if (mask_window_elems == 0 or m.len == 0 or m.len % mask_window_elems != 0) return error.InvalidInputShape;

@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const linalg = @import("termite_linalg");
+const linalg = @import("inference_linalg");
 
 // Optional system BLAS bindings — uses vecLib/cblas on macOS, OpenBLAS elsewhere.
 const c = if (build_options.enable_system_blas) @cImport({

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const validation = @import("termite_internal").finetune.gliner2_run_validation;
+const validation = @import("inference_internal").finetune.gliner2_run_validation;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

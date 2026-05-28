@@ -68,7 +68,7 @@ pub fn chunkTextWithConfigJson(
             cfg.defaultedTargetTokens(),
             cfg.defaultedOverlapTokens(),
         ),
-        .termite => error.UnsupportedPlatform,
+        .antfly => error.UnsupportedPlatform,
     };
 }
 
@@ -91,13 +91,13 @@ test "chunker stub supports local configured chunking" {
     try std.testing.expectEqualStrings("ghij", chunks[2].text.?);
 }
 
-test "chunker stub rejects termite configured chunking" {
+test "chunker stub rejects antfly configured chunking" {
     const alloc = std.testing.allocator;
 
     try std.testing.expectError(
         error.UnsupportedPlatform,
         chunkTextWithConfigJson(alloc, "abcdefghij",
-            \\{"provider":"termite","model":"fixed"}
+            \\{"provider":"antfly","model":"fixed"}
         ),
     );
 }

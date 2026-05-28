@@ -17,7 +17,7 @@ frontend/tracing
   -> backend kernel picker and command encoder
 ```
 
-Termite should keep graph policy in `src/graph/`. Backend modules should own
+Antfly inference should keep graph policy in `src/graph/`. Backend modules should own
 device buffers, command submission, kernel selection, and packed-weight
 preparation.
 
@@ -33,7 +33,7 @@ expert IDs through `ggml_mul_mat_id`. The important layouts are:
 - `ffn_gate_up_exps.weight`: `[hidden, 2 * expert_ff, expert_count]`
 - `ffn_down_exps.weight`: `[expert_ff, hidden, expert_count]`
 
-The production target is a Termite `mul_mat_id`-style primitive where routed
+The production target is a Antfly inference `mul_mat_id`-style primitive where routed
 MoE execution receives the full packed tensor and selected expert IDs. The
 current grouped MoE path follows that contract for packed GGUF weights at the
 weight-registration, graph dispatch, native reference, MLX provider, and Metal
@@ -362,7 +362,7 @@ Implemented slice:
 - added partition execution counters for command dispatches, interpreter
   fallbacks, runtime/cross-device transfers, device-resident outputs, host
   materialized outputs, and boundary output materializations
-- `TERMITE_GRAPH_EXECUTOR_STATS=1` now prints those counters from the shared
+- `ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1` now prints those counters from the shared
   `MultiExecutor` path, so real graph/model executions can expose whether a
   run stayed resident or silently fell back/materialized
 - expanded Metal command dispatch coverage for primitive unary ops, subtract,
@@ -389,13 +389,13 @@ Implemented slice:
   interpreter fallbacks, and device-resident output before readback
 - graph executor stats now include Metal graph-plan slot and byte reservations,
   making Phase 5 buffer-plan handoff observable from executor tests and
-  `TERMITE_GRAPH_EXECUTOR_STATS=1`
+  `ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1`
 - real Metal model smokes were run under the Metal debug wrapper for Gemma
   generation and CLIPCLAP text embedding; both passed validation with no
   diagnostic reports, and neither emitted `graph_executor_stats`, confirming
   those CLI paths still use direct model/runtime executors rather than the
   shared `MultiExecutor`
-- `TERMITE_GRAPH_EXECUTOR_STATS=1` now reports an explicit bypass line for
+- `ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1` now reports an explicit bypass line for
   those real direct paths (`termite.generate` and `termite.embed`) when they do
   not request graph execution, so smokes distinguish "graph executor produced
   zero stats" from "this CLI path intentionally bypassed `MultiExecutor`"
@@ -411,7 +411,7 @@ Implemented slice:
   fallback
 - graph-mode generation now routes ordinary single-device traced graph replay
   through `MultiExecutor` instead of falling back to the interpreter replay
-  path; `TERMITE_GRAPH_MODE=1 TERMITE_GRAPH_EXECUTOR_STATS=1` on Gemma/native
+  path; `ANTFLY_INFERENCE_GRAPH_MODE=1 ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1` on Gemma/native
   emits real graph executor stats for the full traced graph
 - graph-mode generation skips the direct live whole-model executor when graph
   mode is explicitly requested, so graph-mode smokes no longer silently exit
@@ -478,9 +478,9 @@ Implemented slice:
   reduction tile; validator coverage with varied activation columns catches
   the old simdgroup-matrix under-accumulation pattern
 - the fused Q8_0 gate/up activation MM kernel uses the same reduction tile and
-  is enabled by default; `TERMITE_METAL_DISABLE_Q8_PAIR_ACTIVATION_MM=1`
+  is enabled by default; `ANTFLY_INFERENCE_METAL_DISABLE_Q8_PAIR_ACTIVATION_MM=1`
   forces the split gate/up path for bisection
-- `TERMITE_METAL_DISABLE_Q8_MM=1` forces rows >= 9 back onto the verified
+- `ANTFLY_INFERENCE_METAL_DISABLE_Q8_MM=1` forces rows >= 9 back onto the verified
   small-batch/MMV paths for bisection; the default path enables tiled Q8_0 MM
 - runtime tests assert the plain linear, QKV, and fused gate/up rows >= 9 paths
   increment the expected Q8_0 MM dispatch-family counters
@@ -653,7 +653,7 @@ Implemented slice:
   future op claims should land with the matching WGSL/import and executor
   classification coverage in the same slice
 - WebGPU is selectable as a compiled partition backend in Wasm/WebGPU builds:
-  `compiled` means Termite runs graph compilation/planning/fusion/partitioning
+  `compiled` means Antfly inference runs graph compilation/planning/fusion/partitioning
   and attaches the `WebGpuPartitionExecutor`, not that it emits an offline
   WebGPU artifact. This mirrors Metal's compiled partition path; offline
   artifacts remain the ONNX/PJRT-style backend model.
@@ -665,12 +665,12 @@ adoption and coverage rather than a missing planning phase:
 
 - make graph execution the default hot path where it is at least as reliable and
   fast as the direct runtime path. Today generation keeps the eager/direct
-  runtime default unless `TERMITE_GRAPH_MODE`, an explicit compiled partition
+  runtime default unless `ANTFLY_INFERENCE_GRAPH_MODE`, an explicit compiled partition
   backend, or graph-runtime option selects the graph path; embedding similarly
   reports a direct-runtime bypass when no graph runtime strategy is requested.
 - broaden real-model graph-mode smokes for Metal and WebGPU. Focused graph
   executor and browser smokes cover the promoted command families, but full
-  model layouts should be exercised under `TERMITE_GRAPH_EXECUTOR_STATS=1` so
+  model layouts should be exercised under `ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1` so
   regressions show up as unexpected interpreter fallbacks, boundary
   materializations, or direct-runtime bypasses.
 - continue the Metal FFN precision migration. Command plans now distinguish f32

@@ -13,7 +13,6 @@ pub const GeneratorProvider = enum {
     bedrock,
     anthropic,
     cohere,
-    termite,
     antfly,
     mock,
 
@@ -27,7 +26,6 @@ pub const GeneratorProvider = enum {
             .bedrock => "bedrock",
             .anthropic => "anthropic",
             .cohere => "cohere",
-            .termite => "termite",
             .antfly => "antfly",
             .mock => "mock",
         };
@@ -48,7 +46,6 @@ pub const GeneratorProvider = enum {
             .{ "bedrock", .bedrock },
             .{ "anthropic", .anthropic },
             .{ "cohere", .cohere },
-            .{ "termite", .termite },
             .{ "antfly", .antfly },
             .{ "mock", .mock },
         });
@@ -160,8 +157,8 @@ pub const OllamaGeneratorConfig = struct {
     timeout: ?i64 = null,
 };
 
-/// Configuration for the Termite generative AI provider.
-pub const TermiteGeneratorConfig = struct {
+/// Configuration for the Antfly generative AI provider.
+pub const AntflyGeneratorConfig = struct {
     /// The name of the generator model.
     model: []const u8,
     /// The URL of the Inference API endpoint.

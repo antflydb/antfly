@@ -1,6 +1,6 @@
 # PEFT
 
-This note tracks Termite's PEFT parity beyond basic LoRA. The implementation
+This note tracks Antfly inference's PEFT parity beyond basic LoRA. The implementation
 surface lives under `pkg/inference/src/finetune/`; this file is the durable status
 and follow-up checklist.
 

@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const structlog = @import("structlog");
-const termite_cli = @import("termite_cli");
+const inference_cli = @import("inference_cli");
 const platform = @import("antfly_platform");
 
 pub const std_options: std.Options = .{
@@ -41,7 +41,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "version")) {
-        return termite_cli.runFromArgs(init, platform.allocator.processAllocator(std.heap.smp_allocator), "antfly inference", &.{"version"});
+        inference_cli.printVersion();
+        return;
     }
 
     if (!std.mem.eql(u8, args[1], "inference")) {
@@ -50,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
 
-    return termite_cli.runFromArgs(init, platform.allocator.processAllocator(std.heap.smp_allocator), "antfly inference", args[2..]);
+    return inference_cli.runFromArgs(init, platform.allocator.processAllocator(std.heap.smp_allocator), "antfly inference", args[2..]);
 }
 
 fn printUsage() void {

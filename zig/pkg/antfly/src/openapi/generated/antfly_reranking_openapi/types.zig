@@ -7,7 +7,6 @@ const std = @import("std");
 pub const RerankerProvider = enum {
     antfly,
     ollama,
-    termite,
     cohere,
     vertex,
 
@@ -15,7 +14,6 @@ pub const RerankerProvider = enum {
         const s = switch (self) {
             .antfly => "antfly",
             .ollama => "ollama",
-            .termite => "termite",
             .cohere => "cohere",
             .vertex => "vertex",
         };
@@ -30,7 +28,6 @@ pub const RerankerProvider = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "antfly", .antfly },
             .{ "ollama", .ollama },
-            .{ "termite", .termite },
             .{ "cohere", .cohere },
             .{ "vertex", .vertex },
         });
@@ -47,7 +44,7 @@ pub const OllamaRerankerConfig = struct {
 };
 
 /// Configuration for the inference reranking provider.
-pub const TermiteRerankerConfig = struct {
+pub const AntflyRerankerConfig = struct {
     /// The name of the reranking model (e.g., cross-encoder model name).
     model: []const u8,
     /// The URL of the Inference API endpoint.
@@ -77,9 +74,6 @@ pub const VertexRerankerConfig = struct {
     /// Maximum number of records to return. If not specified, returns all documents with scores.
     top_n: ?i64 = null,
 };
-
-/// Configuration for the built-in Antfly reranking provider. Uses an embedded INT8-quantized cross-encoder/ms-marco-MiniLM-L-6-v2 ONNX model bundled directly in the binary. No external service, API key, or model download required. **Model:** cross-encoder/ms-marco-MiniLM-L-6-v2 (6-layer MiniLM cross-encoder) **Features:** - Zero configuration — works out of the box - No network access required - Pure Go inference via GoMLX
-pub const AntflyRerankerConfig = struct {};
 
 /// A unified configuration for a reranking provider.
 pub const RerankerConfig = struct {

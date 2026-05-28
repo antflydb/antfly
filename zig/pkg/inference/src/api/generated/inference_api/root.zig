@@ -87,7 +87,6 @@ pub const GenerateDelta = types.GenerateDelta;
 pub const ToolCallDelta = types.ToolCallDelta;
 pub const ToolCallFunctionDelta = types.ToolCallFunctionDelta;
 pub const Config = types.Config;
-pub const VersionResponse = types.VersionResponse;
 pub const BackendCapabilities = types.BackendCapabilities;
 pub const TextChunkOptions = types.TextChunkOptions;
 pub const TextContent = types.TextContent;

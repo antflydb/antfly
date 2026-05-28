@@ -14,7 +14,7 @@
 
 """Tests for /api/rerank endpoint.
 
-Matches Go termite's rerankers_test.go patterns.
+Matches Go antfly's rerankers_test.go patterns.
 """
 
 import pytest

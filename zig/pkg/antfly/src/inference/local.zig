@@ -12,9 +12,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-// Termite inference provider.
+// Local inference provider.
 //
-// Wraps the termite-zig generated client to implement the
+// Wraps the inference API client to implement the
 // provider-neutral Embedder, Generator, and Reranker interfaces.
 
 const std = @import("std");
@@ -22,7 +22,7 @@ const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
 const inference = @import("types.zig");
-const binary = @import("termite_binary.zig");
+const binary = @import("binary.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
     @import("../storage/db/template_stub.zig")
 else
@@ -368,14 +368,14 @@ fn mapEmbedStatus(status: u16) anyerror {
 fn logEmbedFailure(kind: []const u8, url: []const u8, status: u16, body: ?[]const u8) void {
     const raw = body orelse "";
     const clipped = raw[0..@min(raw.len, 512)];
-    std.log.warn("termite {s} embed failed status={d} url={s} body={s}", .{ kind, status, url, clipped });
+    std.log.warn("antfly {s} embed failed status={d} url={s} body={s}", .{ kind, status, url, clipped });
 }
 
-test "termite provider compiles" {
+test "antfly provider compiles" {
     _ = Provider;
 }
 
-test "termite embed request omits nullable generated fields" {
+test "antfly embed request omits nullable generated fields" {
     const alloc = std.testing.allocator;
     var input = std.json.Array.init(alloc);
     defer input.deinit();
@@ -392,7 +392,7 @@ test "termite embed request omits nullable generated fields" {
     try std.testing.expect(std.mem.indexOf(u8, body, "null") == null);
 }
 
-test "termite generate round trip" {
+test "antfly generate round trip" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -401,7 +401,7 @@ test "termite generate round trip" {
     var ts = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/generate", .respond = .{
             .body =
-            \\{"choices":[{"message":{"role":"assistant","content":"Hi from Termite!"}}]}
+            \\{"choices":[{"message":{"role":"assistant","content":"Hi from Antfly!"}}]}
             ,
         } },
     });
@@ -444,10 +444,10 @@ test "termite generate round trip" {
         std.debug.print("generate fiber error: {}\n", .{result_err});
         return error.TestUnexpectedResult;
     }
-    try std.testing.expectEqualStrings("Hi from Termite!", result_content orelse "NO CONTENT");
+    try std.testing.expectEqualStrings("Hi from Antfly!", result_content orelse "NO CONTENT");
 }
 
-test "termite sparse embed round trip" {
+test "antfly sparse embed round trip" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -507,7 +507,7 @@ test "termite sparse embed round trip" {
     try std.testing.expect(ok);
 }
 
-test "termite rerank round trip" {
+test "antfly rerank round trip" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -563,7 +563,7 @@ test "termite rerank round trip" {
     try std.testing.expectEqual(@as(f32, 0.9), result_first_score);
 }
 
-test "termite rerank accepts scores array response" {
+test "antfly rerank accepts scores array response" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -619,7 +619,7 @@ test "termite rerank accepts scores array response" {
     try std.testing.expectEqual(@as(f32, 0.8), result_first_score);
 }
 
-test "termite embed round trip (binary)" {
+test "antfly embed round trip (binary)" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -684,7 +684,7 @@ test "termite embed round trip (binary)" {
     try std.testing.expectEqual(@as(f32, 2.5), vec[2]);
 }
 
-test "termite embed fails on non-200 response" {
+test "antfly embed fails on non-200 response" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();

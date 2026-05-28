@@ -13,15 +13,15 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite = @import("termite_internal");
-const compat = termite.io.compat;
-const gliner2 = termite.finetune.gliner2;
-const cleanup_data = termite.finetune.entity_cleanup_data;
-const cleanup_gliner_cache = termite.finetune.entity_cleanup_gliner_cache;
-const cleanup_model = termite.finetune.entity_cleanup_model;
-const text_encoder_boundary = termite.finetune.text_encoder_boundary;
-const run_contract = termite.run.contract;
-const artifact_writer = termite.run.artifact_writer;
+const inference = @import("inference_internal");
+const compat = inference.io.compat;
+const gliner2 = inference.finetune.gliner2;
+const cleanup_data = inference.finetune.entity_cleanup_data;
+const cleanup_gliner_cache = inference.finetune.entity_cleanup_gliner_cache;
+const cleanup_model = inference.finetune.entity_cleanup_model;
+const text_encoder_boundary = inference.finetune.text_encoder_boundary;
+const run_contract = inference.run.contract;
+const artifact_writer = inference.run.artifact_writer;
 
 const WorkflowSummary = struct {
     artifact_family_version: []const u8,

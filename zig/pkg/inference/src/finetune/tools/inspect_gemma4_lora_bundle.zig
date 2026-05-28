@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const finetune = @import("termite_internal").finetune.gemma4;
+const finetune = @import("inference_internal").finetune.gemma4;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

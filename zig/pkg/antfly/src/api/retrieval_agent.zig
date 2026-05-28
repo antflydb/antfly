@@ -2210,7 +2210,6 @@ fn publicGeneratorConfigToGenerated(cfg: generating_openapi.GeneratorConfig) gen
             .bedrock => .bedrock,
             .anthropic => .anthropic,
             .cohere => .cohere,
-            .termite => .termite,
             .antfly => .antfly,
             .mock => .mock,
         },
@@ -2233,14 +2232,12 @@ fn generatorConfigFromGenerated(cfg: generating_openapi.GeneratorConfig) !genera
     const provider: generating.Provider = switch (cfg.provider) {
         .openai => .openai,
         .ollama => .ollama,
-        .termite => .termite,
         .antfly => .antfly,
         else => return error.UnsupportedRetrievalAgentRequest,
     };
     const model = cfg.model orelse return error.InvalidRetrievalAgentRequest;
     const url = switch (provider) {
-        .termite => cfg.api_url orelse "",
-        .antfly => "",
+        .antfly => cfg.api_url orelse "",
         .openai, .ollama => cfg.url orelse return error.InvalidRetrievalAgentRequest,
         else => return error.UnsupportedRetrievalAgentRequest,
     };
@@ -5968,7 +5965,7 @@ test "build generation messages includes tree hierarchy context" {
     }, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "local-generator",
                 .url = "http://127.0.0.1:8082",
             } },
@@ -6058,7 +6055,7 @@ test "generation messages keep only the strongest tree branches" {
     }, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "local-generator",
                 .url = "http://127.0.0.1:8082",
             } },
@@ -6115,7 +6112,7 @@ test "generation messages prefer query-relevant tree branches" {
     }, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "local-generator",
                 .url = "http://127.0.0.1:8082",
             } },
@@ -6168,7 +6165,7 @@ test "generation messages trim branch context after ancestor-first limit" {
     const messages = try buildGenerationMessages(alloc, "trim the branch", hits.items, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "local-generator",
                 .url = "http://127.0.0.1:8082",
             } },
@@ -6223,7 +6220,7 @@ test "generation messages expand branch when deeper node is query-relevant" {
     const messages = try buildGenerationMessages(alloc, "payments rollout", hits.items, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "local-generator",
                 .url = "http://127.0.0.1:8082",
             } },
@@ -6292,7 +6289,7 @@ test "generation messages can expand to a deeply relevant descendant" {
     const messages = try buildGenerationMessages(alloc, "revenue forecast", hits.items, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "local-generator",
                 .url = "http://127.0.0.1:8082",
             } },
@@ -6759,7 +6756,7 @@ test "retrieval agent supports bounded agentic mode" {
     };
 
     const body =
-        \\{"query":"How does Raft work?","stream":false,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"max_internal_iterations":3,"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"How does Raft work?","stream":false,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"max_internal_iterations":3,"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
     ;
     var runner = FakeRunner{};
     const encoded = try executeJson(std.testing.allocator, runner.ifaceWithState(), null, body);
@@ -6807,7 +6804,7 @@ test "retrieval agent agentic streaming emits tool mode" {
     };
 
     const body =
-        \\{"query":"How does Raft work?","stream":true,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"max_internal_iterations":3,"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"How does Raft work?","stream":true,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"max_internal_iterations":3,"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
     ;
     var runner = FakeRunner{};
     const encoded = try execute(std.testing.allocator, runner.ifaceWithState(), null, body);
@@ -7887,7 +7884,7 @@ test "retrieval agent supports generation step in phase 2" {
     };
 
     const body =
-        \\{"query":"find alpha","stream":false,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"find alpha","stream":false,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body);
     defer std.testing.allocator.free(encoded);
@@ -7987,7 +7984,7 @@ test "retrieval agent supports classification confidence and followup" {
     };
 
     const body =
-        \\{"query":"How does retrieval work?","stream":false,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"classification":{"enabled":true,"with_reasoning":true},"generation":{"enabled":true},"confidence":{"enabled":true},"followup":{"enabled":true,"count":3}},"queries":[{"table":"docs","semantic_search":"retrieval docs","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"How does retrieval work?","stream":false,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"classification":{"enabled":true,"with_reasoning":true},"generation":{"enabled":true},"confidence":{"enabled":true},"followup":{"enabled":true,"count":3}},"queries":[{"table":"docs","semantic_search":"retrieval docs","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body);
     defer std.testing.allocator.free(encoded);
@@ -8036,7 +8033,7 @@ test "retrieval agent supports inline eval" {
     };
 
     const body =
-        \\{"query":"Explain raft consensus in Antfly","stream":false,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true},"eval":{"evaluators":["relevance","faithfulness","precision","recall"],"judge":{"provider":"termite","model":"judge","api_url":"http://127.0.0.1:8082"},"ground_truth":{"relevant_ids":["doc:a"],"expectations":"raft consensus leader follower log replication"}}},"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"Explain raft consensus in Antfly","stream":false,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true},"eval":{"evaluators":["relevance","faithfulness","precision","recall"],"judge":{"provider":"antfly","model":"judge","api_url":"http://127.0.0.1:8082"},"ground_truth":{"relevant_ids":["doc:a"],"expectations":"raft consensus leader follower log replication"}}},"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body);
     defer std.testing.allocator.free(encoded);
@@ -8068,7 +8065,7 @@ test "retrieval agent classification can decompose multi-part queries" {
     };
 
     const body =
-        \\{"query":"Compare raft consensus and termite embeddings","stream":false,"steps":{"classification":{"enabled":true,"with_reasoning":true}},"queries":[{"table":"docs","full_text_search":{"query":"body:raft"},"limit":5}]}
+        \\{"query":"Compare raft consensus and Antfly embeddings","stream":false,"steps":{"classification":{"enabled":true,"with_reasoning":true}},"queries":[{"table":"docs","full_text_search":{"query":"body:raft"},"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, FakeRunner.iface(), null, body);
     defer std.testing.allocator.free(encoded);
@@ -8116,7 +8113,7 @@ test "retrieval agent supports fixed-body sse streaming" {
     };
 
     const body =
-        \\{"query":"find alpha","stream":true,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"find alpha","stream":true,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try execute(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body);
     defer std.testing.allocator.free(encoded.body);
@@ -8174,7 +8171,7 @@ test "retrieval agent sse emits followup events" {
     };
 
     const body =
-        \\{"query":"How does retrieval work?","stream":true,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true},"followup":{"enabled":true,"count":2}},"queries":[{"table":"docs","semantic_search":"retrieval docs","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"How does retrieval work?","stream":true,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true},"followup":{"enabled":true,"count":2}},"queries":[{"table":"docs","semantic_search":"retrieval docs","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try execute(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body);
     defer std.testing.allocator.free(encoded.body);
@@ -8214,7 +8211,7 @@ test "retrieval agent sse emits eval events" {
     };
 
     const body =
-        \\{"query":"Explain raft consensus in Antfly","stream":true,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true},"eval":{"evaluators":["relevance","faithfulness"],"ground_truth":{"expectations":"raft consensus"}}},"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"Explain raft consensus in Antfly","stream":true,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true},"eval":{"evaluators":["relevance","faithfulness"],"ground_truth":{"expectations":"raft consensus"}}},"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try execute(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body);
     defer std.testing.allocator.free(encoded.body);

@@ -29,7 +29,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const session_factory = @import("../architectures/session_factory.zig");
 const backends = @import("../backends/backends.zig");
-const tokenizer_mod = @import("termite_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 const image = @import("image.zig");
 
 pub const ReadConfig = struct {

@@ -15,7 +15,7 @@
 const std = @import("std");
 const c_file = @import("../util/c_file.zig");
 const image = @import("image.zig");
-const hf_tokenizer = @import("termite_hf_tokenizer");
+const hf_tokenizer = @import("inference_hf_tokenizer");
 const common = @import("document_shared.zig");
 pub const default_max_length: usize = 512;
 pub const default_mean = [3]f32{ 0.5, 0.5, 0.5 };

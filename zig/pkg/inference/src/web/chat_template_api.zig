@@ -58,7 +58,7 @@ pub fn renderSingleTurn(
     return chat_template.apply(allocator, messages, add_generation_prompt);
 }
 
-fn specialTokenString(hf_tok: *const @import("termite_hf_tokenizer").HfTokenizer, token_id: i32) []const u8 {
+fn specialTokenString(hf_tok: *const @import("inference_hf_tokenizer").HfTokenizer, token_id: i32) []const u8 {
     if (token_id < 0) return "";
     return hf_tok.id_to_token.get(token_id) orelse "";
 }

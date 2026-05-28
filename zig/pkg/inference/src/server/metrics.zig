@@ -56,7 +56,7 @@ pub const Metrics = struct {
         .generate_requests = prometheus.Counter(u64).init("termite_endpoint_requests_generate", .{ .help = "Generate endpoint requests" }, .{}),
         .transcribe_requests = prometheus.Counter(u64).init("termite_endpoint_requests_transcribe", .{ .help = "Transcribe endpoint requests" }, .{}),
         .read_requests = prometheus.Counter(u64).init("termite_endpoint_requests_read", .{ .help = "Read endpoint requests" }, .{}),
-        .models_loaded = prometheus.Gauge(u64).init("termite_models_loaded", .{ .help = "Number of loaded models" }, .{}),
+        .models_loaded = prometheus.Gauge(u64).init("inference_models_loaded", .{ .help = "Number of loaded models" }, .{}),
         .cache_hits = prometheus.Counter(u64).init("termite_cache_hits_total", .{ .help = "Cache hits" }, .{}),
         .cache_misses = prometheus.Counter(u64).init("termite_cache_misses_total", .{ .help = "Cache misses" }, .{}),
         .queue_depth = prometheus.Gauge(i64).init("termite_request_queue_depth", .{ .help = "Current request queue depth" }, .{}),

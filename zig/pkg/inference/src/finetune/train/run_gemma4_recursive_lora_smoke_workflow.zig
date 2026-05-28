@@ -13,10 +13,10 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite = @import("termite_internal");
+const inference = @import("inference_internal");
 const platform = @import("antfly_platform");
-const compat = termite.io.compat;
-const c_file = termite.util.c_file;
+const compat = inference.io.compat;
+const c_file = inference.util.c_file;
 
 const materialize_gemma4_recursive_base = @import("../tools/materialize_gemma4_recursive_base.zig");
 const run_gemma4_lora_pilot_workflow = @import("run_gemma4_lora_pilot_workflow.zig");

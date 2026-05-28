@@ -38,7 +38,7 @@ def test_models_has_openai_data_field(api):
         assert isinstance(model.get("id"), str), model
         assert model.get("object") == "model", model
         assert isinstance(model.get("created"), int), model
-        assert model.get("owned_by") == "termite", model
+        assert model.get("owned_by") == "antfly", model
 
 
 def test_models_exposes_gliner2_as_extractor(api):

@@ -86,7 +86,7 @@ pub const QueryPlanningContext = struct {
     ptr: *anyopaque,
     admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
     free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
 
     fn adminSnapshot(self: QueryPlanningContext) !metadata_api.AdminSnapshot {
@@ -112,7 +112,7 @@ pub fn planSemanticQuery(
 
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, table.indexes_json, .{
-        .local_termite_provider = planning.local_termite_provider,
+        .antfly_provider = planning.antfly_provider,
         .remote_content = planning.remote_content,
     });
     defer runtime.deinit();
@@ -172,7 +172,7 @@ const SemanticStatusResolver = struct {
             .ptr = self.catalog.ptr,
             .admin_snapshot = self.catalog.admin_snapshot orelse return error.UnsupportedQueryRequest,
             .free_admin_snapshot = self.catalog.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
-            .local_termite_provider = null,
+            .antfly_provider = null,
         }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
     }
 };

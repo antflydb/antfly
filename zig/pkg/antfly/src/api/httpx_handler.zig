@@ -1221,7 +1221,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const QueryBuilderGenerationRunner = struct {
-            local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
 
             fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
@@ -1242,10 +1242,10 @@ pub const AntflyApiHandler = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = QueryBuilderGenerationRunner{ .local_termite_provider = self.api_server.local_termite_provider, .secret_store = self.api_server.cfg.secret_store };
+        var generation_runner = QueryBuilderGenerationRunner{ .antfly_provider = self.api_server.antfly_provider, .secret_store = self.api_server.cfg.secret_store };
         var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
         const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
             error.InvalidQueryBuilderRequest => {
@@ -1296,7 +1296,7 @@ pub const AntflyApiHandler = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var semantic_resolver = http_server_mod.SemanticStatusResolver{ .source = runner.server.source, .local_termite_provider = runner.server.local_termite_provider };
+                var semantic_resolver = http_server_mod.SemanticStatusResolver{ .source = runner.server.source, .antfly_provider = runner.server.antfly_provider };
                 var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
@@ -1352,7 +1352,7 @@ pub const AntflyApiHandler = struct {
         };
 
         const RetrievalGenerationRunner = struct {
-            local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
@@ -1373,10 +1373,10 @@ pub const AntflyApiHandler = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.api_server.local_termite_provider, .secret_store = self.api_server.cfg.secret_store };
+        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.api_server.antfly_provider, .secret_store = self.api_server.cfg.secret_store };
 
         var query_runner = RetrievalQueryRunner{
             .server = self.api_server,

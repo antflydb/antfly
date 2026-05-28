@@ -1,6 +1,6 @@
-# Termite Quantization Layout
+# Antfly inference Quantization Layout
 
-This document describes the publishing layout used by `termite quantize` for
+This document describes the publishing layout used by `antfly inference quantize` for
 ClipClap model variants.
 
 ## Goals
@@ -75,7 +75,7 @@ Format suffixes are canonicalized to uppercase GGUF-style names such as
 By default, ClipClap quantization writes into the source model directory.
 
 ```bash
-termite quantize ~/.termite/models/antflydb/clipclap \
+antfly inference quantize ~/.antfly/inference/models/antflydb/clipclap \
   --target gguf \
   --format q4_k
 ```
@@ -83,15 +83,15 @@ termite quantize ~/.termite/models/antflydb/clipclap \
 This writes:
 
 ```text
-~/.termite/models/antflydb/clipclap/clipclap-clip.Q4_K.gguf
-~/.termite/models/antflydb/clipclap/clipclap-clap.Q4_K.gguf
-~/.termite/models/antflydb/clipclap/termite_variants.json
+~/.antfly/inference/models/antflydb/clipclap/clipclap-clip.Q4_K.gguf
+~/.antfly/inference/models/antflydb/clipclap/clipclap-clap.Q4_K.gguf
+~/.antfly/inference/models/antflydb/clipclap/termite_variants.json
 ```
 
 Use `--format none` to materialize the default F32 GGUF pair:
 
 ```bash
-termite quantize ~/.termite/models/antflydb/clipclap \
+antfly inference quantize ~/.antfly/inference/models/antflydb/clipclap \
   --target gguf \
   --format none
 ```
@@ -112,7 +112,7 @@ default model.
 For ONNX Q8:
 
 ```bash
-termite quantize ~/.termite/models/antflydb/clipclap \
+antfly inference quantize ~/.antfly/inference/models/antflydb/clipclap \
   --target onnx \
   --format q8_0
 ```
@@ -123,7 +123,7 @@ F32 ONNX files.
 `--output` stages the same single-repo layout elsewhere.
 
 ```bash
-termite quantize ~/.termite/models/antflydb/clipclap \
+antfly inference quantize ~/.antfly/inference/models/antflydb/clipclap \
   --target gguf \
   --format q4_k \
   --output /tmp/clipclap
@@ -147,7 +147,7 @@ selection without changing default loading behavior.
 The intended publishing flow is to upload the model directory itself:
 
 ```bash
-hf upload antflydb/clipclap ~/.termite/models/antflydb/clipclap .
+hf upload antflydb/clipclap ~/.antfly/inference/models/antflydb/clipclap .
 ```
 
 For large repos or interrupted uploads, use Hugging Face Hub's resumable large
@@ -155,7 +155,7 @@ folder upload command against the same directory.
 
 ## General Artifact Model
 
-Termite still separates three concerns:
+Antfly inference still separates three concerns:
 
 - Source format: where the original weights and graph came from.
 - Graph format: how execution is represented when the artifact includes a
@@ -166,7 +166,7 @@ The desired support matrix is:
 
 | Source | Emit ONNX | Emit GGUF | Emit safetensors |
 | --- | --- | --- | --- |
-| ONNX | yes | yes, when the ONNX initializers can be mapped to a Termite architecture or graph bundle | yes, for extracted initializers |
+| ONNX | yes | yes, when the ONNX initializers can be mapped to a Antfly inference architecture or graph bundle | yes, for extracted initializers |
 | GGUF | yes, when a graph/architecture wrapper exists | yes | yes, for dense dequantized export or supported packed tensors |
 | safetensors | yes, when a graph/architecture wrapper exists | yes | yes |
 
@@ -192,12 +192,12 @@ backends can fuse or keep Q8 weights resident directly.
 ## Generic CLI
 
 ```text
-termite export <model-dir> [--target onnx|gguf|safetensors] [--format <format>] [--output <path>]
-termite quantize <model-dir> [--target onnx|gguf|safetensors] [--format <q-format>] [--output <path>]
+antfly inference export <model-dir> [--target onnx|gguf|safetensors] [--format <format>] [--output <path>]
+antfly inference quantize <model-dir> [--target onnx|gguf|safetensors] [--format <q-format>] [--output <path>]
 ```
 
-`termite export` is the generic artifact conversion command. Quantization is a
-conversion option, not a separate artifact family. `termite quantize` remains as
+`antfly inference export` is the generic artifact conversion command. Quantization is a
+conversion option, not a separate artifact family. `antfly inference quantize` remains as
 a convenience/compatibility command over the same dispatcher for users who are
 explicitly asking for a quantized variant.
 
@@ -225,7 +225,7 @@ Safetensors defaults:
 - `--format dense` or `--format native` exports the source tensor bytes without
   dtype conversion
 - `--format q8_0` is accepted as the current default alias for dense export so
-  `termite quantize --target safetensors` works without extra flags
+  `antfly inference quantize --target safetensors` works without extra flags
 - `--output <source-basename>.safetensors` beside the source directory
 - graph/config/tokenizer sidecar bundling is planned; the current command emits
   one safetensors tensor artifact
@@ -233,17 +233,17 @@ Safetensors defaults:
 Examples:
 
 ```text
-termite export ~/.termite/models/antflydb/clipclap --target safetensors --dry-run
-termite export ~/.termite/models/ggml-org/gemma-4-e2b-it-gguf --target gguf --format q4_k
-termite quantize ~/.termite/models/antflydb/clipclap --target onnx --format q8_0
-termite quantize ~/.termite/models/antflydb/clipclap --target gguf --format q4_k
-termite quantize ~/.termite/models/antflydb/clipclap --target safetensors --dry-run
+antfly inference export ~/.antfly/inference/models/antflydb/clipclap --target safetensors --dry-run
+antfly inference export ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf --target gguf --format q4_k
+antfly inference quantize ~/.antfly/inference/models/antflydb/clipclap --target onnx --format q8_0
+antfly inference quantize ~/.antfly/inference/models/antflydb/clipclap --target gguf --format q4_k
+antfly inference quantize ~/.antfly/inference/models/antflydb/clipclap --target safetensors --dry-run
 ```
 
 Internally, GGUF and safetensors keep format-specific exporter modules because
 their file layouts and metadata rules differ. They are implementation details,
 not separate public commands. The public CLI should stay centered on
-`termite export` and `termite quantize`.
+`antfly inference export` and `antfly inference quantize`.
 
 ## Code Organization
 
@@ -283,14 +283,14 @@ can be exposed separately as a user or scheduler hint, for example:
 --weights q8_0
 ```
 
-If a requested quantized variant is missing, Termite can lazily derive it from
+If a requested quantized variant is missing, Antfly inference can lazily derive it from
 the dense model or fall back to dense based on policy.
 
 ## Near-Term Work
 
 1. Add runtime selection against `termite_variants.json`.
 2. Add graph/config/tokenizer sidecar bundling for safetensors exports.
-3. Add packed safetensors metadata if Termite needs q4/q5 safetensors artifacts
+3. Add packed safetensors metadata if Antfly inference needs q4/q5 safetensors artifacts
    that avoid dense expansion.
 4. Add registry/runtime selection for `--weights q8_0`, `--weights q4_k`, and
    `--weights q5_k`.

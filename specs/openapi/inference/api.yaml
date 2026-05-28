@@ -953,24 +953,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-  /version:
-    get:
-      summary: Get version information
-      description: Returns inference runtime version, git commit, build time, and Go runtime version.
-      operationId: getVersion
-      responses:
-        '200':
-          description: Version information
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/VersionResponse'
-        '400':
-          description: Bad request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
   /embeddings:
     post:
       summary: Create embeddings (OpenAI-compatible)
@@ -3164,40 +3146,6 @@ components:
           default: true
         log:
           $ref: '#/components/schemas/schemas-Config'
-    VersionResponse:
-      type: object
-      required:
-        - version
-        - git_commit
-        - build_time
-        - go_version
-      properties:
-        version:
-          type: string
-          description: inference version
-          example: v1.0.0
-        git_commit:
-          type: string
-          description: Git commit hash
-          example: abc1234
-        build_time:
-          type: string
-          description: Build timestamp
-          example: '2024-01-15T10:30:00Z'
-        go_version:
-          type: string
-          description: Go runtime version
-          example: go1.25.0
-        runtime:
-          type: string
-          description: inference runtime implementation
-          example: antfly-inference
-        backends:
-          $ref: '#/components/schemas/BackendCapabilities'
-        allow_downloads:
-          type: boolean
-          description: Whether model downloads are allowed in this deployment
-          example: true
     BackendCapabilities:
       type: object
       properties:

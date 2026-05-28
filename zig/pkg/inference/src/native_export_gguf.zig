@@ -33,8 +33,8 @@ const qwen2vl_types_mod = @import("architectures/qwen2vl_types.zig");
 const session_factory_mod = @import("architectures/session_factory.zig");
 const backends_mod = @import("backends/backends.zig");
 const weight_source_mod = @import("models/weight_source.zig");
-const hf_tokenizer_mod = @import("termite_hf_tokenizer");
-const tokenizer_mod = @import("termite_tokenizer");
+const hf_tokenizer_mod = @import("inference_hf_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 const multimodal_reranker_mod = @import("pipelines/multimodal_reranker.zig");
 const qwen2vl_multimodal_mod = @import("pipelines/qwen2vl_multimodal.zig");
 const variants_manifest = @import("quantize/variants_manifest.zig");
@@ -3254,59 +3254,59 @@ fn buildTermiteProjectorMetadataEntries(
         .value = .{ .u32 = 32 },
     });
     try entries.append(allocator, .{
-        .key = try allocator.dupe(u8, "termite.projector.kind"),
+        .key = try allocator.dupe(u8, "inference.projector.kind"),
         .value = .{ .string = try allocator.dupe(u8, "integrated-multimodal") },
     });
     try entries.append(allocator, .{
-        .key = try allocator.dupe(u8, "termite.projector.source_architecture"),
+        .key = try allocator.dupe(u8, "inference.projector.source_architecture"),
         .value = .{ .string = try allocator.dupe(u8, archStringForConfig(manifest, config)) },
     });
 
     if (config.mm_tokens_per_image > 0) {
         try entries.append(allocator, .{
-            .key = try allocator.dupe(u8, "termite.projector.mm_tokens_per_image"),
+            .key = try allocator.dupe(u8, "inference.projector.mm_tokens_per_image"),
             .value = .{ .u32 = config.mm_tokens_per_image },
         });
     }
     if (config.hidden_size > 0) {
         try entries.append(allocator, .{
-            .key = try allocator.dupe(u8, "termite.projector.text_hidden_size"),
+            .key = try allocator.dupe(u8, "inference.projector.text_hidden_size"),
             .value = .{ .u32 = config.hidden_size },
         });
     }
     if (config.vision_hidden_size > 0) {
         try entries.append(allocator, .{
-            .key = try allocator.dupe(u8, "termite.projector.vision_hidden_size"),
+            .key = try allocator.dupe(u8, "inference.projector.vision_hidden_size"),
             .value = .{ .u32 = config.vision_hidden_size },
         });
     }
     if (config.vision_num_hidden_layers > 0) {
         try entries.append(allocator, .{
-            .key = try allocator.dupe(u8, "termite.projector.vision_block_count"),
+            .key = try allocator.dupe(u8, "inference.projector.vision_block_count"),
             .value = .{ .u32 = config.vision_num_hidden_layers },
         });
     }
     if (config.vision_num_attention_heads > 0) {
         try entries.append(allocator, .{
-            .key = try allocator.dupe(u8, "termite.projector.vision_attention_head_count"),
+            .key = try allocator.dupe(u8, "inference.projector.vision_attention_head_count"),
             .value = .{ .u32 = config.vision_num_attention_heads },
         });
     }
     if (config.vision_intermediate_size > 0) {
         try entries.append(allocator, .{
-            .key = try allocator.dupe(u8, "termite.projector.vision_feed_forward_length"),
+            .key = try allocator.dupe(u8, "inference.projector.vision_feed_forward_length"),
             .value = .{ .u32 = config.vision_intermediate_size },
         });
     }
     if (config.vision_image_size > 0) {
         try entries.append(allocator, .{
-            .key = try allocator.dupe(u8, "termite.projector.vision_image_size"),
+            .key = try allocator.dupe(u8, "inference.projector.vision_image_size"),
             .value = .{ .u32 = config.vision_image_size },
         });
     }
     if (config.vision_patch_size > 0) {
         try entries.append(allocator, .{
-            .key = try allocator.dupe(u8, "termite.projector.vision_patch_size"),
+            .key = try allocator.dupe(u8, "inference.projector.vision_patch_size"),
             .value = .{ .u32 = config.vision_patch_size },
         });
     }
@@ -5693,11 +5693,11 @@ test "multimodal export synthesizes projector gguf from integrated tensors" {
     defer projector_parsed.deinit(allocator);
     const projector_view = gguf_mod.metadata.View.init(&projector_parsed);
     try std.testing.expectEqualStrings("termite-projector", projector_view.getString("general.architecture").?);
-    try std.testing.expectEqualStrings("integrated-multimodal", projector_view.getString("termite.projector.kind").?);
-    try std.testing.expectEqualStrings("gemma3", projector_view.getString("termite.projector.source_architecture").?);
-    try std.testing.expectEqual(@as(u64, 2), projector_view.getU64("termite.projector.mm_tokens_per_image").?);
-    try std.testing.expectEqual(@as(u64, 8), projector_view.getU64("termite.projector.vision_hidden_size").?);
-    try std.testing.expectEqual(@as(u64, 14), projector_view.getU64("termite.projector.vision_patch_size").?);
+    try std.testing.expectEqualStrings("integrated-multimodal", projector_view.getString("inference.projector.kind").?);
+    try std.testing.expectEqualStrings("gemma3", projector_view.getString("inference.projector.source_architecture").?);
+    try std.testing.expectEqual(@as(u64, 2), projector_view.getU64("inference.projector.mm_tokens_per_image").?);
+    try std.testing.expectEqual(@as(u64, 8), projector_view.getU64("inference.projector.vision_hidden_size").?);
+    try std.testing.expectEqual(@as(u64, 14), projector_view.getU64("inference.projector.vision_patch_size").?);
 
     const projector_catalog = gguf_mod.tensor_catalog.Catalog.init(&projector_parsed);
     const vision_ln = projector_catalog.find("vision_tower.vision_model.post_layernorm.weight").?;
@@ -8031,15 +8031,15 @@ fn writeMinimalProjectorFixture(
     };
     const termite_metadata = [_]gguf_mod.format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "termite-projector" } },
-        .{ .key = "termite.projector.source_architecture", .value = .{ .string = "gemma3" } },
-        .{ .key = "termite.projector.text_hidden_size", .value = .{ .u32 = 4 } },
-        .{ .key = "termite.projector.vision_hidden_size", .value = .{ .u32 = 8 } },
-        .{ .key = "termite.projector.vision_feed_forward_length", .value = .{ .u32 = 16 } },
-        .{ .key = "termite.projector.vision_block_count", .value = .{ .u32 = 3 } },
-        .{ .key = "termite.projector.vision_attention_head_count", .value = .{ .u32 = 4 } },
-        .{ .key = "termite.projector.vision_image_size", .value = .{ .u32 = 224 } },
-        .{ .key = "termite.projector.vision_patch_size", .value = .{ .u32 = 14 } },
-        .{ .key = "termite.projector.mm_tokens_per_image", .value = .{ .u32 = 256 } },
+        .{ .key = "inference.projector.source_architecture", .value = .{ .string = "gemma3" } },
+        .{ .key = "inference.projector.text_hidden_size", .value = .{ .u32 = 4 } },
+        .{ .key = "inference.projector.vision_hidden_size", .value = .{ .u32 = 8 } },
+        .{ .key = "inference.projector.vision_feed_forward_length", .value = .{ .u32 = 16 } },
+        .{ .key = "inference.projector.vision_block_count", .value = .{ .u32 = 3 } },
+        .{ .key = "inference.projector.vision_attention_head_count", .value = .{ .u32 = 4 } },
+        .{ .key = "inference.projector.vision_image_size", .value = .{ .u32 = 224 } },
+        .{ .key = "inference.projector.vision_patch_size", .value = .{ .u32 = 14 } },
+        .{ .key = "inference.projector.mm_tokens_per_image", .value = .{ .u32 = 256 } },
     };
     const metadata: []const gguf_mod.format.MetadataEntry = switch (format) {
         .clip => &clip_metadata,

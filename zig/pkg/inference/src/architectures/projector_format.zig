@@ -44,7 +44,7 @@ pub fn detectFile(file: *const gguf_format.File) Kind {
     const arch = view.getString("general.architecture") orelse return .unknown;
 
     if (std.mem.eql(u8, arch, "termite-projector")) {
-        const source_arch = view.getString("termite.projector.source_architecture") orelse return .unknown;
+        const source_arch = view.getString("inference.projector.source_architecture") orelse return .unknown;
         if (std.mem.eql(u8, source_arch, "gemma3")) return .termite_gemma3;
         return .unknown;
     }
@@ -85,7 +85,7 @@ test "detect termite gemma3 projector" {
 
     const metadata = [_]gguf_mod.format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "termite-projector" } },
-        .{ .key = "termite.projector.source_architecture", .value = .{ .string = "gemma3" } },
+        .{ .key = "inference.projector.source_architecture", .value = .{ .string = "gemma3" } },
     };
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);

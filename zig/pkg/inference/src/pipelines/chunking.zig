@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const chunker = @import("termite_chunker");
+const chunker = @import("inference_chunker");
 
 pub const Chunk = struct {
     text: []const u8,

@@ -1,10 +1,10 @@
-# WASM + WebGPU Backend for Termite-Zig
+# WASM + WebGPU Backend for Antfly inference-Zig
 
 ## Context
 
-Termite-zig is a Zig ML inference engine with a clean backend abstraction: `ComputeBackend` VTable in `src/ops/ops.zig` (~35 required ops) and `Session` VTable in `src/backends/session.zig`. Model architectures (BERT, T5, GPT) call ops through the VTable without knowing the backend. Currently three backends exist: BLAS (CPU), MLX (Metal/Apple Silicon), ONNX (runtime).
+Antfly inference-zig is a Zig ML inference engine with a clean backend abstraction: `ComputeBackend` VTable in `src/ops/ops.zig` (~35 required ops) and `Session` VTable in `src/backends/session.zig`. Model architectures (BERT, T5, GPT) call ops through the VTable without knowing the backend. Currently three backends exist: BLAS (CPU), MLX (Metal/Apple Silicon), ONNX (runtime).
 
-Goal: enable termite to run in the browser via WASM, with WASM SIMD as the foundation and WebGPU compute shaders as an acceleration layer. Client-side embedding, reranking, and eventually generation without a server.
+Goal: enable antfly inference to run in the browser via WASM, with WASM SIMD as the foundation and WebGPU compute shaders as an acceleration layer. Client-side embedding, reranking, and eventually generation without a server.
 
 ## Architecture: WASM SIMD Foundation + WebGPU Acceleration
 
@@ -24,11 +24,11 @@ This means the WASM build works without WebGPU at all — WebGPU just makes it f
 ## Shared GGUF Quant Dispatch Target
 
 WebGPU should use the same ggml-shaped GGUF quantized matmul dispatch model as
-Metal and CUDA. This means Termite owns the generic dispatch policy in Zig; the
+Metal and CUDA. This means Antfly inference owns the generic dispatch policy in Zig; the
 browser backend only maps that selected operation to WGSL pipelines.
 
 The target is not to link or port `libggml` into the browser runtime. The target
-is to mirror ggml's useful execution shape inside Termite:
+is to mirror ggml's useful execution shape inside Antfly inference:
 
 - GGUF tensor type and block layout come from `src/gguf/`.
 - A backend-agnostic selector maps
@@ -48,9 +48,9 @@ The browser WebGPU backend and a native Dawn backend should share the same
 shader vocabulary and graph planning model, but they are different runtime
 targets:
 
-- browser WebGPU: `-Dwasm=true -Dwebgpu=true`, Termite runs as WASM and imports
+- browser WebGPU: `-Dwasm=true -Dwebgpu=true`, Antfly inference runs as WASM and imports
   synchronous-looking `webgpu` functions supplied by JavaScript
-- native Dawn WebGPU: Termite stays a native binary and links Dawn's WebGPU C
+- native Dawn WebGPU: Antfly inference stays a native binary and links Dawn's WebGPU C
   API, using Dawn to target Metal, Vulkan, or D3D12 under the hood
 
 Do not link Chromium into the `termite` binary for this path. Chromium/Electron
@@ -59,7 +59,7 @@ directly.
 
 ### Goals
 
-- Add `termite --backend webgpu` for native builds when Dawn is linked.
+- Add `antfly inference --backend webgpu` for native builds when Dawn is linked.
 - Reuse existing WGSL kernels from `web/shaders/`.
 - Reuse existing `.webgpu` graph capability and partition-planning logic where
   possible.
@@ -112,8 +112,8 @@ Files to update:
 Preferred user surface:
 
 ```text
-termite generate MODEL "prompt" --backend webgpu
-termite embed MODEL --text "hello" --backend webgpu
+antfly inference generate MODEL "prompt" --backend webgpu
+antfly inference embed MODEL --text "hello" --backend webgpu
 ```
 
 If ambiguity between WASM and native backends becomes confusing, add
@@ -334,7 +334,7 @@ Phases 1–7 are fully implemented and working. The WASM SIMD backend runs BERT 
 | 4. WASM ComputeBackend | `src/ops/wasm_compute.zig` — full `ComputeBackend` VTable with 30+ ops. Weight storage via `StringHashMap`. |
 | 5. Buffer-backed weights | Weight loading from in-memory `[]const u8` buffers in the wasm export shims. Supports SafeTensors (f32/f16/bf16) and GGUF (f32/f16 + quantized via `quant_codec`). |
 | 6. WASM entry point | `src/wasm_entry_wasm32.zig` / `src/wasm_entry_wasm64.zig` — profile roots that import the shared export shims. |
-| 7. JS glue | `web/termite-web.js` — `TermiteWeb` class with high-level async API. |
+| 7. JS glue | `web/inference-web.js` — `InferenceWeb` class with high-level async API. |
 
 **WASM exports:**
 
@@ -354,10 +354,10 @@ Phases 1–7 are fully implemented and working. The WASM SIMD backend runs BERT 
 | `unload_tokenizer` | Free tokenizer resources |
 | `rerank` | BERT forward + classifier head + sigmoid/softmax scoring |
 
-**JS API (`TermiteWeb`):**
+**JS API (`InferenceWeb`):**
 
 ```javascript
-const t = new TermiteWeb();
+const t = new InferenceWeb();
 await t.init();                          // load WASM module
 const model = await t.loadModel(source); // File, Uint8Array, or URL
 const tok = await t.loadTokenizer(src);  // tokenizer.json
@@ -371,7 +371,7 @@ t.unloadTokenizer(tok);
 ```
 
 **Browser demo:** `web/index.html` is now a directory-first browser page. It supports:
-- local decoder GGUF bundles from a picked `~/.termite/models` directory
+- local decoder GGUF bundles from a picked `~/.antfly/inference/models` directory
 - local Hugging Face SafeTensors GPT bundles (`config.json` + `tokenizer.json` + `model.safetensors`)
 - local T5/MT5/LongT5 text-to-text bundles
 - local BERT-style encoder bundles for single-text embeddings
@@ -381,14 +381,14 @@ The page derives GGUF config/tokenizer/chat-template metadata when available, lo
 
 For browser worker-mode WebGPU, serve `pkg/inference/web` with COOP/COEP headers. A minimal local helper lives at `web/dev-server.mjs`; run `node web/dev-server.mjs` from `pkg/inference` and open `http://localhost:8000/index.html`.
 
-**Projector support status:** the web runtime now has in-memory GGUF projector plumbing too: `tensor_store.GgufStore` can own GGUF bytes directly, the web runtime has projector handle slots, `projector_format` can classify projector bytes without a filesystem path, and `TermiteWeb` exposes direct-mode projector helpers:
+**Projector support status:** the web runtime now has in-memory GGUF projector plumbing too: `tensor_store.GgufStore` can own GGUF bytes directly, the web runtime has projector handle slots, `projector_format` can classify projector bytes without a filesystem path, and `InferenceWeb` exposes direct-mode projector helpers:
 - `loadProjectorGguf(...)` / `unloadProjector(...)`
 - `gptProjectorVisionEncode(...)` for external Gemma 3 projector image tokens
 - `gptProjectorImageEncode(...)` for external Gemma 4 image projectors
 - `gptProjectorAudioEncode(...)` for external Gemma 4 audio projectors
 - `gptGenerateMultimodalGemma4(...)` for projector-backed Gemma 4 image/audio multimodal prefill + decode
 
-Those projector helpers are now wired through the web worker path too, so `TermiteWeb({ worker: true })` can load projector GGUFs and run projector-backed Gemma 3 / Gemma 4 multimodal encode + generation RPCs instead of being limited to direct mode.
+Those projector helpers are now wired through the web worker path too, so `InferenceWeb({ worker: true })` can load projector GGUFs and run projector-backed Gemma 3 / Gemma 4 multimodal encode + generation RPCs instead of being limited to direct mode.
 
 `web/index.html` now uses that surface for local discovered GGUF bundles with external `mmproj` sidecars:
 - external Gemma 3 projector + image generation
@@ -423,7 +423,7 @@ Without `-Dwebgpu=true`, the binary has no WebGPU imports and runs pure SIMD. Wi
 | `src/ops/wasm_extern.zig` | Zig extern declarations for WebGPU JS bridge (`gpu_attention`, etc.) |
 | `src/ops/wasm_compute.zig` | Threshold routing in linear/attention ops, `gpuSgemmTransB` + `gpuAttention` helpers |
 | `web/webgpu-ops.js` | `WebGPUOps` class — device init, shader compilation, compute dispatch, worker command handler |
-| `web/termite-web.js` | `TermiteWeb` class — direct mode + worker mode with sync GPU downloads |
+| `web/inference-web.js` | `InferenceWeb` class — direct mode + worker mode with sync GPU downloads |
 | `web/inference-worker.js` | Web Worker that runs WASM with sync GPU downloads via `SharedArrayBuffer` + `Atomics.wait()` |
 | `web/shaders/matmul.wgsl` | Tiled 16×16 matmul: `C[M,N] = A[M,K] @ B[K,N]` |
 | `web/shaders/matmul_transb.wgsl` | Tiled 16×16 matmul with B transposed (used by BERT linear layers) |
@@ -465,12 +465,12 @@ gpu_download(id, ptr, size)
 
 ```javascript
 import { WebGPUOps } from './webgpu-ops.js';
-import { TermiteWeb } from './termite-web.js';
+import { InferenceWeb } from './inference-web.js';
 
 const gpu = new WebGPUOps();
 await gpu.init();
 
-const t = new TermiteWeb();
+const t = new InferenceWeb();
 await t.init('termite.wasm', { gpu, worker: true });
 
 const model = await t.loadModel('model.gguf', config);
@@ -480,7 +480,7 @@ const emb = await t.embed(model, ids, mask, 1, 128);  // async in worker mode
 **Direct mode (no worker, SIMD only) still works:**
 
 ```javascript
-const t = new TermiteWeb();
+const t = new InferenceWeb();
 await t.init('termite.wasm');  // no gpu, no worker — pure SIMD
 const emb = t.embed(model, ids, mask, 1, 128);  // sync
 ```
@@ -575,7 +575,7 @@ Optional support for running ONNX-only models (e.g. mxbai-rerank-base-v1) alongs
 
 ```javascript
 import * as ort from 'onnxruntime-web';
-const t = new TermiteWeb();
+const t = new InferenceWeb();
 await t.init('termite.wasm');
 await t.initOnnx(ort, { wasmPaths: '/wasm/' });
 const session = await t.loadOnnxModel('reranker.onnx', {
@@ -889,7 +889,7 @@ Architecture code (`bert.zig`, `clip.zig`, `whisper.zig`, `clap.zig`, `florence.
 | `src/web/exports_wasm64.zig` | wasm64 profile shim over the shared export surface |
 | `src/ops/wasm_compute.zig` | ComputeBackend VTable — all ops via WASM SIMD, optional GPU dispatch |
 | `src/ops/wasm_extern.zig` | Extern declarations for WebGPU JS bridge (matmul, attention, causal attention, cross attention) |
-| `web/termite-web.js` | JS glue, `TermiteWeb` class — direct/worker mode, all model APIs, optional ONNX |
+| `web/inference-web.js` | JS glue, `InferenceWeb` class — direct/worker mode, all model APIs, optional ONNX |
 | `web/test-wasm-path.mjs` | Shared test helper for resolving `termite-wasm32.wasm` / `termite-wasm64.wasm` with legacy fallback |
 | `web/test-wasm-runtime.mjs` | Shared Node test helper for ABI-safe WASM instantiation, alloc/free, and typed-array access |
 | `web/webgpu-ops.js` | `WebGPUOps` class — device init, 5 shader pipelines, compute dispatch, worker handler |
@@ -1105,7 +1105,7 @@ The JS host should not directly assume:
 - sizes are always `u32`
 - typed-array views can always be built the same way
 
-Instead, `termite-web.js` should eventually route through ABI adapters:
+Instead, `inference-web.js` should eventually route through ABI adapters:
 
 - `abi32.js`
 - `abi64.js`
@@ -1115,7 +1115,7 @@ Responsibilities:
 - normalize `number` vs `bigint`
 - hide `wasm_alloc` / `wasm_dealloc` wire details
 - centralize memory-view construction and growth handling
-- isolate `wasm32` / `wasm64` calling differences from the public `TermiteWeb` API
+- isolate `wasm32` / `wasm64` calling differences from the public `InferenceWeb` API
 
 #### Loader split: buffered vs streaming
 
@@ -1155,9 +1155,9 @@ Current status:
 - host-facing buffer-length conversion is now centralized in `src/web/host_abi.zig`, and the main JS-facing pointer/slice exports in `src/wasm_entry.zig` now route host buffer lengths through `HostSize` instead of hardcoded `u32`
 - tokenizer semantics and early task-specific execution paths have started moving out of `src/wasm_entry.zig` into `src/web/audio_api.zig`, `src/web/tokenizer_api.zig`, `src/web/bert_api.zig`, `src/web/rerank_api.zig`, `src/web/gliner_api.zig`, `src/web/clip_api.zig`, `src/web/whisper_api.zig`, `src/web/clap_api.zig`, `src/web/florence_api.zig`, and `src/web/t5_api.zig`
 - shared SafeTensors conversion and registration logic is now centralized in `src/web/weight_loader.zig`
-- JS host ABI adaptation is now centralized in `web/runtime/wasm-abi.js` and wired through the current `termite-web.js` and `inference-worker.js` host surface, including generic model loading, GPT, tokenizer, rerank, GLiNER, CLIP, Whisper, CLAP, Florence, T5, and multimodal vision paths
+- JS host ABI adaptation is now centralized in `web/runtime/wasm-abi.js` and wired through the current `inference-web.js` and `inference-worker.js` host surface, including generic model loading, GPT, tokenizer, rerank, GLiNER, CLIP, Whisper, CLAP, Florence, T5, and multimodal vision paths
 - WebGPU host imports now explicitly coerce host pointers/sizes to JS-safe indices instead of assuming raw `wasm32` numbers
-- the Termite wasm root now provides freestanding `PATH_MAX` / `NAME_MAX` overrides for Zig stdlib code that already consults `root.os`
+- the Antfly inference wasm root now provides freestanding `PATH_MAX` / `NAME_MAX` overrides for Zig stdlib code that already consults `root.os`
 - shared wasm runtime state / cache state access and GPU KV-format parsing are now centralized in `src/web/entry_context.zig`
 - generic BERT GGUF / SafeTensors load and embedding now route through `src/web/bert_api.zig`, and CLIP / GLiNER model loading now route through their helper modules
 - GPT decoder-only loading / registration / forward / cached-forward / multimodal forward has started moving out of `src/wasm_entry.zig` into `src/web/gpt_api.zig`
@@ -1165,13 +1165,13 @@ Current status:
 - the export surface is now split into `src/web/exports_core.zig` and `src/web/exports_generation.zig`, with `src/wasm_entry.zig` reduced to a thin freestanding root that imports those shims
 - build-time profile selection now uses explicit `src/wasm_entry_wasm32.zig` / `src/wasm_entry_wasm64.zig` roots and `src/web/exports_wasm32.zig` / `src/web/exports_wasm64.zig` shims instead of a single generic root
 - the build now emits `zig-out/bin/termite-wasm32.wasm` and `zig-out/bin/termite-wasm64.wasm`; the `wasm32` build also installs `zig-out/bin/termite.wasm` as a compatibility alias
-- `web/termite-web.js` and `web/inference-worker.js` now understand profile-specific artifact names, default `wasmMemoryModel` to `auto`, probe `memory64` support before instantiation, and fall back from `termite-wasm64.wasm` / `termite-wasm32.wasm` to legacy `termite.wasm`
-- the local Node-based wasm tests now share `web/test-wasm-path.mjs`, which resolves profile-specific artifacts first and can be steered with `TERMITE_WASM_MEMORY_MODEL=wasm32|wasm64`
+- `web/inference-web.js` and `web/inference-worker.js` now understand profile-specific artifact names, default `wasmMemoryModel` to `auto`, probe `memory64` support before instantiation, and fall back from `termite-wasm64.wasm` / `termite-wasm32.wasm` to legacy `termite.wasm`
+- the local Node-based wasm tests now share `web/test-wasm-path.mjs`, which resolves profile-specific artifacts first and can be steered with `ANTFLY_INFERENCE_WASM_MEMORY_MODEL=wasm32|wasm64`
 - the raw Node tests now share `web/test-wasm-runtime.mjs`, including `test-wasm.mjs`, `test-t5-wasm.mjs`, `test-mt5-wasm.mjs`, `test-rerank-wasm.mjs`, `test-gpt-wasm.mjs`, `test-gliner-wasm.mjs`, `test-clip-wasm.mjs`, `test-whisper-wasm.mjs`, `test-clap-wasm.mjs`, `test-florence-wasm.mjs`, `test-gemma3-q4-wasm.mjs`, and `test-gemma3-vision-wasm.mjs`, so their alloc/free, pointer sizes, and typed-array views are ABI-safe for both `wasm32` and `wasm64`
-- `web/runtime/safetensors-stream.js` now provides the true header-first SafeTensors streaming path for `streamLoadGptModel()`, and both `web/termite-web.js` and `web/inference-worker.js` use it to register one weight at a time from the fetch stream instead of concatenating the entire file before load
+- `web/runtime/safetensors-stream.js` now provides the true header-first SafeTensors streaming path for `streamLoadGptModel()`, and both `web/inference-web.js` and `web/inference-worker.js` use it to register one weight at a time from the fetch stream instead of concatenating the entire file before load
 - `web/runtime/gguf-stream.js` now provides the matching header-first GGUF streaming path for `streamLoadGgufModel()`, backed by the new `register_weight_gguf` export so quantized GGUF tensors can be registered incrementally in direct mode or worker mode
 - streamed GGUF tensor ingestion no longer requires a full JS `Uint8Array` for each tensor: the loader now allocates the tensor buffer directly in WASM, streams file chunks into that buffer, and finalizes registration with `register_weight_gguf_owned`
-- non-streamed tokenizer loading can now derive Hugging Face tokenizer state directly from GGUF metadata through `load_tokenizer_gguf`, and `web/termite-web.js` / `web/inference-worker.js` route `loadTokenizer(..., { format: 'gguf' })` through that path
+- non-streamed tokenizer loading can now derive Hugging Face tokenizer state directly from GGUF metadata through `load_tokenizer_gguf`, and `web/inference-web.js` / `web/inference-worker.js` route `loadTokenizer(..., { format: 'gguf' })` through that path
 - streamed GGUF loading now parses tokenizer-related header metadata in `web/runtime/gguf-stream.js` and surfaces `{ tokenizerJson, chatTemplate }` through `streamLoadGgufModel(..., { onMetadata })`; `streamLoadGgufModel(..., { autoLoadTokenizer: true, onTokenizerLoaded })` can now also install that tokenizer automatically without a second whole-file fetch
 - the web runtime now exposes `gguf_chat_template` and `render_chat_prompt`, so direct mode and worker mode can extract a GGUF chat template and render a single-turn system/user prompt through Zig's existing Jinja chat-template engine instead of relying on raw prompt text
 - GPU-resident weights have now started as an explicit runtime feature: `WasmCompute` now owns a `GpuWeightStore`, WebGPU-enabled registration eagerly uploads those weights during model load, and the WebGPU matmul / LayerNorm / RMSNorm paths now reuse those resident GPU buffers instead of re-uploading long-lived `B`, `gamma`, and `beta` tensors on every dispatch
@@ -1209,7 +1209,7 @@ That keeps the current `wasm32` path stable while creating a real seam for futur
 13. ~~**f16 weight storage**~~ ✅ Done — on-the-fly dequant, halves memory
 14. ~~**Quantized GPU kernels**~~ ✅ Done — Q4_0/Q8_0 WGSL dequant shaders + CPU fallback
 15. ~~**KV cache**~~ ✅ Done — O(1) per-token decode, 3-5x speedup
-16. ~~**Weight streaming**~~ ✅ Done — `create_model_gpt` + `register_weight` plus true header-first SafeTensors streaming in `web/termite-web.js`
+16. ~~**Weight streaming**~~ ✅ Done — `create_model_gpt` + `register_weight` plus true header-first SafeTensors streaming in `web/inference-web.js`
 17. ~~**Tiled quantized matmul**~~ ✅ Done — 16x16x32 shared memory tiling for Q4_0/Q8_0
 18. ~~**WebGPU GQA attention**~~ ✅ Done — GPU-accelerated grouped-query attention
 19. ~~**GPU-resident KV cache**~~ ✅ Done — persistent GPU buffers, incremental K/V upload
@@ -1283,8 +1283,8 @@ The browser demo now has a minimal Electron shell under `pkg/inference/electron/
 Current behavior:
 
 - Electron serves the same web assets behind a local loopback HTTP server with `COOP/COEP` enabled, so the page can use the `worker + WebGPU` runtime path without the browser-dev-server setup
-- the preload bridge exposes the default local models directory (`~/.termite/models`), a directory chooser, and recursive model-file scanning to the page
-- the page now detects that Electron bridge and auto-scans `~/.termite/models` on startup, then loads discovered local GGUF / HF SafeTensors bundles by local file URL instead of browser `FileSystemHandle`
+- the preload bridge exposes the default local models directory (`~/.antfly/inference/models`), a directory chooser, and recursive model-file scanning to the page
+- the page now detects that Electron bridge and auto-scans `~/.antfly/inference/models` on startup, then loads discovered local GGUF / HF SafeTensors bundles by local file URL instead of browser `FileSystemHandle`
 - the local loopback file endpoint supports HTTP byte ranges, so GGUF metadata probing in the page can read just the front of a large local model instead of fetching the entire file before streamed load starts
 
 Run:
@@ -1311,7 +1311,7 @@ The current Electron shell is intentionally thin. It exists to give the existing
    - `node --max-old-space-size=4096 web/test-mt5-wasm.mjs` — mT5-small encoder + decoder + greedy generation
    - `node --max-old-space-size=8192 web/test-gemma3-vision-wasm.mjs` — Gemma3 vision encode + multimodal forward + cached generation
    - `node --max-old-space-size=4096 web/test-gemma3-q4-wasm.mjs` — Gemma3-2B Q4_0 GGUF load + cached forward + generation
-   - `node web/test-model-discovery.mjs` — local `~/.termite/models` bundle discovery/classification coverage for GGUF + `mmproj`, HF GPT/T5/Whisper/GLiNER/REBEL/encoder/CLIP, and unsupported HF bundles
+   - `node web/test-model-discovery.mjs` — local `~/.antfly/inference/models` bundle discovery/classification coverage for GGUF + `mmproj`, HF GPT/T5/Whisper/GLiNER/REBEL/encoder/CLIP, and unsupported HF bundles
    - `node web/test-page-behavior.mjs` — page-level multimodal action-label, media-availability, prompt-expansion, and integrated image-offset logic coverage
    - `node web/test-page-controller.mjs` — page-level source-mode and load-button/controller-state coverage for local bundles vs remote GGUF URL mode
    - `node web/test-page-prompt.mjs` — page-level loaded-mode prompt-meta and chat-template-control coverage for unloaded, encoder, GLiNER extraction, REBEL relation extraction, seq2seq, Whisper transcription, and generate/chat-template states

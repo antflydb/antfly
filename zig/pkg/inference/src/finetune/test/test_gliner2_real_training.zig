@@ -40,31 +40,31 @@
 const std = @import("std");
 const ml = @import("ml");
 const platform = @import("antfly_platform");
-const termite = @import("termite_internal");
+const inference = @import("inference_internal");
 
 const Graph = ml.graph.Graph;
 const Builder = ml.graph.Builder;
 const NodeId = ml.graph.NodeId;
 const Shape = ml.graph.Shape;
 
-const deberta_graph = termite.architectures.deberta_graph;
-const native_compute_mod = termite.native_compute.native;
+const deberta_graph = inference.architectures.deberta_graph;
+const native_compute_mod = inference.native_compute.native;
 const NativeCompute = native_compute_mod.NativeCompute;
 const WeightStore = native_compute_mod.WeightStore;
-const ops_mod = termite.ops;
+const ops_mod = inference.ops;
 const CT = ops_mod.CT;
 const ComputeBackend = ops_mod.ComputeBackend;
 
-const real_autodiff = termite.finetune.real_autodiff_trainer;
-const gliner2_autodiff = termite.finetune.gliner2_real_autodiff;
-const gliner2_bundle = termite.finetune.gliner2;
-const gliner2_data = termite.finetune.gliner2_data;
-const weight_source_mod = termite.models.weight_source;
-const safetensors = termite.models.safetensors;
+const real_autodiff = inference.finetune.real_autodiff_trainer;
+const gliner2_autodiff = inference.finetune.gliner2_real_autodiff;
+const gliner2_bundle = inference.finetune.gliner2;
+const gliner2_data = inference.finetune.gliner2_data;
+const weight_source_mod = inference.models.weight_source;
+const safetensors = inference.models.safetensors;
 const SafetensorsSource = weight_source_mod.SafetensorsSource;
 const LoadedWeight = weight_source_mod.LoadedWeight;
-const Tensor = termite.backends.Tensor;
-const compat = termite.io.compat;
+const Tensor = inference.backends.Tensor;
+const compat = inference.io.compat;
 
 const model_dir_env = "TERMITE_GLINER2_REAL_MODEL_DIR";
 const ner_data_env = "TERMITE_GLINER2_REAL_NER_JSONL";

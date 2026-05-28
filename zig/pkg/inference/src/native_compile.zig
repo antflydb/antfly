@@ -998,7 +998,7 @@ fn refreshWholeModelPackageManifest(
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".termite.json")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".inference.json")) continue;
 
         const candidate_path = try std.fs.path.join(allocator, &.{ artifact_dir, entry.name });
         defer allocator.free(candidate_path);

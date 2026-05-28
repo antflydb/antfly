@@ -399,7 +399,7 @@
   </div>
 
   <script type="module">
-    import { TermiteWeb } from './termite-web.js';
+    import { InferenceWeb } from './inference-web.js';
     import {
       basename,
       buildDiscoveredModelEntries,
@@ -438,7 +438,7 @@
     import { computePromptModeState } from './runtime/page-prompt.js';
     import { computeLoadWarnings, computeMetricEntries } from './runtime/page-summary.js';
 
-    const termite = new TermiteWeb();
+    const termite = new InferenceWeb();
 
     const modelFileInput = document.getElementById('modelFile');
     const discoveredModelInput = document.getElementById('discoveredModel');

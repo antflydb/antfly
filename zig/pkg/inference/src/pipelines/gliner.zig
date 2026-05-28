@@ -27,7 +27,7 @@
 
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
-const Tokenizer = @import("termite_tokenizer").Tokenizer;
+const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Tensor = backends.Tensor;
 const runtime = @import("../runtime/root.zig");
 

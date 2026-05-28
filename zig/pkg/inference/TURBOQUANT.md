@@ -34,7 +34,7 @@ Primary references:
 
 ## Current State
 
-Termite already has the substrate needed for this work:
+Antfly inference already has the substrate needed for this work:
 
 | Area | Current file | Notes |
 |------|--------------|-------|
@@ -494,7 +494,7 @@ Status:
 - Done: Chrome browser rerun after the WebGPU projection hoist reported
   `baseBytes=48`, `residualBytes=8`, `totalBytes=56`,
   `maxAbs=1.490116e-7`, `rms=4.972192e-8`, `worstIndex=5`, and `PASS`.
-- Done: local `termite generate` smoke on GPT-2 with native `--cache-dtype
+- Done: local `antfly inference generate` smoke on GPT-2 with native `--cache-dtype
   turbo3` generated 64 tokens with `prefill=90 ms`, `decode=3731 ms`, and
   `generate=3822 ms`, or about `17.15 decode tokens/sec`. A matching native
   f32 run generated 64 tokens with `decode=4008 ms`, or about
@@ -506,41 +506,41 @@ Status:
   run generated 64 tokens with `decode=2449 ms`, or about
   `26.13 decode tokens/sec`.
 - Done: dense MLX decode now defaults to a full decoder-stack eval stride,
-  with `TERMITE_DENSE_DECODE_EVAL_STRIDE` as a rollback/tuning knob. On local
+  with `ANTFLY_INFERENCE_DENSE_DECODE_EVAL_STRIDE` as a rollback/tuning knob. On local
   GPT-2 MLX generate, the explicit eval count for 64 tokens dropped from `384`
   to `69`; f32 decode improved from `2449 ms` to `2209 ms`, and `turbo3`
   improved from `2886 ms` to `2081 ms`.
 - Done: dense MLX decode now defaults to no explicit decoder-layer evals,
   letting the final token read force evaluation of the lazy full-stack graph.
-  `TERMITE_DENSE_DECODE_EVAL_STRIDE=2` restores the old dense-decode barrier
+  `ANTFLY_INFERENCE_DENSE_DECODE_EVAL_STRIDE=2` restores the old dense-decode barrier
   cadence, and positive values keep the layer-group tuning path available.
   Local GPT-2 MLX generate with the new default reported `eval_count=6`; f32
   decode was `2222 ms`, while `turbo3` decode improved to `1459 ms`, or about
   `43.9 decode tokens/sec`.
 - Done: added an experimental MLX greedy decode token path behind
-  `TERMITE_MLX_GREEDY_DEVICE_DECODE=1`. It uses the backend argmax path after
+  `ANTFLY_INFERENCE_MLX_GREEDY_DEVICE_DECODE=1`. It uses the backend argmax path after
   the first generated token for pure greedy, grammar-free paged decode, avoiding
   full-vocab CPU logits downloads. On local GPT-2 this did not beat the default
   no-explicit-eval path: `turbo3` decode was `1558 ms` and f32 decode was
   `2270 ms`, so the path stays opt-in while deeper MLX decode ownership is
   investigated.
 - Done: added `METAL.md` and an opt-in direct-Metal LM-head argmax hook behind
-  `TERMITE_MLX_METAL_LM_HEAD_ARGMAX=1`. The Metal-provider unit compares the
+  `ANTFLY_INFERENCE_MLX_METAL_LM_HEAD_ARGMAX=1`. The Metal-provider unit compares the
   token id against scalar `hidden @ W^T` argmax. With
-  `TERMITE_MLX_GREEDY_DEVICE_DECODE=1`, local GPT-2 MLX/turbo3 decode improved
+  `ANTFLY_INFERENCE_MLX_GREEDY_DEVICE_DECODE=1`, local GPT-2 MLX/turbo3 decode improved
   from the MLX-argmax opt-in result (`1558 ms`) to `1477 ms`, roughly matching
   the default no-explicit-eval path (`1487 ms` in the rerun).
 - Done: added an opt-in MLX device-token handoff path behind
-  `TERMITE_MLX_DEVICE_TOKEN_HANDOFF=1`. It can seed the generated token as an
+  `ANTFLY_INFERENCE_MLX_DEVICE_TOKEN_HANDOFF=1`. It can seed the generated token as an
   MLX integer tensor, feed backend tensor ids into the next embedding lookup,
   and preserve the direct-Metal LM-head token tensor across greedy paged-decode
   steps. The path remains opt-in because local GPT-2 MLX/turbo3 with
-  `TERMITE_MLX_DEVICE_TOKEN_HANDOFF=1 TERMITE_MLX_METAL_LM_HEAD_ARGMAX=1`
+  `ANTFLY_INFERENCE_MLX_DEVICE_TOKEN_HANDOFF=1 ANTFLY_INFERENCE_MLX_METAL_LM_HEAD_ARGMAX=1`
   measured `decode=1543 ms`, slower than the default no-explicit-eval rerun
   (`1487 ms`) and slightly slower than a same-session direct LM-head greedy
   comparison without handoff (`1517 ms`).
 - Done: added an opt-in compressed-KV decode attention block behind
-  `TERMITE_MLX_METAL_COMPRESSED_ATTENTION_BLOCK=1`. For qLen=1 `polar4`/`turbo3`
+  `ANTFLY_INFERENCE_MLX_METAL_COMPRESSED_ATTENTION_BLOCK=1`. For qLen=1 `polar4`/`turbo3`
   paged decode, the Metal provider can fuse compressed key scoring,
   causal/sliding masking, online softmax state update, and V accumulation for
   one KV block. Local GPT-2 MLX/turbo3 generated the same greedy stream, with
@@ -551,11 +551,11 @@ Status:
   entry. The opt-in compressed attention block path and the compressed-score
   fallback now reuse those arrays instead of rebuilding/uploading encoded key
   bytes for every block visit. Local GPT-2 MLX/turbo3 with
-  `TERMITE_MLX_METAL_COMPRESSED_ATTENTION_BLOCK=1` improved slightly to
+  `ANTFLY_INFERENCE_MLX_METAL_COMPRESSED_ATTENTION_BLOCK=1` improved slightly to
   `decode=2962 ms`, confirming that per-block kernel launch/object overhead is
   the larger remaining issue.
 - Done: added a separate opt-in compressed-KV span path behind
-  `TERMITE_MLX_METAL_COMPRESSED_ATTENTION_SPAN=1`. It maintains persistent
+  `ANTFLY_INFERENCE_MLX_METAL_COMPRESSED_ATTENTION_SPAN=1`. It maintains persistent
   per-layer gathered V and encoded-key arrays across qLen=1 decode steps, then
   runs one Metal kernel over the retained KV span instead of launching once per
   KV block. Local correctness smoke passed, but the warmed 64-token GPT-2
@@ -564,11 +564,11 @@ Status:
   span kernel serializes too much work per query head.
 - Done: split the block and span toggles so the cheaper cached block experiment
   remains available independently. With
-  `TERMITE_MLX_METAL_COMPRESSED_ATTENTION_BLOCK=1`, the latest local GPT-2
+  `ANTFLY_INFERENCE_MLX_METAL_COMPRESSED_ATTENTION_BLOCK=1`, the latest local GPT-2
   MLX/turbo3 rerun measured `decode=2872 ms`, still correct and still slower
   than the default MLX/turbo3 path.
 - Done: added chunked span partials under the existing
-  `TERMITE_MLX_METAL_COMPRESSED_ATTENTION_SPAN=1` path for retained spans over
+  `ANTFLY_INFERENCE_MLX_METAL_COMPRESSED_ATTENTION_SPAN=1` path for retained spans over
   32 tokens. The partial kernel computes per-head/per-chunk softmax state and
   weighted V, then a reduce kernel merges the chunks. The 64-token GPT-2
   MLX/turbo3 span run improved from `decode=4473 ms` to `decode=3673 ms`, but
@@ -590,7 +590,7 @@ Status:
   steps can build an actual GPT-2 greedy `qLen=1` decode loop below
   `mlx_fast_metal_kernel`.
 - Done: threaded the whole-token bring-up flag through the MLX generation loop.
-  `TERMITE_MLX_RAW_METAL_WHOLE_TOKEN=1` now prepares that runtime during the
+  `ANTFLY_INFERENCE_MLX_RAW_METAL_WHOLE_TOKEN=1` now prepares that runtime during the
   narrow decoder-only greedy paged-decode path and then falls back to the
   existing MLX token execution.
 - Done: moved the absolute token-input slice to resident Metal-owned embedding
@@ -601,7 +601,7 @@ Status:
   raw-Metal runtime as a resident layer-norm slot. The whole-token bring-up now
   runs token embedding, absolute position add, and the first decoder pre-norm
   on Metal before falling back to MLX. The latest unsandboxed GPT-2 MLX/turbo3
-  smoke with `TERMITE_MLX_RAW_METAL_WHOLE_TOKEN=1` showed
+  smoke with `ANTFLY_INFERENCE_MLX_RAW_METAL_WHOLE_TOKEN=1` showed
   `raw_whole_token_prepare_layer_norm_calls=1`,
   `raw_whole_token_apply_layer_norm_calls=3`, and
   `gpt_timing_ms.attn_norm=0`, confirming the override is live.

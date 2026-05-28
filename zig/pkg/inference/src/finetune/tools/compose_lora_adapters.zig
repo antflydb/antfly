@@ -13,8 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite = @import("termite_internal");
-const peft = termite.finetune.peft;
+const inference = @import("inference_internal");
+const peft = inference.finetune.peft;
 
 const print = std.debug.print;
 

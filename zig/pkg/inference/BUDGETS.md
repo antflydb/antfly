@@ -1,4 +1,4 @@
-# Termite Budget Plan
+# Antfly inference Budget Plan
 
 ## Goal
 
@@ -91,7 +91,7 @@ What should change is not its scope, but how it is admitted.
 
 `ModelManager` should not become the direct owner of all request budgeting.
 
-Instead, termite should add a shared coordinator above the model-manager layer.
+Instead, antfly inference should add a shared coordinator above the model-manager layer.
 That coordinator should own global memory policy and expose:
 
 - load admission
@@ -165,7 +165,7 @@ Deliverables:
 
 Acceptance:
 
-- termite can report how much memory is already pinned by loaded models
+- antfly inference can report how much memory is already pinned by loaded models
 - unload returns that capacity to the system
 
 ### Phase 3: Add a global `BudgetCoordinator`
@@ -284,7 +284,7 @@ The right direction is:
 2. `RunBudget` stays request-scoped
 3. a new global coordinator makes them aware of each other
 
-That gets termite to the real goal:
+That gets antfly inference to the real goal:
 
 - no accidental OOM during load
 - no independent run budgets making incompatible assumptions

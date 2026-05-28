@@ -33,27 +33,27 @@
 
 const std = @import("std");
 const ml = @import("ml");
-const termite = @import("termite_internal");
+const inference = @import("inference_internal");
 
 const Graph = ml.graph.Graph;
 const Builder = ml.graph.Builder;
 const NodeId = ml.graph.NodeId;
 const Shape = ml.graph.Shape;
 
-const deberta_graph = termite.architectures.deberta_graph;
-const native_compute_mod = termite.native_compute.native;
+const deberta_graph = inference.architectures.deberta_graph;
+const native_compute_mod = inference.native_compute.native;
 const NativeCompute = native_compute_mod.NativeCompute;
 const WeightStore = native_compute_mod.WeightStore;
-const ops_mod = termite.ops;
+const ops_mod = inference.ops;
 
-const real_autodiff = termite.finetune.real_autodiff_trainer;
-const gliner2_autodiff = termite.finetune.gliner2_real_autodiff;
-const gliner2_bundle = termite.finetune.gliner2;
-const gliner2_data = termite.finetune.gliner2_data;
-const weight_source = termite.models.weight_source;
+const real_autodiff = inference.finetune.real_autodiff_trainer;
+const gliner2_autodiff = inference.finetune.gliner2_real_autodiff;
+const gliner2_bundle = inference.finetune.gliner2;
+const gliner2_data = inference.finetune.gliner2_data;
+const weight_source = inference.models.weight_source;
 const LoadedWeight = weight_source.LoadedWeight;
-const Tensor = termite.backends.Tensor;
-const compat = termite.io.compat;
+const Tensor = inference.backends.Tensor;
+const compat = inference.io.compat;
 
 // ── Tiny DeBERTa config (for GLiNER2 backbone) ───────────────────────
 

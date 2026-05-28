@@ -104,7 +104,6 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/transcribe", .operation_id = "transcribeAudio" },
     .{ .method = "POST", .path = "/extract", .operation_id = "extractJSON" },
     .{ .method = "GET", .path = "/models", .operation_id = "listModels" },
-    .{ .method = "GET", .path = "/version", .operation_id = "getVersion" },
     .{ .method = "POST", .path = "/embeddings", .operation_id = "createEmbedding" },
 };
 
@@ -134,7 +133,6 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "transcribeAudio")) @compileError("ServerRouter: Impl missing required method 'transcribeAudio'");
         if (!@hasDecl(Impl, "extractJSON")) @compileError("ServerRouter: Impl missing required method 'extractJSON'");
         if (!@hasDecl(Impl, "listModels")) @compileError("ServerRouter: Impl missing required method 'listModels'");
-        if (!@hasDecl(Impl, "getVersion")) @compileError("ServerRouter: Impl missing required method 'getVersion'");
         if (!@hasDecl(Impl, "createEmbedding")) @compileError("ServerRouter: Impl missing required method 'createEmbedding'");
     }
 
@@ -165,7 +163,6 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/transcribe", transcribeAudio);
             try server.post("/extract", extractJSON);
             try server.get("/models", listModels);
-            try server.get("/version", getVersion);
             try server.post("/embeddings", createEmbedding);
         }
 
@@ -274,13 +271,6 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.listModels(ctx);
         }
 
-        /// Get version information
-        /// GET /version
-        fn getVersion(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.getVersion(ctx);
-        }
-
         /// Create embeddings (OpenAI-compatible)
         /// POST /embeddings
         fn createEmbedding(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -307,5 +297,4 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn transcribeAudio(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn extractJSON(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listModels(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn getVersion(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createEmbedding(self: *Impl, ctx: *httpx.Context) !httpx.Response

@@ -13,10 +13,10 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite = @import("termite_internal");
+const inference = @import("inference_internal");
 
-const gemma_data = termite.finetune.gemma_data;
-const compat = termite.io.compat;
+const gemma_data = inference.finetune.gemma_data;
+const compat = inference.io.compat;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

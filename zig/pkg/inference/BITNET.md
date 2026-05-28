@@ -1,6 +1,6 @@
 # BitNet Support
 
-This tracks the work needed for Termite to run Microsoft BitNet-style GGUF
+This tracks the work needed for Antfly inference to run Microsoft BitNet-style GGUF
 models, starting with `microsoft/bitnet-b1.58-2B-4T-gguf`.
 
 BitNet support is not just another post-training quantization format. The
@@ -41,7 +41,7 @@ Tensor-type histogram:
 | 1 | `F16` | 1 | `token_embd.weight` `[2560, 128256]` |
 | 36 | `I2_S` | 210 | `blk.0.ffn_down.weight` `[6912, 2560]` |
 
-Termite now recognizes type id 36 as `I2_S`. In BitNet's vendored GGML enum,
+Antfly inference now recognizes type id 36 as `I2_S`. In BitNet's vendored GGML enum,
 the relevant type ids are:
 
 | Type | Name |
@@ -51,7 +51,7 @@ the relevant type ids are:
 | 38 | `TL1` |
 | 39 | `TL2` |
 
-## Current Termite State
+## Current Antfly inference State
 
 - GGUF metadata parsing recognizes `general.architecture = bitnet-b1.58` as a
   BitNet GPT-family variant.
@@ -67,7 +67,7 @@ the relevant type ids are:
 - MLX/Metal has a direct `I2_S` kernel with the same activation-quantized
   semantics.
 - Real-model MLX/Metal validation now exists for
-  `microsoft/bitnet-b1.58-2B-4T-gguf/ggml-model-i2_s.gguf`: `termite generate`
+  `microsoft/bitnet-b1.58-2B-4T-gguf/ggml-model-i2_s.gguf`: `antfly inference generate`
   on `--backend mlx` completes end-to-end using the direct `I2_S` path.
   On this machine and build, a 1-token prompt completed in about 4.0s total
   including model load, and an 8-token prompt completed in about 2.7s total
@@ -75,7 +75,7 @@ the relevant type ids are:
   which was about 25.8s for a single token in the same environment.
 - The current MLX/Metal gap is no longer the BitNet quant formats themselves.
   `I2_S`, `I8_S`, `TL1`, and `TL2` now all have direct device-native paths.
-  The remaining GPU work is deeper decode-path optimization. Termite now has
+  The remaining GPU work is deeper decode-path optimization. Antfly inference now has
   raw whole-token Metal RMSNorm coverage for the BitNet layer-0 norms, and the
   raw entry path can start from the BitNet token embedding instead of the
   GPT-2 absolute-position path. The larger gap is still quantized layer-0
@@ -130,7 +130,7 @@ the relevant type ids are:
 - [x] Allow `I2_S` through GGUF inspection compatibility checks.
 - [x] Add a `bitnet`/`bitnet-b1.58` architecture family or a GPT-family variant
   that preserves BitNet-specific defaults.
-- [x] Parse BitNet GGUF metadata into a Termite config:
+- [x] Parse BitNet GGUF metadata into a Antfly inference config:
   - hidden size
   - layer count
   - attention head count
@@ -138,7 +138,7 @@ the relevant type ids are:
   - feed-forward size
   - RoPE settings
   - vocab size and tokenizer metadata
-- [x] Normalize BitNet GGUF tensor names into Termite's internal weight keys.
+- [x] Normalize BitNet GGUF tensor names into Antfly inference's internal weight keys.
 - [x] Implement a slow correctness path for `I2_S`:
   - full tensor materialization to f32
   - row dequantization
@@ -204,7 +204,7 @@ The conservative bring-up order should be:
 7. Add MLX/Metal and WebGPU kernels.
 
 The official BitNet docs warn that generic transformer execution paths do not
-deliver the efficiency benefits of BitNet. Termite should keep that distinction
+deliver the efficiency benefits of BitNet. Antfly inference should keep that distinction
 explicit: compatibility means the model runs correctly; complete support means
 the BitNet-specific quantized path is actually used.
 

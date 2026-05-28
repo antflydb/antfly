@@ -17,7 +17,7 @@ const httpx = @import("httpx");
 const lib = @import("antfly_reranking");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const termite_provider = @import("../inference/termite.zig");
+const antfly_provider = @import("../inference/local.zig");
 const common_secrets = @import("../common/secrets.zig");
 
 pub const Config = lib.Config;
@@ -30,22 +30,22 @@ pub fn rerankDocuments(
     query: []const u8,
     documents: []const []const u8,
 ) ![]f32 {
-    return try rerankDocumentsWithLocalTermite(alloc, http, cfg, null, query, documents);
+    return try rerankDocumentsWithAntflyProvider(alloc, http, cfg, null, query, documents);
 }
 
-pub fn rerankDocumentsWithLocalTermite(
+pub fn rerankDocumentsWithAntflyProvider(
     alloc: std.mem.Allocator,
     http: *httpx.Client,
     cfg: Config,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+    embedded_antfly_provider: ?managed_embedder.AntflyProvider,
     query: []const u8,
     documents: []const []const u8,
 ) ![]f32 {
-    return try rerankDocumentsWithOptions(alloc, http, cfg, .{ .local_termite_provider = local_termite_provider }, query, documents);
+    return try rerankDocumentsWithOptions(alloc, http, cfg, .{ .antfly_provider = embedded_antfly_provider }, query, documents);
 }
 
 pub const Options = struct {
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
 };
 
@@ -67,19 +67,14 @@ pub fn rerankDocumentsWithOptions(
 
     switch (cfg.provider) {
         .antfly => {
-            const local = options.local_termite_provider orelse return error.UnsupportedRerankerProvider;
-            const rerank = local.rerank_texts orelse return error.UnsupportedRerankerProvider;
-            return try rerank(local.ptr, alloc, cfg.model, query, documents);
-        },
-        .termite => {
             if (cfg.url.len == 0) {
-                if (options.local_termite_provider) |local| {
+                if (options.antfly_provider) |local| {
                     if (local.rerank_texts) |rerank| {
                         return try rerank(local.ptr, alloc, cfg.model, query, documents);
                     }
                 }
             }
-            var provider = termite_provider.Provider.init(alloc, http, cfg.defaultedUrl());
+            var provider = antfly_provider.Provider.init(alloc, http, cfg.defaultedUrl());
             defer provider.deinit();
             var result = try provider.reranker().rerank(alloc, cfg.model, query, documents);
             defer result.deinit();
@@ -89,7 +84,7 @@ pub fn rerankDocumentsWithOptions(
     }
 }
 
-test "reranking runtime delegates to termite provider" {
+test "reranking runtime delegates to antfly provider" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -123,7 +118,7 @@ test "reranking runtime delegates to termite provider" {
         ) std.Io.Cancelable!void {
             _ = test_io;
             const cfg = Config{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "cross-encoder/ms-marco-MiniLM-L-6-v2",
                 .url = reranker_url,
                 .field = "body",
@@ -144,7 +139,7 @@ test "reranking runtime delegates to termite provider" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), scores.?[0], 0.0001);
 }
 
-test "reranking runtime routes antfly provider to local termite" {
+test "reranking runtime routes antfly provider to local antfly" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -176,7 +171,7 @@ test "reranking runtime routes antfly provider to local termite" {
     };
 
     var state = State{};
-    const local = managed_embedder.LocalTermiteProvider{
+    const local = managed_embedder.AntflyProvider{
         .ptr = &state,
         .embed_dense_texts = State.dense,
         .embed_sparse_texts = State.sparse,
@@ -186,7 +181,7 @@ test "reranking runtime routes antfly provider to local termite" {
         .provider = .antfly,
         .field = "body",
     };
-    const scores = try rerankDocumentsWithLocalTermite(alloc, &client, cfg, local, "query", &.{ "doc1", "doc2" });
+    const scores = try rerankDocumentsWithAntflyProvider(alloc, &client, cfg, local, "query", &.{ "doc1", "doc2" });
     defer alloc.free(scores);
     try std.testing.expect(state.called);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), scores[1], 0.0001);

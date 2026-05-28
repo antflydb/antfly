@@ -16,7 +16,7 @@
 // Uses Zig's @Vector for vectorized operations on supported platforms.
 
 const std = @import("std");
-const linalg_primitives = @import("termite_linalg").primitives;
+const linalg_primitives = @import("inference_linalg").primitives;
 
 // Comptime-selected SIMD width and vectorized exp helper, sourced from
 // `lib/linalg/src/primitives.zig` so the two sides cannot diverge.  The

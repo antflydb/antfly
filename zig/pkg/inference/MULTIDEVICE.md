@@ -1,6 +1,6 @@
 # Multi-Device Inference
 
-Termite supports splitting model execution across multiple compute devices (CPU+GPU, multiple GPUs, or networked machines). This builds on the graph partitioning system described in [GRAPH.md](GRAPH.md).
+Antfly inference supports splitting model execution across multiple compute devices (CPU+GPU, multiple GPUs, or networked machines). This builds on the graph partitioning system described in [GRAPH.md](GRAPH.md).
 
 ## Architecture
 

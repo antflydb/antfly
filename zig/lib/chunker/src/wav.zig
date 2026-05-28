@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const shared = @import("termite_audio").wav;
+const shared = @import("inference_audio").wav;
 
 pub const Format = shared.Format;
 pub const Decoded = shared.Decoded;

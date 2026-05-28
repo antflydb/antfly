@@ -19,13 +19,13 @@ const chunking_types = @import("types.zig");
 const Chunk = @import("chunk.zig").Chunk;
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
-const termite_chunker = @import("termite_chunker");
+const inference_chunker = @import("inference_chunker");
 
 const Allocator = std.mem.Allocator;
 
-pub const RemoteChunk = termite_chunker.Chunk;
-pub const RemoteInput = termite_chunker.Input;
-pub const RemoteBinaryInput = termite_chunker.BinaryInput;
+pub const RemoteChunk = inference_chunker.Chunk;
+pub const RemoteInput = inference_chunker.Input;
+pub const RemoteBinaryInput = inference_chunker.BinaryInput;
 
 pub fn chunkText(alloc: Allocator, cfg: chunking_types.Config, text: []const u8) ![]Chunk {
     const shared_chunks = try chunkInput(alloc, cfg, .{ .text = text });
@@ -82,7 +82,7 @@ pub fn chunkInput(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInp
 }
 
 fn chunkInputDirect(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput) ![]RemoteChunk {
-    var fixed_cfg = termite_chunker.FixedChunkConfig{};
+    var fixed_cfg = inference_chunker.FixedChunkConfig{};
     if (cfg.model.len > 0) fixed_cfg.model = cfg.model;
     if (cfg.max_chunks > 0) fixed_cfg.max_chunks = @intCast(cfg.max_chunks);
     fixed_cfg.threshold = cfg.threshold;
@@ -92,8 +92,8 @@ fn chunkInputDirect(alloc: Allocator, cfg: chunking_types.Config, input: RemoteI
     if (cfg.audio.window_duration_ms > 0) fixed_cfg.audio.window_duration_ms = @intCast(cfg.audio.window_duration_ms);
     if (cfg.audio.overlap_duration_ms > 0) fixed_cfg.audio.overlap_duration_ms = @intCast(cfg.audio.overlap_duration_ms);
 
-    const chunks = try termite_chunker.fixed_multimodal.chunkInput(alloc, input, fixed_cfg);
-    defer termite_chunker.types.freeChunks(alloc, chunks);
+    const chunks = try inference_chunker.fixed_multimodal.chunkInput(alloc, input, fixed_cfg);
+    defer inference_chunker.types.freeChunks(alloc, chunks);
     return try cloneRemoteChunks(alloc, chunks);
 }
 
@@ -252,13 +252,13 @@ fn base64DecodeAlloc(alloc: Allocator, encoded: []const u8) ![]u8 {
     return out;
 }
 
-test "termite chunker compiles" {
+test "antfly chunker compiles" {
     _ = chunkText;
     _ = chunkInput;
     _ = chunkBinary;
 }
 
-test "termite chunker text round trip" {
+test "antfly chunker text round trip" {
     const alloc = std.testing.allocator;
     const FakeApp = struct {
         fn executor() http_common.RequestExecutor {
@@ -295,7 +295,7 @@ test "termite chunker text round trip" {
     defer alloc.free(base_uri);
 
     const cfg = chunking_types.Config{
-        .provider = .termite,
+        .provider = .antfly,
         .api_url = base_uri,
         .model = "chunker-v1",
         .text = .{ .target_tokens = 8, .overlap_tokens = 2 },
@@ -312,7 +312,7 @@ test "termite chunker text round trip" {
     try std.testing.expectEqual(@as(?u32, 11), chunks[1].start_offset);
 }
 
-test "termite chunker binary round trip" {
+test "antfly chunker binary round trip" {
     const alloc = std.testing.allocator;
     const FakeApp = struct {
         fn executor() http_common.RequestExecutor {
@@ -348,7 +348,7 @@ test "termite chunker binary round trip" {
     defer alloc.free(base_uri);
 
     const cfg = chunking_types.Config{
-        .provider = .termite,
+        .provider = .antfly,
         .api_url = base_uri,
         .model = "chunker-v1",
     };
@@ -363,10 +363,10 @@ test "termite chunker binary round trip" {
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, chunks[0].data.?[0..8]);
 }
 
-test "termite chunker with empty api_url runs locally" {
+test "antfly chunker with empty api_url runs locally" {
     const alloc = std.testing.allocator;
     const cfg = chunking_types.Config{
-        .provider = .termite,
+        .provider = .antfly,
         .model = "fixed-bert-tokenizer",
         .max_chunks = 2,
         .text = .{ .target_tokens = 3, .overlap_tokens = 0, .separator = " " },
@@ -383,10 +383,10 @@ test "termite chunker with empty api_url runs locally" {
     try std.testing.expect(chunks[0].text != null);
 }
 
-test "termite chunker local path preserves explicit zero overlap when target is set" {
+test "antfly chunker local path preserves explicit zero overlap when target is set" {
     const alloc = std.testing.allocator;
     const cfg = chunking_types.Config{
-        .provider = .termite,
+        .provider = .antfly,
         .model = "fixed-bert-tokenizer",
         .text = .{ .target_tokens = 4, .overlap_tokens = 0, .separator = " " },
     };

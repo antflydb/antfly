@@ -74,7 +74,7 @@ fn projectorFixtureBytes(allocator: std.mem.Allocator, kind: projector_format_mo
     const metadata: []const gguf_mod.format.MetadataEntry = switch (kind) {
         .termite_gemma3 => &[_]gguf_mod.format.MetadataEntry{
             .{ .key = "general.architecture", .value = .{ .string = "termite-projector" } },
-            .{ .key = "termite.projector.source_architecture", .value = .{ .string = "gemma3" } },
+            .{ .key = "inference.projector.source_architecture", .value = .{ .string = "gemma3" } },
         },
         .clip_gemma4_image => &[_]gguf_mod.format.MetadataEntry{
             .{ .key = "general.architecture", .value = .{ .string = "clip" } },

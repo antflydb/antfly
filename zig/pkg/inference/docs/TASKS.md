@@ -1,15 +1,15 @@
-# Termite Model Tasks
+# Antfly inference Model Tasks
 
 ## Goal
 
-Termite should install models once, infer what they can be used for, and route
+Antfly inference should install models once, infer what they can be used for, and route
 requests by task rather than by directory layout.
 
 The current task-scoped layout:
 
 ```text
-~/.termite/models/generators/<owner>/<name>
-~/.termite/models/embedders/<owner>/<name>
+~/.antfly/inference/models/generators/<owner>/<name>
+~/.antfly/inference/models/embedders/<owner>/<name>
 ...
 ```
 
@@ -18,7 +18,7 @@ does not scale well once a single model can serve multiple endpoints.
 The target design is a canonical flat install layout:
 
 ```text
-~/.termite/models/<owner>/<name>
+~/.antfly/inference/models/<owner>/<name>
 ```
 
 with task metadata stored alongside the model and used by discovery, listing,
@@ -38,7 +38,7 @@ lazy pulls, and request-time resolution.
 - `rewrite`
 - `extract`
 
-That is what users ask termite to do, what API routes represent, and what
+That is what users ask antfly inference to do, what API routes represent, and what
 `/ml/v1/models` should advertise.
 
 The word `capabilities` is still useful internally for narrower features inside
@@ -56,10 +56,10 @@ features might this model have?".
 
 ## Proposed Pull Behavior
 
-`termite pull` should:
+`antfly inference pull` should:
 
 1. Default bare model refs to Hugging Face.
-2. Install into `~/.termite/models/<owner>/<name>` unless `--models-dir` is set.
+2. Install into `~/.antfly/inference/models/<owner>/<name>` unless `--models-dir` is set.
 3. Infer supported tasks best-effort from the downloaded files and manifestable
    model shape.
 4. Accept an optional `--tasks` hint for ambiguous models.
@@ -68,9 +68,9 @@ features might this model have?".
 Examples:
 
 ```bash
-termite pull ggml-org/gemma-4-e2b-it-gguf
-termite pull ggml-org/gemma-4-e2b-it-gguf --tasks generate,read
-termite pull BAAI/bge-small-en-v1.5 --tasks embed
+antfly inference pull ggml-org/gemma-4-e2b-it-gguf
+antfly inference pull ggml-org/gemma-4-e2b-it-gguf --tasks generate,read
+antfly inference pull BAAI/bge-small-en-v1.5 --tasks embed
 ```
 
 The intent is:
@@ -81,7 +81,7 @@ The intent is:
 
 ## Proposed Metadata
 
-Termite already has `model_manifest.json`. That should become the canonical
+Antfly inference already has `model_manifest.json`. That should become the canonical
 place for persisted task metadata.
 
 Suggested shape:
@@ -102,7 +102,7 @@ Notes:
 - `inputs` describes accepted modalities.
 - `features` is optional secondary metadata for task-specific behavior.
 
-If `tasks` is absent, termite should infer them from `type`, model files, and
+If `tasks` is absent, antfly inference should infer them from `type`, model files, and
 known architecture rules.
 
 ## Task Inference
@@ -135,7 +135,7 @@ Examples:
 - Whisper:
   - `tasks: ["transcribe"]`
 
-Inference should not over-advertise. If termite is not confident that a model
+Inference should not over-advertise. If antfly inference is not confident that a model
 can serve a task, it should leave that task out unless the user explicitly hints
 with `--tasks`.
 
@@ -145,7 +145,7 @@ with `--tasks`.
 
 Instead it should:
 
-1. Discover flat model directories under `~/.termite/models/<owner>/<name>`.
+1. Discover flat model directories under `~/.antfly/inference/models/<owner>/<name>`.
 2. Load each model manifest.
 3. Read or infer `tasks`.
 4. Group the model under every task it supports.
@@ -155,7 +155,7 @@ without duplication on disk.
 
 ## Request-Time Resolution
 
-When a request hits an endpoint, termite already knows the requested task from
+When a request hits an endpoint, antfly inference already knows the requested task from
 the route. Resolution should become:
 
 1. If a model was explicitly named, load it from the flat store.
@@ -180,7 +180,7 @@ Short term:
 
 Long term:
 
-- `termite pull` writes only to the flat layout
+- `antfly inference pull` writes only to the flat layout
 - `/ml/v1/models` classifies from manifest tasks
 - task-scoped layout becomes compatibility-only
 
@@ -189,9 +189,9 @@ Long term:
 Planned user-facing pull syntax:
 
 ```bash
-termite pull <owner>/<name>
-termite pull <owner>/<name> --tasks generate,read
-termite pull hf:<owner>/<name>
+antfly inference pull <owner>/<name>
+antfly inference pull <owner>/<name> --tasks generate,read
+antfly inference pull hf:<owner>/<name>
 ```
 
 Expected semantics:

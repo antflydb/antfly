@@ -20,7 +20,7 @@ const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
 const qwen2vl_vision = @import("../architectures/qwen2vl_vision.zig");
-const tokenizer_mod = @import("termite_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 const qwen2vl_types = @import("../architectures/qwen2vl_types.zig");
 
 pub const PreprocessorConfig = qwen2vl_types.PreprocessorConfig;

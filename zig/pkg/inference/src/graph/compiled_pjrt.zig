@@ -929,7 +929,7 @@ fn findMatchingPjrtDecodeArtifactsForPrefill(
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".termite.json")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".inference.json")) continue;
 
         const manifest_path = try std.fs.path.join(allocator, &.{ artifact_dir, entry.name });
         errdefer allocator.free(manifest_path);
@@ -1012,7 +1012,7 @@ test "PJRT whole-model decode artifact lookup collects sorted decode buckets" {
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(base_dir);
 
-    const prefill_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "prefill.exec.termite.json" });
+    const prefill_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "prefill.exec.inference.json" });
     defer allocator.free(prefill_manifest_path);
     try compiled_artifact.writeManifest(allocator, io, prefill_manifest_path, .{
         .kind = "pjrt_executable",
@@ -1030,7 +1030,7 @@ test "PJRT whole-model decode artifact lookup collects sorted decode buckets" {
     });
 
     inline for (.{ 4, 3 }) |seq_len| {
-        const manifest_name = try std.fmt.allocPrint(allocator, "decode-{d}.exec.termite.json", .{seq_len});
+        const manifest_name = try std.fmt.allocPrint(allocator, "decode-{d}.exec.inference.json", .{seq_len});
         defer allocator.free(manifest_name);
         const manifest_path = try std.fs.path.join(allocator, &.{ base_dir, manifest_name });
         defer allocator.free(manifest_path);
@@ -1061,9 +1061,9 @@ test "PJRT whole-model decode artifact lookup collects sorted decode buckets" {
         compiled_artifact.pjrt_parameter_mode_inputs,
     );
     defer allocator.free(package_path);
-    const decode4_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "decode-4.exec.termite.json" });
+    const decode4_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "decode-4.exec.inference.json" });
     defer allocator.free(decode4_manifest_path);
-    const decode3_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "decode-3.exec.termite.json" });
+    const decode3_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "decode-3.exec.inference.json" });
     defer allocator.free(decode3_manifest_path);
     try compiled_artifact.writePackageManifest(allocator, io, package_path, .{
         .backend = "xla",
@@ -1072,7 +1072,7 @@ test "PJRT whole-model decode artifact lookup collects sorted decode buckets" {
         .pjrt_parameter_mode = compiled_artifact.pjrt_parameter_mode_inputs,
         .artifacts = &.{
             .{
-                .manifest_path = "/tmp/unused.prefill.exec.termite.json",
+                .manifest_path = "/tmp/unused.prefill.exec.inference.json",
                 .artifact_path = "/tmp/model.prefill.exec",
                 .artifact_role = compiled_artifact.artifact_role_prefill,
                 .seq_len = 2,
@@ -1115,7 +1115,7 @@ test "PJRT whole-model decode artifact lookup rejects first missing decode bucke
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(base_dir);
 
-    const prefill_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "prefill.hlo.termite.json" });
+    const prefill_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "prefill.hlo.inference.json" });
     defer allocator.free(prefill_manifest_path);
     try compiled_artifact.writeManifest(allocator, io, prefill_manifest_path, .{
         .kind = "pjrt_hlo",
@@ -1132,7 +1132,7 @@ test "PJRT whole-model decode artifact lookup rejects first missing decode bucke
         .pjrt_parameter_mode = compiled_artifact.pjrt_parameter_mode_inputs,
     });
 
-    const manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "decode-4.hlo.termite.json" });
+    const manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "decode-4.hlo.inference.json" });
     defer allocator.free(manifest_path);
     try compiled_artifact.writeManifest(allocator, io, manifest_path, .{
         .kind = "pjrt_hlo",
@@ -1163,7 +1163,7 @@ test "PJRT whole-model artifact lookup prefers embedded HLO over parameter-input
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(base_dir);
 
-    const embedded_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "embedded.hlo.termite.json" });
+    const embedded_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "embedded.hlo.inference.json" });
     defer allocator.free(embedded_manifest_path);
     try compiled_artifact.writeManifest(allocator, io, embedded_manifest_path, .{
         .kind = "pjrt_hlo",
@@ -1180,7 +1180,7 @@ test "PJRT whole-model artifact lookup prefers embedded HLO over parameter-input
         .pjrt_parameter_mode = compiled_artifact.pjrt_parameter_mode_embedded,
     });
 
-    const inputs_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "inputs.hlo.termite.json" });
+    const inputs_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "inputs.hlo.inference.json" });
     defer allocator.free(inputs_manifest_path);
     try compiled_artifact.writeManifest(allocator, io, inputs_manifest_path, .{
         .kind = "pjrt_hlo",
@@ -1240,7 +1240,7 @@ test "PJRT whole-model artifact lookup can resolve prefill from package index" {
         .pjrt_parameter_mode = compiled_artifact.pjrt_parameter_mode_inputs,
         .artifacts = &.{
             .{
-                .manifest_path = "/tmp/model.prefill.exec.termite.json",
+                .manifest_path = "/tmp/model.prefill.exec.inference.json",
                 .artifact_path = "/tmp/model.prefill.exec",
                 .artifact_role = compiled_artifact.artifact_role_prefill,
                 .seq_len = 2,

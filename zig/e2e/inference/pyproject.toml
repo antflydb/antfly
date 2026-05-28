@@ -1,7 +1,7 @@
 [project]
-name = "termite-e2e"
+name = "antfly-e2e"
 version = "0.1.0"
-description = "Portable E2E tests for Termite (Go, Zig, or Cloud)"
+description = "Portable E2E tests for Antfly inference (Go, Zig, or Cloud)"
 requires-python = ">=3.11"
 dependencies = [
     "pytest>=8.0",

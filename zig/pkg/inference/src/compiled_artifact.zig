@@ -224,7 +224,7 @@ pub fn packageManifestPath(
 }
 
 pub fn artifactManifestPath(allocator: std.mem.Allocator, artifact_path: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}.termite.json", .{artifact_path});
+    return std.fmt.allocPrint(allocator, "{s}.inference.json", .{artifact_path});
 }
 
 pub fn isPackageManifestPath(path: []const u8) bool {
@@ -232,7 +232,7 @@ pub fn isPackageManifestPath(path: []const u8) bool {
 }
 
 pub fn resolveManifestPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    if (std.mem.endsWith(u8, path, ".termite.json")) return allocator.dupe(u8, path);
+    if (std.mem.endsWith(u8, path, ".inference.json")) return allocator.dupe(u8, path);
     return artifactManifestPath(allocator, path);
 }
 
@@ -402,7 +402,7 @@ fn findMatchingArtifactPathMode(
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".termite.json")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".inference.json")) continue;
 
         const manifest_path = try std.fs.path.join(allocator, &.{ search_dir, entry.name });
         errdefer allocator.free(manifest_path);
@@ -439,7 +439,7 @@ fn findMatchingArtifactPathMode(
 test "artifactManifestPath appends termite sidecar suffix" {
     const path = try artifactManifestPath(std.testing.allocator, "/tmp/model.mlpackage");
     defer std.testing.allocator.free(path);
-    try std.testing.expectEqualStrings("/tmp/model.mlpackage.termite.json", path);
+    try std.testing.expectEqualStrings("/tmp/model.mlpackage.inference.json", path);
 }
 
 test "packageManifestPath includes model, backend, kind, and parameter mode" {
@@ -465,16 +465,16 @@ test "modelArtifactNamespace falls back to basename for single-component paths" 
 test "resolveManifestPath accepts artifact or sidecar path" {
     const direct = try resolveManifestPath(std.testing.allocator, "/tmp/model.onnx");
     defer std.testing.allocator.free(direct);
-    try std.testing.expectEqualStrings("/tmp/model.onnx.termite.json", direct);
+    try std.testing.expectEqualStrings("/tmp/model.onnx.inference.json", direct);
 
-    const sidecar = try resolveManifestPath(std.testing.allocator, "/tmp/model.onnx.termite.json");
+    const sidecar = try resolveManifestPath(std.testing.allocator, "/tmp/model.onnx.inference.json");
     defer std.testing.allocator.free(sidecar);
-    try std.testing.expectEqualStrings("/tmp/model.onnx.termite.json", sidecar);
+    try std.testing.expectEqualStrings("/tmp/model.onnx.inference.json", sidecar);
 }
 
 test "isPackageManifestPath detects package sidecars" {
     try std.testing.expect(isPackageManifestPath("/tmp/model.xla.termite-package.json"));
-    try std.testing.expect(!isPackageManifestPath("/tmp/model.onnx.termite.json"));
+    try std.testing.expect(!isPackageManifestPath("/tmp/model.onnx.inference.json"));
 }
 
 test "matchesRequest matches exact artifact shape and backend" {
@@ -580,7 +580,7 @@ test "writeManifest and readManifest roundtrip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const manifest_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "artifact.termite.json" });
+    const manifest_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "artifact.inference.json" });
     defer allocator.free(manifest_path);
 
     const manifest: Manifest = .{
@@ -622,7 +622,7 @@ test "writePackageManifest and readPackageManifest roundtrip" {
         .pjrt_parameter_mode = pjrt_parameter_mode_inputs,
         .artifacts = &.{
             .{
-                .manifest_path = "/tmp/model.prefill.exec.termite.json",
+                .manifest_path = "/tmp/model.prefill.exec.inference.json",
                 .artifact_path = "/tmp/model.prefill.exec",
                 .artifact_role = artifact_role_prefill,
                 .seq_len = 2,
@@ -630,7 +630,7 @@ test "writePackageManifest and readPackageManifest roundtrip" {
                 .attention_mode = "paged_prefill",
             },
             .{
-                .manifest_path = "/tmp/model.decode.s3.exec.termite.json",
+                .manifest_path = "/tmp/model.decode.s3.exec.inference.json",
                 .artifact_path = "/tmp/model.decode.s3.exec",
                 .artifact_role = artifact_role_decode,
                 .seq_len = 3,
@@ -656,7 +656,7 @@ test "writeManifest and readManifest support absolute paths" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const manifest_path = try std.fs.path.resolve(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "absolute-artifact.termite.json" });
+    const manifest_path = try std.fs.path.resolve(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "absolute-artifact.inference.json" });
     defer allocator.free(manifest_path);
 
     const manifest: Manifest = .{
@@ -695,7 +695,7 @@ test "writePackageManifest and readPackageManifest support absolute paths" {
         .pjrt_parameter_mode = pjrt_parameter_mode_embedded,
         .artifacts = &.{
             .{
-                .manifest_path = "/tmp/model.prefill.exec.termite.json",
+                .manifest_path = "/tmp/model.prefill.exec.inference.json",
                 .artifact_path = "/tmp/model.prefill.exec",
                 .artifact_role = artifact_role_prefill,
                 .seq_len = 2,
@@ -722,7 +722,7 @@ test "findMatchingArtifactPath returns the matching sidecar artifact" {
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(base_dir);
 
-    const match_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "good.onnx.termite.json" });
+    const match_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "good.onnx.inference.json" });
     defer allocator.free(match_manifest_path);
     try writeManifest(allocator, io, match_manifest_path, .{
         .kind = "onnx_graph",
@@ -737,7 +737,7 @@ test "findMatchingArtifactPath returns the matching sidecar artifact" {
         .chat_template_applied = true,
     });
 
-    const non_match_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "other.onnx.termite.json" });
+    const non_match_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "other.onnx.inference.json" });
     defer allocator.free(non_match_manifest_path);
     try writeManifest(allocator, io, non_match_manifest_path, .{
         .kind = "onnx_graph",
@@ -762,7 +762,7 @@ test "findMatchingArtifactPath returns the matching sidecar artifact" {
     defer found.deinit(allocator);
 
     try std.testing.expectEqualStrings("/tmp/model.good.onnx", found.artifact_path);
-    try std.testing.expect(std.mem.endsWith(u8, found.manifest_path, "good.onnx.termite.json"));
+    try std.testing.expect(std.mem.endsWith(u8, found.manifest_path, "good.onnx.inference.json"));
 }
 
 test "findUniqueMatchingArtifactPath rejects ambiguous matches" {
@@ -775,7 +775,7 @@ test "findUniqueMatchingArtifactPath rejects ambiguous matches" {
     defer allocator.free(base_dir);
 
     inline for (.{ "a", "b" }) |name| {
-        const manifest_path = try std.fs.path.join(allocator, &.{ base_dir, name ++ ".onnx.termite.json" });
+        const manifest_path = try std.fs.path.join(allocator, &.{ base_dir, name ++ ".onnx.inference.json" });
         defer allocator.free(manifest_path);
         try writeManifest(allocator, io, manifest_path, .{
             .kind = "onnx_graph",

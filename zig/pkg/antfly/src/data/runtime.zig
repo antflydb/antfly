@@ -239,7 +239,7 @@ const RaftTableApplyStateMachine = struct {
         self.write_cache.hbc_cache = &storage.hbc_cache;
         self.write_cache.resource_manager = &storage.resource_manager;
         self.write_cache.backend_runtime = storage.backend_runtime;
-        self.write_cache.local_termite_provider = self.write_source.local_termite_provider;
+        self.write_cache.antfly_provider = self.write_source.antfly_provider;
         self.write_cache.secret_store = self.write_source.secret_store;
         self.write_cache.remote_content = self.write_source.remote_content;
         self.write_source.read_cache = &storage.read_cache;
@@ -1634,20 +1634,20 @@ pub const DataServer = struct {
             self.read_source.source(),
             self.write_source.source(),
         );
-        self.http_server.?.local_termite_provider = self.read_source.local_termite_provider;
+        self.http_server.?.antfly_provider = self.read_source.antfly_provider;
     }
 
-    pub fn setLocalTermiteProvider(
+    pub fn setAntflyProvider(
         self: *DataServer,
-        provider: ?antfly.inference.managed_embedder.LocalTermiteProvider,
+        provider: ?antfly.inference.managed_embedder.AntflyProvider,
     ) void {
-        _ = self.read_source.withLocalTermiteProvider(provider);
-        _ = self.write_source.withLocalTermiteProvider(provider);
+        _ = self.read_source.withAntflyProvider(provider);
+        _ = self.write_source.withAntflyProvider(provider);
         if (self.data_raft_apply) |apply_sm| {
-            _ = apply_sm.write_source.withLocalTermiteProvider(provider);
-            apply_sm.write_cache.local_termite_provider = provider;
+            _ = apply_sm.write_source.withAntflyProvider(provider);
+            apply_sm.write_cache.antfly_provider = provider;
         }
-        if (self.http_server) |*server| server.local_termite_provider = provider;
+        if (self.http_server) |*server| server.antfly_provider = provider;
     }
 
     pub fn start(self: *DataServer) !void {

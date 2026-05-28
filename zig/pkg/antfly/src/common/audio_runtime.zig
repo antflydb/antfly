@@ -85,7 +85,7 @@ test "audio runtime activates configured transcribing and synthesizing providers
     defer cfg.deinit();
 
     var stt_cfg = transcribing.Config{
-        .provider = .termite,
+        .provider = .antfly,
         .api_url = try alloc.dupe(u8, "http://127.0.0.1:9090"),
         .model = try alloc.dupe(u8, "whisper-small"),
     };

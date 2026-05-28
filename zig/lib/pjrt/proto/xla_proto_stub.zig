@@ -6,7 +6,7 @@
 //! build-time codegen support, and no checked-in generated file exists
 //! yet. Rather than port the generator or stop compiling pjrt entirely
 //! (pjrt is imported unconditionally by `lib/pjrt/src/root.zig` which is
-//! in turn imported by `termite_mod`), we stub out just enough of the
+//! in turn imported by `inference_mod`), we stub out just enough of the
 //! `xla.*` surface that `src/hlo.zig` actually touches so the module
 //! semantically analyses. Methods that serialize/deserialize return
 //! empty buffers / errors at runtime — pjrt is disabled by default

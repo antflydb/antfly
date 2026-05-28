@@ -13,9 +13,9 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite_audio = @import("termite_audio");
-const mp3_synth = termite_audio.mp3.synthesis;
-const aac = termite_audio.aac;
+const inference_audio = @import("inference_audio");
+const mp3_synth = inference_audio.mp3.synthesis;
+const aac = inference_audio.aac;
 
 const mp3_fixture_path = "lib/audio/testdata/tone.mp3";
 const vorbis_fixture_path = "lib/audio/testdata/codec-corpus/tone-stereo.ogg";
@@ -179,7 +179,7 @@ fn benchDecode(
     const profile_aac = std.mem.eql(u8, name, "aac_decode") or std.mem.eql(u8, name, "aac_adts_decode");
     var warmup: usize = 0;
     while (warmup < cfg.warmup_iters) : (warmup += 1) {
-        const decoded = try termite_audio.decodeInterleaved(allocator, fixture, .{});
+        const decoded = try inference_audio.decodeInterleaved(allocator, fixture, .{});
         allocator.free(decoded.samples);
     }
 
@@ -187,7 +187,7 @@ fn benchDecode(
     const started_ns = try monotonicNowNs();
     var iter: usize = 0;
     while (iter < cfg.measure_iters) : (iter += 1) {
-        const decoded = try termite_audio.decodeInterleaved(allocator, fixture, .{});
+        const decoded = try inference_audio.decodeInterleaved(allocator, fixture, .{});
         allocator.free(decoded.samples);
     }
     const maybe_perf = if (profile_aac) blk: {

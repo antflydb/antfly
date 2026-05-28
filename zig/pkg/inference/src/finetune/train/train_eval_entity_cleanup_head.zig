@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const cleanup_model = @import("termite_internal").finetune.entity_cleanup_model;
+const cleanup_model = @import("inference_internal").finetune.entity_cleanup_model;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

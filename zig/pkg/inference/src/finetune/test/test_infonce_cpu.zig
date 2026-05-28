@@ -13,5 +13,5 @@
 // limitations under the License.
 
 test {
-    _ = @import("termite_internal").finetune.infonce_cpu;
+    _ = @import("inference_internal").finetune.infonce_cpu;
 }

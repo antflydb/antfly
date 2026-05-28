@@ -199,7 +199,7 @@ async function waitForResult(cdp, timeoutMs) {
 const server = createStaticServer();
 const address = await listen(server);
 const url = `http://127.0.0.1:${address.port}${page}`;
-const userDataDir = mkdtempSync(join(tmpdir(), 'termite-webgpu-smoke-'));
+const userDataDir = mkdtempSync(join(tmpdir(), 'inference-webgpu-smoke-'));
 let chromiumProcess = null;
 
 try {

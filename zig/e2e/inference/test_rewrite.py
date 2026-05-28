@@ -14,7 +14,7 @@
 
 """Tests for /api/rewrite (seq2seq) endpoint.
 
-Matches Go termite's rewriter_test.go patterns.
+Matches Go antfly's rewriter_test.go patterns.
 """
 
 import pytest

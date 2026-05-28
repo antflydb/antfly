@@ -846,7 +846,7 @@ test "ONNX package selectors resolve unique prefill and decode manifests" {
         .kind = "onnx_graph",
         .artifacts = &.{
             .{
-                .manifest_path = "/tmp/prefill.termite.json",
+                .manifest_path = "/tmp/prefill.inference.json",
                 .artifact_path = "/tmp/prefill.onnx",
                 .artifact_role = compiled_artifact.artifact_role_prefill,
                 .seq_len = 2,
@@ -854,7 +854,7 @@ test "ONNX package selectors resolve unique prefill and decode manifests" {
                 .attention_mode = "paged_prefill",
             },
             .{
-                .manifest_path = "/tmp/decode.termite.json",
+                .manifest_path = "/tmp/decode.inference.json",
                 .artifact_path = "/tmp/decode.onnx",
                 .artifact_role = compiled_artifact.artifact_role_decode,
                 .seq_len = 2,
@@ -871,7 +871,7 @@ test "ONNX package selectors resolve unique prefill and decode manifests" {
         .attention_mode = "paged_prefill",
     })).?;
     try std.testing.expectEqualStrings(
-        "/tmp/prefill.termite.json",
+        "/tmp/prefill.inference.json",
         prefill_entry.manifest_path,
     );
     const decode_entry = (try compiled_artifact.findUniqueMatchingPackageEntry(package, .{
@@ -880,7 +880,7 @@ test "ONNX package selectors resolve unique prefill and decode manifests" {
         .attention_mode = "paged_decode",
     })).?;
     try std.testing.expectEqualStrings(
-        "/tmp/decode.termite.json",
+        "/tmp/decode.inference.json",
         decode_entry.manifest_path,
     );
 }

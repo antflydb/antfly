@@ -24,7 +24,7 @@ const t5_config = @import("../models/t5.zig");
 const projector_store_mod = @import("projector_store.zig");
 const whisper_config = @import("../models/whisper.zig");
 const wasm_compute = @import("../ops/wasm_compute.zig");
-const hf_tokenizer_mod = @import("termite_hf_tokenizer");
+const hf_tokenizer_mod = @import("inference_hf_tokenizer");
 
 pub const max_models = 16;
 pub const max_projectors = 16;

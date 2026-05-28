@@ -730,22 +730,6 @@ pub const ToolCallDelta = struct {
     function: ?ToolCallFunctionDelta = null,
 };
 
-pub const VersionResponse = struct {
-    /// inference version
-    version: []const u8,
-    /// Git commit hash
-    git_commit: []const u8,
-    /// Build timestamp
-    build_time: []const u8,
-    /// Go runtime version
-    go_version: []const u8,
-    /// inference runtime implementation
-    runtime: ?[]const u8 = null,
-    backends: ?BackendCapabilities = null,
-    /// Whether model downloads are allowed in this deployment
-    allow_downloads: ?bool = null,
-};
-
 /// A chunk of content. Text chunks have mime_type text/plain.
 pub const Chunk = struct {
     /// The chunk text content

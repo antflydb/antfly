@@ -5,7 +5,7 @@
 This document has two jobs:
 
 - Track GGUF/GGML tensor format compatibility.
-- Record the ggml/llama.cpp execution shape Termite should follow where it is
+- Record the ggml/llama.cpp execution shape Antfly inference should follow where it is
   useful.
 
 It fits with:
@@ -15,7 +15,7 @@ It fits with:
 
 The main architectural lesson from ggml is that the frontend graph stays
 structural while the backend chooses kernels from tensor type, shape, quant
-format, and device capability. Termite should copy that shape, not the exact
+format, and device capability. Antfly inference should copy that shape, not the exact
 file layout or every local constant.
 
 ## Execution Shape To Borrow
@@ -41,8 +41,8 @@ For the local reference checkout, the most relevant files are:
 - `../ggml/src/ggml-metal/ggml-metal-device.cpp`
 - `../ggml/src/ggml-metal/ggml-metal.metal`
 
-The Termite target is not "clone ggml inside Termite". The target is the same
-performance shape expressed through Termite's graph/runtime boundaries:
+The Antfly inference target is not "clone ggml inside Antfly inference". The target is the same
+performance shape expressed through Antfly inference's graph/runtime boundaries:
 
 - [GRAPH.md](GRAPH.md) owns graph/runtime policy.
 - [METAL.md](METAL.md) owns the pure-Metal backend implementation plan.
@@ -59,7 +59,7 @@ dimension order:
 
 That makes the expert axis the third dimension and the quantized input axis the
 first dimension. This is normal GGUF/ggml layout, not an unsupported variant.
-Termite should therefore treat packed experts as first-class 3D weights plus
+Antfly inference should therefore treat packed experts as first-class 3D weights plus
 expert IDs, not as a bundle of independently contiguous 2D tensors.
 
 Implementation implications:
@@ -70,7 +70,7 @@ Implementation implications:
   contiguous.
 - Fused gate/up tensors should project once over the packed expert tensor, then
   split gate and up rows, or use an equivalent backend implementation.
-- Backend kernels route through Termite's `mulMatId` contract: full packed 3D
+- Backend kernels route through Antfly inference's `mulMatId` contract: full packed 3D
   weight tensor, selected expert IDs, logical `in_dim/out_dim`, and
   backend-owned layout handling. `moeLinearNoBias` remains as a compatibility
   wrapper for older call sites.
@@ -78,13 +78,13 @@ Implementation implications:
   quantized GGUF weights it keeps storage packed and performs selected-row block
   dot products directly against the quantized bytes.
 
-## Termite Graph Alignment Plan
+## Antfly inference Graph Alignment Plan
 
-Termite should align with ggml at the execution-contract level, not by copying
+Antfly inference should align with ggml at the execution-contract level, not by copying
 ggml's graph structs or backend file layout. The intended shape is:
 
 ```text
-Termite frontend/tracing
+Antfly inference frontend/tracing
   -> ml.graph.Graph
   -> canonical lowered op set
   -> partition + memory plan
@@ -94,7 +94,7 @@ Termite frontend/tracing
 
 The rough concept map is:
 
-| ggml concept | Termite equivalent |
+| ggml concept | Antfly inference equivalent |
 | --- | --- |
 | `ggml_cgraph` | `ml.graph.Graph` |
 | `ggml_tensor` shape/type/view metadata | graph tensor descriptor + backend tensor handle |
@@ -112,7 +112,7 @@ execution should prefer backend-owned partition executors.
 
 ### Canonical Lowered Ops
 
-Termite's graph can keep fused model-level ops for tracing and optimization, but
+Antfly inference's graph can keep fused model-level ops for tracing and optimization, but
 compiled/static execution needs a small ggml-like lowered op set that every
 backend can reason about:
 
@@ -125,7 +125,7 @@ backend can reason about:
 - attention pieces: `softmax`, `rope`, attention/flash-attention fused forms
 - model-specific primitives as needed: `conv`, `im2col`, `pool`, gather/scatter
 
-Fused Termite ops should lower to these primitives unless a backend explicitly
+Fused Antfly inference ops should lower to these primitives unless a backend explicitly
 advertises a fused implementation. That keeps the graph portable while still
 allowing Metal/WebGPU/native paths to use larger kernels when profitable.
 
@@ -150,13 +150,13 @@ Examples:
 
 The profitability check matters. ggml's BLAS backend, for example, does not claim
 every f32 matmul: it gates BLAS use on contiguity, f32 RHS, convertible LHS, and
-a minimum matrix size. Termite should make this explicit instead of treating
+a minimum matrix size. Antfly inference should make this explicit instead of treating
 `supports(op)` as only a correctness predicate.
 
 The storage class matters just as much as the op. ggml scheduling is tied to
 backend buffer types: an op is cheap only if its inputs already live in a
 compatible buffer, or if the transfer cost is justified by the following
-partition. Termite's capability model should therefore expose both:
+partition. Antfly inference's capability model should therefore expose both:
 
 - `canExecute`: the backend can produce correct results for this op
 - `shouldExecute`: the backend is expected to be faster after transfer/setup
@@ -270,7 +270,7 @@ treats metadata ops as no-ops, checks backend support, then encodes supported
 ops into command buffers. It also has local fusion/concurrency logic around the
 graph walk.
 
-Termite should preserve that idea in backend executors:
+Antfly inference should preserve that idea in backend executors:
 
 - graph/runtime owns partition boundaries and buffer lifetime
 - backend executor owns command encoding for a partition
@@ -333,7 +333,7 @@ request-level scheduling.
 
 ## Quantization Support
 
-Termite's GGUF loader already understands GGML tensor type ids and stores raw
+Antfly inference's GGUF loader already understands GGML tensor type ids and stores raw
 quantized bytes for lazy execution. The remaining work for a quantization type is
 to make every execution path either dequantize it correctly or explicitly fall
 back to a supported path.
@@ -350,7 +350,7 @@ GGML `Q4_1` is a legacy 4-bit block format:
 - Nibble order follows the other legacy GGML formats: low nibbles decode
   elements `0..15`, high nibbles decode elements `16..31`.
 
-Termite already recognizes the `Q4_1` tensor type and block sizing in
+Antfly inference already recognizes the `Q4_1` tensor type and block sizing in
 `src/gguf/tensor_types.zig`, but support needs to be present in these layers:
 
 - GGUF codec materialization and row dequantization.
@@ -390,18 +390,18 @@ GGUF smoke test that verifies quantized execution counters are hit.
 
 ## Quantization Task List
 
-Termite should prioritize formats by how much real GGUF compatibility they
+Antfly inference should prioritize formats by how much real GGUF compatibility they
 unlock and how close they are to already-covered paths.
 
-- [x] Finish `Q4_1` across GGUF codec, native CPU, MLX/Metal, Termite WebGPU,
+- [x] Finish `Q4_1` across GGUF codec, native CPU, MLX/Metal, Antfly inference WebGPU,
   and the embedded WebGPU mirror.
-- [x] Add WebGPU `Q4_K` support in Termite and the embedded mirror. `Q4_K` is a
+- [x] Add WebGPU `Q4_K` support in Antfly inference and the embedded mirror. `Q4_K` is a
   common K-quant format and already has codec/native/MLX coverage.
 - [x] Add fast-path parity for legacy `Q5_0`, `Q5_1`, and `Q8_1`, starting with
   WebGPU where missing and then filling any MLX grouped-path gaps.
-  - [x] Termite WebGPU `Q5_0` direct linear shader and WASM dispatch.
-  - [x] Termite WebGPU `Q5_1` direct linear shader and WASM dispatch.
-  - [x] Termite WebGPU `Q8_1` direct linear shader and WASM dispatch.
+  - [x] Antfly inference WebGPU `Q5_0` direct linear shader and WASM dispatch.
+  - [x] Antfly inference WebGPU `Q5_1` direct linear shader and WASM dispatch.
+  - [x] Antfly inference WebGPU `Q8_1` direct linear shader and WASM dispatch.
   - [x] Embedded WebGPU mirror and install packaging for `Q5_0`, `Q5_1`, and
     `Q8_1`.
   - [x] MLX grouped coverage checked: `Q5_0` already has direct and grouped
@@ -409,9 +409,9 @@ unlock and how close they are to already-covered paths.
   - [x] Add MLX direct and grouped kernels for `Q5_1` and `Q8_1`.
 - [x] Add WebGPU parity for `Q2_K`, `Q3_K`, and `Q8_K` so browser execution
   covers the same K-quant family as codec/native/MLX paths.
-  - [x] Termite WebGPU `Q2_K` direct linear shader and WASM dispatch.
-  - [x] Termite WebGPU `Q3_K` direct linear shader and WASM dispatch.
-  - [x] Termite WebGPU `Q8_K` direct linear shader and WASM dispatch.
+  - [x] Antfly inference WebGPU `Q2_K` direct linear shader and WASM dispatch.
+  - [x] Antfly inference WebGPU `Q3_K` direct linear shader and WASM dispatch.
+  - [x] Antfly inference WebGPU `Q8_K` direct linear shader and WASM dispatch.
   - [x] Embedded WebGPU mirror and install packaging for `Q2_K`, `Q3_K`, and
     `Q8_K`.
 - [x] Add type ids, byte sizing, and CPU dequant correctness for `IQ4_NL` and
@@ -419,7 +419,7 @@ unlock and how close they are to already-covered paths.
 - [x] Add fast kernels for the `IQ4_*` formats that show up in real target
   GGUFs.
   - [x] MLX direct and grouped kernels for `IQ4_NL` and `IQ4_XS`.
-  - [x] Termite WebGPU direct linear shaders and WASM dispatch for `IQ4_NL` and
+  - [x] Antfly inference WebGPU direct linear shaders and WASM dispatch for `IQ4_NL` and
     `IQ4_XS`.
   - [x] Embedded WebGPU mirror and install packaging for `IQ4_NL` and
     `IQ4_XS`.

@@ -1,8 +1,8 @@
-# Termite LLM Plan
+# Antfly inference LLM Plan
 
 ## Goal
 
-Add first-class local LLM support to termite with:
+Add first-class local LLM support to antfly inference with:
 
 - complete GGUF model/container support
 - native Zig execution, not a llama.cpp wrapper
@@ -53,7 +53,7 @@ GGUF is:
 - a tensor catalog
 - a set of ggml tensor encodings / quantization layouts
 
-GGUF is not the compute backend. Termite backends remain `mlx`, `native`, and later `cuda`.
+GGUF is not the compute backend. Antfly inference backends remain `mlx`, `native`, and later `cuda`.
 
 ### 2. Single Stored Model Artifact
 
@@ -100,7 +100,7 @@ Later optimization phases can add:
 
 ### 5. Architecture Support Must Be Independent Of Weight Format
 
-Today termite mostly assumes:
+Today antfly inference mostly assumes:
 
 - SafeTensors
 - dense tensors
@@ -157,7 +157,7 @@ Important:
 
 - model variants like `Q5_K_M` are not primitive tensor types
 - they are mixed quantization recipes across tensors
-- termite must support the underlying tensor types used by those recipes
+- antfly inference must support the underlying tensor types used by those recipes
 
 ### Generative Runtime
 
@@ -197,7 +197,7 @@ Important:
 
 ## Current State
 
-Current termite native path is shaped roughly like:
+Current antfly inference native path is shaped roughly like:
 
 - manifest discovers ONNX or SafeTensors
 - session factory loads all weights eagerly
@@ -344,7 +344,7 @@ A contiguous monolithic KV tensor is simple, but it causes:
 
 Paged KV cache should be termite's primary design, not a later optimization.
 
-Termite can still support a simpler contiguous mode for:
+Antfly inference can still support a simpler contiguous mode for:
 
 - testing
 - debugging
@@ -369,7 +369,7 @@ The logical view must not require contiguous physical storage.
 
 Each backend gets one or more physical KV pools.
 
-At minimum termite should support pools keyed by:
+At minimum antfly inference should support pools keyed by:
 
 - backend type
 - element type
@@ -423,7 +423,7 @@ This avoids complicated correctness bugs while still capturing most of the value
 
 ### 5. Sliding-Window / Rolling Cache
 
-For models with limited attention windows, termite should:
+For models with limited attention windows, antfly inference should:
 
 - keep a logical token cursor
 - retire blocks that fall outside the effective window
@@ -525,7 +525,7 @@ Top-level API for:
 
 ## Prefill
 
-For prefill, termite should support two modes:
+For prefill, antfly inference should support two modes:
 
 ### Full Prefill
 
@@ -616,7 +616,7 @@ Reason:
 - KV offload is valuable, but much more latency-sensitive
 - incorrect prioritization here will destroy decode latency
 
-So termite should implement:
+So antfly inference should implement:
 
 1. paged GPU KV cache first
 2. RAM spill / reusable-prefix spill second
@@ -672,7 +672,7 @@ But correctness and scheduling should land first.
 
 ## Recommended First Implementation
 
-The first complete KV implementation in termite should be:
+The first complete KV implementation in antfly inference should be:
 
 - paged KV cache
 - fixed page size, likely 16 or 32 tokens
@@ -740,7 +740,7 @@ Status:
 
 Goal:
 
-- termite can inspect GGUF models and expose metadata without inference
+- antfly inference can inspect GGUF models and expose metadata without inference
 
 Deliverables:
 
@@ -754,7 +754,7 @@ Deliverables:
 
 Acceptance:
 
-- termite can open a GGUF model directory or file
+- antfly inference can open a GGUF model directory or file
 - tokenizer/chat template/special tokens can be surfaced
 
 ## Phase 2: Dense GGUF Execution
@@ -995,11 +995,11 @@ Current status:
 E2E bring-up checklist:
 
 - landed now:
-  - `termite smoke <model-dir> <prompt>`
+  - `antfly inference smoke <model-dir> <prompt>`
     - prints GGUF tensor-type coverage for the chosen artifact
     - loads the model through the native BLAS/MLX path
     - runs one real native generation pass with paged KV enabled
-  - `termite generate <model-dir> <prompt>`
+  - `antfly inference generate <model-dir> <prompt>`
     - is now the primary user-facing bring-up command once inspection is clean
     - supports `--print-chat-template-status`, `--print-prompt`, `--print-token-ids`, and `--print-finish-reason`
 - next:
@@ -1007,16 +1007,16 @@ E2E bring-up checklist:
     - recommended shape: Gemma-family or Qwen/LLaMA-family text-only GGUF in a single model directory
     - current GGUF inspection accepts `F16`, `F32`, `Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_K`
     - native MLX/Metal quant linear now covers `Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_K`
-    - both `termite smoke` and `termite generate` expect a model directory with the `.gguf` plus tokenizer files, not an Ollama tag like `gemma3:4b-it-qat`
+    - both `antfly inference smoke` and `antfly inference generate` expect a model directory with the `.gguf` plus tokenizer files, not an Ollama tag like `gemma3:4b-it-qat`
     - Gemma GGUF metadata with `general.architecture = gemma`, `gemma2`, or `gemma3` currently maps onto the native Gemma family path here
     - preferred first command for inspection:
-      - `ulimit -n 65536 && ./zig-out/bin/termite smoke <gemma-gguf-dir> 'hi' --backend mlx --inspect-only`
+      - `ulimit -n 65536 && ./zig-out/bin/antfly inference smoke <gemma-gguf-dir> 'hi' --backend mlx --inspect-only`
     - first real-token check after inspection is clean:
-      - `ulimit -n 65536 && ./zig-out/bin/termite generate <gemma-gguf-dir> 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
+      - `ulimit -n 65536 && ./zig-out/bin/antfly inference generate <gemma-gguf-dir> 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
     - validated MLX command for the small bring-up target:
-      - `ulimit -n 65536 && ./zig-out/bin/termite generate /Users/ajroetker/go/src/github.com/antflydb/termite-zig/termite-models/gemma-3-270m-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
+      - `ulimit -n 65536 && ./zig-out/bin/antfly inference generate /Users/ajroetker/go/src/github.com/antflydb/antfly-inference-zig/termite-models/gemma-3-270m-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
     - validated MLX command for the 4B QAT target:
-      - `ulimit -n 65536 && ./zig-out/bin/termite generate /Users/ajroetker/go/src/github.com/antflydb/termite-zig/termite-models/gemma-3-4b-it-qat-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
+      - `ulimit -n 65536 && ./zig-out/bin/antfly inference generate /Users/ajroetker/go/src/github.com/antflydb/antfly-inference-zig/termite-models/gemma-3-4b-it-qat-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
     - if the candidate Gemma export reports unsupported tensor types, pick a smaller dense GGUF that stays inside the current coverage set rather than debugging Mixtral first
   - then run the smoke path against the exact target Mixtral GGUF artifact
   - compare the reported GGUF tensor-type set with native quant coverage
@@ -1047,7 +1047,7 @@ Implementation note:
     - backend eviction can now demote back to host instead of always dropping to disk
   - host and backend residency now have separate shared byte budgets
     - current budgets are heuristic defaults, not tuned per machine yet
-  - native memory-safety guardrails now exist for `termite generate`, `termite smoke`, and the native `/generate` server path
+  - native memory-safety guardrails now exist for `antfly inference generate`, `antfly inference smoke`, and the native `/generate` server path
     - each run estimates and reserves `kv` and `scratch` bytes up front
     - BLAS/MLX lazy weight promotion now checks tier budgets before allocating and fails with `MemoryBudgetExceeded` instead of allocating first
     - the tier planner now demotes large cold tensors toward disk more aggressively when budgets are tight
@@ -1247,7 +1247,7 @@ Deliverables (all done):
 
 ## Differential Tests
 
-Compare termite outputs against reference implementations for:
+Compare antfly inference outputs against reference implementations for:
 
 - dense GGUF models
 - K-quant dense models
@@ -1300,7 +1300,7 @@ Comparisons:
 
 ## Success Criteria
 
-Termite should eventually be able to:
+Antfly inference should eventually be able to:
 
 - load GGUF directly with no mandatory duplicate runtime copy
 - run small dense GGUF models natively on MLX/BLAS
@@ -1325,7 +1325,7 @@ That sequence unlocks the rest of the plan without forcing premature quant-kerne
 
 ## External Design References
 
-These are the main external designs worth tracking while implementing the termite runtime:
+These are the main external designs worth tracking while implementing the antfly inference runtime:
 
 - PagedAttention / vLLM paper:
   - "Efficient Memory Management for Large Language Model Serving with PagedAttention"
@@ -1347,4 +1347,4 @@ These are the main external designs worth tracking while implementing the termit
   - https://docs.flashinfer.ai/api/attention.html
   - https://docs.flashinfer.ai/api/cascade.html
 
-These should inform the implementation, but termite should keep its own backend-neutral interfaces rather than mirroring any one engine directly.
+These should inform the implementation, but antfly inference should keep its own backend-neutral interfaces rather than mirroring any one engine directly.

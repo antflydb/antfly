@@ -25,7 +25,7 @@
 
 const std = @import("std");
 const ops = @import("../ops/ops.zig");
-const linalg = @import("termite_linalg");
+const linalg = @import("inference_linalg");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const t5_config = @import("../models/t5.zig");

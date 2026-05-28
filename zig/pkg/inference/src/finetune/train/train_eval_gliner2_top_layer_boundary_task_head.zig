@@ -13,11 +13,11 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite = @import("termite_internal");
-const gliner2_boundary = termite.finetune.gliner2_boundary;
-const text_encoder_boundary = termite.finetune.text_encoder_boundary;
-const run_contract = termite.run.contract;
-const artifact_writer = termite.run.artifact_writer;
+const inference = @import("inference_internal");
+const gliner2_boundary = inference.finetune.gliner2_boundary;
+const text_encoder_boundary = inference.finetune.text_encoder_boundary;
+const run_contract = inference.run.contract;
+const artifact_writer = inference.run.artifact_writer;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

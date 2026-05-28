@@ -1,8 +1,8 @@
-# Termite Metal Plan
+# Antfly inference Metal Plan
 
 ## Scope
 
-Metal is Termite's pure Apple GPU backend. This document tracks the current
+Metal is Antfly inference's pure Apple GPU backend. This document tracks the current
 production direction, benchmark anchors, and remaining work for the Metal
 runtime. It is not an experiment journal; old debugging trails belong in git
 history.
@@ -38,14 +38,14 @@ The durable architecture is: simplify upward, specialize downward.
 
 The ggml lesson is not one magic tile constant. ggml keeps a simple structural
 graph above the backend, then lets the Metal backend choose kernels by tensor
-type, quant format, shape, and device capability. Termite should follow that
+type, quant format, shape, and device capability. Antfly inference should follow that
 shape: generic runtime contract above, format-specific packed kernels below.
-This is a ggml-shaped dispatch target inside Termite, not a dependency on
+This is a ggml-shaped dispatch target inside Antfly inference, not a dependency on
 `libggml`.
 
 ### North Star
 
-Termite's Metal backend should converge on the same broad shape as upstream
+Antfly inference's Metal backend should converge on the same broad shape as upstream
 ggml's Metal backend:
 
 - The model/frontend builds a graph or layer contract. It does not orchestrate
@@ -86,7 +86,7 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
   failed persistent-encoder experiment proved that simply keeping one encoder
   open is not equivalent to ggml's dependency planner.
 - ggml reserves graph extra buffers for attention padding/block/temp scratch
-  up front to avoid reallocating while encoding. Termite's graph-plan slots
+  up front to avoid reallocating while encoding. Antfly inference's graph-plan slots
   should keep moving in that direction rather than allocating scratch inside
   individual layer helpers.
 - `Q8_0 x F32` qLen=1 uses `kernel_mul_mv_q8_0_f32` with `N_R0_Q8_0=2`,
@@ -95,13 +95,13 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
 - qLen>8 uses the simdgroup matrix path when supported.
 - ggml's Metal quant coverage is a templated kernel family: per-format
   dequant functions feed common `mul_mv`, `mul_mm`, and `mul_mm_id` surfaces.
-  Termite should continue toward one packed-weight descriptor and one quant
+  Antfly inference should continue toward one packed-weight descriptor and one quant
   dispatch surface, not one-off model or format entrypoints.
 - ggml does not get its speed from a Gemma-specific monolithic transformer
   layer kernel. It gets the shape from graph allocation, dependency-aware Metal
   encoding, selected graph-op fusions, flash-attention-class kernels, and tuned
   per-format matmul kernels.
-- Termite's Q8_0 qLen=1 MMV path now uses the same `N_R0=2` / `N_SG=4`
+- Antfly inference's Q8_0 qLen=1 MMV path now uses the same `N_R0=2` / `N_SG=4`
   shared-memory reduction shape as ggml. It is the canonical path because it is
   correctness-equivalent and keeps future kernel work aligned with the reference,
   even though this swap alone did not improve the 16-token Gemma4 decode anchor.
@@ -117,7 +117,7 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
   shapes in isolation.
   The remaining work is a broader ggml-shaped graph/command planner plus
   production packed quant kernels under one matmul dispatch surface.
-- The largest evidenced gap is structural: Termite's active decode still
+- The largest evidenced gap is structural: Antfly inference's active decode still
   enters a Zig layer loop and emits `41` compute encoders for one
   decode-token frame, while ggml executes a planned graph through backend op
   dispatch. Kernel quality matters, especially for qLen=2..8 prompt batches,
@@ -250,7 +250,7 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
   view into decoder runtime linear preparation generically, rather than only
   for the final LM head. Unsupported quant formats still stay on the explicit
   dense path until the Metal quant kernel exists.
-- `termite smoke --inspect-only` now reports the largest non-quantized GGUF
+- `antfly inference smoke --inspect-only` now reports the largest non-quantized GGUF
   tensors as well as quantized samples. Use that when checking whether a
   "Q8_0" model file still contains dense 2D tensors that the Metal backend
   should treat as explicit dense matmuls.
@@ -305,9 +305,9 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
   ggml-shaped planner work is mostly kernel quality and larger runtime-owned
   graph/layer submissions rather than frontend cleanup around the active
   single-token layer loop.
-- `TERMITE_METAL_TRACE_FRAME=1` now enables a generic debug trace for
+- `ANTFLY_INFERENCE_METAL_TRACE_FRAME=1` now enables a generic debug trace for
   substantial frames that prints the last frame's `region x source`
-  compute-encoder matrix. `TERMITE_METAL_TRACE_FRAME=all` includes small
+  compute-encoder matrix. `ANTFLY_INFERENCE_METAL_TRACE_FRAME=all` includes small
   prefill/setup frames too. Use it when deciding which layer contract to
   collapse next; source-only counters cannot distinguish, for example, `other`
   encoders in attention setup from `other` encoders in FFN or tail work.
@@ -343,8 +343,8 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
   command submission as the dominant explanation for the remaining 130ms-class
   prefill frame; the remaining gap is the dense BF16 PLE model projection kernel
   and layer math.
-- `TERMITE_METAL_TRACE_GRAPH_PLAN=1` prints graph-plan commit summaries, and
-  `TERMITE_METAL_TRACE_GRAPH_PLAN=all` also prints requested slot sizes. Graph
+- `ANTFLY_INFERENCE_METAL_TRACE_GRAPH_PLAN=1` prints graph-plan commit summaries, and
+  `ANTFLY_INFERENCE_METAL_TRACE_GRAPH_PLAN=all` also prints requested slot sizes. Graph
   plan readiness now uses allocated capacity rather than the last request set,
   and graph-plan buffers grow geometrically. On the 4-token Gemma4 anchor this
   collapsed scratch planning from `graph_plan_count=3`, `graph_plan_allocs=41`,
@@ -412,7 +412,7 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
 - In builds that include both MLX and native Metal, the `.metal` backend now
   uses the native Metal session/provider path instead of opening an MLX stream
   and constructing an MLX-backed Metal provider. This keeps GGUF Metal runtime
-  availability tied to Termite's native `MTLDevice` probe and prevents native
+  availability tied to Antfly inference's native `MTLDevice` probe and prevents native
   Metal sessions from failing with `MlxMetalUnavailable` before model load.
 - Active decode now passes per-layer output scale into the direct
   f32-KV/Q8_0 gated block. That removes the separate post-block scale multiply
@@ -450,7 +450,7 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
 - `test-metal-gemma4-prefill-block-parity` validates staged-vs-block behavior
   and the direct Q8_0 block path.
 - Active-frame batching is still gated for the conservative safe oracle. When
-  `TERMITE_METAL_DISABLE_GATED_FAMILY_RUNTIME_PREFILL_BLOCK=1` selects the safe
+  `ANTFLY_INFERENCE_METAL_DISABLE_GATED_FAMILY_RUNTIME_PREFILL_BLOCK=1` selects the safe
   staged path, both the decoder-runtime layer frame and backend-owned active
   decode frame are disabled. That is a correctness guard, not the final runtime
   shape.
@@ -469,8 +469,8 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
   slot counts/bytes/timing. GGUF quant weights are already mmap-backed; the
   Metal runtime now tries `newBufferWithBytesNoCopy` for borrowed, unpacked
   quant storage and falls back to private upload unless
-  `TERMITE_METAL_FORCE_MAPPED_QUANT_WEIGHTS=1` is set. Use
-  `TERMITE_METAL_DISABLE_MAPPED_QUANT_WEIGHTS=1` to force the old private path
+  `ANTFLY_INFERENCE_METAL_FORCE_MAPPED_QUANT_WEIGHTS=1` is set. Use
+  `ANTFLY_INFERENCE_METAL_DISABLE_MAPPED_QUANT_WEIGHTS=1` to force the old private path
   for A/B timing.
 
 ## Benchmark Anchors
@@ -478,14 +478,14 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
 These are local directional anchors, not absolute device claims.
 
 - Current compiled partitioned graph anchor, Gemma4 Q8_0 short prompt:
-  `TERMITE_GRAPH_EXECUTOR_STATS=1` with `--backend metal --mode compiled
+  `ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1` with `--backend metal --mode compiled
   --compiled-target partitioned --max-tokens 1 --temperature 0` reports
   `interpreter_fallbacks=0`, `host_outputs=0`, `device_outputs=819`, and
   `planned_commands=141` on the default fused path. A current local run on
   2026-05-05 reported `prefill=998ms`, `total=998ms`, and token id `10979`.
   This is the right residency milestone, but it is not the same as ggml-class
   throughput.
-- A detailed timing run with `TERMITE_DEBUG_METAL_TIMING=1` reported
+- A detailed timing run with `ANTFLY_INFERENCE_DEBUG_METAL_TIMING=1` reported
   `metal_decoder_frame: begins=1 submits=1 wait_ms=23 gpu_ms=22
   last_compute_encoders=15 total_compute_encoders=942 total_blit_encoders=53`
   for the same short prefill. That means the slow prefill gap is mostly not
@@ -494,7 +494,7 @@ These are local directional anchors, not absolute device claims.
   non-ggml-quality quant matmul kernels.
 - The latest fused gated-FFN graph path is enabled by default for the matched
   Gemma gated FFN pattern. Use
-  `TERMITE_METAL_DISABLE_GATED_FFN_GRAPH_FUSION=1` to compare against the
+  `ANTFLY_INFERENCE_METAL_DISABLE_GATED_FFN_GRAPH_FUSION=1` to compare against the
   staged path. A recent local A/B dropped graph executor commands from `1134`
   to `924` and planned commands from `211` to `176`; elapsed time is still
   noisy enough that command reduction is the stronger regression signal.
@@ -502,7 +502,7 @@ These are local directional anchors, not absolute device claims.
   default for matched Gemma attention output strips:
   `fused_gqa_causal_attention -> optional rms_norm -> o_proj -> optional
   rms_norm -> residual add`. Use
-  `TERMITE_METAL_DISABLE_ATTENTION_OUTPUT_RESIDUAL_GRAPH_FUSION=1` for A/B
+  `ANTFLY_INFERENCE_METAL_DISABLE_ATTENTION_OUTPUT_RESIDUAL_GRAPH_FUSION=1` for A/B
   comparisons. A local validation run reduced graph executor commands from
   `980` to `819`, planned commands from `176` to `141`, and warm prefill from
   `1034ms` to `998ms`; correctness stayed at token id `10979` with zero
@@ -511,13 +511,13 @@ These are local directional anchors, not absolute device claims.
   difference in the fused FFN path. Native dense byte-only RMS weights had empty
   host slices and collided when the dynamic RMS slot key used `data.ptr`; the
   key now uses the native dense buffer identity.
-- Termite Gemma4 short prompt prefill: after enabling the fused
+- Antfly inference Gemma4 short prompt prefill: after enabling the fused
   f32-KV/Q8_0 attention-residual block, the Debug 10-token chat-template `hi`
   anchor is correct and fully fused. Recent warm runs show roughly `0.49s`
   `decoder_gated_prefill_ms.block` and roughly `1.2s` prefill-family time.
   Cold runs after rebuild can still be much slower from Metal/runtime setup
   noise.
-- Termite Gemma4 greedy decode: roughly `15-17 tok/s` on the small anchor.
+- Antfly inference Gemma4 greedy decode: roughly `15-17 tok/s` on the small anchor.
 - The 2026-05-07 RMS-add PLE fallback change passed `zig build test-bin`
   through the Metal wrapper (`metal-command-20260507-220244`) and rebuilt
   binary validation smokes for 1, 2, and 3 generated tokens
@@ -552,7 +552,7 @@ Interpretation:
 
 ## llama.cpp Comparison
 
-Yes: compare against Homebrew llama.cpp now. Termite has enough device-resident
+Yes: compare against Homebrew llama.cpp now. Antfly inference has enough device-resident
 coverage that the remaining gap is a real performance gap, not just an artifact
 of obvious host fallback.
 
@@ -561,7 +561,7 @@ binaries for measured baselines on this machine:
 
 ```sh
 llama-bench \
-  -m ~/.termite/models/ggml-org/gemma-4-e2b-it-gguf/gemma-4-E2B-it-Q8_0.gguf \
+  -m ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf/gemma-4-E2B-it-Q8_0.gguf \
   -ngl 99 \
   -p 10,128,512 \
   -n 16 \
@@ -573,7 +573,7 @@ For the smallest local anchor, run:
 
 ```sh
 llama-bench \
-  -m ~/.termite/models/ggml-org/gemma-4-e2b-it-gguf/gemma-4-E2B-it-Q8_0.gguf \
+  -m ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf/gemma-4-E2B-it-Q8_0.gguf \
   -ngl 99 \
   -p 10 \
   -n 16 \
@@ -589,18 +589,18 @@ pp10: 345.84 tok/s
 tg16: 100.96 tok/s
 ```
 
-Run the comparable Termite commands through the debug wrapper so a bad Metal
+Run the comparable Antfly inference commands through the debug wrapper so a bad Metal
 run leaves a bundle:
 
 ```sh
-TERMITE_GRAPH_EXECUTOR_STATS=1 \
+ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1 \
 bash pkg/inference/scripts/debug_metal_command.sh command \
   --label termite-gemma4-metal-pp10-tg1 \
   --timeout 60 \
   --no-validate \
   --cwd "$PWD" \
-  -- pkg/inference/zig-out/bin/termite generate \
-    ~/.termite/models/ggml-org/gemma-4-e2b-it-gguf \
+  -- pkg/inference/zig-out/bin/antfly inference generate \
+    ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf \
     hi \
     --backend metal \
     --mode compiled \
@@ -614,15 +614,15 @@ bash pkg/inference/scripts/debug_metal_command.sh command \
 For A/B checks against the gated-FFN fusion:
 
 ```sh
-TERMITE_METAL_DISABLE_GATED_FFN_GRAPH_FUSION=1 \
-TERMITE_GRAPH_EXECUTOR_STATS=1 \
+ANTFLY_INFERENCE_METAL_DISABLE_GATED_FFN_GRAPH_FUSION=1 \
+ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1 \
 bash pkg/inference/scripts/debug_metal_command.sh command \
   --label termite-gemma4-metal-pp10-tg1-no-gated-ffn-fusion \
   --timeout 60 \
   --no-validate \
   --cwd "$PWD" \
-  -- pkg/inference/zig-out/bin/termite generate \
-    ~/.termite/models/ggml-org/gemma-4-e2b-it-gguf \
+  -- pkg/inference/zig-out/bin/antfly inference generate \
+    ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf \
     hi \
     --backend metal \
     --mode compiled \
@@ -636,14 +636,14 @@ bash pkg/inference/scripts/debug_metal_command.sh command \
 Compare these fields, in order:
 
 - llama.cpp: `pp` tokens/sec and `tg` tokens/sec from `llama-bench`.
-- Termite: `generate_timing_ms`, `prefill`, decode timing, token IDs, and
+- Antfly inference: `generate_timing_ms`, `prefill`, decode timing, token IDs, and
   `graph_executor_stats`.
-- Termite residency counters: `interpreter_fallbacks=0` and `host_outputs=0`
+- Antfly inference residency counters: `interpreter_fallbacks=0` and `host_outputs=0`
   should stay true before treating timing as a backend-performance signal.
-- Termite command shape: total `commands` and `planned_commands` should not
+- Antfly inference command shape: total `commands` and `planned_commands` should not
   regress when adding fusions or planner regions.
 
-If llama.cpp stays much faster while Termite reports zero host outputs and zero
+If llama.cpp stays much faster while Antfly inference reports zero host outputs and zero
 interpreter fallbacks, the next fixes are not more residency work. They are:
 
 - ggml-quality packed quant `mul_mv` / `mul_mm` kernels for Q8_0 and the other
@@ -998,7 +998,7 @@ Implementation order:
 ### Operator Family Completion Checklist
 
 This is the production operator surface we are migrating toward. ggml remains
-the reference implementation shape, but these names are Termite graph/backend
+the reference implementation shape, but these names are Antfly inference graph/backend
 operators so the same plan can later target Metal, CUDA, WebGPU, Wasm, or native
 fallback.
 
@@ -1083,7 +1083,7 @@ fallback.
     queues copied seed tensors for a post-submit flush. Active qLen>1 prefill
     also bypasses the copy-based reserved hidden carrier, so the `hi
     --max-tokens 4` Metal validator anchor remains correct with `token_ids:
-    10979 236888 2088 740` and no `TERMITE_METAL_TRACE_FRAME_BLITS=1` frame
+    10979 236888 2088 740` and no `ANTFLY_INFERENCE_METAL_TRACE_FRAME_BLITS=1` frame
     blit traces. The paged-KV metadata hook now allows raw f32 `MetalKvStorage`
     pages too, and it is per-layer shape aware for mixed KV dimensions, so
     eligible planned attention can consume the same physical page table path as
@@ -1097,7 +1097,7 @@ fallback.
     hidden ping-pong/returned-output allocation pattern with runtime-owned
     planned scratch/output slots, replace the intermediate materialized PLE
     slice with a true strided PLE operand, and investigate the remaining
-    shared-KV setup miss visible under `TERMITE_METAL_TRACE_Q80_BLOCK=1`.
+    shared-KV setup miss visible under `ANTFLY_INFERENCE_METAL_TRACE_Q80_BLOCK=1`.
 - [ ] Attention operators.
   - [x] Add graph-level `attention_flash`, `attention_paged`, and
     `attention_quantized_kv` command ops.
@@ -1451,7 +1451,7 @@ The likely largest remaining costs are:
 
 ## Reference Files
 
-Termite:
+Antfly inference:
 
 - `pkg/inference/src/graph/backend_contracts.zig`
 - `pkg/inference/src/ops/metal_compute.zig`
@@ -1477,7 +1477,7 @@ zig build test-metal-gemma4-prefill-block-parity -Dmetal=true -Dmlx=false --summ
 zig build -Dmetal=true -Dmlx=false -Donnx=false --summary failures
 LIST_ONLY=1 bash pkg/inference/scripts/debug_metal_command.sh unit 'metal|Metal'
 RUN_MODE=isolated USE_PREBUILT_UNIT=1 bash pkg/inference/scripts/debug_metal_command.sh unit --api-validate 'metal|Metal'
-./zig-out/bin/termite generate ~/.termite/models/ggml-org/gemma-4-e2b-it-gguf hi --backend metal --max-tokens 4 --print-token-ids --print-timing
+./zig-out/bin/antfly inference generate ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf hi --backend metal --max-tokens 4 --print-token-ids --print-timing
 ```
 
 Run Gemma4 Metal timing through the crash-debug wrapper:
@@ -1486,26 +1486,26 @@ Run Gemma4 Metal timing through the crash-debug wrapper:
 env TIMEOUT_SECS=180 LABEL=metal-gemma4-mapped-quant-default \
   bash pkg/inference/scripts/debug_metal_command.sh command --api-validate \
   --cwd /Users/ajroetker/go/src/github.com/antflydb/antfly-zig \
-  -- ./pkg/inference/zig-out/bin/termite generate \
-  /Users/ajroetker/.termite/models/ggml-org/gemma-4-e2b-it-gguf hi \
+  -- ./pkg/inference/zig-out/bin/antfly inference generate \
+  /Users/ajroetker/.antfly/models/ggml-org/gemma-4-e2b-it-gguf hi \
   --backend metal --mode compiled --compiled-target whole-model \
   --max-tokens 4 --print-token-ids --print-timing
 
 env TIMEOUT_SECS=180 LABEL=metal-gemma4-private-quant-baseline \
-  TERMITE_METAL_DISABLE_MAPPED_QUANT_WEIGHTS=1 \
+  ANTFLY_INFERENCE_METAL_DISABLE_MAPPED_QUANT_WEIGHTS=1 \
   bash pkg/inference/scripts/debug_metal_command.sh command --api-validate \
   --cwd /Users/ajroetker/go/src/github.com/antflydb/antfly-zig \
-  -- ./pkg/inference/zig-out/bin/termite generate \
-  /Users/ajroetker/.termite/models/ggml-org/gemma-4-e2b-it-gguf hi \
+  -- ./pkg/inference/zig-out/bin/antfly inference generate \
+  /Users/ajroetker/.antfly/models/ggml-org/gemma-4-e2b-it-gguf hi \
   --backend metal --mode compiled --compiled-target whole-model \
   --max-tokens 4 --print-token-ids --print-timing
 
 env TIMEOUT_SECS=180 LABEL=metal-gemma4-force-mapped-quant \
-  TERMITE_METAL_FORCE_MAPPED_QUANT_WEIGHTS=1 \
+  ANTFLY_INFERENCE_METAL_FORCE_MAPPED_QUANT_WEIGHTS=1 \
   bash pkg/inference/scripts/debug_metal_command.sh command --api-validate \
   --cwd /Users/ajroetker/go/src/github.com/antflydb/antfly-zig \
-  -- ./pkg/inference/zig-out/bin/termite generate \
-  /Users/ajroetker/.termite/models/ggml-org/gemma-4-e2b-it-gguf hi \
+  -- ./pkg/inference/zig-out/bin/antfly inference generate \
+  /Users/ajroetker/.antfly/models/ggml-org/gemma-4-e2b-it-gguf hi \
   --backend metal --mode compiled --compiled-target whole-model \
   --max-tokens 4 --print-token-ids --print-timing
 ```
@@ -1527,8 +1527,8 @@ need a different location.
 Examples:
 
 ```sh
-bash pkg/inference/scripts/debug_metal_command.sh command -- ./zig-out/bin/termite --help
-bash pkg/inference/scripts/debug_metal_command.sh command --api-validate -- ./zig-out/bin/termite embed ~/.termite/models/antflydb/clipclap --text "hello"
+bash pkg/inference/scripts/debug_metal_command.sh command -- ./zig-out/bin/antfly inference --help
+bash pkg/inference/scripts/debug_metal_command.sh command --api-validate -- ./zig-out/bin/antfly inference embed ~/.antfly/inference/models/antflydb/clipclap --text "hello"
 RUN_MODE=chunked CHUNK_SIZE=4 bash pkg/inference/scripts/debug_metal_command.sh unit --no-validate 'metal eager graph|metal_compute'
 ```
 
@@ -1537,7 +1537,7 @@ debugging. A broad test run can launch many Metal runtime tests in one process
 and has produced SoC watchdog reboots without preserving the failing test name.
 The wrapper refuses that shape by default; use `unit` mode so
 `current_test.txt`, `progress.tsv`, and per-test bundles identify the last
-started test or chunk. `TERMITE_ALLOW_BROAD_METAL_TEST=1` exists only for
+started test or chunk. `ANTFLY_INFERENCE_ALLOW_BROAD_METAL_TEST=1` exists only for
 deliberate override.
 
 If a machine-level reset interrupts `unit` mode, resume from the same output
@@ -1558,7 +1558,7 @@ is the best suspect after a watchdog reboot.
 For reboot bisection, prefer disabling post-capture during unit isolation:
 
 ```sh
-TERMITE_METAL_SKIP_POSTCAPTURE=1 \
+ANTFLY_INFERENCE_METAL_SKIP_POSTCAPTURE=1 \
 RESUME=1 RESUME_SKIP_CURRENT=1 \
 RUN_MODE=isolated USE_PREBUILT_UNIT=1 \
 bash pkg/inference/scripts/debug_metal_command.sh unit \
@@ -1598,7 +1598,7 @@ but still captures long-running Metal commands. In this sandbox, backgrounded
 `zig build` invocations can fail with `PermissionDenied` even when the same test
 passes in the foreground; use foreground `zig build test -Dmetal=true ...` for
 compile-only capability filters, and use the debug wrapper for already-built
-Termite commands or long-running Metal executions.
+Antfly inference commands or long-running Metal executions.
 
 ## Rejected Directions
 
@@ -1715,7 +1715,7 @@ Success criteria:
   - Assert `interpreter_fallbacks=0` and `host_outputs=0`.
 
 - Performance checks:
-  - Run with `TERMITE_GRAPH_EXECUTOR_STATS=1 TERMITE_DEBUG_METAL_TIMING=1`.
+  - Run with `ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1 ANTFLY_INFERENCE_DEBUG_METAL_TIMING=1`.
   - Record `commands`, `planned_commands`, `total_compute_encoders`, `total_blit_encoders`, `prefill`, and `gpu_ms`.
   - Compare against current local baseline: `commands=924`, `planned_commands=176`, `total_compute_encoders=942`, `total_blit_encoders=53`, `prefill≈1194-1331ms`.
 
@@ -1800,7 +1800,7 @@ Target for this chunk: keep correctness and residency, reduce enabled command vo
   - The remaining region work is integration: promote compatible regions into a larger whole-frame command sequence instead of executing many small planned scopes.
 
 - Implement ggml-style fusion eligibility.
-  - Use existing use-count/last-use checks plus buffer/resource ranges as Termite’s equivalent of `ggml_can_fuse`.
+  - Use existing use-count/last-use checks plus buffer/resource ranges as Antfly inference’s equivalent of `ggml_can_fuse`.
   - Fuse only when intermediates have no escaping uses.
   - Reject write/read or write/write overlap; allow source-source overlap.
   - Preserve stateful order for KV writes, paged attention, rope position mutation, and requested graph outputs.
@@ -1897,4 +1897,4 @@ Reduce Gemma4 partitioned Metal command volume by matching ggml’s execution mo
 - Promote per-region planned scopes into a whole-frame `GraphCommandPlanView` executor for Gemma prefill/decode so compatible attention/FFN/PLE/tail regions share a command buffer and encoder scopes.
 - Use `GraphCommandPlanView.scopes` as the source of truth for grouping; region-local scopes are the fallback, not the destination.
 - Move per-frame quant descriptor/slot preparation out of execution hot paths; execution should reference prepared resident slots/descriptors.
-- Add frame counters for real submitted frame count, empty-frame cancels, planned-scope count, and top frame-break reasons so regressions are visible without verbose `TERMITE_METAL_TRACE_FRAME=all`.
+- Add frame counters for real submitted frame count, empty-frame cancels, planned-scope count, and top frame-break reasons so regressions are visible without verbose `ANTFLY_INFERENCE_METAL_TRACE_FRAME=all`.

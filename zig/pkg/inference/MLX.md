@@ -10,13 +10,13 @@ This is not a separate full Metal backend.
 
 The design target is:
 
-- termite owns tensor storage, tiering, prefetch, routing, and execution-mode choice
+- antfly inference owns tensor storage, tiering, prefetch, routing, and execution-mode choice
 - MLX owns the general tensor runtime and dense compute path
 - Metal owns only the missing quantized kernels
 
 ## Runtime Split
 
-### Termite
+### Antfly inference
 
 - GGUF tensor store
 - packed expert views
@@ -116,15 +116,15 @@ Start MLX validation with a small GGUF before using Mixtral or other MoE artifac
 - recommended first target:
   - a Gemma-family text-only GGUF such as local `gemma3` 270M first, then `gemma3` 4B QAT once the small path is clean
 - first pass for inspection:
-  - `ulimit -n 65536 && ./zig-out/bin/termite smoke <gemma-gguf-dir> 'hi' --backend mlx --inspect-only`
+  - `ulimit -n 65536 && ./zig-out/bin/antfly inference smoke <gemma-gguf-dir> 'hi' --backend mlx --inspect-only`
 - first token:
-  - `ulimit -n 65536 && ./zig-out/bin/termite generate <gemma-gguf-dir> 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
+  - `ulimit -n 65536 && ./zig-out/bin/antfly inference generate <gemma-gguf-dir> 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
 - validated small-model command:
-  - `ulimit -n 65536 && ./zig-out/bin/termite generate /Users/ajroetker/go/src/github.com/antflydb/termite-zig/termite-models/gemma-3-270m-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
+  - `ulimit -n 65536 && ./zig-out/bin/antfly inference generate /Users/ajroetker/go/src/github.com/antflydb/antfly-inference-zig/termite-models/gemma-3-270m-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
 - validated 4B QAT command:
-  - `ulimit -n 65536 && ./zig-out/bin/termite generate /Users/ajroetker/go/src/github.com/antflydb/termite-zig/termite-models/gemma-3-4b-it-qat-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
+  - `ulimit -n 65536 && ./zig-out/bin/antfly inference generate /Users/ajroetker/go/src/github.com/antflydb/antfly-inference-zig/termite-models/gemma-3-4b-it-qat-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
 - model layout requirement:
-  - `termite smoke` and `termite generate` take a directory containing the `.gguf` and tokenizer files; an Ollama tag such as `gemma3:4b-it-qat` is only a source artifact identifier, not the direct CLI argument here
+  - `antfly inference smoke` and `antfly inference generate` take a directory containing the `.gguf` and tokenizer files; an Ollama tag such as `gemma3:4b-it-qat` is only a source artifact identifier, not the direct CLI argument here
 - reason for the ordering:
   - this isolates GGUF parsing, tokenizer discovery, MLX residency, and first-token generation without mixing in MoE routing, packed experts, or Mixtral-specific debugging
 

@@ -1096,7 +1096,7 @@ wheels = [
 ]
 
 [[package]]
-name = "termite-e2e"
+name = "antfly-e2e"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

@@ -14,7 +14,7 @@
 
 """Tests for /embed and /embeddings alias endpoints.
 
-Matches Go termite's embedders_test.go and clip_test.go patterns.
+Matches Go antfly's embedders_test.go and clip_test.go patterns.
 """
 
 import pytest

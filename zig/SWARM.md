@@ -7,11 +7,11 @@ providers, shard DB access, and DB runtime ownership.
 
 - A node should own one `BackendRuntime` and share it across metadata, data,
   and all DB/store opens on that node.
-- A swarm node always owns embedded Termite. It exposes Termite as both the
+- A swarm node always owns embedded Antfly inference. It exposes Antfly inference as both the
   direct local inference provider for Antfly enrichment/query code and as the
   public `/ml/v1` compatibility API on the unified server. Local managed
   embeddings must not loop back through the node's public HTTP `/ml/v1` server
-  just to call Termite in the same process.
+  just to call Antfly inference in the same process.
 - Metadata should not grow private DB runtimes or private worker pools when it
   probes local shard data.
 - Metadata should prefer a typed shard DB adapter for DB-level shard operations
@@ -32,23 +32,23 @@ providers, shard DB access, and DB runtime ownership.
   backed simulations remain useful when the test specifically validates worker
   scheduling or shutdown semantics.
 
-## Local Termite Provider
+## Local Antfly inference Provider
 
-The provider contract should distinguish remote Termite from local embedded
-Termite:
+The provider contract should distinguish remote Antfly inference from local embedded
+Antfly inference:
 
-- **Remote Termite provider:** uses HTTP through `base_url`. This is still the
+- **Remote Antfly inference provider:** uses HTTP through `base_url`. This is still the
   right shape when inference is hosted by another process, another node, or an
-  external Termite deployment.
-- **Local Antfly/Termite provider:** resolves `provider=termite` or
+  external Antfly inference deployment.
+- **Local Antfly/Antfly inference provider:** resolves `provider=antfly` or
   `provider=antfly` configs that target the current node's embedded model
   runtime into direct dense embedder, sparse embedder, reranker, generator, and
-  chunker implementations. It should call the shared Termite `Node` / pipeline
+  chunker implementations. It should call the shared Antfly inference `Node` / pipeline
   APIs directly, reuse loaded model sessions, and never consume public HTTP
   accept/handler capacity.
 
 The direct provider is the production shape for `antfly swarm`. Loopback HTTP is
-only for external clients using the Termite-compatible API; it has the wrong
+only for external clients using the Antfly inference-compatible API; it has the wrong
 failure mode for background enrichment because a long local embedding request
 can occupy the public API path, making status and other public requests look
 unavailable even though the process is alive.
@@ -58,9 +58,9 @@ and batching are controlled. Enrichment can then batch documents and chunking
 requests without creating a fresh HTTP client per sub-batch or competing with
 user traffic for the same listener.
 
-This applies to Termite chunking as well as embeddings. Today the enrichment
-chunker routes `.termite` configs through `chunking.termite.chunkText(...)`,
-which posts to `{api_url}/chunk`. That is correct for remote Termite, but local
+This applies to Antfly inference chunking as well as embeddings. Today the enrichment
+chunker routes `.antfly` configs through `chunking.antfly.chunkText(...)`,
+which posts to `{api_url}/chunk`. That is correct for remote Antfly inference, but local
 embedded swarm should resolve the same config to an in-process chunker instead.
 The existing `.antfly` / `.mock` fixed chunkers are already local and do not
 need this migration.
@@ -154,13 +154,13 @@ Current classification:
       hosted DB adapter by default. Schema readiness stays status-derived, with
       local adapter/fallback probes only for bootstrap or missing runtime
       status.
-- [x] Add direct local Termite dense/sparse embedder, reranker, and chunker
-      implementations and route embedded swarm `provider=termite` /
+- [x] Add direct local Antfly inference dense/sparse embedder, reranker, and chunker
+      implementations and route embedded swarm `provider=antfly` /
       `provider=antfly` configs to them.
-- [x] Always expose the Termite-compatible public `/ml/v1` API from swarm while
+- [x] Always expose the Antfly inference-compatible public `/ml/v1` API from swarm while
       keeping Antfly-managed local enrichment/query paths on the direct provider
       instead of loopback HTTP.
-- [x] Add direct local Termite generator implementations for Antfly managed
+- [x] Add direct local Antfly inference generator implementations for Antfly managed
       query/retrieval paths that need those providers in-process.
 - [ ] Add a swarm regression where enrichment is embedding a slow local batch
       while public index status remains reachable and reports active local

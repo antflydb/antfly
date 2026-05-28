@@ -1,6 +1,6 @@
-# OpenAI Compatibility in termite-zig
+# OpenAI Compatibility in antfly-inference-zig
 
-termite-zig can be used as a local OpenAI-compatible inference server for chat-style generation. The goal is not to copy the entire OpenAI platform, but to make common OpenAI client integrations work with termite-zig using a familiar API shape.
+antfly-inference-zig can be used as a local OpenAI-compatible inference server for chat-style generation. The goal is not to copy the entire OpenAI platform, but to make common OpenAI client integrations work with antfly-inference-zig using a familiar API shape.
 
 ## What Works
 
@@ -12,7 +12,7 @@ Use the OpenAI-style endpoint:
 /api/chat/completions
 ```
 
-termite-zig also keeps its native generator endpoint:
+antfly-inference-zig also keeps its native generator endpoint:
 
 ```text
 /api/generate
@@ -71,7 +71,7 @@ Streaming works for both ONNX-backed generation and native generation paths.
 }
 ```
 
-termite-zig still keeps its richer nested task-based model metadata in the same response so existing termite clients continue to work.
+antfly-inference-zig still keeps its richer nested task-based model metadata in the same response so existing antfly inference clients continue to work.
 
 ### Health endpoints
 
@@ -81,23 +81,23 @@ Operational endpoints are available outside `/api`:
 - `/readyz`
 
 `/healthz` reports basic liveness.  
-`/readyz` reports whether termite-zig can discover usable models and includes per-task counts.
+`/readyz` reports whether antfly-inference-zig can discover usable models and includes per-task counts.
 
 ## Compatibility Notes
 
 ### Token accounting
 
-termite-zig reports:
+antfly-inference-zig reports:
 
 - prompt tokens when the server can determine them directly
 - completion tokens from the generated output
 - total tokens as the sum of the two
 
-For some ONNX generation paths, prompt token accounting may be approximate or unavailable at the backend layer. In those cases termite-zig still returns a valid OpenAI-compatible response shape.
+For some ONNX generation paths, prompt token accounting may be approximate or unavailable at the backend layer. In those cases antfly-inference-zig still returns a valid OpenAI-compatible response shape.
 
 ### Tool calling
 
-Tool-call parsing and streaming are supported through termite-zig's existing tool parser integration. When a model emits tool calls, termite-zig maps them into OpenAI-style `tool_calls` structures in both full responses and streaming deltas.
+Tool-call parsing and streaming are supported through antfly-inference-zig's existing tool parser integration. When a model emits tool calls, antfly-inference-zig maps them into OpenAI-style `tool_calls` structures in both full responses and streaming deltas.
 
 ### Scope
 
@@ -145,7 +145,7 @@ Run e2e tests:
 ```text
 cd e2e
 uv sync
-TERMITE_BIN=../zig-out/bin/termite .venv/bin/pytest -q
+ANTFLY_INFERENCE_BIN=../zig-out/bin/antfly inference .venv/bin/pytest -q
 ```
 
 Useful manual checks:

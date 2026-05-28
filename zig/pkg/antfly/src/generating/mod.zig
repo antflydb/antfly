@@ -18,7 +18,7 @@ const lib = @import("antfly_generating");
 const inference = @import("../inference/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const openai_provider = @import("../inference/openai.zig");
-const termite_provider = @import("../inference/termite.zig");
+const antfly_provider = @import("../inference/local.zig");
 const common_secrets = @import("../common/secrets.zig");
 
 pub const Role = lib.Role;
@@ -27,7 +27,7 @@ pub const GenerateResult = lib.GenerateResult;
 pub const Provider = lib.Provider;
 pub const OpenAIConfig = lib.OpenAIConfig;
 pub const OllamaConfig = lib.OllamaConfig;
-pub const TermiteConfig = lib.TermiteConfig;
+pub const AntflyConfig = lib.AntflyConfig;
 pub const GeneratorConfig = lib.GeneratorConfig;
 pub const RetryConfig = lib.RetryConfig;
 pub const ChainCondition = lib.ChainCondition;
@@ -37,23 +37,23 @@ pub const GeneratorFactory = lib.GeneratorFactory;
 pub const BackendFactory = struct {
     alloc: std.mem.Allocator,
     http: *httpx.Client,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
     }
 
-    pub fn initWithLocalTermite(
+    pub fn initWithAntflyProvider(
         alloc: std.mem.Allocator,
         http: *httpx.Client,
-        local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+        embedded_antfly_provider: ?managed_embedder.AntflyProvider,
     ) BackendFactory {
-        return initWithOptions(alloc, http, .{ .local_termite_provider = local_termite_provider });
+        return initWithOptions(alloc, http, .{ .antfly_provider = embedded_antfly_provider });
     }
 
     pub const Options = struct {
-        local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+        antfly_provider: ?managed_embedder.AntflyProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
     };
 
@@ -65,7 +65,7 @@ pub const BackendFactory = struct {
         return .{
             .alloc = alloc,
             .http = http,
-            .local_termite_provider = options.local_termite_provider,
+            .antfly_provider = options.antfly_provider,
             .secret_store = options.secret_store,
         };
     }
@@ -79,7 +79,7 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.local_termite_provider, self.secret_store);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store);
     }
 };
 
@@ -91,15 +91,15 @@ const BackendState = struct {
     secret_store: ?*common_secrets.FileStore = null,
     provider: union(enum) {
         openai: openai_provider.Provider,
-        termite: termite_provider.Provider,
-        local_termite: managed_embedder.LocalTermiteProvider,
+        remote_antfly: antfly_provider.Provider,
+        embedded_antfly: managed_embedder.AntflyProvider,
     },
 
     fn init(
         alloc: std.mem.Allocator,
         http: *httpx.Client,
         cfg: GeneratorConfig,
-        local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+        embedded_antfly_provider: ?managed_embedder.AntflyProvider,
         secret_store: ?*common_secrets.FileStore,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
@@ -116,11 +116,10 @@ const BackendState = struct {
                 const provider = openai_provider.Provider.init(alloc, http, cfg.url);
                 break :blk .{ .openai = provider };
             },
-            .antfly => .{ .local_termite = local_termite_provider orelse return error.UnsupportedGeneratorProvider },
-            .termite => if (cfg.url.len == 0 and local_termite_provider != null)
-                .{ .local_termite = local_termite_provider.? }
+            .antfly => if (cfg.url.len == 0 and embedded_antfly_provider != null)
+                .{ .embedded_antfly = embedded_antfly_provider.? }
             else
-                .{ .termite = termite_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082") },
+                .{ .remote_antfly = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082") },
             else => return error.UnsupportedGeneratorProvider,
         };
 
@@ -137,8 +136,8 @@ const BackendState = struct {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
         switch (self.provider) {
             .openai => |*provider| provider.deinit(),
-            .termite => |*provider| provider.deinit(),
-            .local_termite => {},
+            .remote_antfly => |*provider| provider.deinit(),
+            .embedded_antfly => {},
         }
         self.auth_header_cache.deinit(self.alloc);
         if (self.api_key) |*api_key| api_key.deinit(self.alloc);
@@ -170,8 +169,8 @@ const BackendState = struct {
                 }
                 break :blk try provider.generator().generate(alloc, model, inference_messages);
             },
-            .termite => |*provider| try provider.generator().generate(alloc, model, inference_messages),
-            .local_termite => |local| blk: {
+            .remote_antfly => |*provider| try provider.generator().generate(alloc, model, inference_messages),
+            .embedded_antfly => |local| blk: {
                 const generate_text = local.generate_text orelse return error.UnsupportedGeneratorProvider;
                 const roles = try alloc.alloc([]const u8, messages.len);
                 defer alloc.free(roles);
@@ -211,14 +210,14 @@ pub fn executeChain(
     return try lib.executeChain(alloc, chain, factory_impl.factory(), messages);
 }
 
-pub fn executeChainWithLocalTermite(
+pub fn executeChainWithAntflyProvider(
     alloc: std.mem.Allocator,
     http: *httpx.Client,
     chain: []const ChainLink,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+    embedded_antfly_provider: ?managed_embedder.AntflyProvider,
     messages: []const ChatMessage,
 ) !GenerateResult {
-    var factory_impl = BackendFactory.initWithLocalTermite(alloc, http, local_termite_provider);
+    var factory_impl = BackendFactory.initWithAntflyProvider(alloc, http, embedded_antfly_provider);
     return try lib.executeChain(alloc, chain, factory_impl.factory(), messages);
 }
 
@@ -244,7 +243,7 @@ test "generating backend factory executes fallback chain across providers" {
             .status = 429,
             .body = "{\"error\":\"rate limit\"}",
         } },
-        .{ .method = .POST, .path = "/termite/generate", .respond = .{
+        .{ .method = .POST, .path = "/antfly/generate", .respond = .{
             .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"fallback ok\"}}]}",
         } },
     });
@@ -252,8 +251,8 @@ test "generating backend factory executes fallback chain across providers" {
 
     const openai_url = try std.fmt.allocPrint(alloc, "{s}/openai", .{ts.baseUrl()});
     defer alloc.free(openai_url);
-    const termite_url = try std.fmt.allocPrint(alloc, "{s}/termite", .{ts.baseUrl()});
-    defer alloc.free(termite_url);
+    const antfly_url = try std.fmt.allocPrint(alloc, "{s}/antfly", .{ts.baseUrl()});
+    defer alloc.free(antfly_url);
 
     var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
     defer client.deinit();
@@ -264,7 +263,7 @@ test "generating backend factory executes fallback chain across providers" {
             .condition = .on_error,
         },
         .{
-            .generator = GeneratorConfig.fromTermite(.{ .model = "local", .url = termite_url }),
+            .generator = GeneratorConfig.fromAntfly(.{ .model = "local", .url = antfly_url }),
         },
     };
 
@@ -304,7 +303,7 @@ test "generating backend factory executes fallback chain across providers" {
     try std.testing.expectEqualStrings("fallback ok", content orelse return error.TestUnexpectedResult);
 }
 
-test "generating backend routes antfly and url-less termite to local provider" {
+test "generating backend routes antfly and url-less antfly to local provider" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -360,7 +359,7 @@ test "generating backend routes antfly and url-less termite to local provider" {
     };
 
     var fake = FakeLocal{};
-    const local_provider = managed_embedder.LocalTermiteProvider{
+    const local_provider = managed_embedder.AntflyProvider{
         .ptr = &fake,
         .embed_dense_texts = FakeLocal.embedDenseTexts,
         .embed_sparse_texts = FakeLocal.embedSparseTexts,
@@ -375,20 +374,9 @@ test "generating backend routes antfly and url-less termite to local provider" {
             .url = "",
         },
     }};
-    var antfly_result = try executeChainWithLocalTermite(alloc, &client, &antfly_chain, local_provider, &messages);
+    var antfly_result = try executeChainWithAntflyProvider(alloc, &client, &antfly_chain, local_provider, &messages);
     defer antfly_result.deinit();
     try std.testing.expectEqualStrings("local ok", antfly_result.content);
-
-    const termite_chain = [_]ChainLink{.{
-        .generator = .{
-            .provider = .termite,
-            .model = "local-model",
-            .url = "",
-        },
-    }};
-    var termite_result = try executeChainWithLocalTermite(alloc, &client, &termite_chain, local_provider, &messages);
-    defer termite_result.deinit();
-    try std.testing.expectEqualStrings("local ok", termite_result.content);
 
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }

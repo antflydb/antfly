@@ -23,7 +23,7 @@ const httpx = @import("httpx");
 const api = @import("inference_api");
 const scraping = @import("antfly_scraping");
 const jsonschema = @import("antfly_jsonschema");
-const lib_chunker = @import("termite_chunker");
+const lib_chunker = @import("inference_chunker");
 const backends_mod = @import("../backends/backends.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const registry_mod = @import("../registry/registry.zig");
@@ -2931,7 +2931,7 @@ pub const Node = struct {
 
     fn recognizeRebel(self: *Node, ctx: *httpx.Context, model_path: []const u8, body: api.RecognizeRequest) !httpx.Response {
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
-        const hf_tokenizer = @import("termite_hf_tokenizer");
+        const hf_tokenizer = @import("inference_hf_tokenizer");
 
         const paths = enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path) catch |err|
             return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
@@ -3523,7 +3523,7 @@ pub const Node = struct {
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
 
         // Load tokenizer
-        const hf_tokenizer = @import("termite_hf_tokenizer");
+        const hf_tokenizer = @import("inference_hf_tokenizer");
         const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
             return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
         defer ctx.allocator.free(tok_path);
@@ -3729,8 +3729,8 @@ pub const Node = struct {
 
         // Find encoder/decoder sessions
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
-        const tokenizer_mod = @import("termite_tokenizer");
-        const hf_tokenizer = @import("termite_hf_tokenizer");
+        const tokenizer_mod = @import("inference_tokenizer");
+        const hf_tokenizer = @import("inference_hf_tokenizer");
         var encoder_session: backends_mod.Session = undefined;
         var decoder_session: backends_mod.Session = undefined;
         var close_encoder = false;
@@ -4095,25 +4095,7 @@ pub const Node = struct {
         return ctx.response.build();
     }
 
-    pub fn getVersion(_: *Node, ctx: *httpx.Context) !httpx.Response {
-        return ctx.json(.{
-            .version = build_options.termite_version,
-            .git_commit = build_options.git_commit,
-            .build_time = build_options.build_time,
-            .go_version = build_options.go_version,
-            .allow_downloads = build_options.allow_downloads,
-            .runtime = "termite-zig",
-            .backends = .{
-                .native = build_options.enable_native,
-                .onnx = true,
-                .onnx_runtime = build_options.enable_onnx,
-                .mlx = build_options.enable_mlx,
-                .wasm = build_options.enable_wasm,
-            },
-        });
-    }
-
-    /// Register termite API routes on an external server with a compile-time prefix.
+    /// Register inference API routes on an external server with a compile-time prefix.
     /// Used by swarm mode to register on the unified httpx.Server.
     pub fn registerRoutesOn(self: *Node, comptime prefix: []const u8, server: anytype) !void {
         const router = api.ServerRouter(Node).init(self);
@@ -4202,6 +4184,13 @@ pub const Node = struct {
         const counts = collectDiscoveredModelCounts(models_dir, ctx.allocator, ctx.io);
         return ctx.status(200).json(.{
             .status = "ready",
+            .backends = .{
+                .native = build_options.enable_native,
+                .onnx = true,
+                .onnx_runtime = build_options.enable_onnx,
+                .mlx = build_options.enable_mlx,
+                .wasm = build_options.enable_wasm,
+            },
             .models = .{
                 .embedders = counts.embedders,
                 .rerankers = counts.rerankers,
@@ -4602,18 +4591,18 @@ fn appendResidentProjectionMetrics(writer: *std.Io.Writer, stats: embedding_mod.
 }
 
 fn appendGraphExecutorMetrics(writer: *std.Io.Writer, stats: graph_mod.executor_stats.ExecutionStats) !void {
-    try appendPromMetric(writer, "termite_graph_executor_partitions_total", "counter", "Total graph executor partitions executed", stats.partitions_executed);
-    try appendPromMetric(writer, "termite_graph_executor_cross_device_transfers_total", "counter", "Total graph executor cross-device transfers", stats.cross_device_transfers);
-    try appendPromMetric(writer, "termite_graph_executor_runtime_input_transfers_total", "counter", "Total graph executor runtime input transfers", stats.runtime_input_transfers);
-    try appendPromMetric(writer, "termite_graph_executor_device_resident_transfers_total", "counter", "Total graph executor device-resident transfers", stats.device_resident_transfers);
-    try appendPromMetric(writer, "termite_graph_executor_backend_command_dispatches_total", "counter", "Total graph executor backend command dispatches", stats.backend_command_dispatches);
-    try appendPromMetric(writer, "termite_graph_executor_planned_operator_dispatches_total", "counter", "Total graph executor planned operator dispatches", stats.planned_operator_dispatches);
-    try appendPromMetric(writer, "termite_graph_executor_interpreter_fallbacks_total", "counter", "Total graph executor interpreter fallback partitions", stats.interpreter_fallbacks);
-    try appendPromMetric(writer, "termite_graph_executor_device_resident_outputs_total", "counter", "Total graph executor device-resident outputs", stats.device_resident_outputs);
-    try appendPromMetric(writer, "termite_graph_executor_host_materialized_outputs_total", "counter", "Total graph executor host-materialized outputs", stats.host_materialized_outputs);
-    try appendPromMetric(writer, "termite_graph_executor_boundary_output_materializations_total", "counter", "Total graph executor boundary output materializations", stats.boundary_output_materializations);
-    try appendPromMetric(writer, "termite_graph_executor_graph_plan_slots_reserved_total", "counter", "Total graph executor planned buffer slots reserved", stats.graph_plan_slots_reserved);
-    try appendPromMetric(writer, "termite_graph_executor_graph_plan_bytes_reserved_total", "counter", "Total graph executor planned buffer bytes reserved", stats.graph_plan_bytes_reserved);
+    try appendPromMetric(writer, "inference_graph_executor_partitions_total", "counter", "Total graph executor partitions executed", stats.partitions_executed);
+    try appendPromMetric(writer, "inference_graph_executor_cross_device_transfers_total", "counter", "Total graph executor cross-device transfers", stats.cross_device_transfers);
+    try appendPromMetric(writer, "inference_graph_executor_runtime_input_transfers_total", "counter", "Total graph executor runtime input transfers", stats.runtime_input_transfers);
+    try appendPromMetric(writer, "inference_graph_executor_device_resident_transfers_total", "counter", "Total graph executor device-resident transfers", stats.device_resident_transfers);
+    try appendPromMetric(writer, "inference_graph_executor_backend_command_dispatches_total", "counter", "Total graph executor backend command dispatches", stats.backend_command_dispatches);
+    try appendPromMetric(writer, "inference_graph_executor_planned_operator_dispatches_total", "counter", "Total graph executor planned operator dispatches", stats.planned_operator_dispatches);
+    try appendPromMetric(writer, "inference_graph_executor_interpreter_fallbacks_total", "counter", "Total graph executor interpreter fallback partitions", stats.interpreter_fallbacks);
+    try appendPromMetric(writer, "inference_graph_executor_device_resident_outputs_total", "counter", "Total graph executor device-resident outputs", stats.device_resident_outputs);
+    try appendPromMetric(writer, "inference_graph_executor_host_materialized_outputs_total", "counter", "Total graph executor host-materialized outputs", stats.host_materialized_outputs);
+    try appendPromMetric(writer, "inference_graph_executor_boundary_output_materializations_total", "counter", "Total graph executor boundary output materializations", stats.boundary_output_materializations);
+    try appendPromMetric(writer, "inference_graph_executor_graph_plan_slots_reserved_total", "counter", "Total graph executor planned buffer slots reserved", stats.graph_plan_slots_reserved);
+    try appendPromMetric(writer, "inference_graph_executor_graph_plan_bytes_reserved_total", "counter", "Total graph executor planned buffer bytes reserved", stats.graph_plan_bytes_reserved);
 }
 
 fn aggregateResidentProjectionStats(models: anytype) embedding_mod.ResidentProjectionStats {
@@ -4652,9 +4641,9 @@ test "graph executor metrics render counters" {
         .host_materialized_outputs = 3,
     });
     const output = writer.writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "termite_graph_executor_partitions_total 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "termite_graph_executor_interpreter_fallbacks_total 2\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "termite_graph_executor_host_materialized_outputs_total 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_graph_executor_partitions_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_graph_executor_interpreter_fallbacks_total 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_graph_executor_host_materialized_outputs_total 3\n") != null);
 }
 
 fn taskMatchesModelListing(task: []const u8, model_kind: []const u8, gliner_model_type: []const u8, tasks: []const []const u8, capabilities: []const []const u8) bool {

@@ -15,7 +15,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const build_options = @import("build_options");
-const linalg_primitives = @import("termite_linalg").primitives;
+const linalg_primitives = @import("inference_linalg").primitives;
 
 pub const MemoryModel = enum {
     wasm32,

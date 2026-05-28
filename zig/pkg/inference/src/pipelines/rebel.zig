@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const c_file = @import("../util/c_file.zig");
-const tokenizer_mod = @import("termite_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 const enc_dec_mod = @import("encoder_decoder.zig");
 const ner_mod = @import("ner.zig");
 const gliner_mod = @import("gliner.zig");

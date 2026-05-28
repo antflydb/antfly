@@ -1,6 +1,6 @@
-# Fine-Tuning in termite-zig
+# Fine-Tuning in antfly-inference-zig
 
-termite-zig supports training and fine-tuning through reverse-mode automatic differentiation on the graph IR. Features are implemented in pure Zig and run on CPU (BLAS) or Apple Silicon (MLX) — no CUDA dependencies.
+antfly-inference-zig supports training and fine-tuning through reverse-mode automatic differentiation on the graph IR. Features are implemented in pure Zig and run on CPU (BLAS) or Apple Silicon (MLX) — no CUDA dependencies.
 
 ---
 
@@ -9,10 +9,10 @@ termite-zig supports training and fine-tuning through reverse-mode automatic dif
 The recipe runner gives post-training one stable entry point:
 
 ```sh
-termite finetune run recipe.json
+antfly inference finetune run recipe.json
 ```
 
-It follows the same direction as TRL's trainer taxonomy and Training Hub's algorithm-first routing layer: users choose an algorithm, keep common fields stable, and let termite route to the existing family-specific prepare, train/eval, and materialize tools.
+It follows the same direction as TRL's trainer taxonomy and Training Hub's algorithm-first routing layer: users choose an algorithm, keep common fields stable, and let antfly inference route to the existing family-specific prepare, train/eval, and materialize tools.
 
 ### Schema
 
@@ -94,13 +94,13 @@ For learning-rate selection, do not copy full-finetune LRs directly. Start LoRA 
 Use `--dry-run` to print the routed tool plan without launching training:
 
 ```sh
-termite finetune run recipe.json --dry-run
+antfly inference finetune run recipe.json --dry-run
 ```
 
 For a no-download recipe-layer verifier, use:
 
 ```sh
-termite finetune smoke-fast
+antfly inference finetune smoke-fast
 ```
 
 `smoke-fast` runs quick dry-runs across every family adapter fixture, executes synthetic no-download GLiNER2, Qwen2, and Gemma4 recipe cases plus the fast scalar DPO/GRPO recipes, verifies the normalized run artifacts reach `status = "succeeded"`, and writes a suite summary at `/tmp/termite-finetune-smoke-fast/fast_smoke_summary.json` by default.
@@ -311,7 +311,7 @@ For Gemma4 multimodal GRPO, add `model.projector_path` and use prompt rows with 
 
 Completed:
 
-1. Added a common recipe schema and `termite finetune run <recipe.json>`.
+1. Added a common recipe schema and `antfly inference finetune run <recipe.json>`.
 2. Added adapter routing for Gemma4 LoRA, GLiNER2 LoRA, LayoutLMv3 LoRA, reranker head, reranker LoRA, and ColQwen2 VLM retrieval.
 3. Split train/eval dataset and cache fields where existing tools require separate train/eval inputs.
 4. Added dry-run expansion tests for every supported adapter family plus SFT, DPO, and GRPO recipes.
@@ -329,9 +329,9 @@ Completed:
 16. Extended normalized recipe reports with dataset fingerprints, backend build metadata, optimizer summaries, and artifact checksums.
 17. Added a first model-backed DPO route for decoder models using `preference_harness.zig`, real sequence logprobs, and optional explicit reference model paths.
 18. Added a first model-backed GRPO route for decoder models using `preference_harness.zig`, deterministic decoder sampling, exact-match rewards, and optional explicit reference model paths.
-19. Added `termite finetune smoke-fast` for fast no-download recipe-layer verification across family dry-runs and scalar preference executes.
+19. Added `antfly inference finetune smoke-fast` for fast no-download recipe-layer verification across family dry-runs and scalar preference executes.
 20. Added one synthetic no-download GLiNER2 direct-family execute case to `smoke-fast`, covering bootstrap, cache prepare, train/eval, and normalized artifact finalization through the unified recipe runner.
-21. Updated the fine-tuning docs so `termite finetune run` is the primary public entrypoint and family build-step commands are documented as backend reference.
+21. Updated the fine-tuning docs so `antfly inference finetune run` is the primary public entrypoint and family build-step commands are documented as backend reference.
 22. Added an initial optimizer-backed Gemma4 LoRA DPO path for `dataset.format = "text-preference"`, using live autodiff policy logprobs plus `preference_loss` gradients to train adapters and emit a trained adapter bundle.
 23. Added an initial optimizer-backed Gemma4 LoRA GRPO path for `dataset.format = "text-grpo"`, using live autodiff sampling plus token-logprob gradients to train adapters.
 24. Added `prefix-match` as a second text reward mode for model-backed GRPO and covered the new dry-run route in `smoke-fast`.
@@ -716,7 +716,7 @@ Current results:
 
 ## Family Command Reference
 
-Use `termite finetune run <recipe.json>` for normal post-training work.
+Use `antfly inference finetune run <recipe.json>` for normal post-training work.
 
 The family-specific `zig build <tool> -- ...` commands below are still useful
 for implementation work, debugging, and narrow backend verification, but they
@@ -732,8 +732,8 @@ runner.
 Preferred user path:
 
 ```sh
-termite finetune run recipe_layoutlmv3_lora_token.json
-termite finetune run recipe_layoutlmv3_lora_token.json --dry-run
+antfly inference finetune run recipe_layoutlmv3_lora_token.json
+antfly inference finetune run recipe_layoutlmv3_lora_token.json --dry-run
 ```
 
 ### Build Steps
@@ -1042,8 +1042,8 @@ This section documents the Gemma family backend commands. Prefer a recipe for
 normal use:
 
 ```sh
-termite finetune run recipe_gemma4_lora.json
-termite finetune run recipe_gemma4_lora.json --dry-run
+antfly inference finetune run recipe_gemma4_lora.json
+antfly inference finetune run recipe_gemma4_lora.json --dry-run
 ```
 
 Three-step pipeline: dataset preparation, tokenization, then train/eval. Gemma now supports two training modes:
@@ -1223,8 +1223,8 @@ recipe runner and by the lower-level family smoke-workflow entrypoints.
 Contract versions: `run_status/v1`, `training_config/v1`, `training_report/v1`
 
 Applies to:
-- `termite finetune run <recipe.json>`
-- `termite finetune smoke-fast`
+- `antfly inference finetune run <recipe.json>`
+- `antfly inference finetune smoke-fast`
 - `run-layoutlmv3-lora-smoke-workflow`
 - `run-gliner2-boundary-task-head-smoke-workflow`
 - `train-eval-layoutlmv3-lora-sequence`
@@ -1262,7 +1262,7 @@ Semantics:
 - `inputs` records the user-facing source paths
 - `training` records bounded hyperparameters and layer selection
 - `backend_policy.selected` is the backend actually requested/used by the CLI
-- `backend_policy.preferred` is the current termite default for that entrypoint
+- `backend_policy.preferred` is the current antfly inference default for that entrypoint
 
 ### `training_report.json`
 

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const linalg = @import("termite_linalg");
+const linalg = @import("inference_linalg");
 
 const BenchConfig = struct {
     warmup_iters: usize = 2,

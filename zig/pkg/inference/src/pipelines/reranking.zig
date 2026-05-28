@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
-const tokenizer_mod = @import("termite_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Tensor = backends.Tensor;
 const runtime = @import("../runtime/root.zig");
@@ -325,7 +325,7 @@ pub const RerankingPipeline = struct {
         };
     }
 
-    fn encodeSingleText(self: *RerankingPipeline, text: []const u8) !@import("termite_tokenizer").EncodeResult {
+    fn encodeSingleText(self: *RerankingPipeline, text: []const u8) !@import("inference_tokenizer").EncodeResult {
         return switch (self.config.single_text_encoding) {
             .encoder => self.tok.encodeForModel(self.allocator, text, self.config.max_length),
             .generation => self.tok.encodeForGenerationConfigured(self.allocator, text, self.config.max_length, self.config.add_bos_token),

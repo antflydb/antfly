@@ -24,13 +24,13 @@ pub const Import = enum {
     pjrt,
     protobuf,
     termite_c_file,
-    termite_finetune_data,
-    termite_finetune_tokenizer_batch,
-    termite_hf_tokenizer,
-    termite_internal,
+    inference_finetune_data,
+    inference_finetune_tokenizer_batch,
+    inference_hf_tokenizer,
+    inference_internal,
     termite_io_compat,
-    termite_linalg,
-    termite_tokenizer,
+    inference_linalg,
+    inference_tokenizer,
 };
 
 pub const NativeLink = enum {
@@ -47,13 +47,13 @@ pub const Context = struct {
     jinja_mod: *std.Build.Module,
     ml_mod: *std.Build.Module,
     onnx_graph_mod: *std.Build.Module,
-    termite_internal_mod: *std.Build.Module,
-    termite_tokenizer_mod: *std.Build.Module,
-    termite_hf_tokenizer_mod: *std.Build.Module,
+    inference_internal_mod: *std.Build.Module,
+    inference_tokenizer_mod: *std.Build.Module,
+    inference_hf_tokenizer_mod: *std.Build.Module,
     antfly_image_mod: *std.Build.Module,
     pjrt_mod: *std.Build.Module,
     protobuf_mod: *std.Build.Module,
-    termite_linalg_mod: *std.Build.Module,
+    inference_linalg_mod: *std.Build.Module,
     antfly_platform_mod: *std.Build.Module,
     enable_system_blas: bool,
     blas_root: ?[]const u8,
@@ -78,30 +78,30 @@ pub const Context = struct {
             }),
             // These roots intentionally live directly under src/. Their
             // transitive imports need src as the Zig module boundary.
-            .termite_finetune_data => ctx.b.createModule(.{
+            .inference_finetune_data => ctx.b.createModule(.{
                 .root_source_file = ctx.b.path("src/finetune_data_root.zig"),
                 .target = ctx.target,
                 .optimize = ctx.optimize,
             }),
-            .termite_finetune_tokenizer_batch => blk: {
+            .inference_finetune_tokenizer_batch => blk: {
                 const mod = ctx.b.createModule(.{
                     .root_source_file = ctx.b.path("src/finetune_tokenizer_batch_root.zig"),
                     .target = ctx.target,
                     .optimize = ctx.optimize,
                 });
-                mod.addImport("termite_tokenizer", ctx.termite_tokenizer_mod);
-                mod.addImport("termite_hf_tokenizer", ctx.termite_hf_tokenizer_mod);
+                mod.addImport("inference_tokenizer", ctx.inference_tokenizer_mod);
+                mod.addImport("inference_hf_tokenizer", ctx.inference_hf_tokenizer_mod);
                 break :blk mod;
             },
-            .termite_hf_tokenizer => ctx.termite_hf_tokenizer_mod,
-            .termite_internal => ctx.termite_internal_mod,
+            .inference_hf_tokenizer => ctx.inference_hf_tokenizer_mod,
+            .inference_internal => ctx.inference_internal_mod,
             .termite_io_compat => ctx.b.createModule(.{
                 .root_source_file = ctx.b.path("src/io/compat.zig"),
                 .target = ctx.target,
                 .optimize = ctx.optimize,
             }),
-            .termite_linalg => ctx.termite_linalg_mod,
-            .termite_tokenizer => ctx.termite_tokenizer_mod,
+            .inference_linalg => ctx.inference_linalg_mod,
+            .inference_tokenizer => ctx.inference_tokenizer_mod,
         };
     }
 };

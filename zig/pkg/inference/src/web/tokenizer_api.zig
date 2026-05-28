@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const hf_tokenizer_mod = @import("termite_hf_tokenizer");
+const hf_tokenizer_mod = @import("inference_hf_tokenizer");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
 const web_runtime = @import("runtime_state.zig");

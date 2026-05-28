@@ -14,10 +14,10 @@
 
 const std = @import("std");
 const open_corpus_cases = @import("open_corpus_cases.zig");
-const termite_audio = @import("src/mod.zig");
+const inference_audio = @import("src/mod.zig");
 const Io = std.Io;
 
-const EncodedFormat = termite_audio.EncodedFormat;
+const EncodedFormat = inference_audio.EncodedFormat;
 const OpenCorpusCodecCase = open_corpus_cases.OpenCorpusCodecCase;
 
 const Summary = struct {
@@ -141,12 +141,12 @@ fn verifyCheckedInCase(
     case: OpenCorpusCodecCase,
     bytes: []const u8,
 ) !void {
-    const detected = termite_audio.detectFormat(bytes) orelse
-        termite_audio.detectFormatFromFilename(case.name) orelse
+    const detected = inference_audio.detectFormat(bytes) orelse
+        inference_audio.detectFormatFromFilename(case.name) orelse
         return error.UndetectedFormat;
     if (detected != case.format) return error.UnexpectedDetectedFormat;
 
-    var interleaved = termite_audio.decodeInterleaved(allocator, bytes, .{
+    var interleaved = inference_audio.decodeInterleaved(allocator, bytes, .{
         .file_name_hint = case.name,
     }) catch |err| switch (err) {
         error.UnsupportedAudioFormat => return error.InterleavedDecodeUnsupported,
@@ -158,7 +158,7 @@ fn verifyCheckedInCase(
     if (interleaved.channels != case.expected_channels) return error.UnexpectedChannelCount;
     if (interleaved.samples.len == 0) return error.EmptyDecode;
 
-    var mono = termite_audio.decode(allocator, bytes, .{
+    var mono = inference_audio.decode(allocator, bytes, .{
         .file_name_hint = case.name,
     }) catch |err| switch (err) {
         error.UnsupportedAudioFormat => return error.MonoDecodeUnsupported,
@@ -167,7 +167,7 @@ fn verifyCheckedInCase(
     defer mono.deinit();
     if (mono.samples.len == 0) return error.EmptyMonoDecode;
 
-    var reference = termite_audio.decodeInterleaved(allocator, case.bytes, .{
+    var reference = inference_audio.decodeInterleaved(allocator, case.bytes, .{
         .file_name_hint = case.name,
     }) catch |err| switch (err) {
         error.UnsupportedAudioFormat => return error.ReferenceDecodeUnsupported,
@@ -177,12 +177,12 @@ fn verifyCheckedInCase(
     if (reference.channels != case.expected_channels) return error.ReferenceChannelCountMismatch;
 
     const aligned_reference = if (interleaved.sample_rate == reference.sample_rate)
-        try termite_audio.copyOrResample(allocator, reference.samples, reference.sample_rate, reference.sample_rate)
+        try inference_audio.copyOrResample(allocator, reference.samples, reference.sample_rate, reference.sample_rate)
     else
-        try termite_audio.resample(allocator, reference.samples, reference.sample_rate, interleaved.sample_rate);
+        try inference_audio.resample(allocator, reference.samples, reference.sample_rate, interleaved.sample_rate);
     defer allocator.free(aligned_reference);
 
-    const metrics = termite_audio.conformance.bestAlignmentMetrics(aligned_reference, interleaved.samples, 8192);
+    const metrics = inference_audio.conformance.bestAlignmentMetrics(aligned_reference, interleaved.samples, 8192);
     if (metrics.compared < case.min_compared) return error.ReferenceComparedTooShort;
     if (metrics.correlation < case.min_correlation) return error.ReferenceCorrelationTooLow;
     if (metrics.mean_abs_error > case.max_mean_abs_error) return error.ReferenceMaeTooHigh;

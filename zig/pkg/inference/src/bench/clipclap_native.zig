@@ -22,19 +22,19 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
-const termite_internal = @import("termite_internal");
-const clip_arch = termite_internal.architectures.clip;
-const clap_arch = termite_internal.architectures.clap;
-const clip_config_mod = termite_internal.models.clip;
-const clap_config_mod = termite_internal.models.clap;
-const native_compute = termite_internal.native_compute.native;
+const inference_internal = @import("inference_internal");
+const clip_arch = inference_internal.architectures.clip;
+const clap_arch = inference_internal.architectures.clap;
+const clip_config_mod = inference_internal.models.clip;
+const clap_config_mod = inference_internal.models.clap;
+const native_compute = inference_internal.native_compute.native;
 const NativeCompute = native_compute.NativeCompute;
-const cuda_compute = if (build_options.enable_cuda) termite_internal.native_compute.cuda else struct {};
+const cuda_compute = if (build_options.enable_cuda) inference_internal.native_compute.cuda else struct {};
 const WeightStore = native_compute.WeightStore;
-const QuantizedStorage = termite_internal.models.weight_source.QuantizedStorage;
-const Tensor = termite_internal.backends.Tensor;
-const quant_codec = termite_internal.gguf.quant_codec;
-const tensor_types = termite_internal.gguf.tensor_types;
+const QuantizedStorage = inference_internal.models.weight_source.QuantizedStorage;
+const Tensor = inference_internal.backends.Tensor;
+const quant_codec = inference_internal.gguf.quant_codec;
+const tensor_types = inference_internal.gguf.tensor_types;
 
 const QuantMode = enum {
     none,

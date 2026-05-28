@@ -1,6 +1,6 @@
 # GLiNER2 Finetuning State
 
-This file summarizes the current GLiNER2 finetuning state in `termite-zig`.
+This file summarizes the current GLiNER2 finetuning state in `antfly-inference-zig`.
 
 It is intentionally focused on:
 - what is implemented
@@ -10,14 +10,14 @@ It is intentionally focused on:
 
 ## Scope
 
-All work described here was implemented in `termite-zig`, not `gopeft-zig`.
+All work described here was implemented in `antfly-inference-zig`, not `gopeft-zig`.
 
 `gopeft-zig` was used as:
 - a reference implementation
 - a source of local datasets
 - a source of workflow ideas and artifact contracts
 
-The active `termite-zig` GLiNER2 finetuning surface lives primarily in:
+The active `antfly-inference-zig` GLiNER2 finetuning surface lives primarily in:
 - `src/finetune/gliner2.zig`
 - `src/finetune/gliner2_boundary.zig`
 - `src/finetune/gliner2_data.zig`
@@ -264,11 +264,11 @@ Still not implemented:
 - exact DeBERTa-backbone GLiNER2 LoRA backward/update parity
 - full `gopeft-zig` GLiNER2 taskgraph parity
 - larger local workflow validation on this smaller machine
-- full native distributed GLiNER2 finetuning ownership in termite workflow code
+- full native distributed GLiNER2 finetuning ownership in antfly inference workflow code
 
 ## Practical Interpretation
 
-GLiNER2 finetuning in `termite-zig` is now:
+GLiNER2 finetuning in `antfly-inference-zig` is now:
 - real
 - termite-owned
 - exercised on actual local artifacts

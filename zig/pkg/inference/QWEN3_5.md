@@ -54,7 +54,7 @@ Qwen3.5 is inference-ready enough for native smoke testing. Text-only
 optimizer-backed fine-tuning now has graph coverage for hybrid
 full-attention/linear-attention Qwen3.5 decoder layers, but it still needs
 real-weight CPU smoke coverage before being declared production-ready. The
-unified `termite finetune` recipe layer recognizes Qwen3.5/Chandra model paths
+unified `antfly inference finetune` recipe layer recognizes Qwen3.5/Chandra model paths
 as `qwen3_5` instead of collapsing them to the Qwen2 route.
 
 The training graph now has a Qwen3.5 text slice:
@@ -169,11 +169,11 @@ fine-tuning.
 
 ## Current Smoke Status
 
-- Pulled `datalab-to/chandra-ocr-2` to `~/.termite/models/datalab-to/chandra-ocr-2`.
+- Pulled `datalab-to/chandra-ocr-2` to `~/.antfly/inference/models/datalab-to/chandra-ocr-2`.
 - Native text generation now gets through Chandra prefill and emits a first token with explicit host memory budget:
-  - `termite generate ~/.termite/models/datalab-to/chandra-ocr-2 "hello" --backend native --max-tokens 1 --host-budget-mb 14000 --combined-budget-mb 16000 --scratch-budget-mb 1024`
+  - `antfly inference generate ~/.antfly/inference/models/datalab-to/chandra-ocr-2 "hello" --backend native --max-tokens 1 --host-budget-mb 14000 --combined-budget-mb 16000 --scratch-budget-mb 1024`
 - Native image generation now completes the Qwen prompt expansion, Chandra vision tower, multimodal embedding injection, and first-token prefill:
-  - `termite generate ~/.termite/models/datalab-to/chandra-ocr-2 "Read the image." --image testdata/image/png/basic/red-2x2.png --backend native --max-tokens 1 --host-budget-mb 14000 --combined-budget-mb 18000 --scratch-budget-mb 2048`
+  - `antfly inference generate ~/.antfly/inference/models/datalab-to/chandra-ocr-2 "Read the image." --image testdata/image/png/basic/red-2x2.png --backend native --max-tokens 1 --host-budget-mb 14000 --combined-budget-mb 18000 --scratch-budget-mb 2048`
 - Current native CPU path is correctness-oriented and slow on the full bf16 checkpoint; production use still needs Metal/WASM kernels or a quantized/exported artifact.
 
 ## Acceptance Tests

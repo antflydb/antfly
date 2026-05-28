@@ -14,6 +14,6 @@
 
 pub const runtime = @import("runtime.zig");
 
-test "termite module compiles" {
+test "inference module compiles" {
     _ = runtime;
 }

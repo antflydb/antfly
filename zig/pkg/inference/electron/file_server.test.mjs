@@ -38,7 +38,7 @@ test('resolveAllowedFilePath rejects paths outside allowed model roots', async (
 });
 
 test('file endpoint streams only files under allowed model roots', async () => {
-  const webRoot = await mkdtemp(join(tmpdir(), 'termite-web-'));
+  const webRoot = await mkdtemp(join(tmpdir(), 'inference-web-'));
   await writeFile(join(webRoot, 'index.html'), '<!doctype html>');
   const modelRoot = await mkdtemp(join(tmpdir(), 'termite-models-'));
   const outsideRoot = await mkdtemp(join(tmpdir(), 'termite-outside-'));

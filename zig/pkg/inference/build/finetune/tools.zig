@@ -14,11 +14,11 @@
 
 const common = @import("common.zig");
 
-const gliner_boundary_imports = &.{ .build_options, .jinja, .termite_hf_tokenizer };
-const gliner_boundary_train_imports = &.{ .build_options, .jinja, .ml, .termite_internal, .termite_hf_tokenizer };
-const reranker_text_imports = &.{ .build_options, .jinja, .termite_tokenizer, .termite_hf_tokenizer };
-const reranker_train_imports = &.{ .build_options, .jinja, .ml, .termite_tokenizer, .termite_hf_tokenizer };
-const gemma_lora_imports = &.{ .build_options, .ml, .termite_internal };
+const gliner_boundary_imports = &.{ .build_options, .jinja, .inference_hf_tokenizer };
+const gliner_boundary_train_imports = &.{ .build_options, .jinja, .ml, .inference_internal, .inference_hf_tokenizer };
+const reranker_text_imports = &.{ .build_options, .jinja, .inference_tokenizer, .inference_hf_tokenizer };
+const reranker_train_imports = &.{ .build_options, .jinja, .ml, .inference_tokenizer, .inference_hf_tokenizer };
+const gemma_lora_imports = &.{ .build_options, .ml, .inference_internal };
 
 const commands = [_]common.CommandSpec{
     .{
@@ -30,7 +30,7 @@ const commands = [_]common.CommandSpec{
         .name = "compose-lora-adapters",
         .root_source_file = "src/finetune/tools/compose_lora_adapters.zig",
         .description = "Compose LoRA adapter SafeTensors with optional eval gate",
-        .imports = &.{ .build_options, .termite_internal },
+        .imports = &.{ .build_options, .inference_internal },
     },
     .{
         .name = "bootstrap-gliner2-lora",
@@ -60,7 +60,7 @@ const commands = [_]common.CommandSpec{
         .name = "inspect-gliner2-dataset",
         .root_source_file = "src/finetune/tools/inspect_gliner2_dataset.zig",
         .description = "Inspect GLiNER2 finetune dataset stats, coverage, and encoded batch shapes",
-        .imports = &.{ .build_options, .termite_internal },
+        .imports = &.{ .build_options, .inference_internal },
     },
     .{
         .name = "validate-gliner2-autodiff-run",
@@ -72,33 +72,33 @@ const commands = [_]common.CommandSpec{
         .name = "eval-gliner2-autodiff-adapter",
         .root_source_file = "src/finetune/tools/eval_gliner2_autodiff_adapter.zig",
         .description = "Run fixed-text semantic eval against a saved GLiNER2 autodiff PEFT adapter and task head",
-        .imports = &.{ .build_options, .ml, .termite_internal, .termite_hf_tokenizer, .termite_linalg },
+        .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer, .inference_linalg },
         .native_link = .default,
     },
     .{
         .name = "eval-gliner2-autodiff-adapter-dataset",
         .root_source_file = "src/finetune/tools/eval_gliner2_autodiff_adapter_dataset.zig",
         .description = "Evaluate saved GLiNER2 autodiff PEFT adapter exact-match entity precision/recall/F1 on JSONL data",
-        .imports = &.{ .build_options, .ml, .termite_internal, .termite_hf_tokenizer, .termite_linalg },
+        .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer, .inference_linalg },
         .native_link = .default,
     },
     .{
         .name = "prepare-entity-cleanup-cache",
         .root_source_file = "src/finetune/tools/prepare_entity_cleanup_cache.zig",
         .description = "Prepare learned entity cleanup cache from annotated mention spans",
-        .imports = &.{.termite_internal},
+        .imports = &.{.inference_internal},
     },
     .{
         .name = "prepare-gliner2-entity-cleanup-cache",
         .root_source_file = "src/finetune/tools/prepare_gliner2_entity_cleanup_cache.zig",
         .description = "Prepare GLiNER2-native learned entity cleanup cache from annotated mention spans",
-        .imports = &.{.termite_internal},
+        .imports = &.{.inference_internal},
     },
     .{
         .name = "prepare-gliner2-top-layer-boundary-cache",
         .root_source_file = "src/finetune/tools/prepare_gliner2_top_layer_boundary_cache.zig",
         .description = "Precompute and persist GLiNER2 top-layer boundary caches for future task-head replay/update work",
-        .imports = &.{ .build_options, .jinja, .termite_internal, .termite_hf_tokenizer },
+        .imports = &.{ .build_options, .jinja, .inference_internal, .inference_hf_tokenizer },
         .native_link = .default,
     },
     .{
@@ -133,27 +133,27 @@ const commands = [_]common.CommandSpec{
         .name = "train-eval-gliner2-lora-bundle",
         .root_source_file = "src/finetune/train/train_eval_gliner2_lora_bundle.zig",
         .description = "Train GLiNER2 LoRA adapters using cached top-layer boundary representations and report before/after MSE",
-        .imports = &.{ .build_options, .ml, .termite_internal, .pjrt },
+        .imports = &.{ .build_options, .ml, .inference_internal, .pjrt },
         .native_link = .default,
     },
     .{
         .name = "train-eval-entity-cleanup-head",
         .root_source_file = "src/finetune/train/train_eval_entity_cleanup_head.zig",
         .description = "Train/eval a learned entity cleanup head from cached mention features",
-        .imports = &.{.termite_internal},
+        .imports = &.{.inference_internal},
     },
     .{
         .name = "train-gliner2-autodiff",
         .root_source_file = "src/finetune/train/train_gliner2_autodiff.zig",
         .description = "Train GLiNER2 NER with real autodiff through DeBERTa encoder (level-3 LoRA training)",
-        .imports = &.{ .build_options, .ml, .termite_internal, .termite_hf_tokenizer, .protobuf, .termite_linalg },
+        .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer, .protobuf, .inference_linalg },
         .native_link = .default,
     },
     .{
         .name = "inspect-reranker-dataset",
         .root_source_file = "src/finetune/tools/inspect_reranker_dataset.zig",
         .description = "Inspect reranker finetune dataset stats and grouped pair counts",
-        .imports = &.{.termite_finetune_data},
+        .imports = &.{.inference_finetune_data},
     },
     .{
         .name = "eval-reranker-checkpoint",
@@ -229,7 +229,7 @@ const commands = [_]common.CommandSpec{
         .name = "materialize-reranker-lora",
         .root_source_file = "src/finetune/tools/materialize_reranker_lora.zig",
         .description = "Materialize a bounded encoder-side LoRA bundle into a merged reranker checkpoint",
-        .imports = &.{ .build_options, .jinja, .termite_tokenizer, .termite_hf_tokenizer, .termite_internal },
+        .imports = &.{ .build_options, .jinja, .inference_tokenizer, .inference_hf_tokenizer, .inference_internal },
         .link_libc = true,
     },
     .{
@@ -257,49 +257,49 @@ const commands = [_]common.CommandSpec{
         .name = "bootstrap-colqwen2-lora",
         .root_source_file = "src/finetune/tools/bootstrap_colqwen2_lora.zig",
         .description = "Bootstrap a ColQwen2 LoRA adapter bundle",
-        .imports = &.{ .build_options, .ml, .termite_hf_tokenizer },
+        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer },
     },
     .{
         .name = "inspect-colqwen2-checkpoint",
         .root_source_file = "src/finetune/tools/inspect_colqwen2_checkpoint.zig",
         .description = "Inspect a ColQwen2 checkpoint or adapter bundle",
-        .imports = &.{ .build_options, .ml, .termite_hf_tokenizer },
+        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer },
     },
     .{
         .name = "inspect-colqwen2-lora-bundle",
         .root_source_file = "src/finetune/tools/inspect_colqwen2_lora_bundle.zig",
         .description = "Inspect a ColQwen2 LoRA adapter bundle",
-        .imports = &.{ .build_options, .ml, .termite_hf_tokenizer },
+        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer },
     },
     .{
         .name = "materialize-colqwen2-lora",
         .root_source_file = "src/finetune/tools/materialize_colqwen2_lora.zig",
         .description = "Materialize a ColQwen2 LoRA adapter bundle into a merged checkpoint",
-        .imports = &.{ .build_options, .ml, .termite_hf_tokenizer, .termite_internal },
+        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer, .inference_internal },
     },
     .{
         .name = "prepare-colqwen2-inputs",
         .root_source_file = "src/finetune/tools/prepare_colqwen2_inputs.zig",
         .description = "Prepare bounded ColQwen2 multimodal finetune inputs",
-        .imports = &.{ .build_options, .ml, .termite_tokenizer, .termite_hf_tokenizer, .antfly_image },
+        .imports = &.{ .build_options, .ml, .inference_tokenizer, .inference_hf_tokenizer, .antfly_image },
     },
     .{
         .name = "prepare-gemma4-text-dataset",
         .root_source_file = "src/finetune/tools/prepare_gemma4_text_dataset.zig",
         .description = "Convert Gemma4 text JSONL dataset to CSV for finetuning",
-        .imports = &.{.termite_finetune_data},
+        .imports = &.{.inference_finetune_data},
     },
     .{
         .name = "prepare-gemma4-multimodal-dataset",
         .root_source_file = "src/finetune/tools/prepare_gemma4_multimodal_dataset.zig",
         .description = "Convert Gemma4 multimodal JSONL dataset to CSV for finetuning",
-        .imports = &.{.termite_finetune_data},
+        .imports = &.{.inference_finetune_data},
     },
     .{
         .name = "prepare-gemma4-lora-inputs",
         .root_source_file = "src/finetune/tools/prepare_gemma4_lora_inputs.zig",
         .description = "Tokenize Gemma4 JSONL examples into prepared LoRA input JSON",
-        .imports = &.{ .build_options, .ml, .termite_internal, .termite_hf_tokenizer },
+        .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer },
         .native_link = .default,
     },
     .{
@@ -320,13 +320,13 @@ const commands = [_]common.CommandSpec{
         .name = "generate-gemma4-pilot-dataset",
         .root_source_file = "src/finetune/tools/generate_gemma4_pilot_dataset.zig",
         .description = "Generate a deterministic Gemma4 chat JSONL dataset for 100-example pilot runs",
-        .imports = &.{ .build_options, .termite_internal },
+        .imports = &.{ .build_options, .inference_internal },
     },
     .{
         .name = "generate-gemma4-multimodal-pilot-dataset",
         .root_source_file = "src/finetune/tools/generate_gemma4_multimodal_pilot_dataset.zig",
         .description = "Generate a deterministic Gemma4 chat JSONL dataset with image parts for multimodal pilot runs",
-        .imports = &.{ .build_options, .termite_internal },
+        .imports = &.{ .build_options, .inference_internal },
     },
     .{
         .name = "analyze-gemma4-recursive-lora-sweep",
@@ -339,7 +339,7 @@ const commands = [_]common.CommandSpec{
         .name = "train-eval-gemma4-lora-bundle",
         .root_source_file = "src/finetune/train/train_eval_gemma4_lora_bundle.zig",
         .description = "Run a bounded Gemma4 LoRA train/eval step",
-        .imports = &.{ .build_options, .ml, .termite_internal, .termite_hf_tokenizer },
+        .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer },
         .native_link = .default,
     },
     .{
@@ -364,7 +364,7 @@ const commands = [_]common.CommandSpec{
         .name = "train-eval-colqwen2-lora-bundle",
         .root_source_file = "src/finetune/train/train_eval_colqwen2_lora_bundle.zig",
         .description = "Run a bounded ColQwen2 LoRA train/eval step",
-        .imports = &.{ .build_options, .ml, .termite_internal, .termite_tokenizer, .termite_hf_tokenizer },
+        .imports = &.{ .build_options, .ml, .inference_internal, .inference_tokenizer, .inference_hf_tokenizer },
         .native_link = .no_accel,
     },
     .{
@@ -409,7 +409,7 @@ const commands = [_]common.CommandSpec{
         .name = "train-fused-chunker",
         .root_source_file = "src/finetune_train_fused_chunker_root.zig",
         .description = "End-to-end training for the fused chunker-embedder model",
-        .imports = &.{ .build_options, .ml, .termite_tokenizer, .termite_hf_tokenizer, .termite_linalg },
+        .imports = &.{ .build_options, .ml, .inference_tokenizer, .inference_hf_tokenizer, .inference_linalg },
         .native_link = .default,
     },
 };

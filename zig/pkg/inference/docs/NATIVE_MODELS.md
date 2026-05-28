@@ -1,6 +1,6 @@
 # Native Model Runtimes
 
-This document covers the native (non-ONNX) model runtime implementations in termite-zig: the GLiNER2 distributed MLX path and the LayoutDoc runtime for document classification.
+This document covers the native (non-ONNX) model runtime implementations in antfly-inference-zig: the GLiNER2 distributed MLX path and the LayoutDoc runtime for document classification.
 
 ---
 
@@ -46,12 +46,12 @@ bash ./scripts/verify_gliner2_mlx_distributed_smoke.sh
 ### Environment
 
 ```
-TERMITE_MLX_DISTRIBUTED_ENABLE=1
-TERMITE_MLX_DISTRIBUTED_MODE=tensor_parallel
-TERMITE_MLX_DISTRIBUTED_BACKEND=ring
-TERMITE_MLX_WORLD_SIZE=<n>
-TERMITE_MLX_RANK=<rank>
-TERMITE_MLX_LOCAL_RANK=<rank>
+ANTFLY_INFERENCE_MLX_DISTRIBUTED_ENABLE=1
+ANTFLY_INFERENCE_MLX_DISTRIBUTED_MODE=tensor_parallel
+ANTFLY_INFERENCE_MLX_DISTRIBUTED_BACKEND=ring
+ANTFLY_INFERENCE_MLX_WORLD_SIZE=<n>
+ANTFLY_INFERENCE_MLX_RANK=<rank>
+ANTFLY_INFERENCE_MLX_LOCAL_RANK=<rank>
 MLX_WORLD_SIZE=<n>
 MLX_RANK=<rank>
 MLX_HOSTFILE=<path>
@@ -160,14 +160,14 @@ That script:
 - Trains tiny real `gopeft-zig` LayoutDoc sequence and token heads when needed
 - Extracts one real sequence example and one real token example
 - Writes termite-compatible request fixtures under `/tmp/layoutdoc_termite_parity`
-- Attempts to run `probe-layoutdoc-sequence` and `probe-layoutdoc-token` if the `termite-zig` build is healthy
+- Attempts to run `probe-layoutdoc-sequence` and `probe-layoutdoc-token` if the `antfly-inference-zig` build is healthy
 
 Generated files:
 - `/tmp/layoutdoc_termite_parity/sequence_request.json`
 - `/tmp/layoutdoc_termite_parity/token_request.json`
 - `/tmp/layoutdoc_termite_parity/token_probe_tokens.json`
 - `/tmp/layoutdoc_termite_parity/parity_summary.json`
-- Optional probe outputs when the local `termite-zig` build succeeds
+- Optional probe outputs when the local `antfly-inference-zig` build succeeds
 
 ### Remaining Work
 

@@ -13,5 +13,5 @@
 // limitations under the License.
 
 test {
-    _ = @import("termite_internal").finetune.colqwen2;
+    _ = @import("inference_internal").finetune.colqwen2;
 }

@@ -13,9 +13,9 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite = @import("termite_internal");
+const inference = @import("inference_internal");
 
-const reranker_data = termite.finetune.reranker_data;
+const reranker_data = inference.finetune.reranker_data;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

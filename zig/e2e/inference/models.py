@@ -217,27 +217,27 @@ LISTING_BOOTSTRAP = {
 }
 
 GENERATOR_ENV_VARS = (
-    "TERMITE_DEFAULT_GENERATOR_MODEL",
-    "TERMITE_TOOL_MODEL",
-    "TERMITE_MULTIMODAL_GENERATOR_MODEL",
+    "ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL",
+    "ANTFLY_INFERENCE_TOOL_MODEL",
+    "ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL",
 )
 
 READER_ENV_VARS = (
-    "TERMITE_TROCR_MODEL",
-    "TERMITE_DONUT_MODEL",
-    "TERMITE_MULTISTAGE_READER_MODEL",
-    "TERMITE_PADDLEOCR_MODEL",
-    "TERMITE_SURYA_READER_MODEL",
-    "TERMITE_SURYA_MODEL",
-    "TERMITE_MOONDREAM_MODEL",
-    "TERMITE_PIX2STRUCT_MODEL",
+    "ANTFLY_INFERENCE_TROCR_MODEL",
+    "ANTFLY_INFERENCE_DONUT_MODEL",
+    "ANTFLY_INFERENCE_MULTISTAGE_READER_MODEL",
+    "ANTFLY_INFERENCE_PADDLEOCR_MODEL",
+    "ANTFLY_INFERENCE_SURYA_READER_MODEL",
+    "ANTFLY_INFERENCE_SURYA_MODEL",
+    "ANTFLY_INFERENCE_MOONDREAM_MODEL",
+    "ANTFLY_INFERENCE_PIX2STRUCT_MODEL",
 )
 
 
 def models_dir() -> Path:
     """Return the models directory, creating it if needed."""
 
-    configured = os.environ.get("ANTFLY_INFERENCE_MODELS_DIR") or os.environ.get("TERMITE_MODELS_DIR")
+    configured = os.environ.get("ANTFLY_INFERENCE_MODELS_DIR")
     if configured:
         directory = Path(configured)
     else:
@@ -276,7 +276,7 @@ def _model_path(spec: ModelSpec) -> Path:
 def _looks_like_model_dir(path: Path) -> bool:
     if not path.exists():
         return False
-    for filename in ("config.json", "tokenizer.json", "genai_config.json", "termite_metadata.json"):
+    for filename in ("config.json", "tokenizer.json", "genai_config.json", "antfly_metadata.json"):
         if (path / filename).exists():
             return True
     if any(path.glob("*.gguf")):
@@ -348,7 +348,7 @@ def ensure_model(spec: ModelSpec) -> Path:
         "--tasks",
         TASK_NAME_BY_DIR[spec.task],
     ]
-    configured_models_dir = os.environ.get("ANTFLY_INFERENCE_MODELS_DIR") or os.environ.get("TERMITE_MODELS_DIR")
+    configured_models_dir = os.environ.get("ANTFLY_INFERENCE_MODELS_DIR")
     if configured_models_dir:
         command.extend(["--models-dir", str(models_dir())])
     print(f"Downloading {spec.pull_ref}")
@@ -368,7 +368,7 @@ def ensure_model_by_name(name: str, task_hint: str | None = None) -> Path | None
 
 
 def default_generator_model_name(available_generators: set[str] | None = None) -> str | None:
-    override = os.environ.get("TERMITE_DEFAULT_GENERATOR_MODEL")
+    override = os.environ.get("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL")
     if override:
         return override
 
@@ -412,7 +412,7 @@ def detect_tool_call_format(model_path: Path) -> str | None:
 def find_tool_model_name(available_generators: set[str] | None = None) -> str | None:
     """Find a local tool-capable generator model name for E2E tests."""
 
-    override = os.environ.get("TERMITE_TOOL_MODEL")
+    override = os.environ.get("ANTFLY_INFERENCE_TOOL_MODEL")
     if override:
         return override
 
@@ -477,7 +477,7 @@ def detect_multimodal_generator(model_path: Path) -> bool:
 def find_multimodal_generator_model_name(available_generators: set[str] | None = None) -> str | None:
     """Find a local multimodal generator model name for E2E tests."""
 
-    override = os.environ.get("TERMITE_MULTIMODAL_GENERATOR_MODEL")
+    override = os.environ.get("ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL")
     if override:
         return override
 

@@ -40,7 +40,6 @@ pub const GenerateResult = struct {
 pub const Provider = enum {
     openai,
     ollama,
-    termite,
     antfly,
     mock,
 
@@ -60,7 +59,7 @@ pub const OllamaConfig = struct {
     url: []const u8 = "http://127.0.0.1:11434/v1",
 };
 
-pub const TermiteConfig = struct {
+pub const AntflyConfig = struct {
     model: []const u8,
     url: []const u8 = "",
 };
@@ -104,9 +103,9 @@ pub const GeneratorConfig = struct {
         };
     }
 
-    pub fn fromTermite(cfg: TermiteConfig) GeneratorConfig {
+    pub fn fromAntfly(cfg: AntflyConfig) GeneratorConfig {
         return .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = cfg.model,
             .url = cfg.url,
         };
@@ -115,7 +114,7 @@ pub const GeneratorConfig = struct {
     pub fn validate(self: GeneratorConfig) !void {
         try self.provider.validate();
         if (self.model.len == 0 and self.provider != .mock) return error.InvalidGeneratorConfig;
-        if (self.url.len == 0 and self.provider != .mock and self.provider != .termite and self.provider != .antfly) return error.InvalidGeneratorConfig;
+        if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly) return error.InvalidGeneratorConfig;
     }
 
     pub fn getModel(self: GeneratorConfig) []const u8 {
@@ -225,12 +224,10 @@ pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
         .model = if (cfg.model.len > 0) cfg.model else null,
         .url = switch (cfg.provider) {
             .openai, .ollama, .mock => if (cfg.url.len > 0) cfg.url else null,
-            .termite => null,
             .antfly => null,
         },
         .api_url = switch (cfg.provider) {
-            .termite => if (cfg.url.len > 0) cfg.url else null,
-            .antfly => null,
+            .antfly => if (cfg.url.len > 0) cfg.url else null,
             else => null,
         },
         .api_key = cfg.api_key,
@@ -458,7 +455,6 @@ fn providerFromOpenApi(provider: openapi.GeneratorProvider) !Provider {
     return switch (provider) {
         .openai => .openai,
         .ollama => .ollama,
-        .termite => .termite,
         .antfly => .antfly,
         .mock => .mock,
         else => error.UnsupportedGeneratorProvider,
@@ -469,7 +465,6 @@ fn providerToOpenApi(provider: Provider) openapi.GeneratorProvider {
     return switch (provider) {
         .openai => .openai,
         .ollama => .ollama,
-        .termite => .termite,
         .antfly => .antfly,
         .mock => .mock,
     };
@@ -496,18 +491,18 @@ fn chainConditionToOpenApi(condition: ChainCondition) openapi.ChainCondition {
 test "generator config round trips through generating openapi types" {
     const alloc = std.testing.allocator;
     const raw =
-        \\{"provider":"termite","model":"onnxruntime/Gemma-3-ONNX","api_url":"http://localhost:8082"}
+        \\{"provider":"antfly","model":"onnxruntime/Gemma-3-ONNX","api_url":"http://localhost:8082"}
     ;
     var cfg = try parseConfigFromSlice(alloc, raw);
     defer cfg.deinit(alloc);
-    try std.testing.expectEqual(.termite, cfg.provider);
+    try std.testing.expectEqual(.antfly, cfg.provider);
     try std.testing.expectEqualStrings("http://localhost:8082", cfg.url);
 
     const encoded = try stringifyConfigAlloc(alloc, cfg);
     defer alloc.free(encoded);
     var reparsed = try parseConfigFromSlice(alloc, encoded);
     defer reparsed.deinit(alloc);
-    try std.testing.expectEqual(.termite, reparsed.provider);
+    try std.testing.expectEqual(.antfly, reparsed.provider);
 }
 
 test "chain link round trips through generating openapi types" {
@@ -551,11 +546,11 @@ test "generator config normalization and validation work" {
 
 test "resolveGeneratorOrChain wraps a single generator" {
     const alloc = std.testing.allocator;
-    const chain = try resolveGeneratorOrChain(alloc, GeneratorConfig.fromTermite(.{ .model = "m1" }), &.{});
+    const chain = try resolveGeneratorOrChain(alloc, GeneratorConfig.fromAntfly(.{ .model = "m1" }), &.{});
     defer deinitChainAlloc(alloc, chain);
 
     try std.testing.expectEqual(@as(usize, 1), chain.len);
-    try std.testing.expectEqual(Provider.termite, chain[0].generator.provider);
+    try std.testing.expectEqual(Provider.antfly, chain[0].generator.provider);
 }
 
 test "executeChain falls back on timeout and retries within a link" {
@@ -594,7 +589,7 @@ test "executeChain falls back on timeout and retries within a link" {
                         .allocator = alloc_inner,
                     };
                 },
-                .termite => {
+                .antfly => {
                     return .{
                         .content = try alloc_inner.dupe(u8, "fallback-success"),
                         .allocator = alloc_inner,
@@ -635,7 +630,7 @@ test "executeChain falls back on timeout and retries within a link" {
             .retry = .{ .max_attempts = 1, .initial_backoff_ms = 1, .max_backoff_ms = 1 },
         },
         .{
-            .generator = GeneratorConfig.fromTermite(.{ .model = "local" }),
+            .generator = GeneratorConfig.fromAntfly(.{ .model = "local" }),
         },
     };
 
@@ -668,7 +663,7 @@ test "executeChain falls back on rate limit" {
             const state: *State = @ptrCast(@alignCast(ptr));
             return switch (state.cfg.provider) {
                 .openai => error.RateLimit,
-                .termite => .{
+                .antfly => .{
                     .content = try alloc_inner.dupe(u8, "rate-limit-fallback"),
                     .allocator = alloc_inner,
                 },
@@ -693,7 +688,7 @@ test "executeChain falls back on rate limit" {
             .condition = .on_rate_limit,
         },
         .{
-            .generator = GeneratorConfig.fromTermite(.{ .model = "local" }),
+            .generator = GeneratorConfig.fromAntfly(.{ .model = "local" }),
         },
     };
 

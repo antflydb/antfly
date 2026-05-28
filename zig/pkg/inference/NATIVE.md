@@ -91,11 +91,11 @@ for the current format and shape.
 
 Dense dequant+SGEMM remains an explicit rollout and benchmark path:
 
-- `TERMITE_QUANT_DEQUANT_SGEMM=1` enables the supported-format dense dequant
+- `ANTFLY_INFERENCE_QUANT_DEQUANT_SGEMM=1` enables the supported-format dense dequant
   path.
-- `TERMITE_QUANT_DEQUANT_SGEMM_CACHE_BYTES` bounds the persistent f32 cache.
-- `TERMITE_QUANT_DEQUANT_CACHE=0` disables the persistent dense cache.
-- `TERMITE_QUANT_DEQUANT_SGEMM_SCRATCH=1` enables transient dense scratch for
+- `ANTFLY_INFERENCE_QUANT_DEQUANT_SGEMM_CACHE_BYTES` bounds the persistent f32 cache.
+- `ANTFLY_INFERENCE_QUANT_DEQUANT_CACHE=0` disables the persistent dense cache.
+- `ANTFLY_INFERENCE_QUANT_DEQUANT_SGEMM_SCRATCH=1` enables transient dense scratch for
   benchmark/debug runs.
 
 Cache denial falls back to the direct quant kernel instead of silently
@@ -105,9 +105,9 @@ normal native backend configuration. Production paths should rely on dispatcher
 defaults and the bounded dequant controls above.
 
 Quantized direct kernels use the persistent native worker pool by default. Use
-`TERMITE_QUANT_PARALLEL=0` for single-threaded debugging,
-`TERMITE_QUANT_PARALLEL_WORKERS` to cap worker count, and
-`TERMITE_QUANT_PARALLEL_DEBUG=1` to print dispatch decisions.
+`ANTFLY_INFERENCE_QUANT_PARALLEL=0` for single-threaded debugging,
+`ANTFLY_INFERENCE_QUANT_PARALLEL_WORKERS` to cap worker count, and
+`ANTFLY_INFERENCE_QUANT_PARALLEL_DEBUG=1` to print dispatch decisions.
 
 ## Notes
 

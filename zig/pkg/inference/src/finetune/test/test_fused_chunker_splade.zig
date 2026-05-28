@@ -13,5 +13,5 @@
 // limitations under the License.
 
 test {
-    _ = @import("termite_internal").finetune.fused_chunker_splade;
+    _ = @import("inference_internal").finetune.fused_chunker_splade;
 }

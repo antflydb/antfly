@@ -60,13 +60,8 @@ pub fn chunkTextWithConfigJson(
     defer cfg.deinit(alloc);
 
     return switch (cfg.provider) {
-        .antfly => blk: {
-            var local_cfg = cfg;
-            local_cfg.api_url = "";
-            break :blk try chunking.termite.chunkText(alloc, local_cfg, text);
-        },
         .mock => try chunking.fixed.chunkText(alloc, text, cfg),
-        .termite => try chunking.termite.chunkText(alloc, cfg, text),
+        .antfly => try chunking.inference.chunkText(alloc, cfg, text),
     };
 }
 

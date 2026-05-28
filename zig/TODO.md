@@ -10,7 +10,7 @@ Observed on 2026-05-11:
 
 Latest full-suite status:
 
-- Termite E2E is green:
+- Antfly inference E2E is green:
   - command: `bash go/pkg/termite/scripts/debug_metal_command.sh command --timeout 1800 -- e2e/inference/.venv/bin/pytest -q -s e2e/inference`
   - result: `63 passed, 31 skipped in 825.24s (0:13:45)`
   - debug bundle: `go/pkg/termite/.debug/metal-command-20260510-195358`
@@ -82,7 +82,7 @@ Passing / skipped Antfly E2E areas in the latest full run:
 - Full `zig build test` is nightly/manual.
 - Antfly Python E2E is not currently part of the GitHub workflows found in
   `.github/workflows`.
-- Termite standalone and Python E2E coverage is not part of normal PR CI.
+- Antfly inference standalone and Python E2E coverage is not part of normal PR CI.
 - Full OpenAPI codegen drift (`make openapi-check`) is still not suitable for
   CI until all OpenAPI source specs are local to this repository. The safe check
   today is `zig build openapi-root-check`.

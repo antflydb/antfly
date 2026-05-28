@@ -14,7 +14,7 @@
 
 """Tests for /api/recognize (NER) endpoint.
 
-Matches Go termite's gliner_test.go patterns.
+Matches Go antfly's gliner_test.go patterns.
 GLiNER models use zero-shot NER with user-specified entity labels.
 """
 

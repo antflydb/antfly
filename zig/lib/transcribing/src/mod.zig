@@ -255,13 +255,13 @@ fn deinitSpeaker(alloc: Allocator, speaker: *Speaker) void {
 
 fn initTranscriber(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
     return switch (cfg.provider) {
-        .termite => try TermiteTranscriberState.init(alloc, http, cfg),
+        .antfly => try AntflyTranscriberState.init(alloc, http, cfg),
         .openai => try OpenAiTranscriberState.init(alloc, http, cfg),
         else => error.UnsupportedTranscribingProvider,
     };
 }
 
-const TermiteTranscriberState = struct {
+const AntflyTranscriberState = struct {
     alloc: Allocator,
     http: *httpx.Client,
     api_url: []const u8,
@@ -269,7 +269,7 @@ const TermiteTranscriberState = struct {
     language_code: ?[]const u8 = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
-        const state = try alloc.create(TermiteTranscriberState);
+        const state = try alloc.create(AntflyTranscriberState);
         errdefer alloc.destroy(state);
 
         state.* = .{
@@ -290,7 +290,7 @@ const TermiteTranscriberState = struct {
     }
 
     fn deinit(ptr: *anyopaque) void {
-        const self: *TermiteTranscriberState = @ptrCast(@alignCast(ptr));
+        const self: *AntflyTranscriberState = @ptrCast(@alignCast(ptr));
         self.alloc.free(self.api_url);
         freeOpt(self.alloc, self.model);
         freeOpt(self.alloc, self.language_code);
@@ -298,7 +298,7 @@ const TermiteTranscriberState = struct {
     }
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
-        const self: *TermiteTranscriberState = @ptrCast(@alignCast(ptr));
+        const self: *AntflyTranscriberState = @ptrCast(@alignCast(ptr));
         const audio_bytes = try resolveAudioInputAlloc(alloc, req.url);
         defer alloc.free(audio_bytes);
 
@@ -576,7 +576,7 @@ test "transcribing registry preserves named providers and default" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
-        \\  "whisper-local": { "provider": "termite", "api_url": "http://127.0.0.1:8080", "model": "openai/whisper-base" },
+        \\  "whisper-local": { "provider": "antfly", "api_url": "http://127.0.0.1:8080", "model": "openai/whisper-base" },
         \\  "whisper-remote": { "provider": "openai", "model": "whisper-1" }
         \\}
     ;
@@ -588,7 +588,7 @@ test "transcribing registry preserves named providers and default" {
 
     try std.testing.expectEqualStrings("whisper-local", registry.defaultProviderName().?);
     const default_cfg = try registry.getConfig(null);
-    try std.testing.expectEqual(Provider.termite, default_cfg.provider);
+    try std.testing.expectEqual(Provider.antfly, default_cfg.provider);
     try std.testing.expectEqualStrings("openai/whisper-base", default_cfg.model.?);
 
     const explicit_cfg = try registry.getConfig("whisper-remote");
@@ -596,7 +596,7 @@ test "transcribing registry preserves named providers and default" {
     try std.testing.expectEqualStrings("whisper-1", explicit_cfg.model.?);
 }
 
-test "transcribing runtime loads termite provider and transcribes data uri input" {
+test "transcribing runtime loads antfly provider and transcribes data uri input" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -604,7 +604,7 @@ test "transcribing runtime loads termite provider and transcribes data uri input
 
     var server = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/transcribe", .respond = .{
-            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"hello from termite\",\"language\":\"en\"}],\"model\":\"openai/whisper-base\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3,\"total_tokens\":3}}",
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"hello from antfly\",\"language\":\"en\"}],\"model\":\"openai/whisper-base\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3,\"total_tokens\":3}}",
         } },
     });
     defer server.deinit();
@@ -613,7 +613,7 @@ test "transcribing runtime loads termite provider and transcribes data uri input
     defer alloc.free(api_url);
     const raw =
         \\{
-        \\  "whisper-local": { "provider": "termite", "api_url": "
+        \\  "whisper-local": { "provider": "antfly", "api_url": "
     ;
     const suffix =
         \\", "model": "openai/whisper-base" }
@@ -660,7 +660,7 @@ test "transcribing runtime loads termite provider and transcribes data uri input
     group.await(io) catch {};
     if (run_err) |err| return err;
 
-    try std.testing.expectEqualStrings("hello from termite", response.?.text.?);
+    try std.testing.expectEqualStrings("hello from antfly", response.?.text.?);
     try std.testing.expectEqualStrings("en", response.?.language.?);
 }
 

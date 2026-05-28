@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const hf_tokenizer = @import("termite_hf_tokenizer");
-const tokenizer_mod = @import("termite_tokenizer");
+const hf_tokenizer = @import("inference_hf_tokenizer");
+const tokenizer_mod = @import("inference_tokenizer");
 
 const compat = @import("../io/compat.zig");
 const c_file = @import("../util/c_file.zig");

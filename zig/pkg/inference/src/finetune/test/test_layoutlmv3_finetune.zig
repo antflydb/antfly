@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const termite = @import("termite_internal");
-const graph_bridge = termite.finetune.graph_bridge;
-const layoutlmv3 = termite.finetune.layoutlmv3;
+const inference = @import("inference_internal");
+const graph_bridge = inference.finetune.graph_bridge;
+const layoutlmv3 = inference.finetune.layoutlmv3;
 
 test {
     _ = graph_bridge;

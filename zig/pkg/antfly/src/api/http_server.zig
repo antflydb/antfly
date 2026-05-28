@@ -115,7 +115,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var semantic_resolver = SemanticStatusResolver{
             .source = self.server.source,
-            .local_termite_provider = self.server.local_termite_provider,
+            .antfly_provider = self.server.antfly_provider,
             .remote_content = self.server.cfg.remote_content,
         };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
@@ -149,7 +149,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
     ) !?db_mod.RuntimePreflightSummary {
         var semantic_resolver = SemanticStatusResolver{
             .source = self.server.source,
-            .local_termite_provider = self.server.local_termite_provider,
+            .antfly_provider = self.server.antfly_provider,
             .remote_content = self.server.cfg.remote_content,
         };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
@@ -227,7 +227,7 @@ pub const ApiHttpServerConfig = struct {
 
 pub const SemanticStatusResolver = struct {
     source: StatusSource,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
 
     pub fn iface(self: *SemanticStatusResolver) query_contract.SemanticResolver {
@@ -253,7 +253,7 @@ pub const SemanticStatusResolver = struct {
             .ptr = self.source.ptr,
             .admin_snapshot = self.source.vtable.admin_snapshot orelse return error.UnsupportedQueryRequest,
             .free_admin_snapshot = self.source.vtable.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
-            .local_termite_provider = self.local_termite_provider,
+            .antfly_provider = self.antfly_provider,
             .remote_content = self.remote_content,
         }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
     }
@@ -810,7 +810,7 @@ pub const ApiHttpServer = struct {
     source: StatusSource,
     table_reads: ?table_reads.TableReadSource = null,
     table_writes: ?table_writes.TableWriteSource = null,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     owned_foreign_registry: ?*foreign_mod.Registry = null,
     txn_sessions: transactions_api.SessionRegistry = .{},
@@ -2094,7 +2094,7 @@ pub const ApiHttpServer = struct {
             var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
             defer arena_impl.deinit();
             const QueryBuilderGenerationRunner = struct {
-                local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+                antfly_provider: ?managed_embedder.AntflyProvider,
                 secret_store: ?*common_secrets.FileStore,
 
                 fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
@@ -2115,10 +2115,10 @@ pub const ApiHttpServer = struct {
                     defer io_impl.deinit();
                     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
                     defer client.deinit();
-                    return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
+                    return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
                 }
             };
-            var generation_runner = QueryBuilderGenerationRunner{ .local_termite_provider = self.local_termite_provider, .secret_store = self.cfg.secret_store };
+            var generation_runner = QueryBuilderGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store };
             var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
             const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
                 error.InvalidQueryBuilderRequest => return try jsonErrorResponse(self.alloc, 400, "invalid query builder request"),
@@ -2633,7 +2633,7 @@ pub const ApiHttpServer = struct {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
                 var semantic_resolver = SemanticStatusResolver{
                     .source = runner.server.source,
-                    .local_termite_provider = runner.server.local_termite_provider,
+                    .antfly_provider = runner.server.antfly_provider,
                     .remote_content = runner.server.cfg.remote_content,
                 };
                 var query_req = query_api.parsePublicQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
@@ -2691,7 +2691,7 @@ pub const ApiHttpServer = struct {
         };
 
         const RetrievalGenerationRunner = struct {
-            local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
@@ -2712,10 +2712,10 @@ pub const ApiHttpServer = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(inner_alloc, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.local_termite_provider, .secret_store = self.cfg.secret_store };
+        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store };
 
         var query_runner = RetrievalQueryRunner{
             .server = self,
@@ -2813,7 +2813,7 @@ pub const ApiHttpServer = struct {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
                 var semantic_resolver = SemanticStatusResolver{
                     .source = runner.server.source,
-                    .local_termite_provider = runner.server.local_termite_provider,
+                    .antfly_provider = runner.server.antfly_provider,
                     .remote_content = runner.server.cfg.remote_content,
                 };
                 var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
@@ -2871,7 +2871,7 @@ pub const ApiHttpServer = struct {
         };
 
         const RetrievalGenerationRunner = struct {
-            local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
@@ -2892,10 +2892,10 @@ pub const ApiHttpServer = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.local_termite_provider, .secret_store = self.cfg.secret_store };
+        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store };
 
         var query_runner = RetrievalQueryRunner{
             .server = self,
@@ -3003,7 +3003,7 @@ pub const ApiHttpServer = struct {
                     self.alloc,
                     create_req.indexes_json orelse tables_api.default_indexes_json,
                     .{
-                        .local_termite_provider = self.local_termite_provider,
+                        .antfly_provider = self.antfly_provider,
                         .secret_store = self.cfg.secret_store,
                         .remote_content = self.cfg.remote_content,
                     },
@@ -4839,7 +4839,7 @@ pub const ApiHttpServer = struct {
     ) !query_api.QueryResponse {
         var semantic_resolver = SemanticStatusResolver{
             .source = self.source,
-            .local_termite_provider = self.local_termite_provider,
+            .antfly_provider = self.antfly_provider,
             .remote_content = self.cfg.remote_content,
         };
         var query_req = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, body) catch |err| {
@@ -4887,7 +4887,7 @@ pub const ApiHttpServer = struct {
         defer alloc.free(query_body);
         var semantic_resolver = SemanticStatusResolver{
             .source = self.source,
-            .local_termite_provider = self.local_termite_provider,
+            .antfly_provider = self.antfly_provider,
             .remote_content = self.cfg.remote_content,
         };
         var owned = try query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, query_body);
@@ -5029,7 +5029,7 @@ pub const ApiHttpServer = struct {
             index_name,
             expanded_index_json,
             .{
-                .local_termite_provider = self.local_termite_provider,
+                .antfly_provider = self.antfly_provider,
                 .secret_store = self.cfg.secret_store,
                 .remote_content = self.cfg.remote_content,
             },
@@ -5040,7 +5040,7 @@ pub const ApiHttpServer = struct {
         defer alloc.free(normalized_index_json);
 
         table_writes.validateIndexConfigWithOptions(alloc, index_name, normalized_index_json, .{
-            .local_termite_provider = self.local_termite_provider,
+            .antfly_provider = self.antfly_provider,
             .secret_store = self.cfg.secret_store,
             .remote_content = self.cfg.remote_content,
         }) catch |err| switch (err) {

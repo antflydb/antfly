@@ -53,7 +53,7 @@ const backend_contracts = @import("../graph/backend_contracts.zig");
 const metal_command_planner = @import("../graph/metal_command_planner.zig");
 const graph_quant_matmul = @import("../graph/quant_matmul.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
-const linalg = @import("termite_linalg");
+const linalg = @import("inference_linalg");
 
 const WeightStore = gpu_hosted_store_mod.WeightStore;
 const NativeWeightStore = native_compute_mod.WeightStore;

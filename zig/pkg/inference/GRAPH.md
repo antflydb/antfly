@@ -1,6 +1,6 @@
 # Graph IR
 
-Termite's graph IR is an XLA-inspired trace-once/cache/replay system for ML inference and training. Models are traced into a DAG of operations, optimized through compiler passes, and executed through backend-agnostic interpreters.
+Antfly inference's graph IR is an XLA-inspired trace-once/cache/replay system for ML inference and training. Models are traced into a DAG of operations, optimized through compiler passes, and executed through backend-agnostic interpreters.
 
 ## Related Docs
 
@@ -9,7 +9,7 @@ These docs describe one runtime architecture from different layers:
 - this file: generic graph IR, graph runtime, partitioning,
   compiled backend attachment, and memory planning.
 - [GGML.md](GGML.md): GGUF/GGML format compatibility and the ggml execution
-  shape Termite uses as a reference for packed quantized kernels.
+  shape Antfly inference uses as a reference for packed quantized kernels.
 - [METAL.md](METAL.md): the concrete pure-Metal backend plan, including
   backend-owned KV, quantized matmul, command planning, and scratch/frame
   lifetime.
@@ -65,7 +65,7 @@ The runtime should support these strategies:
 
 CLI commands that run imported static graphs should expose this with
 `--graph-runtime interpreter|partitioned|compiled|compiled-required`. The
-environment variables `TERMITE_GRAPH_RUNTIME` and `TERMITE_ONNX_GRAPH_RUNTIME`
+environment variables `ANTFLY_INFERENCE_GRAPH_RUNTIME` and `ANTFLY_INFERENCE_ONNX_GRAPH_RUNTIME`
 are compatibility/default fallbacks, not the primary user control surface.
 
 This makes the layering:
@@ -98,7 +98,7 @@ ONNX-specific execution architecture.
 
 Explicit graph-runtime selection is authoritative for imported static graphs:
 when a CLI/API path sets `--graph-runtime`, `SessionManager` routes `.onnx`
-loads through Termite's imported graph runtime instead of the external ONNX
+loads through Antfly inference's imported graph runtime instead of the external ONNX
 Runtime binding, and `ModelManager` preserves that strategy through per-backend
 session-manager clones. This prevents a model phase from silently bypassing the
 generic graph runtime while sidecar phases use it.
@@ -163,7 +163,7 @@ coverage for that path is:
 
 The current eager `MetalCompute` backend still preserves host-backed behavior
 by default because existing unit tests and decoder fallbacks depend on it.
-`TERMITE_METAL_UPLOAD_FLOAT32_INPUTS=1` is an explicit experiment knob for
+`ANTFLY_INFERENCE_METAL_UPLOAD_FLOAT32_INPUTS=1` is an explicit experiment knob for
 runtime-input upload at `fromFloat32Shape`; it should eventually move behind a
 graph-runtime policy rather than remaining a backend-wide environment flag.
 
@@ -173,27 +173,27 @@ coverage on machines or shells where constructing a Metal backend is unavailable
 or risky:
 
 ```sh
-TERMITE_GRAPH_PARTITION_REPORT=1 \
-TERMITE_GRAPH_PARTITION_REPORT_TARGET=metal \
-termite embed ~/.termite/models/antflydb/clipclap \
+ANTFLY_INFERENCE_GRAPH_PARTITION_REPORT=1 \
+ANTFLY_INFERENCE_GRAPH_PARTITION_REPORT_TARGET=metal \
+antfly inference embed ~/.antfly/inference/models/antflydb/clipclap \
   --backend native --graph-runtime partitioned --text "hello world"
 ```
 
 The report includes target/fallback node totals plus aggregated
 `fallback_ops` and `metal_host_assisted_ops`. Missing-op work should be driven
 from those aggregates, not from one failing runtime trace. Set
-`TERMITE_GRAPH_PARTITION_REPORT_PARTS=1` only when the per-partition rows are
+`ANTFLY_INFERENCE_GRAPH_PARTITION_REPORT_PARTS=1` only when the per-partition rows are
 needed.
 
 Benchmark and CI runs that validate resident graph paths should fail closed
 instead of silently accepting slow partitions. Use
-`TERMITE_GRAPH_RUNTIME_FAIL_CLOSED=1` to reject both native compute fallback
+`ANTFLY_INFERENCE_GRAPH_RUNTIME_FAIL_CLOSED=1` to reject both native compute fallback
 partitions and Metal host-assisted target ops. The narrower gates are
-`TERMITE_GRAPH_RUNTIME_REQUIRE_NO_FALLBACK=1` and
-`TERMITE_GRAPH_RUNTIME_REQUIRE_NO_HOST_ASSISTED=1`; compatibility aliases
-`TERMITE_GRAPH_PARTITION_FAIL_CLOSED=1`,
-`TERMITE_GRAPH_PARTITION_TARGET_REQUIRED=1`, and
-`TERMITE_GRAPH_RUNTIME_FAIL_ON_FALLBACK=1` are also accepted. Parameter- and
+`ANTFLY_INFERENCE_GRAPH_RUNTIME_REQUIRE_NO_FALLBACK=1` and
+`ANTFLY_INFERENCE_GRAPH_RUNTIME_REQUIRE_NO_HOST_ASSISTED=1`; compatibility aliases
+`ANTFLY_INFERENCE_GRAPH_PARTITION_FAIL_CLOSED=1`,
+`ANTFLY_INFERENCE_GRAPH_PARTITION_TARGET_REQUIRED=1`, and
+`ANTFLY_INFERENCE_GRAPH_RUNTIME_FAIL_ON_FALLBACK=1` are also accepted. Parameter- and
 constant-only host partitions are allowed by the fallback gate because they do
 not represent compute fallback.
 
@@ -293,7 +293,7 @@ All in `lib/ml/src/graph/passes/`:
 
 ## Execution Backends
 
-Termite now treats graph execution as two layers:
+Antfly inference now treats graph execution as two layers:
 
 - **Host backends**: own the baseline tensor runtime and can execute the whole graph through the interpreter.
 - **Compiled graph backends**: optionally compile all or part of the graph into backend-specific artifacts/executors.
@@ -360,10 +360,10 @@ Compiled graph backends can now be materialized as offline artifacts rather than
 
 CLI surface:
 
-- `termite compile-artifact <model-dir> <prompt> ...`
-- `termite run-artifact <artifact> <prompt> ...`
-- `termite run-artifact <artifact> --validate`
-- `termite generate ... --artifact-dir <path>`
+- `antfly inference compile-artifact <model-dir> <prompt> ...`
+- `antfly inference run-artifact <artifact> <prompt> ...`
+- `antfly inference run-artifact <artifact> --validate`
+- `antfly inference generate ... --artifact-dir <path>`
 
 Core files:
 
@@ -371,7 +371,7 @@ Core files:
 - `src/native_compile.zig`: graph tracing + artifact export
 - `src/native_run_artifact.zig`: validation and exact-shape execution
 
-Artifact sidecars (`*.termite.json`) are termite-specific metadata. They record:
+Artifact sidecars (`*.antfly.json`) are termite-specific metadata. They record:
 
 - backend
 - artifact kind
@@ -381,7 +381,7 @@ Artifact sidecars (`*.termite.json`) are termite-specific metadata. They record:
 - attention mode
 - backend-specific metadata needed to run the artifact safely
 
-This sidecar is required because the artifact file itself (`.onnx`, `.mlmodelc`) does not carry enough information for termite to know whether it matches a particular generation request.
+This sidecar is required because the artifact file itself (`.onnx`, `.mlmodelc`) does not carry enough information for antfly inference to know whether it matches a particular generation request.
 
 Offline artifacts are currently exact shape buckets. A different prompt can use an existing artifact only when the rendered/tokenized prompt matches the artifact's recorded `seq_len`, `query_seq_len`, attention mode, and ABI. A prompt with a different token count needs a separate artifact or future dynamic/bucketed-shape support.
 
@@ -488,8 +488,8 @@ Near-term graph/backend work:
 Recent graph/backend progress is now best summarized at the architecture level rather than as the old ONNX node-by-node bisection log.
 
 1. Offline artifact plumbing exists end to end.
-   - `compile-artifact` emits backend artifacts plus termite sidecars and package manifests.
-   - Default artifact directories now mirror the model namespace: `~/.termite/artifacts/<owner>/<model>/<backend>/...`.
+   - `compile-artifact` emits backend artifacts plus antfly inference sidecars and package manifests.
+   - Default artifact directories now mirror the model namespace: `~/.antfly/inference/artifacts/<owner>/<model>/<backend>/...`.
    - `run-artifact` validates and executes exact-shape artifacts and can target a package manifest directly.
    - `generate` fast artifact lookup now prefers package manifests before raw sidecar scanning.
 
@@ -527,7 +527,7 @@ Recent graph/backend progress is now best summarized at the architecture level r
    - Package manifests are now the primary whole-model attach surface for both ONNX and PJRT, with raw sidecar scans retained as fallback compatibility.
    - `GraphCache` now separates shape-specific compiled executors from session-level `ModelRuntime` state, which is the required lifetime model for KV/cache across prefill and decode.
    - Current compiled ONNX graph artifacts still cover prefill; the intended decode path is a separate `artifact_role=decode` ONNX entrypoint with a decoder-style past/present ABI, not retrofitting every traced/debug graph artifact to expose semantic KV.
-   - The import bridge proved the runtime/package shape with existing semantic ONNX files; native GPT-2 artifacts now prove the same path with Termite-exported prefill/decode entrypoints.
+   - The import bridge proved the runtime/package shape with existing semantic ONNX files; native GPT-2 artifacts now prove the same path with Antfly inference-exported prefill/decode entrypoints.
    - Native `paged_decode` tracing already exposes current-token K/V projection nodes. The native semantic decoder entrypoint now turns those into ONNX `past_key_values.*` inputs and `present.*` outputs for equal-head attention and grouped-query attention; Gemma-style GQA now has a full native semantic prefill/decode package proof through `ModelExecutor` / `ModelRuntime`, retained ORT cache values, and shared q8 external weights.
    - ONNX whole-model phase packages now use ORT IO binding for backend-owned past/present cache state. Traced/debug graph artifacts with explicit node inputs remain host-assisted unless they expose the semantic decoder ABI.
    - Gemma GQA semantic decode has been validated for multiple decode steps from the same prefill cache; semantic prefill now covers the first multi-token buckets (`seq_len=2/query_seq_len=2`, `seq_len=3/query_seq_len=3`, `seq_len=4/query_seq_len=4`, and `seq_len=8/query_seq_len=8`) plus the chat-template France prompt bucket (`seq_len=16/query_seq_len=16`) with backend-owned ORT state.
@@ -536,7 +536,7 @@ Recent graph/backend progress is now best summarized at the architecture level r
    - PJRT/XLA now follows the same whole-model runtime surface, but backend-owned decode/KV is still incomplete and some shapes still fall back to inline graph compilation.
    - PJRT artifacts now report their load mode explicitly. Existing `pjrt_hlo` artifacts are still HLO compile-on-load through the configured plugin, while `pjrt_executable` artifacts deserialize plugin-native executables through the bound PJRT serialize/deserialize C API. Whole-model generation prefers matching `pjrt_executable` phase artifacts, then matching HLO phase artifacts, before falling back to inline graph compilation.
    - Bounded PJRT partition HLO and executable artifacts can now run through `run-artifact` with host-materialized graph inputs and `--compare-host`; the Gemma best-partition HLO and plugin-native executable proofs execute through the local CPU plugin and match native outputs within float noise.
-   - GPT-2 whole-model prefill now exports as `pjrt_hlo`, but the default dense artifact embeds constants and is too large for reliable local CPU-plugin compile-on-load. Load-only executable export is wired and tested on a small executable, while bounded partition `pjrt_executable` export is proven; large dense whole-model executable export is budget-gated by `TERMITE_PJRT_MAX_EXECUTABLE_EXPORT_HLO_BYTES` until plugin compile/serialize capacity or external/offline constant handling is proven. `--xla-parameter-mode inputs` provides an explicit host-assisted validation bridge that shrinks HLO by passing graph parameters as PJRT inputs, and manifests record `pjrt_parameter_mode` so this bridge can coexist with embedded artifacts; it is not the final backend-owned weight residency model.
+   - GPT-2 whole-model prefill now exports as `pjrt_hlo`, but the default dense artifact embeds constants and is too large for reliable local CPU-plugin compile-on-load. Load-only executable export is wired and tested on a small executable, while bounded partition `pjrt_executable` export is proven; large dense whole-model executable export is budget-gated by `ANTFLY_INFERENCE_PJRT_MAX_EXECUTABLE_EXPORT_HLO_BYTES` until plugin compile/serialize capacity or external/offline constant handling is proven. `--xla-parameter-mode inputs` provides an explicit host-assisted validation bridge that shrinks HLO by passing graph parameters as PJRT inputs, and manifests record `pjrt_parameter_mode` so this bridge can coexist with embedded artifacts; it is not the final backend-owned weight residency model.
    - PJRT whole-model misses now report compute coverage directly, including unsupported node count, first unsupported op, and attention/RoPE blocker counts. Static 2D `fused_rope` now lowers to HLO constants plus a rotation matrix, and static batch-1 full-recompute GQA attention lowers to HLO dot/reduce/softmax. Offline semantic XLA export can lower static single-token skip-KV attention by adding past-KV parameters, concatenating past plus current K/V, and returning present K/V outputs. Remaining full-decoder misses should concentrate on dynamic/bucketed cache lengths, broader stateful attention, and dynamic RoPE layouts.
    - PJRT host-assisted single-token replay remains distinct from backend-owned KV/cache decode. PJRT artifact manifests now have semantic binding names for `input_ids` and past/present KV entries; semantic `present.*` outputs can populate the retained PJRT buffer cache, and semantic `past_*` inputs can feed retained buffers back into executable input slots. `PjrtModelRuntime` now shares one retained-buffer cache across attached prefill/decode HLO phases. GPT-2 semantic decode HLO now validates a real bucketed decode ABI with `input_ids`, 24 `past_key_values.*` inputs, and 24 `present.*` outputs; the remaining PJRT proof is executing the prefill/decode package without dense embedded HLO overwhelming the local plugin.
 

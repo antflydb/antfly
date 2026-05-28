@@ -352,7 +352,7 @@ Implemented in this pass:
 - DB and heatmap detection post-processing in the shared OCR coordinator
 - CTC recognition session loading with character-dictionary support
 - `/api/read` multistage dispatch now produces `text` plus `regions` for CTC-based OCR readers
-- native `termite read` now emits `regions` too, so local reader output matches the richer API result shape more closely
+- native `antfly inference read` now emits `regions` too, so local reader output matches the richer API result shape more closely
 - PaddleOCR recognition preprocessing now keeps aspect ratio and pads crops instead of always stretching them to the recognition width
 - multistage OCR preprocessing now honors explicit `rescale_factor` values instead of assuming `/255` normalization in every case
 - multistage `preprocessor_config.json` parsing now accepts additional Hugging Face-style size variants such as `[width, height]` arrays and `{ "shortest_edge": N }`
@@ -367,7 +367,7 @@ Verified in this pass:
 
 - `/api/version` now exposes built backend capabilities so e2e can gate ONNX-backed OCR checks without shelling out
 - the installed `monkt/paddleocr-onnx` reader now has a model-backed e2e assertion on the generated bitmap fixture
-- `termite pull hf:monkt/paddleocr-onnx --models-dir models/readers` now works against the raw upstream Hugging Face repo by selecting the nested detection/English recognition assets and synthesizing a local `termite_metadata.json`
+- `antfly inference pull hf:monkt/paddleocr-onnx --models-dir models/readers` now works against the raw upstream Hugging Face repo by selecting the nested detection/English recognition assets and synthesizing a local `termite_metadata.json`
 - the freshly pulled local `monkt/paddleocr-onnx` bundle now passes the multistage `/api/read` e2e, so PaddleOCR is no longer blocked on manual repackaging
 - plain `zig build` now auto-enables ONNX when a matching local `onnxruntime/<platform>-<arch>` bundle is present, so the default local binary keeps the PaddleOCR reader path live
 - the default build now passes `zig build test`, `e2e/inference/test_version.py`, and the `monkt/paddleocr-onnx` multistage `/api/read` e2e without extra `-Donnx=true` flags
@@ -408,8 +408,8 @@ Implemented in this pass:
 - that Surya e2e now prefers the Go repo's existing `sample-page-1.png` fixture when available, so real-model validation can cover document structure and OCR phrases without duplicating binary testdata here
 - the Surya e2e also accepts env-driven stricter assertions for expected OCR phrases and layout labels, so a local real-model run can validate more than just non-empty regions without another code change
 - the Surya e2e can now also assert ordered region texts and ordered region labels from env vars, which lets a local real-model run validate reading order behavior directly
-- the same Surya e2e now accepts `TERMITE_SURYA_EXPECTATIONS_JSON`, so a local pinned expectation set can capture phrase, label, and ordered-region checks in one file instead of many env vars
-- the same test can now write an observed expectation snapshot via `TERMITE_SURYA_WRITE_EXPECTATIONS_JSON`, and `e2e/testdata/surya_expectations.sample.json` documents the expected file shape for promoting a local Surya run into a regression
+- the same Surya e2e now accepts `ANTFLY_INFERENCE_SURYA_EXPECTATIONS_JSON`, so a local pinned expectation set can capture phrase, label, and ordered-region checks in one file instead of many env vars
+- the same test can now write an observed expectation snapshot via `ANTFLY_INFERENCE_SURYA_WRITE_EXPECTATIONS_JSON`, and `e2e/testdata/surya_expectations.sample.json` documents the expected file shape for promoting a local Surya run into a regression
 - if `e2e/testdata/surya_expectations.local.json` exists, the Surya e2e will now pick it up automatically; that file is gitignored so one machine can pin a real local Surya expectation set without affecting the shared repo
 
 Still remaining in this phase:

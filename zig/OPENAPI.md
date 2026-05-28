@@ -73,7 +73,7 @@ default. For experiments, the old dynamic codegen path remains available:
 
 ```sh
 cd pkg/inference
-zig build -Dtermite-openapi-spec=../../../specs/openapi/inference/api.yaml
+zig build -Dinference-openapi-spec=../../../specs/openapi/inference/api.yaml
 ```
 
 ## Updating An API

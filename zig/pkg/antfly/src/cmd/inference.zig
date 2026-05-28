@@ -16,14 +16,14 @@ const std = @import("std");
 const antfly = @import("antfly-zig");
 
 pub fn run(init: std.process.Init) !void {
-    return try antfly.termite_runtime.run(init);
+    return try antfly.inference_runtime.run(init);
 }
 
 pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.process.Args.Iterator) !void {
-    return try antfly.termite_runtime.runFromIterator(init, argv0, args);
+    return try antfly.inference_runtime.runFromIterator(init, argv0, args);
 }
 
-test "termite cmd compiles" {
+test "inference cmd compiles" {
     _ = run;
     _ = runFromIterator;
 }

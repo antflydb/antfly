@@ -13,12 +13,12 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite = @import("termite_internal");
-const compat = termite.io.compat;
-const finetune = termite.finetune.layoutlmv3;
-const document_data = termite.finetune.document_data;
-const run_contract = termite.run.contract;
-const artifact_writer = termite.run.artifact_writer;
+const inference = @import("inference_internal");
+const compat = inference.io.compat;
+const finetune = inference.finetune.layoutlmv3;
+const document_data = inference.finetune.document_data;
+const run_contract = inference.run.contract;
+const artifact_writer = inference.run.artifact_writer;
 
 const DatasetStats = struct {
     num_examples: usize,

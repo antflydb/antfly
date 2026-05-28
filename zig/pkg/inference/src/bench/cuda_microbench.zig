@@ -22,7 +22,7 @@ const native_embed = @import("../native_embed.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 
 const print = std.debug.print;
-const cuda_ptx = if (build_options.enable_cuda) @embedFile("../ops/cuda/artifacts/termite_cuda_kernels.ptx") else "";
+const cuda_ptx = if (build_options.enable_cuda) @embedFile("../ops/cuda/artifacts/inference_cuda_kernels.ptx") else "";
 const cuda_ptx_z = cuda_ptx ++ "\x00";
 
 const q4_k_values_per_block: usize = 256;

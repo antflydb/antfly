@@ -22,7 +22,7 @@
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { instantiateTermiteWasm } from './test-wasm-runtime.mjs';
-import { TermiteWeb } from './termite-web.js';
+import { InferenceWeb } from './inference-web.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, '..');
@@ -53,7 +53,7 @@ for (const name of requiredExports) {
 if (!allPresent) process.exit(1);
 console.log(`  All ${requiredExports.length} projector-related exports are present`);
 
-console.log('\nTest 2: TermiteWeb multimodal projector helpers exist');
+console.log('\nTest 2: InferenceWeb multimodal projector helpers exist');
 const helperMethods = [
   'loadProjectorGguf',
   'unloadProjector',
@@ -66,15 +66,15 @@ const helperMethods = [
 ];
 
 for (const name of helperMethods) {
-  if (typeof TermiteWeb.prototype[name] !== 'function') {
-    console.error(`  FAIL: missing TermiteWeb helper ${name}`);
+  if (typeof InferenceWeb.prototype[name] !== 'function') {
+    console.error(`  FAIL: missing InferenceWeb helper ${name}`);
     process.exit(1);
   }
 }
-console.log(`  All ${helperMethods.length} TermiteWeb helpers are present`);
+console.log(`  All ${helperMethods.length} InferenceWeb helpers are present`);
 
 console.log('\nTest 3: worker-mode projector helpers dispatch correct RPCs');
-const termite = new TermiteWeb();
+const termite = new InferenceWeb();
 termite._worker = { postMessage() {} };
 termite._readBinarySource = async (source) => {
   if (source instanceof Uint8Array) return source;
@@ -204,7 +204,7 @@ if (!Array.isArray(workerCalls[6].extra.expandedIds) || workerCalls[6].extra.exp
 console.log(`  Executed ${workerCalls.length} projector worker RPCs with expected payloads`);
 
 console.log('\nTest 4: Gemma4 cached multimodal generation composes the new projector path correctly');
-const generateTermite = new TermiteWeb();
+const generateTermite = new InferenceWeb();
 const generationCalls = [];
 let freedCache = null;
 generateTermite.gptCreateKvCache = (modelHandle, maxLen, options) => {
