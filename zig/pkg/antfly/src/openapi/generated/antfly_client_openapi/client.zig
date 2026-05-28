@@ -107,6 +107,15 @@ pub const Client = struct {
         return ApiResponse(types.ClusterStatus).fromResponse(self.allocator, &resp);
     }
 
+    /// Get cluster topology
+    /// GET /cluster
+    pub fn getCluster(self: *@This()) !ApiResponse(types.ClusterTopology) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/cluster", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ClusterTopology).fromResponse(self.allocator, &resp);
+    }
+
     /// List secrets status
     /// GET /secrets
     pub fn listSecrets(self: *@This()) !ApiResponse(types.SecretList) {

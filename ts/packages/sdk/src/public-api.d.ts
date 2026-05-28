@@ -13,9 +13,29 @@ export interface paths {
         };
         /**
          * Get cluster status
-         * @description Returns the current health and status of all stores and shards in the cluster
+         * @description Returns minimal cluster health and runtime status.
          */
         get: operations["getStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/cluster": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get cluster topology
+         * @description Returns cluster health plus data-node, range, replica, and group topology for dashboard views.
+         */
+        get: operations["getCluster"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1804,6 +1824,112 @@ export interface components {
             secret_store?: components["schemas"]["SecretStoreStatus"];
         } & {
             [key: string]: unknown;
+        };
+        ClusterTopology: {
+            health: components["schemas"]["ClusterHealth"];
+            /** @description Optional message providing details about the health status */
+            message?: string;
+            /** @description Indicates whether authentication is enabled for the cluster */
+            auth_enabled?: boolean;
+            /** @description Indicates whether the cluster is running in single-node swarm mode */
+            swarm_mode?: boolean;
+            secret_store?: components["schemas"]["SecretStoreStatus"];
+            data: components["schemas"]["ClusterDataStatus"];
+        } & {
+            [key: string]: unknown;
+        };
+        /** @description Typed Zig status view for table data topology and range placement. */
+        ClusterDataStatus: {
+            nodes?: components["schemas"]["ClusterDataNodeStatus"][];
+            ranges?: components["schemas"]["ClusterDataRangeStatus"][];
+            replicas?: components["schemas"]["ClusterDataReplicaStatus"][];
+            groups?: components["schemas"]["ClusterDataGroupStatus"][];
+        };
+        ClusterDataNodeStatus: {
+            /** Format: uint64 */
+            data_id: number;
+            /** Format: uint64 */
+            node_id: number;
+            api_url?: string;
+            raft_url?: string;
+            role?: string;
+            state?: string;
+            health_class?: string;
+            failure_domain?: string;
+            live?: boolean;
+            drain_requested?: boolean;
+            /** Format: uint64 */
+            capacity_bytes?: number;
+            /** Format: uint64 */
+            available_bytes?: number;
+            /** Format: uint32 */
+            lease_pressure?: number;
+            /** Format: uint32 */
+            read_load?: number;
+            /** Format: uint32 */
+            write_load?: number;
+            /** Format: uint32 */
+            active_backfills?: number;
+        };
+        ClusterDataRangeStatus: {
+            /** Format: uint64 */
+            group_id: number;
+            /** Format: uint64 */
+            range_id: number;
+            /** Format: uint64 */
+            table_id: number;
+            table_name?: string;
+            start_key?: string;
+            end_key?: string | null;
+            /** Format: uint64 */
+            doc_identity_shard_id?: number;
+            /** Format: uint64 */
+            doc_identity_range_id?: number;
+            state?: string;
+            /** Format: uint64 */
+            leader_data_id?: number | null;
+            /** Format: uint32 */
+            voter_count?: number;
+            /** Format: uint64 */
+            doc_count?: number;
+            /** Format: uint64 */
+            disk_bytes?: number;
+            empty?: boolean;
+        };
+        ClusterDataReplicaStatus: {
+            /** Format: uint64 */
+            group_id: number;
+            /** Format: uint64 */
+            data_id: number;
+            /** Format: uint64 */
+            node_id: number;
+            /** Format: uint64 */
+            replica_id: number;
+            peer_node_ids?: number[];
+        };
+        ClusterDataGroupStatus: {
+            /** Format: uint64 */
+            group_id: number;
+            leader_known?: boolean;
+            /** Format: uint64 */
+            leader_data_id?: number | null;
+            voter_count_known?: boolean;
+            /** Format: uint32 */
+            voter_count?: number;
+            /** Format: uint32 */
+            healthy_voter_reports?: number;
+            joint_consensus?: boolean;
+            transition_pending?: boolean;
+            replay_required?: boolean;
+            replay_caught_up?: boolean;
+            cutover_ready?: boolean;
+            reads_ready_after_cutover?: boolean;
+            doc_identity_lifecycle?: string;
+            /** Format: uint64 */
+            doc_count?: number;
+            /** Format: uint64 */
+            disk_bytes?: number;
+            empty?: boolean;
         };
         /** @description Non-secret status for the local secrets file store, when one is available. */
         SecretStoreStatus: {
@@ -9638,6 +9764,36 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ClusterStatus"];
+                };
+            };
+            /** @description Unauthorized - authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getCluster: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cluster topology retrieved successfully */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClusterTopology"];
                 };
             };
             /** @description Unauthorized - authentication required */

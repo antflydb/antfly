@@ -52,6 +52,69 @@ pub const ClusterHealth = enum {
     }
 };
 
+pub const ClusterDataNodeStatus = struct {
+    data_id: i64,
+    node_id: i64,
+    api_url: ?[]const u8 = null,
+    raft_url: ?[]const u8 = null,
+    role: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    health_class: ?[]const u8 = null,
+    failure_domain: ?[]const u8 = null,
+    live: ?bool = null,
+    drain_requested: ?bool = null,
+    capacity_bytes: ?i64 = null,
+    available_bytes: ?i64 = null,
+    lease_pressure: ?i64 = null,
+    read_load: ?i64 = null,
+    write_load: ?i64 = null,
+    active_backfills: ?i64 = null,
+};
+
+pub const ClusterDataRangeStatus = struct {
+    group_id: i64,
+    range_id: i64,
+    table_id: i64,
+    table_name: ?[]const u8 = null,
+    start_key: ?[]const u8 = null,
+    end_key: ?[]const u8 = null,
+    doc_identity_shard_id: ?i64 = null,
+    doc_identity_range_id: ?i64 = null,
+    state: ?[]const u8 = null,
+    leader_data_id: ?i64 = null,
+    voter_count: ?i64 = null,
+    doc_count: ?i64 = null,
+    disk_bytes: ?i64 = null,
+    empty: ?bool = null,
+};
+
+pub const ClusterDataReplicaStatus = struct {
+    group_id: i64,
+    data_id: i64,
+    node_id: i64,
+    replica_id: i64,
+    peer_node_ids: ?[]const i64 = null,
+};
+
+pub const ClusterDataGroupStatus = struct {
+    group_id: i64,
+    leader_known: ?bool = null,
+    leader_data_id: ?i64 = null,
+    voter_count_known: ?bool = null,
+    voter_count: ?i64 = null,
+    healthy_voter_reports: ?i64 = null,
+    joint_consensus: ?bool = null,
+    transition_pending: ?bool = null,
+    replay_required: ?bool = null,
+    replay_caught_up: ?bool = null,
+    cutover_ready: ?bool = null,
+    reads_ready_after_cutover: ?bool = null,
+    doc_identity_lifecycle: ?[]const u8 = null,
+    doc_count: ?i64 = null,
+    disk_bytes: ?i64 = null,
+    empty: ?bool = null,
+};
+
 /// Non-secret status for the local secrets file store, when one is available.
 pub const SecretStoreStatus = struct {
     /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
@@ -1303,6 +1366,14 @@ pub const RowFilterEntry = struct {
     filter: std.json.ArrayHashMap(std.json.Value),
 };
 
+/// Typed Zig status view for table data topology and range placement.
+pub const ClusterDataStatus = struct {
+    nodes: ?[]const ClusterDataNodeStatus = null,
+    ranges: ?[]const ClusterDataRangeStatus = null,
+    replicas: ?[]const ClusterDataReplicaStatus = null,
+    groups: ?[]const ClusterDataGroupStatus = null,
+};
+
 pub const ClusterStatus = struct {
     health: ClusterHealth,
     /// Optional message providing details about the health status
@@ -1672,6 +1743,18 @@ pub const Permission = struct {
     resource: []const u8,
     resource_type: ResourceType,
     type: PermissionType,
+};
+
+pub const ClusterTopology = struct {
+    health: ClusterHealth,
+    /// Optional message providing details about the health status
+    message: ?[]const u8 = null,
+    /// Indicates whether authentication is enabled for the cluster
+    auth_enabled: ?bool = null,
+    /// Indicates whether the cluster is running in single-node swarm mode
+    swarm_mode: ?bool = null,
+    secret_store: ?SecretStoreStatus = null,
+    data: ClusterDataStatus,
 };
 
 pub const SecretList = struct {

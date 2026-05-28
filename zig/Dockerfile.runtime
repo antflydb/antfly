@@ -1,0 +1,19 @@
+FROM --platform=$TARGETPLATFORM alpine:3.21
+
+LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
+LABEL org.opencontainers.image.description="AntflyDB Zig runtime image"
+LABEL org.opencontainers.image.licenses=Elastic-2.0
+
+WORKDIR /
+COPY bin/antfly /antfly
+COPY share/antfly /usr/share/antfly
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD wget -qO- http://localhost:4200/readyz || exit 1
+
+USER 10001:10001
+
+EXPOSE 8080 11433 4200
+
+ENTRYPOINT ["/antfly"]
+CMD ["swarm"]
