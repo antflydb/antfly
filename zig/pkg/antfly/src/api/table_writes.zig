@@ -1236,7 +1236,9 @@ pub const ProvisionedTableWriteCache = struct {
         table_name: []const u8,
         generation_source: ?table_reads.GroupLsmGenerationSource,
     ) !usize {
-        if (self.alloc.ptr != dest.alloc.ptr or self.alloc.vtable != dest.alloc.vtable) return 0;
+        if (self.alloc.ptr != dest.alloc.ptr or self.alloc.vtable != dest.alloc.vtable) {
+            return self.retireAdoptableEntriesForTableLocked(table_name);
+        }
 
         const metadata = self.tableMetadataLocked(table_name);
         if (metadata) |value| {
@@ -1279,6 +1281,30 @@ pub const ProvisionedTableWriteCache = struct {
             moved += 1;
         }
         return moved;
+    }
+
+    fn retireAdoptableEntriesForTableLocked(
+        self: *ProvisionedTableWriteCache,
+        table_name: []const u8,
+    ) usize {
+        var retired: usize = 0;
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (!std.mem.eql(u8, entry.table_name, table_name) or
+                !entry.allow_generation_adoption or
+                entry.active_leases != 0 or
+                entry.bulk_ingest_session_open)
+            {
+                i += 1;
+                continue;
+            }
+
+            const removed = self.entries.orderedRemove(i);
+            self.retireEntryLocked(removed);
+            retired += 1;
+        }
+        return retired;
     }
 
     fn getOrLoadMetadataLocked(
@@ -17997,4 +18023,89 @@ test "write cache transfers adoptable provisioned db to raft apply source" {
     var cached = try apply_source.getOrOpenCachedDbMode(alloc, &apply_cache, path, 7001, "docs", .default_async, null, null);
     cached.deinit(alloc);
     try std.testing.expectEqual(misses_before, apply_cache.miss_count.load(.monotonic));
+}
+
+test "write cache retires adoptable seed when transfer allocators differ" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-transfer-allocator-mismatch", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const GenerationSource = struct {
+        fn iface(value: *u64) table_reads.GroupLsmGenerationSource {
+            return .{
+                .ptr = value,
+                .generation_for_group = generationForGroup,
+            };
+        }
+
+        fn generationForGroup(ptr: *anyopaque, _: u64) u64 {
+            return (@as(*u64, @ptrCast(@alignCast(ptr)))).*;
+        }
+    };
+
+    var generation: u64 = 1;
+    var source_cache = ProvisionedTableWriteCache.init(alloc);
+    defer source_cache.deinit();
+    var apply_arena = std.heap.ArenaAllocator.init(alloc);
+    defer apply_arena.deinit();
+    var apply_cache = ProvisionedTableWriteCache.init(apply_arena.allocator());
+    defer apply_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    var apply_source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &source_cache;
+    apply_source.write_cache = &apply_cache;
+    source.group_lsm_generation = GenerationSource.iface(&generation);
+    apply_source.group_lsm_generation = GenerationSource.iface(&generation);
+
+    var seeded = try source_cache.getOrOpenLocked(path, Catalog.iface(), 7001, generation, "docs");
+    seeded.deinit(alloc);
+    source_cache.entries.items[0].allow_generation_adoption = true;
+
+    generation = 2;
+    const retired = try source.transferAdoptableWriteCacheEntriesTo(&apply_source, "docs");
+    try std.testing.expectEqual(@as(usize, 1), retired);
+    try std.testing.expectEqual(@as(usize, 0), source_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), apply_cache.entries.items.len);
 }
