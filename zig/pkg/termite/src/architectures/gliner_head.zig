@@ -25,16 +25,6 @@ const ops = @import("../ops/ops.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 
-// Same SIMD width selection as lib/linalg/src/primitives.zig.  We don't import
-// linalg here to avoid pulling its build-options dependency into this file.
-const vec_len: usize = blk: {
-    const builtin = @import("builtin");
-    if (builtin.cpu.arch == .wasm32) break :blk 4;
-    if (builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f)) break :blk 16;
-    break :blk 8;
-};
-const F32xN = @Vector(vec_len, f32);
-
 pub const ForwardResult = struct {
     logits: []f32, // [batch * num_words * max_width * num_labels]
     num_words: usize,
@@ -368,39 +358,20 @@ fn extractWordEmbeddings(
     defer allocator.free(counts);
     @memset(counts, 0.0);
 
-    const main = (H / vec_len) * vec_len;
     for (0..batch) |b| {
         for (0..seq_len) |t| {
             const word_id = words_mask[b * seq_len + t];
             if (word_id <= 0) continue;
             const w: usize = @intCast(word_id - 1); // 0-indexed
+            const count_off = b * num_words + w;
+            if (counts[count_off] != 0.0) continue;
             const src_off = (b * seq_len + t) * H;
             const dst_off = (b * num_words + w) * H;
             const dst = output[dst_off..][0..H];
             const src = hidden[src_off..][0..H];
-            var d: usize = 0;
-            while (d < main) : (d += vec_len) {
-                const dv: F32xN = dst[d..][0..vec_len].*;
-                const sv: F32xN = src[d..][0..vec_len].*;
-                dst[d..][0..vec_len].* = dv + sv;
-            }
-            while (d < H) : (d += 1) dst[d] += src[d];
-            counts[b * num_words + w] += 1.0;
+            @memcpy(dst, src);
+            counts[count_off] = 1.0;
         }
-    }
-
-    // Average
-    for (0..batch * num_words) |i| {
-        if (counts[i] <= 0.0) continue;
-        const inv = 1.0 / counts[i];
-        const inv_v: F32xN = @splat(inv);
-        const row = output[i * H ..][0..H];
-        var d: usize = 0;
-        while (d < main) : (d += vec_len) {
-            const rv: F32xN = row[d..][0..vec_len].*;
-            row[d..][0..vec_len].* = rv * inv_v;
-        }
-        while (d < H) : (d += 1) row[d] *= inv;
     }
 
     return .{ .embeddings = output, .num_words = num_words };
@@ -1116,7 +1087,7 @@ fn outProjectorMlp(
     return cb.linear(h2_relu, w4, b4, N, H, H);
 }
 
-test "extractWordEmbeddings averages sub-token embeddings per word" {
+test "extractWordEmbeddings uses first sub-token embedding per word" {
     const allocator = std.testing.allocator;
     const hidden = [_]f32{
         1, 2,
@@ -1130,7 +1101,7 @@ test "extractWordEmbeddings averages sub-token embeddings per word" {
     defer allocator.free(result.embeddings);
 
     try std.testing.expectEqual(@as(usize, 2), result.num_words);
-    try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 6 }, result.embeddings);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 5, 6 }, result.embeddings);
 }
 
 test "extractLabelEmbeddings uses entity marker positions" {

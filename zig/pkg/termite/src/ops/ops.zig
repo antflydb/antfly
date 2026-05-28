@@ -839,7 +839,7 @@ pub const ComputeBackend = struct {
         takeRows: ?*const fn (ctx: *anyopaque, request: *const TakeRowsRequest) anyerror!?CT = null,
 
         /// GLiNER-specific word embedding aggregation:
-        /// averages encoder hidden rows by a host words_mask into
+        /// takes the first encoder hidden row by a host words_mask into
         /// [batch * num_words, hidden_size].
         glinerWordEmbeddings: ?*const fn (ctx: *anyopaque, request: *const GlinerWordEmbeddingsRequest) anyerror!?CT = null,
 

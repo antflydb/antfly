@@ -997,6 +997,9 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
     if (obj.get("num_labels")) |v| {
         if (jsonU32(v)) |val| manifest.num_labels = val;
     }
+    if (obj.get("max_width")) |v| {
+        if (jsonU32(v)) |val| manifest.gliner_max_width = val;
+    }
 
     // Parse id2label: {"0": "O", "1": "B-PER", ...}
     if (obj.get("id2label")) |v| {

@@ -1198,19 +1198,29 @@ fn dedupEntitiesByLabelText(alloc: std.mem.Allocator, input: []Entity) ![]Entity
     };
 
     for (input) |entity| {
-        var seen = false;
-        for (keep.items) |existing| {
+        var kept_duplicate = false;
+        for (keep.items) |*existing| {
             if (std.ascii.eqlIgnoreCase(entity.label, existing.label) and std.ascii.eqlIgnoreCase(entity.text, existing.text)) {
-                seen = true;
+                kept_duplicate = true;
+                if (entity.score > existing.score) {
+                    alloc.free(existing.text);
+                    existing.* = entity;
+                } else {
+                    alloc.free(entity.text);
+                }
                 break;
             }
         }
-        if (seen) {
-            alloc.free(entity.text);
-        } else {
+        if (!kept_duplicate) {
             keep.appendAssumeCapacity(entity);
         }
     }
+
+    std.mem.sort(Entity, keep.items, {}, struct {
+        fn lessThan(_: void, a: Entity, b: Entity) bool {
+            return if (a.start != b.start) a.start < b.start else a.end < b.end;
+        }
+    }.lessThan);
 
     alloc.free(input);
     return try keep.toOwnedSlice(alloc);
@@ -1381,7 +1391,7 @@ test "gliner dedups repeated entity text per label" {
     const alloc = std.testing.allocator;
     var entities = try alloc.alloc(Entity, 4);
     entities[0] = .{ .text = try alloc.dupe(u8, "Apple Inc."), .label = "organization", .start = 0, .end = 10, .score = 1.0 };
-    entities[1] = .{ .text = try alloc.dupe(u8, "Apple Inc."), .label = "organization", .start = 20, .end = 30, .score = 0.9 };
+    entities[1] = .{ .text = try alloc.dupe(u8, "Apple Inc."), .label = "organization", .start = 20, .end = 30, .score = 1.1 };
     entities[2] = .{ .text = try alloc.dupe(u8, "Apple Inc."), .label = "location", .start = 40, .end = 50, .score = 0.8 };
     entities[3] = .{ .text = try alloc.dupe(u8, "Cupertino"), .label = "location", .start = 60, .end = 69, .score = 0.7 };
 
@@ -1392,7 +1402,7 @@ test "gliner dedups repeated entity text per label" {
     }
 
     try std.testing.expectEqual(@as(usize, 3), deduped.len);
-    try std.testing.expectEqual(@as(usize, 0), deduped[0].start);
+    try std.testing.expectEqual(@as(usize, 20), deduped[0].start);
     try std.testing.expectEqualStrings("organization", deduped[0].label);
     try std.testing.expectEqualStrings("location", deduped[1].label);
     try std.testing.expectEqualStrings("Cupertino", deduped[2].text);
