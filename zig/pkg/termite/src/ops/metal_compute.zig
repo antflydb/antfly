@@ -173,7 +173,7 @@ fn enableGlinerDebertaDirectFfn() bool {
 
 fn enableGlinerHeadCustomMlp2() bool {
     if (getenvBool("TERMITE_METAL_DISABLE_GLINER_HEAD_CUSTOM_MLP2")) return false;
-    return true;
+    return getenvBool("TERMITE_METAL_GLINER_HEAD_CUSTOM_MLP2");
 }
 
 fn enableDebertaFusedEmbeddings() bool {

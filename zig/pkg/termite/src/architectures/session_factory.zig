@@ -147,7 +147,7 @@ fn glinerDenseQkvScratchEnabled() bool {
 
 fn glinerHeadCustomMlp2Enabled() bool {
     if (platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_HEAD_CUSTOM_MLP2")) return false;
-    return true;
+    return platform.env.getenvBool("TERMITE_METAL_GLINER_HEAD_CUSTOM_MLP2");
 }
 
 const metal_graph_plan_hot_hidden_slot_base: usize = 17;

@@ -1260,18 +1260,18 @@ fn splitIntoWords(
             startsWithAsciiIgnoreCase(text[i..], "www."))
         {
             i = consumeUntilWhitespace(text, i);
-        } else if (text[i] == '@' and i + 1 < text.len and isAsciiWord(text[i + 1])) {
-            i += 2;
-            while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or text[i] == '_')) i += 1;
-        } else if (isAsciiWord(text[i])) {
+        } else if (text[i] == '@' and i + 1 < text.len and isWordScalar(text[i + 1 ..])) {
             i += 1;
+            while (i < text.len and isWordScalar(text[i..])) i += utf8ScalarLen(text[i..]);
+        } else if (isWordScalar(text[i..])) {
+            i += utf8ScalarLen(text[i..]);
             while (i < text.len) {
-                if (isAsciiWord(text[i])) {
-                    i += 1;
+                if (isWordScalar(text[i..])) {
+                    i += utf8ScalarLen(text[i..]);
                     continue;
                 }
-                if ((text[i] == '-' or text[i] == '_') and i + 1 < text.len and isAsciiWord(text[i + 1])) {
-                    i += 2;
+                if (text[i] == '-' and i + 1 < text.len and isWordScalar(text[i + 1 ..])) {
+                    i += 1 + utf8ScalarLen(text[i + 1 ..]);
                     continue;
                 }
                 break;
@@ -1294,6 +1294,11 @@ fn isAsciiWord(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
+fn isWordScalar(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    return isAsciiWord(bytes[0]) or bytes[0] >= 0x80;
+}
+
 fn consumeUntilWhitespace(text: []const u8, start: usize) usize {
     var i = start;
     while (i < text.len and !isAsciiWhitespace(text[i])) i += utf8ScalarLen(text[i..]);
@@ -1306,7 +1311,7 @@ fn startsWithAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 fn utf8ScalarLen(bytes: []const u8) usize {
     if (bytes.len == 0) return 0;
-    return std.unicode.utf8ByteSequenceLength(bytes[0]) catch 1;
+    return @min(std.unicode.utf8ByteSequenceLength(bytes[0]) catch 1, bytes.len);
 }
 
 fn toLower(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -1345,6 +1350,26 @@ test "gliner splitIntoWords separates punctuation like Python processor" {
     try splitIntoWords(alloc, text, &words, &starts, &ends);
 
     const expected = [_][]const u8{ "Apple", "Inc", ".", "hired", "@alice", "in", "San", "Francisco", "." };
+    try std.testing.expectEqual(expected.len, words.items.len);
+    for (expected, 0..) |want, i| {
+        try std.testing.expectEqualStrings(want, words.items[i]);
+        try std.testing.expectEqualStrings(want, text[starts.items[i]..ends.items[i]]);
+    }
+}
+
+test "gliner splitIntoWords keeps utf8 word text intact" {
+    const alloc = std.testing.allocator;
+    const text = "José García joined München Labs in São Paulo.";
+    var words = std.ArrayListUnmanaged([]const u8).empty;
+    defer words.deinit(alloc);
+    var starts = std.ArrayListUnmanaged(usize).empty;
+    defer starts.deinit(alloc);
+    var ends = std.ArrayListUnmanaged(usize).empty;
+    defer ends.deinit(alloc);
+
+    try splitIntoWords(alloc, text, &words, &starts, &ends);
+
+    const expected = [_][]const u8{ "José", "García", "joined", "München", "Labs", "in", "São", "Paulo", "." };
     try std.testing.expectEqual(expected.len, words.items.len);
     for (expected, 0..) |want, i| {
         try std.testing.expectEqualStrings(want, words.items[i]);
