@@ -132,8 +132,10 @@ import {
   SelectValue,
   Separator,
   Sheet,
+  SheetBody,
   SheetContent,
   SheetDescription,
+  SheetFooter,
   SheetHeader,
   SheetTitle,
   SheetTrigger,
@@ -234,6 +236,7 @@ demoCategories.primitives.demos = [
         <Badge>Default</Badge>
         <Badge variant="secondary">Secondary</Badge>
         <Badge variant="outline">Outline</Badge>
+        <Badge variant="amber">Amber</Badge>
         <Badge variant="destructive">Destructive</Badge>
       </div>
     ),
@@ -604,9 +607,12 @@ demoCategories.primitives.demos = [
             <SheetTitle>Filters</SheetTitle>
             <SheetDescription>Refine what's shown in the table.</SheetDescription>
           </SheetHeader>
-          <div className="mt-4 space-y-3 text-sm text-muted-foreground">
+          <SheetBody className="space-y-3 text-muted-foreground">
             Filter controls go here.
-          </div>
+          </SheetBody>
+          <SheetFooter>
+            <Button size="sm">Apply</Button>
+          </SheetFooter>
         </SheetContent>
       </Sheet>
     ),
