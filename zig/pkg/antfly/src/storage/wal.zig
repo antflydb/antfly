@@ -43,6 +43,11 @@ const large_entry_threshold = 4096;
 const storage_sim_soak = zig_lmdb.storage_sim_soak;
 var wal_tmp_nonce: u64 = 0;
 
+fn lsmOpenDebugLogsEnabled() bool {
+    if (builtin.os.tag == .freestanding) return false;
+    return std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+}
+
 fn nextWalTmpNonce() u64 {
     return @atomicRmw(u64, &wal_tmp_nonce, .Add, 1, .seq_cst);
 }
@@ -870,10 +875,28 @@ fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !Stor
             break :blk .{ .lmdb = backend };
         },
         .lsm => blk: {
+            const path_slice = std.mem.span(path);
+            const path_owned = try alloc.dupe(u8, path_slice);
+            defer alloc.free(path_owned);
+            const debug_open = lsmOpenDebugLogsEnabled();
+            if (debug_open) {
+                std.log.info(
+                    "wal lsm open begin path={s} path_ptr=0x{x} owned_ptr=0x{x} storage_provided={any} read_only={any} no_sync={any}",
+                    .{
+                        path_owned,
+                        @intFromPtr(path),
+                        @intFromPtr(path_owned.ptr),
+                        opts.storage != null,
+                        opts.read_only,
+                        opts.no_sync,
+                    },
+                );
+            }
             if (opts.storage == null) {
                 var io_impl = std.Io.Threaded.init(alloc, .{});
                 defer io_impl.deinit();
-                try fs_paths.createDirPathPortable(io_impl.io(), std.mem.span(path));
+                try fs_paths.createDirPathPortable(io_impl.io(), path_owned);
+                if (debug_open) std.log.info("wal lsm open ensured dir path={s}", .{path_owned});
             }
 
             var lsm_options = opts.lsm_options;
@@ -881,7 +904,19 @@ fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !Stor
             if (opts.read_only) lsm_options.backend.create_if_missing = false;
             lsm_options.backend.durability = if (opts.no_sync) .none else lsm_options.backend.durability;
             lsm_options.storage = opts.storage orelse lsm_options.storage;
-            var handle = try lsm_backend.BackendHandle.open(alloc, std.mem.span(path), lsm_options);
+            if (debug_open) {
+                std.log.info(
+                    "wal lsm backend handle open begin path={s} lsm_storage_provided={any} create_if_missing={any} durability={s}",
+                    .{
+                        path_owned,
+                        lsm_options.storage != null,
+                        lsm_options.backend.create_if_missing,
+                        @tagName(lsm_options.backend.durability),
+                    },
+                );
+            }
+            var handle = try lsm_backend.BackendHandle.open(alloc, path_owned, lsm_options);
+            if (debug_open) std.log.info("wal lsm backend handle open done path={s}", .{path_owned});
             errdefer handle.close();
             break :blk .{ .lsm = handle };
         },
