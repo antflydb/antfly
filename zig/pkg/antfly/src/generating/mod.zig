@@ -179,9 +179,10 @@ const BackendState = struct {
             },
             .termite => |*provider| blk: {
                 if (self.api_key) |*api_key_ref| {
-                    const auth_header = try self.auth_header_cache.getOwned(self.alloc, alloc, api_key_ref, self.secret_store);
-                    defer alloc.free(auth_header);
-                    try provider.setAuthorizationHeader(auth_header);
+                    if (try self.optionalAuthHeaderOwned(alloc, api_key_ref)) |auth_header| {
+                        defer alloc.free(auth_header);
+                        try provider.setAuthorizationHeader(auth_header);
+                    }
                 }
                 break :blk try provider.generator().generate(alloc, model, inference_messages);
             },
@@ -211,6 +212,20 @@ const BackendState = struct {
         return .{
             .content = try alloc.dupe(u8, result.content),
             .allocator = alloc,
+        };
+    }
+
+    fn optionalAuthHeaderOwned(
+        self: *BackendState,
+        alloc: std.mem.Allocator,
+        api_key_ref: *const common_secrets.SecretValue,
+    ) !?[]u8 {
+        return self.auth_header_cache.getOwned(self.alloc, alloc, api_key_ref, self.secret_store) catch |err| switch (err) {
+            error.SecretNotFound => switch (api_key_ref.*) {
+                .env_var => return null,
+                else => return err,
+            },
+            else => return err,
         };
     }
 };
@@ -405,4 +420,65 @@ test "generating backend routes antfly and url-less termite to local provider" {
     try std.testing.expectEqualStrings("local ok", termite_result.content);
 
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "generating termite backend treats missing default api key env as optional" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var ts = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/generate", .respond = .{
+            .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"no auth ok\"}}]}",
+        } },
+    });
+    defer ts.deinit();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const chain = [_]ChainLink{.{
+        .generator = .{
+            .provider = .termite,
+            .model = "local",
+            .url = ts.baseUrl(),
+        },
+    }};
+    const messages = [_]ChatMessage{.{ .role = .user, .content = "hello" }};
+
+    var group = std.Io.Group.init;
+    var content: ?[]u8 = null;
+    defer if (content) |value| alloc.free(value);
+    var run_err: ?anyerror = null;
+
+    const Fiber = struct {
+        fn run(
+            a: std.mem.Allocator,
+            test_io: std.Io,
+            test_client: *httpx.Client,
+            links: []const ChainLink,
+            test_messages: []const ChatMessage,
+            out: *?[]u8,
+            err_out: *?anyerror,
+        ) std.Io.Cancelable!void {
+            _ = test_io;
+            var result = executeChain(a, test_client, links, test_messages) catch |err| {
+                err_out.* = err;
+                return;
+            };
+            defer result.deinit();
+            out.* = a.dupe(u8, result.content) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    group.concurrent(io, Fiber.run, .{ alloc, io, &client, &chain, &messages, &content, &run_err }) catch return;
+    try ts.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+
+    try std.testing.expectEqualStrings("no auth ok", content orelse return error.TestUnexpectedResult);
 }
