@@ -174,8 +174,9 @@ jobs:
 
   unit:
     needs: changes
-    if: github.event_name != 'schedule' && needs.changes.outputs.zig_tests == 'true'
+    if: (github.event_name != 'schedule' && needs.changes.outputs.zig_tests == 'true') || needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
     runs-on: arc-antfly-heavy
+    timeout-minutes: 45
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
@@ -183,6 +184,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          submodules: ${{ needs.changes.outputs.trace_validate == 'true' }}
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
@@ -203,7 +205,55 @@ jobs:
         run: zig version
 
       - name: Run hermetic Antfly unit tests
+        if: needs.changes.outputs.zig_tests == 'true'
         run: make zig-unit-test
+
+      - name: Set up Java for TLA+
+        if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Run TLC on all specs
+        if: needs.changes.outputs.model_check == 'true'
+        working-directory: zig
+        run: make tla-check
+
+      - name: Download TLA+ tools
+        if: needs.changes.outputs.trace_validate == 'true'
+        working-directory: zig
+        run: make tla-tools
+
+      - name: Run raft tests and extract traces
+        if: needs.changes.outputs.trace_validate == 'true'
+        working-directory: zig
+        env:
+          ANTFLY_TRACE_FILE: /tmp/raft-trace.ndjson
+        run: |
+          zig build -Dwith_tla=true raft-test
+          test -s /tmp/raft-trace.ndjson
+          echo "Raft trace lines: $(wc -l < /tmp/raft-trace.ndjson)"
+
+      - name: Validate raft traces
+        if: needs.changes.outputs.trace_validate == 'true'
+        working-directory: zig
+        run: make tla-trace-raft TRACE_FILES=/tmp/raft-trace.ndjson
+
+      - name: Run transaction tests and extract traces
+        if: needs.changes.outputs.trace_validate == 'true'
+        working-directory: zig
+        env:
+          ANTFLY_TRACE_FILE: /tmp/txn-trace.ndjson
+        run: |
+          zig build -Dwith_tla=true lib-db-txn-test
+          test -s /tmp/txn-trace.ndjson
+          echo "Transaction trace lines: $(wc -l < /tmp/txn-trace.ndjson)"
+
+      - name: Validate transaction traces
+        if: needs.changes.outputs.trace_validate == 'true'
+        working-directory: zig
+        run: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson
 
   full-default:
     if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
@@ -359,76 +409,3 @@ jobs:
         env:
           TERMITE_BIN: ./zig-out/bin/termite
         run: uv run --project e2e/termite pytest -q -x e2e/termite
-
-  tla-verify:
-    needs: changes
-    if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
-    runs-on: ${{ needs.changes.outputs.trace_validate == 'true' && 'arc-antfly-heavy' || 'arc-antfly-standard' }}
-    timeout-minutes: 30
-    env:
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
-      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: ${{ needs.changes.outputs.trace_validate == 'true' }}
-
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
-
-      - name: Set up Zig
-        if: needs.changes.outputs.trace_validate == 'true'
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
-
-      - name: Prepare ARC cache dirs
-        if: needs.changes.outputs.trace_validate == 'true'
-        run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
-
-      - name: Set up Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: "temurin"
-          java-version: "21"
-
-      - name: Run TLC on all specs
-        if: needs.changes.outputs.model_check == 'true'
-        working-directory: zig
-        run: make tla-check
-
-      - name: Download TLA+ tools
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        run: make tla-tools
-
-      - name: Run raft tests and extract traces
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        env:
-          ANTFLY_TRACE_FILE: /tmp/raft-trace.ndjson
-        run: |
-          zig build -Dwith_tla=true raft-test
-          test -s /tmp/raft-trace.ndjson
-          echo "Raft trace lines: $(wc -l < /tmp/raft-trace.ndjson)"
-
-      - name: Validate raft traces
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        run: make tla-trace-raft TRACE_FILES=/tmp/raft-trace.ndjson
-
-      - name: Run transaction tests and extract traces
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        env:
-          ANTFLY_TRACE_FILE: /tmp/txn-trace.ndjson
-        run: |
-          zig build -Dwith_tla=true lib-db-txn-test
-          test -s /tmp/txn-trace.ndjson
-          echo "Transaction trace lines: $(wc -l < /tmp/txn-trace.ndjson)"
-
-      - name: Validate transaction traces
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        run: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson

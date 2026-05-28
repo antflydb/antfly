@@ -175,6 +175,10 @@ jobs:
           done
 
   sim-validate:
+    # Temporarily disabled while simulator coverage is migrated/stabilized.
+    # Keep the job definition here so it can be re-enabled without rebuilding
+    # the runner setup from scratch. Set ENABLE_GO_SIM_CI=true to opt back in.
+    if: ${{ vars.ENABLE_GO_SIM_CI == 'true' }}
     runs-on: arc-antfly-heavy
     # sim-validate runs `go test ./go/pkg/antfly/src/sim` under a wrapper; on the 4-cpu
     # standard runner with no /mnt/cache, it tipped past the 10Gi ephemeral

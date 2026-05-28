@@ -12,6 +12,10 @@ concurrency:
 
 jobs:
   trace-validate:
+    # Temporarily disabled with the Go simulator CI jobs. Zig trace validation
+    # now runs inside the Zig unit job in zig-tests.yml. Set
+    # ENABLE_GO_SIM_CI=true to opt back in.
+    if: ${{ vars.ENABLE_GO_SIM_CI == 'true' }}
     runs-on: arc-antfly-standard
     timeout-minutes: 30
     steps:
