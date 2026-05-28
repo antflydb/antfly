@@ -58,6 +58,12 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
                 if (!(try jsonDocMatchesPatternFilter(alloc, key, doc, item))) return false;
             }
         }
+        if (bool_query.object.get("filter")) |filter| {
+            if (filter != .array or filter.array.items.len == 0) return error.InvalidArgument;
+            for (filter.array.items) |item| {
+                if (!(try jsonDocMatchesPatternFilter(alloc, key, doc, item))) return false;
+            }
+        }
 
         var saw_should = false;
         if (bool_query.object.get("should")) |should| {
@@ -81,7 +87,7 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
         }
 
         if (bool_query.object.count() == 0) return error.InvalidArgument;
-        if (!saw_should and bool_query.object.get("must") == null and bool_query.object.get("must_not") == null) {
+        if (!saw_should and bool_query.object.get("must") == null and bool_query.object.get("filter") == null and bool_query.object.get("must_not") == null) {
             return error.InvalidArgument;
         }
         return true;
@@ -596,5 +602,20 @@ test "stored doc matches conjunctive filters including doc id" {
         "doc:silver",
         "{\"title\":\"silver doc\",\"tier\":\"gold\"}",
         "{\"conjuncts\":[{\"doc_id\":{\"ids\":[\"doc:gold\"]}},{\"term\":{\"tier\":\"gold\"}}]}",
+    )));
+}
+
+test "stored doc bool filter clauses are required with must clauses" {
+    try std.testing.expect(try storedDocMatchesPatternFilter(
+        std.testing.allocator,
+        "doc:gold",
+        "{\"tenant\":\"acme\",\"tier\":\"gold\"}",
+        "{\"bool\":{\"must\":[{\"term\":{\"tenant\":\"acme\"}}],\"filter\":[{\"term\":{\"tier\":\"gold\"}}]}}",
+    ));
+    try std.testing.expect(!(try storedDocMatchesPatternFilter(
+        std.testing.allocator,
+        "doc:silver",
+        "{\"tenant\":\"acme\",\"tier\":\"silver\"}",
+        "{\"bool\":{\"must\":[{\"term\":{\"tenant\":\"acme\"}}],\"filter\":[{\"term\":{\"tier\":\"gold\"}}]}}",
     )));
 }

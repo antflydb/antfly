@@ -3841,8 +3841,16 @@ fn parseTextQueryJson(alloc: std.mem.Allocator, value: std.json.Value) anyerror!
     if (value.object.get("bool")) |bool_query| {
         if (bool_query != .object) return error.InvalidArgument;
 
-        const must = if (bool_query.object.get("must")) |must_value|
-            try parseTextQueryArrayJson(alloc, must_value)
+        var must_list = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+        errdefer must_list.deinit(alloc);
+        if (bool_query.object.get("filter")) |filter_value| {
+            try appendTextQueryArrayJson(alloc, &must_list, filter_value);
+        }
+        if (bool_query.object.get("must")) |must_value| {
+            try appendTextQueryArrayJson(alloc, &must_list, must_value);
+        }
+        const must = if (must_list.items.len > 0)
+            try must_list.toOwnedSlice(alloc)
         else
             &.{};
         const should = if (bool_query.object.get("should")) |should_value|
@@ -4003,6 +4011,38 @@ fn parseTextQueryArrayJson(alloc: std.mem.Allocator, value: std.json.Value) anye
         clauses[i] = try parseTextQueryJson(alloc, item);
     }
     return clauses;
+}
+
+fn appendTextQueryArrayJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
+    value: std.json.Value,
+) anyerror!void {
+    if (value != .array or value.array.items.len == 0) return error.InvalidArgument;
+    try out.ensureUnusedCapacity(alloc, value.array.items.len);
+    for (value.array.items) |item| {
+        out.appendAssumeCapacity(try parseTextQueryJson(alloc, item));
+    }
+}
+
+test "c api bool text parser treats filter clauses as required" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool":{"must":[{"term":{"field":"body","term":"invoice"}}],"filter":[{"term":{"field":"tenant","term":"acme"}}]}}
+    , .{});
+    const query = try parseTextQueryJson(alloc, parsed.value);
+
+    try std.testing.expect(query == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), query.bool_query.must.len);
+    try std.testing.expect(query.bool_query.must[0] == .term);
+    try std.testing.expectEqualStrings("tenant", query.bool_query.must[0].term.field);
+    try std.testing.expectEqualStrings("acme", query.bool_query.must[0].term.term);
+    try std.testing.expect(query.bool_query.must[1] == .term);
+    try std.testing.expectEqualStrings("body", query.bool_query.must[1].term.field);
+    try std.testing.expectEqualStrings("invoice", query.bool_query.must[1].term.term);
 }
 
 pub export fn antfly_db_execute_graph_queries_json(

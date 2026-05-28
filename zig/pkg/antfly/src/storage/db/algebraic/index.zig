@@ -7066,8 +7066,16 @@ pub const Index = struct {
                 else => return false,
             };
             if (bool_object.get("should") != null or bool_object.get("must_not") != null) return false;
-            if (bool_object.get("must")) |must_value| return try self.collectConstraintArrayAlloc(must_value, out);
-            return false;
+            var collected = false;
+            if (bool_object.get("must")) |must_value| {
+                if (!(try self.collectConstraintArrayAlloc(must_value, out))) return false;
+                collected = true;
+            }
+            if (bool_object.get("filter")) |filter_value| {
+                if (!(try self.collectConstraintArrayAlloc(filter_value, out))) return false;
+                collected = true;
+            }
+            return collected;
         }
         return false;
     }
@@ -20688,6 +20696,21 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     defer idx.freeDocIds(filter_ids);
     try std.testing.expectEqual(@as(usize, 1), filter_ids.len);
     try std.testing.expectEqualStrings("o1", filter_ids[0]);
+
+    const required_filter_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+        \\{"bool":{"must":[{"term":{"customer":"alice"}}],"filter":[{"term":{"region":"east"}}]}}
+    )).?;
+    defer idx.freeDocIds(required_filter_ids);
+    try std.testing.expectEqual(@as(usize, 1), required_filter_ids.len);
+    try std.testing.expectEqualStrings("o2", required_filter_ids[0]);
+
+    var required_filter_set = (try idx.docIdSetForFilterJsonAlloc(&store,
+        \\{"bool":{"must":[{"term":{"customer":"alice"}}],"filter":[{"term":{"region":"east"}}]}}
+    )).?;
+    defer required_filter_set.deinit(&idx);
+    const required_filter_include = required_filter_set.include orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), required_filter_include.len);
+    try std.testing.expectEqualStrings("o2", required_filter_include[0]);
 
     var filter_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
         \\{"bool":{"must":[{"term":{"customer":"alice"}},{"term":{"region":"west"}}]}}
