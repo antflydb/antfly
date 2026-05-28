@@ -1045,53 +1045,33 @@ pub const Node = struct {
                                 defer ctx.allocator.free(downloaded.content_type);
                                 try images.append(ctx.allocator, downloaded.data);
                             } else if (std.mem.eql(u8, ctype, "media")) {
-                                const data_val = obj.get("data") orelse return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "media content part missing 'data' field",
-                                });
-                                if (data_val != .string) return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "media 'data' must be a base64 string",
-                                });
-                                const mime_val = obj.get("mime_type");
-                                const is_audio = if (mime_val) |mv|
-                                    (if (mv == .string) std.mem.startsWith(u8, mv.string, "audio/") else false)
-                                else
-                                    false;
-                                const is_image = if (mime_val) |mv|
-                                    (if (mv == .string) std.mem.startsWith(u8, mv.string, "image/") else false)
-                                else
-                                    false;
-
-                                const decoded_payload = decodeMediaData(ctx.allocator, data_val.string) catch
-                                    return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid base64 data" });
-                                const decoded = decoded_payload.data;
-                                errdefer ctx.allocator.free(decoded);
-                                if (!mediaMimeMatches(if (mime_val) |mv| if (mv == .string) mv.string else null else null, decoded_payload.mime_type)) {
-                                    ctx.allocator.free(decoded);
+                                var media = resolveMediaContentPart(self, ctx.allocator, obj) catch |err| {
                                     return ctx.status(400).json(.{
                                         .@"error" = "INVALID_REQUEST",
-                                        .message = "media data URI mime_type does not match content part mime_type",
+                                        .message = embedInputParseErrorMessage(err),
                                     });
-                                }
+                                };
+                                defer media.deinit(ctx.allocator);
 
-                                if (is_audio) {
-                                    const mime_str = if (mime_val) |mv| if (mv == .string) mv.string else null else null;
+                                if (std.mem.startsWith(u8, media.mime_type, "audio/")) {
                                     const decode_options = audio_mod.DecodeOptions{
-                                        .mime_hint = mime_str,
+                                        .mime_hint = media.mime_type,
                                     };
+                                    const decoded = media.takeBytes();
                                     if (!audio_mod.canDecodeWithOptions(decoded, decode_options)) {
                                         ctx.allocator.free(decoded);
                                         return unsupportedAudioResponse(ctx, "unsupported audio media content");
                                     }
+                                    errdefer ctx.allocator.free(decoded);
                                     try audio_clips.append(ctx.allocator, .{
                                         .bytes = decoded,
                                         .decode_options = decode_options,
                                     });
-                                } else if (is_image) {
+                                } else if (std.mem.startsWith(u8, media.mime_type, "image/")) {
+                                    const decoded = media.takeBytes();
+                                    errdefer ctx.allocator.free(decoded);
                                     try images.append(ctx.allocator, decoded);
                                 } else {
-                                    ctx.allocator.free(decoded);
                                     return ctx.status(400).json(.{
                                         .@"error" = "INVALID_REQUEST",
                                         .message = "media content part must have mime_type starting with 'audio/' or 'image/'",
@@ -1647,88 +1627,24 @@ pub const Node = struct {
                                 try msg_images.append(ctx.allocator, downloaded.data);
                                 try msg_parts.append(ctx.allocator, .{ .image = msg_images.items.len - 1 });
                             } else if (std.mem.eql(u8, ptype, "media")) {
-                                if (obj.get("url")) |url_val| {
-                                    if (url_val != .string) return ctx.status(400).json(.{
-                                        .@"error" = "INVALID_REQUEST",
-                                        .message = "media 'url' must be a string",
-                                    });
-                                    const downloaded = downloadRemoteContent(self, ctx.allocator, url_val.string) catch {
-                                        return ctx.status(400).json(.{
-                                            .@"error" = "INVALID_REQUEST",
-                                            .message = "failed to download media content",
-                                        });
-                                    };
-                                    const mime_val = obj.get("mime_type");
-                                    const declared_mime = if (mime_val) |mv| if (mv == .string) mv.string else return ctx.status(400).json(.{
-                                        .@"error" = "INVALID_REQUEST",
-                                        .message = "media 'mime_type' must be a string",
-                                    }) else null;
-                                    const content_type = std.mem.trim(u8, downloaded.content_type, " \t\r\n");
-                                    if (!mediaMimeMatches(declared_mime, content_type)) {
-                                        ctx.allocator.free(downloaded.data);
-                                        ctx.allocator.free(downloaded.content_type);
-                                        return ctx.status(400).json(.{
-                                            .@"error" = "INVALID_REQUEST",
-                                            .message = "media URL mime_type does not match content part mime_type",
-                                        });
-                                    }
-                                    if (std.mem.startsWith(u8, content_type, "image/")) {
-                                        try decoded_images.append(ctx.allocator, downloaded.data);
-                                        try msg_images.append(ctx.allocator, downloaded.data);
-                                        try msg_parts.append(ctx.allocator, .{ .image = msg_images.items.len - 1 });
-                                        ctx.allocator.free(downloaded.content_type);
-                                    } else if (std.mem.startsWith(u8, content_type, "audio/")) {
-                                        try decoded_audio.append(ctx.allocator, downloaded.data);
-                                        try msg_audio.append(ctx.allocator, downloaded.data);
-                                        try msg_parts.append(ctx.allocator, .{ .audio = msg_audio.items.len - 1 });
-                                        ctx.allocator.free(downloaded.content_type);
-                                    } else {
-                                        ctx.allocator.free(downloaded.data);
-                                        ctx.allocator.free(downloaded.content_type);
-                                        return ctx.status(400).json(.{
-                                            .@"error" = "INVALID_REQUEST",
-                                            .message = "media content part must have mime_type starting with 'audio/' or 'image/'",
-                                        });
-                                    }
-                                    continue;
-                                }
-                                const data_val = obj.get("data") orelse return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "media content part missing 'data' field",
-                                });
-                                if (data_val != .string) return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "media 'data' must be a base64 string",
-                                });
-                                const mime_val = obj.get("mime_type") orelse return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "media content part missing 'mime_type' field",
-                                });
-                                if (mime_val != .string) return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "media 'mime_type' must be a string",
-                                });
-
-                                const decoded_payload = decodeMediaData(ctx.allocator, data_val.string) catch
-                                    return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid base64 data" });
-                                const decoded = decoded_payload.data;
-                                var decoded_owned = true;
-                                defer if (decoded_owned) ctx.allocator.free(decoded);
-                                if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) {
+                                var media = resolveMediaContentPart(self, ctx.allocator, obj) catch |err| {
                                     return ctx.status(400).json(.{
                                         .@"error" = "INVALID_REQUEST",
-                                        .message = "media data URI mime_type does not match content part mime_type",
+                                        .message = embedInputParseErrorMessage(err),
                                     });
-                                }
+                                };
+                                defer media.deinit(ctx.allocator);
 
-                                if (std.mem.startsWith(u8, mime_val.string, "image/")) {
+                                if (std.mem.startsWith(u8, media.mime_type, "image/")) {
+                                    const decoded = media.bytes.?;
                                     try decoded_images.append(ctx.allocator, decoded);
-                                    decoded_owned = false;
+                                    _ = media.takeBytes();
                                     try msg_images.append(ctx.allocator, decoded);
                                     try msg_parts.append(ctx.allocator, .{ .image = msg_images.items.len - 1 });
-                                } else if (std.mem.startsWith(u8, mime_val.string, "audio/")) {
+                                } else if (std.mem.startsWith(u8, media.mime_type, "audio/")) {
+                                    const decoded = media.bytes.?;
                                     try decoded_audio.append(ctx.allocator, decoded);
-                                    decoded_owned = false;
+                                    _ = media.takeBytes();
                                     try msg_audio.append(ctx.allocator, decoded);
                                     try msg_parts.append(ctx.allocator, .{ .audio = msg_audio.items.len - 1 });
                                 } else {
@@ -2565,14 +2481,11 @@ pub const Node = struct {
                             try images.append(allocator, try allocator.dupe(u8, downloaded.data));
                         }
                     } else if (std.mem.eql(u8, ptype, "media")) {
-                        const data_val = obj.get("data") orelse return error.UnsupportedContentPartType;
-                        const mime_val = obj.get("mime_type") orelse return error.UnsupportedContentPartType;
-                        if (data_val != .string or mime_val != .string) return error.UnsupportedContentPartType;
-                        if (!std.mem.startsWith(u8, mime_val.string, "image/")) return error.UnsupportedContentPartType;
-                        const decoded_payload = decodeMediaData(allocator, data_val.string) catch return error.UnsupportedContentPartType;
-                        const decoded = decoded_payload.data;
+                        var media = resolveMediaContentPart(self, allocator, obj) catch return error.UnsupportedContentPartType;
+                        defer media.deinit(allocator);
+                        if (!std.mem.startsWith(u8, media.mime_type, "image/")) return error.UnsupportedContentPartType;
+                        const decoded = media.takeBytes();
                         errdefer allocator.free(decoded);
-                        if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) return error.UnsupportedContentPartType;
                         try images.append(allocator, decoded);
                     } else {
                         return error.UnsupportedContentPartType;
@@ -4595,6 +4508,17 @@ fn canonicalInputPart(allocator: std.mem.Allocator, part: std.json.Value) !Canon
             }
         }
     }
+    if (part.object.get("type")) |type_value| {
+        if (type_value == .string and std.mem.eql(u8, type_value.string, "media")) {
+            if (part.object.get("url")) |url_value| {
+                if (url_value != .string) return error.UnsupportedExtractionContent;
+                if (part.object.get("mime_type")) |mime_value| {
+                    if (mime_value != .string or !std.mem.startsWith(u8, mime_value.string, "image/")) return error.UnsupportedExtractionContent;
+                }
+                return .{ .image_url = try allocator.dupe(u8, url_value.string) };
+            }
+        }
+    }
     if (part.object.get("data")) |data_value| {
         if (data_value == .string) {
             const mime_type = if (part.object.get("mime_type")) |mime_value|
@@ -4703,6 +4627,29 @@ test "canonical extraction content accepts text parts and image urls" {
         .image_url => |url| try std.testing.expectEqualStrings("data:image/png;base64,aaa", url),
         .text => return error.ExpectedImageContent,
     }
+
+    var parsed_media_url = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"type":"media","url":"data:image/png;base64,bbb","mime_type":"image/png"}
+    , .{});
+    defer parsed_media_url.deinit();
+    const media_url_content = try canonicalInputContent(allocator, parsed_media_url.value);
+    defer switch (media_url_content) {
+        .text => |text| allocator.free(text),
+        .image_url => |url| allocator.free(url),
+    };
+    switch (media_url_content) {
+        .image_url => |url| try std.testing.expectEqualStrings("data:image/png;base64,bbb", url),
+        .text => return error.ExpectedImageContent,
+    }
+
+    var parsed_audio_media_url = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"type":"media","url":"data:audio/wav;base64,AA==","mime_type":"audio/wav"}
+    , .{});
+    defer parsed_audio_media_url.deinit();
+    try std.testing.expectError(
+        error.UnsupportedExtractionContent,
+        canonicalInputContent(allocator, parsed_audio_media_url.value),
+    );
 }
 
 test "canonical structure schemas map field objects to extraction fields" {
@@ -5953,6 +5900,7 @@ const ParsedBinaryEmbedInput = struct {
     index: usize,
     bytes: []u8,
     mime_type: ?[]const u8 = null,
+    owned_mime_type: ?[]u8 = null,
 };
 
 const ParsedDenseEmbedInputs = struct {
@@ -5963,9 +5911,15 @@ const ParsedDenseEmbedInputs = struct {
 
     fn deinit(self: *ParsedDenseEmbedInputs, allocator: std.mem.Allocator) void {
         self.texts.deinit(allocator);
-        for (self.images.items) |item| allocator.free(item.bytes);
+        for (self.images.items) |item| {
+            allocator.free(item.bytes);
+            if (item.owned_mime_type) |mime_type| allocator.free(mime_type);
+        }
         self.images.deinit(allocator);
-        for (self.audio.items) |item| allocator.free(item.bytes);
+        for (self.audio.items) |item| {
+            allocator.free(item.bytes);
+            if (item.owned_mime_type) |mime_type| allocator.free(mime_type);
+        }
         self.audio.deinit(allocator);
     }
 };
@@ -6146,32 +6100,39 @@ fn parseDenseEmbedInputs(
                 }
 
                 if (std.mem.eql(u8, part_type, "media")) {
-                    const data_value = obj.get("data") orelse return error.MediaContentPartMissingData;
-                    if (data_value != .string) return error.MediaContentPartMissingData;
-                    const mime_value = obj.get("mime_type") orelse return error.MediaContentPartMissingMimeType;
-                    if (mime_value != .string) return error.MediaContentPartMissingMimeType;
+                    var media = try resolveMediaContentPart(self, allocator, obj);
+                    defer media.deinit(allocator);
 
-                    const decoded_payload = decodeMediaData(allocator, data_value.string) catch return error.InvalidMediaBase64;
-                    const decoded = decoded_payload.data;
-                    errdefer allocator.free(decoded);
-                    if (!mediaMimeMatches(mime_value.string, decoded_payload.mime_type)) return error.MediaDataMimeTypeMismatch;
-
-                    if (std.mem.startsWith(u8, mime_value.string, "image/")) {
+                    if (std.mem.startsWith(u8, media.mime_type, "image/")) {
                         if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
+                        const bytes = media.takeBytes();
+                        const owned_mime_type = media.takeOwnedMimeType();
+                        errdefer {
+                            allocator.free(bytes);
+                            if (owned_mime_type) |mime_type| allocator.free(mime_type);
+                        }
                         try parsed.images.append(allocator, .{
                             .index = index,
-                            .bytes = decoded,
-                            .mime_type = mime_value.string,
+                            .bytes = bytes,
+                            .mime_type = media.mime_type,
+                            .owned_mime_type = owned_mime_type,
                         });
                         continue;
                     }
 
-                    if (std.mem.startsWith(u8, mime_value.string, "audio/")) {
+                    if (std.mem.startsWith(u8, media.mime_type, "audio/")) {
                         if (!model_caps.modelAcceptsInput(manifest, "audio")) return error.ModelDoesNotSupportAudioInput;
+                        const bytes = media.takeBytes();
+                        const owned_mime_type = media.takeOwnedMimeType();
+                        errdefer {
+                            allocator.free(bytes);
+                            if (owned_mime_type) |mime_type| allocator.free(mime_type);
+                        }
                         try parsed.audio.append(allocator, .{
                             .index = index,
-                            .bytes = decoded,
-                            .mime_type = mime_value.string,
+                            .bytes = bytes,
+                            .mime_type = media.mime_type,
+                            .owned_mime_type = owned_mime_type,
                         });
                         continue;
                     }
@@ -6200,10 +6161,13 @@ fn embedInputParseErrorMessage(err: anyerror) []const u8 {
         error.ImageUrlContentPartMissingUrl => "image_url must contain a 'url' string",
         error.ImageUrlDownloadFailed => "failed to download image_url content",
         error.ImageUrlMustResolveToImage => "image_url content must resolve to an image",
-        error.MediaContentPartMissingData => "media content part missing 'data' field",
+        error.MediaContentPartMissingData => "media content part missing 'data' or 'url' field",
+        error.MediaUrlMustBeString => "media 'url' must be a string",
+        error.MediaUrlDownloadFailed => "failed to download media content",
         error.MediaContentPartMissingMimeType => "media content part missing 'mime_type' field",
         error.InvalidMediaBase64 => "invalid base64 media data",
         error.MediaDataMimeTypeMismatch => "media data URI mime_type does not match content part mime_type",
+        error.MediaUrlMimeTypeMismatch => "media URL mime_type does not match content part mime_type",
         error.UnsupportedMediaMimeType => "media content part must have an image/* or audio/* mime_type",
         error.ModelDoesNotSupportTextInput => "model does not support text input",
         error.ModelDoesNotSupportImageInput => "model does not support image input",
@@ -6682,6 +6646,68 @@ test "termite embed parser accepts data uri media payloads" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, inputs.images.items[0].bytes);
 }
 
+test "termite embed parser accepts media URL payloads" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "model": "clipclap",
+        \\  "input": [
+        \\    {"type":"media","url":"data:image/png;base64,AQI="}
+        \\  ]
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+
+    const request = try parseEmbedRequest(parsed.value);
+    var node: Node = undefined;
+    node.config = .{};
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = alloc,
+        .model_type = .embedder,
+        .visual_model_path = "visual.onnx",
+    };
+
+    var inputs = try parseDenseEmbedInputs(&node, alloc, &manifest, request.input);
+    defer inputs.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), inputs.total_count);
+    try std.testing.expectEqual(@as(usize, 1), inputs.images.items.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, inputs.images.items[0].bytes);
+    try std.testing.expectEqualStrings("image/png", inputs.images.items[0].mime_type.?);
+}
+
+test "termite embed parser rejects mismatched media URL mime type" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "model": "clipclap",
+        \\  "input": [
+        \\    {"type":"media","mime_type":"audio/wav","url":"data:image/png;base64,AQI="}
+        \\  ]
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+
+    const request = try parseEmbedRequest(parsed.value);
+    var node: Node = undefined;
+    node.config = .{};
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = alloc,
+        .model_type = .embedder,
+        .visual_model_path = "visual.onnx",
+        .audio_model_path = "audio.onnx",
+    };
+
+    try std.testing.expectError(
+        error.MediaUrlMimeTypeMismatch,
+        parseDenseEmbedInputs(&node, alloc, &manifest, request.input),
+    );
+}
+
 test "termite embed parser rejects mismatched data uri media mime type" {
     const alloc = std.testing.allocator;
     const body =
@@ -6866,6 +6892,70 @@ fn decodeMediaData(allocator: std.mem.Allocator, data: []const u8) !DecodedDataU
     return .{
         .mime_type = null,
         .data = decoded,
+    };
+}
+
+const ResolvedMediaContent = struct {
+    bytes: ?[]u8,
+    mime_type: []const u8,
+    owned_mime_type: ?[]u8 = null,
+
+    fn deinit(self: *ResolvedMediaContent, allocator: std.mem.Allocator) void {
+        if (self.bytes) |bytes| allocator.free(bytes);
+        if (self.owned_mime_type) |mime_type| allocator.free(mime_type);
+        self.* = undefined;
+    }
+
+    fn takeBytes(self: *ResolvedMediaContent) []u8 {
+        const bytes = self.bytes.?;
+        self.bytes = null;
+        return bytes;
+    }
+
+    fn takeOwnedMimeType(self: *ResolvedMediaContent) ?[]u8 {
+        const mime_type = self.owned_mime_type;
+        self.owned_mime_type = null;
+        return mime_type;
+    }
+};
+
+fn resolveMediaContentPart(
+    self: *const Node,
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+) !ResolvedMediaContent {
+    if (obj.get("url")) |url_value| {
+        if (url_value != .string) return error.MediaUrlMustBeString;
+
+        var downloaded = downloadRemoteContent(self, allocator, url_value.string) catch return error.MediaUrlDownloadFailed;
+        errdefer downloaded.deinit(allocator);
+
+        const declared_mime = if (obj.get("mime_type")) |mime_value| blk: {
+            if (mime_value != .string) return error.MediaContentPartMissingMimeType;
+            break :blk mime_value.string;
+        } else null;
+        const resolved_mime = trimMimeParametersLocal(downloaded.content_type);
+        if (!mediaMimeMatches(declared_mime, resolved_mime)) return error.MediaUrlMimeTypeMismatch;
+
+        return .{
+            .bytes = downloaded.data,
+            .mime_type = declared_mime orelse resolved_mime,
+            .owned_mime_type = downloaded.content_type,
+        };
+    }
+
+    const data_value = obj.get("data") orelse return error.MediaContentPartMissingData;
+    if (data_value != .string) return error.MediaContentPartMissingData;
+    const mime_value = obj.get("mime_type") orelse return error.MediaContentPartMissingMimeType;
+    if (mime_value != .string) return error.MediaContentPartMissingMimeType;
+
+    const decoded_payload = decodeMediaData(allocator, data_value.string) catch return error.InvalidMediaBase64;
+    errdefer decoded_payload.deinit(allocator);
+    if (!mediaMimeMatches(mime_value.string, decoded_payload.mime_type)) return error.MediaDataMimeTypeMismatch;
+
+    return .{
+        .bytes = decoded_payload.data,
+        .mime_type = mime_value.string,
     };
 }
 
