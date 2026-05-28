@@ -190,15 +190,19 @@ fn loadEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, case_dir: []const u
         if (item != .object) return error.InvalidCompatCase;
         const name = item.object.get("name") orelse return error.InvalidCompatCase;
         const kind = item.object.get("kind") orelse return error.InvalidCompatCase;
-        const source_field = item.object.get("source_field") orelse return error.InvalidCompatCase;
+        const field = item.object.get("field") orelse return error.InvalidCompatCase;
         try db.addEnrichment(.{
             .name = name.string,
             .kind = parseEnrichmentKind(kind.string),
-            .source_field = source_field.string,
+            .field = field.string,
+            .template = if (item.object.get("template")) |value| value.string else "",
             .source_artifact_name = if (item.object.get("source_artifact_name")) |value| value.string else "",
             .expected_dims = if (item.object.get("expected_dims")) |value| try parseU32JsonValue(value) else 0,
             .chunk_size = if (item.object.get("chunk_size")) |value| try parseU32JsonValue(value) else 0,
             .chunk_overlap = if (item.object.get("chunk_overlap")) |value| try parseU32JsonValue(value) else 0,
+            .chunker_json = if (item.object.get("chunker_json")) |value| value.string else "",
+            .content_type = if (item.object.get("content_type")) |value| value.string else "",
+            .producer_json = if (item.object.get("producer_json")) |value| value.string else "",
         });
     }
 }
@@ -1067,7 +1071,7 @@ fn parseIndexKind(kind: []const u8) db_mod.types.IndexKind {
 
 fn parseEnrichmentKind(kind: []const u8) db_mod.types.EnrichmentKind {
     if (std.mem.eql(u8, kind, "chunk")) return .chunk;
-    if (std.mem.eql(u8, kind, "summary")) return .summary;
+    if (std.mem.eql(u8, kind, "asset")) return .asset;
     if (std.mem.eql(u8, kind, "embedding")) return .embedding;
     unreachable;
 }

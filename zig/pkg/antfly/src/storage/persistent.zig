@@ -687,8 +687,10 @@ pub const PersistentIndex = struct {
             (opts.resolvedWalBackend() == .lsm and wal_storage == null);
 
         // Create subdirectories
-        var index_buf: [512]u8 = undefined;
-        const index_path = std.fmt.bufPrintZ(&index_buf, "{s}/index", .{path_span}) catch return error.PathTooLong;
+        const index_path_raw = try std.fmt.allocPrint(alloc, "{s}/index", .{path_span});
+        defer alloc.free(index_path_raw);
+        const index_path = try alloc.dupeZ(u8, index_path_raw);
+        defer alloc.free(index_path);
         const index_path_span = index_path[0..index_path.len];
         if (builtin.os.tag != .freestanding and needs_host_dirs) {
             var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -697,8 +699,10 @@ pub const PersistentIndex = struct {
             try storage_io.createDirPathPortable(io_impl.io(), index_path_span);
         }
 
-        var wal_buf: [512]u8 = undefined;
-        const wal_path = std.fmt.bufPrintZ(&wal_buf, "{s}/wal", .{path_span}) catch return error.PathTooLong;
+        const wal_path_raw = try std.fmt.allocPrint(alloc, "{s}/wal", .{path_span});
+        defer alloc.free(wal_path_raw);
+        const wal_path = try alloc.dupeZ(u8, wal_path_raw);
+        defer alloc.free(wal_path);
 
         var segment_files: ?SegmentFileStore = null;
         if (supports_main_lmdb) {

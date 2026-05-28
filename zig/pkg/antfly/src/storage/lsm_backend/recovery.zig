@@ -32,7 +32,7 @@ pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const 
         std.log.info(
             "lsm backend open begin root={s} read_only={any} create_if_missing={any} wal_enabled={any} storage_provided={any}",
             .{
-                root_dir,
+                backend.root_dir.?,
                 options.read_only,
                 options.create_if_missing,
                 backend.options.wal_enabled,
@@ -74,7 +74,7 @@ pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const 
         );
     }
     if (!loaded_manifest and options.create_if_missing) {
-        try repository_mod.ensureOpenDirsWithStorage(backend.storage.?, root_dir);
+        try repository_mod.ensureOpenDirsWithStorage(backend.storage.?, backend.root_dir.?);
         if (debug_open) std.log.info("lsm backend open ensured dirs root={s}", .{backend.root_dir.?});
     }
     {
