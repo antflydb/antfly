@@ -284,6 +284,7 @@ jobs:
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_LSM_OPEN_DEBUG: "1"
+          ANTFLY_FS_PATH_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly ./zig-out/bin/termite
           uv run --project e2e/antfly pytest -q -x \
@@ -348,6 +349,7 @@ jobs:
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_LSM_OPEN_DEBUG: "1"
+          ANTFLY_FS_PATH_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly ./zig-out/bin/termite
           uv run --project e2e/antfly pytest -q -x e2e/antfly
