@@ -113,8 +113,8 @@ const openapi_join_input_paths = [_][]const u8{
     "../specs/openapi/inference/api.yaml",
     "../specs/openapi/inference/config.yaml",
     "../specs/openapi/shared/generating.yaml",
-    "../go/pkg/antfly/lib/schema/openapi.yaml",
-    "../go/pkg/antfly/src/store/db/indexes/openapi.yaml",
+    "../specs/openapi/antfly/schema.yaml",
+    "../specs/openapi/antfly/indexes.yaml",
 };
 
 fn addOpenApiJoinInputs(b: *std.Build, run: *std.Build.Step.Run) void {
@@ -777,8 +777,8 @@ fn addPublicOpenApiModule(
         "antfly_public_openapi",
         "types,extractors",
         &.{
-            .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
+            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_ai_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -805,8 +805,8 @@ fn addPublicClientOpenApiModule(
         "antfly_client_openapi",
         "types,client",
         &.{
-            .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
+            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_ai_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -945,8 +945,8 @@ fn addOpenApiRegenStep(
     const inference_generated_root = "pkg/inference/src/api/generated";
     const runs = [_]*std.Build.Step.Run{
         addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
-            .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
+            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_ai_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -954,19 +954,19 @@ fn addOpenApiRegenStep(
             .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, addPrefixedPublicOpenApiSpec(b), "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", "types,client", &.{
-            .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
+            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_ai_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
             .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
             .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/schema/openapi.yaml"), "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/src/store/db/indexes/openapi.yaml"), "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi", "types", &.{
-            .{ "../../../../../../../specs/openapi/antfly/embeddings.yaml", "antfly_embeddings_openapi" },
-            .{ "../../../../../../../specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "../../../../../../../specs/openapi/antfly/chunking.yaml", "antfly_chunking_openapi" },
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/schema.yaml"), "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/indexes.yaml"), "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi", "types", &.{
+            .{ "embeddings.yaml", "antfly_embeddings_openapi" },
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "chunking.yaml", "antfly_chunking_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/websearch.yaml"), "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi", "types", &.{
             .{ "../shared/s3.yaml", "antfly_s3_openapi" },
@@ -978,8 +978,8 @@ fn addOpenApiRegenStep(
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/auth/api.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
             .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
-            .{ "../../../go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
-            .{ "../../../go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
+            .{ "indexes.yaml", "antfly_indexes_openapi" },
+            .{ "schema.yaml", "antfly_schema_openapi" },
             .{ "generating.yaml", "antfly_ai_openapi" },
             .{ "eval.yaml", "antfly_eval_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },

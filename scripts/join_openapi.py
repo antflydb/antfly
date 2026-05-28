@@ -224,15 +224,17 @@ def configure_for_repo_contracts(module) -> None:
     module.METADATA_SPEC = ROOT / "specs/openapi/antfly/metadata.yaml"
     module.USERMGR_SPEC = ROOT / "specs/openapi/auth/api.yaml"
     module.ROOT_SPEC = ROOT / "openapi.yaml"
-    module.GO_SCHEMA_SPEC = ROOT / "go/pkg/antfly/lib/schema/openapi.yaml"
-    module.GO_INDEX_SPEC = ROOT / "go/pkg/antfly/src/store/db/indexes/openapi.yaml"
+    module.GO_SCHEMA_SPEC = ROOT / "specs/openapi/antfly/schema.yaml"
+    module.GO_INDEX_SPEC = ROOT / "specs/openapi/antfly/indexes.yaml"
     module.GO_INDEX_REF_PATHS = {
-        "../store/db/indexes/openapi.yaml",
-        "../../../go/pkg/antfly/src/store/db/indexes/openapi.yaml",
+        "indexes.yaml",
+        "specs/openapi/antfly/indexes.yaml",
     }
     module.PATH_REWRITES = {
         "../auth/api.yaml": "specs/openapi/auth/api.yaml",
         "../shared/generating.yaml": "specs/openapi/shared/generating.yaml",
+        "schema.yaml": "specs/openapi/antfly/schema.yaml",
+        "indexes.yaml": "specs/openapi/antfly/indexes.yaml",
         "generating.yaml": "specs/openapi/antfly/generating.yaml",
         "eval.yaml": "specs/openapi/antfly/eval.yaml",
         "reranking.yaml": "specs/openapi/antfly/reranking.yaml",

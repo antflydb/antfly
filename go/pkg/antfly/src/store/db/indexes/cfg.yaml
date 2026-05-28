@@ -12,6 +12,6 @@ output-options:
   prefer-skip-optional-pointer: false
   prefer-skip-optional-pointer-with-omitzero: false
 import-mapping:
-  ../../../../../../../specs/openapi/antfly/embeddings.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/embeddings
-  ../../../../../../../specs/openapi/shared/generating.yaml: github.com/antflydb/antfly/go/pkg/generating
-  ../../../../../../../specs/openapi/antfly/chunking.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/chunking
+  embeddings.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/embeddings
+  ../shared/generating.yaml: github.com/antflydb/antfly/go/pkg/generating
+  chunking.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/chunking

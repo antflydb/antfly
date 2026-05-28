@@ -20,6 +20,6 @@ import-mapping:
   eval.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/ai/eval
   chunking.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/chunking
   reranking.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/reranking
-  ../../../go/pkg/antfly/lib/schema/openapi.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/schema
-  ../../../go/pkg/antfly/src/store/db/indexes/openapi.yaml: github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes
+  schema.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/schema
+  indexes.yaml: github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes
   query.yaml: github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes
