@@ -24,7 +24,11 @@ function TableHeader({ className, ...props }: React.ComponentProps<"thead">) {
           background-color: transparent !important;
         }
       `}</style>
-      <thead data-slot="table-header" className={cn("", className)} {...props} />
+      <thead
+        data-slot="table-header"
+        className={cn("[&>tr]:border-b-2", className)}
+        {...props}
+      />
     </>
   );
 }
@@ -67,7 +71,12 @@ function TableHead({ className, ...props }: React.ComponentProps<"th">) {
     <th
       data-slot="table-head"
       className={cn(
-        "text-foreground h-12 px-4 text-left align-middle font-semibold [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
+        // mono uppercase "instrument readout" voice (same family as MonoLabel)
+        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground",
+        // compact band sized for the smaller type
+        "h-10 px-4 text-left align-middle whitespace-nowrap",
+        // checkbox handling preserved
+        "[&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
         className
       )}
       {...props}
