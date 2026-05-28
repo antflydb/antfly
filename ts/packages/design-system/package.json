@@ -1,6 +1,6 @@
 {
   "name": "@antfly/design-system",
-  "version": "0.0.7",
+  "version": "0.1.0",
   "description": "Antfly's shared shadcn/ui component library: primitives, compound components, brand blocks, design tokens, and Aeonik.",
   "author": "Antfly, Inc. <contact@antfly.io>",
   "license": "MIT",
