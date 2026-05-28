@@ -670,22 +670,6 @@ pub const ProvisionedTableWriteCache = struct {
         return null;
     }
 
-    fn snapshotLatestLeaseForGroupTableLocked(
-        self: *ProvisionedTableWriteCache,
-        group_id: u64,
-        table_name: []const u8,
-    ) ?CachedDb {
-        var selected: ?*Entry = null;
-        for (self.entries.items) |entry| {
-            if (entry.group_id != group_id) continue;
-            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.retired) continue;
-            if (selected == null or entry.lsm_root_generation > selected.?.lsm_root_generation) selected = entry;
-        }
-        const entry = selected orelse return null;
-        return self.leaseEntryLocked(entry);
-    }
-
     fn leaseEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) CachedDb {
         lockAtomic(&self.entry_lifecycle_mutex);
         defer self.entry_lifecycle_mutex.unlock();
@@ -3273,25 +3257,6 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.endGroupOperation(table_name, group_id);
 
         if (self.write_cache) |cache| {
-            var latest_cached: ?ProvisionedTableWriteCache.CachedDb = null;
-            {
-                lockAtomic(&self.local_db_mutex);
-                defer self.local_db_mutex.unlock();
-                latest_cached = cache.snapshotLatestLeaseForGroupTableLocked(group_id, table_name);
-            }
-            if (latest_cached) |*cached| {
-                defer cached.deinit(alloc);
-                if (cached.entry) |entry| {
-                    try self.finishEntryAutoBulkIngestForForegroundVisibility(cache, entry);
-                }
-                try drainManagedDbBeforeClose(cached.db);
-                const median = cached.db.findMedianKey(alloc) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
-                if (median) |key| return key;
-            }
-
             var cached = try self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
             if (cached.entry) |entry| {

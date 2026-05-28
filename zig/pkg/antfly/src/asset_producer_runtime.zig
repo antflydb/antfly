@@ -458,9 +458,9 @@ fn expectOpenAiMultimodalGeneratorRequest(req: httpx.testing_mod.RequestInfo) !v
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"model\":\"gemma4\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"content\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"text\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"media\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"url\":\"data:audio/wav;base64,aaa\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"image_url\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"media\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"image_url\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"url\":\"data:image/png;base64,aaa\"") != null);
 }
 
 test "asset producer runtime passes rendered media parts to generators" {
@@ -500,7 +500,7 @@ test "asset producer runtime passes rendered media parts to generators" {
                 .producer_type = .generator,
                 .config_json = cfg,
                 .source_text = "describe",
-                .source_parts_json = "[{\"type\":\"text\",\"text\":\"describe\"},{\"type\":\"media\",\"url\":\"data:audio/wav;base64,aaa\",\"mime_type\":\"audio/wav\"}]",
+                .source_parts_json = "[{\"type\":\"text\",\"text\":\"describe\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,aaa\",\"mime_type\":\"image/png\"}]",
                 .content_type = "text/plain",
             }) catch |err| {
                 err_out.* = err;
