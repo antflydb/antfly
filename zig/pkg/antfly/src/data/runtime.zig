@@ -2564,30 +2564,19 @@ pub const DataServer = struct {
             };
         }
 
-        const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, self.write_source.replica_root_dir, group_id);
-        defer alloc.free(db_path);
-
-        var db = antfly.db.DB.open(alloc, db_path, .{
-            .open_mode = .query_readonly,
-            .start_index_workers = false,
-            .ttl_cleanup = .{ .enabled = false },
-            .transaction_recovery = .{ .enabled = false },
-            .text_merge = .{ .enabled = false },
-            .lsm_cache = &self.provisioned_storage.lsm_cache,
-            .hbc_cache = &self.provisioned_storage.hbc_cache,
-            .lsm_root_generation = lsm_root_generation,
-            .resource_manager = &self.provisioned_storage.resource_manager,
-            .backend_runtime = try self.ensureBackendRuntime(),
-        }) catch |err| switch (err) {
-            error.FileNotFound => return error.UnknownGroup,
-            else => return err,
-        };
-        defer db.close();
-
-        const median_key = db.findMedianKey(alloc) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const median_key = if (self.data_raft_apply) |apply_sm|
+            (apply_sm.write_source.findMedianKeyForGroup(alloc, group_id, lsm_root_generation) catch |err| switch (err) {
+                error.FileNotFound => return error.UnknownGroup,
+                else => return err,
+            }) orelse (self.write_source.findMedianKeyForGroup(alloc, group_id, lsm_root_generation) catch |err| switch (err) {
+                error.FileNotFound => return error.UnknownGroup,
+                else => return err,
+            })
+        else
+            self.write_source.findMedianKeyForGroup(alloc, group_id, lsm_root_generation) catch |err| switch (err) {
+                error.FileNotFound => return error.UnknownGroup,
+                else => return err,
+            };
         errdefer if (median_key) |key| alloc.free(key);
         try self.storeCachedLocalSplitKey(group_id, lsm_root_generation, change_generation, median_key);
         return median_key;
@@ -2604,7 +2593,7 @@ pub const DataServer = struct {
         defer self.local_split_key_cache_mutex.unlock();
         if (try self.local_split_key_cache.snapshot(alloc, group_id, lsm_root_generation, change_generation)) |snapshot| {
             if (snapshot.split_key) |key| return .{ .key = key };
-            return .missing;
+            return null;
         }
         return null;
     }
@@ -2616,6 +2605,7 @@ pub const DataServer = struct {
         change_generation: u64,
         split_key: ?[]const u8,
     ) !void {
+        if (split_key == null) return;
         lockAtomic(&self.local_split_key_cache_mutex);
         defer self.local_split_key_cache_mutex.unlock();
         try self.local_split_key_cache.put(self.alloc, group_id, lsm_root_generation, change_generation, split_key);
@@ -3082,30 +3072,52 @@ pub const DataServer = struct {
             );
         }
         if (try self.cloneCachedLocalGroupStatusesMatching(alloc, generation, fingerprint, true)) |stale| {
-            try self.requestLocalGroupStatusRefreshWithSources(
-                generation,
-                fingerprint,
+            const stale_owned = stale;
+            errdefer freeGroupStatusesOwned(alloc, stale_owned);
+            const refreshed = self.collectLiveLocalGroupStatusesWithSources(
+                alloc,
                 replica_root_dir,
                 group_ids,
                 tables,
                 ranges,
+                group_leadership_source,
+                group_membership_source,
                 stores,
                 merged_group_statuses,
                 split_transitions,
                 merge_transitions,
                 split_observations,
                 merge_observations,
-                inferred_group_leadership,
-                group_leadership_source,
-                group_membership_source,
-            );
-            return try mergeRaftOnlyLocalGroupStatusFallbacks(
-                alloc,
-                stale,
-                group_ids,
-                group_leadership_source,
-                group_membership_source,
-            );
+            ) catch |err| {
+                std.log.warn("store status stale group refresh failed err={}", .{err});
+                try self.requestLocalGroupStatusRefreshWithSources(
+                    generation,
+                    fingerprint,
+                    replica_root_dir,
+                    group_ids,
+                    tables,
+                    ranges,
+                    stores,
+                    merged_group_statuses,
+                    split_transitions,
+                    merge_transitions,
+                    split_observations,
+                    merge_observations,
+                    inferred_group_leadership,
+                    group_leadership_source,
+                    group_membership_source,
+                );
+                return try mergeRaftOnlyLocalGroupStatusFallbacks(
+                    alloc,
+                    stale_owned,
+                    group_ids,
+                    group_leadership_source,
+                    group_membership_source,
+                );
+            };
+            freeGroupStatusesOwned(alloc, stale_owned);
+            try self.storeCachedLocalGroupStatuses(generation, fingerprint, refreshed);
+            return refreshed;
         }
         try self.requestLocalGroupStatusRefreshWithSources(
             generation,
@@ -3678,14 +3690,15 @@ pub const DataServer = struct {
         lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
         if (self.runtime_status_disk_usage_cache.get(group_id)) |entry| {
             const fresh = now_ns -| entry.checked_at_ns < runtime_status_disk_usage_refresh_interval_ns;
-            if (active or fresh) {
+            const zero_cache_for_nonempty_group = entry.disk_bytes == 0 and status.stats.doc_count > 0;
+            if ((active or fresh) and !zero_cache_for_nonempty_group) {
                 self.runtime_status_disk_usage_cache_mutex.unlock();
                 return entry.disk_bytes;
             }
         }
         self.runtime_status_disk_usage_cache_mutex.unlock();
 
-        if (active) return null;
+        if (active and status.stats.doc_count == 0) return null;
         const disk_bytes = directoryUsageBytes(self.alloc, db_path) catch return null;
 
         lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
@@ -5935,7 +5948,7 @@ fn runtimeStatusReportFromLocalStatus(
         .group_id = group_id,
         .store_id = registration.store_id,
         .node_id = registration.node_id,
-        .updated_at_ns = status.metadata.updated_at_ns,
+        .updated_at_ns = platform_time.monotonicNs(),
         .source = source,
         .freshness = freshness,
         .topology_generation = status.metadata.topology_generation,

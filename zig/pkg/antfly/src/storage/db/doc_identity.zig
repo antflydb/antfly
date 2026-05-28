@@ -773,6 +773,65 @@ fn collectDocOrdinalRowsAlloc(alloc: Allocator, store: *docstore_mod.DocStore, r
     try store.scanWithContext(lower[0..], upper[0..], .{}, &state, State.scanEntry);
 }
 
+pub fn findMedianDocIdAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    lower_raw: []const u8,
+    upper_raw: []const u8,
+) ![]u8 {
+    const State = struct {
+        alloc: Allocator,
+        lower_raw: []const u8,
+        upper_raw: []const u8,
+        count: usize = 0,
+        target: ?usize = null,
+        seen: usize = 0,
+        result: ?[]u8 = null,
+
+        fn inRange(self: *@This(), doc_id: []const u8) bool {
+            if (self.lower_raw.len > 0 and std.mem.order(u8, doc_id, self.lower_raw) == .lt) return false;
+            if (self.upper_raw.len > 0 and std.mem.order(u8, doc_id, self.upper_raw) != .lt) return false;
+            return true;
+        }
+
+        fn countEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            _ = value;
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const doc_id = try parseIdentityDocToOrdinalKeyAlloc(state.alloc, key);
+            defer state.alloc.free(doc_id);
+            if (state.inRange(doc_id)) state.count += 1;
+            return .@"continue";
+        }
+
+        fn selectEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            _ = value;
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const doc_id = try parseIdentityDocToOrdinalKeyAlloc(state.alloc, key);
+            errdefer state.alloc.free(doc_id);
+            if (!state.inRange(doc_id)) {
+                state.alloc.free(doc_id);
+                return .@"continue";
+            }
+            if (state.seen == (state.target orelse return error.InvalidDocIdentity)) {
+                state.result = doc_id;
+                return .stop;
+            }
+            state.seen += 1;
+            state.alloc.free(doc_id);
+            return .@"continue";
+        }
+    };
+
+    const lower = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_doc_to_ordinal_kind };
+    const upper = [_]u8{ internal_keys.identity_namespace, internal_keys.identity_doc_to_ordinal_kind + 1 };
+    var state = State{ .alloc = alloc, .lower_raw = lower_raw, .upper_raw = upper_raw };
+    try store.scanWithContext(lower[0..], upper[0..], .{}, &state, State.countEntry);
+    if (state.count == 0) return error.NotFound;
+    state.target = state.count / 2;
+    try store.scanWithContext(lower[0..], upper[0..], .{}, &state, State.selectEntry);
+    return state.result orelse error.NotFound;
+}
+
 fn collectOrdinalDocRowsAlloc(alloc: Allocator, store: *docstore_mod.DocStore, rows: *OrdinalDocRows) !void {
     const State = struct {
         alloc: Allocator,

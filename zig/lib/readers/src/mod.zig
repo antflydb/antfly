@@ -272,6 +272,7 @@ const AntflyReaderState = struct {
     alloc: Allocator,
     http: *httpx.Client,
     api_url: []const u8,
+    auth_header: ?[2][]const u8 = null,
     model: []const u8,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -287,6 +288,9 @@ const AntflyReaderState = struct {
             .prompt = try dupOpt(alloc, cfg.prompt),
             .max_tokens = cfg.max_tokens,
         };
+        if (cfg.bearer_token orelse cfg.api_key) |token| {
+            try state.setBearer(token);
+        }
         return .{ .ptr = state, .vtable = &.{ .read = read, .deinit = deinit } };
     }
 
@@ -295,7 +299,13 @@ const AntflyReaderState = struct {
         self.alloc.free(self.api_url);
         self.alloc.free(self.model);
         freeOpt(self.alloc, self.prompt);
+        if (self.auth_header) |header| self.alloc.free(header[1]);
         self.alloc.destroy(self);
+    }
+
+    fn setBearer(self: *AntflyReaderState, token: []const u8) !void {
+        if (self.auth_header) |header| self.alloc.free(header[1]);
+        self.auth_header = .{ "Authorization", try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token}) };
     }
 
     fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
@@ -314,7 +324,12 @@ const AntflyReaderState = struct {
 
         const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
         defer alloc.free(url);
-        var resp = try self.http.post(url, .{ .json = body });
+        var header_buf: [1][2][]const u8 = undefined;
+        const headers: []const [2][]const u8 = if (self.auth_header) |header| blk: {
+            header_buf[0] = header;
+            break :blk header_buf[0..];
+        } else &.{};
+        var resp = try self.http.post(url, .{ .json = body, .headers = headers });
         defer resp.deinit();
         if (!resp.ok()) return error.ReadRequestFailed;
 
@@ -666,6 +681,57 @@ test "reader registry duplicate provider error does not double free config" {
     }));
 }
 
+test "antfly reader sends configured bearer auth" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/read", .assert_request = expectAntflyReaderBearer, .respond = .{
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"read_result\",\"index\":0,\"text\":\"read with auth\"}],\"model\":\"reader\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3,\"total_tokens\":3}}",
+        } },
+    });
+    defer server.deinit();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const reader = try initReader(alloc, &client, .{
+        .provider = .antfly,
+        .api_url = server.baseUrl(),
+        .model = "reader",
+        .bearer_token = "reader-bearer",
+    });
+    defer reader.deinit();
+
+    var results: ?[]Result = null;
+    defer if (results) |items| {
+        for (items) |*item| deinitResult(alloc, item);
+        alloc.free(items);
+    };
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+
+    const Fiber = struct {
+        fn run(a: Allocator, r: Reader, out: *?[]Result, err_out: *?anyerror) std.Io.Cancelable!void {
+            const images = [_][]const u8{"data:image/png;base64,ZmFrZQ=="};
+            out.* = r.read(a, .{ .images = &images }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    group.concurrent(io, Fiber.run, .{ alloc, reader, &results, &run_err }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+
+    try std.testing.expectEqual(@as(usize, 1), results.?.len);
+    try std.testing.expectEqualStrings("read with auth", results.?[0].text);
+}
+
 test "vertex reader exchanges service account credentials and sends bearer auth" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -768,4 +834,9 @@ fn fakeVertexCredentialsJsonAlloc(alloc: Allocator, token_uri: []const u8) ![]u8
 fn expectVertexBearer(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqual(httpx.Method.POST, req.method);
     try std.testing.expectEqualStrings("Bearer vertex-token", req.header("Authorization") orelse return error.MissingHeader);
+}
+
+fn expectAntflyReaderBearer(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqual(httpx.Method.POST, req.method);
+    try std.testing.expectEqualStrings("Bearer reader-bearer", req.header("Authorization") orelse return error.MissingHeader);
 }

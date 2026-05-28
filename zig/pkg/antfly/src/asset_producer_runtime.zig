@@ -386,7 +386,16 @@ fn parseGeneratorContentParts(alloc: Allocator, source_text: []const u8, raw_par
             try parts.append(alloc, .{ .image_url = .{ .url = try alloc.dupe(u8, url.string) } });
         } else if (std.mem.eql(u8, type_value.string, "media")) {
             if (part.object.get("url")) |url| {
-                if (url == .string) try parts.append(alloc, .{ .image_url = .{ .url = try alloc.dupe(u8, url.string) } });
+                if (url == .string) {
+                    const mime_type = if (part.object.get("mime_type")) |mime|
+                        if (mime == .string) mime.string else ""
+                    else
+                        "";
+                    try parts.append(alloc, .{ .media = .{
+                        .url = try alloc.dupe(u8, url.string),
+                        .mime_type = if (mime_type.len > 0) try alloc.dupe(u8, mime_type) else "",
+                    } });
+                }
             } else if (part.object.get("mime_type")) |mime| {
                 const data = part.object.get("data") orelse continue;
                 if (mime == .string and data == .string) {
@@ -411,8 +420,9 @@ fn freeGeneratorContentParts(alloc: Allocator, parts: []generating_runtime.Conte
             .text => |text| alloc.free(@constCast(text)),
             .image_url => |image_url| alloc.free(@constCast(image_url.url)),
             .media => |media| {
-                alloc.free(@constCast(media.data));
-                alloc.free(@constCast(media.mime_type));
+                if (media.data.len > 0) alloc.free(@constCast(media.data));
+                if (media.mime_type.len > 0) alloc.free(@constCast(media.mime_type));
+                if (media.url) |url| alloc.free(@constCast(url));
             },
         }
     }
@@ -448,8 +458,9 @@ fn expectOpenAiMultimodalGeneratorRequest(req: httpx.testing_mod.RequestInfo) !v
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"model\":\"gemma4\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"content\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"text\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"image_url\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.body, "data:image/png;base64,aaa") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"media\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"url\":\"data:audio/wav;base64,aaa\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"image_url\"") == null);
 }
 
 test "asset producer runtime passes rendered media parts to generators" {
@@ -489,7 +500,7 @@ test "asset producer runtime passes rendered media parts to generators" {
                 .producer_type = .generator,
                 .config_json = cfg,
                 .source_text = "describe",
-                .source_parts_json = "[{\"type\":\"text\",\"text\":\"describe\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,aaa\"}]",
+                .source_parts_json = "[{\"type\":\"text\",\"text\":\"describe\"},{\"type\":\"media\",\"url\":\"data:audio/wav;base64,aaa\",\"mime_type\":\"audio/wav\"}]",
                 .content_type = "text/plain",
             }) catch |err| {
                 err_out.* = err;

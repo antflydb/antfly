@@ -734,12 +734,18 @@ fn addYamlOpenApiModule(
 
 fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
     const check = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{"--compare"});
+    check.addFileInput(b.path("../scripts/openapi_joiner.py"));
+    check.addFileInput(b.path("../specs/openapi/antfly/metadata.yaml"));
+    check.addFileInput(b.path("../specs/openapi/antfly/usermgr.yaml"));
     check.addFileArg(b.path("../openapi.yaml"));
     return check;
 }
 
 fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--joined-only"});
+    join.addFileInput(b.path("../scripts/openapi_joiner.py"));
+    join.addFileInput(b.path("../specs/openapi/antfly/metadata.yaml"));
+    join.addFileInput(b.path("../specs/openapi/antfly/usermgr.yaml"));
     return join.addOutputFileArg("openapi.public.joined.yaml");
 }
 

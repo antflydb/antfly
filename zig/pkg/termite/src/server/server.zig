@@ -1647,6 +1647,51 @@ pub const Node = struct {
                                 try msg_images.append(ctx.allocator, downloaded.data);
                                 try msg_parts.append(ctx.allocator, .{ .image = msg_images.items.len - 1 });
                             } else if (std.mem.eql(u8, ptype, "media")) {
+                                if (obj.get("url")) |url_val| {
+                                    if (url_val != .string) return ctx.status(400).json(.{
+                                        .@"error" = "INVALID_REQUEST",
+                                        .message = "media 'url' must be a string",
+                                    });
+                                    const downloaded = downloadRemoteContent(self, ctx.allocator, url_val.string) catch {
+                                        return ctx.status(400).json(.{
+                                            .@"error" = "INVALID_REQUEST",
+                                            .message = "failed to download media content",
+                                        });
+                                    };
+                                    const mime_val = obj.get("mime_type");
+                                    const declared_mime = if (mime_val) |mv| if (mv == .string) mv.string else return ctx.status(400).json(.{
+                                        .@"error" = "INVALID_REQUEST",
+                                        .message = "media 'mime_type' must be a string",
+                                    }) else null;
+                                    const content_type = std.mem.trim(u8, downloaded.content_type, " \t\r\n");
+                                    if (!mediaMimeMatches(declared_mime, content_type)) {
+                                        ctx.allocator.free(downloaded.data);
+                                        ctx.allocator.free(downloaded.content_type);
+                                        return ctx.status(400).json(.{
+                                            .@"error" = "INVALID_REQUEST",
+                                            .message = "media URL mime_type does not match content part mime_type",
+                                        });
+                                    }
+                                    if (std.mem.startsWith(u8, content_type, "image/")) {
+                                        try decoded_images.append(ctx.allocator, downloaded.data);
+                                        try msg_images.append(ctx.allocator, downloaded.data);
+                                        try msg_parts.append(ctx.allocator, .{ .image = msg_images.items.len - 1 });
+                                        ctx.allocator.free(downloaded.content_type);
+                                    } else if (std.mem.startsWith(u8, content_type, "audio/")) {
+                                        try decoded_audio.append(ctx.allocator, downloaded.data);
+                                        try msg_audio.append(ctx.allocator, downloaded.data);
+                                        try msg_parts.append(ctx.allocator, .{ .audio = msg_audio.items.len - 1 });
+                                        ctx.allocator.free(downloaded.content_type);
+                                    } else {
+                                        ctx.allocator.free(downloaded.data);
+                                        ctx.allocator.free(downloaded.content_type);
+                                        return ctx.status(400).json(.{
+                                            .@"error" = "INVALID_REQUEST",
+                                            .message = "media content part must have mime_type starting with 'audio/' or 'image/'",
+                                        });
+                                    }
+                                    continue;
+                                }
                                 const data_val = obj.get("data") orelse return ctx.status(400).json(.{
                                     .@"error" = "INVALID_REQUEST",
                                     .message = "media content part missing 'data' field",

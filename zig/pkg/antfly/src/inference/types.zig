@@ -117,7 +117,7 @@ fn appendContentPartJson(
                 try appendMediaContentPartJson(alloc, out, media);
             },
             .openai_compatible => {
-                if (std.mem.startsWith(u8, media.mime_type, "image/")) {
+                if (media.url == null and std.mem.startsWith(u8, media.mime_type, "image/")) {
                     const data_uri = try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ media.mime_type, media.data });
                     defer alloc.free(data_uri);
                     try out.appendSlice(alloc, "{\"type\":\"image_url\",\"image_url\":{\"url\":");
@@ -136,10 +136,20 @@ fn appendMediaContentPartJson(
     out: *std.ArrayListUnmanaged(u8),
     media: MediaContent,
 ) !void {
-    try out.appendSlice(alloc, "{\"type\":\"media\",\"data\":");
-    try appendJsonString(alloc, out, media.data);
-    try out.appendSlice(alloc, ",\"mime_type\":");
-    try appendJsonString(alloc, out, media.mime_type);
+    try out.appendSlice(alloc, "{\"type\":\"media\"");
+    if (media.url) |url| {
+        try out.appendSlice(alloc, ",\"url\":");
+        try appendJsonString(alloc, out, url);
+        if (media.mime_type.len > 0) {
+            try out.appendSlice(alloc, ",\"mime_type\":");
+            try appendJsonString(alloc, out, media.mime_type);
+        }
+    } else {
+        try out.appendSlice(alloc, ",\"data\":");
+        try appendJsonString(alloc, out, media.data);
+        try out.appendSlice(alloc, ",\"mime_type\":");
+        try appendJsonString(alloc, out, media.mime_type);
+    }
     try out.append(alloc, '}');
 }
 
@@ -284,4 +294,20 @@ test "openai compatible chat serialization keeps non-image media as media" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"mime_type\":\"audio/wav\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "data:image/png;base64,AQ==") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "data:audio/wav;base64") == null);
+}
+
+test "openai compatible chat serialization preserves media urls as media" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{.{
+        .role = .user,
+        .content = .{ .parts = &.{
+            .{ .text = "listen" },
+            .{ .media = .{ .mime_type = "audio/wav", .url = "https://example.test/audio.wav" } },
+        } },
+    }};
+    const body = try chatRequestJsonAlloc(alloc, "gemma4", &messages, .openai_compatible);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"media\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://example.test/audio.wav\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image_url\"") == null);
 }

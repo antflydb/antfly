@@ -4304,9 +4304,12 @@ pub const DB = struct {
         const upper = if (byte_range.end.len > 0) try self.core.documentRangeUpperAlloc(byte_range.end) else null;
         defer if (upper) |buf| self.core.alloc.free(buf);
 
-        const internal_key = try self.core.findMedianStoreKey(alloc, lower, if (upper) |buf| buf else "", .{
+        const internal_key = self.core.findMedianStoreKey(alloc, lower, if (upper) |buf| buf else "", .{
             .skip_fn = &skipNonPrimaryMedianKey,
-        });
+        }) catch |err| switch (err) {
+            error.NotFound => return try doc_identity.findMedianDocIdAlloc(alloc, self.core.store, byte_range.start, byte_range.end),
+            else => return err,
+        };
         defer alloc.free(internal_key);
 
         return (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, internal_key)) orelse error.NotFound;

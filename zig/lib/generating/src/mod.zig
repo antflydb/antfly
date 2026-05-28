@@ -37,8 +37,9 @@ pub const ImageURL = struct {
 };
 
 pub const MediaContent = struct {
-    data: []const u8,
-    mime_type: []const u8,
+    data: []const u8 = "",
+    mime_type: []const u8 = "",
+    url: ?[]const u8 = null,
 };
 
 pub const ContentPart = union(enum) {

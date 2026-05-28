@@ -670,6 +670,22 @@ pub const ProvisionedTableWriteCache = struct {
         return null;
     }
 
+    fn snapshotLatestLeaseForGroupTableLocked(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+    ) ?CachedDb {
+        var selected: ?*Entry = null;
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.retired) continue;
+            if (selected == null or entry.lsm_root_generation > selected.?.lsm_root_generation) selected = entry;
+        }
+        const entry = selected orelse return null;
+        return self.leaseEntryLocked(entry);
+    }
+
     fn leaseEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) CachedDb {
         lockAtomic(&self.entry_lifecycle_mutex);
         defer self.entry_lifecycle_mutex.unlock();
@@ -2699,11 +2715,35 @@ pub const ProvisionedTableWriteSource = struct {
         finish_expired_auto_bulk_now_ns: ?u64,
         ensure_auto_bulk_now_ns: ?u64,
     ) !ProvisionedTableWriteCache.CachedDb {
+        return try self.getOrOpenCachedDbModeAtGeneration(
+            alloc,
+            cache,
+            path,
+            group_id,
+            self.lsmRootGeneration(group_id),
+            table_name,
+            mode,
+            finish_expired_auto_bulk_now_ns,
+            ensure_auto_bulk_now_ns,
+        );
+    }
+
+    fn getOrOpenCachedDbModeAtGeneration(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        cache: *ProvisionedTableWriteCache,
+        path: []const u8,
+        group_id: u64,
+        lsm_root_generation: u64,
+        table_name: []const u8,
+        mode: ManagedDbOpenMode,
+        finish_expired_auto_bulk_now_ns: ?u64,
+        ensure_auto_bulk_now_ns: ?u64,
+    ) !ProvisionedTableWriteCache.CachedDb {
         _ = alloc;
         if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
         cache.local_termite_provider = self.local_termite_provider;
         cache.remote_content = self.remote_content;
-        const lsm_root_generation = self.lsmRootGeneration(group_id);
         const identity_namespace = try loadTableIdentityNamespaceForGroup(cache.alloc, self.catalog, table_name, group_id);
         const expected_identity_namespace = if (mode == .startup_catch_up or mode == .restore_repair)
             null
@@ -2990,7 +3030,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (cache.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.lsm_root_generation != self.lsmRootGeneration(entry.group_id)) continue;
-            self.finishEntryAutoBulkIngestBeforeStatusPublish(cache, entry) catch |err| {
+            self.finishEntryAutoBulkIngestForForegroundVisibility(cache, entry) catch |err| {
                 if (!isTransientReplayVisibilityError(err)) {
                     std.log.warn("managed writer auto bulk finish before status publish failed table={s} group_id={} err={s}", .{
                         entry.table_name,
@@ -3006,7 +3046,7 @@ pub const ProvisionedTableWriteSource = struct {
         return published;
     }
 
-    fn finishEntryAutoBulkIngestBeforeStatusPublish(
+    fn finishEntryAutoBulkIngestForForegroundVisibility(
         self: *ProvisionedTableWriteSource,
         cache: *ProvisionedTableWriteCache,
         entry: *ProvisionedTableWriteCache.Entry,
@@ -3203,6 +3243,75 @@ pub const ProvisionedTableWriteSource = struct {
 
         var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
         db.close();
+    }
+
+    pub fn findMedianKeyForGroup(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        lsm_root_generation: u64,
+    ) !?[]u8 {
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+
+        const range = metadata_mod.findAdminRange(&snapshot, group_id) orelse return error.UnknownGroup;
+        const table = metadata_mod.findAdminTable(&snapshot, range.table_id) orelse return error.TableNotFound;
+        return try self.findMedianKeyForTableGroup(alloc, group_id, lsm_root_generation, table.name);
+    }
+
+    pub fn findMedianKeyForTableGroup(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        lsm_root_generation: u64,
+        table_name: []const u8,
+    ) !?[]u8 {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (self.write_cache) |cache| {
+            var latest_cached: ?ProvisionedTableWriteCache.CachedDb = null;
+            {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
+                latest_cached = cache.snapshotLatestLeaseForGroupTableLocked(group_id, table_name);
+            }
+            if (latest_cached) |*cached| {
+                defer cached.deinit(alloc);
+                if (cached.entry) |entry| {
+                    try self.finishEntryAutoBulkIngestForForegroundVisibility(cache, entry);
+                }
+                try drainManagedDbBeforeClose(cached.db);
+                const median = cached.db.findMedianKey(alloc) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (median) |key| return key;
+            }
+
+            var cached = try self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null);
+            defer cached.deinit(alloc);
+            if (cached.entry) |entry| {
+                try self.finishEntryAutoBulkIngestForForegroundVisibility(cache, entry);
+            }
+            try drainManagedDbBeforeClose(cached.db);
+            const median = cached.db.findMedianKey(alloc) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            return median;
+        }
+
+        var db = try openManagedDbForTableGroupWithCacheAndRuntime(alloc, path, self.catalog, table_name, group_id, null, null, lsm_root_generation, null, self.backend_runtime);
+        defer db.close();
+        const median = db.findMedianKey(alloc) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return median;
     }
 
     pub fn catchUpTableGroupBestEffort(

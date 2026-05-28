@@ -44,11 +44,9 @@ components:
           $ref: "#/components/schemas/ImageURL"
     MediaContentPart:
       type: object
-      description: Inline binary media content for providers that support non-image media parts.
+      description: Binary or URL media content for providers that support non-image media parts.
       required:
         - type
-        - data
-        - mime_type
       properties:
         type:
           type: string
@@ -57,10 +55,13 @@ components:
         data:
           type: string
           format: byte
-          description: Base64-encoded binary data.
+          description: Base64-encoded binary data. Use either data or url.
+        url:
+          type: string
+          description: URL or data URI media reference. Use either url or data.
         mime_type:
           type: string
-          description: MIME type such as image/png, audio/wav, or application/pdf.
+          description: MIME type such as image/png, audio/wav, or application/pdf. Required with data and optional with url when the URL can resolve content type.
     ContentPart:
       description: A multimodal content part.
       oneOf:

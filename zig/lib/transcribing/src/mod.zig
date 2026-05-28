@@ -314,6 +314,7 @@ const AntflyTranscriberState = struct {
     alloc: Allocator,
     http: *httpx.Client,
     api_url: []const u8,
+    auth_header: ?[2][]const u8 = null,
     model: ?[]const u8 = null,
     language_code: ?[]const u8 = null,
 
@@ -328,6 +329,9 @@ const AntflyTranscriberState = struct {
             .model = try dupOpt(alloc, cfg.model),
             .language_code = try dupOpt(alloc, cfg.language_code),
         };
+        if (cfg.bearer_token orelse cfg.api_key) |token| {
+            try state.setBearer(token);
+        }
 
         return .{
             .ptr = state,
@@ -343,7 +347,16 @@ const AntflyTranscriberState = struct {
         self.alloc.free(self.api_url);
         freeOpt(self.alloc, self.model);
         freeOpt(self.alloc, self.language_code);
+        if (self.auth_header) |header| self.alloc.free(header[1]);
         self.alloc.destroy(self);
+    }
+
+    fn setBearer(self: *AntflyTranscriberState, token: []const u8) !void {
+        if (self.auth_header) |header| self.alloc.free(header[1]);
+        self.auth_header = .{
+            "Authorization",
+            try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token}),
+        };
     }
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
@@ -366,7 +379,12 @@ const AntflyTranscriberState = struct {
         });
         defer alloc.free(body);
 
-        var resp = try self.http.post(url, .{ .json = body });
+        var header_buf: [1][2][]const u8 = undefined;
+        const headers: []const [2][]const u8 = if (self.auth_header) |header| blk: {
+            header_buf[0] = header;
+            break :blk header_buf[0..];
+        } else &.{};
+        var resp = try self.http.post(url, .{ .json = body, .headers = headers });
         defer resp.deinit();
         if (!resp.ok()) return error.TranscribeRequestFailed;
 
@@ -403,7 +421,7 @@ const OpenAiTranscriberState = struct {
             .model = try alloc.dupe(u8, cfg.model orelse "whisper-1"),
             .language_code = try dupOpt(alloc, cfg.language_code),
         };
-        if (cfg.api_key) |api_key| try state.setApiKey(api_key);
+        if (cfg.bearer_token orelse cfg.api_key) |token| try state.setBearer(token);
 
         return .{
             .ptr = state,
@@ -423,11 +441,11 @@ const OpenAiTranscriberState = struct {
         self.alloc.destroy(self);
     }
 
-    fn setApiKey(self: *OpenAiTranscriberState, api_key: []const u8) !void {
+    fn setBearer(self: *OpenAiTranscriberState, token: []const u8) !void {
         if (self.auth_header) |header| self.alloc.free(header[1]);
         self.auth_header = .{
             "Authorization",
-            try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{api_key}),
+            try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token}),
         };
     }
 
@@ -842,7 +860,7 @@ test "transcribing runtime loads termite provider and transcribes data uri input
     const io = io_impl.io();
 
     var server = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/transcribe", .respond = .{
+        .{ .method = .POST, .path = "/transcribe", .assert_request = expectTermiteTranscriberBearer, .respond = .{
             .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"hello from termite\",\"language\":\"en\"}],\"model\":\"openai/whisper-base\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3,\"total_tokens\":3}}",
         } },
     });
@@ -855,7 +873,7 @@ test "transcribing runtime loads termite provider and transcribes data uri input
         \\  "whisper-local": { "provider": "termite", "api_url": "
     ;
     const suffix =
-        \\", "model": "openai/whisper-base" }
+        \\", "model": "openai/whisper-base", "api_key": "termite-secret" }
         \\}
     ;
     const cfg_json = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ raw, api_url, suffix });
@@ -910,7 +928,7 @@ test "transcribing runtime loads openai provider and transcribes data uri input"
     const io = io_impl.io();
 
     var server = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/audio/transcriptions", .respond = .{
+        .{ .method = .POST, .path = "/audio/transcriptions", .assert_request = expectOpenAiTranscriberBearer, .respond = .{
             .body = "{\"text\":\"hello from openai\",\"language\":\"en\"}",
         } },
     });
@@ -920,7 +938,7 @@ test "transcribing runtime loads openai provider and transcribes data uri input"
     defer alloc.free(base_url);
     const cfg_json = try std.fmt.allocPrint(
         alloc,
-        \\{{"whisper-remote":{{"provider":"openai","base_url":"{s}","api_key":"secret","model":"whisper-1"}}}}
+        \\{{"whisper-remote":{{"provider":"openai","base_url":"{s}","bearer_token":"openai-bearer","model":"whisper-1"}}}}
     ,
         .{base_url},
     );
@@ -1068,4 +1086,14 @@ fn fakeVertexCredentialsJsonAlloc(alloc: Allocator, token_uri: []const u8) ![]u8
 fn expectVertexBearer(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqual(httpx.Method.POST, req.method);
     try std.testing.expectEqualStrings("Bearer vertex-token", req.header("Authorization") orelse return error.MissingHeader);
+}
+
+fn expectTermiteTranscriberBearer(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqual(httpx.Method.POST, req.method);
+    try std.testing.expectEqualStrings("Bearer termite-secret", req.header("Authorization") orelse return error.MissingHeader);
+}
+
+fn expectOpenAiTranscriberBearer(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqual(httpx.Method.POST, req.method);
+    try std.testing.expectEqualStrings("Bearer openai-bearer", req.header("Authorization") orelse return error.MissingHeader);
 }
