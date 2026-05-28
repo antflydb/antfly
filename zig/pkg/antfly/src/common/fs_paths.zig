@@ -196,7 +196,7 @@ fn createAbsoluteDirPathPosix(path: []const u8) !void {
     if (!std.fs.path.isAbsolute(path)) return error.BadPathName;
     if (path.len == 1 and path[0] == std.fs.path.sep) return;
 
-    var current_fd = try std.posix.openat(std.posix.AT.FDCWD, std.fs.path.sep_str, .{
+    var current_fd = try std.posix.openatZ(std.posix.AT.FDCWD, "/", .{
         .ACCMODE = .RDONLY,
         .DIRECTORY = true,
         .CLOEXEC = true,

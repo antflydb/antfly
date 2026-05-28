@@ -94,6 +94,11 @@ jobs:
             go/pkg/sdk/query/query.gen.go)"
           if [ -n "$status" ]; then
             echo "$status"
+            git diff -- \
+              openapi.yaml \
+              go/pkg/sdk/oapi/client.gen.go \
+              go/pkg/sdk/oapi/validate.go \
+              go/pkg/sdk/query/query.gen.go
             exit 1
           fi
 
