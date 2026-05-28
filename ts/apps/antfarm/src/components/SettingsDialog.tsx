@@ -81,14 +81,14 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
               <FormItem>
                 <FormLabel>Antfly API URL</FormLabel>
                 <FormControl>
-                  <Input placeholder="http://localhost:8082/api/v1" {...field} />
+                  <Input placeholder="http://localhost:8082/db/v1" {...field} />
                 </FormControl>
                 <FormDescription>
                   Current: <code className="text-xs bg-muted px-1 py-0.5 rounded">{apiUrl}</code>
                 </FormDescription>
                 <FormDescription className="text-xs">
-                  Examples: <code className="bg-muted px-1 py-0.5 rounded">/api/v1</code> (default),{" "}
-                  <code className="bg-muted px-1 py-0.5 rounded">http://server:8082/api/v1</code>
+                  Examples: <code className="bg-muted px-1 py-0.5 rounded">/db/v1</code> (default),{" "}
+                  <code className="bg-muted px-1 py-0.5 rounded">http://server:8082/db/v1</code>
                 </FormDescription>
               </FormItem>
             )}

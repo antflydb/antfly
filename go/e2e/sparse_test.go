@@ -97,8 +97,8 @@ func testSparseSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, t
 
 	// -- Create embedder config pointing at the SPLADE model in Termite --
 	embedderConfig := antfly.EmbedderConfig{}
-	embedderConfig.Provider = antfly.EmbedderProviderTermite
-	err := embedderConfig.FromTermiteEmbedderConfig(antfly.TermiteEmbedderConfig{
+	embedderConfig.Provider = antfly.EmbedderProviderAntfly
+	err := embedderConfig.FromAntflyEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model:  spladeModel,
 		ApiUrl: termiteURL,
 	})
@@ -202,14 +202,19 @@ func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, t
 
 	tableName := "hybrid_search_test"
 
-	// -- Dense embedder (built-in antfly embedder) --
+	// -- Dense embedder via Antfly inference --
 	denseEmbedder := &antfly.EmbedderConfig{}
 	denseEmbedder.Provider = antfly.EmbedderProviderAntfly
-	err := denseEmbedder.FromAntflyEmbedderConfig(antfly.AntflyEmbedderConfig{})
+	err := denseEmbedder.FromAntflyEmbedderConfig(antfly.AntflyEmbedderConfig{
+		Model:  "BAAI/bge-small-en-v1.5",
+		ApiUrl: termiteURL,
+	})
 	require.NoError(t, err)
 
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
+		Model:  "fixed",
+		ApiUrl: termiteURL,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  256,
 			OverlapTokens: 25,
@@ -228,10 +233,10 @@ func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, t
 	})
 	require.NoError(t, err)
 
-	// -- Sparse embedder (Termite SPLADE) --
+	// -- Sparse embedder via Antfly inference --
 	sparseEmbedder := antfly.EmbedderConfig{}
-	sparseEmbedder.Provider = antfly.EmbedderProviderTermite
-	err = sparseEmbedder.FromTermiteEmbedderConfig(antfly.TermiteEmbedderConfig{
+	sparseEmbedder.Provider = antfly.EmbedderProviderAntfly
+	err = sparseEmbedder.FromAntflyEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model:  spladeModel,
 		ApiUrl: termiteURL,
 	})
@@ -330,8 +335,8 @@ func testSparseImport(t *testing.T, ctx context.Context, swarm *SwarmInstance, t
 
 	// -- Create sparse index (no embedder needed for import-only) --
 	sparseEmbedder := antfly.EmbedderConfig{}
-	sparseEmbedder.Provider = antfly.EmbedderProviderTermite
-	err := sparseEmbedder.FromTermiteEmbedderConfig(antfly.TermiteEmbedderConfig{
+	sparseEmbedder.Provider = antfly.EmbedderProviderAntfly
+	err := sparseEmbedder.FromAntflyEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model:  spladeModel,
 		ApiUrl: termiteURL,
 	})

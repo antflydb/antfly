@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, TypeVar
+
+from attrs import define as _attrs_define
+from attrs import field as _attrs_field
+
+from ..models.cluster_health import ClusterHealth
+from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.cluster_data_status import ClusterDataStatus
+    from ..models.secret_store_status import SecretStoreStatus
+
+
+T = TypeVar("T", bound="ClusterTopology")
+
+
+@_attrs_define
+class ClusterTopology:
+    """
+    Attributes:
+        health (ClusterHealth): Overall health status of the cluster
+        data (ClusterDataStatus): Typed Zig status view for table data topology and range placement.
+        message (str | Unset): Optional message providing details about the health status
+        auth_enabled (bool | Unset): Indicates whether authentication is enabled for the cluster
+        swarm_mode (bool | Unset): Indicates whether the cluster is running in single-node swarm mode
+        secret_store (SecretStoreStatus | Unset): Non-secret status for the local secrets file store, when one is
+            available.
+    """
+
+    health: ClusterHealth
+    data: ClusterDataStatus
+    message: str | Unset = UNSET
+    auth_enabled: bool | Unset = UNSET
+    swarm_mode: bool | Unset = UNSET
+    secret_store: SecretStoreStatus | Unset = UNSET
+    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        health = self.health.value
+
+        data = self.data.to_dict()
+
+        message = self.message
+
+        auth_enabled = self.auth_enabled
+
+        swarm_mode = self.swarm_mode
+
+        secret_store: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.secret_store, Unset):
+            secret_store = self.secret_store.to_dict()
+
+        field_dict: dict[str, Any] = {}
+        field_dict.update(self.additional_properties)
+        field_dict.update(
+            {
+                "health": health,
+                "data": data,
+            }
+        )
+        if message is not UNSET:
+            field_dict["message"] = message
+        if auth_enabled is not UNSET:
+            field_dict["auth_enabled"] = auth_enabled
+        if swarm_mode is not UNSET:
+            field_dict["swarm_mode"] = swarm_mode
+        if secret_store is not UNSET:
+            field_dict["secret_store"] = secret_store
+
+        return field_dict
+
+    @classmethod
+    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.cluster_data_status import ClusterDataStatus
+        from ..models.secret_store_status import SecretStoreStatus
+
+        d = dict(src_dict)
+        health = ClusterHealth(d.pop("health"))
+
+        data = ClusterDataStatus.from_dict(d.pop("data"))
+
+        message = d.pop("message", UNSET)
+
+        auth_enabled = d.pop("auth_enabled", UNSET)
+
+        swarm_mode = d.pop("swarm_mode", UNSET)
+
+        _secret_store = d.pop("secret_store", UNSET)
+        secret_store: SecretStoreStatus | Unset
+        if isinstance(_secret_store, Unset):
+            secret_store = UNSET
+        else:
+            secret_store = SecretStoreStatus.from_dict(_secret_store)
+
+        cluster_topology = cls(
+            health=health,
+            data=data,
+            message=message,
+            auth_enabled=auth_enabled,
+            swarm_mode=swarm_mode,
+            secret_store=secret_store,
+        )
+
+        cluster_topology.additional_properties = d
+        return cluster_topology
+
+    @property
+    def additional_keys(self) -> list[str]:
+        return list(self.additional_properties.keys())
+
+    def __getitem__(self, key: str) -> Any:
+        return self.additional_properties[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.additional_properties[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self.additional_properties[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.additional_properties

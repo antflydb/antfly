@@ -25,12 +25,12 @@ The documents are processed page-by-page, chunked for semantic search, and made 
 ```bash
 # From the antfly root directory
 cd zig
-zig build install-antfly
+zig build install
 ./zig-out/bin/antfly swarm
 ```
 
 This starts a single-node Antfly cluster on `http://localhost:8080` with the
-Zig Termite routes mounted under the same public API.
+Zig inference routes mounted under the same public API.
 
 ### 2. Pull Models
 
@@ -153,14 +153,14 @@ Loads prepared JSON data into Antfly.
 ./epstein load [flags]
 
 Flags:
-  --url             Antfly API URL (default: http://localhost:8080/api/v1)
+  --url             Antfly API URL (default: http://localhost:8080/db/v1)
   --table           Table name (default: epstein_docs)
   --input           Input JSON file (default: epstein-docs.json)
   --create-table    Create table if it doesn't exist
   --dry-run         Preview changes without applying
   --num-shards      Number of shards (default: 1)
   --batch-size      Batch size for linear merge (default: 25)
-  --termite-url     Termite root URL for chunking; table config stores its /ml/v1 route (default: ANTFLY_TERMITE_URL or http://localhost:8080)
+  --termite-url     Termite root URL for chunking; table config stores its /ai/v1 route (default: ANTFLY_TERMITE_URL or http://localhost:8080)
   --embedding-model Embedding model (default: antflydb/clipclap)
   --chunker-model   Chunker model (default: fixed-bert-tokenizer)
   --target-tokens   Target tokens per chunk (default: 512)
@@ -222,7 +222,7 @@ Starts a web server with search interface.
 ./epstein serve [flags]
 
 Flags:
-  --url     Antfly API URL (default: http://localhost:8080/api/v1)
+  --url     Antfly API URL (default: http://localhost:8080/db/v1)
   --table   Table name to search (default: epstein_docs)
   --listen  Listen address (default: :3000)
 ```
@@ -307,7 +307,7 @@ You can also query the Antfly API directly:
 
 ```bash
 # Search via curl
-curl "http://localhost:8080/api/v1/tables/epstein_docs/query" \
+curl "http://localhost:8080/db/v1/tables/epstein_docs/query" \
   -H "Content-Type: application/json" \
   -d '{
     "semantic_search": "flight logs to Little St James",
@@ -319,7 +319,7 @@ curl "http://localhost:8080/api/v1/tables/epstein_docs/query" \
 Or use the Go SDK:
 
 ```go
-client, _ := antfly.NewAntflyClient("http://localhost:8080/api/v1", http.DefaultClient)
+client, _ := antfly.NewAntflyClient("http://localhost:8080/db/v1", http.DefaultClient)
 
 resp, _ := client.Query(ctx, "epstein_docs", antfly.QueryRequest{
     SemanticSearch: "flight logs",
@@ -347,7 +347,7 @@ The table already exists. This is fine - the sync will update existing documents
 Embedding generation runs asynchronously. You can monitor progress:
 
 ```bash
-curl "http://localhost:8080/api/v1/tables/epstein_docs/indexes/embeddings" | jq '.status.total_indexed'
+curl "http://localhost:8080/db/v1/tables/epstein_docs/indexes/embeddings" | jq '.status.total_indexed'
 ```
 
 ### Out of memory

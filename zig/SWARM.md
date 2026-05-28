@@ -9,8 +9,8 @@ providers, shard DB access, and DB runtime ownership.
   and all DB/store opens on that node.
 - A swarm node always owns embedded Antfly inference. It exposes Antfly inference as both the
   direct local inference provider for Antfly enrichment/query code and as the
-  public `/ml/v1` compatibility API on the unified server. Local managed
-  embeddings must not loop back through the node's public HTTP `/ml/v1` server
+  public `/ai/v1` compatibility API on the unified server. Local managed
+  embeddings must not loop back through the node's public HTTP `/ai/v1` server
   just to call Antfly inference in the same process.
 - Metadata should not grow private DB runtimes or private worker pools when it
   probes local shard data.
@@ -157,7 +157,7 @@ Current classification:
 - [x] Add direct local Antfly inference dense/sparse embedder, reranker, and chunker
       implementations and route embedded swarm `provider=antfly` /
       `provider=antfly` configs to them.
-- [x] Always expose the Antfly inference-compatible public `/ml/v1` API from swarm while
+- [x] Always expose the Antfly inference-compatible public `/ai/v1` API from swarm while
       keeping Antfly-managed local enrichment/query paths on the direct provider
       instead of loopback HTTP.
 - [x] Add direct local Antfly inference generator implementations for Antfly managed

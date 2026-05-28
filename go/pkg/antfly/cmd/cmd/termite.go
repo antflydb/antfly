@@ -178,8 +178,8 @@ func runTermite(cmd *cobra.Command, args []string) error {
 	defer cancel()
 
 	config, err := parseConfigWithOptions(viper.GetViper(), parseConfigOptions{
-		RequireMetadata:      false,
-		DefaultTermiteAPIURL: defaultTermiteAPIURL,
+		RequireMetadata:        false,
+		DefaultInferenceAPIURL: defaultInferenceAPIURL,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %w", err)
@@ -194,7 +194,7 @@ func runTermite(cmd *cobra.Command, args []string) error {
 		startHealthServer(logger, config.HealthPort, readyC, "Termite")
 	}
 
-	termite.RunAsTermite(ctx, logger, termiteConfigWithSecurity(config), readyC)
+	termite.RunAsTermite(ctx, logger, inferenceConfigWithSecurity(config), readyC)
 	return nil
 }
 

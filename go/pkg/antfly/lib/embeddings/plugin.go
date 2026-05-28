@@ -228,7 +228,7 @@ func init() {
 
 	RegisterEmbedder(EmbedderProviderBedrock, NewBedrockImpl)
 
-	RegisterEmbedder(EmbedderProviderTermite, NewTermiteEmbedderFromConfig)
+	RegisterEmbedder(EmbedderProviderAntfly, NewAntflyEmbedderFromConfig)
 }
 
 // Default rate limits for remote providers (requests per second).
@@ -804,9 +804,9 @@ func GetDefaultEmbedderConfig() *EmbedderConfig {
 	return defaultEmbedderConfig
 }
 
-// NewTermiteEmbedderFromConfig creates a Termite embedder from the unified config.
-func NewTermiteEmbedderFromConfig(config EmbedderConfig) (Embedder, error) {
-	c, err := config.AsTermiteEmbedderConfig()
+// NewAntflyEmbedderFromConfig creates an Antfly inference embedder from the unified config.
+func NewAntflyEmbedderFromConfig(config EmbedderConfig) (Embedder, error) {
+	c, err := config.AsAntflyEmbedderConfig()
 	if err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
@@ -818,7 +818,7 @@ func NewTermiteEmbedderFromConfig(config EmbedderConfig) (Embedder, error) {
 	}
 	url := libtermite.ResolveURL(configURL)
 	if url == "" {
-		return nil, fmt.Errorf("termite URL is required: set api_url in config or ANTFLY_TERMITE_URL environment variable")
+		return nil, fmt.Errorf("antfly inference URL is required: set api_url in config or ANTFLY_INFERENCE_URL environment variable")
 	}
 
 	return NewTermiteClient(url, c.Model, config.GetConfigCapabilities())

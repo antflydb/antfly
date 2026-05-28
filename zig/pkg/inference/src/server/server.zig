@@ -99,7 +99,7 @@ pub const NodeConfig = struct {
     generation_budget_overrides: BudgetOverrides = .{},
 };
 
-pub const public_api_prefix = "/ml/v1";
+pub const public_api_prefix = "/ai/v1";
 
 const GenerateBackendSelection = struct {
     native_choice: native_backend_choice.Choice = .auto,
@@ -4740,7 +4740,7 @@ fn appendModelInfo(
 
 /// Wrapper that prepends a path prefix to route registrations.
 /// This bridges the generated router (which emits paths like "/embed")
-/// to the actual server (which serves under a configured prefix such as "/ml/v1/embed").
+/// to the actual server (which serves under a configured prefix such as "/ai/v1/embed").
 fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
     return struct {
         inner: *Inner,

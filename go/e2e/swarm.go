@@ -201,7 +201,7 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 	time.Sleep(500 * time.Millisecond)
 
 	// Create client with timeout to prevent hanging on slow LLM responses
-	apiURL := metadataAPIURL + "/api/v1"
+	apiURL := metadataAPIURL + "/db/v1"
 	httpClient := &http.Client{Timeout: 10 * time.Minute}
 	client, err := antfly.NewAntflyClient(apiURL, httpClient)
 	if err != nil {

@@ -14,35 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package termite provides shared configuration for the Termite ML service.
-// All packages that need the Termite API URL (embeddings, generators, rerankers,
+// Package termite provides shared configuration for the Antfly inference service.
+// All packages that need the inference API URL (embeddings, generators, rerankers,
 // chunkers, etc.) should use this package to resolve it.
 package termite
 
 import "os"
 
-// defaultURL is the default URL for the Termite API, set from config at startup.
+// defaultURL is the default URL for the inference API, set from config at startup.
 var defaultURL string
 
-// SetDefaultURL sets the default Termite API URL used when no URL is specified
+// SetDefaultURL sets the default inference API URL used when no URL is specified
 // in config. This should be called during config initialization.
 func SetDefaultURL(url string) {
 	defaultURL = url
 }
 
-// GetDefaultURL returns the current default Termite API URL.
+// GetDefaultURL returns the current default inference API URL.
 func GetDefaultURL() string {
 	return defaultURL
 }
 
-// ResolveURL resolves the Termite API URL from the given value, falling back
-// to the ANTFLY_TERMITE_URL environment variable, then the global default.
+// ResolveURL resolves the inference API URL from the given value, falling back
+// to the ANTFLY_INFERENCE_URL environment variable, then the global default.
 // Returns an empty string if no URL is available.
 func ResolveURL(configURL string) string {
 	if configURL != "" {
 		return configURL
 	}
-	if envURL := os.Getenv("ANTFLY_TERMITE_URL"); envURL != "" {
+	if envURL := os.Getenv("ANTFLY_INFERENCE_URL"); envURL != "" {
 		return envURL
 	}
 	return defaultURL

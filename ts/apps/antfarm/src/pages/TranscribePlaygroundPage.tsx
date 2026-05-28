@@ -378,7 +378,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         updateSegment(index, { rawText, status: "cleaning" });
 
         try {
-          const resp = await fetchWithRetry(`${termiteApiUrl}/ml/v1/generate`, {
+          const resp = await fetchWithRetry(`${termiteApiUrl}/ai/v1/generate`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -440,7 +440,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     try {
       if (useVAD && selectedChunkerModel && audioDuration != null && audioDuration > 30) {
         // VAD pipeline: chunk -> transcribe each -> optionally clean up
-        const resp = await fetchWithRetry(`${termiteApiUrl}/ml/v1/chunk`, {
+        const resp = await fetchWithRetry(`${termiteApiUrl}/ai/v1/chunk`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({

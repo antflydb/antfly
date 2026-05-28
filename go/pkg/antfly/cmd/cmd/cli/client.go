@@ -292,27 +292,27 @@ func printIndexDetails(index antfly.IndexStatus, indent string) {
 				fmt.Fprintf(os.Stderr, "%sEmbedder Model: %s\n", indent, openai.Model)
 			}
 		}
-		if termite, err := embCfg.Chunker.AsTermiteChunkerConfig(); err == nil {
-			if termite.Model != "" || termite.Text.TargetTokens != 0 || termite.ApiUrl != "" || termite.MaxChunks != 0 || embCfg.Chunker.FullTextIndex != nil {
+		if antfly, err := embCfg.Chunker.AsAntflyChunkerConfig(); err == nil {
+			if antfly.Model != "" || antfly.Text.TargetTokens != 0 || antfly.ApiUrl != "" || antfly.MaxChunks != 0 || embCfg.Chunker.FullTextIndex != nil {
 				provider := string(embCfg.Chunker.Provider)
 				if provider == "" {
-					provider = "termite"
+					provider = "antfly"
 				}
 				fmt.Fprintf(os.Stderr, "%sChunker Provider: %s\n", indent, provider)
-				if termite.Model != "" {
-					fmt.Fprintf(os.Stderr, "%sChunker Model: %s\n", indent, termite.Model)
+				if antfly.Model != "" {
+					fmt.Fprintf(os.Stderr, "%sChunker Model: %s\n", indent, antfly.Model)
 				}
-				if termite.Text.TargetTokens != 0 {
-					fmt.Fprintf(os.Stderr, "%sChunker Target Tokens: %d\n", indent, termite.Text.TargetTokens)
+				if antfly.Text.TargetTokens != 0 {
+					fmt.Fprintf(os.Stderr, "%sChunker Target Tokens: %d\n", indent, antfly.Text.TargetTokens)
 				}
-				if termite.Text.OverlapTokens != 0 {
-					fmt.Fprintf(os.Stderr, "%sChunker Overlap Tokens: %d\n", indent, termite.Text.OverlapTokens)
+				if antfly.Text.OverlapTokens != 0 {
+					fmt.Fprintf(os.Stderr, "%sChunker Overlap Tokens: %d\n", indent, antfly.Text.OverlapTokens)
 				}
-				if termite.MaxChunks != 0 {
-					fmt.Fprintf(os.Stderr, "%sChunker Max Chunks: %d\n", indent, termite.MaxChunks)
+				if antfly.MaxChunks != 0 {
+					fmt.Fprintf(os.Stderr, "%sChunker Max Chunks: %d\n", indent, antfly.MaxChunks)
 				}
-				if termite.ApiUrl != "" {
-					fmt.Fprintf(os.Stderr, "%sChunker API URL: %s\n", indent, termite.ApiUrl)
+				if antfly.ApiUrl != "" {
+					fmt.Fprintf(os.Stderr, "%sChunker API URL: %s\n", indent, antfly.ApiUrl)
 				}
 				if embCfg.Chunker.FullTextIndex != nil {
 					fmt.Fprintf(os.Stderr, "%sChunker Full Text Indexing: enabled\n", indent)

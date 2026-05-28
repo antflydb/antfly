@@ -391,7 +391,7 @@ const RecognizePlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/ml/v1/models`, {
+        const response = await fetch(`${termiteApiUrl}/ai/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -494,7 +494,7 @@ const RecognizePlaygroundPage: React.FC = () => {
 
     try {
       if (mode === "recognize") {
-        const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/recognize`, {
+        const response = await fetchWithRetry(`${termiteApiUrl}/ai/v1/recognize`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -519,7 +519,7 @@ const RecognizePlaygroundPage: React.FC = () => {
           apiSchema[structure.name] = structure.fields.map((f) => `${f.name}::${f.type}`);
         }
 
-        const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/extract`, {
+        const response = await fetchWithRetry(`${termiteApiUrl}/ai/v1/extract`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({

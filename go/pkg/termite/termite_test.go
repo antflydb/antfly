@@ -77,7 +77,7 @@ func TestAPIHandlerServesRootOperationalRoutesOutsideMLPrefix(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code, path)
 	}
 
-	for _, path := range []string{"/ml/v1/healthz", "/ml/v1/readyz"} {
+	for _, path := range []string{"/ai/v1/healthz", "/ai/v1/readyz"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
@@ -91,12 +91,7 @@ func TestAPIMLHandlerDoesNotExposeOperationalRoutes(t *testing.T) {
 	}
 	handler := node.APIMLHandler()
 
-	versionReq := httptest.NewRequest(http.MethodGet, "/ml/v1/version", nil)
-	versionRec := httptest.NewRecorder()
-	handler.ServeHTTP(versionRec, versionReq)
-	require.Equal(t, http.StatusOK, versionRec.Code)
-
-	for _, path := range []string{"/healthz", "/readyz", "/ml/v1/healthz", "/ml/v1/readyz"} {
+	for _, path := range []string{"/healthz", "/readyz", "/ai/v1/healthz", "/ai/v1/readyz", "/ai/v1/version"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
@@ -130,7 +125,7 @@ func TestTermiteNode_HandleApiEmbed_NoRegistry(t *testing.T) {
 	body, err := json.Marshal(reqBody)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("POST", "/ml/v1/embed", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/ai/v1/embed", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -149,7 +144,7 @@ func TestTermiteNode_HandleApiEmbed_InvalidRequest(t *testing.T) {
 	handler := NewTermiteAPI(logger, node)
 
 	// Test invalid JSON - should return 503 (registry check first) or 400
-	req := httptest.NewRequest("POST", "/ml/v1/embed", bytes.NewReader([]byte("invalid json")))
+	req := httptest.NewRequest("POST", "/ai/v1/embed", bytes.NewReader([]byte("invalid json")))
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	assert.True(t, w.Code == http.StatusServiceUnavailable || w.Code == http.StatusBadRequest)
@@ -259,7 +254,7 @@ func TestTermiteNode_HandleApiRerank_Success(t *testing.T) {
 	body, err := json.Marshal(reqBody)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("POST", "/ml/v1/rerank", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/ai/v1/rerank", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -323,7 +318,7 @@ func TestTermiteNode_HandleApiRerank_NotAvailable(t *testing.T) {
 	body, err := json.Marshal(reqBody)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("POST", "/ml/v1/rerank", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/ai/v1/rerank", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -409,7 +404,7 @@ func TestTermiteNode_HandleApiRerank_InvalidRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("POST", "/ml/v1/rerank", bytes.NewReader([]byte(tt.body)))
+			req := httptest.NewRequest("POST", "/ai/v1/rerank", bytes.NewReader([]byte(tt.body)))
 			req.Header.Set("Content-Type", "application/json")
 
 			w := httptest.NewRecorder()
@@ -571,7 +566,7 @@ func TestTermiteNode_ListModels_IncludesAllRegistries(t *testing.T) {
 	}
 	handler := NewTermiteAPI(logger, node)
 
-	req := httptest.NewRequest("GET", "/ml/v1/models", nil)
+	req := httptest.NewRequest("GET", "/ai/v1/models", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
@@ -608,7 +603,7 @@ func TestTermiteNode_ListModels_EmptyRegistries(t *testing.T) {
 	}
 	handler := NewTermiteAPI(logger, node)
 
-	req := httptest.NewRequest("GET", "/ml/v1/models", nil)
+	req := httptest.NewRequest("GET", "/ai/v1/models", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
@@ -640,7 +635,7 @@ func TestTermiteNode_ListModels_OnlyRerankers(t *testing.T) {
 	}
 	handler := NewTermiteAPI(logger, node)
 
-	req := httptest.NewRequest("GET", "/ml/v1/models", nil)
+	req := httptest.NewRequest("GET", "/ai/v1/models", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
@@ -706,7 +701,7 @@ func TestTermiteNode_HandleApiNER_Success(t *testing.T) {
 	body, err := json.Marshal(reqBody)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("POST", "/ml/v1/recognize", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/ai/v1/recognize", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -757,7 +752,7 @@ func TestTermiteNode_HandleApiNER_NotAvailable(t *testing.T) {
 	body, err := json.Marshal(reqBody)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("POST", "/ml/v1/recognize", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/ai/v1/recognize", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -840,7 +835,7 @@ func TestTermiteNode_HandleApiNER_InvalidRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("POST", "/ml/v1/recognize", bytes.NewReader([]byte(tt.body)))
+			req := httptest.NewRequest("POST", "/ai/v1/recognize", bytes.NewReader([]byte(tt.body)))
 			req.Header.Set("Content-Type", "application/json")
 
 			w := httptest.NewRecorder()

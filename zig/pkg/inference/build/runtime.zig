@@ -68,6 +68,7 @@ pub const SharedModules = struct {
     onnx_graph: ?*std.Build.Module = null,
     pjrt: ?*std.Build.Module = null,
     inference_api: ?*std.Build.Module = null,
+    generating_openapi: ?*std.Build.Module = null,
     inference_client: ?*std.Build.Module = null,
 };
 
@@ -183,7 +184,7 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     }).module("pjrt");
 
-    const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules);
+    const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
             .root_source_file = b.path(pathJoin(b, paths.inference_root, "../inference-client/src/root.zig")),
@@ -431,7 +432,14 @@ fn addInferenceApiModule(
     skip_openapi: bool,
     paths: Paths,
     register_public_modules: bool,
+    shared: SharedModules,
 ) *std.Build.Module {
+    const generating_openapi_mod = shared.generating_openapi orelse addOrCreateModule(b, register_public_modules, "antfly_generating_openapi", .{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_generating_openapi/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+
     if (skip_openapi) {
         const empty_wf = b.addWriteFiles();
         const empty_root = empty_wf.add("inference_api_stub.zig",
@@ -446,6 +454,7 @@ fn addInferenceApiModule(
             .optimize = optimize,
         });
         mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_generating_openapi", generating_openapi_mod);
         return mod;
     }
 
@@ -462,6 +471,7 @@ fn addInferenceApiModule(
             .optimize = optimize,
         });
         mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_generating_openapi", generating_openapi_mod);
         return mod;
     }
 
@@ -491,6 +501,7 @@ fn addInferenceApiModule(
         .optimize = optimize,
     });
     mod.addImport("httpx", httpx_mod);
+    mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     return mod;
 }
 

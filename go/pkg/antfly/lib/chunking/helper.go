@@ -30,22 +30,12 @@ type ChunkingHelper struct {
 }
 
 // detectChunkerProvider attempts to detect the provider from the union data
-// when the Provider field is not set (e.g., SDK's FromAntflyChunkerConfig).
-// It tries to unmarshal as each provider type and uses heuristics to determine the provider.
+// when the Provider field is not set.
 func detectChunkerProvider(config ChunkerConfig) ChunkerProvider {
-	// Try Antfly first - if it has TargetTokens or other Antfly-specific fields, it's Antfly
 	if antflyConfig, err := config.AsAntflyChunkerConfig(); err == nil {
-		// AntflyChunkerConfig uses Text.TargetTokens (primary field for fixed-size chunking)
-		if antflyConfig.Text.TargetTokens > 0 || antflyConfig.Text.OverlapTokens > 0 || antflyConfig.Text.Separator != "" {
+		// AntflyChunkerConfig uses Model (required field for semantic chunking)
+		if antflyConfig.Model != "" || antflyConfig.ApiUrl != "" {
 			return ChunkerProviderAntfly
-		}
-	}
-
-	// Try Termite - if it has Model or ApiUrl, it's likely Termite
-	if termiteConfig, err := config.AsTermiteChunkerConfig(); err == nil {
-		// TermiteChunkerConfig uses Model (required field for semantic chunking)
-		if termiteConfig.Model != "" || termiteConfig.ApiUrl != "" {
-			return ChunkerProviderTermite
 		}
 	}
 
@@ -55,11 +45,9 @@ func detectChunkerProvider(config ChunkerConfig) ChunkerProvider {
 
 // NewChunkingHelper creates a new chunking helper from a ChunkerConfig.
 // This function properly respects the Provider field in the config:
-//   - For "antfly" provider: uses local chunking directly, ignoring Termite URL
-//   - For "termite" provider: uses Termite service for chunking
+//   - For "antfly" provider: uses the Antfly inference service for chunking.
 func NewChunkingHelper(name string, config ChunkerConfig, logger *zap.Logger) (*ChunkingHelper, error) {
-	// If Provider is empty (e.g., SDK's FromAntflyChunkerConfig doesn't set it),
-	// try to detect the provider from the union data
+	// If Provider is empty, try to detect the provider from the union data.
 	provider := config.Provider
 	if provider == "" {
 		provider = detectChunkerProvider(config)
@@ -73,52 +61,33 @@ func NewChunkingHelper(name string, config ChunkerConfig, logger *zap.Logger) (*
 
 	switch provider {
 	case ChunkerProviderAntfly:
-		// Use local Antfly chunking directly - ignore Termite URL even if configured
-		logger.Info("Using local Antfly chunking (provider=antfly)",
-			zap.String("name", name))
-
-		// Create chunker using the registry (config already has correct provider)
-		chunker, err := NewChunker(config)
+		antflyConfig, err := config.AsAntflyChunkerConfig()
 		if err != nil {
-			return nil, fmt.Errorf("failed to create antfly chunker: %w", err)
+			return nil, fmt.Errorf("failed to extract antfly chunker config: %w", err)
 		}
 
-		return &ChunkingHelper{
-			Name:    name,
-			chunker: chunker,
-			logger:  logger,
-		}, nil
-
-	case ChunkerProviderTermite:
-		// Use Termite for chunking
-		termiteConfig, err := config.AsTermiteChunkerConfig()
-		if err != nil {
-			return nil, fmt.Errorf("failed to extract termite chunker config: %w", err)
+		inferenceURL := libtermite.ResolveURL(antflyConfig.ApiUrl)
+		if inferenceURL == "" {
+			return nil, fmt.Errorf("antfly chunker configured but no inference URL available")
 		}
 
-		// Get Termite URL from config, env var, or global default
-		termiteURL := libtermite.ResolveURL(termiteConfig.ApiUrl)
-		if termiteURL == "" {
-			return nil, fmt.Errorf("termite chunker configured but no Termite URL available")
-		}
-
-		logger.Info("Using Termite for chunking (provider=termite)",
+		logger.Info("Using Antfly inference for chunking",
 			zap.String("name", name),
-			zap.String("termite_url", termiteURL),
-			zap.String("model", termiteConfig.Model))
+			zap.String("inference_url", inferenceURL),
+			zap.String("model", antflyConfig.Model))
 
-		return NewTermiteChunkingHelper(name, termiteURL, termiteConfig, logger)
+		return NewInferenceChunkingHelper(name, inferenceURL, antflyConfig, logger)
 
 	default:
 		return nil, fmt.Errorf("unknown chunker provider: %s", config.Provider)
 	}
 }
 
-// NewTermiteChunkingHelper creates a chunking helper that uses Termite for chunking
-func NewTermiteChunkingHelper(name string, termiteURL string, config TermiteChunkerConfig, logger *zap.Logger) (*ChunkingHelper, error) {
+// NewInferenceChunkingHelper creates a chunking helper that uses Antfly inference for chunking.
+func NewInferenceChunkingHelper(name string, inferenceURL string, config AntflyChunkerConfig, logger *zap.Logger) (*ChunkingHelper, error) {
 	// Set API URL if not already set
 	if config.ApiUrl == "" {
-		config.ApiUrl = termiteURL
+		config.ApiUrl = inferenceURL
 	}
 
 	// Create chunker config using helper (sets provider automatically)

@@ -67,7 +67,7 @@ pub const Style = enum {
     }
 };
 
-/// Logging configuration for Antfly services
+/// Logging configuration for Termite services
 pub const Config = struct {
     level: ?Level = null,
     style: ?Style = null,

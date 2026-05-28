@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useApi } from "@/hooks/use-api-config";
 
 // TypeScript interfaces for the untyped AdditionalProperties
-// from GET /api/v1/status response
+// from GET /db/v1/status response
 
 export interface StoreInfo {
   id: string;

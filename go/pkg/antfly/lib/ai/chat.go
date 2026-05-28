@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strings"
 
+	generatingtypes "github.com/antflydb/antfly/go/pkg/generating"
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
 	"go.uber.org/zap"
@@ -28,6 +29,11 @@ import (
 
 // Aliases for ChatToolName constants for convenience
 const (
+	ChatMessageRoleAssistant ChatMessageRole = generatingtypes.ChatMessageRoleAssistant
+	ChatMessageRoleSystem    ChatMessageRole = generatingtypes.ChatMessageRoleSystem
+	ChatMessageRoleTool      ChatMessageRole = generatingtypes.ChatMessageRoleTool
+	ChatMessageRoleUser      ChatMessageRole = generatingtypes.ChatMessageRoleUser
+
 	ToolNameFilter        = ChatToolNameAddFilter
 	ToolNameClarification = ChatToolNameAskClarification
 	ToolNameSearch        = ChatToolNameSearch
@@ -379,6 +385,68 @@ func GetProviderCapabilities(provider GeneratorProvider) ProviderCapabilities {
 
 // ChatMessagesToGenKit converts Antfly ChatMessage types to GenKit ai.Message types.
 // This enables passing conversation history from the API layer through to GenKit prompts.
+func NewTextChatMessageContent(text string) ChatMessageContent {
+	content, err := json.Marshal(text)
+	if err != nil {
+		return ChatMessageContent([]byte(`""`))
+	}
+	return ChatMessageContent(content)
+}
+
+func NewTextChatMessage(role ChatMessageRole, text string) ChatMessage {
+	return ChatMessage{
+		Role:    role,
+		Content: NewTextChatMessageContent(text),
+	}
+}
+
+func ChatMessageContentAsText(content ChatMessageContent) string {
+	if len(content) == 0 {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(content, &text); err == nil {
+		return text
+	}
+	var parts []generatingtypes.ContentPart
+	if err := json.Unmarshal(content, &parts); err == nil {
+		var b strings.Builder
+		for _, part := range parts {
+			textPart, err := part.AsTextContentPart()
+			if err == nil {
+				b.WriteString(textPart.Text)
+			}
+		}
+		return b.String()
+	}
+	return string(content)
+}
+
+func chatMessageContentToGenKitParts(content ChatMessageContent) []*ai.Part {
+	if len(content) == 0 {
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(content, &text); err == nil {
+		if text == "" {
+			return nil
+		}
+		return []*ai.Part{ai.NewTextPart(text)}
+	}
+	var contentParts []generatingtypes.ContentPart
+	if err := json.Unmarshal(content, &contentParts); err == nil {
+		parts := make([]*ai.Part, 0, len(contentParts))
+		for _, part := range contentParts {
+			textPart, err := part.AsTextContentPart()
+			if err == nil && textPart.Text != "" {
+				parts = append(parts, ai.NewTextPart(textPart.Text))
+			}
+		}
+		return parts
+	}
+	return []*ai.Part{ai.NewTextPart(string(content))}
+}
+
 func ChatMessagesToGenKit(messages []ChatMessage) []*ai.Message {
 	if len(messages) == 0 {
 		return nil
@@ -402,10 +470,7 @@ func ChatMessagesToGenKit(messages []ChatMessage) []*ai.Message {
 
 		var parts []*ai.Part
 
-		// Add text content
-		if msg.Content != "" {
-			parts = append(parts, ai.NewTextPart(msg.Content))
-		}
+		parts = append(parts, chatMessageContentToGenKitParts(msg.Content)...)
 
 		// Add tool call parts for assistant messages
 		if msg.ToolCalls != nil {
@@ -462,9 +527,8 @@ func GenKitToChatMessages(messages []*ai.Message) []ChatMessage {
 			role = ChatMessageRoleUser
 		}
 
-		cm := ChatMessage{
-			Role: role,
-		}
+		cm := ChatMessage{Role: role}
+		var text strings.Builder
 
 		// Extract text content and tool parts
 		var toolCalls []ChatToolCall
@@ -472,7 +536,7 @@ func GenKitToChatMessages(messages []*ai.Message) []ChatMessage {
 
 		for _, part := range msg.Content {
 			if part.Text != "" {
-				cm.Content += part.Text
+				text.WriteString(part.Text)
 			}
 			if part.IsToolRequest() {
 				tr := part.ToolRequest
@@ -504,6 +568,9 @@ func GenKitToChatMessages(messages []*ai.Message) []ChatMessage {
 		}
 		if len(toolResults) > 0 {
 			cm.ToolResults = &toolResults
+		}
+		if text.Len() > 0 {
+			cm.Content = NewTextChatMessageContent(text.String())
 		}
 
 		result = append(result, cm)

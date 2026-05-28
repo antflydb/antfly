@@ -81,7 +81,7 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 	id := viper.GetUint64("swarm.id")
 	enableTermite := viper.GetBool("swarm.termite")
 	// When termite is enabled, decide whether to run it in-process (mounted on
-	// antfly's metadata listener under /ml/v1/) or as a separate HTTP server.
+	// antfly's metadata listener under /ai/v1/) or as a separate HTTP server.
 	// In-process is the default. If the user explicitly provides
 	// --termite-api-url, we run termite standalone on that URL and the
 	// metadata server reverse-proxies /termite/* to it.
@@ -159,19 +159,19 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 	localProvider := metadata.NewDeferredLocalExecutionProvider()
 
 	// If termite is running in-process, construct the node synchronously so
-	// we can mount its /ml/v1/ handler on the metadata server. The node
+	// we can mount its /ai/v1/ handler on the metadata server. The node
 	// holds Pebble resources that need to be closed at shutdown.
 	var termiteNode *termite.TermiteNode
 	if runTermiteInProcess {
-		termiteNode = termite.NewTermiteNode(ctx, logger, termiteConfigWithSecurity(config))
+		termiteNode = termite.NewTermiteNode(ctx, logger, inferenceConfigWithSecurity(config))
 		defer func() {
 			if err := termiteNode.Close(); err != nil {
 				logger.Error("failed to close termite node", zap.Error(err))
 			}
 		}()
 		// Point the default Termite URL at the metadata listener — the
-		// termite-client appends /ml/v1 automatically, and the metadata
-		// handler mounts the in-process TermiteNode under /ml/v1/.
+		// termite-client appends /ai/v1 automatically, and the metadata
+		// handler mounts the in-process TermiteNode under /ai/v1/.
 		libtermite.SetDefaultURL(metaConf.ApiURL)
 	}
 
@@ -179,7 +179,7 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 		ExecutionProvider: localProvider,
 	}
 	if termiteNode != nil {
-		runtimeOpts.TermiteMLHandler = termiteNode.APIMLHandler()
+		runtimeOpts.InferenceMLHandler = termiteNode.APIMLHandler()
 	}
 
 	metaRuntime, err := metadata.NewRuntime(
@@ -203,7 +203,7 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 	}()
 
 	if enableTermite && !runTermiteInProcess {
-		go termite.RunAsTermite(ctx, logger, termiteConfigWithSecurity(config), termiteReadyC)
+		go termite.RunAsTermite(ctx, logger, inferenceConfigWithSecurity(config), termiteReadyC)
 		// Wait for termite to finish Pebble initialization before opening store Pebble.
 		<-termiteReadyC
 	}

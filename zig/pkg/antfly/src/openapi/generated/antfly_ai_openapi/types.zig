@@ -125,57 +125,15 @@ pub const ChainCondition = antfly_generating_openapi.ChainCondition;
 
 pub const ChainLink = antfly_generating_openapi.ChainLink;
 
-/// Role of the message sender in the conversation
-pub const ChatMessageRole = enum {
-    user,
-    assistant,
-    system,
-    tool,
+pub const ChatMessageRole = antfly_generating_openapi.ChatMessageRole;
 
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .user => "user",
-            .assistant => "assistant",
-            .system => "system",
-            .tool => "tool",
-        };
-        try jw.write(s);
-    }
+pub const ChatMessageContent = antfly_generating_openapi.ChatMessageContent;
 
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "user", .user },
-            .{ "assistant", .assistant },
-            .{ "system", .system },
-            .{ "tool", .tool },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
+pub const ChatToolCall = antfly_generating_openapi.ChatToolCall;
 
-/// A tool call made by the assistant
-pub const ChatToolCall = struct {
-    /// Unique identifier for this tool call
-    id: []const u8,
-    /// Name of the tool being called
-    name: []const u8,
-    /// Arguments passed to the tool as key-value pairs
-    arguments: std.json.Value,
-};
+pub const ChatToolResult = antfly_generating_openapi.ChatToolResult;
 
-/// Result from executing a tool call
-pub const ChatToolResult = struct {
-    /// ID of the tool call this result corresponds to
-    tool_call_id: []const u8,
-    /// Result data from the tool execution
-    result: std.json.Value,
-    /// Error message if tool execution failed
-    @"error": ?[]const u8 = null,
-};
+pub const ChatMessage = antfly_generating_openapi.ChatMessage;
 
 /// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - search: Execute semantic searches (legacy, use semantic_search for retrieval) - websearch: Search the web (requires websearch_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search
 pub const ChatToolName = enum {
@@ -323,24 +281,13 @@ pub const ConfidenceStepConfig = struct {
     context: ?[]const u8 = null,
 };
 
-/// A message in the conversation history
-pub const ChatMessage = struct {
-    role: ChatMessageRole,
-    /// Text content of the message
-    content: []const u8,
-    /// Tool calls made by the assistant (only for assistant role)
-    tool_calls: ?[]const ChatToolCall = null,
-    /// Results from tool executions (only for tool role)
-    tool_results: ?[]const ChatToolResult = null,
-};
-
 /// Configuration for chat agent tools. If `enabled_tools` is empty/omitted, defaults to: add_filter, ask_clarification, search. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
 pub const ChatToolsConfig = struct {
     /// List of tools to enable. If empty, defaults to filter, clarification, and search.
     enabled_tools: ?[]const ChatToolName = null,
-    /// Web search provider configuration. Required when websearch tool is enabled. See go/pkg/antfly/lib/websearch/openapi.yaml for provider-specific options.
+    /// Web search provider configuration. Required when websearch tool is enabled. See specs/openapi/antfly/websearch.yaml for provider-specific options.
     websearch_config: ?antfly_websearch_openapi.WebSearchConfig = null,
-    /// URL fetching configuration. See go/pkg/antfly/lib/websearch/openapi.yaml for available options and security controls.
+    /// URL fetching configuration. See specs/openapi/antfly/websearch.yaml for available options and security controls.
     fetch_config: ?antfly_websearch_openapi.FetchConfig = null,
     /// Maximum number of tool call iterations per turn. Prevents infinite loops in tool execution.
     max_tool_iterations: ?i64 = null,

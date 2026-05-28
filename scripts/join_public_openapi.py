@@ -84,7 +84,7 @@ def prefixed_path(prefix: str, path: str) -> str:
 def antfly_public_path(path: str) -> str:
     if path.startswith("/auth/v1/"):
         return path
-    return prefixed_path("/api/v1", path)
+    return prefixed_path("/db/v1", path)
 
 
 def walk_refs(value: object, rename_schema) -> object:
@@ -93,8 +93,11 @@ def walk_refs(value: object, rename_schema) -> object:
         for key, child in value.items():
             if key == "$ref" and isinstance(child, str):
                 prefix = "#/components/schemas/"
+                shared_generating_prefix = "../shared/generating.yaml#/components/schemas/"
                 if child.startswith(prefix):
                     out[key] = prefix + rename_schema(child[len(prefix) :])
+                elif child.startswith(shared_generating_prefix):
+                    out[key] = prefix + child[len(shared_generating_prefix) :]
                 else:
                     out[key] = child
                 continue
@@ -153,7 +156,7 @@ def join_specs() -> dict:
     for path, item in antfly.get("paths", {}).items():
         paths[antfly_public_path(path)] = copy.deepcopy(item)
     for path, item in inference.get("paths", {}).items():
-        paths[prefixed_path("/ml/v1", path)] = walk_refs(item, inference_schema_name)
+        paths[prefixed_path("/ai/v1", path)] = walk_refs(item, inference_schema_name)
 
     tags = []
     seen_tags = set()
@@ -171,7 +174,7 @@ def join_specs() -> dict:
             "version": antfly.get("info", {}).get("version", "0.1.0"),
             "description": (
                 "Joined public contract for the Antfly server. Antfly APIs are served under "
-                "`/api/v1`, auth APIs under `/auth/v1`, and inference ML APIs under `/ml/v1`."
+                "`/db/v1`, auth APIs under `/auth/v1`, and inference APIs under `/ai/v1`."
             ),
         },
         "servers": [{"url": "/"}],

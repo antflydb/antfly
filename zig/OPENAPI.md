@@ -30,7 +30,7 @@ Repo-local specs:
 
 - `../openapi.yaml`: bundled public Antfly and inference API spec
 - `../specs/openapi/antfly/metadata.yaml`: Antfly metadata/table API
-- `../specs/openapi/antfly/usermgr.yaml`: Antfly user-management API
+- `../specs/openapi/auth/api.yaml`: Antfly authentication/user-management API
 - `../specs/openapi/inference/api.yaml`: inference public API
 - `specs/openai-openapi.yaml`: vendored OpenAI API schema used for types
 
@@ -99,13 +99,13 @@ modular Antfly specs.
 Antfly public APIs are served under:
 
 ```text
-/api/v1/*
+/db/v1/*
 ```
 
 inference public APIs are served under:
 
 ```text
-/ml/v1/*
+/ai/v1/*
 ```
 
 Inference keeps `/embed` and `/embeddings` as aliases over the same

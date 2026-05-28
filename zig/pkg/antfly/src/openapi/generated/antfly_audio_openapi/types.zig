@@ -176,7 +176,7 @@ pub const VertexSTTConfig = struct {
     model: ?[]const u8 = null,
 };
 
-/// Configuration for Antfly STT (Whisper, Wav2Vec2, HuBERT) provider. Uses local Antfly service for speech-to-text inference. **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC **Docs:** See inference documentation
+/// Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider. Uses the Antfly inference service for speech-to-text inference. **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC **Docs:** See inference documentation
 pub const AntflySTTConfig = struct {
     /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
@@ -283,7 +283,7 @@ pub const TTSConfig = struct {
     provider: TTSProvider,
 };
 
-/// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Local Antfly service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
+/// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
 pub const STTConfig = struct {
     /// Whisper model to use.
     model: ?[]const u8 = null,

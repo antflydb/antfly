@@ -603,7 +603,7 @@ func (r *ModelRegistry) RefreshEndpoint(ctx context.Context, address string) err
 		}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address+"/ml/v1/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address+"/ai/v1/models", nil)
 	if err != nil {
 		r.markUnhealthy(address)
 		return err
@@ -1001,14 +1001,14 @@ func NewProxy(cfg Config) *Proxy {
 func (p *Proxy) Start(ctx context.Context) error {
 	// Main API mux
 	apiMux := http.NewServeMux()
-	apiMux.HandleFunc("/ml/v1/embed", p.handleEmbed)
-	apiMux.HandleFunc("/ml/v1/embeddings", p.handleEmbeddings)
-	apiMux.HandleFunc("/ml/v1/chunk", p.handleChunk)
-	apiMux.HandleFunc("/ml/v1/rerank", p.handleRerank)
-	apiMux.HandleFunc("/ml/v1/recognize", p.handleRecognize)
-	apiMux.HandleFunc("/ml/v1/extract", p.handleExtract)
-	apiMux.HandleFunc("/ml/v1/generate", p.handleGenerate)
-	apiMux.HandleFunc("/ml/v1/chat/completions", p.handleChatCompletions)
+	apiMux.HandleFunc("/ai/v1/embed", p.handleEmbed)
+	apiMux.HandleFunc("/ai/v1/embeddings", p.handleEmbeddings)
+	apiMux.HandleFunc("/ai/v1/chunk", p.handleChunk)
+	apiMux.HandleFunc("/ai/v1/rerank", p.handleRerank)
+	apiMux.HandleFunc("/ai/v1/recognize", p.handleRecognize)
+	apiMux.HandleFunc("/ai/v1/extract", p.handleExtract)
+	apiMux.HandleFunc("/ai/v1/generate", p.handleGenerate)
+	apiMux.HandleFunc("/ai/v1/chat/completions", p.handleChatCompletions)
 	apiMux.HandleFunc("/healthz", p.handleHealth)
 	apiMux.HandleFunc("/readyz", p.handleReady)
 

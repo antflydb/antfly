@@ -76,7 +76,7 @@ export class TermiteClient {
     input: EmbedInput,
     options?: { truncate?: boolean }
   ): Promise<EmbedResponse> {
-    const { data, error } = await this.client.POST("/ml/v1/embed", {
+    const { data, error } = await this.client.POST("/ai/v1/embed", {
       body: {
         model,
         input,
@@ -113,7 +113,7 @@ export class TermiteClient {
     input: EmbedInput,
     options?: { truncate?: boolean }
   ): Promise<number[][]> {
-    const response = await fetch(`${this.baseUrl}/ml/v1/embed`, {
+    const response = await fetch(`${this.baseUrl}/ai/v1/embed`, {
       method: "POST",
       headers: {
         ...this.headers,
@@ -176,7 +176,7 @@ export class TermiteClient {
     config?: ChunkConfig,
     options?: RequestOptions
   ): Promise<ChunkResponse> {
-    const { data, error } = await this.client.POST("/ml/v1/chunk", {
+    const { data, error } = await this.client.POST("/ai/v1/chunk", {
       body: {
         text,
         config,
@@ -212,7 +212,7 @@ export class TermiteClient {
    * ```
    */
   async rerank(model: string, query: string, prompts: string[]): Promise<RerankResponse> {
-    const { data, error } = await this.client.POST("/ml/v1/rerank", {
+    const { data, error } = await this.client.POST("/ai/v1/rerank", {
       body: {
         model,
         query,
@@ -249,7 +249,7 @@ export class TermiteClient {
     texts: string[],
     options?: { labels?: string[]; relationLabels?: string[] }
   ): Promise<RecognizeResponse> {
-    const { data, error } = await this.client.POST("/ml/v1/recognize", {
+    const { data, error } = await this.client.POST("/ai/v1/recognize", {
       body: {
         model,
         texts,
@@ -291,7 +291,7 @@ export class TermiteClient {
       includeSpans?: boolean;
     }
   ): Promise<ExtractResponse> {
-    const { data, error } = await this.client.POST("/ml/v1/extract", {
+    const { data, error } = await this.client.POST("/ai/v1/extract", {
       body: {
         model,
         texts,
@@ -323,7 +323,7 @@ export class TermiteClient {
    * ```
    */
   async rewrite(model: string, inputs: string[]): Promise<RewriteResponse> {
-    const { data, error } = await this.client.POST("/ml/v1/rewrite", {
+    const { data, error } = await this.client.POST("/ai/v1/rewrite", {
       body: {
         model,
         inputs,
@@ -362,7 +362,7 @@ export class TermiteClient {
     audio: string,
     options?: { model?: string; language?: string }
   ): Promise<TranscribeResponse> {
-    const { data, error } = await this.client.POST("/ml/v1/transcribe", {
+    const { data, error } = await this.client.POST("/ai/v1/transcribe", {
       body: {
         audio,
         model: options?.model,
@@ -388,7 +388,7 @@ export class TermiteClient {
    * ```
    */
   async listModels(): Promise<ModelsResponse> {
-    const { data, error } = await this.client.GET("/ml/v1/models");
+    const { data, error } = await this.client.GET("/ai/v1/models");
     if (error) throw new Error(`List models failed: ${error.error}`);
     if (!data) throw new Error("List models failed: unexpected empty response");
     return data;
@@ -406,7 +406,7 @@ export class TermiteClient {
    * ```
    */
   async getVersion(): Promise<VersionResponse> {
-    const { data, error } = await this.client.GET("/ml/v1/version");
+    const { data, error } = await this.client.GET("/ai/v1/version");
     if (error) throw new Error(`Get version failed: ${error.error}`);
     if (!data) throw new Error("Get version failed: unexpected empty response");
     return data;
@@ -427,8 +427,8 @@ function normalizeBaseUrl(baseUrl: string): string {
     return "";
   }
 
-  if (trimmed.endsWith("/ml/v1")) {
-    return trimmed.slice(0, -"/ml/v1".length);
+  if (trimmed.endsWith("/ai/v1")) {
+    return trimmed.slice(0, -"/ai/v1".length);
   }
 
   if (trimmed.endsWith("/api")) {

@@ -20,6 +20,7 @@ pub const GenerationStepConfig = types.GenerationStepConfig;
 pub const FollowupStepConfig = types.FollowupStepConfig;
 pub const ConfidenceStepConfig = types.ConfidenceStepConfig;
 pub const ChatMessageRole = types.ChatMessageRole;
+pub const ChatMessageContent = types.ChatMessageContent;
 pub const ChatToolCall = types.ChatToolCall;
 pub const ChatToolResult = types.ChatToolResult;
 pub const ChatMessage = types.ChatMessage;

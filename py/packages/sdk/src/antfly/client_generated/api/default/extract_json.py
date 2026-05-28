@@ -5,21 +5,21 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.termite_error import TermiteError
-from ...models.termite_extract_request import TermiteExtractRequest
-from ...models.termite_extract_response import TermiteExtractResponse
+from ...models.inference_error import InferenceError
+from ...models.inference_extract_request import InferenceExtractRequest
+from ...models.inference_extract_response import InferenceExtractResponse
 from ...types import Response
 
 
 def _get_kwargs(
     *,
-    body: TermiteExtractRequest,
+    body: InferenceExtractRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/ml/v1/extract",
+        "url": "/ai/v1/extract",
     }
 
     _kwargs["json"] = body.to_dict()
@@ -32,29 +32,29 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> TermiteError | TermiteExtractResponse | None:
+) -> InferenceError | InferenceExtractResponse | None:
     if response.status_code == 200:
-        response_200 = TermiteExtractResponse.from_dict(response.json())
+        response_200 = InferenceExtractResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 400:
-        response_400 = TermiteError.from_dict(response.json())
+        response_400 = InferenceError.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 404:
-        response_404 = TermiteError.from_dict(response.json())
+        response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
     if response.status_code == 500:
-        response_500 = TermiteError.from_dict(response.json())
+        response_500 = InferenceError.from_dict(response.json())
 
         return response_500
 
     if response.status_code == 503:
-        response_503 = TermiteError.from_dict(response.json())
+        response_503 = InferenceError.from_dict(response.json())
 
         return response_503
 
@@ -66,7 +66,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[TermiteError | TermiteExtractResponse]:
+) -> Response[InferenceError | InferenceExtractResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -78,8 +78,8 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteExtractRequest,
-) -> Response[TermiteError | TermiteExtractResponse]:
+    body: InferenceExtractRequest,
+) -> Response[InferenceError | InferenceExtractResponse]:
     r"""Extract structured data from text
 
      Extracts structured data from text using GLiNER2 models.
@@ -131,7 +131,7 @@ def sync_detailed(
     ```
 
     Args:
-        body (TermiteExtractRequest): Exactly one of `texts` or `images` must be provided.
+        body (InferenceExtractRequest): Exactly one of `texts` or `images` must be provided.
             When using `images`, the server selects a compatible reader internally
             and processes the request as: read document text -> run structured extraction.
 
@@ -140,7 +140,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteExtractResponse]
+        Response[InferenceError | InferenceExtractResponse]
     """
 
     kwargs = _get_kwargs(
@@ -157,8 +157,8 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteExtractRequest,
-) -> TermiteError | TermiteExtractResponse | None:
+    body: InferenceExtractRequest,
+) -> InferenceError | InferenceExtractResponse | None:
     r"""Extract structured data from text
 
      Extracts structured data from text using GLiNER2 models.
@@ -210,7 +210,7 @@ def sync(
     ```
 
     Args:
-        body (TermiteExtractRequest): Exactly one of `texts` or `images` must be provided.
+        body (InferenceExtractRequest): Exactly one of `texts` or `images` must be provided.
             When using `images`, the server selects a compatible reader internally
             and processes the request as: read document text -> run structured extraction.
 
@@ -219,7 +219,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteExtractResponse
+        InferenceError | InferenceExtractResponse
     """
 
     return sync_detailed(
@@ -231,8 +231,8 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteExtractRequest,
-) -> Response[TermiteError | TermiteExtractResponse]:
+    body: InferenceExtractRequest,
+) -> Response[InferenceError | InferenceExtractResponse]:
     r"""Extract structured data from text
 
      Extracts structured data from text using GLiNER2 models.
@@ -284,7 +284,7 @@ async def asyncio_detailed(
     ```
 
     Args:
-        body (TermiteExtractRequest): Exactly one of `texts` or `images` must be provided.
+        body (InferenceExtractRequest): Exactly one of `texts` or `images` must be provided.
             When using `images`, the server selects a compatible reader internally
             and processes the request as: read document text -> run structured extraction.
 
@@ -293,7 +293,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteExtractResponse]
+        Response[InferenceError | InferenceExtractResponse]
     """
 
     kwargs = _get_kwargs(
@@ -308,8 +308,8 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteExtractRequest,
-) -> TermiteError | TermiteExtractResponse | None:
+    body: InferenceExtractRequest,
+) -> InferenceError | InferenceExtractResponse | None:
     r"""Extract structured data from text
 
      Extracts structured data from text using GLiNER2 models.
@@ -361,7 +361,7 @@ async def asyncio(
     ```
 
     Args:
-        body (TermiteExtractRequest): Exactly one of `texts` or `images` must be provided.
+        body (InferenceExtractRequest): Exactly one of `texts` or `images` must be provided.
             When using `images`, the server selects a compatible reader internally
             and processes the request as: read document text -> run structured extraction.
 
@@ -370,7 +370,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteExtractResponse
+        InferenceError | InferenceExtractResponse
     """
 
     return (

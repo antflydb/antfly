@@ -76,7 +76,7 @@ func (ln *TermiteNode) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Model availability is workload-specific. Readiness means the API is
-	// initialized and able to accept requests; /ml/v1/models reports inventory.
+	// initialized and able to accept requests; /ai/v1/models reports inventory.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)

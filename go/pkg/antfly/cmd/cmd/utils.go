@@ -37,11 +37,11 @@ import (
 )
 
 const defaultMaxShardSizeBytes = 64 * 1024 * 1024 // 64MB
-const defaultTermiteAPIURL = "http://0.0.0.0:8080"
+const defaultInferenceAPIURL = "http://0.0.0.0:8080"
 
 type parseConfigOptions struct {
-	RequireMetadata      bool
-	DefaultTermiteAPIURL string
+	RequireMetadata        bool
+	DefaultInferenceAPIURL string
 }
 
 // mustBindPFlag binds a pflag to viper and panics on error.
@@ -117,8 +117,8 @@ func parseConfigWithOptions(v *viper.Viper, opts parseConfigOptions) (*common.Co
 	v.SetDefault("storage.local.base_dir", common.DefaultDataDir())
 	v.SetDefault("storage.keyvalue", "local")
 	v.SetDefault("storage.metadatakv", "local")
-	if opts.DefaultTermiteAPIURL != "" {
-		v.SetDefault("termite.api_url", opts.DefaultTermiteAPIURL)
+	if opts.DefaultInferenceAPIURL != "" {
+		v.SetDefault("inference.api_url", opts.DefaultInferenceAPIURL)
 	}
 
 	var config common.Config
@@ -165,10 +165,10 @@ func parseConfigWithOptions(v *viper.Viper, opts parseConfigOptions) (*common.Co
 	// default even though the generated Go config uses a plain bool.
 	scraping.InitRemoteContentConfigWithOptions(&config.RemoteContent, remoteContentInitOptions(v, &config))
 
-	// Set default Termite URL from config so all consumers (embeddings,
+	// Set default inference URL from config so all consumers (embeddings,
 	// generators, rerankers, chunkers) can resolve it without explicit config.
-	if config.Termite.ApiUrl != "" {
-		libtermite.SetDefaultURL(config.Termite.ApiUrl)
+	if config.Inference.ApiUrl != "" {
+		libtermite.SetDefaultURL(config.Inference.ApiUrl)
 	}
 
 	// Initialize all named providers from config
@@ -230,11 +230,11 @@ func parsePeers(clusterJSON string) (common.Peers, error) {
 	return peers, nil
 }
 
-// termiteConfigWithSecurity returns a copy of the termite config with security
-// settings inherited from the top-level remote content config when the termite
+// inferenceConfigWithSecurity returns a copy of the inference config with security
+// settings inherited from the top-level remote content config when the inference
 // config does not define its own.
-func termiteConfigWithSecurity(config *common.Config) termite.Config {
-	tc := config.Termite
+func inferenceConfigWithSecurity(config *common.Config) termite.Config {
+	tc := config.Inference
 	if scraping.IsSecurityConfigEmpty(tc.ContentSecurity) &&
 		!scraping.IsSecurityConfigEmpty(config.RemoteContent.Security) {
 		tc.ContentSecurity = config.RemoteContent.Security

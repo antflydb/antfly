@@ -6,14 +6,14 @@ contract instead of comparing isolated HBC internals.
 The shared harness is `bench/storage/public_query_guardrail.zig`. It generates one
 deterministic packed-vector dataset, writes it through:
 
-- `POST /api/v1/tables/<table>/batch`
+- `POST /db/v1/tables/<table>/batch`
 - `sync_level=write` by default
 - packed `_embeddings.<index>` payloads
 
 Then it waits for the dense index status endpoint to report query-visible
 documents and runs:
 
-- `POST /api/v1/tables/<table>/query`
+- `POST /db/v1/tables/<table>/query`
 - `embeddings.<index>` packed query vectors
 - the same `k`, query count, repeat count, and concurrency
 

@@ -24,59 +24,59 @@ import (
 	client "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
-// TermiteProvider is a client for the Termite chunking service
-type TermiteProvider struct {
-	client *client.TermiteClient
-	config TermiteChunkerConfig
+// AntflyProvider is a client for the Antfly inference chunking service.
+type AntflyProvider struct {
+	client *client.InferenceClient
+	config AntflyChunkerConfig
 }
 
-// NewTermiteProvider creates a new Termite chunking client
-func NewTermiteProvider(config ChunkerConfig) (Chunker, error) {
-	// Extract termite config
-	termiteConfig, err := config.AsTermiteChunkerConfig()
+// NewAntflyProvider creates a new Antfly inference chunking client.
+func NewAntflyProvider(config ChunkerConfig) (Chunker, error) {
+	// Extract inference config
+	antflyConfig, err := config.AsAntflyChunkerConfig()
 	if err != nil {
 		return nil, err
 	}
 
 	// Get API URL from config, env var, or global default
-	apiURL := libtermite.ResolveURL(termiteConfig.ApiUrl)
+	apiURL := libtermite.ResolveURL(antflyConfig.ApiUrl)
 	if apiURL == "" {
-		return nil, fmt.Errorf("termite API URL must be set via api_url config field or ANTFLY_TERMITE_URL environment variable")
+		return nil, fmt.Errorf("antfly inference API URL must be set via api_url config field or ANTFLY_INFERENCE_URL environment variable")
 	}
 
 	// Set defaults for zero-value fields
-	if termiteConfig.Text.TargetTokens == 0 {
-		termiteConfig.Text.TargetTokens = 500
+	if antflyConfig.Text.TargetTokens == 0 {
+		antflyConfig.Text.TargetTokens = 500
 	}
-	if termiteConfig.Text.OverlapTokens == 0 {
-		termiteConfig.Text.OverlapTokens = 50
+	if antflyConfig.Text.OverlapTokens == 0 {
+		antflyConfig.Text.OverlapTokens = 50
 	}
-	if termiteConfig.MaxChunks == 0 {
-		termiteConfig.MaxChunks = 50
+	if antflyConfig.MaxChunks == 0 {
+		antflyConfig.MaxChunks = 50
 	}
-	if termiteConfig.Text.Separator == "" {
-		termiteConfig.Text.Separator = "\n\n"
+	if antflyConfig.Text.Separator == "" {
+		antflyConfig.Text.Separator = "\n\n"
 	}
-	if termiteConfig.Threshold == 0 {
-		termiteConfig.Threshold = 0.5
+	if antflyConfig.Threshold == 0 {
+		antflyConfig.Threshold = 0.5
 	}
 
 	httpClient := &http.Client{
 		Timeout: 5 * time.Minute, // Increased from 30s to 5min for large document chunking
 	}
-	termiteClient, err := client.NewTermiteClient(apiURL, httpClient)
+	termiteClient, err := client.NewInferenceClient(apiURL, httpClient)
 	if err != nil {
-		return nil, fmt.Errorf("creating termite client: %w", err)
+		return nil, fmt.Errorf("creating inference client: %w", err)
 	}
 
-	return &TermiteProvider{
+	return &AntflyProvider{
 		client: termiteClient,
-		config: termiteConfig,
+		config: antflyConfig,
 	}, nil
 }
 
-// Chunk performs text chunking via the Termite service
-func (tp *TermiteProvider) Chunk(ctx context.Context, text string) ([]Chunk, error) {
+// Chunk performs text chunking via the Antfly inference service.
+func (tp *AntflyProvider) Chunk(ctx context.Context, text string) ([]Chunk, error) {
 	if text == "" {
 		return nil, nil
 	}
@@ -93,8 +93,8 @@ func (tp *TermiteProvider) Chunk(ctx context.Context, text string) ([]Chunk, err
 	})
 }
 
-// ChunkMedia performs media chunking via the Termite service
-func (tp *TermiteProvider) ChunkMedia(ctx context.Context, data []byte, mimeType string) ([]Chunk, error) {
+// ChunkMedia performs media chunking via the Antfly inference service.
+func (tp *AntflyProvider) ChunkMedia(ctx context.Context, data []byte, mimeType string) ([]Chunk, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
@@ -104,11 +104,11 @@ func (tp *TermiteProvider) ChunkMedia(ctx context.Context, data []byte, mimeType
 }
 
 // Close implements the Chunker interface (no cleanup needed for HTTP client)
-func (tp *TermiteProvider) Close() error {
+func (tp *AntflyProvider) Close() error {
 	return nil
 }
 
-// Register termite provider in the registry
+// Register Antfly inference provider in the registry.
 func init() {
-	ChunkerRegistry[ChunkerProviderTermite] = NewTermiteProvider
+	ChunkerRegistry[ChunkerProviderAntfly] = NewAntflyProvider
 }

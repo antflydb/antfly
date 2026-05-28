@@ -14,7 +14,7 @@
 
 //go:build go1.22
 
-//go:generate go tool oapi-codegen --config=cfg.yaml ./openapi.yaml
+//go:generate go tool oapi-codegen --config=cfg.yaml ../../../specs/openapi/inference/config.yaml
 package termite
 
 import (
@@ -29,7 +29,6 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"net/http"
-	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -66,7 +65,7 @@ func NewTermiteAPI(logger *zap.Logger, node *TermiteNode) http.Handler {
 		node:   node,
 	}
 	return HandlerWithOptions(api, StdHTTPServerOptions{
-		BaseURL:    "/ml/v1",
+		BaseURL:    "/ai/v1",
 		BaseRouter: http.NewServeMux(),
 	})
 }
@@ -212,24 +211,6 @@ func (t *TermiteAPI) ListModels(w http.ResponseWriter, r *http.Request) {
 
 	if t.node.transcriberRegistry != nil {
 		resp.Transcribers = stringsToModelInfoMap(t.node.transcriberRegistry.List())
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		t.logger.Error("encoding response", zap.Error(err))
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
-// GetVersion implements ServerInterface
-func (t *TermiteAPI) GetVersion(w http.ResponseWriter, r *http.Request) {
-	resp := VersionResponse{
-		Version:        Version,
-		GitCommit:      GitCommit,
-		BuildTime:      BuildTime,
-		GoVersion:      runtime.Version(),
-		AllowDownloads: t.node.allowDownloads,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

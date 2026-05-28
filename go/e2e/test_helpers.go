@@ -242,7 +242,7 @@ func GetDefaultEmbedderConfig(t *testing.T) (*antfly.EmbedderConfig, error) {
 		}
 		// Use full-precision model - quantized (-i8) models cause 200x memory
 		// inflation with CoreML on macOS (6-8GB for a 33MB model)
-		return antfly.NewEmbedderConfig(antfly.TermiteEmbedderConfig{
+		return antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
 			Model:  "BAAI/bge-small-en-v1.5",
 			ApiUrl: termiteURL,
 		})
@@ -271,7 +271,7 @@ func GetDefaultGeneratorConfig(t *testing.T) antfly.GeneratorConfig {
 		if termiteURL == "" {
 			t.Fatalf("E2E_TERMITE_URL not set (required for E2E_PROVIDER=termite)")
 		}
-		config, err = antfly.NewGeneratorConfig(antfly.TermiteGeneratorConfig{
+		config, err = antfly.NewGeneratorConfig(antfly.AntflyGeneratorConfig{
 			Model:       "onnxruntime/Gemma-3-ONNX",
 			ApiUrl:      termiteURL,
 			Temperature: 0.1,

@@ -23,13 +23,30 @@ import (
 
 // Defines values for ChunkerProvider.
 const (
-	ChunkerProviderAntfly  ChunkerProvider = "antfly"
-	ChunkerProviderMock    ChunkerProvider = "mock"
-	ChunkerProviderTermite ChunkerProvider = "termite"
+	ChunkerProviderAntfly ChunkerProvider = "antfly"
+	ChunkerProviderMock   ChunkerProvider = "mock"
 )
 
-// AntflyChunkerConfig Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults.
-type AntflyChunkerConfig = externalRef0.ChunkOptions
+// AntflyChunkerConfig defines model for AntflyChunkerConfig.
+type AntflyChunkerConfig struct {
+	// ApiUrl The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
+	ApiUrl string `json:"api_url,omitempty,omitzero"`
+
+	// Audio Options specific to audio chunking.
+	Audio externalRef0.AudioChunkOptions `json:"audio,omitempty,omitzero"`
+
+	// MaxChunks Maximum number of chunks to generate per document.
+	MaxChunks int `json:"max_chunks,omitempty,omitzero"`
+
+	// Model The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+	Model string `json:"model"`
+
+	// Text Options specific to text chunking.
+	Text externalRef0.TextChunkOptions `json:"text,omitempty,omitzero"`
+
+	// Threshold Confidence threshold for model-based chunking (0.0-1.0).
+	Threshold float32 `json:"threshold,omitempty,omitzero"`
+}
 
 // Chunk A chunk of content. Text chunks have mime_type text/plain.
 type Chunk = externalRef0.Chunk
@@ -54,53 +71,6 @@ type ChunkerConfig struct {
 
 // ChunkerProvider The chunking provider to use.
 type ChunkerProvider string
-
-// TermiteChunkerConfig defines model for TermiteChunkerConfig.
-type TermiteChunkerConfig struct {
-	// ApiUrl The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_TERMITE_URL environment variable.
-	ApiUrl string `json:"api_url,omitempty,omitzero"`
-
-	// Audio Options specific to audio chunking.
-	Audio externalRef0.AudioChunkOptions `json:"audio,omitempty,omitzero"`
-
-	// MaxChunks Maximum number of chunks to generate per document.
-	MaxChunks int `json:"max_chunks,omitempty,omitzero"`
-
-	// Model The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-	Model string `json:"model"`
-
-	// Text Options specific to text chunking.
-	Text externalRef0.TextChunkOptions `json:"text,omitempty,omitzero"`
-
-	// Threshold Confidence threshold for model-based chunking (0.0-1.0).
-	Threshold float32 `json:"threshold,omitempty,omitzero"`
-}
-
-// AsTermiteChunkerConfig returns the union data inside the ChunkerConfig as a TermiteChunkerConfig
-func (t ChunkerConfig) AsTermiteChunkerConfig() (TermiteChunkerConfig, error) {
-	var body TermiteChunkerConfig
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromTermiteChunkerConfig overwrites any union data inside the ChunkerConfig as the provided TermiteChunkerConfig
-func (t *ChunkerConfig) FromTermiteChunkerConfig(v TermiteChunkerConfig) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeTermiteChunkerConfig performs a merge with any union data inside the ChunkerConfig, using the provided TermiteChunkerConfig
-func (t *ChunkerConfig) MergeTermiteChunkerConfig(v TermiteChunkerConfig) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
 
 // AsAntflyChunkerConfig returns the union data inside the ChunkerConfig as a AntflyChunkerConfig
 func (t ChunkerConfig) AsAntflyChunkerConfig() (AntflyChunkerConfig, error) {
@@ -328,43 +298,39 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"H4sIAAAAAAAC/+xZbY/buPH/KgP+/8DuBrLsJG1x0Lu9NO0FSLKLi6/p4TYwaHFksaFIHUn5IYG/ezGk",
-	"JMu2drPJ3bvmTZCVhjPDefz95M8sN1VtNGrvWPaZubzEiof/XmtfqN2LstEf0b4wupAresyVuilY9ttn",
-	"9v8WC5ax/5seVEzb81Mll7xY5HRY6tXC1Kh5LRdB203tpdGO7T8kTKDLrQwPWMailcZy+hsKY8GXCMrk",
-	"XEF0BzqVUFuzlgJteqfv9LyUrn8CttHuICikxdyrHWykL6UOKp03lq8QtBFI53J0LrnTJGEaDxZ/b6Sl",
-	"w1wDbj1azRXM0VbSIzi0a5ljCq88NA4dOFnVCqGQWxQTJz/hnfbmI2r5Ce1kyR2KgzdkArSBnOcl/W3W",
-	"aEvkIlzjyZNfHIKny2xK1NmTJ3d6Aj83WpOok3qlcBJ8Flgrs6so5nDpNtxWUBmBVyT/q2lAGH3hQSMK",
-	"wGqJQki9mgYness8t8a5EALXHdtw7aGSWlZcgUPf1EDJVbiVfnfwsIuE1M4jF2POVo3yMvqaq8Z5tOFO",
-	"Fnv7FkWTo4PcON87EDy+efv23xOe56jQcj+MHt1RHXtbo3XSedQ+ik37+wZLdDeWMNxyugYVcMW3sTAd",
-	"y/46S1hXNixjPNQYS5jHrSdZyo7i9SKks5V3WHPLvaEDFBIS53aFfiA12+/3CQvVftwzRuO3d88ct/6F",
-	"0XRXtk++ScWPUnO765V8IDW1NTVaLzG0vRT073FfvsPfG9Q5gm6qJVowReiiWE+XswSeJvAsgTRNryga",
-	"uxpZxqT2uELLEradrMykfdpI7Z8/Y/uEVbLCRXx6au/NqzcvgV5lQJmY1opLnQBvhDTTDV8nICu+wmmt",
-	"Vwmgz9ODVeepbxmFP3YxCpb9RrcaWvzQy5vlfzD3I7Pour2eKSCP4UqBEhAfOyj5GqHXOPAzZV3qu0F3",
-	"dr9btBPyDp0n5Sczr0taCtdKQSFRCQfcIphwniuYwCe0Zmoq6ak91lw16GgWxbNoQWDBG+UdReY4vyGI",
-	"9J9vqJ5rOns8w5OjfjpLJN/KqqkGddNGzxtYoQ7tTR0MwuQNTbP0vH72h3b81p458diXFl1p1Eilhw0k",
-	"Qq33UiEpYfKcDvPLWTqbPE1nV+R2YWzFPctYoQz3h3vEu4eKPKm5tkzGt+vjJkU7iY/1fGk2jG32sVFQ",
-	"NEotKPYLqQVug39CyFiEtwNRbxv88i4ndRNSB0Fd2H59QUgNPypcY3qn35eoobboaKZf4ho1yAKwqv3u",
-	"KunkN1IpWMZNjiKu1SwvfAauKQq5Ba5FtIOiV37hoC3V2FadMb4kW71uaqQsP9IU2k+rHb2LBbHG3Bt7",
-	"2K4ujavgKMWD2TdxH2U96Vp4Uhuqbxtjtx9uoYdz12btthPfJyyE4KgFQ++zrODKjeXFW6PCNvYltuMG",
-	"BPccCES161RQi7YwKYUQpaAOLlv1h1RQbLpmDrGusDJ2F+IWYnaIUZCNKWuVhtKBpfFlr06Le04cwrs0",
-	"RiHXj47vyTbog/1hbO43WhaS2vysgvkI/DwBFzQmaAYQFmRH4MLHVv0CungISgzSfja45t0+HjpHOWwc",
-	"Bh91U9HVK5N/DC50zrSY58PZBk3Y6HD5cynA2cwhkcaq8Qv+8vPrDnt0EPT69hWgFiHdcInpKk3govS+",
-	"zqbTQBxK43z2w+yH2cVVCi+4Bq6cCZMDPawlh+u383+8/nUxf/nzm1fzlwuygXotrdG0kGDNreRLhUeJ",
-	"ZqMWhkugsZKNhLStj0GT9qXyQD7DqS6Z8FKGvr0IBy9CYbYMJFTNyZJKIBRuVKF5hVBYU7VIetriBTf9",
-	"TK/20+Nbdq49jK3inR4BqcbpXZfJe5hdRzUcdR9qb7mSn1DAT/P5bUfFwJfcd+fcCdmKTMRLGnWReqRE",
-	"GHEYkorXAZMQ82ifR9pIc4wkiGXJSioeeqo0G7hRilccNsZ+dFcte3vRGX4TottSohDFDN6dssSDn8td",
-	"TB3kpqEyXjZS+QlBXt361MU7ELxrvQMTaiA4H1Yh9542JHmnDBcPJvlwt9btGJbW3ddPM3gTJ3ggUDGK",
-	"zyaV1I1HmM9fB6lnGdweqNctLpcKwxah8iOJd4GuFkquSg8CRVMrmQ9QrtF5Yy0dJsDlJZH8FhSfcbZ+",
-	"KtzbeKes7g8P4sfTvEeD5bOZ1r4AV2MuC5lT9gI+P3CAM/ze+SraPlpUY4qjEHRCYStLpaTD3GjhYIl+",
-	"g4R8DtZcv9oziIj2HIhvpBZm87Dt90HmftMBCoYmiNpObjzw4vlsNhv3ZAxLP4rxnnkbX0OFQvKO6MWK",
-	"j6N80uemQs+pvs9TQk9HNHOHf/vLBHVuBApYRkMBZ12uuZIC3l//K4Hbt/+MHPZquD6Wu1igp/sDtVh4",
-	"Ip1jkQ8Vl0EbVtQCSPQ0AY+gKgkrLK9wIVDx3bgpLauQ3gyEdLXiOwjCI8bOqygq7znFvZqDXMsdRxU5",
-	"z61/bDyC8LdG5CsK7vtXn//Zrz6PgbzfPwZ9/xj0VfPkzOlHwQjfF+2DKKLDMqcq3x5aPkiQyvZMjx1y",
-	"ox3mjZfrttRcCj+hqh1UXGrPpY49tPXdbw2xt5am0YJbiS6Fm/6bynJ3Bo3RuvESGGCz86HVvoI4EyI9",
-	"qpX0PiSpZYh3d/ruTkfyRAdWltelu/oqhw5b+QQYnlHX8Ho4RmNM6+7ryx+EOMMNcW48FMIQ2OQltzz3",
-	"wZXC4dhcIJhBYiM90R+ujZMdwDNWriQNo5Dt9neekGwkyHeJ21w1Tq7x6oE9/ucYDLrcg5PjHqbd9kwb",
-	"yC/tlqDsyPXkELbzTUPHpS7MGOCBmxr19e2rvoGPWFJYCPGHzKJA2//QNaTK4ftp/Kz79x9DNUkfGHz7",
-	"7Qa6D0dwxMFZwtbE4YIfs3SWPqUwtWXFMvY8naXPqTi4Lx3LdKPU/r8BAAD//0kk4lUyHgAA",
+	"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",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file
@@ -404,7 +370,7 @@ func PathToRawSpec(pathToFile string) map[string]func() ([]byte, error) {
 		res[pathToFile] = rawSpec
 	}
 
-	for rawPath, rawFunc := range externalRef0.PathToRawSpec(path.Join(path.Dir(pathToFile), "../../../libaf/chunking/openapi.yaml")) {
+	for rawPath, rawFunc := range externalRef0.PathToRawSpec(path.Join(path.Dir(pathToFile), "../shared/chunking.yaml")) {
 		if _, ok := res[rawPath]; ok {
 			// it is not possible to compare functions in golang, so always overwrite the old value
 		}

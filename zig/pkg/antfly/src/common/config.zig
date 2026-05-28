@@ -45,7 +45,7 @@ pub const Config = struct {
     cors: ?CorsConfig = null,
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
-    antfly: AntflyConfig = .{},
+    inference: InferenceConfig = .{},
     remote_content: ?RemoteContentConfig = null,
     shard_allocation: ShardAllocationConfig = .{},
 
@@ -93,13 +93,13 @@ pub const Config = struct {
         }
     };
 
-    pub const AntflyConfig = struct {
+    pub const InferenceConfig = struct {
         api_url: ?[]u8 = null,
         models_dir: ?[]u8 = null,
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
 
-        fn deinit(self: *AntflyConfig, alloc: std.mem.Allocator) void {
+        fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
             if (self.models_dir) |value| alloc.free(value);
             if (self.content_security) |*security| security.deinit(alloc);
@@ -222,11 +222,11 @@ pub const Config = struct {
                 if (validated.value.metadata) |metadata| metadata.orchestration_urls else null,
             ),
             .storage = try storageFromOpenApi(alloc, validated.value.storage),
-            .antfly = if (validated.value.antfly) |antfly| .{
-                .api_url = if (antfly.api_url.len > 0) try alloc.dupe(u8, antfly.api_url) else null,
-                .models_dir = if (antfly.models_dir) |value| try alloc.dupe(u8, value) else null,
-                .content_security = if (antfly.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
-                .s3_credentials = try parseRawAntflyS3Credentials(alloc, raw_root, antfly.s3_credentials),
+            .inference = if (validated.value.inference) |inference| .{
+                .api_url = if (inference.api_url.len > 0) try alloc.dupe(u8, inference.api_url) else null,
+                .models_dir = if (inference.models_dir) |value| try alloc.dupe(u8, value) else null,
+                .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
+                .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
@@ -274,7 +274,7 @@ pub const Config = struct {
         if (self.cors) |*cors| cors.deinit(self.registry.allocator);
         self.metadata.deinit(self.registry.allocator);
         self.storage.deinit(self.registry.allocator);
-        self.antfly.deinit(self.registry.allocator);
+        self.inference.deinit(self.registry.allocator);
         self.speech_to_text.deinit();
         self.text_to_speech.deinit();
         if (self.remote_content) |*remote_content| remote_content.deinit(self.registry.allocator);
@@ -284,7 +284,7 @@ pub const Config = struct {
 
     pub fn effectiveAntflyContentSecurity(self: *const Config) ?*const ContentSecurityConfig {
         return scraping.effectiveContentSecurity(
-            if (self.antfly.content_security) |*security| security else null,
+            if (self.inference.content_security) |*security| security else null,
             if (self.remote_content) |*remote_content|
                 if (remote_content.security) |*security| security else null
             else
@@ -552,14 +552,14 @@ fn s3CredentialsFromOpenApi(
     };
 }
 
-fn parseRawAntflyS3Credentials(
+fn parseRawInferenceS3Credentials(
     alloc: std.mem.Allocator,
     raw_root: std.json.ObjectMap,
     fallback: ?s3_openapi.Credentials,
 ) !?Config.S3CredentialsConfig {
-    if (raw_root.get("antfly")) |antfly_value| {
-        if (antfly_value == .object) {
-            if (antfly_value.object.get("s3_credentials")) |credentials_value| {
+    if (raw_root.get("inference")) |inference_value| {
+        if (inference_value == .object) {
+            if (inference_value.object.get("s3_credentials")) |credentials_value| {
                 const parsed = try std.json.parseFromValue(s3_openapi.Credentials, alloc, credentials_value, .{
                     .allocate = .alloc_always,
                     .ignore_unknown_fields = true,
@@ -775,7 +775,7 @@ test "common config extracts antfly settings" {
         \\  "default_shards_per_table": 1,
         \\  "max_shard_size_bytes": 1024,
         \\  "max_shards_per_table": 4,
-        \\  "antfly": {
+        \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
         \\    "content_security": {
@@ -1062,7 +1062,7 @@ test "common config resolves secret references through the provided store" {
         \\  "default_shards_per_table": 1,
         \\  "max_shard_size_bytes": 1024,
         \\  "max_shards_per_table": 4,
-        \\  "antfly": {
+        \\  "inference": {
         \\    "api_url": "${secret:inference.api_url}"
         \\  }
         \\}
@@ -1090,7 +1090,7 @@ test "common config inherits antfly content security from remote content" {
         \\      "allowed_hosts": ["cdn.example.com"]
         \\    }
         \\  },
-        \\  "antfly": {
+        \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083"
         \\  },
         \\  "replication_factor": 1,
@@ -1125,7 +1125,7 @@ test "common config prefers antfly content security over inherited remote conten
         \\      "allowed_hosts": ["cdn.example.com"]
         \\    }
         \\  },
-        \\  "antfly": {
+        \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "content_security": {
         \\      "block_private_ips": false,
@@ -1164,7 +1164,7 @@ test "common config treats empty antfly content security as inheritable" {
         \\      "allowed_hosts": ["cdn.example.com"]
         \\    }
         \\  },
-        \\  "antfly": {
+        \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "content_security": {}
         \\  },

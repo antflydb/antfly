@@ -5,21 +5,21 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.termite_classify_request import TermiteClassifyRequest
-from ...models.termite_classify_response import TermiteClassifyResponse
-from ...models.termite_error import TermiteError
+from ...models.inference_classify_request import InferenceClassifyRequest
+from ...models.inference_classify_response import InferenceClassifyResponse
+from ...models.inference_error import InferenceError
 from ...types import Response
 
 
 def _get_kwargs(
     *,
-    body: TermiteClassifyRequest,
+    body: InferenceClassifyRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/ml/v1/classify",
+        "url": "/ai/v1/classify",
     }
 
     _kwargs["json"] = body.to_dict()
@@ -32,24 +32,24 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> TermiteClassifyResponse | TermiteError | None:
+) -> InferenceClassifyResponse | InferenceError | None:
     if response.status_code == 200:
-        response_200 = TermiteClassifyResponse.from_dict(response.json())
+        response_200 = InferenceClassifyResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 400:
-        response_400 = TermiteError.from_dict(response.json())
+        response_400 = InferenceError.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 404:
-        response_404 = TermiteError.from_dict(response.json())
+        response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
     if response.status_code == 500:
-        response_500 = TermiteError.from_dict(response.json())
+        response_500 = InferenceError.from_dict(response.json())
 
         return response_500
 
@@ -61,7 +61,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[TermiteClassifyResponse | TermiteError]:
+) -> Response[InferenceClassifyResponse | InferenceError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -73,8 +73,8 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteClassifyRequest,
-) -> Response[TermiteClassifyResponse | TermiteError]:
+    body: InferenceClassifyRequest,
+) -> Response[InferenceClassifyResponse | InferenceError]:
     r"""Zero-shot text classification
 
      Classifies text into arbitrary categories using NLI-based zero-shot classification models.
@@ -104,14 +104,14 @@ def sync_detailed(
     in any supported language using labels in that language.
 
     Args:
-        body (TermiteClassifyRequest):
+        body (InferenceClassifyRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteClassifyResponse | TermiteError]
+        Response[InferenceClassifyResponse | InferenceError]
     """
 
     kwargs = _get_kwargs(
@@ -128,8 +128,8 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteClassifyRequest,
-) -> TermiteClassifyResponse | TermiteError | None:
+    body: InferenceClassifyRequest,
+) -> InferenceClassifyResponse | InferenceError | None:
     r"""Zero-shot text classification
 
      Classifies text into arbitrary categories using NLI-based zero-shot classification models.
@@ -159,14 +159,14 @@ def sync(
     in any supported language using labels in that language.
 
     Args:
-        body (TermiteClassifyRequest):
+        body (InferenceClassifyRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteClassifyResponse | TermiteError
+        InferenceClassifyResponse | InferenceError
     """
 
     return sync_detailed(
@@ -178,8 +178,8 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteClassifyRequest,
-) -> Response[TermiteClassifyResponse | TermiteError]:
+    body: InferenceClassifyRequest,
+) -> Response[InferenceClassifyResponse | InferenceError]:
     r"""Zero-shot text classification
 
      Classifies text into arbitrary categories using NLI-based zero-shot classification models.
@@ -209,14 +209,14 @@ async def asyncio_detailed(
     in any supported language using labels in that language.
 
     Args:
-        body (TermiteClassifyRequest):
+        body (InferenceClassifyRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteClassifyResponse | TermiteError]
+        Response[InferenceClassifyResponse | InferenceError]
     """
 
     kwargs = _get_kwargs(
@@ -231,8 +231,8 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteClassifyRequest,
-) -> TermiteClassifyResponse | TermiteError | None:
+    body: InferenceClassifyRequest,
+) -> InferenceClassifyResponse | InferenceError | None:
     r"""Zero-shot text classification
 
      Classifies text into arbitrary categories using NLI-based zero-shot classification models.
@@ -262,14 +262,14 @@ async def asyncio(
     in any supported language using labels in that language.
 
     Args:
-        body (TermiteClassifyRequest):
+        body (InferenceClassifyRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteClassifyResponse | TermiteError
+        InferenceClassifyResponse | InferenceError
     """
 
     return (

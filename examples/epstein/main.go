@@ -189,7 +189,7 @@ var needsOCRFallback = docsaf.NeedsOCRFallback
 var templatesFS embed.FS
 
 const (
-	DefaultAntflyURL       = "http://localhost:8080/api/v1"
+	DefaultAntflyURL       = "http://localhost:8080/db/v1"
 	DefaultTermiteURL      = "http://localhost:8080"
 	DefaultFullTextIndex   = "full_text_index_v0"
 	DefaultEmbeddingIndex  = "embeddings"
@@ -264,20 +264,20 @@ func termiteMLBaseURL(raw string) (string, error) {
 	if trimmed == "" {
 		return "", fmt.Errorf("termite URL is required")
 	}
-	if strings.HasSuffix(trimmed, "/ml/v1") {
+	if strings.HasSuffix(trimmed, "/ai/v1") {
 		return trimmed, nil
 	}
 	if strings.HasSuffix(trimmed, "/api") {
-		return "", fmt.Errorf("legacy Termite /api URLs are unsupported; use the Antfly root URL or a /ml/v1 URL")
+		return "", fmt.Errorf("legacy Termite /api URLs are unsupported; use the Antfly root URL or a /ai/v1 URL")
 	}
 	root := strings.TrimRight(antfly.NormalizeBaseURL(trimmed), "/")
 	if root == "" {
 		return "", fmt.Errorf("termite URL is required")
 	}
-	if strings.HasSuffix(root, "/ml/v1") {
+	if strings.HasSuffix(root, "/ai/v1") {
 		return root, nil
 	}
-	return root + "/ml/v1", nil
+	return root + "/ai/v1", nil
 }
 
 func splitCSV(value string) []string {
@@ -1665,7 +1665,7 @@ func syncCmd(args []string) error {
 // serveCmd starts a web server with a search interface
 func serveCmd(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	antflyURL := fs.String("url", "http://localhost:8080/api/v1", "Antfly API URL")
+	antflyURL := fs.String("url", "http://localhost:8080/db/v1", "Antfly API URL")
 	tableName := fs.String("table", "epstein_docs", "Table name to search")
 	listenAddr := fs.String("listen", ":3000", "Listen address for web server")
 	pdfDir := fs.String("pdf-dir", "./epstein-docs", "Directory containing PDF files (including pages/ subdirectory)")
@@ -3848,11 +3848,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  epstein sync [flags]      - Full pipeline (process + load)\n")
 		fmt.Fprintf(os.Stderr, "  epstein serve [flags]     - Start web search interface\n")
 		fmt.Fprintf(os.Stderr, "  epstein audit [flags]     - Audit parsed documents for errors\n")
-		fmt.Fprintf(os.Stderr, "  epstein enrich [flags]    - Re-OCR low-quality pages with Termite readers\n")
-		fmt.Fprintf(os.Stderr, "  epstein entities [flags]  - Add Termite entity metadata to prepared JSON\n")
+		fmt.Fprintf(os.Stderr, "  epstein enrich [flags]    - Re-OCR low-quality pages with Antfly inference readers\n")
+		fmt.Fprintf(os.Stderr, "  epstein entities [flags]  - Add Antfly inference entity metadata to prepared JSON\n")
 		fmt.Fprintf(os.Stderr, "\nQuick Start:\n")
 		fmt.Fprintf(os.Stderr, "  # 1. Build and start Zig Antfly\n")
-		fmt.Fprintf(os.Stderr, "  cd zig && zig build install-antfly && ./zig-out/bin/antfly swarm\n\n")
+		fmt.Fprintf(os.Stderr, "  cd zig && zig build install && ./zig-out/bin/antfly swarm\n\n")
 		fmt.Fprintf(os.Stderr, "  # 2. Download documents (choose dataset)\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset court-2024    # ~23MB, 943 pages\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset doj-complete  # ~4.8GB, 8 datasets (Dec 2025)\n")

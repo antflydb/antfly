@@ -62,7 +62,7 @@ Query: "chart or graph"
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `ANTFLY_URL` | `http://localhost:8080/api/v1` | Antfly API endpoint |
+| `ANTFLY_URL` | `http://localhost:8080/db/v1` | Antfly API endpoint |
 
 ## Tips
 

@@ -203,8 +203,13 @@ func indexAntflyDocsWithHierarchy(t *testing.T, ctx context.Context, client *ant
 	embedder, err := GetDefaultEmbedderConfig(t)
 	require.NoError(t, err, "Failed to configure embedder")
 
+	termiteURL := GetTermiteURL()
+	require.NotEmpty(t, termiteURL, "Termite URL should be set after swarm start")
+
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
+		Model:  "fixed",
+		ApiUrl: termiteURL,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  512,
 			OverlapTokens: 50,
@@ -348,8 +353,13 @@ func indexAntflyDocs(t *testing.T, ctx context.Context, client *antfly.AntflyCli
 	require.NoError(t, err, "Failed to configure embedder")
 
 	// Configure fixed-size chunker (no ML model needed - reduces memory usage)
+	termiteURL := GetTermiteURL()
+	require.NotEmpty(t, termiteURL, "Termite URL should be set after swarm start")
+
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
+		Model:  "fixed",
+		ApiUrl: termiteURL,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  512,
 			OverlapTokens: 50,
@@ -870,7 +880,7 @@ type testQueryConfig struct {
 func newTestQueryConfig(t *testing.T, tableName, termiteURL string) testQueryConfig {
 	t.Helper()
 
-	rerankerConfig, err := antfly.NewRerankerConfig(antfly.TermiteRerankerConfig{
+	rerankerConfig, err := antfly.NewRerankerConfig(antfly.AntflyRerankerConfig{
 		Model: "mixedbread-ai/mxbai-rerank-base-v1",
 		Url:   termiteURL,
 	})

@@ -212,10 +212,10 @@ func InitGenkit(ctx context.Context, config *ai.GeneratorConfig) (*genkit.Genkit
 		anthropicPlugin.DefineModel(model, genkitAI.ModelOptions{})
 		modelName = fmt.Sprintf("anthropic/%s", model)
 
-	case ai.GeneratorProviderTermite:
-		c, err := config.AsTermiteGeneratorConfig()
+	case ai.GeneratorProviderAntfly:
+		c, err := config.AsAntflyGeneratorConfig()
 		if err != nil {
-			return nil, "", fmt.Errorf("parsing termite config: %w", err)
+			return nil, "", fmt.Errorf("parsing antfly inference config: %w", err)
 		}
 
 		configURL := ""
@@ -224,19 +224,18 @@ func InitGenkit(ctx context.Context, config *ai.GeneratorConfig) (*genkit.Genkit
 		}
 		apiURL := libtermite.ResolveURL(configURL)
 		if apiURL == "" {
-			return nil, "", fmt.Errorf("termite: api_url is required (set via config, ANTFLY_TERMITE_URL env var, or termite.api_url in config file)")
+			return nil, "", fmt.Errorf("antfly inference: api_url is required (set via config or ANTFLY_INFERENCE_URL env var)")
 		}
 
-		// Termite's /generate endpoint is OpenAI-compatible, so we use the OpenAI plugin
-		// with a custom base URL pointing to Termite
-		termiteURL := apiURL + "/openai/v1"
+		// Antfly inference exposes an OpenAI-compatible generation endpoint.
+		inferenceURL := apiURL + "/openai/v1"
 		opts := []option.RequestOption{
-			option.WithBaseURL(termiteURL),
+			option.WithBaseURL(inferenceURL),
 		}
 
 		openaiPlugin := &openai.OpenAI{
-			// Termite doesn't require an API key, but the OpenAI plugin requires one
-			APIKey: "termite-local",
+			// Antfly inference doesn't require an API key, but the OpenAI plugin requires one.
+			APIKey: "antfly-inference",
 			Opts:   opts,
 		}
 
@@ -266,8 +265,8 @@ func providerToGenkitPrefix(provider ai.GeneratorProvider) string {
 		return "openai"
 	case ai.GeneratorProviderAnthropic:
 		return "anthropic"
-	case ai.GeneratorProviderTermite:
-		// Termite uses the OpenAI-compatible API
+	case ai.GeneratorProviderAntfly:
+		// Antfly inference uses the OpenAI-compatible API.
 		return "openai"
 	default:
 		return string(provider)

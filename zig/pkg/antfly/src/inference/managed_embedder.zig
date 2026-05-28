@@ -1559,12 +1559,12 @@ fn resolveAntflyInferenceBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_
 
 fn normalizeAntflyInferenceBaseUrl(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
     const trimmed = std.mem.trimEnd(u8, raw, "/");
-    if (std.mem.endsWith(u8, trimmed, "/ml/v1")) return try alloc.dupe(u8, trimmed);
+    if (std.mem.endsWith(u8, trimmed, "/ai/v1")) return try alloc.dupe(u8, trimmed);
 
     const scheme_pos = std.mem.indexOf(u8, trimmed, "://");
     const host_start = if (scheme_pos) |pos| pos + 3 else 0;
     const path_pos = std.mem.indexOfPos(u8, trimmed, host_start, "/");
-    if (path_pos == null) return try std.fmt.allocPrint(alloc, "{s}/ml/v1", .{trimmed});
+    if (path_pos == null) return try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{trimmed});
 
     return error.InvalidAntflyInferenceBaseUrl;
 }
@@ -2746,7 +2746,7 @@ test "managed embedder preserves antfly api_url path for shared antfly endpoint"
 
         fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/ml/v1/embed"));
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/ai/v1/embed"));
             try std.testing.expect(std.mem.indexOf(u8, req.body, "\"model\":\"remote-model\"") != null);
             return .{
                 .status = 200,
@@ -2764,7 +2764,7 @@ test "managed embedder preserves antfly api_url path for shared antfly endpoint"
 
     const base_uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
-    const shared_antfly_uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/ml/v1", .{base_uri});
+    const shared_antfly_uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/ai/v1", .{base_uri});
     defer std.testing.allocator.free(shared_antfly_uri);
 
     var local = Local{};

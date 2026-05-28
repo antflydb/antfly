@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:generate go tool oapi-codegen --config=cfg.yaml ./openapi.yaml
+//go:generate go tool oapi-codegen --config=cfg.yaml ../../../specs/openapi/inference/config.yaml
 package termite
 
 import (
@@ -631,27 +631,27 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 	return node
 }
 
-// APIHandler returns the full HTTP handler serving /ml/v1/*, /openai/v1/*,
+// APIHandler returns the full HTTP handler serving /ai/v1/*, /openai/v1/*,
 // /anthropic/v1/*, /healthz, /readyz, the registry proxy, and the embedded
 // dashboard. It includes CORS middleware.
 //
 // Callers embedding Termite in a shared mux should typically mount only the
-// /ml/v1/ subtree via APIMLHandler() to avoid exposing OpenAI/Anthropic-compat
+// /ai/v1/ subtree via APIMLHandler() to avoid exposing OpenAI/Anthropic-compat
 // and dashboard surfaces alongside another service.
 func (n *TermiteNode) APIHandler() http.Handler {
 	apiHandler := NewTermiteAPI(n.logger, n)
 
 	rootMux := http.NewServeMux()
 
-	// Health endpoints (outside /ml/v1 prefix for k8s compatibility)
+	// Health endpoints (outside /ai/v1 prefix for k8s compatibility)
 	rootMux.HandleFunc("GET /healthz", n.handleHealthz)
 	rootMux.HandleFunc("GET /readyz", n.handleReadyz)
 
 	// Generate endpoint (manually registered until OpenAPI codegen is updated)
-	rootMux.HandleFunc("POST /ml/v1/generate", n.handleApiGenerate)
+	rootMux.HandleFunc("POST /ai/v1/generate", n.handleApiGenerate)
 
-	// Mount the OpenAPI-generated API handler (includes /ml/v1/version)
-	rootMux.Handle("/ml/v1/", apiHandler)
+	// Mount the OpenAPI-generated API handler.
+	rootMux.Handle("/ai/v1/", apiHandler)
 
 	// OpenAI-compatible API at /openai/v1/* for standard SDK compatibility
 	n.RegisterOpenAIRoutes(rootMux)
@@ -668,7 +668,7 @@ func (n *TermiteNode) APIHandler() http.Handler {
 	return corsMiddleware(rootMux)
 }
 
-// APIMLHandler returns a handler that serves only the /ml/v1/* surface.
+// APIMLHandler returns a handler that serves only the /ai/v1/* surface.
 // Intended for embedding in an antfly metadata HTTP server where
 // OpenAI/Anthropic-compat, dashboard, and operational probe surfaces are
 // undesirable.
@@ -676,8 +676,8 @@ func (n *TermiteNode) APIMLHandler() http.Handler {
 	apiHandler := NewTermiteAPI(n.logger, n)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /ml/v1/generate", n.handleApiGenerate)
-	mux.Handle("/ml/v1/", apiHandler)
+	mux.HandleFunc("POST /ai/v1/generate", n.handleApiGenerate)
+	mux.Handle("/ai/v1/", apiHandler)
 
 	return mux
 }

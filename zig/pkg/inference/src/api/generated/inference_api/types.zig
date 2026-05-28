@@ -2,6 +2,7 @@
 // Package: inference_api
 
 const std = @import("std");
+const antfly_generating_openapi = @import("antfly_generating_openapi");
 
 pub const Error = struct {
     /// Error message
@@ -28,6 +29,22 @@ pub const MediaContentPart = struct {
     data: []const u8,
     /// MIME type (audio/wav, image/gif, image/png, etc.)
     mime_type: []const u8,
+};
+
+/// OpenAI-compatible embedding request with inference multimodal content-part extension
+pub const EmbedRequest = struct {
+    /// Model name to use for embedding generation
+    model: []const u8,
+    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
+    input: std.json.Value,
+    /// Encoding format for the embeddings (only "float" supported)
+    encoding_format: ?[]const u8 = null,
+    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
+    dimensions: ?i64 = null,
+    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+    task_type: ?[]const u8 = null,
+    /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
+    input_type: ?[]const u8 = null,
 };
 
 /// A sparse vector with parallel index/value arrays, sorted by index ascending
@@ -57,6 +74,12 @@ pub const RerankRequest = struct {
     query: []const u8,
     /// Pre-rendered document texts to rerank. The client is responsible for extracting and rendering document fields/templates before calling this endpoint.
     prompts: []const []const u8,
+};
+
+pub const RerankMultimodalDocument = struct {
+    /// Optional caller-provided document identifier
+    id: ?[]const u8 = null,
+    content: antfly_generating_openapi.ChatMessageContent,
 };
 
 pub const RerankObject = struct {
@@ -330,6 +353,9 @@ pub const FinishReason = enum {
     }
 };
 
+/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
+pub const ChatMessageContent = std.json.Value;
+
 pub const GenerateJsonSchemaConfig = struct {
     /// Schema name
     name: ?[]const u8 = null,
@@ -561,6 +587,15 @@ pub const AudioChunkConfig = struct {
     /// Overlap duration in milliseconds between audio chunks (default: 0).
     overlap_duration_ms: ?i64 = null,
     vad: ?VADOptions = null,
+};
+
+pub const RerankMultimodalRequest = struct {
+    /// Name of multimodal reranking model from models_dir/rerankers/
+    model: []const u8,
+    /// Text query for relevance scoring
+    query: []const u8,
+    /// Documents expressed as text and image content parts
+    documents: []const RerankMultimodalDocument,
 };
 
 pub const Relation = struct {
@@ -889,6 +924,15 @@ pub const ReadObject = struct {
     index: i64,
 };
 
+pub const ChatMessage = struct {
+    role: Role,
+    content: ?antfly_generating_openapi.ChatMessageContent = null,
+    /// Tool calls made by the assistant (only for role=assistant)
+    tool_calls: ?[]const ToolCall = null,
+    /// ID of the tool call this message is responding to (only for role=tool)
+    tool_call_id: ?[]const u8 = null,
+};
+
 pub const GenerateMessage = struct {
     role: Role,
     /// The generated message content (null when tool_calls is present)
@@ -967,25 +1011,6 @@ pub const Config = struct {
     log: ?SchemasConfig = null,
 };
 
-/// OpenAI-compatible embedding request with inference multimodal content-part extension
-pub const EmbedRequest = struct {
-    /// Model name to use for embedding generation
-    model: []const u8,
-    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
-    input: std.json.Value,
-    /// Encoding format for the embeddings (only "float" supported)
-    encoding_format: ?[]const u8 = null,
-    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
-    dimensions: ?i64 = null,
-    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
-    task_type: ?[]const u8 = null,
-    /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
-    input_type: ?[]const u8 = null,
-};
-
-/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
-pub const ChatMessageContent = std.json.Value;
-
 pub const ChunkRequest = struct {
     /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` (backward compatible) - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
     input: ?std.json.Value = null,
@@ -1020,81 +1045,6 @@ pub const ReadResponse = struct {
     /// Name of model used for reading
     model: []const u8,
     usage: GenerateUsage,
-};
-
-pub const GenerateChoice = struct {
-    /// Index of this choice in the list
-    index: i64,
-    message: GenerateMessage,
-    finish_reason: FinishReason,
-    /// Log probability information (not supported, always null)
-    logprobs: ?std.json.Value = null,
-};
-
-pub const GenerateChunkChoice = struct {
-    index: i64,
-    delta: GenerateDelta,
-    finish_reason: ?FinishReason = null,
-};
-
-pub const ChunkResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Array of chunk objects
-    data: []const ChunkObject,
-    /// Chunking model actually used (may differ from requested if fallback occurred)
-    model: []const u8,
-    usage: GenerateUsage,
-    /// Whether result was served from cache
-    cache_hit: bool,
-};
-
-pub const RerankMultimodalDocument = struct {
-    /// Optional caller-provided document identifier
-    id: ?[]const u8 = null,
-    content: ChatMessageContent,
-};
-
-pub const ChatMessage = struct {
-    role: Role,
-    content: ?ChatMessageContent = null,
-    /// Tool calls made by the assistant (only for role=assistant)
-    tool_calls: ?[]const ToolCall = null,
-    /// ID of the tool call this message is responding to (only for role=tool)
-    tool_call_id: ?[]const u8 = null,
-};
-
-/// OpenAI-compatible chat completion response
-pub const GenerateResponse = struct {
-    /// A unique identifier for the chat completion
-    id: []const u8,
-    /// The object type, always "chat.completion"
-    object: []const u8,
-    /// Unix timestamp (seconds) when the completion was created
-    created: i64,
-    /// Model used for generation
-    model: []const u8,
-    /// List of completion choices (currently always 1)
-    choices: []const GenerateChoice,
-    usage: GenerateUsage,
-};
-
-/// Streaming generation chunk (SSE event data)
-pub const GenerateChunk = struct {
-    id: []const u8,
-    object: []const u8,
-    created: i64,
-    model: []const u8,
-    choices: []const GenerateChunkChoice,
-};
-
-pub const RerankMultimodalRequest = struct {
-    /// Name of multimodal reranking model from models_dir/rerankers/
-    model: []const u8,
-    /// Text query for relevance scoring
-    query: []const u8,
-    /// Documents expressed as text and image content parts
-    documents: []const RerankMultimodalDocument,
 };
 
 pub const GenerateRequest = struct {
@@ -1142,4 +1092,55 @@ pub const GenerateRequest = struct {
     compiled_target: ?[]const u8 = null,
     /// Controls how the model uses tools
     tool_choice: ?ToolChoice = null,
+};
+
+pub const GenerateChoice = struct {
+    /// Index of this choice in the list
+    index: i64,
+    message: GenerateMessage,
+    finish_reason: FinishReason,
+    /// Log probability information (not supported, always null)
+    logprobs: ?std.json.Value = null,
+};
+
+pub const GenerateChunkChoice = struct {
+    index: i64,
+    delta: GenerateDelta,
+    finish_reason: ?FinishReason = null,
+};
+
+pub const ChunkResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Array of chunk objects
+    data: []const ChunkObject,
+    /// Chunking model actually used (may differ from requested if fallback occurred)
+    model: []const u8,
+    usage: GenerateUsage,
+    /// Whether result was served from cache
+    cache_hit: bool,
+};
+
+/// OpenAI-compatible chat completion response
+pub const GenerateResponse = struct {
+    /// A unique identifier for the chat completion
+    id: []const u8,
+    /// The object type, always "chat.completion"
+    object: []const u8,
+    /// Unix timestamp (seconds) when the completion was created
+    created: i64,
+    /// Model used for generation
+    model: []const u8,
+    /// List of completion choices (currently always 1)
+    choices: []const GenerateChoice,
+    usage: GenerateUsage,
+};
+
+/// Streaming generation chunk (SSE event data)
+pub const GenerateChunk = struct {
+    id: []const u8,
+    object: []const u8,
+    created: i64,
+    model: []const u8,
+    choices: []const GenerateChunkChoice,
 };

@@ -61,7 +61,7 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 
 ```sql
 CREATE INDEX idx_content ON docs USING antfly (content)
-  WITH (url = 'http://localhost:8080/api/v1/', collection = 'my_docs');
+  WITH (url = 'http://localhost:8080/db/v1/', collection = 'my_docs');
 
 SELECT * FROM docs WHERE content @@@ 'fix my computer';
 ```

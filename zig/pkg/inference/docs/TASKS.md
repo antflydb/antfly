@@ -39,7 +39,7 @@ lazy pulls, and request-time resolution.
 - `extract`
 
 That is what users ask antfly inference to do, what API routes represent, and what
-`/ml/v1/models` should advertise.
+`/ai/v1/models` should advertise.
 
 The word `capabilities` is still useful internally for narrower features inside
 one task, for example:
@@ -141,7 +141,7 @@ with `--tasks`.
 
 ## Discovery And Listing
 
-`/ml/v1/models` should stop relying on task folder names as the source of truth.
+`/ai/v1/models` should stop relying on task folder names as the source of truth.
 
 Instead it should:
 
@@ -181,7 +181,7 @@ Short term:
 Long term:
 
 - `antfly inference pull` writes only to the flat layout
-- `/ml/v1/models` classifies from manifest tasks
+- `/ai/v1/models` classifies from manifest tasks
 - task-scoped layout becomes compatibility-only
 
 ## CLI Direction

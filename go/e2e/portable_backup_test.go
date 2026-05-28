@@ -149,7 +149,7 @@ func backupTableWithFormat(t *testing.T, metadataURL, tableName, backupID, locat
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/api/v1/tables/%s/backup", metadataURL, tableName)
+	url := fmt.Sprintf("%s/db/v1/tables/%s/backup", metadataURL, tableName)
 	resp, err := http.Post(url, "application/json", bytes.NewReader(body)) //nolint:gosec,noctx
 	if err != nil {
 		return fmt.Errorf("backup request: %w", err)
@@ -178,7 +178,7 @@ func restoreTableWithFormat(t *testing.T, metadataURL, tableName, backupID, loca
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/api/v1/tables/%s/restore", metadataURL, tableName)
+	url := fmt.Sprintf("%s/db/v1/tables/%s/restore", metadataURL, tableName)
 	resp, err := http.Post(url, "application/json", bytes.NewReader(body)) //nolint:gosec,noctx
 	if err != nil {
 		return fmt.Errorf("restore request: %w", err)
@@ -202,7 +202,7 @@ func restoreTableWithFormat(t *testing.T, metadataURL, tableName, backupID, loca
 				return fmt.Errorf("restore timed out waiting for table to become ready")
 			}
 			// Check if table exists and has shards
-			url := fmt.Sprintf("%s/api/v1/tables/%s", metadataURL, tableName)
+			url := fmt.Sprintf("%s/db/v1/tables/%s", metadataURL, tableName)
 			resp, err := http.Get(url) //nolint:gosec,noctx
 			if err != nil {
 				continue

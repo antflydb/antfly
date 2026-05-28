@@ -141,7 +141,7 @@ func TestCreateEmbeddingIndexUsesAntflyClipClap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AsTermiteChunkerConfig failed: %v", err)
 	}
-	wantChunkerURL := DefaultTermiteURL + "/ml/v1"
+	wantChunkerURL := DefaultTermiteURL + "/ai/v1"
 	if chunker.ApiUrl != wantChunkerURL {
 		t.Fatalf("chunker api URL = %q, want %q", chunker.ApiUrl, wantChunkerURL)
 	}
@@ -153,10 +153,10 @@ func TestTermiteMLBaseURLNormalizesRoots(t *testing.T) {
 		in   string
 		want string
 	}{
-		{name: "root", in: "http://localhost:8080", want: "http://localhost:8080/ml/v1"},
-		{name: "api root", in: "http://localhost:8080/api/v1", want: "http://localhost:8080/ml/v1"},
-		{name: "already ml", in: "http://localhost:8080/ml/v1/", want: "http://localhost:8080/ml/v1"},
-		{name: "cloud root", in: "https://platform.antfly.io/cloud/v1/instance", want: "https://platform.antfly.io/cloud/v1/instance/ml/v1"},
+		{name: "root", in: "http://localhost:8080", want: "http://localhost:8080/ai/v1"},
+		{name: "api root", in: "http://localhost:8080/db/v1", want: "http://localhost:8080/ai/v1"},
+		{name: "already ml", in: "http://localhost:8080/ai/v1/", want: "http://localhost:8080/ai/v1"},
+		{name: "cloud root", in: "https://platform.antfly.io/cloud/v1/instance", want: "https://platform.antfly.io/cloud/v1/instance/ai/v1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

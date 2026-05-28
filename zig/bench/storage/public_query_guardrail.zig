@@ -2193,7 +2193,7 @@ fn runSwarmBench(
     var child = try spawnSwarm(alloc, io, cwd, cfg, root_path[0..root_path.len], bind_port, health_port, metadata_port, metadata_admin_port, store_raft_port);
     defer child.kill(io);
 
-    const base_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/api/v1", .{ cfg.bind_host, bind_port });
+    const base_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/db/v1", .{ cfg.bind_host, bind_port });
     defer alloc.free(base_uri);
     const health_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/healthz", .{ cfg.bind_host, health_port });
     defer alloc.free(health_uri);

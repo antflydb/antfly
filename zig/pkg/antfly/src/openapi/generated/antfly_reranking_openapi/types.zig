@@ -43,11 +43,11 @@ pub const OllamaRerankerConfig = struct {
     url: ?[]const u8 = null,
 };
 
-/// Configuration for the inference reranking provider.
+/// Configuration for the Antfly inference reranking provider.
 pub const AntflyRerankerConfig = struct {
     /// The name of the reranking model (e.g., cross-encoder model name).
     model: []const u8,
-    /// The URL of the Inference API endpoint.
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
 };
 
@@ -82,9 +82,9 @@ pub const RerankerConfig = struct {
     field: ?[]const u8 = null,
     /// Handlebars template to render document text for reranking.
     template: ?[]const u8 = null,
-    /// The name of the Ollama model to use for reranking.
+    /// The name of the reranking model (e.g., cross-encoder model name).
     model: ?[]const u8 = null,
-    /// The URL of the Ollama API endpoint.
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,

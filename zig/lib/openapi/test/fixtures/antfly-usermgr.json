@@ -15,7 +15,7 @@
   },
   "servers": [
     {
-      "url": "/api/v1",
+      "url": "/auth/v1",
       "description": "Main API server"
     }
   ],
@@ -48,7 +48,7 @@
     }
   ],
   "paths": {
-    "/users/me": {
+    "/auth/v1/me": {
       "get": {
         "tags": [
           "User"
@@ -102,7 +102,7 @@
         }
       }
     },
-    "/users": {
+    "/auth/v1/users": {
       "get": {
         "tags": [
           "User"
@@ -163,7 +163,7 @@
         }
       }
     },
-    "/users/{userName}": {
+    "/auth/v1/users/{userName}": {
       "parameters": [
         {
           "$ref": "#/components/parameters/UserNamePathParameter"
@@ -324,7 +324,7 @@
         }
       }
     },
-    "/users/{userName}/password": {
+    "/auth/v1/users/{userName}/password": {
       "parameters": [
         {
           "$ref": "#/components/parameters/UserNamePathParameter"
@@ -392,7 +392,7 @@
         }
       }
     },
-    "/users/{userName}/permissions": {
+    "/auth/v1/users/{userName}/permissions": {
       "parameters": [
         {
           "$ref": "#/components/parameters/UserNamePathParameter"
@@ -577,7 +577,7 @@
         }
       }
     },
-    "/users/{userName}/api-keys": {
+    "/auth/v1/users/{userName}/api-keys": {
       "parameters": [
         {
           "$ref": "#/components/parameters/UserNamePathParameter"
@@ -708,7 +708,7 @@
         }
       }
     },
-    "/users/{userName}/api-keys/{keyId}": {
+    "/auth/v1/users/{userName}/api-keys/{keyId}": {
       "parameters": [
         {
           "$ref": "#/components/parameters/UserNamePathParameter"

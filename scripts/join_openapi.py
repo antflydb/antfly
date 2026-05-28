@@ -222,7 +222,7 @@ def load_shared_joiner():
 def configure_for_repo_contracts(module) -> None:
     module.ROOT = ROOT
     module.METADATA_SPEC = ROOT / "specs/openapi/antfly/metadata.yaml"
-    module.USERMGR_SPEC = ROOT / "specs/openapi/antfly/usermgr.yaml"
+    module.USERMGR_SPEC = ROOT / "specs/openapi/auth/api.yaml"
     module.ROOT_SPEC = ROOT / "openapi.yaml"
     module.GO_SCHEMA_SPEC = ROOT / "go/pkg/antfly/lib/schema/openapi.yaml"
     module.GO_INDEX_SPEC = ROOT / "go/pkg/antfly/src/store/db/indexes/openapi.yaml"
@@ -231,7 +231,11 @@ def configure_for_repo_contracts(module) -> None:
         "../../../go/pkg/antfly/src/store/db/indexes/openapi.yaml",
     }
     module.PATH_REWRITES = {
-        "usermgr.yaml": "specs/openapi/antfly/usermgr.yaml",
+        "../auth/api.yaml": "specs/openapi/auth/api.yaml",
+        "../shared/generating.yaml": "specs/openapi/shared/generating.yaml",
+        "generating.yaml": "specs/openapi/antfly/generating.yaml",
+        "eval.yaml": "specs/openapi/antfly/eval.yaml",
+        "reranking.yaml": "specs/openapi/antfly/reranking.yaml",
         "query.yaml": "specs/openapi/antfly/query.yaml",
         "../../../src/": "go/pkg/antfly/src/",
         "../../../lib/": "go/pkg/antfly/lib/",

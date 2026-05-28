@@ -48,7 +48,7 @@ func TestE2E_Auth(t *testing.T) {
 	})
 	defer swarm.Cleanup()
 
-	baseURL := swarm.MetadataAPIURL + "/api/v1"
+	baseURL := swarm.MetadataAPIURL + "/db/v1"
 
 	// ---- 1. Unauthenticated request → 401 ----
 	t.Log("Step 1: Unauthenticated GET /secrets → 401")
@@ -204,7 +204,7 @@ func TestE2E_ApiKeys(t *testing.T) {
 	})
 	defer swarm.Cleanup()
 
-	baseURL := swarm.MetadataAPIURL + "/api/v1"
+	baseURL := swarm.MetadataAPIURL + "/db/v1"
 	adminAuth := basicAuth("admin", "admin")
 
 	// ---- 1. Create a test user with permissions ----

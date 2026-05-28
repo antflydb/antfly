@@ -176,7 +176,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
   useEffect(() => {
     const fetchModels = async () => {
       try {
-        const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/models`);
+        const response = await fetchWithRetry(`${termiteApiUrl}/ai/v1/models`);
         if (response.ok) {
           const data: ModelsResponse = await response.json();
           const embedders = Object.keys(data.embedders || {});

@@ -12,4 +12,4 @@ output-options:
   prefer-skip-optional-pointer: true
   prefer-skip-optional-pointer-with-omitzero: true
 import-mapping:
-  ../s3/openapi.yaml: github.com/antflydb/antfly/go/pkg/libaf/s3
+  ../../../../specs/openapi/shared/s3.yaml: github.com/antflydb/antfly/go/pkg/libaf/s3

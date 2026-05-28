@@ -54,7 +54,7 @@ func TestE2E_SecretsAPI(t *testing.T) {
 	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
 	defer swarm.Cleanup()
 
-	baseURL := swarm.MetadataAPIURL + "/api/v1"
+	baseURL := swarm.MetadataAPIURL + "/db/v1"
 
 	// ---- 1. GET /secrets — initially empty (or env-var-only) ----
 	t.Log("Step 1: List secrets (expect empty)")

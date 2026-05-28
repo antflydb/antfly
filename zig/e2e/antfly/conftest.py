@@ -22,7 +22,7 @@ Usage:
 
     # Run stateful tests against an existing server:
     ANTFLY_STATEFUL_URL=http://127.0.0.1:8080 uv run --project e2e/antfly pytest e2e/antfly/test_schema_migration.py
-    # For Go Antfly, also set ANTFLY_STATEFUL_API_ROOT=/api/v1.
+    # For Go Antfly, also set ANTFLY_STATEFUL_API_ROOT=/db/v1.
 
     # Or start the local unified stateful entrypoint automatically:
     ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest e2e/antfly/test_schema_migration.py
@@ -49,9 +49,9 @@ import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
-ANTFLY_PUBLIC_API_ROOT = "/api/v1"
+ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
-TERMITE_PUBLIC_API_ROOT = "/ml/v1"
+TERMITE_PUBLIC_API_ROOT = "/ai/v1"
 CLIPCLAP_MODEL = "antflydb/clipclap"
 CLIPCLAP_GGUF_FILES = (
     "clipclap-clip.Q4_K.gguf",

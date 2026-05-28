@@ -5,21 +5,21 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.termite_error import TermiteError
-from ...models.termite_recognize_request import TermiteRecognizeRequest
-from ...models.termite_recognize_response import TermiteRecognizeResponse
+from ...models.inference_error import InferenceError
+from ...models.inference_recognize_request import InferenceRecognizeRequest
+from ...models.inference_recognize_response import InferenceRecognizeResponse
 from ...types import Response
 
 
 def _get_kwargs(
     *,
-    body: TermiteRecognizeRequest,
+    body: InferenceRecognizeRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/ml/v1/recognize",
+        "url": "/ai/v1/recognize",
     }
 
     _kwargs["json"] = body.to_dict()
@@ -32,29 +32,29 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> TermiteError | TermiteRecognizeResponse | None:
+) -> InferenceError | InferenceRecognizeResponse | None:
     if response.status_code == 200:
-        response_200 = TermiteRecognizeResponse.from_dict(response.json())
+        response_200 = InferenceRecognizeResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 400:
-        response_400 = TermiteError.from_dict(response.json())
+        response_400 = InferenceError.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 404:
-        response_404 = TermiteError.from_dict(response.json())
+        response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
     if response.status_code == 500:
-        response_500 = TermiteError.from_dict(response.json())
+        response_500 = InferenceError.from_dict(response.json())
 
         return response_500
 
     if response.status_code == 503:
-        response_503 = TermiteError.from_dict(response.json())
+        response_503 = InferenceError.from_dict(response.json())
 
         return response_503
 
@@ -66,7 +66,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[TermiteError | TermiteRecognizeResponse]:
+) -> Response[InferenceError | InferenceRecognizeResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -78,8 +78,8 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteRecognizeRequest,
-) -> Response[TermiteError | TermiteRecognizeResponse]:
+    body: InferenceRecognizeRequest,
+) -> Response[InferenceError | InferenceRecognizeResponse]:
     r"""Recognize named entities
 
      Recognizes named entities (persons, organizations, locations, etc.) from text using ONNX recognition
@@ -101,14 +101,14 @@ def sync_detailed(
     - GLiNER models support custom entity labels via the `labels` parameter
 
     Args:
-        body (TermiteRecognizeRequest):
+        body (InferenceRecognizeRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteRecognizeResponse]
+        Response[InferenceError | InferenceRecognizeResponse]
     """
 
     kwargs = _get_kwargs(
@@ -125,8 +125,8 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteRecognizeRequest,
-) -> TermiteError | TermiteRecognizeResponse | None:
+    body: InferenceRecognizeRequest,
+) -> InferenceError | InferenceRecognizeResponse | None:
     r"""Recognize named entities
 
      Recognizes named entities (persons, organizations, locations, etc.) from text using ONNX recognition
@@ -148,14 +148,14 @@ def sync(
     - GLiNER models support custom entity labels via the `labels` parameter
 
     Args:
-        body (TermiteRecognizeRequest):
+        body (InferenceRecognizeRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteRecognizeResponse
+        InferenceError | InferenceRecognizeResponse
     """
 
     return sync_detailed(
@@ -167,8 +167,8 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteRecognizeRequest,
-) -> Response[TermiteError | TermiteRecognizeResponse]:
+    body: InferenceRecognizeRequest,
+) -> Response[InferenceError | InferenceRecognizeResponse]:
     r"""Recognize named entities
 
      Recognizes named entities (persons, organizations, locations, etc.) from text using ONNX recognition
@@ -190,14 +190,14 @@ async def asyncio_detailed(
     - GLiNER models support custom entity labels via the `labels` parameter
 
     Args:
-        body (TermiteRecognizeRequest):
+        body (InferenceRecognizeRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteRecognizeResponse]
+        Response[InferenceError | InferenceRecognizeResponse]
     """
 
     kwargs = _get_kwargs(
@@ -212,8 +212,8 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteRecognizeRequest,
-) -> TermiteError | TermiteRecognizeResponse | None:
+    body: InferenceRecognizeRequest,
+) -> InferenceError | InferenceRecognizeResponse | None:
     r"""Recognize named entities
 
      Recognizes named entities (persons, organizations, locations, etc.) from text using ONNX recognition
@@ -235,14 +235,14 @@ async def asyncio(
     - GLiNER models support custom entity labels via the `labels` parameter
 
     Args:
-        body (TermiteRecognizeRequest):
+        body (InferenceRecognizeRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteRecognizeResponse
+        InferenceError | InferenceRecognizeResponse
     """
 
     return (

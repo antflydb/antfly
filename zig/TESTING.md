@@ -199,7 +199,7 @@ Common Antfly E2E environment variables:
 - `ANTFLY_BIN`: local Antfly binary to auto-start, usually `./zig-out/bin/antfly`.
 - `ANTFLY_SERVERLESS_URL`: existing serverless API endpoint.
 - `ANTFLY_STATEFUL_URL`: existing stateful API endpoint.
-- `ANTFLY_STATEFUL_API_ROOT`: stateful API root override; use `/api/v1` for Go Antfly.
+- `ANTFLY_STATEFUL_API_ROOT`: stateful API root override; use `/db/v1` for Go Antfly.
 - `ANTFLY_E2E_PRESERVE_ROOT=1`: preserve per-test data roots for debugging.
 - `ANTFLY_E2E_ALLOW_REAL_MODEL_DOWNLOAD=1`: allow real model downloads for model-backed tests.
 

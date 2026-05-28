@@ -25,20 +25,20 @@ import (
 )
 
 type TermiteReranker struct {
-	client   *client.TermiteClient
+	client   *client.InferenceClient
 	config   RerankerConfig
 	field    string
 	template string
 }
 
 func init() {
-	RegisterReranker(RerankerProviderTermite, NewTermiteReranker)
+	RegisterReranker(RerankerProviderAntfly, NewTermiteReranker)
 }
 
 func NewTermiteReranker(config RerankerConfig) (Reranker, error) {
-	c, err := config.AsTermiteRerankerConfig()
+	c, err := config.AsAntflyRerankerConfig()
 	if err != nil {
-		return nil, fmt.Errorf("parsing termite config: %w", err)
+		return nil, fmt.Errorf("parsing antfly inference config: %w", err)
 	}
 
 	url := "http://localhost:11433"
@@ -57,9 +57,9 @@ func NewTermiteReranker(config RerankerConfig) (Reranker, error) {
 	}
 
 	httpClient := &http.Client{Timeout: time.Second * 540}
-	termiteClient, err := client.NewTermiteClient(url, httpClient)
+	termiteClient, err := client.NewInferenceClient(url, httpClient)
 	if err != nil {
-		return nil, fmt.Errorf("creating termite client: %w", err)
+		return nil, fmt.Errorf("creating inference client: %w", err)
 	}
 
 	return &TermiteReranker{
@@ -76,9 +76,9 @@ func (t *TermiteReranker) Rerank(
 	documents []schema.Document,
 ) ([]float32, error) {
 	// Extract model name from config
-	termiteConfig, err := t.config.AsTermiteRerankerConfig()
+	antflyConfig, err := t.config.AsAntflyRerankerConfig()
 	if err != nil {
-		return nil, fmt.Errorf("extracting termite config: %w", err)
+		return nil, fmt.Errorf("extracting antfly inference config: %w", err)
 	}
 
 	// Extract text from documents using field or template
@@ -87,8 +87,8 @@ func (t *TermiteReranker) Rerank(
 		return nil, fmt.Errorf("extracting document texts: %w", err)
 	}
 
-	// Rerank using termite client
-	scores, err := t.client.Rerank(ctx, termiteConfig.Model, query, prompts)
+	// Rerank using the inference client
+	scores, err := t.client.Rerank(ctx, antflyConfig.Model, query, prompts)
 	if err != nil {
 		return nil, err
 	}

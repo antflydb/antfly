@@ -115,7 +115,7 @@ antfly table create --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/tables/wikipedia \
+curl -X POST http://localhost:8080/db/v1/tables/wikipedia \
   -H "Content-Type: application/json" \
   -d '{
     "indexes": {
@@ -293,7 +293,7 @@ antfly load --table wikipedia \
 ```bash
 # The CLI 'load' command handles batching automatically.
 # With cURL, send documents via the batch endpoint:
-curl -X POST http://localhost:8080/api/v1/tables/wikipedia/batch \
+curl -X POST http://localhost:8080/db/v1/tables/wikipedia/batch \
   -H "Content-Type: application/json" \
   -d '{
     "inserts": {
@@ -455,7 +455,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/query \
+curl -X POST http://localhost:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -572,7 +572,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/query \
+curl -X POST http://localhost:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -708,7 +708,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/query \
+curl -X POST http://localhost:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -865,7 +865,7 @@ antfly index create --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/tables/wikipedia/indexes/thumbnail \
+curl -X POST http://localhost:8080/db/v1/tables/wikipedia/indexes/thumbnail \
   -H "Content-Type: application/json" \
   -d '{
     "type": "embeddings",
@@ -978,7 +978,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/query \
+curl -X POST http://localhost:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -1107,7 +1107,7 @@ antfly agents retrieval --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/api/v1/agents/retrieval \
+curl -X POST http://localhost:8080/db/v1/agents/retrieval \
   -H "Content-Type: application/json" \
   -d '{
     "queries": [{

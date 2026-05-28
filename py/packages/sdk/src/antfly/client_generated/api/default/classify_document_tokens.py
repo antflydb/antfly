@@ -5,21 +5,21 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.termite_document_token_classification_request import TermiteDocumentTokenClassificationRequest
-from ...models.termite_document_token_classification_response import TermiteDocumentTokenClassificationResponse
-from ...models.termite_error import TermiteError
+from ...models.inference_document_token_classification_request import InferenceDocumentTokenClassificationRequest
+from ...models.inference_document_token_classification_response import InferenceDocumentTokenClassificationResponse
+from ...models.inference_error import InferenceError
 from ...types import Response
 
 
 def _get_kwargs(
     *,
-    body: TermiteDocumentTokenClassificationRequest,
+    body: InferenceDocumentTokenClassificationRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/ml/v1/classify/document_tokens",
+        "url": "/ai/v1/classify/document_tokens",
     }
 
     _kwargs["json"] = body.to_dict()
@@ -32,29 +32,29 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> TermiteDocumentTokenClassificationResponse | TermiteError | None:
+) -> InferenceDocumentTokenClassificationResponse | InferenceError | None:
     if response.status_code == 200:
-        response_200 = TermiteDocumentTokenClassificationResponse.from_dict(response.json())
+        response_200 = InferenceDocumentTokenClassificationResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 400:
-        response_400 = TermiteError.from_dict(response.json())
+        response_400 = InferenceError.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 404:
-        response_404 = TermiteError.from_dict(response.json())
+        response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
     if response.status_code == 500:
-        response_500 = TermiteError.from_dict(response.json())
+        response_500 = InferenceError.from_dict(response.json())
 
         return response_500
 
     if response.status_code == 503:
-        response_503 = TermiteError.from_dict(response.json())
+        response_503 = InferenceError.from_dict(response.json())
 
         return response_503
 
@@ -66,7 +66,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[TermiteDocumentTokenClassificationResponse | TermiteError]:
+) -> Response[InferenceDocumentTokenClassificationResponse | InferenceError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -78,8 +78,8 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteDocumentTokenClassificationRequest,
-) -> Response[TermiteDocumentTokenClassificationResponse | TermiteError]:
+    body: InferenceDocumentTokenClassificationRequest,
+) -> Response[InferenceDocumentTokenClassificationResponse | InferenceError]:
     """Document token classification
 
      Runs a native document token classification head against caller-provided OCR tokens and bounding
@@ -102,14 +102,14 @@ def sync_detailed(
     - Label vocab discovery from checkpoint artifacts
 
     Args:
-        body (TermiteDocumentTokenClassificationRequest):
+        body (InferenceDocumentTokenClassificationRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteDocumentTokenClassificationResponse | TermiteError]
+        Response[InferenceDocumentTokenClassificationResponse | InferenceError]
     """
 
     kwargs = _get_kwargs(
@@ -126,8 +126,8 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteDocumentTokenClassificationRequest,
-) -> TermiteDocumentTokenClassificationResponse | TermiteError | None:
+    body: InferenceDocumentTokenClassificationRequest,
+) -> InferenceDocumentTokenClassificationResponse | InferenceError | None:
     """Document token classification
 
      Runs a native document token classification head against caller-provided OCR tokens and bounding
@@ -150,14 +150,14 @@ def sync(
     - Label vocab discovery from checkpoint artifacts
 
     Args:
-        body (TermiteDocumentTokenClassificationRequest):
+        body (InferenceDocumentTokenClassificationRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteDocumentTokenClassificationResponse | TermiteError
+        InferenceDocumentTokenClassificationResponse | InferenceError
     """
 
     return sync_detailed(
@@ -169,8 +169,8 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteDocumentTokenClassificationRequest,
-) -> Response[TermiteDocumentTokenClassificationResponse | TermiteError]:
+    body: InferenceDocumentTokenClassificationRequest,
+) -> Response[InferenceDocumentTokenClassificationResponse | InferenceError]:
     """Document token classification
 
      Runs a native document token classification head against caller-provided OCR tokens and bounding
@@ -193,14 +193,14 @@ async def asyncio_detailed(
     - Label vocab discovery from checkpoint artifacts
 
     Args:
-        body (TermiteDocumentTokenClassificationRequest):
+        body (InferenceDocumentTokenClassificationRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteDocumentTokenClassificationResponse | TermiteError]
+        Response[InferenceDocumentTokenClassificationResponse | InferenceError]
     """
 
     kwargs = _get_kwargs(
@@ -215,8 +215,8 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteDocumentTokenClassificationRequest,
-) -> TermiteDocumentTokenClassificationResponse | TermiteError | None:
+    body: InferenceDocumentTokenClassificationRequest,
+) -> InferenceDocumentTokenClassificationResponse | InferenceError | None:
     """Document token classification
 
      Runs a native document token classification head against caller-provided OCR tokens and bounding
@@ -239,14 +239,14 @@ async def asyncio(
     - Label vocab discovery from checkpoint artifacts
 
     Args:
-        body (TermiteDocumentTokenClassificationRequest):
+        body (InferenceDocumentTokenClassificationRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteDocumentTokenClassificationResponse | TermiteError
+        InferenceDocumentTokenClassificationResponse | InferenceError
     """
 
     return (

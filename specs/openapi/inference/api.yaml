@@ -20,7 +20,7 @@ info:
 
     Antfly inference can run standalone or as part of an Antfly cluster:
     - Local ONNX model inference without external API dependencies
-    - OpenAI-compatible embedding payloads served at `/ml/v1/embed` and `/ml/v1/embeddings`
+    - OpenAI-compatible embedding payloads served at `/ai/v1/embed` and `/ai/v1/embeddings`
     - Semantic text chunking for RAG pipelines
     - Relevance reranking for improved search quality
     - Centralized model serving across distributed nodes
@@ -30,7 +30,7 @@ info:
 
     ### Embedding Generation
     - **Models**: ONNX models auto-discovered from `{models_dir}/embedders/`
-    - **API**: OpenAI-compatible payloads served at `/ml/v1/embed` and `/ml/v1/embeddings`
+    - **API**: OpenAI-compatible payloads served at `/ai/v1/embed` and `/ai/v1/embeddings`
     - **Response Shape**: Each `data[i].embedding` is either a dense float vector or a sparse `{indices, values}` object
 
     ### Text Chunking
@@ -50,7 +50,7 @@ info:
     name: All Rights Reserved
     url: https://antfly.io/legal
 servers:
-  - url: /ml/v1
+  - url: /ai/v1
     description: Inference API server
 security: []
 paths:
@@ -58,7 +58,7 @@ paths:
     post:
       summary: Create embeddings (alias of `/embeddings`)
       description: |
-        Alias of `/ml/v1/embeddings`.
+        Alias of `/ai/v1/embeddings`.
 
         Accepts the OpenAI embeddings request shape and returns the same OpenAI-compatible
         response envelope. For sparse-capable models, `data[i].embedding` is a sparse
@@ -259,7 +259,7 @@ paths:
         ## Models
 
         Models are auto-discovered from `models_dir/generators/` at startup.
-        Use the `/ml/v1/models` endpoint to list available models.
+        Use the `/ai/v1/models` endpoint to list available models.
 
         ## Streaming
 
@@ -662,7 +662,7 @@ paths:
         ## Models
 
         Models are auto-discovered from `models_dir/readers/` at startup.
-        Use the `/ml/v1/models` endpoint to list available models.
+        Use the `/ai/v1/models` endpoint to list available models.
 
         - **TrOCR**: Pure OCR for printed/handwritten text
         - **Donut**: Document understanding with structured output (receipts, forms)
@@ -958,7 +958,7 @@ paths:
       summary: Create embeddings (OpenAI-compatible)
       description: |
         OpenAI-compatible embeddings endpoint. Accepts the same request format
-        as OpenAI's `/v1/embeddings` API, served here under `/ml/v1/embeddings`.
+        as OpenAI's `/v1/embeddings` API, served here under `/ai/v1/embeddings`.
         For sparse-capable models, each `data` item still uses the `embedding`
         field, but its value is a sparse vector object instead of a dense float array.
         Use this endpoint for drop-in compatibility with OpenAI SDKs.
@@ -1093,7 +1093,7 @@ components:
             - type: array
               description: Array of multimodal content parts
               items:
-                $ref: '#/components/schemas/ContentPart'
+                $ref: '../shared/generating.yaml#/components/schemas/ContentPart'
         encoding_format:
           type: string
           description: Encoding format for the embeddings (only "float" supported)
@@ -1249,7 +1249,7 @@ components:
           oneOf:
             - type: string
               description: Text to chunk (backward compatible)
-            - $ref: '#/components/schemas/ContentPart'
+            - $ref: '../shared/generating.yaml#/components/schemas/ContentPart'
               description: Content part (text or media)
         text:
           type: string
@@ -1359,7 +1359,7 @@ components:
           type: string
           description: Optional caller-provided document identifier
         content:
-          $ref: '#/components/schemas/ChatMessageContent'
+          $ref: '../shared/generating.yaml#/components/schemas/ChatMessageContent'
     RerankMultimodalRequest:
       type: object
       required:
@@ -2626,7 +2626,7 @@ components:
         - type: array
           description: Array of content parts (OpenAI multimodal format)
           items:
-            $ref: '#/components/schemas/ContentPart'
+            $ref: '../shared/generating.yaml#/components/schemas/ContentPart'
     ChatMessage:
       type: object
       required:
@@ -2635,7 +2635,7 @@ components:
         role:
           $ref: '#/components/schemas/Role'
         content:
-          $ref: '#/components/schemas/ChatMessageContent'
+          $ref: '../shared/generating.yaml#/components/schemas/ChatMessageContent'
         tool_calls:
           type: array
           items:

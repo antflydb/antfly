@@ -30,11 +30,11 @@ func TestNewChunkerConfig(t *testing.T) {
 	}{
 		{
 			name: "termite config",
-			config: TermiteChunkerConfig{
+			config: AntflyChunkerConfig{
 				Model: termchunking.ModelFixedBert,
 			},
 			wantErr:      false,
-			wantProvider: ChunkerProviderTermite,
+			wantProvider: ChunkerProviderAntfly,
 		},
 		{
 			name:    "unknown config type",
@@ -60,7 +60,7 @@ func TestNewChunkerConfig(t *testing.T) {
 func TestGetProviderConfig(t *testing.T) {
 	targetTokens := 500
 	overlapTokens := 50
-	termiteConfig := TermiteChunkerConfig{
+	termiteConfig := AntflyChunkerConfig{
 		Model: termchunking.ModelFixedBert,
 		Text: libafchunking.TextChunkOptions{
 			TargetTokens:  targetTokens,
@@ -78,7 +78,7 @@ func TestGetProviderConfig(t *testing.T) {
 		t.Fatalf("GetProviderConfig() failed: %v", err)
 	}
 
-	termite, ok := got.(TermiteChunkerConfig)
+	termite, ok := got.(AntflyChunkerConfig)
 	if !ok {
 		t.Fatalf("GetProviderConfig() returned wrong type: %T", got)
 	}
@@ -98,7 +98,7 @@ func TestRoundTrip(t *testing.T) {
 	// Test that we can round-trip a config through NewChunkerConfig and GetProviderConfig
 	targetTokens := 1000
 	maxChunks := 100
-	original := TermiteChunkerConfig{
+	original := AntflyChunkerConfig{
 		Model:     "chonky-mmbert-small-multilingual-1", // Use actual model name (directory-based)
 		MaxChunks: maxChunks,
 		Text: libafchunking.TextChunkOptions{
@@ -116,7 +116,7 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatalf("GetProviderConfig() failed: %v", err)
 	}
 
-	termite, ok := extracted.(TermiteChunkerConfig)
+	termite, ok := extracted.(AntflyChunkerConfig)
 	if !ok {
 		t.Fatalf("GetProviderConfig() returned wrong type: %T", extracted)
 	}

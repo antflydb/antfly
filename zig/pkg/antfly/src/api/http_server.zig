@@ -6886,10 +6886,10 @@ pub fn buildLocalSchemaUpdateStatus(alloc: std.mem.Allocator, table_name: []cons
 }
 
 pub fn stripApiPrefix(path: []const u8) []const u8 {
-    const prefix = "/api/v1";
+    const prefix = "/db/v1";
     if (std.mem.startsWith(u8, path, prefix)) {
         const rest = path[prefix.len..];
-        // "/api/v1" alone or "/api/v1/" → "/"
+        // "/db/v1" alone or "/db/v1/" → "/"
         if (rest.len == 0) return "/";
         return rest;
     }
@@ -6987,11 +6987,11 @@ test "api http server serves status" {
     try std.testing.expectEqualStrings("application/json", readyz.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, readyz.body, "\"status\":\"ready\"") != null);
 
-    var prefixed_healthz = try server.handle(.{ .method = .GET, .uri = "/api/v1/healthz" });
+    var prefixed_healthz = try server.handle(.{ .method = .GET, .uri = "/db/v1/healthz" });
     defer prefixed_healthz.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), prefixed_healthz.status);
 
-    var prefixed_readyz = try server.handle(.{ .method = .GET, .uri = "/api/v1/readyz" });
+    var prefixed_readyz = try server.handle(.{ .method = .GET, .uri = "/db/v1/readyz" });
     defer prefixed_readyz.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), prefixed_readyz.status);
 

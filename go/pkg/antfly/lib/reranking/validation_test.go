@@ -30,8 +30,8 @@ func TestRerankerProviderValidate(t *testing.T) {
 			wantErr:  false,
 		},
 		{
-			name:     "valid termite",
-			provider: RerankerProviderTermite,
+			name:     "valid antfly",
+			provider: RerankerProviderAntfly,
 			wantErr:  false,
 		},
 		{
@@ -79,7 +79,7 @@ func TestValidRerankerProviders(t *testing.T) {
 	// Check that known providers are present (from generated constants)
 	knownProviders := []RerankerProvider{
 		RerankerProviderOllama,
-		RerankerProviderTermite,
+		RerankerProviderAntfly,
 	}
 
 	providerSet := make(map[RerankerProvider]bool)

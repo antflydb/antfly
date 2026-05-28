@@ -286,7 +286,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/ml/v1/models`, {
+        const response = await fetch(`${termiteApiUrl}/ai/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -394,7 +394,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         }
       }
 
-      const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/recognize`, {
+      const response = await fetchWithRetry(`${termiteApiUrl}/ai/v1/recognize`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

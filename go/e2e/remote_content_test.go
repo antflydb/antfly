@@ -393,7 +393,7 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Create client
-	apiURL := metadataAPIURL + "/api/v1"
+	apiURL := metadataAPIURL + "/db/v1"
 	httpClient := &http.Client{Timeout: 5 * time.Minute}
 	client, err := antfly.NewAntflyClient(apiURL, httpClient)
 	require.NoError(t, err)
@@ -404,9 +404,10 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	tableName := "remote_content_test"
 
 	var embedderConfig oapi.EmbedderConfig
-	embedderConfig.Provider = oapi.EmbedderProviderTermite
-	err = embedderConfig.FromTermiteEmbedderConfig(oapi.TermiteEmbedderConfig{
-		Model: clipModelName,
+	embedderConfig.Provider = oapi.EmbedderProviderAntfly
+	err = embedderConfig.FromAntflyEmbedderConfig(oapi.AntflyEmbedderConfig{
+		Model:  clipModelName,
+		ApiUrl: GetTermiteURL(),
 	})
 	require.NoError(t, err)
 
@@ -738,7 +739,7 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 
 	time.Sleep(500 * time.Millisecond)
 
-	apiURL := metadataAPIURL + "/api/v1"
+	apiURL := metadataAPIURL + "/db/v1"
 	httpClient := &http.Client{Timeout: 5 * time.Minute}
 	client, err := antfly.NewAntflyClient(apiURL, httpClient)
 	require.NoError(t, err)
@@ -749,8 +750,8 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 
 	// CLIP embedder config
 	var clipEmbedder oapi.EmbedderConfig
-	clipEmbedder.Provider = oapi.EmbedderProviderTermite
-	err = clipEmbedder.FromTermiteEmbedderConfig(oapi.TermiteEmbedderConfig{Model: clipModelName})
+	clipEmbedder.Provider = oapi.EmbedderProviderAntfly
+	err = clipEmbedder.FromAntflyEmbedderConfig(oapi.AntflyEmbedderConfig{Model: clipModelName, ApiUrl: GetTermiteURL()})
 	require.NoError(t, err)
 
 	var imageIndex oapi.IndexConfig
@@ -765,8 +766,8 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 
 	// CLAP embedder config
 	var clapEmbedder oapi.EmbedderConfig
-	clapEmbedder.Provider = oapi.EmbedderProviderTermite
-	err = clapEmbedder.FromTermiteEmbedderConfig(oapi.TermiteEmbedderConfig{Model: clapModelName})
+	clapEmbedder.Provider = oapi.EmbedderProviderAntfly
+	err = clapEmbedder.FromAntflyEmbedderConfig(oapi.AntflyEmbedderConfig{Model: clapModelName, ApiUrl: GetTermiteURL()})
 	require.NoError(t, err)
 
 	var audioIndex oapi.IndexConfig

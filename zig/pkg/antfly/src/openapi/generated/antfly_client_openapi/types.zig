@@ -1820,7 +1820,7 @@ pub const RetrievalAgentResult = struct {
     /// Total number of tool calls made during retrieval
     tool_calls_made: ?i64 = null,
     /// Optional conversational context including tool calls and responses. Decisions remain the authoritative continuation input for bounded agent interactions.
-    messages: ?[]const antfly_ai_openapi.ChatMessage = null,
+    messages: ?[]const antfly_generating_openapi.ChatMessage = null,
     /// Query classification and transformation result. Present when steps.classification was configured. Includes strategy, semantic_query, sub_questions (decompose), step_back_query, and reasoning.
     classification: ?antfly_ai_openapi.ClassificationTransformationResult = null,
     /// Generated response in markdown format. Present when steps.generation was configured.
@@ -2220,7 +2220,7 @@ pub const RetrievalAgentRequest = struct {
     /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available.
     queries: []const RetrievalQueryRequest,
     /// Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
-    messages: ?[]const antfly_ai_openapi.ChatMessage = null,
+    messages: ?[]const antfly_generating_openapi.ChatMessage = null,
     /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
     agent_knowledge: ?[]const u8 = null,
     /// Pre-applied filters from prior interactions. These are applied to all search tool invocations.

@@ -597,7 +597,7 @@ pub fn runFromIterator(
     };
     if (loaded_config) |*cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
-        if (cfg.antfly.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
+        if (cfg.inference.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
     defer antfly_node.deinit();
@@ -870,19 +870,19 @@ fn serveUnifiedInner(
     });
     defer server.deinit();
 
-    // Register antfly routes under /ml/v1
+    // Register antfly routes under /ai/v1
     if (antfly_node) |node| {
         try node.registerRoutesOn(inference.server.public_api_prefix, &server);
     }
 
-    // Register antfly public API routes under /api/v1
+    // Register antfly public API routes under /db/v1
     const public_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(handler);
-    var public_prefixed = PrefixedServer("/api/v1", httpx.Server){ .inner = &server };
+    var public_prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = &server };
     try public_router.register(&public_prefixed);
 
-    // Register usermgr routes under /api/v1
+    // Register user management routes under /auth/v1
     const usermgr_router = usermgr_openapi.server.ServerRouter(AntflyApiHandler).init(handler);
-    try usermgr_router.register(&public_prefixed);
+    try usermgr_router.register(&server);
 
     // Health/ready at root level
     try server.get("/healthz", healthzHandler);
@@ -1510,7 +1510,7 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
 
 fn resolveAntflyModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
     if (cli.inference_models_dir) |value| return value;
-    if (cfg) |loaded| return loaded.antfly.models_dir;
+    if (cfg) |loaded| return loaded.inference.models_dir;
     return null;
 }
 
@@ -1696,8 +1696,8 @@ test "swarm runtime registers antfarm static routes" {
 }
 
 test "swarm runtime antfarm path guards keep api routes reserved" {
-    try std.testing.expect(isAntfarmReservedPath("/api/v1/tables"));
-    try std.testing.expect(isAntfarmReservedPath("/ml/v1/models"));
+    try std.testing.expect(isAntfarmReservedPath("/db/v1/tables"));
+    try std.testing.expect(isAntfarmReservedPath("/ai/v1/models"));
     try std.testing.expect(isAntfarmReservedPath("/antfly/readyz"));
     try std.testing.expect(!isAntfarmReservedPath("/models"));
     try std.testing.expect(hasUnsafeStaticPath("../index.html"));
@@ -1750,7 +1750,7 @@ test "antfly config uses cli override before common config" {
         .registry = antfly.common.provider_registry.Registry.init(alloc),
         .speech_to_text = antfly.transcribing.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
-        .antfly = .{
+        .inference = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:9000"),
             .models_dir = try alloc.dupe(u8, "/tmp/from-config"),
         },
@@ -1798,7 +1798,7 @@ test "antfly config falls back to common config" {
         .registry = antfly.common.provider_registry.Registry.init(alloc),
         .speech_to_text = antfly.transcribing.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
-        .antfly = .{
+        .inference = .{
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
         },
@@ -1818,7 +1818,7 @@ test "swarm runtime resolves paths from common storage base dir" {
         .storage = .{
             .local_base_dir = try alloc.dupe(u8, "/tmp/antflydb"),
         },
-        .antfly = .{},
+        .inference = .{},
     };
     defer cfg.deinit();
 
@@ -1862,7 +1862,7 @@ test "swarm runtime data dir overrides common storage base dir" {
         .storage = .{
             .local_base_dir = try alloc.dupe(u8, "/tmp/from-config"),
         },
-        .antfly = .{},
+        .inference = .{},
     };
     defer cfg.deinit();
 

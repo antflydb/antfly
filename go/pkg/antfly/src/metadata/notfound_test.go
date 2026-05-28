@@ -33,28 +33,28 @@ func TestApplyPatternCorrections(t *testing.T) {
 	}{
 		{
 			name:     "singular table to plural",
-			input:    "/api/v1/table",
-			expected: "/api/v1/tables",
+			input:    "/db/v1/table",
+			expected: "/db/v1/tables",
 		},
 		{
 			name:     "singular index to plural",
-			input:    "/api/v1/tables/foo/index",
-			expected: "/api/v1/tables/foo/indexes",
+			input:    "/db/v1/tables/foo/index",
+			expected: "/db/v1/tables/foo/indexes",
 		},
 		{
 			name:     "nested index path",
-			input:    "/api/v1/tables/mytable/index/myindex",
-			expected: "/api/v1/tables/mytable/indexes/myindex",
+			input:    "/db/v1/tables/mytable/index/myindex",
+			expected: "/db/v1/tables/mytable/indexes/myindex",
 		},
 		{
 			name:     "singular agent to plural",
-			input:    "/api/v1/agent/retrieval",
-			expected: "/api/v1/agents/retrieval",
+			input:    "/db/v1/agent/retrieval",
+			expected: "/db/v1/agents/retrieval",
 		},
 		{
 			name:     "already plural - no change",
-			input:    "/api/v1/tables",
-			expected: "/api/v1/tables",
+			input:    "/db/v1/tables",
+			expected: "/db/v1/tables",
 		},
 		{
 			name:     "non-API path - no change",
@@ -63,8 +63,8 @@ func TestApplyPatternCorrections(t *testing.T) {
 		},
 		{
 			name:     "multiple corrections in one path",
-			input:    "/api/v1/table/foo/index/bar",
-			expected: "/api/v1/tables/foo/indexes/bar",
+			input:    "/db/v1/table/foo/index/bar",
+			expected: "/db/v1/tables/foo/indexes/bar",
 		},
 	}
 
@@ -87,38 +87,38 @@ func TestMatchesPattern(t *testing.T) {
 	}{
 		{
 			name:     "exact match",
-			path:     "/api/v1/tables",
-			pattern:  "/api/v1/tables",
+			path:     "/db/v1/tables",
+			pattern:  "/db/v1/tables",
 			expected: true,
 		},
 		{
 			name:     "parameter match",
-			path:     "/api/v1/tables/mytable",
-			pattern:  "/api/v1/tables/{tableName}",
+			path:     "/db/v1/tables/mytable",
+			pattern:  "/db/v1/tables/{tableName}",
 			expected: true,
 		},
 		{
 			name:     "multiple parameters",
-			path:     "/api/v1/tables/mytable/indexes/myindex",
-			pattern:  "/api/v1/tables/{tableName}/indexes/{indexName}",
+			path:     "/db/v1/tables/mytable/indexes/myindex",
+			pattern:  "/db/v1/tables/{tableName}/indexes/{indexName}",
 			expected: true,
 		},
 		{
 			name:     "no match - different segments",
-			path:     "/api/v1/table",
-			pattern:  "/api/v1/tables",
+			path:     "/db/v1/table",
+			pattern:  "/db/v1/tables",
 			expected: false,
 		},
 		{
 			name:     "no match - different length",
-			path:     "/api/v1/tables/foo/bar",
-			pattern:  "/api/v1/tables/{tableName}",
+			path:     "/db/v1/tables/foo/bar",
+			pattern:  "/db/v1/tables/{tableName}",
 			expected: false,
 		},
 		{
 			name:     "trailing slash handling",
-			path:     "/api/v1/tables/",
-			pattern:  "/api/v1/tables",
+			path:     "/db/v1/tables/",
+			pattern:  "/db/v1/tables",
 			expected: true,
 		},
 	}
@@ -247,31 +247,31 @@ func TestFuzzyMatchEndpoints(t *testing.T) {
 	}{
 		{
 			name:          "typo in tables",
-			requestedPath: "/api/v1/tabel",
+			requestedPath: "/db/v1/tabel",
 			expectMatch:   true,
-			expectContain: "/api/v1/tables",
+			expectContain: "/db/v1/tables",
 		},
 		{
 			name:          "missing character",
-			requestedPath: "/api/v1/tbles",
+			requestedPath: "/db/v1/tbles",
 			expectMatch:   true,
-			expectContain: "/api/v1/tables",
+			expectContain: "/db/v1/tables",
 		},
 		{
 			name:          "extra character",
-			requestedPath: "/api/v1/tabless",
+			requestedPath: "/db/v1/tabless",
 			expectMatch:   true,
-			expectContain: "/api/v1/tables",
+			expectContain: "/db/v1/tables",
 		},
 		{
 			name:          "status typo",
-			requestedPath: "/api/v1/statu",
+			requestedPath: "/db/v1/statu",
 			expectMatch:   true,
-			expectContain: "/api/v1/status",
+			expectContain: "/db/v1/status",
 		},
 		{
 			name:          "completely different - no good match",
-			requestedPath: "/api/v1/xyz123",
+			requestedPath: "/db/v1/xyz123",
 			expectMatch:   false,
 		},
 	}
@@ -309,18 +309,18 @@ func TestFindSimilarEndpoints(t *testing.T) {
 	}{
 		{
 			name:          "pattern correction - singular table",
-			requestedPath: "/api/v1/table",
-			expectContain: "/api/v1/tables",
+			requestedPath: "/db/v1/table",
+			expectContain: "/db/v1/tables",
 		},
 		{
 			name:          "pattern correction - nested index",
-			requestedPath: "/api/v1/tables/foo/index",
-			expectContain: "/api/v1/tables/{tableName}/indexes",
+			requestedPath: "/db/v1/tables/foo/index",
+			expectContain: "/db/v1/tables/{tableName}/indexes",
 		},
 		{
 			name:          "fuzzy match - typo",
-			requestedPath: "/api/v1/tabel",
-			expectContain: "/api/v1/tables",
+			requestedPath: "/db/v1/tabel",
+			expectContain: "/db/v1/tables",
 		},
 	}
 
@@ -350,14 +350,14 @@ func TestFormatSuggestions(t *testing.T) {
 	}{
 		{
 			name:          "single suggestion",
-			requestedPath: "/api/v1/table",
-			suggestions:   []string{"/api/v1/tables"},
-			expectContain: "Did you mean: /api/v1/tables?",
+			requestedPath: "/db/v1/table",
+			suggestions:   []string{"/db/v1/tables"},
+			expectContain: "Did you mean: /db/v1/tables?",
 		},
 		{
 			name:          "multiple suggestions",
-			requestedPath: "/api/v1/tab",
-			suggestions:   []string{"/api/v1/tables", "/api/v1/status"},
+			requestedPath: "/db/v1/tab",
+			suggestions:   []string{"/db/v1/tables", "/db/v1/status"},
 			expectContain: "Did you mean one of:",
 		},
 	}
@@ -396,28 +396,28 @@ func TestNotFoundHandler(t *testing.T) {
 	}{
 		{
 			name:               "typo in table",
-			requestPath:        "/api/v1/table",
+			requestPath:        "/db/v1/table",
 			expectStatus:       http.StatusNotFound,
 			expectContainError: true,
-			expectSuggestion:   "/api/v1/tables",
+			expectSuggestion:   "/db/v1/tables",
 		},
 		{
 			name:               "typo in nested path",
-			requestPath:        "/api/v1/tables/foo/index",
+			requestPath:        "/db/v1/tables/foo/index",
 			expectStatus:       http.StatusNotFound,
 			expectContainError: true,
 			expectSuggestion:   "indexes",
 		},
 		{
 			name:               "fuzzy match",
-			requestPath:        "/api/v1/tabel",
+			requestPath:        "/db/v1/tabel",
 			expectStatus:       http.StatusNotFound,
 			expectContainError: true,
-			expectSuggestion:   "/api/v1/tables",
+			expectSuggestion:   "/db/v1/tables",
 		},
 		{
 			name:               "completely wrong path",
-			requestPath:        "/api/v1/nonexistent",
+			requestPath:        "/db/v1/nonexistent",
 			expectStatus:       http.StatusNotFound,
 			expectContainError: true,
 		},
@@ -458,7 +458,7 @@ func TestNotFoundHandler(t *testing.T) {
 func TestNotFoundHandler_ValidRequest(t *testing.T) {
 	// Create a handler that returns 200 for valid requests
 	baseHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/status" {
+		if r.URL.Path == "/db/v1/status" {
 			w.WriteHeader(http.StatusOK)
 			if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
 				t.Logf("failed to write response: %v", err)
@@ -471,7 +471,7 @@ func TestNotFoundHandler_ValidRequest(t *testing.T) {
 	logger := zap.NewNop()
 	handler := newNotFoundHandler(baseHandler, logger)
 
-	req := httptest.NewRequest("GET", "/api/v1/status", nil)
+	req := httptest.NewRequest("GET", "/db/v1/status", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -526,7 +526,7 @@ func TestNotFoundHandler_NoDoubleWriteHeader(t *testing.T) {
 
 			logger := zap.NewNop()
 			handler := newNotFoundHandler(tt.handler, logger)
-			req := httptest.NewRequest("GET", "/api/v1/status", nil)
+			req := httptest.NewRequest("GET", "/db/v1/status", nil)
 			handler.ServeHTTP(counting, req)
 
 			if counting.writeHeaderCalls > 1 {

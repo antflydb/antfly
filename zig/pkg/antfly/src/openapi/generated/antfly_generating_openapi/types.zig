@@ -97,6 +97,80 @@ pub const ChainCondition = enum {
     }
 };
 
+/// Role of the message sender in a generation/chat conversation
+pub const ChatMessageRole = enum {
+    user,
+    assistant,
+    system,
+    tool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .user => "user",
+            .assistant => "assistant",
+            .system => "system",
+            .tool => "tool",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "user", .user },
+            .{ "assistant", .assistant },
+            .{ "system", .system },
+            .{ "tool", .tool },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Text content for multimodal input.
+pub const TextContentPart = struct {
+    type: []const u8,
+    /// Text content.
+    text: []const u8,
+};
+
+/// Image URL or data URI.
+pub const ImageURL = struct {
+    /// URL or data URI (data:image/png;base64,...).
+    url: []const u8,
+};
+
+/// Inline binary media content (audio, image, etc.).
+pub const MediaContentPart = struct {
+    type: []const u8,
+    /// Base64-encoded binary data.
+    data: []const u8,
+    /// MIME type (audio/wav, image/gif, image/png, etc.).
+    mime_type: []const u8,
+};
+
+/// A tool call made by the assistant
+pub const ChatToolCall = struct {
+    /// Unique identifier for this tool call
+    id: []const u8,
+    /// Name of the tool being called
+    name: []const u8,
+    /// Arguments passed to the tool as key-value pairs
+    arguments: std.json.Value,
+};
+
+/// Result from executing a tool call
+pub const ChatToolResult = struct {
+    /// ID of the tool call this result corresponds to
+    tool_call_id: []const u8,
+    /// Result data from the tool execution
+    result: std.json.Value,
+    /// Error message if tool execution failed
+    @"error": ?[]const u8 = null,
+};
+
 /// Configuration for the Google generative AI provider (Gemini).
 pub const GoogleGeneratorConfig = struct {
     /// The Google Cloud project ID.
@@ -157,11 +231,11 @@ pub const OllamaGeneratorConfig = struct {
     timeout: ?i64 = null,
 };
 
-/// Configuration for the Antfly generative AI provider.
+/// Configuration for the Antfly inference generative AI provider.
 pub const AntflyGeneratorConfig = struct {
     /// The name of the generator model.
     model: []const u8,
-    /// The URL of the Inference API endpoint.
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
     /// Controls randomness in generation (0.0-2.0).
     temperature: ?f32 = null,
@@ -269,6 +343,12 @@ pub const OpenRouterGeneratorConfig = struct {
     presence_penalty: ?f32 = null,
 };
 
+/// Image content in OpenAI-compatible format.
+pub const ImageURLContentPart = struct {
+    type: []const u8,
+    image_url: ImageURL,
+};
+
 /// A unified configuration for a generative AI provider.
 pub const GeneratorConfig = struct {
     /// The Google Cloud project ID.
@@ -293,7 +373,7 @@ pub const GeneratorConfig = struct {
     credentials_path: ?[]const u8 = null,
     /// HTTP response timeout in seconds for Ollama API calls.
     timeout: ?i64 = null,
-    /// The URL of the Inference API endpoint.
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
     /// Penalty for token frequency (-2.0 to 2.0).
     frequency_penalty: ?f32 = null,
@@ -306,6 +386,62 @@ pub const GeneratorConfig = struct {
     provider: GeneratorProvider,
 };
 
+/// A content part for multimodal input (text, image URL, or inline media).
+pub const ContentPart = union(enum) {
+    media_content_part: *MediaContentPart,
+    image_url_content_part: *ImageURLContentPart,
+    text_content_part: *TextContentPart,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed.value;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "data",
+            "mime_type",
+        })) {
+            if (try parseStructuralVariant(MediaContentPart, allocator, source, options)) |parsed| return .{ .media_content_part = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "image_url",
+        })) {
+            if (try parseStructuralVariant(ImageURLContentPart, allocator, source, options)) |parsed| return .{ .image_url_content_part = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "text",
+        })) {
+            if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .media_content_part => |v| try jw.write(v.*),
+            .image_url_content_part => |v| try jw.write(v.*),
+            .text_content_part => |v| try jw.write(v.*),
+        }
+    }
+};
+
 /// A single link in a generator chain with optional retry and condition
 pub const ChainLink = struct {
     generator: GeneratorConfig,
@@ -313,4 +449,17 @@ pub const ChainLink = struct {
     retry: ?RetryConfig = null,
     /// When to try the next generator in chain
     condition: ?ChainCondition = null,
+};
+
+/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts: [{"type": "text", "text": "Hello"}]
+pub const ChatMessageContent = std.json.Value;
+
+/// A message in a generation/chat conversation
+pub const ChatMessage = struct {
+    role: ChatMessageRole,
+    content: ChatMessageContent,
+    /// Tool calls made by the assistant (only for assistant role)
+    tool_calls: ?[]const ChatToolCall = null,
+    /// Results from tool executions (only for tool role)
+    tool_results: ?[]const ChatToolResult = null,
 };

@@ -148,7 +148,7 @@ const RewritingPlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/ml/v1/models`, {
+        const response = await fetch(`${termiteApiUrl}/ai/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -222,7 +222,7 @@ const RewritingPlaygroundPage: React.FC = () => {
     try {
       const formattedInput = formatInput(context, answer);
 
-      const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/rewrite`, {
+      const response = await fetchWithRetry(`${termiteApiUrl}/ai/v1/rewrite`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

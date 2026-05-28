@@ -6,41 +6,56 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..types import UNSET, Unset
+
 T = TypeVar("T", bound="AntflyRerankerConfig")
 
 
 @_attrs_define
 class AntflyRerankerConfig:
-    """Configuration for the built-in Antfly reranking provider.
+    """Configuration for the Antfly inference reranking provider.
 
-    Uses an embedded INT8-quantized cross-encoder/ms-marco-MiniLM-L-6-v2 ONNX model
-    bundled directly in the binary. No external service, API key, or model download required.
+    Example:
+        {'provider': 'antfly', 'model': 'mixedbread-ai/mxbai-rerank-base-v1', 'url': 'http://localhost:8080'}
 
-    **Model:** cross-encoder/ms-marco-MiniLM-L-6-v2 (6-layer MiniLM cross-encoder)
-
-    **Features:**
-    - Zero configuration — works out of the box
-    - No network access required
-    - Pure Go inference via GoMLX
-
-        Example:
-            {'provider': 'antfly'}
-
+    Attributes:
+        model (str): The name of the reranking model (e.g., cross-encoder model name).
+        url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment
+            variable.
     """
 
+    model: str
+    url: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        model = self.model
+
+        url = self.url
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
+        field_dict.update(
+            {
+                "model": model,
+            }
+        )
+        if url is not UNSET:
+            field_dict["url"] = url
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        antfly_reranker_config = cls()
+        model = d.pop("model")
+
+        url = d.pop("url", UNSET)
+
+        antfly_reranker_config = cls(
+            model=model,
+            url=url,
+        )
 
         antfly_reranker_config.additional_properties = d
         return antfly_reranker_config

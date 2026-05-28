@@ -61,10 +61,7 @@ func extractConversationHistory(task *a2a.Task) []ai.ChatMessage {
 		}
 		text := extractTextFromMessage(msg)
 		if text != "" {
-			messages = append(messages, ai.ChatMessage{
-				Role:    role,
-				Content: text,
-			})
+			messages = append(messages, ai.NewTextChatMessage(role, text))
 		}
 	}
 	return messages

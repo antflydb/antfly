@@ -4,7 +4,7 @@
  */
 
 export interface paths {
-    "/api/v1/status": {
+    "/db/v1/status": {
         parameters: {
             query?: never;
             header?: never;
@@ -24,7 +24,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/cluster": {
+    "/db/v1/cluster": {
         parameters: {
             query?: never;
             header?: never;
@@ -44,7 +44,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/secrets": {
+    "/db/v1/secrets": {
         parameters: {
             query?: never;
             header?: never;
@@ -65,7 +65,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/secrets/{key}": {
+    "/db/v1/secrets/{key}": {
         parameters: {
             query?: never;
             header?: never;
@@ -94,7 +94,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/batch": {
+    "/db/v1/batch": {
         parameters: {
             query?: never;
             header?: never;
@@ -123,7 +123,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions/commit": {
+    "/db/v1/transactions/commit": {
         parameters: {
             query?: never;
             header?: never;
@@ -159,7 +159,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions": {
+    "/db/v1/transactions": {
         parameters: {
             query?: never;
             header?: never;
@@ -176,7 +176,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions/cleanup": {
+    "/db/v1/transactions/cleanup": {
         parameters: {
             query?: never;
             header?: never;
@@ -193,7 +193,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions/begin": {
+    "/db/v1/transactions/begin": {
         parameters: {
             query?: never;
             header?: never;
@@ -210,7 +210,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions/{transaction_id}": {
+    "/db/v1/transactions/{transaction_id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -227,7 +227,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions/{transaction_id}/stage": {
+    "/db/v1/transactions/{transaction_id}/stage": {
         parameters: {
             query?: never;
             header?: never;
@@ -244,7 +244,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions/{transaction_id}/read": {
+    "/db/v1/transactions/{transaction_id}/read": {
         parameters: {
             query?: never;
             header?: never;
@@ -261,7 +261,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions/{transaction_id}/write": {
+    "/db/v1/transactions/{transaction_id}/write": {
         parameters: {
             query?: never;
             header?: never;
@@ -278,7 +278,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions/{transaction_id}/delete": {
+    "/db/v1/transactions/{transaction_id}/delete": {
         parameters: {
             query?: never;
             header?: never;
@@ -295,7 +295,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions/{transaction_id}/savepoints": {
+    "/db/v1/transactions/{transaction_id}/savepoints": {
         parameters: {
             query?: never;
             header?: never;
@@ -312,7 +312,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback": {
+    "/db/v1/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback": {
         parameters: {
             query?: never;
             header?: never;
@@ -329,7 +329,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions/{transaction_id}/commit": {
+    "/db/v1/transactions/{transaction_id}/commit": {
         parameters: {
             query?: never;
             header?: never;
@@ -346,7 +346,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/transactions/{transaction_id}/abort": {
+    "/db/v1/transactions/{transaction_id}/abort": {
         parameters: {
             query?: never;
             header?: never;
@@ -363,7 +363,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/backup": {
+    "/db/v1/backup": {
         parameters: {
             query?: never;
             header?: never;
@@ -403,7 +403,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/restore": {
+    "/db/v1/restore": {
         parameters: {
             query?: never;
             header?: never;
@@ -432,7 +432,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/backups": {
+    "/db/v1/backups": {
         parameters: {
             query?: never;
             header?: never;
@@ -454,7 +454,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/query": {
+    "/db/v1/query": {
         parameters: {
             query?: never;
             header?: never;
@@ -527,7 +527,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/eval": {
+    "/db/v1/eval": {
         parameters: {
             query?: never;
             header?: never;
@@ -554,7 +554,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/agents/query-builder": {
+    "/db/v1/agents/query-builder": {
         parameters: {
             query?: never;
             header?: never;
@@ -580,7 +580,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/agents/retrieval": {
+    "/db/v1/agents/retrieval": {
         parameters: {
             query?: never;
             header?: never;
@@ -629,7 +629,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/tables": {
+    "/db/v1/tables": {
         parameters: {
             query?: never;
             header?: never;
@@ -646,7 +646,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/tables/{tableName}": {
+    "/db/v1/tables/{tableName}": {
         parameters: {
             query?: never;
             header?: never;
@@ -772,7 +772,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/tables/{tableName}/query": {
+    "/db/v1/tables/{tableName}/query": {
         parameters: {
             query?: never;
             header?: never;
@@ -792,7 +792,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/tables/{tableName}/batch": {
+    "/db/v1/tables/{tableName}/batch": {
         parameters: {
             query?: never;
             header?: never;
@@ -812,7 +812,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/tables/{tableName}/merge": {
+    "/db/v1/tables/{tableName}/merge": {
         parameters: {
             query?: never;
             header?: never;
@@ -851,7 +851,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/tables/{tableName}/backup": {
+    "/db/v1/tables/{tableName}/backup": {
         parameters: {
             query?: never;
             header?: never;
@@ -871,7 +871,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/tables/{tableName}/restore": {
+    "/db/v1/tables/{tableName}/restore": {
         parameters: {
             query?: never;
             header?: never;
@@ -891,7 +891,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/tables/{tableName}/schema": {
+    "/db/v1/tables/{tableName}/schema": {
         parameters: {
             query?: never;
             header?: never;
@@ -911,7 +911,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/tables/{tableName}/lookup": {
+    "/db/v1/tables/{tableName}/lookup": {
         parameters: {
             query?: never;
             header?: never;
@@ -937,7 +937,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/tables/{tableName}/lookup/{key}": {
+    "/db/v1/tables/{tableName}/lookup/{key}": {
         parameters: {
             query?: never;
             header?: never;
@@ -959,7 +959,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/tables/{tableName}/indexes": {
+    "/db/v1/tables/{tableName}/indexes": {
         parameters: {
             query?: never;
             header?: never;
@@ -979,7 +979,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/tables/{tableName}/indexes/{indexName}": {
+    "/db/v1/tables/{tableName}/indexes/{indexName}": {
         parameters: {
             query?: never;
             header?: never;
@@ -1343,7 +1343,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/embed": {
+    "/ai/v1/embed": {
         parameters: {
             query?: never;
             header?: never;
@@ -1354,7 +1354,7 @@ export interface paths {
         put?: never;
         /**
          * Create embeddings (alias of `/embeddings`)
-         * @description Alias of `/ml/v1/embeddings`.
+         * @description Alias of `/ai/v1/embeddings`.
          *
          *     Accepts the OpenAI embeddings request shape and returns the same OpenAI-compatible
          *     response envelope. For sparse-capable models, `data[i].embedding` is a sparse
@@ -1367,7 +1367,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/chunk": {
+    "/ai/v1/chunk": {
         parameters: {
             query?: never;
             header?: never;
@@ -1403,7 +1403,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/rerank_multimodal": {
+    "/ai/v1/rerank_multimodal": {
         parameters: {
             query?: never;
             header?: never;
@@ -1428,7 +1428,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/rerank": {
+    "/ai/v1/rerank": {
         parameters: {
             query?: never;
             header?: never;
@@ -1470,7 +1470,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/generate": {
+    "/ai/v1/generate": {
         parameters: {
             query?: never;
             header?: never;
@@ -1487,7 +1487,7 @@ export interface paths {
          *     ## Models
          *
          *     Models are auto-discovered from `models_dir/generators/` at startup.
-         *     Use the `/ml/v1/models` endpoint to list available models.
+         *     Use the `/ai/v1/models` endpoint to list available models.
          *
          *     ## Streaming
          *
@@ -1507,7 +1507,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/chat/completions": {
+    "/ai/v1/chat/completions": {
         parameters: {
             query?: never;
             header?: never;
@@ -1528,7 +1528,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/recognize": {
+    "/ai/v1/recognize": {
         parameters: {
             query?: never;
             header?: never;
@@ -1563,7 +1563,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/classify": {
+    "/ai/v1/classify": {
         parameters: {
             query?: never;
             header?: never;
@@ -1607,7 +1607,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/classify/document": {
+    "/ai/v1/classify/document": {
         parameters: {
             query?: never;
             header?: never;
@@ -1644,7 +1644,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/classify/document_tokens": {
+    "/ai/v1/classify/document_tokens": {
         parameters: {
             query?: never;
             header?: never;
@@ -1680,7 +1680,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/rewrite": {
+    "/ai/v1/rewrite": {
         parameters: {
             query?: never;
             header?: never;
@@ -1713,7 +1713,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/read": {
+    "/ai/v1/read": {
         parameters: {
             query?: never;
             header?: never;
@@ -1729,7 +1729,7 @@ export interface paths {
          *     ## Models
          *
          *     Models are auto-discovered from `models_dir/readers/` at startup.
-         *     Use the `/ml/v1/models` endpoint to list available models.
+         *     Use the `/ai/v1/models` endpoint to list available models.
          *
          *     - **TrOCR**: Pure OCR for printed/handwritten text
          *     - **Donut**: Document understanding with structured output (receipts, forms)
@@ -1755,7 +1755,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/transcribe": {
+    "/ai/v1/transcribe": {
         parameters: {
             query?: never;
             header?: never;
@@ -1810,7 +1810,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/extract": {
+    "/ai/v1/extract": {
         parameters: {
             query?: never;
             header?: never;
@@ -1876,7 +1876,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/models": {
+    "/ai/v1/models": {
         parameters: {
             query?: never;
             header?: never;
@@ -1939,7 +1939,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/version": {
+    "/ai/v1/version": {
         parameters: {
             query?: never;
             header?: never;
@@ -1959,7 +1959,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/embeddings": {
+    "/ai/v1/embeddings": {
         parameters: {
             query?: never;
             header?: never;
@@ -1971,7 +1971,7 @@ export interface paths {
         /**
          * Create embeddings (OpenAI-compatible)
          * @description OpenAI-compatible embeddings endpoint. Accepts the same request format
-         *     as OpenAI's `/v1/embeddings` API, served here under `/ml/v1/embeddings`.
+         *     as OpenAI's `/v1/embeddings` API, served here under `/ai/v1/embeddings`.
          *     For sparse-capable models, each `data` item still uses the `embedding`
          *     field, but its value is a sparse vector object instead of a dense float array.
          *     Use this endpoint for drop-in compatibility with OpenAI SDKs.

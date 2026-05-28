@@ -58,7 +58,7 @@ func TestE2E_Quickstart(t *testing.T) {
 	// --- Create table with two indexes matching quickstart guide ---
 
 	// Text embedder: BGE via Termite
-	bgeEmbedder, err := antfly.NewEmbedderConfig(antfly.TermiteEmbedderConfig{
+	bgeEmbedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model:  "BAAI/bge-small-en-v1.5",
 		ApiUrl: termiteURL,
 	})
@@ -66,6 +66,8 @@ func TestE2E_Quickstart(t *testing.T) {
 
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
+		Model:  "fixed",
+		ApiUrl: termiteURL,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  200,
 			OverlapTokens: 25,
@@ -85,7 +87,7 @@ func TestE2E_Quickstart(t *testing.T) {
 	require.NoError(t, err)
 
 	// Image embedder: CLIP via Termite
-	clipEmbedder, err := antfly.NewEmbedderConfig(antfly.TermiteEmbedderConfig{
+	clipEmbedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model:  "openai/clip-vit-base-patch32",
 		ApiUrl: termiteURL,
 	})
@@ -224,7 +226,7 @@ func TestE2E_Quickstart(t *testing.T) {
 
 	// --- Hybrid search with reranker ---
 	t.Log("Running hybrid search with reranker...")
-	rerankerConfig, err := antfly.NewRerankerConfig(antfly.TermiteRerankerConfig{
+	rerankerConfig, err := antfly.NewRerankerConfig(antfly.AntflyRerankerConfig{
 		Model: "mixedbread-ai/mxbai-rerank-base-v1",
 		Url:   termiteURL,
 	})

@@ -194,7 +194,7 @@ export interface TermiteRegistryState {
   retry: () => void;
 }
 
-// Transform Termite's live /ml/v1/models response into the UI model card format.
+// Transform Termite's live /ai/v1/models response into the UI model card format.
 function transformModel(
   task: TermiteTaskKey,
   name: string,
@@ -248,7 +248,7 @@ let modelCache: {
 
 export function useTermiteRegistry(): TermiteRegistryState {
   const { termiteApiUrl } = useApiConfig();
-  const cacheKey = `${termiteApiUrl}/ml/v1/models`;
+  const cacheKey = `${termiteApiUrl}/ai/v1/models`;
   const cached = modelCache?.key === cacheKey ? modelCache : null;
   const [models, setModels] = useState<TermiteModel[]>(cached?.models ?? []);
   const [types, setTypes] = useState<ModelTypeInfo[]>(cached?.types ?? []);

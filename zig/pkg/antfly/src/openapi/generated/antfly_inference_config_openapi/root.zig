@@ -61,4 +61,3 @@ pub const GenerateDelta = types.GenerateDelta;
 pub const ToolCallDelta = types.ToolCallDelta;
 pub const ToolCallFunctionDelta = types.ToolCallFunctionDelta;
 pub const Config = types.Config;
-pub const VersionResponse = types.VersionResponse;

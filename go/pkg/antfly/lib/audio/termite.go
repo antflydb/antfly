@@ -26,18 +26,18 @@ import (
 )
 
 func init() {
-	RegisterSTT(STTProviderTermite, NewTermiteSTT)
+	RegisterSTT(STTProviderAntfly, NewTermiteSTT)
 }
 
-// TermiteSTT implements the STT interface using Termite's transcriber API.
+// TermiteSTT implements the STT interface using Antfly inference transcriber API.
 type TermiteSTT struct {
-	client *client.TermiteClient
+	client *client.InferenceClient
 	model  string
 }
 
-// NewTermiteSTT creates a new Termite STT provider.
+// NewTermiteSTT creates a new Antfly inference STT provider.
 func NewTermiteSTT(config STTConfig) (STT, error) {
-	c, err := config.AsTermiteSTTConfig()
+	c, err := config.AsAntflySTTConfig()
 	if err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
@@ -45,12 +45,12 @@ func NewTermiteSTT(config STTConfig) (STT, error) {
 	// Resolve API URL
 	apiURL := libtermite.ResolveURL(c.ApiUrl)
 	if apiURL == "" {
-		return nil, fmt.Errorf("termite api_url not configured (set api_url or ANTFLY_TERMITE_URL)")
+		return nil, fmt.Errorf("antfly inference api_url not configured (set api_url or ANTFLY_INFERENCE_URL)")
 	}
 
-	termiteClient, err := client.NewTermiteClient(apiURL, http.DefaultClient)
+	termiteClient, err := client.NewInferenceClient(apiURL, http.DefaultClient)
 	if err != nil {
-		return nil, fmt.Errorf("creating termite client: %w", err)
+		return nil, fmt.Errorf("creating inference client: %w", err)
 	}
 
 	return &TermiteSTT{
@@ -72,7 +72,7 @@ func (s *TermiteSTT) Capabilities() STTCapabilities {
 		MaxFileSizeBytes:    100 * 1024 * 1024, // 100 MB
 		SupportsStreaming:   false,
 		SupportsDiarization: false,
-		SupportsTimestamps:  false,      // Termite transcribe API doesn't return timestamps yet
+		SupportsTimestamps:  false,      // Inference transcribe API doesn't return timestamps yet
 		SupportedLanguages:  []string{}, // Whisper supports 50+ languages
 	}
 }
@@ -85,7 +85,7 @@ func (s *TermiteSTT) Transcribe(ctx context.Context, req TranscribeRequest) (*Tr
 		return nil, fmt.Errorf("resolving audio: %w", err)
 	}
 
-	// Call Termite transcribe API
+	// Call inference transcribe API
 	resp, err := s.client.Transcribe(ctx, s.model, audioData, req.Language)
 	if err != nil {
 		return nil, fmt.Errorf("transcribing: %w", err)
@@ -100,9 +100,9 @@ func (s *TermiteSTT) Transcribe(ctx context.Context, req TranscribeRequest) (*Tr
 	}, nil
 }
 
-// TranscribeStream is not supported by Termite's transcribe API.
+// TranscribeStream is not supported by the inference transcribe API.
 func (s *TermiteSTT) TranscribeStream(ctx context.Context, audioStream <-chan []byte, opts StreamOptions) (<-chan TranscriptChunk, error) {
-	return nil, fmt.Errorf("streaming transcription not supported by Termite")
+	return nil, fmt.Errorf("streaming transcription not supported by Antfly inference")
 }
 
 // resolveAudio gets audio bytes from the request's input source.
@@ -111,7 +111,7 @@ func (s *TermiteSTT) resolveAudio(ctx context.Context, req TranscribeRequest) ([
 	if len(req.Audio) > 0 {
 		format := req.Format
 		if format == "" {
-			format = AudioFormatWav // Default for Termite
+			format = AudioFormatWav
 		}
 		return req.Audio, format, nil
 	}

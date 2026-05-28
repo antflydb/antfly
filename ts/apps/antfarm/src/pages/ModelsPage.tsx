@@ -981,7 +981,7 @@ const ModelsPage: React.FC = () => {
           }
         } else {
           // Termite-only build: check allow_downloads from Termite version
-          const response = await fetch(`${termiteApiUrl}/ml/v1/version`);
+          const response = await fetch(`${termiteApiUrl}/ai/v1/version`);
           if (response.ok) {
             const data = await response.json();
             setAllowDownloads(data.allow_downloads === true);

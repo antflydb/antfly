@@ -2,8 +2,8 @@ openapi: 3.0.3
 info:
   title: Antfly Public API
   version: v1alpha1
-  description: Joined public contract for the Antfly server. Antfly APIs are served under `/api/v1`, auth
-    APIs under `/auth/v1`, and inference ML APIs under `/ml/v1`.
+  description: Joined public contract for the Antfly server. Antfly APIs are served under `/db/v1`, auth
+    APIs under `/auth/v1`, and inference APIs under `/ai/v1`.
 servers:
   - url: /
 tags:
@@ -2068,7 +2068,7 @@ security:
   - ApiKeyAuth: []
   - BearerAuth: []
 paths:
-  /api/v1/status:
+  /db/v1/status:
     get:
       summary: Get cluster status
       tags:
@@ -2094,7 +2094,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/cluster:
+  /db/v1/cluster:
     get:
       summary: Get cluster topology
       tags:
@@ -2121,7 +2121,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/secrets:
+  /db/v1/secrets:
     get:
       summary: List secrets status
       tags:
@@ -2150,7 +2150,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/secrets/{key}:
+  /db/v1/secrets/{key}:
     parameters:
       - name: key
         in: path
@@ -2229,7 +2229,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/batch:
+  /db/v1/batch:
     post:
       summary: Cross-table batch operations
       tags:
@@ -2276,7 +2276,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/commit:
+  /db/v1/transactions/commit:
     post:
       summary: Commit an OCC transaction
       tags:
@@ -2337,7 +2337,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions:
+  /db/v1/transactions:
     get:
       summary: List transaction sessions
       tags:
@@ -2356,7 +2356,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/cleanup:
+  /db/v1/transactions/cleanup:
     post:
       summary: Clean up expired transaction sessions
       tags:
@@ -2383,7 +2383,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/begin:
+  /db/v1/transactions/begin:
     post:
       summary: Begin a transaction session
       tags:
@@ -2410,7 +2410,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}:
+  /db/v1/transactions/{transaction_id}:
     get:
       summary: Get transaction session details
       tags:
@@ -2437,7 +2437,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/stage:
+  /db/v1/transactions/{transaction_id}/stage:
     post:
       summary: Stage a transaction commit request
       tags:
@@ -2470,7 +2470,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/read:
+  /db/v1/transactions/{transaction_id}/read:
     post:
       summary: Stage a transaction read version
       tags:
@@ -2507,7 +2507,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/write:
+  /db/v1/transactions/{transaction_id}/write:
     post:
       summary: Stage a transaction write
       tags:
@@ -2540,7 +2540,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/delete:
+  /db/v1/transactions/{transaction_id}/delete:
     post:
       summary: Stage a transaction delete
       tags:
@@ -2573,7 +2573,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/savepoints:
+  /db/v1/transactions/{transaction_id}/savepoints:
     post:
       summary: Create a transaction savepoint
       tags:
@@ -2600,7 +2600,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback:
+  /db/v1/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback:
     post:
       summary: Roll back a transaction session to a savepoint
       tags:
@@ -2632,7 +2632,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/commit:
+  /db/v1/transactions/{transaction_id}/commit:
     post:
       summary: Commit a transaction session
       tags:
@@ -2669,7 +2669,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/abort:
+  /db/v1/transactions/{transaction_id}/abort:
     post:
       summary: Abort a transaction session
       tags:
@@ -2696,7 +2696,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/backup:
+  /db/v1/backup:
     post:
       summary: Backup all tables or selected tables
       tags:
@@ -2762,7 +2762,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/restore:
+  /db/v1/restore:
     post:
       summary: Restore multiple tables from a backup
       tags:
@@ -2807,7 +2807,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/backups:
+  /db/v1/backups:
     get:
       summary: List available backups
       tags:
@@ -2847,7 +2847,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/query:
+  /db/v1/query:
     post:
       summary: Perform a global query
       tags:
@@ -2964,7 +2964,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/eval:
+  /db/v1/eval:
     post:
       summary: Standalone evaluation endpoint
       tags:
@@ -3013,7 +3013,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/agents/query-builder:
+  /db/v1/agents/query-builder:
     post:
       summary: Build a search query from natural language
       tags:
@@ -3068,7 +3068,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/agents/retrieval:
+  /db/v1/agents/retrieval:
     post:
       summary: Retrieval Agent - Agentic document retrieval with tool calling
       tags:
@@ -3168,7 +3168,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables:
+  /db/v1/tables:
     get:
       summary: List all tables
       tags:
@@ -3208,7 +3208,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}:
+  /db/v1/tables/{tableName}:
     parameters:
       - name: tableName
         in: path
@@ -3396,7 +3396,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/query:
+  /db/v1/tables/{tableName}/query:
     parameters:
       - name: tableName
         in: path
@@ -3435,7 +3435,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/batch:
+  /db/v1/tables/{tableName}/batch:
     parameters:
       - name: tableName
         in: path
@@ -3471,7 +3471,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/merge:
+  /db/v1/tables/{tableName}/merge:
     parameters:
       - name: tableName
         in: path
@@ -3564,7 +3564,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/backup:
+  /db/v1/tables/{tableName}/backup:
     parameters:
       - name: tableName
         in: path
@@ -3604,7 +3604,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/restore:
+  /db/v1/tables/{tableName}/restore:
     parameters:
       - name: tableName
         in: path
@@ -3642,7 +3642,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/schema:
+  /db/v1/tables/{tableName}/schema:
     parameters:
       - name: tableName
         in: path
@@ -3678,7 +3678,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/lookup:
+  /db/v1/tables/{tableName}/lookup:
     parameters:
       - name: tableName
         in: path
@@ -3723,7 +3723,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/lookup/{key}:
+  /db/v1/tables/{tableName}/lookup/{key}:
     parameters:
       - name: tableName
         in: path
@@ -3791,7 +3791,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/indexes:
+  /db/v1/tables/{tableName}/indexes:
     parameters:
       - name: tableName
         in: path
@@ -3821,7 +3821,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/indexes/{indexName}:
+  /db/v1/tables/{tableName}/indexes/{indexName}:
     parameters:
       - name: tableName
         in: path
@@ -4793,11 +4793,11 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /ml/v1/embed:
+  /ai/v1/embed:
     post:
       summary: Create embeddings (alias of `/embeddings`)
       description: >
-        Alias of `/ml/v1/embeddings`.
+        Alias of `/ai/v1/embeddings`.
 
 
         Accepts the OpenAI embeddings request shape and returns the same OpenAI-compatible
@@ -4837,7 +4837,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/chunk:
+  /ai/v1/chunk:
     post:
       summary: Chunk text into smaller segments
       description: >
@@ -4895,7 +4895,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/rerank_multimodal:
+  /ai/v1/rerank_multimodal:
     post:
       summary: Rerank multimodal documents by relevance
       description: >
@@ -4941,7 +4941,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/rerank:
+  /ai/v1/rerank:
     post:
       summary: Rerank prompts by relevance
       description: >
@@ -5024,7 +5024,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/generate:
+  /ai/v1/generate:
     post:
       summary: Generate text using LLM (OpenAI-compatible)
       description: >
@@ -5038,7 +5038,7 @@ paths:
 
         Models are auto-discovered from `models_dir/generators/` at startup.
 
-        Use the `/ml/v1/models` endpoint to list available models.
+        Use the `/ai/v1/models` endpoint to list available models.
 
 
         ## Streaming
@@ -5101,7 +5101,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/chat/completions:
+  /ai/v1/chat/completions:
     post:
       summary: OpenAI Chat Completions endpoint
       description: >
@@ -5152,7 +5152,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/recognize:
+  /ai/v1/recognize:
     post:
       summary: Recognize named entities
       description: >
@@ -5222,7 +5222,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/classify:
+  /ai/v1/classify:
     post:
       summary: Zero-shot text classification
       description: >
@@ -5299,7 +5299,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/classify/document:
+  /ai/v1/classify/document:
     post:
       summary: Document classification
       description: >
@@ -5365,7 +5365,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/classify/document_tokens:
+  /ai/v1/classify/document_tokens:
     post:
       summary: Document token classification
       description: >
@@ -5436,7 +5436,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/rewrite:
+  /ai/v1/rewrite:
     post:
       summary: Rewrite text using Seq2Seq models
       description: >
@@ -5501,7 +5501,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/read:
+  /ai/v1/read:
     post:
       summary: Read text from images (OCR/document understanding)
       description: >
@@ -5513,7 +5513,7 @@ paths:
 
         Models are auto-discovered from `models_dir/readers/` at startup.
 
-        Use the `/ml/v1/models` endpoint to list available models.
+        Use the `/ai/v1/models` endpoint to list available models.
 
 
         - **TrOCR**: Pure OCR for printed/handwritten text
@@ -5583,7 +5583,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/transcribe:
+  /ai/v1/transcribe:
     post:
       summary: Transcribe audio to text (speech-to-text)
       description: >
@@ -5681,7 +5681,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/extract:
+  /ai/v1/extract:
     post:
       summary: Extract structured data from text
       description: >
@@ -5789,7 +5789,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/models:
+  /ai/v1/models:
     get:
       summary: List available models
       description: >
@@ -5885,31 +5885,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ml/v1/version:
-    get:
-      summary: Get version information
-      description: Returns inference runtime version, git commit, build time, and Go runtime version.
-      operationId: getVersion
-      responses:
-        '200':
-          description: Version information
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceVersionResponse'
-        '400':
-          description: Bad request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
-  /ml/v1/embeddings:
+  /ai/v1/embeddings:
     post:
       summary: Create embeddings (OpenAI-compatible)
       description: >
         OpenAI-compatible embeddings endpoint. Accepts the same request format
 
-        as OpenAI's `/v1/embeddings` API, served here under `/ml/v1/embeddings`.
+        as OpenAI's `/v1/embeddings` API, served here under `/ai/v1/embeddings`.
 
         For sparse-capable models, each `data` item still uses the `embedding`
 
@@ -9318,7 +9300,7 @@ components:
             ```json
 
             {
-              "provider": "termite",
+              "provider": "antfly",
               "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
               "field": "content"
             }
@@ -11320,13 +11302,13 @@ components:
         provider: cohere
         model: embed-english-v3.0
         input_type: search_document
-    TermiteEmbedderConfig:
+    AntflyEmbedderConfig:
       type: object
       description: >-
-        Configuration for the Termite embedding provider.
+        Configuration for the Antfly inference embedding provider.
 
 
-        Termite is Antfly's built-in ML service for local embeddings using ONNX models.
+        Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
 
         It provides embedding generation with multi-tier caching (memory + persistent).
 
@@ -11354,38 +11336,15 @@ components:
         api_url:
           type: string
           format: uri
-          description: The URL of the Inference API endpoint. Can also be set via ANTFLY_TERMITE_URL environment
-            variable.
+          description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
+            environment variable.
           example: http://localhost:8082
       required:
         - model
       example:
-        provider: termite
+        provider: antfly
         model: bge-base-en-v1.5
         api_url: http://localhost:8082
-    AntflyEmbedderConfig:
-      type: object
-      description: >-
-        Configuration for the built-in Antfly embedding provider.
-
-
-        Uses an embedded INT8-quantized all-MiniLM-L6-v2 ONNX model bundled directly
-
-        in the binary. No external service, API key, or model download required.
-
-
-        **Model:** all-MiniLM-L6-v2 (384 dimensions, text-only)
-
-
-        **Features:**
-
-        - Zero configuration — works out of the box
-
-        - No network access required
-
-        - Pure Go inference via GoMLX
-      example:
-        provider: antfly
     EmbedderProvider:
       type: string
       enum:
@@ -11397,7 +11356,6 @@ components:
         - bedrock
         - cohere
         - mock
-        - termite
         - antfly
       description: The embedding provider to use.
     EmbedderConfig:
@@ -11645,7 +11603,6 @@ components:
             - $ref: '#/components/schemas/OpenRouterEmbedderConfig'
             - $ref: '#/components/schemas/BedrockEmbedderConfig'
             - $ref: '#/components/schemas/CohereEmbedderConfig'
-            - $ref: '#/components/schemas/TermiteEmbedderConfig'
             - $ref: '#/components/schemas/AntflyEmbedderConfig'
         - properties:
             provider:
@@ -11808,10 +11765,10 @@ components:
           minimum: 1
       required:
         - model
-    TermiteGeneratorConfig:
+    AntflyGeneratorConfig:
       type: object
       description: >
-        Configuration for the Termite generative AI provider.
+        Configuration for the Antfly inference generative AI provider.
       properties:
         model:
           type: string
@@ -11820,7 +11777,8 @@ components:
         api_url:
           type: string
           format: uri
-          description: The URL of the Inference API endpoint.
+          description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
+            environment variable.
         temperature:
           type: number
           format: float
@@ -12061,7 +12019,6 @@ components:
         - bedrock
         - anthropic
         - cohere
-        - termite
         - antfly
         - mock
       description: The generative AI provider to use.
@@ -12073,7 +12030,7 @@ components:
             - $ref: '#/components/schemas/GoogleGeneratorConfig'
             - $ref: '#/components/schemas/VertexGeneratorConfig'
             - $ref: '#/components/schemas/OllamaGeneratorConfig'
-            - $ref: '#/components/schemas/TermiteGeneratorConfig'
+            - $ref: '#/components/schemas/AntflyGeneratorConfig'
             - $ref: '#/components/schemas/OpenAIGeneratorConfig'
             - $ref: '#/components/schemas/OpenRouterGeneratorConfig'
             - $ref: '#/components/schemas/BedrockGeneratorConfig'
@@ -12130,12 +12087,12 @@ components:
           $ref: '#/components/schemas/TextChunkOptions'
         audio:
           $ref: '#/components/schemas/AudioChunkOptions'
-    TermiteChunkerConfig:
+    AntflyChunkerConfig:
       description: >
-        Configuration for the Termite chunking provider.
+        Configuration for the Antfly inference chunking provider.
 
 
-        Termite is a centralized HTTP service that provides chunking with multi-tier caching.
+        Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
 
         The model name maps to ONNX model directory names (similar to how Ollama works).
 
@@ -12161,8 +12118,8 @@ components:
             api_url:
               type: string
               format: uri
-              description: The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also
-                be set via ANTFLY_TERMITE_URL environment variable.
+              description: The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can
+                also be set via ANTFLY_INFERENCE_URL environment variable.
               example: http://localhost:8080
             model:
               type: string
@@ -12173,48 +12130,9 @@ components:
           required:
             - model
       example:
-        provider: termite
+        provider: antfly
         api_url: http://localhost:8080
         model: fixed
-        max_chunks: 50
-        text:
-          target_tokens: 500
-          overlap_tokens: 50
-          separator: >2+
-
-
-    AntflyChunkerConfig:
-      description: >
-        Configuration for the local Antfly chunking provider.
-
-
-        This provider runs chunking directly within the storage node process,
-
-        without requiring an external Termite service. It uses simple fixed-size
-
-        tokenizer-based chunking with no caching overhead.
-
-
-        **Use this when:**
-
-        - Running single-node deployments (swarm mode)
-
-        - You don't need embedding/chunk caching across nodes
-
-        - You want minimal setup complexity
-
-
-        **Use Termite instead when:**
-
-        - Running multi-node clusters where caching reduces costs
-
-        - You need ONNX-accelerated chunking models
-
-        - You want persistent chunk/embedding caches
-      allOf:
-        - $ref: '#/components/schemas/ChunkOptions'
-      example:
-        provider: antfly
         max_chunks: 50
         text:
           target_tokens: 500
@@ -12226,14 +12144,12 @@ components:
       type: string
       enum:
         - mock
-        - termite
         - antfly
       description: The chunking provider to use.
     ChunkerConfig:
       description: A unified configuration for a chunking provider.
       allOf:
         - oneOf:
-            - $ref: '#/components/schemas/TermiteChunkerConfig'
             - $ref: '#/components/schemas/AntflyChunkerConfig'
         - properties:
             provider:
@@ -12259,7 +12175,7 @@ components:
           required:
             - provider
       example:
-        provider: termite
+        provider: antfly
         model: fixed
         text:
           target_tokens: 500
@@ -13861,11 +13777,11 @@ components:
           description: >
             Web search provider configuration. Required when websearch tool is enabled.
 
-            See go/pkg/antfly/lib/websearch/openapi.yaml for provider-specific options.
+            See specs/openapi/antfly/websearch.yaml for provider-specific options.
         fetch_config:
           $ref: '#/components/schemas/FetchConfig'
           description: >
-            URL fetching configuration. See go/pkg/antfly/lib/websearch/openapi.yaml
+            URL fetching configuration. See specs/openapi/antfly/websearch.yaml
 
             for available options and security controls.
         max_tool_iterations:
@@ -14201,7 +14117,87 @@ components:
         - assistant
         - system
         - tool
-      description: Role of the message sender in the conversation
+      description: Role of the message sender in a generation/chat conversation
+    TextContentPart:
+      type: object
+      description: Text content for multimodal input.
+      required:
+        - type
+        - text
+      properties:
+        type:
+          type: string
+          enum:
+            - text
+        text:
+          type: string
+          description: Text content.
+    ImageURL:
+      type: object
+      description: Image URL or data URI.
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          description: URL or data URI (data:image/png;base64,...).
+          example: data:image/png;base64,iVBORw0KGgo...
+    ImageURLContentPart:
+      type: object
+      description: Image content in OpenAI-compatible format.
+      required:
+        - type
+        - image_url
+      properties:
+        type:
+          type: string
+          enum:
+            - image_url
+        image_url:
+          $ref: '#/components/schemas/ImageURL'
+    MediaContentPart:
+      type: object
+      description: Inline binary media content (audio, image, etc.).
+      required:
+        - type
+        - data
+        - mime_type
+      properties:
+        type:
+          type: string
+          enum:
+            - media
+        data:
+          type: string
+          format: byte
+          description: Base64-encoded binary data.
+        mime_type:
+          type: string
+          description: MIME type (audio/wav, image/gif, image/png, etc.).
+    ContentPart:
+      description: A content part for multimodal input (text, image URL, or inline media).
+      oneOf:
+        - $ref: '#/components/schemas/TextContentPart'
+        - $ref: '#/components/schemas/ImageURLContentPart'
+        - $ref: '#/components/schemas/MediaContentPart'
+    ChatMessageContent:
+      x-go-type: stdjson.RawMessage
+      x-go-type-import:
+        path: encoding/json
+        name: stdjson
+      description: >
+        Message content. Supports two formats:
+
+        - Simple string: "Hello, how are you?"
+
+        - Array of content parts: [{"type": "text", "text": "Hello"}]
+      oneOf:
+        - type: string
+          description: Simple text content.
+        - type: array
+          description: Array of multimodal content parts.
+          items:
+            $ref: '#/components/schemas/ContentPart'
     ChatToolCall:
       type: object
       description: A tool call made by the assistant
@@ -14239,7 +14235,7 @@ components:
           description: Error message if tool execution failed
     ChatMessage:
       type: object
-      description: A message in the conversation history
+      description: A message in a generation/chat conversation
       required:
         - role
         - content
@@ -14247,8 +14243,7 @@ components:
         role:
           $ref: '#/components/schemas/ChatMessageRole'
         content:
-          type: string
-          description: Text content of the message
+          $ref: '#/components/schemas/ChatMessageContent'
         tool_calls:
           type: array
           items:
@@ -14483,33 +14478,27 @@ components:
       enum:
         - antfly
         - ollama
-        - termite
         - cohere
         - vertex
       description: The reranking provider to use.
     AntflyRerankerConfig:
       type: object
-      description: >-
-        Configuration for the built-in Antfly reranking provider.
-
-
-        Uses an embedded INT8-quantized cross-encoder/ms-marco-MiniLM-L-6-v2 ONNX model
-
-        bundled directly in the binary. No external service, API key, or model download required.
-
-
-        **Model:** cross-encoder/ms-marco-MiniLM-L-6-v2 (6-layer MiniLM cross-encoder)
-
-
-        **Features:**
-
-        - Zero configuration — works out of the box
-
-        - No network access required
-
-        - Pure Go inference via GoMLX
+      description: Configuration for the Antfly inference reranking provider.
+      properties:
+        model:
+          type: string
+          description: The name of the reranking model (e.g., cross-encoder model name).
+        url:
+          type: string
+          format: uri
+          description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
+            environment variable.
+      required:
+        - model
       example:
         provider: antfly
+        model: mixedbread-ai/mxbai-rerank-base-v1
+        url: http://localhost:8080
     OllamaRerankerConfig:
       type: object
       description: Configuration for the Ollama reranking provider.
@@ -14521,19 +14510,6 @@ components:
           type: string
           format: uri
           description: The URL of the Ollama API endpoint.
-      required:
-        - model
-    TermiteRerankerConfig:
-      type: object
-      description: Configuration for the inference reranking provider.
-      properties:
-        model:
-          type: string
-          description: The name of the reranking model (e.g., cross-encoder model name).
-        url:
-          type: string
-          format: uri
-          description: The URL of the Inference API endpoint.
       required:
         - model
     CohereRerankerConfig:
@@ -14636,7 +14612,6 @@ components:
         - oneOf:
             - $ref: '#/components/schemas/AntflyRerankerConfig'
             - $ref: '#/components/schemas/OllamaRerankerConfig'
-            - $ref: '#/components/schemas/TermiteRerankerConfig'
             - $ref: '#/components/schemas/CohereRerankerConfig'
             - $ref: '#/components/schemas/VertexRerankerConfig'
       example:
@@ -15174,7 +15149,7 @@ components:
             - type: array
               description: Array of multimodal content parts
               items:
-                $ref: '#/components/schemas/InferenceContentPart'
+                $ref: '#/components/schemas/ContentPart'
         encoding_format:
           type: string
           description: Encoding format for the embeddings (only "float" supported)
@@ -15345,7 +15320,7 @@ components:
           oneOf:
             - type: string
               description: Text to chunk (backward compatible)
-            - $ref: '#/components/schemas/InferenceContentPart'
+            - $ref: '#/components/schemas/ContentPart'
               description: Content part (text or media)
         text:
           type: string
@@ -15456,7 +15431,7 @@ components:
           type: string
           description: Optional caller-provided document identifier
         content:
-          $ref: '#/components/schemas/InferenceChatMessageContent'
+          $ref: '#/components/schemas/ChatMessageContent'
     InferenceRerankMultimodalRequest:
       type: object
       required:
@@ -16771,7 +16746,7 @@ components:
         - type: array
           description: Array of content parts (OpenAI multimodal format)
           items:
-            $ref: '#/components/schemas/InferenceContentPart'
+            $ref: '#/components/schemas/ContentPart'
     InferenceChatMessage:
       type: object
       required:
@@ -16780,7 +16755,7 @@ components:
         role:
           $ref: '#/components/schemas/InferenceRole'
         content:
-          $ref: '#/components/schemas/InferenceChatMessageContent'
+          $ref: '#/components/schemas/ChatMessageContent'
         tool_calls:
           type: array
           items:
@@ -17374,40 +17349,6 @@ components:
           default: true
         log:
           $ref: '#/components/schemas/Inferenceschemas-Config'
-    InferenceVersionResponse:
-      type: object
-      required:
-        - version
-        - git_commit
-        - build_time
-        - go_version
-      properties:
-        version:
-          type: string
-          description: inference version
-          example: v1.0.0
-        git_commit:
-          type: string
-          description: Git commit hash
-          example: abc1234
-        build_time:
-          type: string
-          description: Build timestamp
-          example: '2024-01-15T10:30:00Z'
-        go_version:
-          type: string
-          description: Go runtime version
-          example: go1.25.0
-        runtime:
-          type: string
-          description: inference runtime implementation
-          example: antfly-inference
-        backends:
-          $ref: '#/components/schemas/InferenceBackendCapabilities'
-        allow_downloads:
-          type: boolean
-          description: Whether model downloads are allowed in this deployment
-          example: true
     InferenceBackendCapabilities:
       type: object
       properties:

@@ -42,7 +42,7 @@ import requests
 
 from .models import bootstrap_models_for_listing, inference_command, maybe_pull_missing_model, models_dir
 
-API_PREFIX = "/ml/v1"
+API_PREFIX = "/ai/v1"
 
 
 def env_first(*names: str) -> str | None:

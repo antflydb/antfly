@@ -63,9 +63,9 @@ describe("TermiteClient", () => {
     expect(client).toBeDefined();
   });
 
-  it("should accept explicit /ml/v1-prefixed base URLs", () => {
+  it("should accept explicit /ai/v1-prefixed base URLs", () => {
     const client = new TermiteClient({
-      baseUrl: "http://localhost:8080/ml/v1",
+      baseUrl: "http://localhost:8080/ai/v1",
     });
     expect(client).toBeDefined();
   });
@@ -164,7 +164,7 @@ describe("TermiteClient with mock fetch", () => {
 
       expect(fetch).toHaveBeenCalledTimes(1);
       const [url, options] = vi.mocked(fetch).mock.calls[0];
-      expect(url).toBe("http://localhost:8080/ml/v1/embed");
+      expect(url).toBe("http://localhost:8080/ai/v1/embed");
       expect(options?.method).toBe("POST");
       expect(options?.headers).toBeDefined();
       const headers = options?.headers as Record<string, string>;

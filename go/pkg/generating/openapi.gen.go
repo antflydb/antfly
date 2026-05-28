@@ -13,6 +13,8 @@ import (
 	"path"
 	"strings"
 
+	stdjson "encoding/json"
+
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/oapi-codegen/runtime"
 )
@@ -23,6 +25,14 @@ const (
 	ChainConditionOnError     ChainCondition = "on_error"
 	ChainConditionOnRateLimit ChainCondition = "on_rate_limit"
 	ChainConditionOnTimeout   ChainCondition = "on_timeout"
+)
+
+// Defines values for ChatMessageRole.
+const (
+	ChatMessageRoleAssistant ChatMessageRole = "assistant"
+	ChatMessageRoleSystem    ChatMessageRole = "system"
+	ChatMessageRoleTool      ChatMessageRole = "tool"
+	ChatMessageRoleUser      ChatMessageRole = "user"
 )
 
 // Defines values for GeneratorProvider.
@@ -36,9 +46,47 @@ const (
 	GeneratorProviderOllama     GeneratorProvider = "ollama"
 	GeneratorProviderOpenai     GeneratorProvider = "openai"
 	GeneratorProviderOpenrouter GeneratorProvider = "openrouter"
-	GeneratorProviderTermite    GeneratorProvider = "termite"
 	GeneratorProviderVertex     GeneratorProvider = "vertex"
 )
+
+// Defines values for ImageURLContentPartType.
+const (
+	ImageURLContentPartTypeImageUrl ImageURLContentPartType = "image_url"
+)
+
+// Defines values for MediaContentPartType.
+const (
+	MediaContentPartTypeMedia MediaContentPartType = "media"
+)
+
+// Defines values for TextContentPartType.
+const (
+	TextContentPartTypeText TextContentPartType = "text"
+)
+
+// AntflyGeneratorConfig Configuration for the Antfly inference generative AI provider.
+type AntflyGeneratorConfig struct {
+	// ApiUrl The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+	ApiUrl *string `json:"api_url,omitempty"`
+
+	// MaxTokens Maximum number of tokens to generate.
+	MaxTokens *int `json:"max_tokens,omitempty"`
+
+	// Model The name of the generator model.
+	Model string `json:"model"`
+
+	// Temperature Controls randomness in generation (0.0-2.0).
+	Temperature *float32 `json:"temperature,omitempty"`
+
+	// Timeout HTTP response timeout in seconds for Inference API calls.
+	Timeout *int `json:"timeout,omitempty"`
+
+	// TopK Top-k sampling parameter.
+	TopK *int `json:"top_k,omitempty"`
+
+	// TopP Nucleus sampling parameter.
+	TopP *float32 `json:"top_p,omitempty"`
+}
 
 // AnthropicGeneratorConfig Configuration for the Anthropic generative AI provider.
 type AnthropicGeneratorConfig struct {
@@ -108,6 +156,55 @@ type ChainLink struct {
 	Retry *RetryConfig `json:"retry,omitempty"`
 }
 
+// ChatMessage A message in a generation/chat conversation
+type ChatMessage struct {
+	// Content Message content. Supports two formats:
+	// - Simple string: "Hello, how are you?"
+	// - Array of content parts: [{"type": "text", "text": "Hello"}]
+	Content ChatMessageContent `json:"content"`
+
+	// Role Role of the message sender in a generation/chat conversation
+	Role ChatMessageRole `json:"role"`
+
+	// ToolCalls Tool calls made by the assistant (only for assistant role)
+	ToolCalls *[]ChatToolCall `json:"tool_calls,omitempty"`
+
+	// ToolResults Results from tool executions (only for tool role)
+	ToolResults *[]ChatToolResult `json:"tool_results,omitempty"`
+}
+
+// ChatMessageContent Message content. Supports two formats:
+// - Simple string: "Hello, how are you?"
+// - Array of content parts: [{"type": "text", "text": "Hello"}]
+type ChatMessageContent = stdjson.RawMessage
+
+// ChatMessageRole Role of the message sender in a generation/chat conversation
+type ChatMessageRole string
+
+// ChatToolCall A tool call made by the assistant
+type ChatToolCall struct {
+	// Arguments Arguments passed to the tool as key-value pairs
+	Arguments map[string]interface{} `json:"arguments"`
+
+	// Id Unique identifier for this tool call
+	Id string `json:"id"`
+
+	// Name Name of the tool being called
+	Name string `json:"name"`
+}
+
+// ChatToolResult Result from executing a tool call
+type ChatToolResult struct {
+	// Error Error message if tool execution failed
+	Error *string `json:"error,omitempty"`
+
+	// Result Result data from the tool execution
+	Result map[string]interface{} `json:"result"`
+
+	// ToolCallId ID of the tool call this result corresponds to
+	ToolCallId string `json:"tool_call_id"`
+}
+
 // CohereGeneratorConfig Configuration for the Cohere generative AI provider.
 type CohereGeneratorConfig struct {
 	// ApiKey The Cohere API key.
@@ -133,6 +230,11 @@ type CohereGeneratorConfig struct {
 
 	// TopP Nucleus sampling parameter (0.0-1.0).
 	TopP *float32 `json:"top_p,omitempty"`
+}
+
+// ContentPart A content part for multimodal input (text, image URL, or inline media).
+type ContentPart struct {
+	union json.RawMessage
 }
 
 // GeneratorConfig defines model for GeneratorConfig.
@@ -174,6 +276,35 @@ type GoogleGeneratorConfig struct {
 	// Url The URL of the Google API endpoint.
 	Url *string `json:"url,omitempty"`
 }
+
+// ImageURL Image URL or data URI.
+type ImageURL struct {
+	// Url URL or data URI (data:image/png;base64,...).
+	Url string `json:"url"`
+}
+
+// ImageURLContentPart Image content in OpenAI-compatible format.
+type ImageURLContentPart struct {
+	// ImageUrl Image URL or data URI.
+	ImageUrl ImageURL                `json:"image_url"`
+	Type     ImageURLContentPartType `json:"type"`
+}
+
+// ImageURLContentPartType defines model for ImageURLContentPart.Type.
+type ImageURLContentPartType string
+
+// MediaContentPart Inline binary media content (audio, image, etc.).
+type MediaContentPart struct {
+	// Data Base64-encoded binary data.
+	Data []byte `json:"data"`
+
+	// MimeType MIME type (audio/wav, image/gif, image/png, etc.).
+	MimeType string               `json:"mime_type"`
+	Type     MediaContentPartType `json:"type"`
+}
+
+// MediaContentPartType defines model for MediaContentPart.Type.
+type MediaContentPartType string
 
 // OllamaGeneratorConfig Configuration for the Ollama generative AI provider.
 type OllamaGeneratorConfig struct {
@@ -268,29 +399,15 @@ type RetryConfig struct {
 	MaxBackoffMs *int `json:"max_backoff_ms,omitempty"`
 }
 
-// TermiteGeneratorConfig Configuration for the Termite generative AI provider.
-type TermiteGeneratorConfig struct {
-	// ApiUrl The URL of the Inference API endpoint.
-	ApiUrl *string `json:"api_url,omitempty"`
-
-	// MaxTokens Maximum number of tokens to generate.
-	MaxTokens *int `json:"max_tokens,omitempty"`
-
-	// Model The name of the generator model.
-	Model string `json:"model"`
-
-	// Temperature Controls randomness in generation (0.0-2.0).
-	Temperature *float32 `json:"temperature,omitempty"`
-
-	// Timeout HTTP response timeout in seconds for Inference API calls.
-	Timeout *int `json:"timeout,omitempty"`
-
-	// TopK Top-k sampling parameter.
-	TopK *int `json:"top_k,omitempty"`
-
-	// TopP Nucleus sampling parameter.
-	TopP *float32 `json:"top_p,omitempty"`
+// TextContentPart Text content for multimodal input.
+type TextContentPart struct {
+	// Text Text content.
+	Text string              `json:"text"`
+	Type TextContentPartType `json:"type"`
 }
+
+// TextContentPartType defines model for TextContentPart.Type.
+type TextContentPartType string
 
 // VertexGeneratorConfig Configuration for Google Cloud Vertex AI generative models.
 type VertexGeneratorConfig struct {
@@ -317,6 +434,94 @@ type VertexGeneratorConfig struct {
 
 	// TopP Nucleus sampling parameter (0.0-1.0).
 	TopP *float32 `json:"top_p,omitempty"`
+}
+
+// AsTextContentPart returns the union data inside the ContentPart as a TextContentPart
+func (t ContentPart) AsTextContentPart() (TextContentPart, error) {
+	var body TextContentPart
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTextContentPart overwrites any union data inside the ContentPart as the provided TextContentPart
+func (t *ContentPart) FromTextContentPart(v TextContentPart) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTextContentPart performs a merge with any union data inside the ContentPart, using the provided TextContentPart
+func (t *ContentPart) MergeTextContentPart(v TextContentPart) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsImageURLContentPart returns the union data inside the ContentPart as a ImageURLContentPart
+func (t ContentPart) AsImageURLContentPart() (ImageURLContentPart, error) {
+	var body ImageURLContentPart
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromImageURLContentPart overwrites any union data inside the ContentPart as the provided ImageURLContentPart
+func (t *ContentPart) FromImageURLContentPart(v ImageURLContentPart) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeImageURLContentPart performs a merge with any union data inside the ContentPart, using the provided ImageURLContentPart
+func (t *ContentPart) MergeImageURLContentPart(v ImageURLContentPart) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsMediaContentPart returns the union data inside the ContentPart as a MediaContentPart
+func (t ContentPart) AsMediaContentPart() (MediaContentPart, error) {
+	var body MediaContentPart
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromMediaContentPart overwrites any union data inside the ContentPart as the provided MediaContentPart
+func (t *ContentPart) FromMediaContentPart(v MediaContentPart) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeMediaContentPart performs a merge with any union data inside the ContentPart, using the provided MediaContentPart
+func (t *ContentPart) MergeMediaContentPart(v MediaContentPart) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t ContentPart) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *ContentPart) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
 }
 
 // AsGoogleGeneratorConfig returns the union data inside the GeneratorConfig as a GoogleGeneratorConfig
@@ -397,22 +602,22 @@ func (t *GeneratorConfig) MergeOllamaGeneratorConfig(v OllamaGeneratorConfig) er
 	return err
 }
 
-// AsTermiteGeneratorConfig returns the union data inside the GeneratorConfig as a TermiteGeneratorConfig
-func (t GeneratorConfig) AsTermiteGeneratorConfig() (TermiteGeneratorConfig, error) {
-	var body TermiteGeneratorConfig
+// AsAntflyGeneratorConfig returns the union data inside the GeneratorConfig as a AntflyGeneratorConfig
+func (t GeneratorConfig) AsAntflyGeneratorConfig() (AntflyGeneratorConfig, error) {
+	var body AntflyGeneratorConfig
 	err := json.Unmarshal(t.union, &body)
 	return body, err
 }
 
-// FromTermiteGeneratorConfig overwrites any union data inside the GeneratorConfig as the provided TermiteGeneratorConfig
-func (t *GeneratorConfig) FromTermiteGeneratorConfig(v TermiteGeneratorConfig) error {
+// FromAntflyGeneratorConfig overwrites any union data inside the GeneratorConfig as the provided AntflyGeneratorConfig
+func (t *GeneratorConfig) FromAntflyGeneratorConfig(v AntflyGeneratorConfig) error {
 	b, err := json.Marshal(v)
 	t.union = b
 	return err
 }
 
-// MergeTermiteGeneratorConfig performs a merge with any union data inside the GeneratorConfig, using the provided TermiteGeneratorConfig
-func (t *GeneratorConfig) MergeTermiteGeneratorConfig(v TermiteGeneratorConfig) error {
+// MergeAntflyGeneratorConfig performs a merge with any union data inside the GeneratorConfig, using the provided AntflyGeneratorConfig
+func (t *GeneratorConfig) MergeAntflyGeneratorConfig(v AntflyGeneratorConfig) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -599,36 +804,52 @@ func (t *GeneratorConfig) UnmarshalJSON(b []byte) error {
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
+	"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",
+	"4/CkeOGn8ITnjN39JwAA//+OeXSE9zgAAA==",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file
