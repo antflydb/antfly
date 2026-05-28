@@ -36,6 +36,7 @@ pub const Slice = enum(u8) {
     dense_routing_working_set,
     derived_replay_window,
     full_text_pending_segments,
+    full_text_build_working_set,
     derived_backlog,
     text_merge_buffers,
     algebraic_tensor_accumulators,
@@ -53,6 +54,7 @@ pub const Slice = enum(u8) {
             .dense_routing_working_set => "dense.routing_working_set",
             .derived_replay_window => "derived.replay_window",
             .full_text_pending_segments => "full_text.pending_segments",
+            .full_text_build_working_set => "full_text.build_working_set",
             .derived_backlog => "derived.backlog",
             .text_merge_buffers => "text_merge.buffers",
             .algebraic_tensor_accumulators => "algebraic.tensor_accumulators",
@@ -61,7 +63,7 @@ pub const Slice = enum(u8) {
     }
 };
 
-pub const slice_count: usize = 14;
+pub const slice_count: usize = 15;
 
 pub const Budget = struct {
     soft_limit_bytes: u64 = 0,
@@ -113,6 +115,7 @@ pub const Options = struct {
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
             .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
             .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
@@ -132,6 +135,7 @@ pub const Options = struct {
             .{ .soft_action = .report, .hard_action = .throttle_writes },
             .{ .soft_action = .report, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .defer_background_work },
+            .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
             .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
@@ -267,7 +271,7 @@ pub const ResourceManager = struct {
         defer self.mutex.unlock();
 
         var stats: [slice_count]SliceStats = undefined;
-        inline for (.{ Slice.lsm_block_table_cache, Slice.lsm_compaction_work, Slice.lsm_in_memory_state, Slice.lsm_wal_write_working_set, Slice.hbc_node_metadata_cache, Slice.dense_search_working_set, Slice.dense_apply_working_set, Slice.dense_routing_working_set, Slice.derived_replay_window, Slice.full_text_pending_segments, Slice.derived_backlog, Slice.text_merge_buffers, Slice.algebraic_tensor_accumulators, Slice.sparse_apply_working_set }, 0..) |slice, i| {
+        inline for (.{ Slice.lsm_block_table_cache, Slice.lsm_compaction_work, Slice.lsm_in_memory_state, Slice.lsm_wal_write_working_set, Slice.hbc_node_metadata_cache, Slice.dense_search_working_set, Slice.dense_apply_working_set, Slice.dense_routing_working_set, Slice.derived_replay_window, Slice.full_text_pending_segments, Slice.full_text_build_working_set, Slice.derived_backlog, Slice.text_merge_buffers, Slice.algebraic_tensor_accumulators, Slice.sparse_apply_working_set }, 0..) |slice, i| {
             const state = self.slices[i];
             stats[i] = .{
                 .name = slice.name(),
@@ -415,6 +419,22 @@ test "resource manager tracks reservations and releases" {
     reservation.release();
     stats = manager.snapshot();
     try std.testing.expectEqual(@as(u64, 0), stats.slices[sliceIndex(.full_text_pending_segments)].used_bytes);
+}
+
+test "resource manager tracks full text build working set independently" {
+    var manager = ResourceManager.init(.{});
+    var current: u64 = 0;
+
+    try manager.adjustUsage(.full_text_build_working_set, &current, 8192);
+    try std.testing.expectEqual(@as(u64, 8192), current);
+
+    const build_stats = manager.sliceStats(.full_text_build_working_set);
+    const pending_stats = manager.sliceStats(.full_text_pending_segments);
+    try std.testing.expectEqual(@as(u64, 8192), build_stats.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), pending_stats.used_bytes);
+
+    try manager.adjustUsage(.full_text_build_working_set, &current, 0);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.full_text_build_working_set).used_bytes);
 }
 
 test "resource manager records soft and hard budget pressure" {

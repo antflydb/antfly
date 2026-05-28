@@ -37,6 +37,8 @@ const MinSmartReplayWindowBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartReplayWindowBytes: u64 = 256 * 1024 * 1024;
 const MinSmartFullTextPendingBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartFullTextPendingBytes: u64 = 512 * 1024 * 1024;
+const MinSmartFullTextBuildBytes: u64 = 128 * 1024 * 1024;
+const MaxSmartFullTextBuildBytes: u64 = 1024 * 1024 * 1024;
 const MinSmartDerivedBacklogBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartDerivedBacklogBytes: u64 = 512 * 1024 * 1024;
 const MinSmartTextMergeBytes: u64 = 32 * 1024 * 1024;
@@ -120,6 +122,7 @@ fn smartResourceBudgets() SmartResourceBudgets {
     const dense_apply_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseApplyBytes, MaxSmartDenseApplyBytes);
     const replay_hard = adaptiveSliceHardLimit(total, 32, MinSmartReplayWindowBytes, MaxSmartReplayWindowBytes);
     const full_text_hard = adaptiveSliceHardLimit(total, 32, MinSmartFullTextPendingBytes, MaxSmartFullTextPendingBytes);
+    const full_text_build_hard = adaptiveSliceHardLimit(total, 24, MinSmartFullTextBuildBytes, MaxSmartFullTextBuildBytes);
     const derived_hard = adaptiveSliceHardLimit(total, 32, MinSmartDerivedBacklogBytes, MaxSmartDerivedBacklogBytes);
     const text_merge_hard = adaptiveSliceHardLimit(total, 64, MinSmartTextMergeBytes, MaxSmartTextMergeBytes);
     const algebraic_tensor_hard = adaptiveSliceHardLimit(total, 64, MinSmartAlgebraicTensorBytes, MaxSmartAlgebraicTensorBytes);
@@ -134,6 +137,7 @@ fn smartResourceBudgets() SmartResourceBudgets {
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_routing_working_set)] = resourceBudget(3, dense_apply_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = resourceBudget(3, replay_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = resourceBudget(3, full_text_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)] = resourceBudget(2, full_text_build_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = resourceBudget(3, derived_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = resourceBudget(3, text_merge_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);

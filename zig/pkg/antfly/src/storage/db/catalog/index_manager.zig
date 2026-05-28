@@ -94,6 +94,7 @@ const TextSegmentSinkBuildContext = struct {
     projection_batch: mapper.TextProjectionBatch,
     text_analysis: introducer_mod.TextAnalysisConfig,
     profile: ?*introducer_mod.BuildTextProfile,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
 };
 
 fn buildTextSegmentIntoSink(ctx_any: *anyopaque, sink: *segment_mod.SegmentSink) !void {
@@ -103,6 +104,7 @@ fn buildTextSegmentIntoSink(ctx_any: *anyopaque, sink: *segment_mod.SegmentSink)
         ctx.projection_batch,
         ctx.text_analysis,
         ctx.profile,
+        ctx.resource_manager,
         sink,
     );
 }
@@ -5656,6 +5658,7 @@ pub const IndexManager = struct {
     fn shouldDeferTextMergeForResourcePressure(self: *IndexManager) bool {
         const manager = self.resource_manager orelse return false;
         if (sliceDefersBackgroundWork(manager.sliceStats(.full_text_pending_segments))) return true;
+        if (sliceDefersBackgroundWork(manager.sliceStats(.full_text_build_working_set))) return true;
         return sliceDefersBackgroundWork(manager.sliceStats(.text_merge_buffers));
     }
 
@@ -6515,6 +6518,7 @@ pub const IndexManager = struct {
                 .projection_batch = chunk,
                 .text_analysis = entry.text_analysis,
                 .profile = if (profile_enabled) &text_build_profile else null,
+                .resource_manager = self.resource_manager,
             };
             const built_len = try entry.persistent.indexSegmentFromSinkBuilder(&build_ctx, buildTextSegmentIntoSink);
             segment_bytes += built_len;
@@ -6609,6 +6613,61 @@ pub const IndexManager = struct {
                     memory_after_index_segment.footprint_bytes,
                 },
             );
+            std.log.info(
+                "antfly_bench_text_working_set index={s} source_docs={d} projection_docs={d} segments={d} doc_arena_peak_bytes={d} field_postings_estimated_bytes={d} typed_doc_values_estimated_bytes={d} stored_docs_estimated_bytes={d} section_bytes={d} fst_and_term_metadata_bytes={d} segment_sink_bytes={d} resource_peak_bytes={d} builder_rss_before_bytes={d} builder_rss_after_analyze_bytes={d} builder_rss_after_postings_build_bytes={d} builder_rss_after_sections_bytes={d} builder_rss_after_publish_bytes={d}",
+                .{
+                    entry.config.name,
+                    source_docs.len,
+                    projection_batch.docs.len,
+                    segment_count,
+                    text_build_profile.doc_arena_peak_bytes,
+                    text_build_profile.field_postings_estimated_bytes,
+                    text_build_profile.typed_doc_values_estimated_bytes,
+                    text_build_profile.stored_docs_estimated_bytes,
+                    text_build_profile.section_bytes,
+                    text_build_profile.fst_and_term_metadata_bytes,
+                    text_build_profile.segment_sink_bytes,
+                    text_build_profile.resource_peak_bytes,
+                    text_build_profile.rss_before,
+                    text_build_profile.rss_after_analyze,
+                    text_build_profile.rss_after_postings_build,
+                    text_build_profile.rss_after_sections,
+                    text_build_profile.rss_after_publish,
+                },
+            );
+            if (self.resource_manager) |manager| {
+                const resource_stats = manager.snapshot();
+                const ft_pending = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)];
+                const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
+                const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
+                const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
+                const lsm_state = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)];
+                const lsm_stats = self.snapshotLsmMaintenanceStats();
+                std.log.info(
+                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d}",
+                    .{
+                        entry.config.name,
+                        source_docs.len,
+                        projection_batch.docs.len,
+                        segment_count,
+                        ft_pending.used_bytes,
+                        ft_pending.peak_bytes,
+                        ft_build.used_bytes,
+                        ft_build.peak_bytes,
+                        lsm_cache.used_bytes,
+                        lsm_cache.peak_bytes,
+                        lsm_compaction.used_bytes,
+                        lsm_compaction.peak_bytes,
+                        lsm_state.used_bytes,
+                        lsm_state.peak_bytes,
+                        lsm_stats.mutable_bytes,
+                        lsm_stats.immutable_bytes,
+                        lsm_stats.immutable_memtables,
+                        lsm_stats.total_run_bytes,
+                        lsm_stats.total_runs,
+                    },
+                );
+            }
         }
         return .{ .indexed_any = indexed_any };
     }

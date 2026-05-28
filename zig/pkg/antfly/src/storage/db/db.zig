@@ -14019,7 +14019,7 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
             const resource_snapshot = if (replay.db.core.index_manager.resource_manager) |manager| manager.snapshot() else null;
 
             std.log.warn(
-                "dense catch-up watchdog index={s} sequence={} target={} scanned={} applied={} delta_applied={} cache_caps={{nodes={},vectors={}}} hbc={{total={},accounted={},vector_used={},metadata_used={}}} rm={{lsm_cache={},hbc_cache={},dense_search={},dense_apply={},replay_window={},full_text_pending={}}} profile={{find_leaf_ns={},mutate_leaf_ns={},store_vector_ns={},quantized_vector_load_ns={}}}",
+                "dense catch-up watchdog index={s} sequence={} target={} scanned={} applied={} delta_applied={} cache_caps={{nodes={},vectors={}}} hbc={{total={},accounted={},vector_used={},metadata_used={}}} rm={{lsm_cache={},hbc_cache={},dense_search={},dense_apply={},replay_window={},full_text_pending={},full_text_build={}}} profile={{find_leaf_ns={},mutate_leaf_ns={},store_vector_ns={},quantized_vector_load_ns={}}}",
                 .{
                     replay.index_name,
                     progress.sequence,
@@ -14039,6 +14039,7 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
                     if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)].used_bytes else 0,
                     if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)].used_bytes else 0,
                     if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)].used_bytes else 0,
                     profile.insert_find_leaf_ns,
                     profile.insert_mutate_leaf_ns,
                     profile.insert_store_vector_ns,

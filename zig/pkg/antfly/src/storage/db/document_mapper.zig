@@ -20,6 +20,7 @@ const introducer_mod = @import("../../introducer.zig");
 const segment_mod = @import("../../segment.zig");
 const analysis_mod = @import("../../search/analysis.zig");
 const schema_api = @import("../../schema/mod.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 const runtime_schema = @import("../schema.zig");
 const types = @import("types.zig");
 
@@ -135,6 +136,7 @@ pub const default_text_segment_target_bytes: usize = 32 * 1024 * 1024;
 pub const BuildTextSegmentsOptions = struct {
     target_segment_bytes: usize = default_text_segment_target_bytes,
     profile: ?*introducer_mod.BuildTextProfile = null,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub const BuildTextSegmentsResult = struct {
@@ -410,11 +412,13 @@ pub fn writeTextSegmentFromProjectionBatchToSink(
     projection_batch: TextProjectionBatch,
     text_analysis: introducer_mod.TextAnalysisConfig,
     profile: ?*introducer_mod.BuildTextProfile,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
     sink: *segment_mod.SegmentSink,
 ) !void {
     if (projection_batch.docs.len == 0) return;
     try introducer_mod.writeSegmentFromTextWithAnalysisOptions(alloc, projection_batch.docs, &analysis_mod.default_analyzer, text_analysis, .{
         .profile = profile,
+        .resource_manager = resource_manager,
     }, sink);
 }
 
@@ -440,7 +444,11 @@ pub fn buildTextSegmentsFromProjectionBatch(
             .docs = projection_batch.docs[start..end],
             .observed_field_analyzers = &.{},
         };
-        if (try buildTextSegmentFromProjectionBatchWithProfile(alloc, chunk, text_analysis, options.profile)) |segment| {
+        const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, chunk.docs, &analysis_mod.default_analyzer, text_analysis, .{
+            .profile = options.profile,
+            .resource_manager = options.resource_manager,
+        });
+        if (segment.len > 0) {
             try segments.append(alloc, segment);
         }
         start = end;

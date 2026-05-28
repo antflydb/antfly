@@ -178,6 +178,16 @@ pub const InvertedIndexBuilder = struct {
         self.term_arena.deinit();
     }
 
+    pub fn estimatedMemoryBytes(self: *const InvertedIndexBuilder) u64 {
+        var total: u64 = @as(u64, @intCast(self.terms.capacity())) * @sizeOf(std.StringHashMapUnmanaged(PostingAccumulator).Entry);
+        var it = self.terms.iterator();
+        while (it.next()) |entry| {
+            total +|= @intCast(entry.key_ptr.*.len);
+            total +|= entry.value_ptr.estimatedMemoryBytes();
+        }
+        return total;
+    }
+
     /// A single term occurrence in a document.
     pub const TermHit = struct {
         term: []const u8,
@@ -500,6 +510,12 @@ const PostingAccumulator = struct {
         self.doc_ids.deinit(alloc);
         self.metas.deinit(alloc);
         self.all_positions.deinit(alloc);
+    }
+
+    fn estimatedMemoryBytes(self: *const PostingAccumulator) u64 {
+        return (@as(u64, @intCast(self.doc_ids.capacity)) * @sizeOf(u32)) +
+            (@as(u64, @intCast(self.metas.capacity)) * @sizeOf(PostingMeta)) +
+            (@as(u64, @intCast(self.all_positions.capacity)) * @sizeOf(u32));
     }
 
     fn add(self: *PostingAccumulator, alloc: Allocator, doc_num: u32, freq: u32, norm_val: u32, positions: []const u32) !void {

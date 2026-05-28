@@ -27,6 +27,8 @@ const typed_dv = @import("section/typed_doc_values.zig");
 const analysis_mod = @import("search/analysis.zig");
 const geo_mod = @import("search/geo.zig");
 const platform_time = @import("platform/time.zig");
+const process_memory = @import("platform/process_memory.zig");
+const resource_manager_mod = @import("storage/resource_manager.zig");
 
 /// A batch of documents to index.
 pub const Batch = struct {
@@ -82,6 +84,11 @@ const FieldPostingsBuilder = struct {
 
     fn buildAlloc(self: *FieldPostingsBuilder, output_alloc: Allocator) ![]u8 {
         return try self.builder.buildAlloc(output_alloc);
+    }
+
+    fn estimatedMemoryBytes(self: *const FieldPostingsBuilder) u64 {
+        if (!self.active) return 0;
+        return self.builder.estimatedMemoryBytes();
     }
 };
 
@@ -228,6 +235,7 @@ pub const BuildTextOptions = struct {
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
     profile: ?*BuildTextProfile = null,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub const BuildTextProfile = struct {
@@ -247,7 +255,97 @@ pub const BuildTextProfile = struct {
     stored_compress_ns: u64 = 0,
     segment_assembly_ns: u64 = 0,
     segment_encode_ns: u64 = 0,
+    doc_arena_peak_bytes: u64 = 0,
+    field_postings_estimated_bytes: u64 = 0,
+    typed_doc_values_estimated_bytes: u64 = 0,
+    stored_docs_estimated_bytes: u64 = 0,
+    section_bytes: u64 = 0,
+    fst_and_term_metadata_bytes: u64 = 0,
+    segment_sink_bytes: u64 = 0,
+    resource_peak_bytes: u64 = 0,
+    rss_before: u64 = 0,
+    rss_after_analyze: u64 = 0,
+    rss_after_postings_build: u64 = 0,
+    rss_after_sections: u64 = 0,
+    rss_after_publish: u64 = 0,
 };
+
+const TextBuildResourceTracker = struct {
+    manager: ?*resource_manager_mod.ResourceManager,
+    profile: ?*BuildTextProfile,
+    current_bytes: u64 = 0,
+
+    fn init(manager: ?*resource_manager_mod.ResourceManager, profile: ?*BuildTextProfile) TextBuildResourceTracker {
+        return .{ .manager = manager, .profile = profile };
+    }
+
+    fn adjust(self: *TextBuildResourceTracker, next: u64) !void {
+        if (self.manager) |manager| {
+            try manager.adjustUsage(.full_text_build_working_set, &self.current_bytes, next);
+        } else {
+            self.current_bytes = next;
+        }
+        if (self.profile) |profile| profile.resource_peak_bytes = @max(profile.resource_peak_bytes, self.current_bytes);
+    }
+
+    fn release(self: *TextBuildResourceTracker) void {
+        if (self.manager) |manager| {
+            manager.releaseBytes(.full_text_build_working_set, self.current_bytes);
+        }
+        self.current_bytes = 0;
+    }
+};
+
+fn estimateTextDocInputBytes(docs: []const TextDocument) u64 {
+    var total: u64 = 0;
+    for (docs) |doc| {
+        total +|= @intCast(doc.id.len + doc.stored_data.len);
+        total +|= @as(u64, @intCast(doc.text_fields.len)) * (@sizeOf(TextField) + 16);
+        for (doc.text_fields) |field| {
+            total +|= @intCast(field.field_name.len + field.text.len);
+        }
+        if (doc.typed_fields) |typed_fields| {
+            total +|= @as(u64, @intCast(typed_fields.len)) * (@sizeOf(TypedFieldValue) + 16);
+        }
+    }
+    return total;
+}
+
+fn estimateStoredDocBytes(docs: []const TextDocument) u64 {
+    var total: u64 = 0;
+    for (docs) |doc| {
+        total +|= @intCast(doc.id.len + doc.stored_data.len);
+        total +|= 32;
+    }
+    return total;
+}
+
+fn estimateFieldPostingsBuilderBytes(builders: *std.StringHashMapUnmanaged(FieldPostingsBuilder)) u64 {
+    var total: u64 = @as(u64, @intCast(builders.capacity())) * (@sizeOf([]const u8) + @sizeOf(FieldPostingsBuilder) + 24);
+    var it = builders.iterator();
+    while (it.next()) |entry| {
+        total +|= @intCast(entry.key_ptr.*.len);
+        total +|= entry.value_ptr.estimatedMemoryBytes();
+    }
+    return total;
+}
+
+fn estimateTypedDocValuesBytes(typed_fields: *std.StringHashMapUnmanaged(TypedFieldCollector)) u64 {
+    var total: u64 = @as(u64, @intCast(typed_fields.capacity())) * (@sizeOf([]const u8) + @sizeOf(TypedFieldCollector) + 24);
+    var it = typed_fields.iterator();
+    while (it.next()) |entry| {
+        total +|= @intCast(entry.key_ptr.*.len);
+        if (entry.value_ptr.writer) |*writer| total +|= writer.estimatedMemoryBytes();
+    }
+    return total;
+}
+
+fn noteBuildMemorySample(profile: ?*BuildTextProfile, comptime field: []const u8) void {
+    if (profile) |p| {
+        const stats = process_memory.snapshot();
+        @field(p, field) = stats.resident_bytes;
+    }
+}
 
 /// Build a segment from text documents, analyzing each text field.
 /// The default_analyzer is used for fields without an explicit analyzer.
@@ -299,6 +397,12 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
     if (profile) |p| {
         p.doc_count +|= @intCast(docs.len);
     }
+    noteBuildMemorySample(profile, "rss_before");
+
+    var resource_tracker = TextBuildResourceTracker.init(options.resource_manager, profile);
+    defer resource_tracker.release();
+    const input_estimated_bytes = estimateTextDocInputBytes(docs);
+    try resource_tracker.adjust(input_estimated_bytes);
 
     var typed_sections = std.ArrayListUnmanaged(ExtraSection).empty;
     defer {
@@ -453,14 +557,27 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         }
         if (profile) |p| p.typed_collect_ns +|= platform_time.monotonicNs() - typed_collect_start_ns;
     }
+    if (profile) |p| {
+        p.stored_docs_estimated_bytes = estimateStoredDocBytes(docs);
+        p.field_postings_estimated_bytes = estimateFieldPostingsBuilderBytes(&field_builders);
+        p.typed_doc_values_estimated_bytes = estimateTypedDocValuesBytes(&typed_fields);
+        p.doc_arena_peak_bytes = @max(p.doc_arena_peak_bytes, p.field_postings_estimated_bytes + p.typed_doc_values_estimated_bytes);
+    }
+    noteBuildMemorySample(profile, "rss_after_analyze");
+    try resource_tracker.adjust(input_estimated_bytes +
+        estimateStoredDocBytes(docs) +
+        estimateFieldPostingsBuilderBytes(&field_builders) +
+        estimateTypedDocValuesBytes(&typed_fields));
 
     const typed_build_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    var section_bytes: u64 = 0;
     var typed_it = typed_fields.iterator();
     while (typed_it.next()) |entry| {
         if (entry.value_ptr.conflicted or entry.value_ptr.writer == null) continue;
         const writer = &entry.value_ptr.writer.?;
         if (writer.entries.items.len == 0) continue;
         const section_data = try writer.build();
+        section_bytes +|= @intCast(section_data.len);
         try typed_sections.append(alloc, .{
             .field_name = entry.key_ptr.*,
             .section_type = .typed_doc_values,
@@ -478,6 +595,7 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         const field_name = entry.key_ptr.*;
         const inv_data = try entry.value_ptr.buildAlloc(alloc);
         errdefer alloc.free(inv_data);
+        section_bytes +|= @intCast(inv_data.len);
 
         if (inv_data.len == 0) {
             alloc.free(inv_data);
@@ -488,6 +606,16 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         const field_idx = field_indices.get(field_name).?;
         try seg_writer.addSectionOwned(field_idx, .inverted_text, inv_data);
         entry.value_ptr.deinit(alloc);
+        if (profile) |p| {
+            p.section_bytes = section_bytes;
+            p.field_postings_estimated_bytes = estimateFieldPostingsBuilderBytes(&field_builders);
+            p.fst_and_term_metadata_bytes = @max(p.fst_and_term_metadata_bytes, section_bytes);
+        }
+        try resource_tracker.adjust(input_estimated_bytes +
+            estimateStoredDocBytes(docs) +
+            section_bytes +
+            estimateFieldPostingsBuilderBytes(&field_builders) +
+            estimateTypedDocValuesBytes(&typed_fields));
     }
 
     for (typed_sections.items) |*section| {
@@ -501,6 +629,14 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         section.data = &.{};
     }
     if (profile) |p| p.section_attach_ns +|= platform_time.monotonicNs() - section_attach_start_ns;
+    if (profile) |p| {
+        p.section_bytes = section_bytes;
+        p.field_postings_estimated_bytes = estimateFieldPostingsBuilderBytes(&field_builders);
+        p.typed_doc_values_estimated_bytes = estimateTypedDocValuesBytes(&typed_fields);
+        p.fst_and_term_metadata_bytes = @max(p.fst_and_term_metadata_bytes, section_bytes);
+    }
+    noteBuildMemorySample(profile, "rss_after_postings_build");
+    try resource_tracker.adjust(input_estimated_bytes + estimateStoredDocBytes(docs) + section_bytes);
 
     const segment_assembly_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
     const segment_start_len = sink.len();
@@ -510,7 +646,11 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         p.stored_compress_ns +|= seg_writer.last_stored_compress_ns;
         p.segment_encode_ns +|= platform_time.monotonicNs() - segment_encode_start_ns;
         p.segment_bytes +|= @intCast(sink.len() - segment_start_len);
+        p.segment_sink_bytes = @intCast(sink.len() - segment_start_len);
     }
+    noteBuildMemorySample(profile, "rss_after_sections");
+    try resource_tracker.adjust(section_bytes + @as(u64, @intCast(sink.len() - segment_start_len)));
+    noteBuildMemorySample(profile, "rss_after_publish");
 }
 
 const TermAcc = struct {
@@ -2001,6 +2141,59 @@ test "buildSegmentFromTextWithAnalysisOptions records build profile" {
     try std.testing.expect(profile.token_count > 0);
     try std.testing.expect(profile.term_hit_count > 0);
     try std.testing.expect(profile.segment_bytes > 0);
+    try std.testing.expect(profile.resource_peak_bytes > 0);
+    try std.testing.expect(profile.stored_docs_estimated_bytes > 0);
+    try std.testing.expect(profile.field_postings_estimated_bytes > 0);
+    try std.testing.expect(profile.section_bytes > 0);
+}
+
+test "buildSegmentFromTextWithAnalysisOptions accounts and releases full text working set" {
+    const alloc = std.testing.allocator;
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var profile = BuildTextProfile{};
+    const seg_bytes = try buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+        .{
+            .id = "doc1",
+            .stored_data = "{\"title\":\"alpha beta\"}",
+            .text_fields = &.{.{ .field_name = "title", .text = "alpha beta gamma" }},
+        },
+    }, &analysis_mod.default_analyzer, .{}, .{
+        .profile = &profile,
+        .resource_manager = &manager,
+    });
+    defer alloc.free(seg_bytes);
+
+    const stats = manager.sliceStats(.full_text_build_working_set);
+    try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
+    try std.testing.expect(stats.peak_bytes > 0);
+    try std.testing.expect(profile.resource_peak_bytes > 0);
+}
+
+test "buildSegmentFromTextWithAnalysisOptions releases full text working set after budget rejection" {
+    const alloc = std.testing.allocator;
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 1,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var profile = BuildTextProfile{};
+    try std.testing.expectError(error.ResourceBudgetExceeded, buildSegmentFromTextWithAnalysisOptions(alloc, &.{
+        .{
+            .id = "doc1",
+            .stored_data = "{\"title\":\"alpha beta\"}",
+            .text_fields = &.{.{ .field_name = "title", .text = "alpha beta gamma" }},
+        },
+    }, &analysis_mod.default_analyzer, .{}, .{
+        .profile = &profile,
+        .resource_manager = &manager,
+    }));
+
+    const stats = manager.sliceStats(.full_text_build_working_set);
+    try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
+    try std.testing.expect(stats.hard_limit_rejections > 0);
 }
 
 test "buildSegmentFromText omits empty inverted sections" {
