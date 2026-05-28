@@ -82,6 +82,7 @@ var hbc_defer_bulk_quantized_rebuild_cache: std.atomic.Value(u8) = .init(0);
 var bench_hbc_metrics_cache: std.atomic.Value(u8) = .init(0);
 var bench_text_metrics_cache: std.atomic.Value(u8) = .init(0);
 var bench_text_profile_cache: std.atomic.Value(u8) = .init(0);
+var bench_memory_attribution_cache: std.atomic.Value(u8) = .init(0);
 var text_build_memory_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_doc_scratch_retained_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_segment_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
@@ -213,6 +214,17 @@ const PhaseTrackingAllocator = struct {
         self.backing.rawFree(memory, alignment, ret_addr);
         self.stats.noteFree(memory.len);
     }
+};
+
+const TextMemoryAttributionStats = struct {
+    text_indexes: u64 = 0,
+    text_segments: u64 = 0,
+    text_segment_bytes: u64 = 0,
+    text_mmap_segment_bytes: u64 = 0,
+    text_heap_segment_bytes: u64 = 0,
+    text_max_segment_bytes: u64 = 0,
+    configured_lmdb_main_map_bytes: u64 = 0,
+    configured_lmdb_wal_map_bytes: u64 = 0,
 };
 
 const TextBatchMutationStats = struct {
@@ -1646,6 +1658,119 @@ pub const IndexManager = struct {
             }
         }
         return stats;
+    }
+
+    fn snapshotTextMemoryAttribution(self: *IndexManager) TextMemoryAttributionStats {
+        var stats = TextMemoryAttributionStats{};
+        stats.text_indexes = @intCast(self.text_indexes.items.len);
+        for (self.text_indexes.items) |*entry| {
+            const persistent_memory = entry.persistent.memoryStatsSnapshot();
+            stats.configured_lmdb_main_map_bytes +|= persistent_memory.configured_lmdb_main_map_bytes;
+            stats.configured_lmdb_wal_map_bytes +|= persistent_memory.configured_lmdb_wal_map_bytes;
+
+            const snap = entry.persistent.acquireSnapshot();
+            defer snap.release();
+            stats.text_segments +|= @intCast(snap.segments.len);
+            for (snap.segments) |seg| {
+                const bytes: u64 = @intCast(seg.data.bytes().len);
+                stats.text_segment_bytes +|= bytes;
+                stats.text_max_segment_bytes = @max(stats.text_max_segment_bytes, bytes);
+                switch (seg.data) {
+                    .mmap => stats.text_mmap_segment_bytes +|= bytes,
+                    .heap => stats.text_heap_segment_bytes +|= bytes,
+                }
+            }
+        }
+        return stats;
+    }
+
+    fn logMemoryAttribution(
+        self: *IndexManager,
+        label: []const u8,
+        source_docs: usize,
+        projection_docs: usize,
+        batch_segments: usize,
+    ) void {
+        if (!memoryAttributionEnabled()) return;
+
+        const memory = process_memory.snapshot();
+        const text_stats = self.snapshotTextMemoryAttribution();
+        const lsm_stats = self.snapshotLsmMaintenanceStats();
+        const lsm_cache_stats: lsm_backend_mod.cache.Stats = if (self.lsm_cache) |cache| cache.snapshotStats() else .{};
+        var ft_pending_used: u64 = 0;
+        var ft_pending_peak: u64 = 0;
+        var ft_build_used: u64 = 0;
+        var ft_build_peak: u64 = 0;
+        var lsm_cache_used: u64 = 0;
+        var lsm_cache_peak: u64 = 0;
+        var lsm_compaction_used: u64 = 0;
+        var lsm_compaction_peak: u64 = 0;
+        var lsm_state_used: u64 = 0;
+        var lsm_state_peak: u64 = 0;
+        if (self.resource_manager) |manager| {
+            const resource_stats = manager.snapshot();
+            const ft_pending = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)];
+            const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
+            const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
+            const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
+            const lsm_state = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)];
+            ft_pending_used = ft_pending.used_bytes;
+            ft_pending_peak = ft_pending.peak_bytes;
+            ft_build_used = ft_build.used_bytes;
+            ft_build_peak = ft_build.peak_bytes;
+            lsm_cache_used = lsm_cache.used_bytes;
+            lsm_cache_peak = lsm_cache.peak_bytes;
+            lsm_compaction_used = lsm_compaction.used_bytes;
+            lsm_compaction_peak = lsm_compaction.peak_bytes;
+            lsm_state_used = lsm_state.used_bytes;
+            lsm_state_peak = lsm_state.peak_bytes;
+        }
+
+        std.log.info(
+            "antfly_bench_memory_attribution label={s} source_docs={d} projection_docs={d} batch_segments={d} rss_bytes={d} footprint_bytes={d} text_indexes={d} text_segments={d} text_segment_bytes={d} text_mmap_segment_bytes={d} text_heap_segment_bytes={d} text_max_segment_bytes={d} configured_lmdb_main_map_bytes={d} configured_lmdb_wal_map_bytes={d}",
+            .{
+                label,
+                source_docs,
+                projection_docs,
+                batch_segments,
+                memory.resident_bytes,
+                memory.footprint_bytes,
+                text_stats.text_indexes,
+                text_stats.text_segments,
+                text_stats.text_segment_bytes,
+                text_stats.text_mmap_segment_bytes,
+                text_stats.text_heap_segment_bytes,
+                text_stats.text_max_segment_bytes,
+                text_stats.configured_lmdb_main_map_bytes,
+                text_stats.configured_lmdb_wal_map_bytes,
+            },
+        );
+        std.log.info(
+            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d}",
+            .{
+                label,
+                ft_pending_used,
+                ft_pending_peak,
+                ft_build_used,
+                ft_build_peak,
+                lsm_cache_used,
+                lsm_cache_peak,
+                lsm_compaction_used,
+                lsm_compaction_peak,
+                lsm_state_used,
+                lsm_state_peak,
+                lsm_stats.mutable_bytes,
+                lsm_stats.immutable_bytes,
+                lsm_stats.immutable_memtables,
+                lsm_stats.total_run_bytes,
+                lsm_stats.total_runs,
+                lsm_cache_stats.entry_count,
+                lsm_cache_stats.run_state.used_bytes,
+                lsm_cache_stats.run_table_raw.used_bytes,
+                lsm_cache_stats.run_table_index.used_bytes,
+                lsm_cache_stats.run_table_block.used_bytes,
+            },
+        );
     }
 
     pub fn runLsmMaintenanceStep(self: *IndexManager) !bool {
@@ -6864,6 +6989,7 @@ pub const IndexManager = struct {
                 },
             );
         }
+        self.logMemoryAttribution("text_index_batch", source_docs.len, projection_doc_count, segment_count);
         return .{ .indexed_any = indexed_any };
     }
 
@@ -8324,6 +8450,25 @@ pub const IndexManager = struct {
             std.ascii.eqlIgnoreCase(raw, "false") or
             std.ascii.eqlIgnoreCase(raw, "no"));
         bench_text_metrics_cache.store(if (enabled) 2 else 1, .monotonic);
+        return enabled;
+    }
+
+    fn memoryAttributionEnabled() bool {
+        const cached = bench_memory_attribution_cache.load(.monotonic);
+        if (cached != 0) return cached == 2;
+        if (comptime builtin.os.tag == .freestanding) {
+            bench_memory_attribution_cache.store(1, .monotonic);
+            return false;
+        }
+        const raw_z = getenv("ANTFLY_BENCH_MEMORY_ATTRIBUTION") orelse {
+            bench_memory_attribution_cache.store(1, .monotonic);
+            return false;
+        };
+        const raw = std.mem.span(raw_z);
+        const enabled = !(std.mem.eql(u8, raw, "0") or
+            std.ascii.eqlIgnoreCase(raw, "false") or
+            std.ascii.eqlIgnoreCase(raw, "no"));
+        bench_memory_attribution_cache.store(if (enabled) 2 else 1, .monotonic);
         return enabled;
     }
 

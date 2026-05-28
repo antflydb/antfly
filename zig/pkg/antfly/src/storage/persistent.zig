@@ -239,6 +239,11 @@ pub const PersistentIndexStats = struct {
     main_commit: ?lmdb.CommitStats,
 };
 
+pub const PersistentIndexMemoryStats = struct {
+    configured_lmdb_main_map_bytes: u64 = 0,
+    configured_lmdb_wal_map_bytes: u64 = 0,
+};
+
 const SegmentFileStore = struct {
     allocator: Allocator,
     root_dir: []u8,
@@ -560,6 +565,10 @@ pub const PersistentIndex = struct {
     segment_files: ?SegmentFileStore,
     wal: wal_mod.WAL,
     committed_lsn: u64,
+    main_backend: MainBackend,
+    wal_backend: wal_mod.StorageBackend,
+    main_map_size: usize,
+    wal_map_size: usize,
     read_only: bool = false,
 
     pub const BackendStore = backend_adapter.Store(PersistentIndex, MainTxn, MainTxn, MainTxn, .{
@@ -911,6 +920,10 @@ pub const PersistentIndex = struct {
             .segment_files = segment_files,
             .wal = wal,
             .committed_lsn = committed_lsn,
+            .main_backend = opts.main_backend,
+            .wal_backend = opts.resolvedWalBackend(),
+            .main_map_size = opts.main_map_size,
+            .wal_map_size = opts.wal_map_size,
             .read_only = opts.read_only,
         };
 
@@ -1252,6 +1265,13 @@ pub const PersistentIndex = struct {
         return .{
             .wal = self.wal.statsSnapshot(),
             .main_commit = self.main_store_owner.commitStatsSnapshot(),
+        };
+    }
+
+    pub fn memoryStatsSnapshot(self: *const PersistentIndex) PersistentIndexMemoryStats {
+        return .{
+            .configured_lmdb_main_map_bytes = if (self.main_backend == .lmdb) @intCast(self.main_map_size) else 0,
+            .configured_lmdb_wal_map_bytes = if (self.wal_backend == .lmdb) @intCast(self.wal_map_size) else 0,
         };
     }
 
