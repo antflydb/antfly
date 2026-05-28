@@ -195,9 +195,10 @@ def test_retrieval_agent_generation_step(backup_api, termite_generator):
                 "query": "find retrieval docs",
                 "stream": False,
                 "generator": {
-                    "provider": "termite",
+                    "provider": "antfly",
                     "model": "local-generator",
                     "api_url": termite_generator,
+                    "api_key": "test-key",
                 },
                 "steps": {
                     "generation": {
@@ -251,9 +252,10 @@ def test_retrieval_agent_inline_eval_step(backup_api, termite_generator):
                 "query": "Explain raft consensus in Antfly",
                 "stream": False,
                 "generator": {
-                    "provider": "termite",
+                    "provider": "antfly",
                     "model": "local-generator",
                     "api_url": termite_generator,
+                    "api_key": "test-key",
                 },
                 "steps": {
                     "generation": {"enabled": True},
@@ -265,9 +267,10 @@ def test_retrieval_agent_inline_eval_step(backup_api, termite_generator):
                             "recall",
                         ],
                         "judge": {
-                            "provider": "termite",
+                            "provider": "antfly",
                             "model": "judge",
                             "api_url": termite_generator,
+                            "api_key": "test-key",
                         },
                         "ground_truth": {
                             "relevant_ids": ["doc:a"],
@@ -325,9 +328,10 @@ def test_retrieval_agent_streaming_eval_sse(backup_api, termite_generator):
             "query": "Explain raft consensus in Antfly",
             "stream": True,
             "generator": {
-                "provider": "termite",
+                "provider": "antfly",
                 "model": "local-generator",
                 "api_url": termite_generator,
+                "api_key": "test-key",
             },
             "steps": {
                 "generation": {"enabled": True},
@@ -339,9 +343,10 @@ def test_retrieval_agent_streaming_eval_sse(backup_api, termite_generator):
                         "recall",
                     ],
                     "judge": {
-                        "provider": "termite",
+                        "provider": "antfly",
                         "model": "judge",
                         "api_url": termite_generator,
+                        "api_key": "test-key",
                     },
                     "ground_truth": {
                         "relevant_ids": ["doc:a"],
@@ -726,9 +731,10 @@ def test_retrieval_agent_tree_search_generation(backup_api, termite_generator):
                         "query": "summarize the architecture tree",
                         "stream": False,
                         "generator": {
-                            "provider": "termite",
+                            "provider": "antfly",
                             "model": "local-generator",
                             "api_url": termite_generator,
+                            "api_key": "test-key",
                         },
                         "steps": {
                             "generation": {"enabled": True},
@@ -784,9 +790,10 @@ def test_retrieval_agent_classification_confidence_followup(backup_api, termite_
             "query": "How does retrieval work?",
             "stream": False,
             "generator": {
-                "provider": "termite",
+                "provider": "antfly",
                 "model": "local-generator",
                 "api_url": termite_generator,
+                "api_key": "test-key",
             },
             "steps": {
                 "classification": {
@@ -889,9 +896,10 @@ def test_retrieval_agent_streaming_sse(backup_api, termite_generator):
             "query": "find retrieval docs",
             "stream": True,
             "generator": {
-                "provider": "termite",
+                "provider": "antfly",
                 "model": "local-generator",
                 "api_url": termite_generator,
+                "api_key": "test-key",
             },
             "steps": {
                 "generation": {

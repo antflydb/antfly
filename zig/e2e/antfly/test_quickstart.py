@@ -346,7 +346,7 @@ def test_public_hybrid_quickstart_pipeline(backup_api, termite_reranker):
                         "require_multi_index": True,
                     },
                     "reranker": {
-                        "provider": "termite",
+                        "provider": "antfly",
                         "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
                         "url": termite_reranker,
                         "field": "body",
@@ -405,7 +405,7 @@ def test_public_hybrid_quickstart_pipeline(backup_api, termite_reranker):
                         "min_score_ratio": 0.2,
                     },
                     "reranker": {
-                        "provider": "termite",
+                        "provider": "antfly",
                         "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
                         "url": termite_reranker,
                         "field": "body",
@@ -526,7 +526,7 @@ def test_public_hybrid_quickstart_supports_weighted_merge_and_template_reranking
                         },
                     },
                     "reranker": {
-                        "provider": "termite",
+                        "provider": "antfly",
                         "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
                         "url": termite_reranker,
                         "template": "title={{title}}\nbody={{body}}",
@@ -638,7 +638,7 @@ def test_public_managed_semantic_hybrid_quickstart_pipeline(backup_api, openai_e
                         },
                     },
                     "reranker": {
-                        "provider": "termite",
+                        "provider": "antfly",
                         "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
                         "url": termite_reranker,
                         "field": "body",
@@ -808,29 +808,29 @@ def test_public_managed_chunked_semantic_full_index_pipeline(backup_api, openai_
     assert any(chunk["body"].startswith("beta") for chunk in chunks)
 
 
-def test_public_managed_termite_chunked_semantic_full_index_pipeline(backup_api, termite_embedder):
-    table_name = f"quickstart_termite_chunked_semantic_{__import__('time').time_ns()}"
+def test_public_managed_antfly_chunked_semantic_full_index_pipeline(backup_api, termite_embedder):
+    table_name = f"quickstart_antfly_chunked_semantic_{__import__('time').time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
     assert (
         backup_api.create_index(
             table_name,
-            "semantic_termite_idx",
+            "semantic_antfly_idx",
             {
-                "name": "semantic_termite_idx",
+                "name": "semantic_antfly_idx",
                 "type": "embeddings",
                 "field": "body",
                 "dimension": 3,
                 "embedder": {
-                    "provider": "termite",
-                    "model": "termite-embed-v1",
+                    "provider": "antfly",
+                    "model": "antfly-embed-v1",
                     "api_url": termite_embedder,
                 },
                 "chunker": {
-                    "provider": "termite",
+                    "provider": "antfly",
                     "api_url": termite_embedder,
-                    "model": "termite-chunker-v1",
+                    "model": "antfly-chunker-v1",
                     "store_chunks": True,
                     "text": {
                         "target_tokens": 4,
@@ -842,18 +842,18 @@ def test_public_managed_termite_chunked_semantic_full_index_pipeline(backup_api,
         == {}
     )
 
-    ready = backup_api.wait_index_ready(table_name, "semantic_termite_idx", timeout_s=30.0, interval_s=0.5)
+    ready = backup_api.wait_index_ready(table_name, "semantic_antfly_idx", timeout_s=30.0, interval_s=0.5)
     assert ready is not None
 
     batch = backup_api.batch_write(
         table_name,
         inserts={
             "doc:a": {
-                "title": "Alpha in termite chunks",
+                "title": "Alpha in antfly chunks",
                 "body": "alpha body chunk tail",
             },
             "doc:b": {
-                "title": "Beta in termite chunks",
+                "title": "Beta in antfly chunks",
                 "body": "beta body chunk tail",
             },
         },
@@ -865,7 +865,7 @@ def test_public_managed_termite_chunked_semantic_full_index_pipeline(backup_api,
         table_name,
         {
             "semantic_search": "alpha concept",
-            "indexes": ["semantic_termite_idx"],
+            "indexes": ["semantic_antfly_idx"],
             "limit": 5,
         },
     )
@@ -883,8 +883,8 @@ def test_public_managed_termite_chunked_semantic_full_index_pipeline(backup_api,
         },
     )
     assert len(scan) == 1
-    assert scan[0]["title"] == "Alpha in termite chunks"
-    chunks = scan[0]["_chunks"]["semantic_termite_idx_chunks"]
+    assert scan[0]["title"] == "Alpha in antfly chunks"
+    chunks = scan[0]["_chunks"]["semantic_antfly_idx_chunks"]
     assert len(chunks) >= 2
     assert chunks[0]["body"] == "alpha body"
     assert chunks[1]["body"] == "chunk tail"

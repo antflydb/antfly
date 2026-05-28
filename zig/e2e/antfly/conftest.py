@@ -1116,7 +1116,7 @@ class TermiteEmbeddingServer:
 
                 if self.path in ("/chunk", "/api/chunk", f"{TERMITE_PUBLIC_API_ROOT}/chunk"):
                     model = payload.get("config", {}).get("model")
-                    if model != "termite-chunker-v1":
+                    if model != "antfly-chunker-v1":
                         self.send_error(400)
                         return
                     input_value = payload.get("input", "")
@@ -1178,7 +1178,7 @@ class TermiteEmbeddingServer:
                     else:
                         values = [outer._vector_for_text(str(input_value))]
 
-                    if model == "termite-sparse-v1":
+                    if model == "antfly-sparse-v1":
                         data = [
                             {
                                 "object": "embedding",
@@ -1204,7 +1204,7 @@ class TermiteEmbeddingServer:
                         {
                             "object": "list",
                             "data": data,
-                            "model": model or "termite-embed-v1",
+                            "model": model or "antfly-embed-v1",
                             "usage": {
                                 "prompt_tokens": max(1, len(values)),
                                 "total_tokens": max(1, len(values)),

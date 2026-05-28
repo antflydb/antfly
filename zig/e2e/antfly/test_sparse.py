@@ -556,8 +556,8 @@ def test_managed_sparse_hybrid_query_with_termite_embeddings(backup_api, termite
                 "field": "content",
                 "dimension": 3,
                 "embedder": {
-                    "provider": "termite",
-                    "model": "termite-embed-v1",
+                    "provider": "antfly",
+                    "model": "antfly-embed-v1",
                     "api_url": termite_embedder,
                 },
             },
@@ -575,8 +575,8 @@ def test_managed_sparse_hybrid_query_with_termite_embeddings(backup_api, termite
                 "field": "content",
                 "sparse": True,
                 "embedder": {
-                    "provider": "termite",
-                    "model": "termite-sparse-v1",
+                    "provider": "antfly",
+                    "model": "antfly-sparse-v1",
                     "api_url": termite_embedder,
                 },
             },
@@ -643,7 +643,7 @@ def test_managed_sparse_hybrid_query_with_termite_embeddings(backup_api, termite
                     "require_multi_index": True,
                 },
                 "reranker": {
-                    "provider": "termite",
+                    "provider": "antfly",
                     "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
                     "url": termite_reranker,
                     "field": "content",
@@ -746,7 +746,7 @@ def test_sparse_hybrid_query_supports_reranker_and_pruner(backup_api, termite_re
             "require_multi_index": True,
         },
         "reranker": {
-            "provider": "termite",
+            "provider": "antfly",
             "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
             "url": termite_reranker,
             "field": "content",
@@ -920,7 +920,7 @@ def test_sparse_hybrid_query_rejects_invalid_reranker_config(backup_api, termite
                 },
                 "indexes": [sparse_index],
                 "reranker": {
-                    "provider": "termite",
+                    "provider": "antfly",
                     "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
                     "url": termite_reranker,
                     "field": "content",
