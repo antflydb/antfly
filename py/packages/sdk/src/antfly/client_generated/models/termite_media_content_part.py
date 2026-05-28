@@ -13,12 +13,12 @@ T = TypeVar("T", bound="TermiteMediaContentPart")
 
 @_attrs_define
 class TermiteMediaContentPart:
-    """Inline binary media content (audio, image, etc.)
+    """Inline binary media content for providers that support non-image media parts.
 
     Attributes:
         type_ (TermiteMediaContentPartType):
-        data (str): Base64-encoded binary data
-        mime_type (str): MIME type (audio/wav, image/gif, image/png, etc.)
+        data (str): Base64-encoded binary data.
+        mime_type (str): MIME type such as image/png, audio/wav, or application/pdf.
     """
 
     type_: TermiteMediaContentPartType

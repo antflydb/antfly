@@ -1,45 +1,36 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-if TYPE_CHECKING:
-    from ..models.chat_tool_call_arguments import ChatToolCallArguments
-
-
-T = TypeVar("T", bound="ChatToolCall")
+T = TypeVar("T", bound="ToolCallFunction")
 
 
 @_attrs_define
-class ChatToolCall:
-    """A tool call made by the assistant
+class ToolCallFunction:
+    """The function called by a model tool call.
 
     Attributes:
-        id (str): Unique identifier for this tool call
-        name (str): Name of the tool being called
-        arguments (ChatToolCallArguments): Arguments passed to the tool as key-value pairs
+        name (str): Function name.
+        arguments (str): JSON string of function arguments.
     """
 
-    id: str
     name: str
-    arguments: ChatToolCallArguments
+    arguments: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        id = self.id
-
         name = self.name
 
-        arguments = self.arguments.to_dict()
+        arguments = self.arguments
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "id": id,
                 "name": name,
                 "arguments": arguments,
             }
@@ -49,23 +40,18 @@ class ChatToolCall:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.chat_tool_call_arguments import ChatToolCallArguments
-
         d = dict(src_dict)
-        id = d.pop("id")
-
         name = d.pop("name")
 
-        arguments = ChatToolCallArguments.from_dict(d.pop("arguments"))
+        arguments = d.pop("arguments")
 
-        chat_tool_call = cls(
-            id=id,
+        tool_call_function = cls(
             name=name,
             arguments=arguments,
         )
 
-        chat_tool_call.additional_properties = d
-        return chat_tool_call
+        tool_call_function.additional_properties = d
+        return tool_call_function
 
     @property
     def additional_keys(self) -> list[str]:

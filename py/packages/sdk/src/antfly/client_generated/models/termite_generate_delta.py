@@ -21,7 +21,7 @@ class TermiteGenerateDelta:
     """Delta content for streaming
 
     Attributes:
-        role (TermiteRole | Unset): The role of a message sender in a conversation
+        role (TermiteRole | Unset): The role of a chat message sender.
         content (None | str | Unset): Token content delta
         tool_calls (list[TermiteToolCallDelta] | Unset): Tool call deltas for streaming tool calls
     """

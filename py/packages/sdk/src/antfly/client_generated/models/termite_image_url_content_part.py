@@ -9,7 +9,7 @@ from attrs import field as _attrs_field
 from ..models.termite_image_url_content_part_type import TermiteImageURLContentPartType
 
 if TYPE_CHECKING:
-    from ..models.termite_image_url import TermiteImageURL
+    from ..models.image_url import ImageURL
 
 
 T = TypeVar("T", bound="TermiteImageURLContentPart")
@@ -17,15 +17,15 @@ T = TypeVar("T", bound="TermiteImageURLContentPart")
 
 @_attrs_define
 class TermiteImageURLContentPart:
-    """Image content for embedding (OpenAI-compatible format)
+    """Image content in the OpenAI-compatible content part format.
 
     Attributes:
         type_ (TermiteImageURLContentPartType):
-        image_url (TermiteImageURL): Image URL or data URI
+        image_url (ImageURL): Image URL or data URI.
     """
 
     type_: TermiteImageURLContentPartType
-    image_url: TermiteImageURL
+    image_url: ImageURL
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -46,12 +46,12 @@ class TermiteImageURLContentPart:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.termite_image_url import TermiteImageURL
+        from ..models.image_url import ImageURL
 
         d = dict(src_dict)
         type_ = TermiteImageURLContentPartType(d.pop("type"))
 
-        image_url = TermiteImageURL.from_dict(d.pop("image_url"))
+        image_url = ImageURL.from_dict(d.pop("image_url"))
 
         termite_image_url_content_part = cls(
             type_=type_,

@@ -16762,6 +16762,9 @@ components:
           format: uri
           description: URL of the Termite embedding/chunking service
           example: http://localhost:8080
+        api_key:
+          type: string
+          description: API key used when calling an authenticated shared Termite API.
         models_dir:
           type: string
           description: >

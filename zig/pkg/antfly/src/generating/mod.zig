@@ -42,6 +42,7 @@ pub const BackendFactory = struct {
     http: *httpx.Client,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
+    termite_api_key: ?[]const u8 = null,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -58,6 +59,7 @@ pub const BackendFactory = struct {
     pub const Options = struct {
         local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
+        termite_api_key: ?[]const u8 = null,
     };
 
     pub fn initWithOptions(
@@ -70,6 +72,7 @@ pub const BackendFactory = struct {
             .http = http,
             .local_termite_provider = options.local_termite_provider,
             .secret_store = options.secret_store,
+            .termite_api_key = options.termite_api_key,
         };
     }
 
@@ -82,7 +85,7 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.local_termite_provider, self.secret_store);
+        return try BackendState.init(alloc, self.http, cfg, self.local_termite_provider, self.secret_store, self.termite_api_key);
     }
 };
 
@@ -104,13 +107,17 @@ const BackendState = struct {
         cfg: GeneratorConfig,
         local_termite_provider: ?managed_embedder.LocalTermiteProvider,
         secret_store: ?*common_secrets.FileStore,
+        termite_api_key: ?[]const u8,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
 
         state.alloc = alloc;
         state.cfg = cfg;
-        state.api_key = try common_secrets.SecretValue.initConfig(alloc, cfg.api_key);
+        state.api_key = switch (cfg.provider) {
+            .termite, .antfly => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key orelse termite_api_key, "ANTFLY_TERMITE_API_KEY"),
+            else => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
+        };
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
         state.auth_header_cache = .{};
         state.secret_store = secret_store;
@@ -162,7 +169,14 @@ const BackendState = struct {
                 }
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
-            .termite => |*provider| try provider.generator().generate(alloc, model, messages),
+            .termite => |*provider| blk: {
+                if (self.api_key) |*api_key_ref| {
+                    const auth_header = try self.auth_header_cache.getOwned(self.alloc, alloc, api_key_ref, self.secret_store);
+                    defer alloc.free(auth_header);
+                    try provider.setAuthorizationHeader(auth_header);
+                }
+                break :blk try provider.generator().generate(alloc, model, messages);
+            },
             .local_termite => |local| blk: {
                 if (local.generate_messages) |generate_messages| {
                     const content = try generate_messages(local.ptr, alloc, model, messages);
@@ -242,69 +256,73 @@ test "generating backend factory executes fallback chain across providers" {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    var ts = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/openai/chat/completions", .respond = .{
-            .status = 429,
-            .body = "{\"error\":\"rate limit\"}",
-        } },
-        .{ .method = .POST, .path = "/termite/generate", .respond = .{
-            .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"fallback ok\"}}]}",
-        } },
-    });
-    defer ts.deinit();
-
-    const openai_url = try std.fmt.allocPrint(alloc, "{s}/openai", .{ts.baseUrl()});
-    defer alloc.free(openai_url);
-    const termite_url = try std.fmt.allocPrint(alloc, "{s}/termite", .{ts.baseUrl()});
-    defer alloc.free(termite_url);
-
     var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
     defer client.deinit();
 
-    const chain = [_]ChainLink{
-        .{
-            .generator = GeneratorConfig.fromOpenAI(.{ .model = "gpt-4.1", .url = openai_url }),
-            .condition = .on_error,
-        },
-        .{
-            .generator = GeneratorConfig.fromTermite(.{ .model = "local", .url = termite_url }),
-        },
-    };
-
-    var group = std.Io.Group.init;
-    var content: ?[]u8 = null;
-    defer if (content) |value| alloc.free(value);
-    var run_err: ?anyerror = null;
-
-    const Fiber = struct {
-        fn run(
+    const FakeLocal = struct {
+        fn embedDenseTexts(
+            ptr: *anyopaque,
             a: std.mem.Allocator,
-            test_io: std.Io,
-            test_client: *httpx.Client,
-            links: []const ChainLink,
-            out: *?[]u8,
-            err_out: *?anyerror,
-        ) std.Io.Cancelable!void {
-            _ = test_io;
-            var result = executeChain(a, test_client, links, &.{.{ .role = .user, .content = .{ .text = "hello" } }}) catch |err| {
-                err_out.* = err;
-                return;
-            };
-            defer result.deinit();
-            out.* = a.dupe(u8, result.content) catch |err| {
-                err_out.* = err;
-                return;
-            };
+            model: []const u8,
+            texts: []const []const u8,
+        ) anyerror![][]f32 {
+            _ = ptr;
+            _ = a;
+            _ = model;
+            _ = texts;
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparseTexts(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            model: []const u8,
+            texts: []const []const u8,
+        ) anyerror![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            _ = ptr;
+            _ = a;
+            _ = model;
+            _ = texts;
+            return error.TestUnexpectedResult;
+        }
+
+        fn generateMessages(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            model: []const u8,
+            messages: []const ChatMessage,
+        ) anyerror![]u8 {
+            _ = ptr;
+            try std.testing.expectEqualStrings("local", model);
+            try std.testing.expectEqual(@as(usize, 1), messages.len);
+            try std.testing.expectEqual(.user, messages[0].role);
+            try std.testing.expectEqualStrings("hello", textContent(messages[0]) orelse return error.TestUnexpectedResult);
+            return try a.dupe(u8, "fallback ok");
         }
     };
 
-    group.concurrent(io, Fiber.run, .{ alloc, io, &client, &chain, &content, &run_err }) catch return;
-    try ts.handleOne();
-    try ts.handleOne();
-    group.await(io) catch {};
-    if (run_err) |err| return err;
+    var fake = FakeLocal{};
+    const local_provider = managed_embedder.LocalTermiteProvider{
+        .ptr = &fake,
+        .embed_dense_texts = FakeLocal.embedDenseTexts,
+        .embed_sparse_texts = FakeLocal.embedSparseTexts,
+        .generate_messages = FakeLocal.generateMessages,
+    };
 
-    try std.testing.expectEqualStrings("fallback ok", content orelse return error.TestUnexpectedResult);
+    const chain = [_]ChainLink{
+        .{
+            .generator = .{ .provider = .mock, .model = "missing", .url = "", .api_key = null },
+            .condition = .on_error,
+        },
+        .{
+            .generator = GeneratorConfig.fromTermite(.{ .model = "local", .url = "" }),
+        },
+    };
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+
+    var result = try executeChainWithLocalTermite(alloc, &client, &chain, local_provider, &messages);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("fallback ok", result.content);
 }
 
 test "generating backend routes antfly and url-less termite to local provider" {

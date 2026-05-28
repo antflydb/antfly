@@ -58,11 +58,7 @@ from .chain_condition import ChainCondition
 from .chain_link import ChainLink
 from .chat_message import ChatMessage
 from .chat_message_role import ChatMessageRole
-from .chat_tool_call import ChatToolCall
-from .chat_tool_call_arguments import ChatToolCallArguments
 from .chat_tool_name import ChatToolName
-from .chat_tool_result import ChatToolResult
-from .chat_tool_result_result import ChatToolResultResult
 from .chat_tools_config import ChatToolsConfig
 from .chunk_options import ChunkOptions
 from .chunker_config import ChunkerConfig
@@ -74,12 +70,18 @@ from .cluster_backup_request import ClusterBackupRequest
 from .cluster_backup_request_format import ClusterBackupRequestFormat
 from .cluster_backup_response import ClusterBackupResponse
 from .cluster_backup_response_status import ClusterBackupResponseStatus
+from .cluster_data_group_status import ClusterDataGroupStatus
+from .cluster_data_node_status import ClusterDataNodeStatus
+from .cluster_data_range_status import ClusterDataRangeStatus
+from .cluster_data_replica_status import ClusterDataReplicaStatus
+from .cluster_data_status import ClusterDataStatus
 from .cluster_health import ClusterHealth
 from .cluster_restore_request import ClusterRestoreRequest
 from .cluster_restore_request_restore_mode import ClusterRestoreRequestRestoreMode
 from .cluster_restore_response import ClusterRestoreResponse
 from .cluster_restore_response_status import ClusterRestoreResponseStatus
 from .cluster_status import ClusterStatus
+from .cluster_topology import ClusterTopology
 from .cohere_embedder_config import CohereEmbedderConfig
 from .cohere_embedder_config_input_type import CohereEmbedderConfigInputType
 from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
@@ -129,6 +131,28 @@ from .eval_summary import EvalSummary
 from .evaluator_name import EvaluatorName
 from .evaluator_score import EvaluatorScore
 from .evaluator_score_metadata import EvaluatorScoreMetadata
+from .extraction_classification import ExtractionClassification
+from .extraction_classification_schema import ExtractionClassificationSchema
+from .extraction_entity import ExtractionEntity
+from .extraction_input import ExtractionInput
+from .extraction_input_metadata import ExtractionInputMetadata
+from .extraction_object import ExtractionObject
+from .extraction_object_structures import ExtractionObjectStructures
+from .extraction_options import ExtractionOptions
+from .extraction_reader_options import ExtractionReaderOptions
+from .extraction_relation import ExtractionRelation
+from .extraction_relation_endpoint import ExtractionRelationEndpoint
+from .extraction_relation_schema import ExtractionRelationSchema
+from .extraction_request import ExtractionRequest
+from .extraction_response import ExtractionResponse
+from .extraction_response_object import ExtractionResponseObject
+from .extraction_response_usage import ExtractionResponseUsage
+from .extraction_schema import ExtractionSchema
+from .extraction_schema_structures import ExtractionSchemaStructures
+from .extraction_structure_field_type_1 import ExtractionStructureFieldType1
+from .extraction_structure_schema import ExtractionStructureSchema
+from .extraction_structure_schema_fields import ExtractionStructureSchemaFields
+from .extraction_token import ExtractionToken
 from .failed_operation import FailedOperation
 from .failed_operation_operation import FailedOperationOperation
 from .fetch_config import FetchConfig
@@ -173,6 +197,9 @@ from .graph_query_type import GraphQueryType
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .ground_truth import GroundTruth
+from .image_url import ImageURL
+from .image_url_content_part import ImageURLContentPart
+from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
 from .index_status import IndexStatus
@@ -198,6 +225,8 @@ from .match_none_query_match_none import MatchNoneQueryMatchNone
 from .match_phrase_query import MatchPhraseQuery
 from .match_query import MatchQuery
 from .match_query_operator import MatchQueryOperator
+from .media_content_part import MediaContentPart
+from .media_content_part_type import MediaContentPartType
 from .merge_config import MergeConfig
 from .merge_config_weights import MergeConfigWeights
 from .merge_profile import MergeProfile
@@ -468,6 +497,11 @@ from .termite_vad_options import TermiteVADOptions
 from .termite_version_response import TermiteVersionResponse
 from .termiteschemas_config import TermiteschemasConfig
 from .text_chunk_options import TextChunkOptions
+from .text_content_part import TextContentPart
+from .text_content_part_type import TextContentPartType
+from .tool_call import ToolCall
+from .tool_call_function import ToolCallFunction
+from .tool_call_type import ToolCallType
 from .transaction_begin_request import TransactionBeginRequest
 from .transaction_begin_response import TransactionBeginResponse
 from .transaction_commit_request import TransactionCommitRequest
@@ -569,11 +603,7 @@ __all__ = (
     "ChainLink",
     "ChatMessage",
     "ChatMessageRole",
-    "ChatToolCall",
-    "ChatToolCallArguments",
     "ChatToolName",
-    "ChatToolResult",
-    "ChatToolResultResult",
     "ChatToolsConfig",
     "ChunkerConfig",
     "ChunkerConfigFullTextIndex",
@@ -585,12 +615,18 @@ __all__ = (
     "ClusterBackupRequestFormat",
     "ClusterBackupResponse",
     "ClusterBackupResponseStatus",
+    "ClusterDataGroupStatus",
+    "ClusterDataNodeStatus",
+    "ClusterDataRangeStatus",
+    "ClusterDataReplicaStatus",
+    "ClusterDataStatus",
     "ClusterHealth",
     "ClusterRestoreRequest",
     "ClusterRestoreRequestRestoreMode",
     "ClusterRestoreResponse",
     "ClusterRestoreResponseStatus",
     "ClusterStatus",
+    "ClusterTopology",
     "CohereEmbedderConfig",
     "CohereEmbedderConfigInputType",
     "CohereEmbedderConfigTruncate",
@@ -640,6 +676,28 @@ __all__ = (
     "EvaluatorName",
     "EvaluatorScore",
     "EvaluatorScoreMetadata",
+    "ExtractionClassification",
+    "ExtractionClassificationSchema",
+    "ExtractionEntity",
+    "ExtractionInput",
+    "ExtractionInputMetadata",
+    "ExtractionObject",
+    "ExtractionObjectStructures",
+    "ExtractionOptions",
+    "ExtractionReaderOptions",
+    "ExtractionRelation",
+    "ExtractionRelationEndpoint",
+    "ExtractionRelationSchema",
+    "ExtractionRequest",
+    "ExtractionResponse",
+    "ExtractionResponseObject",
+    "ExtractionResponseUsage",
+    "ExtractionSchema",
+    "ExtractionSchemaStructures",
+    "ExtractionStructureFieldType1",
+    "ExtractionStructureSchema",
+    "ExtractionStructureSchemaFields",
+    "ExtractionToken",
     "FailedOperation",
     "FailedOperationOperation",
     "FetchConfig",
@@ -684,6 +742,9 @@ __all__ = (
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GroundTruth",
+    "ImageURL",
+    "ImageURLContentPart",
+    "ImageURLContentPartType",
     "IncompleteDetails",
     "IncompleteDetailsReason",
     "IndexStatus",
@@ -709,6 +770,8 @@ __all__ = (
     "MatchPhraseQuery",
     "MatchQuery",
     "MatchQueryOperator",
+    "MediaContentPart",
+    "MediaContentPartType",
     "MergeConfig",
     "MergeConfigWeights",
     "MergeProfile",
@@ -979,6 +1042,11 @@ __all__ = (
     "TermQuery",
     "TermRangeQuery",
     "TextChunkOptions",
+    "TextContentPart",
+    "TextContentPartType",
+    "ToolCall",
+    "ToolCallFunction",
+    "ToolCallType",
     "TransactionBeginRequest",
     "TransactionBeginResponse",
     "TransactionCommitRequest",

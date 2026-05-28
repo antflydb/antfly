@@ -6,14 +6,14 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.termite_role import TermiteRole
+from ..models.chat_message_role import ChatMessageRole
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.termite_image_url_content_part import TermiteImageURLContentPart
-    from ..models.termite_media_content_part import TermiteMediaContentPart
-    from ..models.termite_text_content_part import TermiteTextContentPart
-    from ..models.termite_tool_call import TermiteToolCall
+    from ..models.image_url_content_part import ImageURLContentPart
+    from ..models.media_content_part import MediaContentPart
+    from ..models.text_content_part import TextContentPart
+    from ..models.tool_call import ToolCall
 
 
 T = TypeVar("T", bound="TermiteChatMessage")
@@ -21,26 +21,25 @@ T = TypeVar("T", bound="TermiteChatMessage")
 
 @_attrs_define
 class TermiteChatMessage:
-    """
+    """OpenAI-compatible chat message.
+
     Attributes:
-        role (TermiteRole): The role of a message sender in a conversation
-        content (list[TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart] | str | Unset):
-            Message content. Supports two formats:
-            - Simple string: "Hello, how are you?"
-            - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
-        tool_calls (list[TermiteToolCall] | Unset): Tool calls made by the assistant (only for role=assistant)
-        tool_call_id (str | Unset): ID of the tool call this message is responding to (only for role=tool)
+        role (ChatMessageRole): The role of a chat message sender.
+        content (list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset): OpenAI-compatible
+            message content: either text or an array of content parts.
+        tool_calls (list[ToolCall] | Unset): Assistant tool calls.
+        tool_call_id (str | Unset): Tool call ID this tool message responds to.
     """
 
-    role: TermiteRole
-    content: list[TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart] | str | Unset = UNSET
-    tool_calls: list[TermiteToolCall] | Unset = UNSET
+    role: ChatMessageRole
+    content: list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset = UNSET
+    tool_calls: list[ToolCall] | Unset = UNSET
     tool_call_id: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.termite_image_url_content_part import TermiteImageURLContentPart
-        from ..models.termite_text_content_part import TermiteTextContentPart
+        from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.text_content_part import TextContentPart
 
         role = self.role.value
 
@@ -49,24 +48,22 @@ class TermiteChatMessage:
             content = UNSET
         elif isinstance(self.content, list):
             content = []
-            for componentsschemas_termite_chat_message_content_type_1_item_data in self.content:
-                componentsschemas_termite_chat_message_content_type_1_item: dict[str, Any]
-                if isinstance(componentsschemas_termite_chat_message_content_type_1_item_data, TermiteTextContentPart):
-                    componentsschemas_termite_chat_message_content_type_1_item = (
-                        componentsschemas_termite_chat_message_content_type_1_item_data.to_dict()
+            for componentsschemas_chat_message_content_type_1_item_data in self.content:
+                componentsschemas_chat_message_content_type_1_item: dict[str, Any]
+                if isinstance(componentsschemas_chat_message_content_type_1_item_data, TextContentPart):
+                    componentsschemas_chat_message_content_type_1_item = (
+                        componentsschemas_chat_message_content_type_1_item_data.to_dict()
                     )
-                elif isinstance(
-                    componentsschemas_termite_chat_message_content_type_1_item_data, TermiteImageURLContentPart
-                ):
-                    componentsschemas_termite_chat_message_content_type_1_item = (
-                        componentsschemas_termite_chat_message_content_type_1_item_data.to_dict()
+                elif isinstance(componentsschemas_chat_message_content_type_1_item_data, ImageURLContentPart):
+                    componentsschemas_chat_message_content_type_1_item = (
+                        componentsschemas_chat_message_content_type_1_item_data.to_dict()
                     )
                 else:
-                    componentsschemas_termite_chat_message_content_type_1_item = (
-                        componentsschemas_termite_chat_message_content_type_1_item_data.to_dict()
+                    componentsschemas_chat_message_content_type_1_item = (
+                        componentsschemas_chat_message_content_type_1_item_data.to_dict()
                     )
 
-                content.append(componentsschemas_termite_chat_message_content_type_1_item)
+                content.append(componentsschemas_chat_message_content_type_1_item)
 
         else:
             content = self.content
@@ -98,78 +95,76 @@ class TermiteChatMessage:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.termite_image_url_content_part import TermiteImageURLContentPart
-        from ..models.termite_media_content_part import TermiteMediaContentPart
-        from ..models.termite_text_content_part import TermiteTextContentPart
-        from ..models.termite_tool_call import TermiteToolCall
+        from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.media_content_part import MediaContentPart
+        from ..models.text_content_part import TextContentPart
+        from ..models.tool_call import ToolCall
 
         d = dict(src_dict)
-        role = TermiteRole(d.pop("role"))
+        role = ChatMessageRole(d.pop("role"))
 
         def _parse_content(
             data: object,
-        ) -> list[TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart] | str | Unset:
+        ) -> list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset:
             if isinstance(data, Unset):
                 return data
             try:
                 if not isinstance(data, list):
                     raise TypeError()
-                componentsschemas_termite_chat_message_content_type_1 = []
-                _componentsschemas_termite_chat_message_content_type_1 = data
+                componentsschemas_chat_message_content_type_1 = []
+                _componentsschemas_chat_message_content_type_1 = data
                 for (
-                    componentsschemas_termite_chat_message_content_type_1_item_data
-                ) in _componentsschemas_termite_chat_message_content_type_1:
+                    componentsschemas_chat_message_content_type_1_item_data
+                ) in _componentsschemas_chat_message_content_type_1:
 
-                    def _parse_componentsschemas_termite_chat_message_content_type_1_item(
+                    def _parse_componentsschemas_chat_message_content_type_1_item(
                         data: object,
-                    ) -> TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart:
+                    ) -> ImageURLContentPart | MediaContentPart | TextContentPart:
                         try:
                             if not isinstance(data, dict):
                                 raise TypeError()
-                            componentsschemas_termite_content_part_type_0 = TermiteTextContentPart.from_dict(data)
+                            componentsschemas_content_part_type_0 = TextContentPart.from_dict(data)
 
-                            return componentsschemas_termite_content_part_type_0
+                            return componentsschemas_content_part_type_0
                         except (TypeError, ValueError, AttributeError, KeyError):
                             pass
                         try:
                             if not isinstance(data, dict):
                                 raise TypeError()
-                            componentsschemas_termite_content_part_type_1 = TermiteImageURLContentPart.from_dict(data)
+                            componentsschemas_content_part_type_1 = ImageURLContentPart.from_dict(data)
 
-                            return componentsschemas_termite_content_part_type_1
+                            return componentsschemas_content_part_type_1
                         except (TypeError, ValueError, AttributeError, KeyError):
                             pass
                         if not isinstance(data, dict):
                             raise TypeError()
-                        componentsschemas_termite_content_part_type_2 = TermiteMediaContentPart.from_dict(data)
+                        componentsschemas_content_part_type_2 = MediaContentPart.from_dict(data)
 
-                        return componentsschemas_termite_content_part_type_2
+                        return componentsschemas_content_part_type_2
 
-                    componentsschemas_termite_chat_message_content_type_1_item = (
-                        _parse_componentsschemas_termite_chat_message_content_type_1_item(
-                            componentsschemas_termite_chat_message_content_type_1_item_data
+                    componentsschemas_chat_message_content_type_1_item = (
+                        _parse_componentsschemas_chat_message_content_type_1_item(
+                            componentsschemas_chat_message_content_type_1_item_data
                         )
                     )
 
-                    componentsschemas_termite_chat_message_content_type_1.append(
-                        componentsschemas_termite_chat_message_content_type_1_item
+                    componentsschemas_chat_message_content_type_1.append(
+                        componentsschemas_chat_message_content_type_1_item
                     )
 
-                return componentsschemas_termite_chat_message_content_type_1
+                return componentsschemas_chat_message_content_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(
-                list[TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart] | str | Unset, data
-            )
+            return cast(list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset, data)
 
         content = _parse_content(d.pop("content", UNSET))
 
         _tool_calls = d.pop("tool_calls", UNSET)
-        tool_calls: list[TermiteToolCall] | Unset = UNSET
+        tool_calls: list[ToolCall] | Unset = UNSET
         if _tool_calls is not UNSET:
             tool_calls = []
             for tool_calls_item_data in _tool_calls:
-                tool_calls_item = TermiteToolCall.from_dict(tool_calls_item_data)
+                tool_calls_item = ToolCall.from_dict(tool_calls_item_data)
 
                 tool_calls.append(tool_calls_item)
 

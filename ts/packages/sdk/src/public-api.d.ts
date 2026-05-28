@@ -9201,6 +9201,8 @@ export interface components {
              * @example http://localhost:8080
              */
             api_url: string;
+            /** @description API key used when calling an authenticated shared Termite API. */
+            api_key?: string;
             /**
              * @description Base directory containing model subdirectories. Termite auto-discovers models from:
              *     - `{models_dir}/embedders/` - Embedding models (ONNX)

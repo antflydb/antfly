@@ -12,9 +12,9 @@ from ..models.termite_embed_request_task_type import TermiteEmbedRequestTaskType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.termite_image_url_content_part import TermiteImageURLContentPart
-    from ..models.termite_media_content_part import TermiteMediaContentPart
-    from ..models.termite_text_content_part import TermiteTextContentPart
+    from ..models.image_url_content_part import ImageURLContentPart
+    from ..models.media_content_part import MediaContentPart
+    from ..models.text_content_part import TextContentPart
 
 
 T = TypeVar("T", bound="TermiteEmbedRequest")
@@ -26,8 +26,8 @@ class TermiteEmbedRequest:
 
     Attributes:
         model (str): Model name to use for embedding generation
-        input_ (list[str] | list[TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart] | str):
-            Input content to embed.
+        input_ (list[ImageURLContentPart | MediaContentPart | TextContentPart] | list[str] | str): Input content to
+            embed.
             Supports:
             - a single string
             - an array of strings
@@ -45,7 +45,7 @@ class TermiteEmbedRequest:
     """
 
     model: str
-    input_: list[str] | list[TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart] | str
+    input_: list[ImageURLContentPart | MediaContentPart | TextContentPart] | list[str] | str
     encoding_format: TermiteEmbedRequestEncodingFormat | Unset = TermiteEmbedRequestEncodingFormat.FLOAT
     dimensions: int | Unset = UNSET
     task_type: TermiteEmbedRequestTaskType | Unset = UNSET
@@ -53,8 +53,8 @@ class TermiteEmbedRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.termite_image_url_content_part import TermiteImageURLContentPart
-        from ..models.termite_text_content_part import TermiteTextContentPart
+        from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.text_content_part import TextContentPart
 
         model = self.model
 
@@ -66,9 +66,9 @@ class TermiteEmbedRequest:
             input_ = []
             for input_type_2_item_data in self.input_:
                 input_type_2_item: dict[str, Any]
-                if isinstance(input_type_2_item_data, TermiteTextContentPart):
+                if isinstance(input_type_2_item_data, TextContentPart):
                     input_type_2_item = input_type_2_item_data.to_dict()
-                elif isinstance(input_type_2_item_data, TermiteImageURLContentPart):
+                elif isinstance(input_type_2_item_data, ImageURLContentPart):
                     input_type_2_item = input_type_2_item_data.to_dict()
                 else:
                     input_type_2_item = input_type_2_item_data.to_dict()
@@ -113,16 +113,16 @@ class TermiteEmbedRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.termite_image_url_content_part import TermiteImageURLContentPart
-        from ..models.termite_media_content_part import TermiteMediaContentPart
-        from ..models.termite_text_content_part import TermiteTextContentPart
+        from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.media_content_part import MediaContentPart
+        from ..models.text_content_part import TextContentPart
 
         d = dict(src_dict)
         model = d.pop("model")
 
         def _parse_input_(
             data: object,
-        ) -> list[str] | list[TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart] | str:
+        ) -> list[ImageURLContentPart | MediaContentPart | TextContentPart] | list[str] | str:
             try:
                 if not isinstance(data, list):
                     raise TypeError()
@@ -140,11 +140,11 @@ class TermiteEmbedRequest:
 
                     def _parse_input_type_2_item(
                         data: object,
-                    ) -> TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart:
+                    ) -> ImageURLContentPart | MediaContentPart | TextContentPart:
                         try:
                             if not isinstance(data, dict):
                                 raise TypeError()
-                            componentsschemas_termite_content_part_type_0 = TermiteTextContentPart.from_dict(data)
+                            componentsschemas_termite_content_part_type_0 = TextContentPart.from_dict(data)
 
                             return componentsschemas_termite_content_part_type_0
                         except (TypeError, ValueError, AttributeError, KeyError):
@@ -152,14 +152,14 @@ class TermiteEmbedRequest:
                         try:
                             if not isinstance(data, dict):
                                 raise TypeError()
-                            componentsschemas_termite_content_part_type_1 = TermiteImageURLContentPart.from_dict(data)
+                            componentsschemas_termite_content_part_type_1 = ImageURLContentPart.from_dict(data)
 
                             return componentsschemas_termite_content_part_type_1
                         except (TypeError, ValueError, AttributeError, KeyError):
                             pass
                         if not isinstance(data, dict):
                             raise TypeError()
-                        componentsschemas_termite_content_part_type_2 = TermiteMediaContentPart.from_dict(data)
+                        componentsschemas_termite_content_part_type_2 = MediaContentPart.from_dict(data)
 
                         return componentsschemas_termite_content_part_type_2
 
@@ -170,10 +170,7 @@ class TermiteEmbedRequest:
                 return input_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(
-                list[str] | list[TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart] | str,
-                data,
-            )
+            return cast(list[ImageURLContentPart | MediaContentPart | TextContentPart] | list[str] | str, data)
 
         input_ = _parse_input_(d.pop("input"))
 

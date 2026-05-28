@@ -97,12 +97,14 @@ pub const Config = struct {
 
     pub const TermiteConfig = struct {
         api_url: ?[]u8 = null,
+        api_key: ?[]u8 = null,
         models_dir: ?[]u8 = null,
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
 
         fn deinit(self: *TermiteConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
+            if (self.api_key) |value| alloc.free(value);
             if (self.models_dir) |value| alloc.free(value);
             if (self.content_security) |*security| security.deinit(alloc);
             if (self.s3_credentials) |*credentials| credentials.deinit(alloc);
@@ -232,6 +234,7 @@ pub const Config = struct {
             .storage = try storageFromOpenApi(alloc, validated.value.storage),
             .termite = if (validated.value.termite) |termite| .{
                 .api_url = if (termite.api_url.len > 0) try alloc.dupe(u8, termite.api_url) else null,
+                .api_key = try rawOptionalStringField(alloc, raw_root.get("termite"), "api_key"),
                 .models_dir = if (termite.models_dir) |value| try alloc.dupe(u8, value) else null,
                 .content_security = if (termite.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
                 .s3_credentials = try parseRawTermiteS3Credentials(alloc, raw_root, termite.s3_credentials),
@@ -462,6 +465,20 @@ fn optionalObjectStringFieldDup(
     const object_value = root.get(object_name) orelse return null;
     if (object_value != .object) return error.InvalidConfig;
     const field_value = object_value.object.get(field_name) orelse return null;
+    return switch (field_value) {
+        .string => try alloc.dupe(u8, field_value.string),
+        else => error.InvalidConfig,
+    };
+}
+
+fn rawOptionalStringField(
+    alloc: std.mem.Allocator,
+    object_value: ?std.json.Value,
+    field_name: []const u8,
+) !?[]u8 {
+    const value = object_value orelse return null;
+    if (value != .object) return error.InvalidConfig;
+    const field_value = value.object.get(field_name) orelse return null;
     return switch (field_value) {
         .string => try alloc.dupe(u8, field_value.string),
         else => error.InvalidConfig,

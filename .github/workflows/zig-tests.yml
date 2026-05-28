@@ -133,45 +133,6 @@ jobs:
             echo "trace_validate=true" >> "$GITHUB_OUTPUT"
           fi
 
-  generated:
-    needs: changes
-    if: github.event_name != 'schedule' && needs.changes.outputs.zig_tests == 'true'
-    runs-on: arc-antfly-standard
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
-
-      - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
-
-      - name: Restore Zig build cache
-        id: zig-cache
-        uses: actions/cache/restore@v5
-        with:
-          path: |
-            ${{ env.ZIG_LOCAL_CACHE_DIR }}
-            ${{ env.ZIG_GLOBAL_CACHE_DIR }}
-          key: zig-${{ runner.os }}-${{ runner.arch }}-0.16.0-main-${{ github.sha }}
-          restore-keys: |
-            zig-${{ runner.os }}-${{ runner.arch }}-0.16.0-main-
-            zig-${{ runner.os }}-${{ runner.arch }}-0.16.0-
-
-      - name: Check Snowball generated sources
-        run: make zig-snowball-check
-
-      - name: Check OpenAPI generated sources
-        run: make zig-openapi-check
-
   unit:
     needs: changes
     if: (github.event_name != 'schedule' && needs.changes.outputs.zig_tests == 'true') || needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
@@ -184,7 +145,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          submodules: ${{ needs.changes.outputs.trace_validate == 'true' }}
+          submodules: true
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
@@ -203,6 +164,12 @@ jobs:
 
       - name: Verify Zig version
         run: zig version
+
+      - name: Check Snowball generated sources
+        run: make zig-snowball-check
+
+      - name: Check OpenAPI generated sources
+        run: make zig-openapi-check
 
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'

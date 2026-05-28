@@ -6,29 +6,44 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="ChatToolResultResult")
+T = TypeVar("T", bound="ImageURL")
 
 
 @_attrs_define
-class ChatToolResultResult:
-    """Result data from the tool execution"""
+class ImageURL:
+    """Image URL or data URI.
 
+    Attributes:
+        url (str): URL or data URI such as data:image/png;base64,...
+    """
+
+    url: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        url = self.url
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
+        field_dict.update(
+            {
+                "url": url,
+            }
+        )
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        chat_tool_result_result = cls()
+        url = d.pop("url")
 
-        chat_tool_result_result.additional_properties = d
-        return chat_tool_result_result
+        image_url = cls(
+            url=url,
+        )
+
+        image_url.additional_properties = d
+        return image_url
 
     @property
     def additional_keys(self) -> list[str]:
