@@ -181,10 +181,7 @@ fn configFromOpenApi(
         cfg.full_text_index_json = try json.Stringify.valueAlloc(alloc, full_text_index, .{});
     }
 
-    switch (cfg.provider) {
-        .antfly => if (cfg.model.len == 0) return error.InvalidChunkerConfig,
-        .mock => {},
-    }
+    if (cfg.provider == .antfly and cfg.api_url.len > 0 and cfg.model.len == 0) return error.InvalidChunkerConfig;
     return cfg;
 }
 
@@ -275,9 +272,12 @@ test "chunker config round trip" {
     try std.testing.expectEqual(@as(u32, 16), reparsed.text.overlap_tokens);
 }
 
-test "chunker config requires antfly model" {
+test "chunker config requires model for remote antfly provider" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidChunkerConfig, parseConfigFromSlice(alloc, "{\"provider\":\"antfly\"}"));
+    try std.testing.expectError(
+        error.InvalidChunkerConfig,
+        parseConfigFromSlice(alloc, "{\"provider\":\"antfly\",\"api_url\":\"http://localhost:8080\"}"),
+    );
 }
 
 test "chunker config detects full text indexing" {

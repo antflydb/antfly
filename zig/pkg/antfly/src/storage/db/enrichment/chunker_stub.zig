@@ -62,13 +62,21 @@ pub fn chunkTextWithConfigJson(
     defer cfg.deinit(alloc);
 
     return switch (cfg.provider) {
-        .antfly, .mock => try chunkText(
+        .mock => try chunkText(
             alloc,
             text,
             cfg.defaultedTargetTokens(),
             cfg.defaultedOverlapTokens(),
         ),
-        .antfly => error.UnsupportedPlatform,
+        .antfly => if (cfg.model.len == 0)
+            try chunkText(
+                alloc,
+                text,
+                cfg.defaultedTargetTokens(),
+                cfg.defaultedOverlapTokens(),
+            )
+        else
+            error.UnsupportedPlatform,
     };
 }
 

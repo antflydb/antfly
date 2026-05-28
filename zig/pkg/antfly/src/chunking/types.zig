@@ -171,7 +171,7 @@ pub fn parseConfigFromValue(alloc: Allocator, value: std.json.Value) !Config {
         }
     }
 
-    if (cfg.provider == .antfly and cfg.model.len == 0) return error.InvalidChunkerConfig;
+    if (cfg.provider == .antfly and cfg.api_url.len > 0 and cfg.model.len == 0) return error.InvalidChunkerConfig;
     return cfg;
 }
 
