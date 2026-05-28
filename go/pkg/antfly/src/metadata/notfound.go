@@ -67,8 +67,8 @@ var validEndpoints = []string{
 	"/mcp/v1/",
 
 	// API Key management
-	"/db/v1/users/{userName}/api-keys",
-	"/db/v1/users/{userName}/api-keys/{keyId}",
+	"/auth/v1/users/{userName}/api-keys",
+	"/auth/v1/users/{userName}/api-keys/{keyId}",
 }
 
 // patternReplacements maps common typos to their correct forms
