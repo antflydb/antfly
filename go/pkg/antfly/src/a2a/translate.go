@@ -63,11 +63,15 @@ func extractConversationHistory(task *a2a.Task) []ai.ChatMessage {
 		if text != "" {
 			messages = append(messages, ai.ChatMessage{
 				Role:    role,
-				Content: text,
+				Content: textMessageContent(text),
 			})
 		}
 	}
 	return messages
+}
+
+func textMessageContent(text string) *ai.ChatMessageContent {
+	return ai.NewTextContent(text)
 }
 
 // stringFromMap extracts a string value from a map, returning fallback if not found.

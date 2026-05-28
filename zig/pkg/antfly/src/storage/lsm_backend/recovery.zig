@@ -25,7 +25,17 @@ fn openDebugLogsEnabled() bool {
 }
 
 pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !BackendType {
-    var backend = BackendType.init(allocator, backend_options);
+    var backend: BackendType = undefined;
+    try openInto(BackendType, &backend, allocator, root_dir, options, backend_options);
+    return backend;
+}
+
+pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !void {
+    if (@hasDecl(BackendType, "initInPlace")) {
+        BackendType.initInPlace(backend, allocator, backend_options);
+    } else {
+        backend.* = BackendType.init(allocator, backend_options);
+    }
     backend.root_dir = try allocator.dupe(u8, root_dir);
     const debug_open = openDebugLogsEnabled();
     if (debug_open) {
@@ -50,7 +60,7 @@ pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const 
         backend.storage_owner = owned;
         backend.storage = owned.storage();
     }
-    errdefer cleanup(BackendType, &backend, false);
+    errdefer cleanup(BackendType, backend, false);
 
     const loaded_manifest = try repository_mod.loadManifestIfPresentWithStorage(
         backend.storage.?,
@@ -78,8 +88,8 @@ pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const 
         if (debug_open) std.log.info("lsm backend open ensured dirs root={s}", .{backend.root_dir.?});
     }
     {
-        const locked = runtime_mod.lockBackend(BackendType, &backend);
-        defer runtime_mod.unlockBackend(BackendType, &backend, locked);
+        const locked = runtime_mod.lockBackend(BackendType, backend);
+        defer runtime_mod.unlockBackend(BackendType, backend, locked);
 
         if (@hasDecl(BackendType, "replayWalIntoMutable")) {
             if (debug_open) std.log.info("lsm backend open wal replay begin root={s}", .{backend.root_dir.?});
@@ -106,7 +116,6 @@ pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const 
             .{ backend.root_dir.?, backend.runs.items.len, backend.mutable.entries.items.len },
         );
     }
-    return backend;
 }
 
 pub fn close(comptime BackendType: type, backend: *BackendType) void {

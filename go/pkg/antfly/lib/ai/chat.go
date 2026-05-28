@@ -514,6 +514,10 @@ func parseToolCallArguments(arguments string) any {
 }
 
 func newTextContent(text string) *ChatMessageContent {
+	return NewTextContent(text)
+}
+
+func NewTextContent(text string) *ChatMessageContent {
 	content := ChatMessageContent{}
 	if err := content.FromChatMessageContent0(text); err != nil {
 		return nil
