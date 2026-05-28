@@ -1583,20 +1583,99 @@ fn readManyCurrentPointLocked(
     var result: BatchCursorReadResult = .{};
     backend.recordPointGets(keys.len);
     for (keys, 0..) |key, i| {
-        const value = backend.getMergedWithMutable(&backend.mutable, namespace, key) catch |err| switch (err) {
+        const value = getCurrentPointRetainedLocked(BackendType, backend, namespace, allocator, held_values, key) catch |err| switch (err) {
             error.NotFound => {
                 result.misses += 1;
                 continue;
             },
             else => return err,
+        } orelse {
+            result.misses += 1;
+            continue;
         };
-        const owned = try allocator.dupe(u8, value);
-        errdefer allocator.free(owned);
-        try held_values.append(allocator, owned);
-        values[i] = owned;
+        values[i] = value;
         result.hits += 1;
     }
     return result;
+}
+
+fn getCurrentPointRetainedLocked(
+    comptime BackendType: type,
+    backend: *BackendType,
+    namespace: backend_types.Namespace,
+    allocator: Allocator,
+    held_values: *std.ArrayListUnmanaged([]u8),
+    key: []const u8,
+) !?[]const u8 {
+    if (backend.mutable.findIndex(namespace, key)) |idx| {
+        const entry = backend.mutable.entries.items[idx];
+        if (entry.tombstone) return error.NotFound;
+        const owned = try allocator.dupe(u8, entry.value);
+        errdefer allocator.free(owned);
+        try held_values.append(allocator, owned);
+        backend.recordMutableHit();
+        return owned;
+    }
+
+    var immutable_index = backend.immutable_memtables.items.len;
+    while (immutable_index > backend.immutable_head) {
+        immutable_index -= 1;
+        const immutable = backend.immutable_memtables.items[immutable_index];
+        if (immutable.findIndex(namespace, key)) |idx| {
+            const entry = immutable.entries.items[idx];
+            if (entry.tombstone) return error.NotFound;
+            const owned = try allocator.dupe(u8, entry.value);
+            errdefer allocator.free(owned);
+            try held_values.append(allocator, owned);
+            backend.recordMutableHit();
+            return owned;
+        }
+    }
+
+    var run_index: usize = 0;
+    while (run_index < backend.runs.items.len and backend.runs.items[run_index].level == 0) : (run_index += 1) {
+        if (try getFromRunPointRetainedLocked(backend, &backend.runs.items[run_index], held_values, allocator, namespace, key)) |value| return value;
+    }
+
+    while (run_index < backend.runs.items.len) {
+        const level = backend.runs.items[run_index].level;
+        const level_start = run_index;
+        while (run_index < backend.runs.items.len and backend.runs.items[run_index].level == level) : (run_index += 1) {}
+        const candidate = findRunIndexInSortedLevel(backend.runs.items[level_start..run_index], namespace, key) orelse continue;
+        if (try getFromRunPointRetainedLocked(backend, &backend.runs.items[level_start + candidate], held_values, allocator, namespace, key)) |value| return value;
+    }
+
+    return null;
+}
+
+fn getFromRunPointRetainedLocked(
+    backend: anytype,
+    run: *Run,
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+) !?[]const u8 {
+    if (!try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, true)) return null;
+    backend.recordRunProbe();
+
+    if (run.path != null) {
+        const value = try getFromRunWithLocalIndex(backend, run, held_values, value_allocator, namespace, key, true) orelse return null;
+        if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
+        return value;
+    }
+
+    const state = if (run.state) |*present_state| present_state else return null;
+    if (state.findIndex(namespace, key)) |idx| {
+        const entry = state.entries.items[idx];
+        if (entry.tombstone) return error.NotFound;
+        const owned = try value_allocator.dupe(u8, entry.value);
+        errdefer value_allocator.free(owned);
+        try held_values.append(value_allocator, owned);
+        if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
+        return owned;
+    }
+    return null;
 }
 
 fn readManyCurrentSortedPointByRunLocked(
@@ -2693,8 +2772,17 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     return entry.value;
                 }
             }
+            if (self.mutable.findIndex(self.namespace, key)) |idx| {
+                const entry = self.mutable.entries.items[idx];
+                if (entry.tombstone) return error.NotFound;
+                return entry.value;
+            }
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
+            if (comptime @hasField(BackendType, "runs") and @hasField(BackendType, "immutable_memtables")) {
+                self.backend.recordPointGets(1);
+                return try getCurrentPointRetainedLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, key) orelse error.NotFound;
+            }
             return self.backend.getMergedWithOverlay(&self.backend.mutable, &self.mutable, self.namespace, key);
         }
 
@@ -3225,6 +3313,22 @@ fn findRunGroup(groups: []const RunGroup, namespace: backend_types.Namespace, ke
 fn groupMayContain(group: RunGroup, namespace: backend_types.Namespace, key: []const u8) bool {
     return compareRunBound(namespace.name, key, group.smallest_namespace_name, group.smallest_key) != .lt and
         compareRunBound(namespace.name, key, group.largest_namespace_name, group.largest_key) != .gt;
+}
+
+fn findRunIndexInSortedLevel(runs: []const Run, namespace: backend_types.Namespace, key: []const u8) ?usize {
+    var lo: usize = 0;
+    var hi: usize = runs.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (compareRunBound(runs[mid].largest_namespace_name, runs[mid].largest_key, namespace.name, key) == .lt) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= runs.len) return null;
+    if (!runMayContain(runs[lo], namespace, key)) return null;
+    return lo;
 }
 
 fn findRunIndexInLevel(runs: []const Run, level: RunLevel, namespace: backend_types.Namespace, key: []const u8) ?usize {
@@ -4589,6 +4693,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         backend: *BackendType,
         mutable: ActiveMemTable,
         snapshot: ?State = null,
+        held_values: std.ArrayListUnmanaged([]u8) = .empty,
         batch_options: backend_types.BatchOptions = .{},
         closed: bool = false,
 
@@ -4616,6 +4721,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             const backend = self.backend;
             self.mutable.deinit(self.allocator);
             invalidateSnapshot(&self.snapshot, self.allocator);
+            releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             backend.finishBatchMode(self.batch_options);
@@ -4632,6 +4738,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.mutable.deinit(self.allocator);
                 self.mutable = .{};
                 invalidateSnapshot(&self.snapshot, self.allocator);
+                releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
                 self.backend.releaseReader();
                 self.closed = true;
@@ -4664,6 +4771,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;
             self.closed = true;
+            releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
             self.backend.finalizeWriteReaderRelease() catch |err| {
                 finalize_err = err;
@@ -4728,8 +4836,17 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn get(self: *@This(), namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
+            if (self.mutable.findIndex(namespace, key)) |idx| {
+                const entry = self.mutable.entries.items[idx];
+                if (entry.tombstone) return error.NotFound;
+                return entry.value;
+            }
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
+            if (comptime @hasField(BackendType, "runs") and @hasField(BackendType, "immutable_memtables")) {
+                self.backend.recordPointGets(1);
+                return try getCurrentPointRetainedLocked(BackendType, self.backend, namespace, self.allocator, &self.held_values, key) orelse error.NotFound;
+            }
             return self.backend.getMergedWithOverlay(&self.backend.mutable, &self.mutable, namespace, key);
         }
 
