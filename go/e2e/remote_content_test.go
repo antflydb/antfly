@@ -33,8 +33,8 @@ import (
 	"testing"
 	"time"
 
+	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/inference"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/scraping"
-	libtermite "github.com/antflydb/antfly/go/pkg/antfly/lib/termite"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/metadata"
@@ -297,7 +297,7 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	}
 
 	// Configure Termite with CLIP model
-	config.Termite = termite.Config{
+	config.Inference = termite.Config{
 		ApiUrl:          termiteAPIURL,
 		ModelsDir:       modelsDir,
 		MaxLoadedModels: 2,
@@ -321,7 +321,7 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	go termite.RunAsTermite(
 		swarmCtx,
 		logger.Named("termite"),
-		config.Termite,
+		config.Inference,
 		termiteReadyC,
 	)
 
@@ -330,7 +330,7 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	case <-termiteReadyC:
 		logger.Info("Termite server ready")
 		SetTermiteURL(termiteAPIURL)
-		libtermite.SetDefaultURL(termiteAPIURL)
+		libinference.SetDefaultURL(termiteAPIURL)
 	case <-time.After(60 * time.Second):
 		t.Fatal("Timeout waiting for Termite server to be ready")
 	}
@@ -683,7 +683,7 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 	config.Metadata.OrchestrationUrls = map[string]string{
 		nodeID.String(): metadataAPIURL,
 	}
-	config.Termite = termite.Config{
+	config.Inference = termite.Config{
 		ApiUrl:          termiteAPIURL,
 		ModelsDir:       modelsDir,
 		MaxLoadedModels: 4, // CLIP + CLAP (each has text + media sub-models)
@@ -700,13 +700,13 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 	storeReadyC := make(chan struct{})
 	termiteReadyC := make(chan struct{})
 
-	go termite.RunAsTermite(swarmCtx, logger.Named("termite"), config.Termite, termiteReadyC)
+	go termite.RunAsTermite(swarmCtx, logger.Named("termite"), config.Inference, termiteReadyC)
 
 	select {
 	case <-termiteReadyC:
 		logger.Info("Termite server ready")
 		SetTermiteURL(termiteAPIURL)
-		libtermite.SetDefaultURL(termiteAPIURL)
+		libinference.SetDefaultURL(termiteAPIURL)
 	case <-time.After(60 * time.Second):
 		t.Fatal("Timeout waiting for Termite server to be ready")
 	}

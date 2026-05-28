@@ -1173,7 +1173,7 @@ func TestE2E_RetrievalAgent_DocsEval(t *testing.T) {
 	require.NotEmpty(t, queries, "No test queries loaded")
 
 	t.Log("Executing retrieval agent queries with hybrid search and inline evaluation...")
-	cfg := newTestQueryConfig(t, tableName, setup.Swarm.Config.Termite.ApiUrl)
+	cfg := newTestQueryConfig(t, tableName, setup.Swarm.Config.Inference.ApiUrl)
 	results := executeRetrievalAgentQueries(t, setup.Ctx, setup.Swarm.Client, cfg, queries)
 
 	// Aggregate and report

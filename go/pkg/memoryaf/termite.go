@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	libtermite "github.com/antflydb/antfly/go/pkg/antfly/lib/termite"
-	termiteclient "github.com/antflydb/antfly/go/pkg/sdk"
+	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/inference"
+	inferenceclient "github.com/antflydb/antfly/go/pkg/sdk"
 	"go.uber.org/zap"
 )
 
@@ -22,10 +22,10 @@ var defaultNERLabels = []string{
 	"service", "tool", "framework", "pattern",
 }
 
-// NERClient wraps the Termite SDK client for named entity recognition
+// NERClient wraps the inference SDK client for named entity recognition
 // with availability caching and graceful degradation.
 type NERClient struct {
-	client    *termiteclient.TermiteClient
+	client    *inferenceclient.InferenceClient
 	nerModel  string
 	nerLabels []string
 	logger    *zap.Logger
@@ -35,9 +35,9 @@ type NERClient struct {
 	checkedAt time.Time
 }
 
-// NewNERClient creates an NER client using the official Termite SDK.
+// NewNERClient creates an NER client using the official inference SDK.
 func NewNERClient(termiteURL, nerModel string, nerLabels []string, logger *zap.Logger) (*NERClient, error) {
-	tc, err := termiteclient.NewTermiteClient(termiteURL, &http.Client{
+	tc, err := inferenceclient.NewInferenceClient(termiteURL, &http.Client{
 		Timeout: 10 * time.Second,
 	})
 	if err != nil {
@@ -52,9 +52,9 @@ func NewNERClient(termiteURL, nerModel string, nerLabels []string, logger *zap.L
 }
 
 // DefaultNERClient creates an NER client with default settings,
-// resolving the Termite URL via go/pkg/antfly/lib/termite.ResolveURL.
+// resolving the inference URL via go/pkg/antfly/lib/inference.ResolveURL.
 func DefaultNERClient(logger *zap.Logger) (*NERClient, error) {
-	url := libtermite.ResolveURL("")
+	url := libinference.ResolveURL("")
 	if url == "" {
 		url = "http://localhost:11433"
 	}
@@ -107,12 +107,13 @@ func (c *NERClient) Extract(ctx context.Context, texts []string, opts ExtractOpt
 	}
 
 	results := make([]Extraction, len(texts))
-	for i, textEntities := range resp.Entities {
+	for _, item := range resp.Data {
+		i := item.Index
 		if i >= len(texts) {
-			break
+			continue
 		}
-		entities := make([]ExtractedEntity, 0, len(textEntities))
-		for _, e := range textEntities {
+		entities := make([]ExtractedEntity, 0, len(item.Entities))
+		for _, e := range item.Entities {
 			entities = append(entities, ExtractedEntity{
 				Text:  e.Text,
 				Label: e.Label,

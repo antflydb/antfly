@@ -106,7 +106,7 @@ func TestE2E_RetrievalAgent_Suite(t *testing.T) {
 	backupID := "docsaf-test-backup"
 	setupTestTable(t, setup.Ctx, setup.Swarm.Client, tableName, backupID)
 
-	cfg := newTestQueryConfig(t, tableName, setup.Swarm.Config.Termite.ApiUrl)
+	cfg := newTestQueryConfig(t, tableName, setup.Swarm.Config.Inference.ApiUrl)
 
 	// --- Subtests sharing the swarm + table ---
 
@@ -147,7 +147,7 @@ func TestE2E_RetrievalAgent_Suite(t *testing.T) {
 		treeTableName := "antfly_docs_tree_suite_e2e"
 		treeBackupID := "docsaf-tree-backup"
 		setupTestTableWithHierarchy(t, setup.Ctx, setup.Swarm.Client, treeTableName, treeBackupID)
-		treeCfg := newTestQueryConfig(t, treeTableName, setup.Swarm.Config.Termite.ApiUrl)
+		treeCfg := newTestQueryConfig(t, treeTableName, setup.Swarm.Config.Inference.ApiUrl)
 		testTreeSearch(t, setup.Ctx, setup.Swarm.Client, treeCfg)
 	})
 }

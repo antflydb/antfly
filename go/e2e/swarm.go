@@ -117,7 +117,7 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 		repoRoot := findRepoRoot(t)
 		modelsDir := filepath.Join(repoRoot, "models")
 
-		config.Termite = termite.Config{
+		config.Inference = termite.Config{
 			ApiUrl:          termiteAPIURL,
 			ModelsDir:       modelsDir,
 			MaxLoadedModels: 2, // Limit concurrent models to reduce memory pressure
@@ -142,7 +142,7 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 		go termite.RunAsTermite(
 			swarmCtx,
 			logger.Named("termite"),
-			config.Termite,
+			config.Inference,
 			termiteReadyC,
 		)
 
@@ -150,8 +150,8 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 		// Generator models (e.g., Gemma) can take 30+ seconds to load
 		select {
 		case <-termiteReadyC:
-			logger.Info("Inference server ready", zap.String("inference_api", config.Termite.ApiUrl))
-			SetTermiteURL(config.Termite.ApiUrl)
+			logger.Info("Inference server ready", zap.String("inference_api", config.Inference.ApiUrl))
+			SetTermiteURL(config.Inference.ApiUrl)
 		case <-time.After(60 * time.Second):
 			cancel()
 			t.Fatal("Timeout waiting for Termite server to be ready")
@@ -210,7 +210,7 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 	}
 
 	logger.Info("Swarm started successfully",
-		zap.String("inference_api", config.Termite.ApiUrl),
+		zap.String("inference_api", config.Inference.ApiUrl),
 		zap.String("metadata_api", metadataAPIURL),
 		zap.String("store_api", storeAPIURL),
 	)
