@@ -70,6 +70,13 @@ fn runtimeScratchAllocator(fallback: Allocator) Allocator {
     return std.heap.smp_allocator;
 }
 
+fn localBlockCacheEnabled(backend: anytype) bool {
+    if (@hasDecl(@TypeOf(backend.*), "localBlockCacheEnabled")) {
+        return backend.localBlockCacheEnabled();
+    }
+    return true;
+}
+
 fn elapsedNs(start_ns: u64) u64 {
     const end_ns = platform_time.monotonicNs();
     return if (end_ns >= start_ns) end_ns - start_ns else 0;
@@ -4100,21 +4107,23 @@ fn loadOwnedBlockForWindowAlloc(
     {
         const locked = lockBackend(@TypeOf(backend.*), backend);
         defer unlockBackend(@TypeOf(backend.*), backend, locked);
-        if (@hasField(@TypeOf(backend.*), "run_block_cache")) {
+        if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend)) {
             if (backend.getCachedRunBlock(path, run.id, absolute_offset, physical_len)) |cached_bytes| {
                 backend.recordLocalBlockCacheHit();
                 return try allocator.dupe(u8, cached_bytes);
             }
         }
     }
-    backend.recordLocalBlockCacheMiss();
+    if (localBlockCacheEnabled(backend)) {
+        backend.recordLocalBlockCacheMiss();
+    }
 
     const bytes = try loadRunTableDecodedBlockWithStats(backend, allocator, path, absolute_offset, physical_len, window.compression, window.len);
     errdefer allocator.free(bytes);
     {
         const locked = lockBackend(@TypeOf(backend.*), backend);
         defer unlockBackend(@TypeOf(backend.*), backend, locked);
-        if (@hasField(@TypeOf(backend.*), "run_block_cache")) {
+        if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend)) {
             _ = try backend.putCachedRunBlock(path, run.id, absolute_offset, physical_len, try backend.allocator.dupe(u8, bytes));
         }
     }
@@ -4140,17 +4149,19 @@ fn loadOwnedBlockForWindowAllocMaybeLocked(
         return try allocator.dupe(u8, block_handle.runTableBlock());
     }
 
-    if (@hasField(@TypeOf(backend.*), "run_block_cache")) {
+    if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend)) {
         if (backend.getCachedRunBlock(path, run.id, absolute_offset, physical_len)) |cached_bytes| {
             backend.recordLocalBlockCacheHit();
             return try allocator.dupe(u8, cached_bytes);
         }
     }
-    backend.recordLocalBlockCacheMiss();
+    if (localBlockCacheEnabled(backend)) {
+        backend.recordLocalBlockCacheMiss();
+    }
 
     const bytes = try loadRunTableDecodedBlockWithStats(backend, allocator, path, absolute_offset, physical_len, window.compression, window.len);
     errdefer allocator.free(bytes);
-    if (@hasField(@TypeOf(backend.*), "run_block_cache")) {
+    if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend)) {
         _ = try backend.putCachedRunBlock(path, run.id, absolute_offset, physical_len, try backend.allocator.dupe(u8, bytes));
     }
     return bytes;

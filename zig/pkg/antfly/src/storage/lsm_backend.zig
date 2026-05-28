@@ -84,6 +84,7 @@ pub const Options = struct {
     io_runtime: storage_io.RuntimeKind = .threaded,
     storage: ?storage_io.Storage = null,
     cache: ?*cache_mod.Cache = null,
+    local_block_cache_enabled: bool = true,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     background_executor: ?*const BackgroundExecutor = null,
     compaction_scheduler: compaction_scheduler_mod.Options = .{},
@@ -2101,6 +2102,10 @@ pub const Backend = struct {
         _ = self.read_stats.local_block_cache_misses.fetchAdd(1, .monotonic);
     }
 
+    pub fn localBlockCacheEnabled(self: *const Backend) bool {
+        return self.options.local_block_cache_enabled;
+    }
+
     pub fn recordCursorBlockReuse(self: *Backend) void {
         _ = self.read_stats.cursor_block_reuses.fetchAdd(1, .monotonic);
     }
@@ -2326,6 +2331,7 @@ pub const Backend = struct {
         block_offset: u64,
         block_len: u32,
     ) ?[]const u8 {
+        if (!self.options.local_block_cache_enabled) return null;
         for (self.run_block_cache.items) |*cached| {
             if (cached.run_id != run_id or
                 cached.block_offset != block_offset or
@@ -2345,6 +2351,10 @@ pub const Backend = struct {
         block_len: u32,
         block: []u8,
     ) ![]const u8 {
+        if (!self.options.local_block_cache_enabled) {
+            self.allocator.free(block);
+            return &.{};
+        }
         errdefer self.allocator.free(block);
         const cached_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(cached_path);

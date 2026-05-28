@@ -80,6 +80,7 @@ var hbc_bulk_rebuild_leaf_min_members_cache: std.atomic.Value(usize) = .init(0);
 var hbc_defer_bulk_leaf_splits_cache: std.atomic.Value(u8) = .init(0);
 var hbc_defer_bulk_quantized_rebuild_cache: std.atomic.Value(u8) = .init(0);
 var bench_hbc_metrics_cache: std.atomic.Value(u8) = .init(0);
+var bench_text_profile_cache: std.atomic.Value(u8) = .init(0);
 var sparse_replay_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
 const default_merge_policy = merger_mod.MergePolicy{
     .max_segments_per_tier = 10,
@@ -87,6 +88,7 @@ const default_merge_policy = merger_mod.MergePolicy{
     .floor_segment_size = 16 * 1024,
 };
 const default_text_segment_build_target_bytes: usize = 32 * 1024 * 1024;
+const default_text_projection_source_build_target_bytes: usize = 16 * 1024 * 1024;
 const force_merge_max_segments_at_once = 16;
 
 const TextSegmentSinkBuildContext = struct {
@@ -6372,14 +6374,14 @@ pub const IndexManager = struct {
         entry: *TextIndex,
         docs: []const mapper.MapperDoc,
     ) !TextBatchMutationStats {
-        if (docs.len <= max_text_projection_docs_per_segment_build) {
+        if (docs.len <= max_text_projection_docs_per_segment_build and estimatedMapperDocsBytes(docs) <= default_text_projection_source_build_target_bytes) {
             return try self.indexTextProjectionDocs(store, entry, docs);
         }
 
         var stats = TextBatchMutationStats{};
         var start: usize = 0;
         while (start < docs.len) {
-            const end = @min(start + max_text_projection_docs_per_segment_build, docs.len);
+            const end = splitMapperDocsEnd(docs, start, default_text_projection_source_build_target_bytes);
             const chunk_stats = try self.indexTextProjectionDocs(store, entry, docs[start..end]);
             stats.noteIndex(chunk_stats.indexed_any);
             stats.noteDelete(chunk_stats.deleted_any);
@@ -6433,14 +6435,14 @@ pub const IndexManager = struct {
         entry: *TextIndex,
         source_docs: []const mapper.TextProjectionSourceDoc,
     ) !TextBatchMutationStats {
-        if (source_docs.len <= max_text_projection_docs_per_segment_build) {
+        if (source_docs.len <= max_text_projection_docs_per_segment_build and estimatedTextProjectionSourceDocsBytes(source_docs) <= default_text_projection_source_build_target_bytes) {
             return try self.indexPreparedTextProjectionSourceDocsWithArena(arena, store, entry, source_docs);
         }
 
         var stats = TextBatchMutationStats{};
         var start: usize = 0;
         while (start < source_docs.len) {
-            const end = @min(start + max_text_projection_docs_per_segment_build, source_docs.len);
+            const end = splitTextProjectionSourceDocsEnd(source_docs, start, default_text_projection_source_build_target_bytes);
             var chunk_arena_state = std.heap.ArenaAllocator.init(self.alloc);
             defer chunk_arena_state.deinit();
             const chunk_stats = try self.indexPreparedTextProjectionSourceDocsWithArena(
@@ -6456,6 +6458,58 @@ pub const IndexManager = struct {
         return stats;
     }
 
+    fn estimatedMapperDocsBytes(docs: []const mapper.MapperDoc) usize {
+        var total: usize = 0;
+        for (docs) |doc| total +|= estimatedMapperDocBytes(doc);
+        return total;
+    }
+
+    fn estimatedMapperDocBytes(doc: mapper.MapperDoc) usize {
+        return @sizeOf(mapper.MapperDoc) + doc.key.len + doc.value.len;
+    }
+
+    fn splitMapperDocsEnd(docs: []const mapper.MapperDoc, start: usize, target_bytes: usize) usize {
+        const max_end = @min(start + max_text_projection_docs_per_segment_build, docs.len);
+        var end = start;
+        var bytes: usize = 0;
+        while (end < max_end) : (end += 1) {
+            const doc_bytes = estimatedMapperDocBytes(docs[end]);
+            if (end > start and bytes +| doc_bytes > target_bytes) break;
+            bytes +|= doc_bytes;
+        }
+        return @max(start + 1, end);
+    }
+
+    fn estimatedTextProjectionSourceDocsBytes(docs: []const mapper.TextProjectionSourceDoc) usize {
+        var total: usize = 0;
+        for (docs) |doc| total +|= estimatedTextProjectionSourceDocBytes(doc);
+        return total;
+    }
+
+    fn estimatedTextProjectionSourceDocBytes(doc: mapper.TextProjectionSourceDoc) usize {
+        var total: usize = @sizeOf(mapper.TextProjectionSourceDoc) + doc.key.len + doc.stored_data.len;
+        for (doc.schema_less_text_fields) |field| {
+            total +|= @sizeOf(introducer_mod.TextField) + field.field_name.len + field.text.len;
+        }
+        return total;
+    }
+
+    fn splitTextProjectionSourceDocsEnd(
+        docs: []const mapper.TextProjectionSourceDoc,
+        start: usize,
+        target_bytes: usize,
+    ) usize {
+        const max_end = @min(start + max_text_projection_docs_per_segment_build, docs.len);
+        var end = start;
+        var bytes: usize = 0;
+        while (end < max_end) : (end += 1) {
+            const doc_bytes = estimatedTextProjectionSourceDocBytes(docs[end]);
+            if (end > start and bytes +| doc_bytes > target_bytes) break;
+            bytes +|= doc_bytes;
+        }
+        return @max(start + 1, end);
+    }
+
     fn indexPreparedTextProjectionSourceDocsWithArena(
         self: *IndexManager,
         arena: std.mem.Allocator,
@@ -6465,43 +6519,44 @@ pub const IndexManager = struct {
     ) !TextBatchMutationStats {
         if (source_docs.len == 0) return .{};
 
-        const profile_enabled = benchMetricsEnabled();
-        const total_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        const detailed_profile_enabled = textBenchProfileEnabled();
+        const metrics_enabled = benchMetricsEnabled() or detailed_profile_enabled;
+        const total_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
         var ordinals_ns: u64 = 0;
         var projection_ns: u64 = 0;
         var analyzer_merge_ns: u64 = 0;
         var segment_build_ns: u64 = 0;
         var index_segment_ns: u64 = 0;
-        const memory_start: process_memory.Stats = if (profile_enabled) process_memory.snapshot() else .{};
+        const memory_start: process_memory.Stats = if (detailed_profile_enabled) process_memory.snapshot() else .{};
 
         var observed_field_analyzers = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
         var ordinals_alloc_stats = PhaseAllocStats{};
         var ordinals_tracking = PhaseTrackingAllocator.init(arena, &ordinals_alloc_stats);
-        const ordinals_alloc = if (profile_enabled) ordinals_tracking.allocator() else arena;
-        const ordinals_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        const ordinals_alloc = if (detailed_profile_enabled) ordinals_tracking.allocator() else arena;
+        const ordinals_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
         const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(ordinals_alloc, store, source_docs);
-        if (profile_enabled) ordinals_ns = platform_time.monotonicNs() - ordinals_start_ns;
-        const memory_after_ordinals: process_memory.Stats = if (profile_enabled) process_memory.snapshot() else .{};
+        if (metrics_enabled) ordinals_ns = platform_time.monotonicNs() - ordinals_start_ns;
+        const memory_after_ordinals: process_memory.Stats = if (detailed_profile_enabled) process_memory.snapshot() else .{};
 
         var projection_alloc_stats = PhaseAllocStats{};
         var projection_tracking = PhaseTrackingAllocator.init(arena, &projection_alloc_stats);
-        const projection_alloc = if (profile_enabled) projection_tracking.allocator() else arena;
-        const projection_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        const projection_alloc = if (detailed_profile_enabled) projection_tracking.allocator() else arena;
+        const projection_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
         const projection_batch = try mapper.buildTextProjectionBatchFromSource(projection_alloc, source_docs_with_ordinals, entry.text_analysis, entry.runtime_schema, &observed_field_analyzers);
-        if (profile_enabled) projection_ns = platform_time.monotonicNs() - projection_start_ns;
-        const memory_after_projection: process_memory.Stats = if (profile_enabled) process_memory.snapshot() else .{};
+        if (metrics_enabled) projection_ns = platform_time.monotonicNs() - projection_start_ns;
+        const memory_after_projection: process_memory.Stats = if (detailed_profile_enabled) process_memory.snapshot() else .{};
         if (projection_batch.observed_field_analyzers.len > 0) {
-            const analyzer_merge_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            const analyzer_merge_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
             try mergeObservedTextFieldAnalyzers(self, store, entry, projection_batch.observed_field_analyzers);
-            if (profile_enabled) analyzer_merge_ns = platform_time.monotonicNs() - analyzer_merge_start_ns;
+            if (metrics_enabled) analyzer_merge_ns = platform_time.monotonicNs() - analyzer_merge_start_ns;
         }
-        const memory_after_analyzer_merge: process_memory.Stats = if (profile_enabled) process_memory.snapshot() else .{};
+        const memory_after_analyzer_merge: process_memory.Stats = if (detailed_profile_enabled) process_memory.snapshot() else .{};
 
         var text_build_profile = introducer_mod.BuildTextProfile{};
         var segment_alloc_stats = PhaseAllocStats{};
         var segment_tracking = PhaseTrackingAllocator.init(self.alloc, &segment_alloc_stats);
-        const segment_alloc = if (profile_enabled) segment_tracking.allocator() else self.alloc;
-        const segment_build_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        const segment_alloc = if (detailed_profile_enabled) segment_tracking.allocator() else self.alloc;
+        const segment_build_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
         var indexed_any = false;
         var segment_bytes: usize = 0;
         var segment_count: usize = 0;
@@ -6517,7 +6572,7 @@ pub const IndexManager = struct {
                 .alloc = segment_alloc,
                 .projection_batch = chunk,
                 .text_analysis = entry.text_analysis,
-                .profile = if (profile_enabled) &text_build_profile else null,
+                .profile = if (detailed_profile_enabled) &text_build_profile else null,
                 .resource_manager = self.resource_manager,
             };
             const built_len = try entry.persistent.indexSegmentFromSinkBuilder(&build_ctx, buildTextSegmentIntoSink);
@@ -6526,13 +6581,12 @@ pub const IndexManager = struct {
             indexed_any = true;
             start = end;
         }
-        if (profile_enabled) segment_build_ns = platform_time.monotonicNs() - segment_build_start_ns;
-        const memory_after_segment_build: process_memory.Stats = if (profile_enabled) process_memory.snapshot() else .{};
+        if (metrics_enabled) segment_build_ns = platform_time.monotonicNs() - segment_build_start_ns;
+        const memory_after_segment_build: process_memory.Stats = if (detailed_profile_enabled) process_memory.snapshot() else .{};
 
-        const index_segment_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        if (profile_enabled) {
+        const index_segment_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
+        if (metrics_enabled) {
             index_segment_ns = platform_time.monotonicNs() - index_segment_start_ns;
-            const memory_after_index_segment = process_memory.snapshot();
             std.log.info(
                 "antfly_bench_text_index index={s} source_docs={d} projection_docs={d} observed_analyzers={d} segments={d} segment_bytes={d} total_ms={d} ordinals_ms={d} projection_ms={d} analyzer_merge_ms={d} segment_build_ms={d} index_segment_ms={d} text_docs={d} text_fields={d} tokens={d} term_hits={d} typed_values={d} analyzer_ms={d} term_accum_ms={d} hit_materialize_ms={d} typed_collect_ms={d} typed_build_ms={d} stored_attach_ms={d} section_attach_ms={d} stored_compress_ms={d} segment_assembly_ms={d} segment_encode_ms={d}",
                 .{
@@ -6565,6 +6619,50 @@ pub const IndexManager = struct {
                     nsToMs(text_build_profile.segment_encode_ns),
                 },
             );
+            if (self.resource_manager) |manager| {
+                const resource_stats = manager.snapshot();
+                const ft_pending = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)];
+                const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
+                const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
+                const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
+                const lsm_state = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)];
+                const lsm_stats = self.snapshotLsmMaintenanceStats();
+                const lsm_cache_stats: lsm_backend_mod.cache.Stats = if (self.lsm_cache) |cache| cache.snapshotStats() else .{};
+                std.log.info(
+                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_block_inserts={d} lsm_cache_block_evictions={d}",
+                    .{
+                        entry.config.name,
+                        source_docs.len,
+                        projection_batch.docs.len,
+                        segment_count,
+                        ft_pending.used_bytes,
+                        ft_pending.peak_bytes,
+                        ft_build.used_bytes,
+                        ft_build.peak_bytes,
+                        lsm_cache.used_bytes,
+                        lsm_cache.peak_bytes,
+                        lsm_compaction.used_bytes,
+                        lsm_compaction.peak_bytes,
+                        lsm_state.used_bytes,
+                        lsm_state.peak_bytes,
+                        lsm_stats.mutable_bytes,
+                        lsm_stats.immutable_bytes,
+                        lsm_stats.immutable_memtables,
+                        lsm_stats.total_run_bytes,
+                        lsm_stats.total_runs,
+                        lsm_cache_stats.entry_count,
+                        lsm_cache_stats.run_state.used_bytes,
+                        lsm_cache_stats.run_table_raw.used_bytes,
+                        lsm_cache_stats.run_table_index.used_bytes,
+                        lsm_cache_stats.run_table_block.used_bytes,
+                        lsm_cache_stats.run_table_block.inserts,
+                        lsm_cache_stats.run_table_block.evictions,
+                    },
+                );
+            }
+        }
+        if (detailed_profile_enabled) {
+            const memory_after_index_segment = process_memory.snapshot();
             std.log.info(
                 "antfly_bench_text_alloc index={s} source_docs={d} projection_docs={d} segments={d} ord_alloc_bytes={d} ord_free_bytes={d} ord_peak_bytes={d} ord_outstanding_bytes={d} ord_alloc_count={d} ord_free_count={d} projection_alloc_bytes={d} projection_free_bytes={d} projection_peak_bytes={d} projection_outstanding_bytes={d} projection_alloc_count={d} projection_free_count={d} segment_alloc_bytes={d} segment_free_bytes={d} segment_peak_bytes={d} segment_outstanding_bytes={d} segment_alloc_count={d} segment_free_count={d}",
                 .{
@@ -6635,47 +6733,6 @@ pub const IndexManager = struct {
                     text_build_profile.rss_after_publish,
                 },
             );
-            if (self.resource_manager) |manager| {
-                const resource_stats = manager.snapshot();
-                const ft_pending = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)];
-                const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
-                const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
-                const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
-                const lsm_state = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)];
-                const lsm_stats = self.snapshotLsmMaintenanceStats();
-                const lsm_cache_stats: lsm_backend_mod.cache.Stats = if (self.lsm_cache) |cache| cache.snapshotStats() else .{};
-                std.log.info(
-                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_block_inserts={d} lsm_cache_block_evictions={d}",
-                    .{
-                        entry.config.name,
-                        source_docs.len,
-                        projection_batch.docs.len,
-                        segment_count,
-                        ft_pending.used_bytes,
-                        ft_pending.peak_bytes,
-                        ft_build.used_bytes,
-                        ft_build.peak_bytes,
-                        lsm_cache.used_bytes,
-                        lsm_cache.peak_bytes,
-                        lsm_compaction.used_bytes,
-                        lsm_compaction.peak_bytes,
-                        lsm_state.used_bytes,
-                        lsm_state.peak_bytes,
-                        lsm_stats.mutable_bytes,
-                        lsm_stats.immutable_bytes,
-                        lsm_stats.immutable_memtables,
-                        lsm_stats.total_run_bytes,
-                        lsm_stats.total_runs,
-                        lsm_cache_stats.entry_count,
-                        lsm_cache_stats.run_state.used_bytes,
-                        lsm_cache_stats.run_table_raw.used_bytes,
-                        lsm_cache_stats.run_table_index.used_bytes,
-                        lsm_cache_stats.run_table_block.used_bytes,
-                        lsm_cache_stats.run_table_block.inserts,
-                        lsm_cache_stats.run_table_block.evictions,
-                    },
-                );
-            }
         }
         return .{ .indexed_any = indexed_any };
     }
@@ -8098,6 +8155,25 @@ pub const IndexManager = struct {
             std.ascii.eqlIgnoreCase(raw, "false") or
             std.ascii.eqlIgnoreCase(raw, "no"));
         bench_hbc_metrics_cache.store(if (enabled) 2 else 1, .monotonic);
+        return enabled;
+    }
+
+    fn textBenchProfileEnabled() bool {
+        const cached = bench_text_profile_cache.load(.monotonic);
+        if (cached != 0) return cached == 2;
+        if (comptime builtin.os.tag == .freestanding) {
+            bench_text_profile_cache.store(1, .monotonic);
+            return false;
+        }
+        const raw_z = getenv("ANTFLY_BENCH_TEXT_PROFILE") orelse {
+            bench_text_profile_cache.store(1, .monotonic);
+            return false;
+        };
+        const raw = std.mem.span(raw_z);
+        const enabled = !(std.mem.eql(u8, raw, "0") or
+            std.ascii.eqlIgnoreCase(raw, "false") or
+            std.ascii.eqlIgnoreCase(raw, "no"));
+        bench_text_profile_cache.store(if (enabled) 2 else 1, .monotonic);
         return enabled;
     }
 
