@@ -102,10 +102,6 @@ pub const Client = struct {
         return try self.raw.listModels();
     }
 
-    /// Get server version.
-    pub fn getVersion(self: *Client) !api.client.ApiResponse(Types.VersionResponse) {
-        return try self.raw.getVersion();
-    }
 };
 
 test "client module compiles" {
