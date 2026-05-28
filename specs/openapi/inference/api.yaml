@@ -2991,7 +2991,7 @@ components:
           example: http://localhost:8080
         api_key:
           type: string
-          description: API key used when calling an authenticated shared Termite API.
+          description: API key used when calling an authenticated shared Antfly inference API.
         models_dir:
           type: string
           description: |
