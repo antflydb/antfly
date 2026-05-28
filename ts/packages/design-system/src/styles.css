@@ -153,6 +153,64 @@
   .dark .grid-paper {
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='55.42' height='96' viewBox='0 0 55.42 96'%3E%3Cpath d='M27.71,0 L55.42,16 L55.42,48 L27.71,64 L0,48 L0,16 Z M27.71,64 L27.71,96' fill='none' stroke='%23ffffff14' stroke-width='0.5'/%3E%3C/svg%3E");
   }
+
+  /* AntyPixel — amber glow halo + stepped eye blink for the pixel-sprite mascot. */
+  .anty-pixel-glow {
+    inset: -15%;
+    background: var(--anty-glow-inner);
+    opacity: 0.35;
+    filter: blur(1px);
+  }
+  .anty-pixel-eye {
+    animation: anty-pixel-blink 3.2s steps(1) infinite;
+  }
+  @keyframes anty-pixel-blink {
+    0%, 92%, 100% { opacity: 1; }
+    95% { opacity: 0; }
+  }
+
+  /* Kicker — pixel-font emphasis overline for loud brand moments.
+     Sparing use only. Sits above an Aeonik headline in Hero/CTA, on tags
+     and splash captions. Don't sprinkle it through the working UI. */
+  .kicker {
+    font-family: var(--font-pixel);
+    font-size: 0.6875rem; /* 11px */
+    line-height: 1.6;
+    letter-spacing: 0.04em;
+    color: var(--amber-600);
+  }
+  .dark .kicker {
+    color: var(--amber-400);
+  }
+
+  /* Highlight — amber-fill inline marker for accent words inside headlines.
+     Amber is a FILL with ink-on-amber text, not amber text on paper. */
+  .highlight {
+    background: var(--primary);
+    color: var(--primary-foreground);
+    padding: 0 0.12em;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+  }
+
+  /* TypeOn — mono steps() typewriter for brand-moment taglines.
+     The reveal target width is set via the --type-on-target custom property
+     on the element, computed from the text length in <ch>. */
+  .type-on {
+    font-family: var(--font-mono);
+    font-size: 0.875rem; /* 14px */
+    color: var(--muted-foreground);
+    white-space: nowrap;
+    overflow: hidden;
+    display: inline-block;
+    border-right: 2px solid var(--primary);
+  }
+  @keyframes type-on-reveal {
+    to { width: var(--type-on-target, 100%); }
+  }
+  @keyframes type-on-caret {
+    50% { border-color: transparent; }
+  }
 }
 
 /* ============================================================================
