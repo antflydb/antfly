@@ -2,20 +2,21 @@
 // Package: antfly_client_openapi
 
 const std = @import("std");
-const antfly_indexes_openapi = @import("antfly_indexes_openapi");
-const antfly_schema_openapi = @import("antfly_schema_openapi");
-const antfly_ai_openapi = @import("antfly_ai_openapi");
-const antfly_eval_openapi = @import("antfly_eval_openapi");
-const antfly_generating_openapi = @import("antfly_generating_openapi");
-const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 
 pub const Error = struct {
     @"error": []const u8,
 };
 
-pub const SortDirection = antfly_indexes_openapi.SortDirection;
+/// Sort direction for a single field. true = descending, false = ascending.
+pub const SortDirection = bool;
 
-pub const SortField = antfly_indexes_openapi.SortField;
+/// A single sort field with direction.
+pub const SortField = struct {
+    /// The field name to sort by.
+    field: []const u8,
+    /// Sort direction. true = descending, false = ascending.
+    desc: ?bool = null,
+};
 
 /// Overall health status of the cluster
 pub const ClusterHealth = enum {
@@ -195,12 +196,59 @@ pub const SyncLevel = enum {
     }
 };
 
-pub const AntflyType = antfly_indexes_openapi.AntflyType;
+pub const AntflyType = enum {
+    search_as_you_type,
+    keyword,
+    text,
+    html,
+    numeric,
+    datetime,
+    boolean,
+    link,
+    geopoint,
+    geoshape,
+    embedding,
+    blob,
 
-/// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
-pub const TableMigration = struct {
-    state: []const u8,
-    read_schema: antfly_schema_openapi.TableSchema,
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .search_as_you_type => "search_as_you_type",
+            .keyword => "keyword",
+            .text => "text",
+            .html => "html",
+            .numeric => "numeric",
+            .datetime => "datetime",
+            .boolean => "boolean",
+            .link => "link",
+            .geopoint => "geopoint",
+            .geoshape => "geoshape",
+            .embedding => "embedding",
+            .blob => "blob",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "search_as_you_type", .search_as_you_type },
+            .{ "keyword", .keyword },
+            .{ "text", .text },
+            .{ "html", .html },
+            .{ "numeric", .numeric },
+            .{ "datetime", .datetime },
+            .{ "boolean", .boolean },
+            .{ "link", .link },
+            .{ "geopoint", .geopoint },
+            .{ "geoshape", .geoshape },
+            .{ "embedding", .embedding },
+            .{ "blob", .blob },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Type of aggregation to compute: - Metrics: sum, avg, min, max, count, sumsquares, stats, cardinality - Bucketing: terms, range, date_range, histogram, date_histogram - Geo: geohash_grid, geo_distance - Analytics: significant_terms
@@ -417,12 +465,6 @@ pub const AlgebraicAggregationJoin = struct {
     measure_side: []const u8,
 };
 
-pub const IndexStatus = struct {
-    shard_status: std.json.ArrayHashMap(antfly_indexes_openapi.IndexStats),
-    config: antfly_indexes_openapi.IndexConfig,
-    status: antfly_indexes_openapi.IndexStats,
-};
-
 pub const StorageStatus = struct {
     /// Disk usage in bytes.
     disk_usage: ?i64 = null,
@@ -484,24 +526,6 @@ pub const TransformOpType = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
-};
-
-/// Request to scan keys in a table within a key range. If no range is specified, scans all keys in the table.
-pub const ScanKeysRequest = struct {
-    /// Start of the key range to scan (exclusive by default). Can be a full key or a prefix. If not specified, starts from the beginning of the table.
-    from: ?[]const u8 = null,
-    /// End of the key range to scan (inclusive by default). Can be a full key or a prefix. If not specified, scans to the end of the table.
-    to: ?[]const u8 = null,
-    /// If true, include keys matching 'from' in the results. Default: false (exclusive lower bound for pagination).
-    inclusive_from: ?bool = null,
-    /// If true, exclude keys matching 'to' from the results. Default: false (inclusive upper bound).
-    exclusive_to: ?bool = null,
-    /// List of fields to include in each result. If not specified, only returns the key. Supports: - Simple fields: "title", "author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings", "_summaries", "_chunks"
-    fields: ?[]const []const u8 = null,
-    /// Antfly query to filter documents. Only documents matching this query are included in results. Uses the sear library for efficient per-document matching without requiring a full index. Examples: - Status filtering: `{"query": "status:published"}` - Date ranges: `{"query": "created_at:>2023-01-01"}` - Field matching: `{"query": "category:technology"}`
-    filter_query: ?std.json.Value = null,
-    /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
-    limit: ?i64 = null,
 };
 
 pub const BatchResponse = struct {
@@ -957,34 +981,6 @@ pub const PruneStats = struct {
     tokens_pruned: ?i64 = null,
 };
 
-/// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
-pub const RetrievalAgentSteps = struct {
-    /// Tool configuration for the retrieval agent. Controls which tools are available and their settings. If not specified, tools are automatically determined from the table's available indexes.
-    tools: ?antfly_ai_openapi.ChatToolsConfig = null,
-    /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
-    classification: ?antfly_ai_openapi.ClassificationStepConfig = null,
-    /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
-    generation: ?antfly_ai_openapi.GenerationStepConfig = null,
-    /// Configuration for generating follow-up questions. Requires steps.generation to be set.
-    followup: ?antfly_ai_openapi.FollowupStepConfig = null,
-    /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
-    confidence: ?antfly_ai_openapi.ConfidenceStepConfig = null,
-    /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
-    eval: ?antfly_eval_openapi.EvalConfig = null,
-};
-
-/// DEPRECATED: Use RetrievalAgentSteps instead. Configuration for the answer agent's pipeline steps.
-pub const AnswerAgentSteps = struct {
-    /// Configuration for query classification and transformation.
-    classification: ?antfly_ai_openapi.ClassificationStepConfig = null,
-    /// DEPRECATED: Use steps.generation on RetrievalAgentRequest instead. Configuration for answer generation from retrieved documents.
-    answer: ?antfly_ai_openapi.GenerationStepConfig = null,
-    /// Configuration for generating follow-up questions.
-    followup: ?antfly_ai_openapi.FollowupStepConfig = null,
-    /// Configuration for confidence assessment.
-    confidence: ?antfly_ai_openapi.ConfidenceStepConfig = null,
-};
-
 pub const Embedding = std.json.Value;
 
 pub const Analyses = struct {
@@ -1059,16 +1055,6 @@ pub const JoinOperator = enum {
     }
 };
 
-/// Filters to apply to a table before joining.
-pub const JoinFilters = struct {
-    /// Antfly query to filter rows before joining.
-    filter_query: ?std.json.Value = null,
-    /// Key prefix filter for the table.
-    filter_prefix: ?[]const u8 = null,
-    /// Maximum number of rows to include from this table.
-    limit: ?i64 = null,
-};
-
 /// Strategy for executing the join: - `broadcast`: Broadcast small table to all shards of large table. Best for dimension tables < 10MB. O(small_table) memory per shard. - `index_lookup`: Use batch key lookups via indexes. Best for selective joins with indexed join keys. Low memory overhead. - `shuffle`: Hash-partition both tables by join key. Best for large-large table joins. Requires data movement.
 pub const JoinStrategy = enum {
     broadcast,
@@ -1115,18 +1101,6 @@ pub const RerankerProfile = struct {
     /// Number of documents that were reranked.
     documents_reranked: ?i64 = null,
     /// Time spent reranking in milliseconds.
-    duration_ms: ?i64 = null,
-};
-
-/// Result merge statistics for hybrid search.
-pub const MergeProfile = struct {
-    /// Merge strategy that was used.
-    strategy: ?antfly_indexes_openapi.MergeStrategy = null,
-    /// Number of hits from full-text search before merge.
-    full_text_hits: ?i64 = null,
-    /// Number of hits from semantic search before merge.
-    semantic_hits: ?i64 = null,
-    /// Time spent merging results in milliseconds.
     duration_ms: ?i64 = null,
 };
 
@@ -1203,23 +1177,89 @@ pub const KeyRange = struct {
     to: ?[]const u8 = null,
 };
 
-pub const Edge = antfly_indexes_openapi.Edge;
+/// A typed, weighted connection between documents
+pub const Edge = struct {
+    /// Base64-encoded source document key
+    source: []const u8,
+    /// Base64-encoded target document key
+    target: []const u8,
+    /// Edge type (e.g., "cites", "similar_to", "authored_by")
+    type: []const u8,
+    /// Edge weight/confidence (0.0 to 1.0)
+    weight: f64,
+    /// When the edge was created
+    created_at: ?[]const u8 = null,
+    /// When the edge was last updated
+    updated_at: ?[]const u8 = null,
+    /// Optional edge metadata
+    metadata: ?std.json.Value = null,
+};
 
-pub const EdgeDirection = antfly_indexes_openapi.EdgeDirection;
+/// Direction of edges to query: - out: Outgoing edges from the node - in: Incoming edges to the node - both: Both outgoing and incoming edges
+pub const EdgeDirection = enum {
+    out,
+    in,
+    both,
 
-pub const TraversalRules = antfly_indexes_openapi.TraversalRules;
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .out => "out",
+            .in => "in",
+            .both => "both",
+        };
+        try jw.write(s);
+    }
 
-pub const TraversalResult = antfly_indexes_openapi.TraversalResult;
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "out", .out },
+            .{ "in", .in },
+            .{ "both", .both },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
 
-pub const PathFindWeightMode = antfly_indexes_openapi.PathFindWeightMode;
+/// Algorithm for path finding: - min_hops: Shortest path by hop count (breadth-first search, ignores weights) - max_weight: Path with maximum product of edge weights (strongest connection chain) - min_weight: Path with minimum sum of edge weights (lowest cost route)
+pub const PathFindWeightMode = enum {
+    min_hops,
+    max_weight,
+    min_weight,
 
-pub const PathFindRequest = antfly_indexes_openapi.PathFindRequest;
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .min_hops => "min_hops",
+            .max_weight => "max_weight",
+            .min_weight => "min_weight",
+        };
+        try jw.write(s);
+    }
 
-pub const PathFindResult = antfly_indexes_openapi.PathFindResult;
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "min_hops", .min_hops },
+            .{ "max_weight", .max_weight },
+            .{ "min_weight", .min_weight },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
 
-pub const Path = antfly_indexes_openapi.Path;
-
-pub const PathEdge = antfly_indexes_openapi.PathEdge;
+pub const PathEdge = struct {
+    source: ?[]const u8 = null,
+    target: ?[]const u8 = null,
+    type: ?[]const u8 = null,
+    weight: ?f64 = null,
+    metadata: ?std.json.Value = null,
+};
 
 pub const ForeignColumn = struct {
     /// Column name in the foreign table.
@@ -1366,6 +1406,1885 @@ pub const RowFilterEntry = struct {
     filter: std.json.ArrayHashMap(std.json.Value),
 };
 
+pub const FullTextIndexConfig = struct {
+    /// Whether to use memory-only storage
+    mem_only: ?bool = null,
+};
+
+/// Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
+pub const DistanceMetric = enum {
+    l2_squared,
+    inner_product,
+    cosine,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .l2_squared => "l2_squared",
+            .inner_product => "inner_product",
+            .cosine => "cosine",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "l2_squared", .l2_squared },
+            .{ "inner_product", .inner_product },
+            .{ "cosine", .cosine },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for the Google AI (Gemini) embedding provider. API key via `api_key` field or `GEMINI_API_KEY` environment variable. **Example Models:** gemini-embedding-001 (default, 3072 dims) **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
+pub const GoogleEmbedderConfig = struct {
+    /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
+    project_id: ?[]const u8 = null,
+    /// The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API.
+    location: ?[]const u8 = null,
+    /// The name of the embedding model to use.
+    model: []const u8,
+    /// The dimension of the embedding vector (768, 1536, or 3072 recommended).
+    dimension: ?i64 = null,
+    /// The Google API key. Can also be set via GEMINI_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// The URL of the Google API endpoint (optional, uses default if not specified).
+    url: ?[]const u8 = null,
+};
+
+/// Configuration for Google Cloud Vertex AI embedding models (enterprise-grade). Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`. **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video) **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
+pub const VertexEmbedderConfig = struct {
+    /// The name of the Vertex AI embedding model to use.
+    model: []const u8,
+    /// Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
+    location: ?[]const u8 = null,
+    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
+    credentials_path: ?[]const u8 = null,
+    /// The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
+    dimension: ?i64 = null,
+};
+
+/// Configuration for the Ollama embedding provider. Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var. **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384 dims) **Docs:** https://ollama.com/search?c=embedding
+pub const OllamaEmbedderConfig = struct {
+    /// The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
+    model: []const u8,
+    /// The URL of the Ollama API endpoint. Can also be set via OLLAMA_HOST environment variable.
+    url: ?[]const u8 = null,
+};
+
+/// Configuration for the OpenAI embedding provider. API key via `api_key` field or `OPENAI_API_KEY` environment variable. Supports OpenAI-compatible APIs via `url` field. **Example Models:** text-embedding-3-small (default, 1536 dims), text-embedding-3-large (3072 dims) **Docs:** https://platform.openai.com/docs/guides/embeddings
+pub const OpenAIEmbedderConfig = struct {
+    /// The name of the OpenAI model to use.
+    model: []const u8,
+    /// The URL of the OpenAI API endpoint. Defaults to OpenAI's API. Can be set via OPENAI_BASE_URL environment variable.
+    url: ?[]const u8 = null,
+    /// The OpenAI API key. Can also be set via OPENAI_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
+    dimensions: ?i64 = null,
+};
+
+/// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
+pub const OpenRouterEmbedderConfig = struct {
+    /// The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
+    model: []const u8,
+    /// The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Output dimension for the embedding (if supported by the model).
+    dimensions: ?i64 = null,
+};
+
+/// Configuration for the AWS Bedrock embedding provider. Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles. **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0 **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
+pub const BedrockEmbedderConfig = struct {
+    /// The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
+    model: []const u8,
+    /// The AWS region for the Bedrock service (e.g., 'us-east-1').
+    region: ?[]const u8 = null,
+    /// Output dimension for Bedrock embedding models that support configurable dimensions.
+    dimension: ?i64 = null,
+    /// Alias for output dimension when using OpenAI-compatible configuration fields.
+    dimensions: ?i64 = null,
+    /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
+    input_type: ?[]const u8 = null,
+    /// Cohere Bedrock truncate behavior.
+    truncate: ?[]const u8 = null,
+    /// Whether to strip new lines from the input text before embedding.
+    strip_new_lines: ?bool = null,
+    /// The batch size for embedding requests to optimize throughput.
+    batch_size: ?i64 = null,
+};
+
+/// Configuration for the Cohere embedding provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/embed
+pub const CohereEmbedderConfig = struct {
+    /// The name of the Cohere embedding model to use.
+    model: []const u8,
+    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Specifies the type of input for optimized embeddings.
+    input_type: ?[]const u8 = null,
+    /// How to handle inputs longer than the max token length.
+    truncate: ?[]const u8 = null,
+};
+
+/// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. It provides embedding generation with multi-tier caching (memory + persistent). **Features:** - Local ONNX-based embedding generation - L1 memory cache with configurable TTL - L2 persistent Pebble database cache - Singleflight deduplication for concurrent identical requests **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
+pub const AntflyEmbedderConfig = struct {
+    /// The embedding model name (maps to models/embedders/{name}/ directory).
+    model: []const u8,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+};
+
+/// The embedding provider to use.
+pub const EmbedderProvider = enum {
+    gemini,
+    vertex,
+    ollama,
+    openai,
+    openrouter,
+    bedrock,
+    cohere,
+    mock,
+    antfly,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .gemini => "gemini",
+            .vertex => "vertex",
+            .ollama => "ollama",
+            .openai => "openai",
+            .openrouter => "openrouter",
+            .bedrock => "bedrock",
+            .cohere => "cohere",
+            .mock => "mock",
+            .antfly => "antfly",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "gemini", .gemini },
+            .{ "vertex", .vertex },
+            .{ "ollama", .ollama },
+            .{ "openai", .openai },
+            .{ "openrouter", .openrouter },
+            .{ "bedrock", .bedrock },
+            .{ "cohere", .cohere },
+            .{ "mock", .mock },
+            .{ "antfly", .antfly },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for the Google generative AI provider (Gemini).
+pub const GoogleGeneratorConfig = struct {
+    /// The Google Cloud project ID.
+    project_id: ?[]const u8 = null,
+    /// The Google Cloud location (e.g., 'us-central1').
+    location: ?[]const u8 = null,
+    /// The name of the generative model to use.
+    model: []const u8,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+    /// The Google API key.
+    api_key: ?[]const u8 = null,
+    /// The URL of the Google API endpoint.
+    url: ?[]const u8 = null,
+};
+
+/// Configuration for Google Cloud Vertex AI generative models.
+pub const VertexGeneratorConfig = struct {
+    /// The name of the Vertex AI model to use.
+    model: []const u8,
+    /// Google Cloud project ID.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud region for Vertex AI API.
+    location: ?[]const u8 = null,
+    /// Path to service account JSON key file.
+    credentials_path: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+};
+
+/// Configuration for the Ollama generative AI provider.
+pub const OllamaGeneratorConfig = struct {
+    /// The name of the Ollama model to use.
+    model: []const u8,
+    /// The URL of the Ollama API endpoint.
+    url: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+    /// HTTP response timeout in seconds for Ollama API calls.
+    timeout: ?i64 = null,
+};
+
+/// Configuration for the Antfly inference generative AI provider.
+pub const AntflyGeneratorConfig = struct {
+    /// The name of the generator model.
+    model: []const u8,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+    /// HTTP response timeout in seconds for Inference API calls.
+    timeout: ?i64 = null,
+};
+
+/// Configuration for the OpenAI generative AI provider.
+pub const OpenAIGeneratorConfig = struct {
+    /// The name of the OpenAI model to use.
+    model: []const u8,
+    /// The URL of the OpenAI API endpoint.
+    url: ?[]const u8 = null,
+    /// The OpenAI API key.
+    api_key: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Penalty for token frequency (-2.0 to 2.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (-2.0 to 2.0).
+    presence_penalty: ?f32 = null,
+};
+
+/// Configuration for the OpenRouter generative AI provider.
+pub const OpenRouterGeneratorConfig = struct {
+    /// Single model identifier. Either model or models must be provided.
+    model: ?[]const u8 = null,
+    /// Array of model identifiers for fallback routing. Either model or models must be provided.
+    models: ?[]const []const u8 = null,
+    /// The OpenRouter API key.
+    api_key: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
+    top_p: ?f32 = null,
+    /// Penalty for token frequency (-2.0 to 2.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (-2.0 to 2.0).
+    presence_penalty: ?f32 = null,
+};
+
+/// Configuration for the AWS Bedrock generative AI provider.
+pub const BedrockGeneratorConfig = struct {
+    /// The Bedrock model ID to use.
+    model: []const u8,
+    /// The AWS region for the Bedrock service.
+    region: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-1.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+};
+
+/// Configuration for the Anthropic generative AI provider.
+pub const AnthropicGeneratorConfig = struct {
+    /// The full model ID of the Anthropic model to use.
+    model: []const u8,
+    /// The Anthropic API key.
+    api_key: ?[]const u8 = null,
+    /// The URL of the Anthropic API endpoint.
+    url: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-1.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+};
+
+/// Configuration for the Cohere generative AI provider.
+pub const CohereGeneratorConfig = struct {
+    /// The name of the Cohere model to use.
+    model: []const u8,
+    /// The Cohere API key.
+    api_key: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-1.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+    /// Penalty for token frequency (0.0-1.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (0.0-1.0).
+    presence_penalty: ?f32 = null,
+};
+
+/// The generative AI provider to use.
+pub const GeneratorProvider = enum {
+    gemini,
+    vertex,
+    ollama,
+    openai,
+    openrouter,
+    bedrock,
+    anthropic,
+    cohere,
+    antfly,
+    mock,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .gemini => "gemini",
+            .vertex => "vertex",
+            .ollama => "ollama",
+            .openai => "openai",
+            .openrouter => "openrouter",
+            .bedrock => "bedrock",
+            .anthropic => "anthropic",
+            .cohere => "cohere",
+            .antfly => "antfly",
+            .mock => "mock",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "gemini", .gemini },
+            .{ "vertex", .vertex },
+            .{ "ollama", .ollama },
+            .{ "openai", .openai },
+            .{ "openrouter", .openrouter },
+            .{ "bedrock", .bedrock },
+            .{ "anthropic", .anthropic },
+            .{ "cohere", .cohere },
+            .{ "antfly", .antfly },
+            .{ "mock", .mock },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Options specific to text chunking.
+pub const TextChunkOptions = struct {
+    /// Target number of tokens per chunk.
+    target_tokens: ?i64 = null,
+    /// Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers.
+    overlap_tokens: ?i64 = null,
+    /// Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers.
+    separator: ?[]const u8 = null,
+};
+
+/// Options specific to audio chunking.
+pub const AudioChunkOptions = struct {
+    /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
+    window_duration_ms: ?i64 = null,
+    /// Overlap duration in milliseconds between audio chunks (default: 0).
+    overlap_duration_ms: ?i64 = null,
+};
+
+/// The chunking provider to use.
+pub const ChunkerProvider = enum {
+    mock,
+    antfly,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .mock => "mock",
+            .antfly => "antfly",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "mock", .mock },
+            .{ "antfly", .antfly },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for a specific edge type
+pub const EdgeTypeConfig = struct {
+    /// Edge type name (e.g., 'cites', 'similar_to')
+    name: []const u8,
+    /// Document field containing target node key(s) for automatic edge creation. Supports string (single target) or array of strings (multiple targets). When omitted, edges must be provided explicitly via _edges.
+    field: ?[]const u8 = null,
+    /// Topology constraint for this edge type: - tree: Single parent per node, no cycles - graph: No constraints (default)
+    topology: ?[]const u8 = null,
+    /// Maximum allowed edge weight
+    max_weight: ?f64 = null,
+    /// Minimum allowed edge weight
+    min_weight: ?f64 = null,
+    /// Whether to allow edges from a node to itself
+    allow_self_loops: ?bool = null,
+    /// Required metadata fields for this edge type
+    required_metadata: ?[]const []const u8 = null,
+};
+
+/// Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned.
+pub const AlgebraicIndexConfig = struct {
+    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    derive_from_schema: ?bool = null,
+};
+
+/// The type of the index.
+pub const IndexType = enum {
+    full_text,
+    embeddings,
+    graph,
+    algebraic,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .full_text => "full_text",
+            .embeddings => "embeddings",
+            .graph => "graph",
+            .algebraic => "algebraic",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "full_text", .full_text },
+            .{ "embeddings", .embeddings },
+            .{ "graph", .graph },
+            .{ "algebraic", .algebraic },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Defines the structure of a document type
+pub const DocumentSchema = struct {
+    /// A description of the document type.
+    description: ?[]const u8 = null,
+    /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types.
+    schema: ?std.json.Value = null,
+};
+
+/// Field type annotations for schema fields
+pub const AntflyType2 = enum {
+    text,
+    html,
+    keyword,
+    numeric,
+    boolean,
+    datetime,
+    geopoint,
+    geoshape,
+    embedding,
+    blob,
+    link,
+    search_as_you_type,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .html => "html",
+            .keyword => "keyword",
+            .numeric => "numeric",
+            .boolean => "boolean",
+            .datetime => "datetime",
+            .geopoint => "geopoint",
+            .geoshape => "geoshape",
+            .embedding => "embedding",
+            .blob => "blob",
+            .link => "link",
+            .search_as_you_type => "search_as_you_type",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "html", .html },
+            .{ "keyword", .keyword },
+            .{ "numeric", .numeric },
+            .{ "boolean", .boolean },
+            .{ "datetime", .datetime },
+            .{ "geopoint", .geopoint },
+            .{ "geoshape", .geoshape },
+            .{ "embedding", .embedding },
+            .{ "blob", .blob },
+            .{ "link", .link },
+            .{ "search_as_you_type", .search_as_you_type },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A floating-point number used to decrease or increase the relevance scores of a query.
+pub const Boost = f64;
+
+/// The fuzziness of the query. Can be an integer or "auto".
+pub const Fuzziness = std.json.Value;
+
+pub const GeoPoint = struct {
+    lon: ?f64 = null,
+    lat: ?f64 = null,
+};
+
+/// A GeoJSON shape object. This is a simplified representation.
+pub const GeoShape = struct {
+    type: []const u8,
+    coordinates: []const std.json.Value,
+};
+
+/// Discriminator for the index stats variant.
+pub const FullTextIndexStatsIndexType = enum {
+    full_text,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .full_text => "full_text",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "full_text", .full_text },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const FullTextIndexStats = struct {
+    /// Discriminator for the index stats variant.
+    index_type: FullTextIndexStatsIndexType,
+    /// Error message if stats could not be retrieved
+    @"error": ?[]const u8 = null,
+    /// Number of documents in the index
+    total_indexed: ?i64 = null,
+    /// Size of the index in bytes
+    disk_usage: ?i64 = null,
+    /// Whether the index is currently rebuilding
+    rebuilding: ?bool = null,
+    /// Progress of ongoing rebuild as fraction [0.0, 1.0]
+    backfill_progress: ?f64 = null,
+    /// Number of documents indexed during current rebuild
+    backfill_items_processed: ?i64 = null,
+};
+
+/// Discriminator for the index stats variant.
+pub const EmbeddingsIndexStatsIndexType = enum {
+    embeddings,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embeddings => "embeddings",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embeddings", .embeddings },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Statistics for an embeddings index (dense or sparse)
+pub const EmbeddingsIndexStats = struct {
+    /// Discriminator for the index stats variant.
+    index_type: EmbeddingsIndexStatsIndexType,
+    /// Error message if stats could not be retrieved
+    @"error": ?[]const u8 = null,
+    /// Number of vectors/documents in the index
+    total_indexed: ?i64 = null,
+    /// Size of the index in bytes
+    disk_usage: ?i64 = null,
+    /// Total number of nodes in the index (dense only)
+    total_nodes: ?i64 = null,
+    /// Number of unique terms in the inverted index (sparse only)
+    total_terms: ?i64 = null,
+    /// Whether the index enricher is currently backfilling
+    rebuilding: ?bool = null,
+    /// Number of documents pending enrichment in the WAL
+    wal_backlog: ?i64 = null,
+    /// Backfill progress as a ratio from 0.0 to 1.0
+    backfill_progress: ?f64 = null,
+    /// Total items processed during backfill
+    backfill_items_processed: ?i64 = null,
+};
+
+/// Discriminator for the index stats variant.
+pub const GraphIndexStatsIndexType = enum {
+    graph,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .graph => "graph",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "graph", .graph },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Statistics for graph index
+pub const GraphIndexStats = struct {
+    /// Discriminator for the index stats variant.
+    index_type: GraphIndexStatsIndexType,
+    /// Error message if stats could not be retrieved
+    @"error": ?[]const u8 = null,
+    /// Total number of edges in the graph
+    total_edges: ?i64 = null,
+    /// Count of edges per edge type
+    edge_types: ?std.json.ArrayHashMap(i64) = null,
+    /// Whether the index is currently rebuilding
+    rebuilding: ?bool = null,
+    /// Rebuild progress as a ratio from 0.0 to 1.0
+    backfill_progress: ?f64 = null,
+    /// Number of edges indexed during current rebuild
+    backfill_items_processed: ?i64 = null,
+    /// Algebraic graph execution health for bounded semiring traversal.
+    algebraic_graph: ?std.json.Value = null,
+};
+
+/// Discriminator for the index stats variant.
+pub const AlgebraicIndexStatsIndexType = enum {
+    algebraic,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .algebraic => "algebraic",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "algebraic", .algebraic },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive, and materialization records remain internal diagnostics.
+pub const AlgebraicIndexStats = struct {
+    /// Discriminator for the index stats variant.
+    index_type: AlgebraicIndexStatsIndexType,
+    /// Error message if stats could not be retrieved
+    @"error": ?[]const u8 = null,
+    /// Number of documents reflected in the algebraic sidecar
+    total_indexed: ?i64 = null,
+    /// Size of the index in bytes
+    disk_usage: ?i64 = null,
+    /// Whether the sidecar is currently rebuilding
+    rebuilding: ?bool = null,
+    /// Backfill progress as a ratio from 0.0 to 1.0
+    backfill_progress: ?f64 = null,
+    /// Number of documents processed during current backfill
+    backfill_items_processed: ?i64 = null,
+    healthy: ?bool = null,
+    parse_error_count: ?i64 = null,
+    schema_version: ?i64 = null,
+    /// Schema-derived algebraic capability lifecycle, for example current, stale, or rebuild_required.
+    capability_lifecycle_status: ?[]const u8 = null,
+    planner_selected: ?i64 = null,
+    planner_fallback_count: ?i64 = null,
+    planner_last_decision: ?[]const u8 = null,
+    planner_last_fallback_reason: ?[]const u8 = null,
+    /// Latest algebraic planner scan-row estimate for the last selected or fallback decision.
+    planner_last_estimated_scan_rows: ?i64 = null,
+    /// Latest algebraic planner result-bucket estimate for the last selected or fallback decision.
+    planner_last_estimated_result_buckets: ?i64 = null,
+    planner_lifecycle_ready: ?bool = null,
+    planner_lifecycle_blocking_reason: ?[]const u8 = null,
+    adaptive_progress_count: ?i64 = null,
+    /// Number of currently recommended algebraic shapes.
+    recommendation_count: ?i64 = null,
+    adaptive_backfilling_count: ?i64 = null,
+    adaptive_ready_count: ?i64 = null,
+    adaptive_stale_count: ?i64 = null,
+    adaptive_cleanup_recommended_count: ?i64 = null,
+    last_error_reason: ?[]const u8 = null,
+    active_progress_lifecycle: ?[]const u8 = null,
+    active_progress_rows_processed: ?i64 = null,
+    active_progress_target_rows: ?i64 = null,
+};
+
+/// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - search: Execute semantic searches (legacy, use semantic_search for retrieval) - websearch: Search the web (requires websearch_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search
+pub const ChatToolName = enum {
+    add_filter,
+    ask_clarification,
+    search,
+    websearch,
+    fetch,
+    semantic_search,
+    full_text_search,
+    tree_search,
+    graph_search,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .add_filter => "add_filter",
+            .ask_clarification => "ask_clarification",
+            .search => "search",
+            .websearch => "websearch",
+            .fetch => "fetch",
+            .semantic_search => "semantic_search",
+            .full_text_search => "full_text_search",
+            .tree_search => "tree_search",
+            .graph_search => "graph_search",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "add_filter", .add_filter },
+            .{ "ask_clarification", .ask_clarification },
+            .{ "search", .search },
+            .{ "websearch", .websearch },
+            .{ "fetch", .fetch },
+            .{ "semantic_search", .semantic_search },
+            .{ "full_text_search", .full_text_search },
+            .{ "tree_search", .tree_search },
+            .{ "graph_search", .graph_search },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// The web search provider to use. - **google**: Google Custom Search API (requires CSE setup) - **bing**: Microsoft Bing Web Search API - **serper**: Serper.dev Google Search API (simpler setup) - **tavily**: Tavily AI Search API (optimized for RAG) - **brave**: Brave Search API - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+pub const WebSearchProvider = enum {
+    google,
+    bing,
+    serper,
+    tavily,
+    brave,
+    duckduckgo,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .google => "google",
+            .bing => "bing",
+            .serper => "serper",
+            .tavily => "tavily",
+            .brave => "brave",
+            .duckduckgo => "duckduckgo",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "google", .google },
+            .{ "bing", .bing },
+            .{ "serper", .serper },
+            .{ "tavily", .tavily },
+            .{ "brave", .brave },
+            .{ "duckduckgo", .duckduckgo },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const Credentials = struct {
+    /// S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
+    endpoint: ?[]const u8 = null,
+    /// Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
+    use_ssl: ?bool = null,
+    /// AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
+    access_key_id: ?[]const u8 = null,
+    /// AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
+    secret_access_key: ?[]const u8 = null,
+    /// Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
+    session_token: ?[]const u8 = null,
+};
+
+/// Retry configuration for generator calls
+pub const RetryConfig = struct {
+    /// Maximum number of retry attempts
+    max_attempts: ?i64 = null,
+    /// Initial backoff delay in milliseconds
+    initial_backoff_ms: ?i64 = null,
+    /// Multiplier for exponential backoff
+    backoff_multiplier: ?f32 = null,
+    /// Maximum backoff delay in milliseconds
+    max_backoff_ms: ?i64 = null,
+};
+
+/// Condition for trying the next generator in chain: - always: Always try next regardless of outcome - on_error: Try next on any error (default) - on_timeout: Try next only on timeout errors - on_rate_limit: Try next only on rate limit errors
+pub const ChainCondition = enum {
+    always,
+    on_error,
+    on_timeout,
+    on_rate_limit,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .always => "always",
+            .on_error => "on_error",
+            .on_timeout => "on_timeout",
+            .on_rate_limit => "on_rate_limit",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "always", .always },
+            .{ "on_error", .on_error },
+            .{ "on_timeout", .on_timeout },
+            .{ "on_rate_limit", .on_rate_limit },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Strategy for query transformation and retrieval: - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries. - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions. - step_back: Generate broader background query first, then specific query. Best for questions needing context. - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
+pub const QueryStrategy = enum {
+    simple,
+    decompose,
+    step_back,
+    hyde,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .simple => "simple",
+            .decompose => "decompose",
+            .step_back => "step_back",
+            .hyde => "hyde",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "simple", .simple },
+            .{ "decompose", .decompose },
+            .{ "step_back", .step_back },
+            .{ "hyde", .hyde },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Mode for semantic query generation: - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level 2 optimization) - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE - Level 3 optimization)
+pub const SemanticQueryMode = enum {
+    rewrite,
+    hypothetical,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rewrite => "rewrite",
+            .hypothetical => "hypothetical",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rewrite", .rewrite },
+            .{ "hypothetical", .hypothetical },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Available evaluator types: **Retrieval metrics** (require ground_truth.relevant_ids): - recall: Recall@k - fraction of relevant docs retrieved - precision: Precision@k - fraction of retrieved docs that are relevant - ndcg: Normalized Discounted Cumulative Gain - mrr: Mean Reciprocal Rank - map: Mean Average Precision **LLM-as-judge metrics** (require judge config): - relevance: Is output relevant to query? (works on retrieval-only too) - faithfulness: Is output grounded in context? - completeness: Does output fully address query? - coherence: Is output well-structured? - safety: Is output safe/appropriate? - helpfulness: Is output useful? - correctness: Is output factually correct? (uses expectations) - citation_quality: Are citations accurate?
+pub const EvaluatorName = enum {
+    recall,
+    precision,
+    ndcg,
+    mrr,
+    map,
+    relevance,
+    faithfulness,
+    completeness,
+    coherence,
+    safety,
+    helpfulness,
+    correctness,
+    citation_quality,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .recall => "recall",
+            .precision => "precision",
+            .ndcg => "ndcg",
+            .mrr => "mrr",
+            .map => "map",
+            .relevance => "relevance",
+            .faithfulness => "faithfulness",
+            .completeness => "completeness",
+            .coherence => "coherence",
+            .safety => "safety",
+            .helpfulness => "helpfulness",
+            .correctness => "correctness",
+            .citation_quality => "citation_quality",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "recall", .recall },
+            .{ "precision", .precision },
+            .{ "ndcg", .ndcg },
+            .{ "mrr", .mrr },
+            .{ "map", .map },
+            .{ "relevance", .relevance },
+            .{ "faithfulness", .faithfulness },
+            .{ "completeness", .completeness },
+            .{ "coherence", .coherence },
+            .{ "safety", .safety },
+            .{ "helpfulness", .helpfulness },
+            .{ "correctness", .correctness },
+            .{ "citation_quality", .citation_quality },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Ground truth data for evaluation
+pub const GroundTruth = struct {
+    /// Document IDs known to be relevant (for retrieval metrics)
+    relevant_ids: ?[]const []const u8 = null,
+    /// Context for evaluators about what to expect in the response. Provides guidance for LLM judges (e.g., "Should mention pricing tiers").
+    expectations: ?[]const u8 = null,
+};
+
+/// Options for evaluation behavior
+pub const EvalOptions = struct {
+    /// K value for @K metrics (precision@k, recall@k, ndcg@k)
+    k: ?i64 = null,
+    /// Score threshold for pass/fail determination
+    pass_threshold: ?f32 = null,
+    /// Timeout for evaluation in seconds
+    timeout_seconds: ?i64 = null,
+};
+
+/// Role of the message sender in a generation/chat conversation
+pub const ChatMessageRole = enum {
+    user,
+    assistant,
+    system,
+    tool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .user => "user",
+            .assistant => "assistant",
+            .system => "system",
+            .tool => "tool",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "user", .user },
+            .{ "assistant", .assistant },
+            .{ "system", .system },
+            .{ "tool", .tool },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Text content for multimodal input.
+pub const TextContentPart = struct {
+    type: []const u8,
+    /// Text content.
+    text: []const u8,
+};
+
+/// Image URL or data URI.
+pub const ImageURL = struct {
+    /// URL or data URI (data:image/png;base64,...).
+    url: []const u8,
+};
+
+/// Inline binary media content (audio, image, etc.).
+pub const MediaContentPart = struct {
+    type: []const u8,
+    /// Base64-encoded binary data.
+    data: []const u8,
+    /// MIME type (audio/wav, image/gif, image/png, etc.).
+    mime_type: []const u8,
+};
+
+/// A tool call made by the assistant
+pub const ChatToolCall = struct {
+    /// Unique identifier for this tool call
+    id: []const u8,
+    /// Name of the tool being called
+    name: []const u8,
+    /// Arguments passed to the tool as key-value pairs
+    arguments: std.json.Value,
+};
+
+/// Result from executing a tool call
+pub const ChatToolResult = struct {
+    /// ID of the tool call this result corresponds to
+    tool_call_id: []const u8,
+    /// Result data from the tool execution
+    result: std.json.Value,
+    /// Error message if tool execution failed
+    @"error": ?[]const u8 = null,
+};
+
+/// A filter specification to apply to search queries
+pub const FilterSpec = struct {
+    /// Field name to filter on
+    field: []const u8,
+    /// Filter operator: - eq: Equals - ne: Not equals - gt/gte: Greater than (or equal) - lt/lte: Less than (or equal) - contains: Contains substring - prefix: Starts with - range: Between two values (value should be array [min, max]) - in: Value in list (value should be array)
+    operator: []const u8,
+    /// Filter value (string, number, boolean, or array for range/in operators)
+    value: std.json.Value,
+};
+
+/// Classification of query type: question (specific factual query) or search (exploratory query)
+pub const RouteType = enum {
+    question,
+    search,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .question => "question",
+            .search => "search",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "question", .question },
+            .{ "search", .search },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Result from a single evaluator
+pub const EvaluatorScore = struct {
+    /// Numeric score (0-1)
+    score: ?f32 = null,
+    /// Whether the evaluation passed the threshold
+    pass: ?bool = null,
+    /// Human-readable explanation of the result
+    reason: ?[]const u8 = null,
+    /// Additional evaluator-specific data
+    metadata: ?std.json.Value = null,
+};
+
+/// Aggregate statistics across all evaluators
+pub const EvalSummary = struct {
+    /// Average score across all evaluators
+    average_score: ?f32 = null,
+    /// Number of evaluators that passed
+    passed: ?i64 = null,
+    /// Number of evaluators that failed
+    failed: ?i64 = null,
+    /// Total number of evaluators run
+    total: ?i64 = null,
+};
+
+/// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores failover: Use full_text_search if embedding generation fails
+pub const MergeStrategy = enum {
+    rrf,
+    rsf,
+    failover,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rrf => "rrf",
+            .rsf => "rsf",
+            .failover => "failover",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rrf", .rrf },
+            .{ "rsf", .rsf },
+            .{ "failover", .failover },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// The reranking provider to use.
+pub const RerankerProvider = enum {
+    antfly,
+    ollama,
+    cohere,
+    vertex,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .antfly => "antfly",
+            .ollama => "ollama",
+            .cohere => "cohere",
+            .vertex => "vertex",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "antfly", .antfly },
+            .{ "ollama", .ollama },
+            .{ "cohere", .cohere },
+            .{ "vertex", .vertex },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for the Antfly inference reranking provider.
+pub const AntflyRerankerConfig = struct {
+    /// The name of the reranking model (e.g., cross-encoder model name).
+    model: []const u8,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    url: ?[]const u8 = null,
+};
+
+/// Configuration for the Ollama reranking provider.
+pub const OllamaRerankerConfig = struct {
+    /// The name of the Ollama model to use for reranking.
+    model: []const u8,
+    /// The URL of the Ollama API endpoint.
+    url: ?[]const u8 = null,
+};
+
+/// Configuration for the Cohere reranking provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** rerank-english-v3.0 (default), rerank-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/rerank
+pub const CohereRerankerConfig = struct {
+    /// The name of the Cohere reranking model to use.
+    model: []const u8,
+    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
+    top_n: ?i64 = null,
+    /// Maximum number of chunks per document for long document handling.
+    max_chunks_per_doc: ?i64 = null,
+};
+
+/// Configuration for the Google Vertex AI Ranking API. Uses Application Default Credentials (ADC) or explicit credentials path. **Prerequisites:** - Enable Discovery Engine API: `gcloud services enable discoveryengine.googleapis.com` - Grant IAM role: `roles/discoveryengine.admin` (includes `discoveryengine.rankingConfigs.rank` permission) **Models:** semantic-ranker-default@latest (default), semantic-ranker-fast-004 **Docs:** https://cloud.google.com/generative-ai-app-builder/docs/ranking **IAM:** https://cloud.google.com/generative-ai-app-builder/docs/access-control
+pub const VertexRerankerConfig = struct {
+    /// The ranking model to use.
+    model: []const u8,
+    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Path to service account JSON file. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of records to return. If not specified, returns all documents with scores.
+    top_n: ?i64 = null,
+};
+
+/// Type of graph query to execute
+pub const GraphQueryType = enum {
+    traverse,
+    neighbors,
+    shortest_path,
+    k_shortest_paths,
+    pattern,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .traverse => "traverse",
+            .neighbors => "neighbors",
+            .shortest_path => "shortest_path",
+            .k_shortest_paths => "k_shortest_paths",
+            .pattern => "pattern",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "traverse", .traverse },
+            .{ "neighbors", .neighbors },
+            .{ "shortest_path", .shortest_path },
+            .{ "k_shortest_paths", .k_shortest_paths },
+            .{ "pattern", .pattern },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Filter nodes during graph traversal using existing query primitives
+pub const NodeFilter = struct {
+    /// Antfly query to filter nodes (same syntax as search filter_query)
+    filter_query: ?std.json.Value = null,
+    /// Filter by key prefix
+    filter_prefix: ?[]const u8 = null,
+};
+
+/// Path weighting algorithm for pathfinding: - min_hops: Minimize number of edges - min_weight: Minimize sum of edge weights - max_weight: Maximize product of edge weights
+pub const PathWeightMode = enum {
+    min_hops,
+    min_weight,
+    max_weight,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .min_hops => "min_hops",
+            .min_weight => "min_weight",
+            .max_weight => "max_weight",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "min_hops", .min_hops },
+            .{ "min_weight", .min_weight },
+            .{ "max_weight", .max_weight },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for pruning search results based on score quality. Helps filter out low-relevance results in RAG pipelines by detecting score gaps or deviations from top results.
+pub const Pruner = struct {
+    /// Keep only results with score >= max_score * min_score_ratio. For example, 0.5 keeps results scoring at least half of the top result. Applied after fusion scoring.
+    min_score_ratio: ?f64 = null,
+    /// Stop returning results when the gap between consecutive scores exceeds this percentage of the total score range (max - min). Detects "elbows" in score distributions regardless of score scale. For example, 30.0 stops when a gap spans 30% of the score range.
+    max_score_gap_percent: ?f64 = null,
+    /// Hard minimum score threshold. Results with scores below this value are excluded regardless of other pruning settings.
+    min_absolute_score: ?f64 = null,
+    /// Only keep results that appear in multiple indexes (both full-text and vector search). Useful for increasing precision by requiring agreement between different retrieval methods.
+    require_multi_index: ?bool = null,
+    /// Keep results within N standard deviations below the mean score. For example, 1.0 keeps results with score >= mean - 1*stddev. Useful for statistical outlier detection in result sets.
+    std_dev_threshold: ?f64 = null,
+};
+
+pub const InferenceError = struct {
+    /// Error message
+    @"error": []const u8,
+};
+
+/// Text content for embedding
+pub const InferenceTextContentPart = struct {
+    type: []const u8,
+    /// Text content to embed
+    text: []const u8,
+};
+
+/// Image URL or data URI
+pub const InferenceImageURL = struct {
+    /// URL or data URI (data:image/png;base64,...)
+    url: []const u8,
+};
+
+/// Inline binary media content (audio, image, etc.)
+pub const InferenceMediaContentPart = struct {
+    type: []const u8,
+    /// Base64-encoded binary data
+    data: []const u8,
+    /// MIME type (audio/wav, image/gif, image/png, etc.)
+    mime_type: []const u8,
+};
+
+/// A sparse vector with parallel index/value arrays, sorted by index ascending
+pub const InferenceSparseVector = struct {
+    /// Token IDs from the model vocabulary (sorted ascending)
+    indices: []const i32,
+    /// Corresponding weights for each index (always positive)
+    values: []const f32,
+};
+
+/// Options for Voice Activity Detection (VAD) based audio segmentation. inference-specific.
+pub const InferenceVADOptions = struct {
+    /// Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300.
+    min_silence_duration_ms: ?i64 = null,
+    /// Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250.
+    min_speech_duration_ms: ?i64 = null,
+    /// Padding (ms) added before and after detected speech. Default: 30.
+    speech_pad_ms: ?i64 = null,
+    /// Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000.
+    max_segment_duration_ms: ?i64 = null,
+};
+
+pub const InferenceRerankRequest = struct {
+    /// Name of reranking model from models_dir/rerankers/
+    model: []const u8,
+    /// Search query for relevance scoring
+    query: []const u8,
+    /// Pre-rendered document texts to rerank. The client is responsible for extracting and rendering document fields/templates before calling this endpoint.
+    prompts: []const []const u8,
+};
+
+pub const InferenceRerankObject = struct {
+    object: []const u8,
+    /// Original prompt index.
+    index: i64,
+    /// Relevance score for this prompt.
+    score: f32,
+};
+
+pub const InferenceRecognizeEntity = struct {
+    /// The entity text
+    text: []const u8,
+    /// Entity type (PER, ORG, LOC, MISC)
+    label: []const u8,
+    /// Character offset where entity begins
+    start: i64,
+    /// Character offset where entity ends (exclusive)
+    end: i64,
+    /// Confidence score (0.0 to 1.0)
+    score: f32,
+};
+
+/// Configuration for entity resolution. When present in a RecognizeRequest, the response entities and relations are deduplicated via entity resolution (e.g., "Elon Musk" and "Musk" are merged into a single entity).
+pub const InferenceResolverConfig = struct {
+    /// Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
+    similarity_threshold: ?f32 = null,
+    /// Whether entity types must match for merging
+    type_must_match: ?bool = null,
+    /// Minimum confidence score for entities to be included
+    min_entity_confidence: ?f32 = null,
+    /// Minimum confidence score for relations to be included
+    min_relation_confidence: ?f32 = null,
+    /// Whether to deduplicate relations after entity resolution
+    deduplicate_relations: ?bool = null,
+    /// Whether to track mention provenance for resolved entities
+    track_provenance: ?bool = null,
+};
+
+pub const InferenceRewriteRequest = struct {
+    /// Name of Seq2Seq rewriter model from models_dir/rewriters/
+    model: []const u8,
+    /// Input texts to rewrite/transform
+    inputs: []const []const u8,
+};
+
+pub const InferenceRewriteObject = struct {
+    object: []const u8,
+    /// Original input text index.
+    index: i64,
+    /// Rewritten texts for this input, one per beam.
+    texts: []const []const u8,
+};
+
+pub const InferenceClassifyRequest = struct {
+    /// Name of classifier model from models_dir/classifiers/
+    model: []const u8,
+    /// Texts to classify
+    texts: []const []const u8,
+    /// Candidate labels for zero-shot classification. The model will predict which label(s) best describe each text.
+    labels: []const []const u8,
+    /// Custom hypothesis template for NLI-based classification. Use "{}" as placeholder for the label. Default: "This example is {}."
+    hypothesis_template: ?[]const u8 = null,
+    /// If true, allows multiple labels per text (independent scoring). If false (default), scores are normalized across labels.
+    multi_label: ?bool = null,
+};
+
+pub const InferenceClassifyResult = struct {
+    /// The predicted class/category
+    label: []const u8,
+    /// Confidence score (0.0 to 1.0)
+    score: f32,
+};
+
+pub const InferenceDocumentClassificationRequest = struct {
+    /// Name or path of the document classification model directory or checkpoint
+    model: []const u8,
+    /// Absolute or server-local path to the page image
+    image_path: []const u8,
+    /// Number of OCR/text tokens associated with the page
+    num_tokens: i64,
+    /// Labels in the same order expected by the checkpoint output head
+    labels: []const []const u8,
+    /// Optional tensor prefix inside the safetensors checkpoint
+    prefix: ?[]const u8 = null,
+};
+
+pub const InferenceDocumentClassificationFeatures = struct {
+    num_tokens: i64,
+    image_width: i64,
+    image_height: i64,
+    image_components: i64,
+    mean_darkness: f32,
+    std_darkness: f32,
+    top_darkness: f32,
+    bottom_darkness: f32,
+    left_darkness: f32,
+    right_darkness: f32,
+    center_darkness: f32,
+};
+
+pub const InferenceDocumentClassificationResult = struct {
+    label: []const u8,
+    score: f32,
+};
+
+pub const InferenceDocumentTokenBox = struct {
+    text: []const u8,
+    /// Bounding box normalized to the same 0-1000 layout space used by training
+    bbox: []const i64,
+};
+
+pub const InferenceDocumentTokenClassificationFeatures = struct {
+    text_length: i64,
+    bbox: []const i64,
+    width: f32,
+    height: f32,
+    relative_position: f32,
+    bbox_phase_sin: f32,
+};
+
+pub const InferenceDocumentTokenClassificationResult = struct {
+    label: []const u8,
+    score: f32,
+};
+
+pub const InferenceExtractFieldValue = struct {
+    /// The extracted text value
+    value: []const u8,
+    /// Confidence score (only present when include_confidence=true)
+    score: ?f32 = null,
+    /// Character offset where value begins (only present when include_spans=true)
+    start: ?i64 = null,
+    /// Character offset where value ends (only present when include_spans=true)
+    end: ?i64 = null,
+};
+
+pub const InferenceExtractObject = struct {
+    object: []const u8,
+    /// Original input index.
+    index: i64,
+    /// Extraction result for this input. Maps structure names to arrays of extracted instances. Each instance maps field names to ExtractFieldValue (for ::str fields) or arrays of ExtractFieldValue (for ::list fields).
+    results: std.json.ArrayHashMap([]const std.json.Value),
+};
+
+pub const InferenceTextRegion = struct {
+    /// Recognized text within the region
+    text: []const u8,
+    /// Bounding box [x1, y1, x2, y2] in pixel coordinates
+    bbox: []const f64,
+    /// Recognition confidence score (0-1)
+    confidence: ?f64 = null,
+    /// Semantic label from layout analysis (e.g., text, title, table)
+    label: ?[]const u8 = null,
+};
+
+pub const InferenceTranscribeRequest = struct {
+    /// Name of transcriber model from models_dir/transcribers/
+    model: ?[]const u8 = null,
+    /// Base64-encoded audio data (WAV, MP3, FLAC, etc.)
+    audio: []const u8,
+    /// Force specific language for transcription (optional, model-dependent)
+    language: ?[]const u8 = null,
+};
+
+pub const InferenceTranscribeObject = struct {
+    object: []const u8,
+    /// Input audio index.
+    index: i64,
+    /// Transcribed text from the audio
+    text: []const u8,
+    /// Detected or forced language
+    language: ?[]const u8 = null,
+};
+
+/// Information about a model including its capabilities
+pub const InferenceModelInfo = struct {
+    /// List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring.
+    capabilities: ?[]const []const u8 = null,
+    /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
+    inputs: ?[]const []const u8 = null,
+};
+
+/// Definition of a function that can be called by the model
+pub const InferenceFunctionDefinition = struct {
+    /// The name of the function to call
+    name: []const u8,
+    /// A description of what the function does
+    description: ?[]const u8 = null,
+    /// JSON Schema object describing the function parameters
+    parameters: ?std.json.Value = null,
+    /// Whether to enforce strict parameter validation
+    strict: ?bool = null,
+};
+
+/// The function called by the model
+pub const InferenceToolCallFunction = struct {
+    /// The name of the function called
+    name: []const u8,
+    /// JSON string of the arguments to the function
+    arguments: []const u8,
+};
+
+/// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
+pub const InferenceToolChoice = std.json.Value;
+
+/// The role of a message sender in a conversation
+pub const InferenceRole = enum {
+    system,
+    user,
+    assistant,
+    tool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .system => "system",
+            .user => "user",
+            .assistant => "assistant",
+            .tool => "tool",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "system", .system },
+            .{ "user", .user },
+            .{ "assistant", .assistant },
+            .{ "tool", .tool },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Reason why generation stopped
+pub const InferenceFinishReason = enum {
+    stop,
+    length,
+    tool_calls,
+    content_filter,
+    function_call,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .stop => "stop",
+            .length => "length",
+            .tool_calls => "tool_calls",
+            .content_filter => "content_filter",
+            .function_call => "function_call",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "stop", .stop },
+            .{ "length", .length },
+            .{ "tool_calls", .tool_calls },
+            .{ "content_filter", .content_filter },
+            .{ "function_call", .function_call },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceGenerateJsonSchemaConfig = struct {
+    /// Schema name
+    name: ?[]const u8 = null,
+    /// Whether output should strictly follow the schema
+    strict: ?bool = null,
+    /// JSON Schema object
+    schema: ?std.json.Value = null,
+};
+
+pub const InferenceGenerateUsage = struct {
+    /// Number of tokens in the prompt
+    prompt_tokens: i64,
+    /// Number of tokens in the completion
+    completion_tokens: i64,
+    /// Total tokens used (prompt + completion)
+    total_tokens: i64,
+};
+
+/// Incremental function call data for streaming
+pub const InferenceToolCallFunctionDelta = struct {
+    /// Function name (only in first delta)
+    name: ?[]const u8 = null,
+    /// Incremental arguments JSON string
+    arguments: ?[]const u8 = null,
+};
+
+pub const InferenceBackendCapabilities = struct {
+    /// Whether the native CPU backend is built into this runtime
+    native: ?bool = null,
+    /// Whether the ONNX Runtime backend is built into this runtime
+    onnx: ?bool = null,
+    /// Whether the MLX backend is built into this runtime
+    mlx: ?bool = null,
+    /// Whether the WASM backend is built into this runtime
+    wasm: ?bool = null,
+};
+
+/// Options specific to text chunking.
+pub const InferenceTextChunkOptions = struct {
+    /// Target number of tokens per chunk.
+    target_tokens: ?i64 = null,
+    /// Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers.
+    overlap_tokens: ?i64 = null,
+    /// Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers.
+    separator: ?[]const u8 = null,
+};
+
+/// Text content with character offsets.
+pub const InferenceTextContent = struct {
+    /// The chunk text content
+    text: []const u8,
+    /// Character position in original text where chunk starts
+    start_char: i64,
+    /// Character position in original text where chunk ends (exclusive)
+    end_char: i64,
+};
+
+/// Binary media content with format-specific metadata.
+pub const InferenceBinaryContent = struct {
+    /// Base64-encoded binary data (valid WAV, PNG, etc.)
+    data: ?[]const u8 = null,
+    /// Audio: window start time in milliseconds
+    start_time_ms: ?f32 = null,
+    /// Audio: window end time in milliseconds
+    end_time_ms: ?f32 = null,
+    /// Animation: frame number
+    frame_index: ?i64 = null,
+    /// Animation: display delay in milliseconds
+    frame_delay_ms: ?i64 = null,
+};
+
+pub const InferenceContentSecurityConfig = struct {
+    /// Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts are allowed (except private IPs if block_private_ips is true).
+    allowed_hosts: ?[]const []const u8 = null,
+    /// Block requests to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
+    block_private_ips: ?bool = null,
+    /// Maximum size of downloaded content in bytes
+    max_download_size_bytes: ?i64 = null,
+    /// Timeout for individual download operations in seconds
+    download_timeout_seconds: ?i64 = null,
+    /// Maximum image width/height in pixels (images will be resized)
+    max_image_dimension: ?i64 = null,
+    /// Whitelist of allowed path prefixes for file:// and s3:// URLs. If empty, all paths are allowed. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+    allowed_paths: ?[]const []const u8 = null,
+    /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
+    user_agent: ?[]const u8 = null,
+};
+
+pub const InferenceCredentials = struct {
+    /// S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
+    endpoint: ?[]const u8 = null,
+    /// Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
+    use_ssl: ?bool = null,
+    /// AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
+    access_key_id: ?[]const u8 = null,
+    /// AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
+    secret_access_key: ?[]const u8 = null,
+    /// Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
+    session_token: ?[]const u8 = null,
+};
+
+/// Logging verbosity level
+pub const InferenceLevel = enum {
+    debug,
+    info,
+    warn,
+    @"error",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .debug => "debug",
+            .info => "info",
+            .warn => "warn",
+            .@"error" => "error",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "debug", .debug },
+            .{ "info", .info },
+            .{ "warn", .warn },
+            .{ "error", .@"error" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Logging output format style. 'terminal' for colorized console, 'json' for structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
+pub const InferenceStyle = enum {
+    terminal,
+    json,
+    logfmt,
+    noop,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .terminal => "terminal",
+            .json => "json",
+            .logfmt => "logfmt",
+            .noop => "noop",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "terminal", .terminal },
+            .{ "json", .json },
+            .{ "logfmt", .logfmt },
+            .{ "noop", .noop },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Token usage information
+pub const InferenceEmbeddingUsage = struct {
+    /// Number of tokens in the input
+    prompt_tokens: i64,
+    /// Total tokens used
+    total_tokens: i64,
+};
+
 /// Typed Zig status view for table data topology and range placement.
 pub const ClusterDataStatus = struct {
     nodes: ?[]const ClusterDataNodeStatus = null,
@@ -1412,42 +3331,6 @@ pub const LinearMergeRequest = struct {
     /// If true, returns what would be deleted without making changes. Use cases: - Validate sync behavior before committing - Check which records will be removed - Test key range boundaries Response includes deleted_ids array when dry_run=true.
     dry_run: ?bool = null,
     sync_level: ?SyncLevel = null,
-};
-
-pub const AggregationRequest = struct {
-    type: AggregationType,
-    /// Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
-    field: ?[]const u8 = null,
-    /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
-    fields: ?[]const []const u8 = null,
-    /// Maximum number of buckets to return (for bucketing aggregations)
-    size: ?i64 = null,
-    /// Ranges for range aggregations
-    ranges: ?[]const AggregationRange = null,
-    /// Date ranges for date_range aggregations
-    date_ranges: ?[]const AggregationDateRange = null,
-    /// Fixed interval for histogram aggregations
-    interval: ?f32 = null,
-    /// Calendar-aware interval for date_histogram aggregations
-    calendar_interval: ?std.json.Value = null,
-    /// Origin for geohash_grid aggregation (format: "lat,lon") Example: "37.7749,-122.4194"
-    origin: ?[]const u8 = null,
-    /// Geohash precision (1-12) for geohash_grid aggregations
-    precision: ?i64 = null,
-    /// Distance ranges for geo_distance aggregations
-    distance_ranges: ?[]const DistanceRange = null,
-    /// Distance unit for geo_distance aggregations
-    unit: ?std.json.Value = null,
-    /// Minimum document count for a bucket to be included
-    min_doc_count: ?i64 = null,
-    /// Background filter for significant_terms aggregations
-    background_filter: ?std.json.Value = null,
-    /// Significance algorithm for significant_terms aggregations
-    algorithm: ?std.json.Value = null,
-    /// Algebraic join descriptor for bounded cross-table aggregation planning
-    algebraic_join: ?AlgebraicAggregationJoin = null,
-    /// Nested sub-aggregations
-    sub_aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
 };
 
 pub const TransformOp = struct {
@@ -1553,36 +3436,6 @@ pub const AgentQuestion = struct {
     default_answer: ?[]const u8 = null,
     /// High-level result areas affected by this decision
     affects: ?[]const []const u8 = null,
-};
-
-pub const QueryBuilderRequest = struct {
-    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
-    session_id: ?[]const u8 = null,
-    /// Structured answers provided by the user as part of client-carried continuation.
-    decisions: ?[]const AgentDecision = null,
-    /// If true, the agent may return clarification questions when needed.
-    interactive: ?bool = null,
-    /// Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting.
-    max_internal_iterations: ?i64 = null,
-    /// Maximum number of clarification turns the agent may request from the user.
-    max_user_clarifications: ?i64 = null,
-    /// Force a user-facing decision after this many unresolved internal passes.
-    require_decision_after: ?i64 = null,
-    /// Optional example documents to help the query builder infer field shapes and representative values. When omitted and the table has data but no schema, the server samples up to one document automatically.
-    example_documents: ?[]const std.json.Value = null,
-    /// Name of the table to build query for. If provided, uses table schema for field context.
-    table: ?[]const u8 = null,
-    /// Natural language description of the search intent
-    intent: []const u8,
-    /// List of searchable field names to consider. Overrides table schema if provided.
-    schema_fields: ?[]const []const u8 = null,
-    /// Optional strategy hint for the coordinator. Suggested values are `auto`, `full_text`, `semantic`, `hybrid`, `filter`, `tree`, and `graph`. Unknown values are accepted for forward compatibility and may fall back to `auto`.
-    mode: ?[]const u8 = null,
-    /// Preferred output artifact. Suggested values are `query_request`, `bleve`, and `filter_query`. The compatibility `query` field is still returned for existing clients.
-    output: ?[]const u8 = null,
-    /// Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`, `prefer_indexes`, and `require_executable`.
-    constraints: ?std.json.Value = null,
-    generator: ?antfly_generating_openapi.GeneratorConfig = null,
 };
 
 /// Emitted when a pipeline step begins execution
@@ -1702,16 +3555,103 @@ pub const LinearMergeResult = struct {
     took: ?i64 = null,
 };
 
+/// A single result from graph traversal
+pub const TraversalResult = struct {
+    /// Base64-encoded document key
+    key: []const u8,
+    /// Document data (if loaded)
+    document: ?std.json.Value = null,
+    /// Distance from start node (0 = start node)
+    depth: i64,
+    /// Sequence of keys from start to this node (if include_paths=true)
+    path: ?[]const []const u8 = null,
+    /// Sequence of edges from start to this node (if include_paths=true)
+    path_edges: ?[]const Edge = null,
+    /// Product of edge weights along the path
+    total_weight: ?f64 = null,
+};
+
 pub const EdgesResponse = struct {
     edges: ?[]const Edge = null,
     /// Total number of edges returned
     count: ?i64 = null,
 };
 
-pub const TraverseResponse = struct {
-    results: ?[]const TraversalResult = null,
-    /// Total number of results
-    count: ?i64 = null,
+/// Rules for graph traversal
+pub const TraversalRules = struct {
+    /// Filter edges by type (empty = all types)
+    edge_types: ?[]const []const u8 = null,
+    /// Minimum edge weight filter
+    min_weight: ?f64 = null,
+    /// Maximum edge weight filter
+    max_weight: ?f64 = null,
+    direction: ?EdgeDirection = null,
+    /// Maximum traversal depth (0 = unlimited)
+    max_depth: ?i64 = null,
+    /// Maximum results to return (0 = unlimited)
+    max_results: ?i64 = null,
+    /// Include path information in results
+    include_paths: ?bool = null,
+    /// Visit each node only once
+    deduplicate_nodes: ?bool = null,
+};
+
+/// Edge constraints in a pattern step
+pub const PatternEdgeStep = struct {
+    /// Edge types to traverse (empty = any)
+    types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    /// Minimum number of hops (1 = direct edge)
+    min_hops: ?i64 = null,
+    /// Maximum number of hops (>1 = variable-length path)
+    max_hops: ?i64 = null,
+    /// Minimum edge weight filter
+    min_weight: ?f64 = null,
+    /// Maximum edge weight filter
+    max_weight: ?f64 = null,
+};
+
+pub const PathFindRequest = struct {
+    /// Source node key (base64-encoded)
+    source: []const u8,
+    /// Target node key (base64-encoded)
+    target: []const u8,
+    /// Filter by specific edge types
+    edge_types: ?[]const []const u8 = null,
+    max_depth: ?i64 = null,
+    weight_mode: ?PathFindWeightMode = null,
+    k: ?i64 = null,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
+    direction: ?EdgeDirection = null,
+};
+
+pub const Path = struct {
+    /// Ordered list of node keys (base64-encoded)
+    nodes: ?[]const []const u8 = null,
+    edges: ?[]const PathEdge = null,
+    total_weight: ?f64 = null,
+    length: ?i64 = null,
+};
+
+/// A node in graph query results
+pub const GraphResultNode = struct {
+    /// Document key
+    key: []const u8,
+    /// Distance from start node
+    depth: ?i64 = null,
+    /// Weighted distance
+    distance: ?f64 = null,
+    /// Full document (if include_documents=true)
+    document: ?std.json.Value = null,
+    /// Keys in path from start to this node
+    path: ?[]const []const u8 = null,
+    /// Edges in path from start to this node
+    path_edges: ?[]const PathEdge = null,
+    /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
+    provenance: ?[]const []const u8 = null,
+    /// Connected edges (when include_edges=true)
+    edges: ?[]const Edge = null,
 };
 
 pub const ForeignSource = struct {
@@ -1725,24 +3665,715 @@ pub const ForeignSource = struct {
     columns: ?[]const ForeignColumn = null,
 };
 
-pub const ReplicationRoute = struct {
-    /// Name of the Antfly table to write matching rows to. The table must already exist.
-    target_table: []const u8,
-    /// Bleve-style filter query evaluated against each CDC row. Only rows matching this filter are written to `target_table`. If omitted, all rows match (equivalent to `match_all`).
-    where: ?std.json.Value = null,
-    /// Override the source-level `key_template` for this route. If omitted, the source-level template is used.
-    key_template: ?[]const u8 = null,
-    /// Transform operations for INSERT/UPDATE events on this route. If omitted, auto-generates `$set` for every column (passthrough mode).
-    on_update: ?[]const ReplicationTransformOp = null,
-    /// Transform operations for DELETE events on this route. If omitted, auto-derives from this route's `on_update` paths.
-    on_delete: ?[]const ReplicationTransformOp = null,
-};
-
 pub const Permission = struct {
     /// Resource name (e.g., table name, target username, or '*' for global).
     resource: []const u8,
     resource_type: ResourceType,
     type: PermissionType,
+};
+
+/// A unified configuration for an embedding provider. Embedders can be configured with templates to customize how documents are converted to text before embedding. Templates use Handlebars syntax and support various built-in helpers. **Template System:** - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/) - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes) - **Context**: Templates receive the full document as context **Built-in Helpers:** 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML ```handlebars {{scrubHtml html_content}} ``` - Removes `<script>` and `<style>` tags - Adds newlines after block elements (p, div, h1-h6, li, etc.) - Returns plain text with preserved readability 2. **eq** - Equality comparison for conditionals ```handlebars {{#if (eq status "active")}}Active user{{/if}} {{#if (eq @key "special")}}Special field{{/if}} ``` 3. **media** - GenKit dotprompt media directive for multimodal content ```handlebars {{media url=imageDataURI}} {{media url=this.image_url}} {{media url="https://example.com/image.jpg"}} {{media url="s3://endpoint/bucket/image.png"}} {{media url="file:///path/to/image.jpg"}} ``` **Supported URL Schemes:** - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`) - `http://` / `https://` - Web URLs with automatic content type detection - `file://` - Local filesystem paths - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`) **Automatic Content Processing:** - **Images**: Downloaded, resized (if needed), converted to data URIs - **PDFs**: Text extracted or first page rendered as image - **HTML**: Readable text extracted using Mozilla Readability **Security Controls:** Downloads are protected by content security settings (see Configuration Reference): - Allowed host whitelist - Private IP blocking (prevents SSRF attacks) - Download size limits (default: 100MB) - Download timeouts (default: 30s) - Image dimension limits (default: 2048px, auto-resized) See: https://antfly.io/docs/configuration#security--cors 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation) ```handlebars {{encodeToon this.fields}} {{encodeToon this.fields lengthMarker=false indent=4}} {{encodeToon this.fields delimiter="\t"}} ``` **What is TOON?** TOON is a compact, human-readable format designed for passing structured data to LLMs. It provides **30-60% token reduction** compared to JSON while maintaining high LLM comprehension accuracy. **Key Features:** - Compact syntax using `:` for key-value pairs - Array length markers: `tags[#3]: ai,search,ml` - Tabular format for uniform data structures - Optimized for LLM parsing and understanding - Maintains human readability **Benefits:** - **Lower API costs** - Reduced token usage means lower LLM API costs - **Faster responses** - Less tokens to process - **More context** - Fit more documents within token limits **Options:** - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true) - `indent` (int): Indentation spacing for nested objects (default: 2) - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs) **Example output:** ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml metadata: edition: 2 pages: 450 ``` **Default in RAG:** TOON is the default format for document rendering in RAG queries. **References:** - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon **Template Examples:** Document with metadata: ```handlebars Title: {{metadata.title}} Date: {{metadata.date}} Tags: {{#each metadata.tags}}{{this}}, {{/each}} {{content}} ``` HTML content extraction: ```handlebars Product: {{name}} Description: {{scrubHtml description_html}} Price: ${{price}} ``` Multimodal with image: ```handlebars Product: {{title}} {{media url=image}} Description: {{description}} ``` Conditional formatting: ```handlebars {{title}} {{#if author}}By: {{author}}{{/if}} {{#if (eq category "premium")}}⭐ Premium Content{{/if}} {{body}} ``` **Environment Variables:** - `GEMINI_API_KEY` - API key for Google AI - `OPENAI_API_KEY` - API key for OpenAI - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434) **Importing Pre-computed Embeddings:** You can import existing embeddings (from OpenAI, Cohere, or any provider), but only for indexes configured with `external: true`. External indexes accept vectors written directly through the document `_embeddings` field and do not generate prompts from `field` or `template`. **Steps:** 1. Create an embeddings index with `external: true` 2. For dense indexes, set the index `dimension` 3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }` **Example:** ```json { "title": "My Document", "content": "Document text...", "_embeddings": { "my_vector_index": [0.1, 0.2, 0.3, ...] } } ``` **Delete Behavior:** - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged **Use Cases:** - Migrating from another vector database with existing embeddings - Using embeddings generated by external systems - Importing pre-computed OpenAI, Cohere, or other provider embeddings - Batch processing embeddings offline before ingestion
+pub const EmbedderConfig = struct {
+    /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
+    project_id: ?[]const u8 = null,
+    /// The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API.
+    location: ?[]const u8 = null,
+    /// The name of the embedding model to use.
+    model: ?[]const u8 = null,
+    /// The dimension of the embedding vector (768, 1536, or 3072 recommended).
+    dimension: ?i64 = null,
+    /// The Google API key. Can also be set via GEMINI_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// The URL of the Google API endpoint (optional, uses default if not specified).
+    url: ?[]const u8 = null,
+    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
+    credentials_path: ?[]const u8 = null,
+    /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
+    dimensions: ?i64 = null,
+    /// The AWS region for the Bedrock service (e.g., 'us-east-1').
+    region: ?[]const u8 = null,
+    /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
+    input_type: ?[]const u8 = null,
+    /// Cohere Bedrock truncate behavior.
+    truncate: ?[]const u8 = null,
+    /// Whether to strip new lines from the input text before embedding.
+    strip_new_lines: ?bool = null,
+    /// The batch size for embedding requests to optimize throughput.
+    batch_size: ?i64 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    provider: EmbedderProvider,
+    /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and will send binary content (images, audio, etc.) to the provider instead of extracting text. The provider's API is still responsible for accepting the content — this flag just tells Antfly not to strip it. Not needed for models already in the registry (e.g., `multimodalembedding`, `gemini-embedding-2-preview`, `clip-*`, `clipclap`). **Example:** ```json { "provider": "vertex", "model": "some-future-multimodal-model", "multimodal": true } ```
+    multimodal: ?bool = null,
+};
+
+/// A unified configuration for a generative AI provider.
+pub const GeneratorConfig = struct {
+    /// The Google Cloud project ID.
+    project_id: ?[]const u8 = null,
+    /// The Google Cloud location (e.g., 'us-central1').
+    location: ?[]const u8 = null,
+    /// The name of the generative model to use.
+    model: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+    /// The Google API key.
+    api_key: ?[]const u8 = null,
+    /// The URL of the Google API endpoint.
+    url: ?[]const u8 = null,
+    /// Path to service account JSON key file.
+    credentials_path: ?[]const u8 = null,
+    /// HTTP response timeout in seconds for Ollama API calls.
+    timeout: ?i64 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// Penalty for token frequency (-2.0 to 2.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (-2.0 to 2.0).
+    presence_penalty: ?f32 = null,
+    /// Array of model identifiers for fallback routing. Either model or models must be provided.
+    models: ?[]const []const u8 = null,
+    /// The AWS region for the Bedrock service.
+    region: ?[]const u8 = null,
+    provider: GeneratorProvider,
+};
+
+/// Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults.
+pub const ChunkOptions = struct {
+    /// Maximum number of chunks to generate per document.
+    max_chunks: ?i64 = null,
+    /// Confidence threshold for model-based chunking (0.0-1.0).
+    threshold: ?f32 = null,
+    text: ?TextChunkOptions = null,
+    audio: ?AudioChunkOptions = null,
+};
+
+/// Field mapping to apply when a dynamic template matches
+pub const TemplateFieldMapping = struct {
+    type: ?AntflyType2 = null,
+    /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.
+    analyzer: ?[]const u8 = null,
+    /// Whether to index the field (default true)
+    index: ?bool = null,
+    /// Whether to store the field value (default false)
+    store: ?bool = null,
+    /// Whether to include in the _all field for cross-field search
+    include_in_all: ?bool = null,
+    /// Whether to enable doc values for sorting/faceting
+    doc_values: ?bool = null,
+};
+
+pub const TermQuery = struct {
+    term: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const MultiMatchBody = struct {
+    query: []const u8,
+    fields: []const []const u8,
+    type: []const u8,
+    boost: ?Boost = null,
+};
+
+pub const PrefixQuery = struct {
+    prefix: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const RegexpQuery = struct {
+    regexp: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const WildcardQuery = struct {
+    wildcard: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const QueryStringQuery = struct {
+    query: []const u8,
+    boost: ?Boost = null,
+};
+
+pub const NumericRangeQuery = struct {
+    min: ?f64 = null,
+    max: ?f64 = null,
+    inclusive_min: ?bool = null,
+    inclusive_max: ?bool = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const TermRangeQuery = struct {
+    min: ?[]const u8 = null,
+    max: ?[]const u8 = null,
+    inclusive_min: ?bool = null,
+    inclusive_max: ?bool = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const DateRangeStringQuery = struct {
+    start: ?[]const u8 = null,
+    end: ?[]const u8 = null,
+    inclusive_start: ?bool = null,
+    inclusive_end: ?bool = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+    datetime_parser: ?[]const u8 = null,
+};
+
+pub const MatchAllQuery = struct {
+    match_all: std.json.Value,
+    boost: ?Boost = null,
+};
+
+pub const MatchNoneQuery = struct {
+    match_none: std.json.Value,
+    boost: ?Boost = null,
+};
+
+pub const DocIdQuery = struct {
+    ids: []const []const u8,
+    boost: ?Boost = null,
+};
+
+pub const BoolFieldQuery = struct {
+    bool: bool,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const IPRangeQuery = struct {
+    cidr: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const GeoBoundingBoxQuery = struct {
+    /// [lon, lat]
+    top_left: []const f64,
+    /// [lon, lat]
+    bottom_right: []const f64,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const GeoDistanceQuery = struct {
+    /// [lon, lat]
+    location: []const f64,
+    distance: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const MatchQuery = struct {
+    match: []const u8,
+    field: ?[]const u8 = null,
+    analyzer: ?[]const u8 = null,
+    boost: ?Boost = null,
+    prefix_length: ?i32 = null,
+    fuzziness: ?Fuzziness = null,
+    operator: ?[]const u8 = null,
+};
+
+pub const MatchPhraseQuery = struct {
+    match_phrase: []const u8,
+    field: ?[]const u8 = null,
+    analyzer: ?[]const u8 = null,
+    boost: ?Boost = null,
+    fuzziness: ?Fuzziness = null,
+};
+
+pub const PhraseQuery = struct {
+    terms: []const []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+    fuzziness: ?Fuzziness = null,
+};
+
+pub const MultiPhraseQuery = struct {
+    terms: []const []const []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+    fuzziness: ?Fuzziness = null,
+};
+
+pub const FuzzyQuery = struct {
+    term: []const u8,
+    prefix_length: ?i32 = null,
+    fuzziness: ?Fuzziness = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const GeoBoundingPolygonQuery = struct {
+    polygon_points: []const GeoPoint,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const GeoShapeGeometry = struct {
+    shape: GeoShape,
+    relation: []const u8,
+};
+
+/// Statistics for an index
+pub const IndexStats = union(enum) {
+    full_text_index_stats: FullTextIndexStats,
+    embeddings_index_stats: EmbeddingsIndexStats,
+    graph_index_stats: GraphIndexStats,
+    algebraic_index_stats: AlgebraicIndexStats,
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("index_type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .full_text_index_stats = try std.json.parseFromValue(FullTextIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .embeddings_index_stats = try std.json.parseFromValue(EmbeddingsIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .graph_index_stats = try std.json.parseFromValue(GraphIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .algebraic_index_stats = try std.json.parseFromValue(AlgebraicIndexStats, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .full_text_index_stats => |v| try jw.write(v),
+            .embeddings_index_stats => |v| try jw.write(v),
+            .graph_index_stats => |v| try jw.write(v),
+            .algebraic_index_stats => |v| try jw.write(v),
+        }
+    }
+};
+
+/// A unified configuration for web search providers. Each provider has specific configuration requirements. Use the appropriate provider-specific config or set common options at the top level. **Environment Variables (fallbacks):** - GOOGLE_CSE_API_KEY, GOOGLE_CSE_ID - BING_SEARCH_API_KEY - SERPER_API_KEY - TAVILY_API_KEY - BRAVE_API_KEY
+pub const WebSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+};
+
+/// Configuration for URL content fetching. Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports: - HTTP/HTTPS URLs with security validation - HTML pages (extracts readable text via go-readability) - PDF files (extracts text) - Images (returns as data URIs) - Plain text files - S3 URLs (requires s3_credentials) Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig): - Allowed host whitelist - Private IP blocking (SSRF prevention) - Download size limits - Timeout controls
+pub const FetchConfig = struct {
+    /// S3 credentials for fetching S3 URLs. If not set, uses package-level defaults.
+    s3_credentials: ?Credentials = null,
+    /// Maximum content length in characters (truncated if exceeded)
+    max_content_length: ?i64 = null,
+    /// Whitelist of allowed hostnames for fetching. If empty, all hosts are allowed (except private IPs). Example: ["docs.example.com", "api.example.com"]
+    allowed_hosts: ?[]const []const u8 = null,
+    /// Block requests to private IP ranges (SSRF prevention). Blocked: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+    block_private_ips: ?bool = null,
+    /// Maximum download size in bytes (default: 100MB)
+    max_download_size_bytes: ?i64 = null,
+    /// Download timeout in seconds
+    timeout_seconds: ?i64 = null,
+};
+
+/// Image content in OpenAI-compatible format.
+pub const ImageURLContentPart = struct {
+    type: []const u8,
+    image_url: ImageURL,
+};
+
+/// Query classification and transformation result combining all query enhancements including strategy selection and semantic optimization
+pub const ClassificationTransformationResult = struct {
+    route_type: RouteType,
+    strategy: QueryStrategy,
+    semantic_mode: SemanticQueryMode,
+    /// Clarified query with added context for answer generation (human-readable)
+    improved_query: []const u8,
+    /// Optimized query for vector/semantic search. Content style depends on semantic_mode: keywords for 'rewrite', hypothetical answer for 'hypothetical'
+    semantic_query: []const u8,
+    /// Broader background query for context (only present when strategy is 'step_back')
+    step_back_query: ?[]const u8 = null,
+    /// Decomposed sub-questions (only present when strategy is 'decompose')
+    sub_questions: ?[]const []const u8 = null,
+    /// Alternative phrasings of the query for expanded retrieval coverage
+    multi_phrases: ?[]const []const u8 = null,
+    /// Pre-retrieval reasoning explaining query analysis and strategy selection (only present when with_classification_reasoning is enabled)
+    reasoning: ?[]const u8 = null,
+    /// Classification confidence (0.0 to 1.0)
+    confidence: f32,
+};
+
+/// Scores organized by category
+pub const EvalScores = struct {
+    /// Retrieval metric scores (recall, precision, ndcg, etc.)
+    retrieval: ?std.json.ArrayHashMap(EvaluatorScore) = null,
+    /// Generation quality scores (faithfulness, relevance, etc.)
+    generation: ?std.json.ArrayHashMap(EvaluatorScore) = null,
+};
+
+/// Result merge statistics for hybrid search.
+pub const MergeProfile = struct {
+    /// Merge strategy that was used.
+    strategy: ?MergeStrategy = null,
+    /// Number of hits from full-text search before merge.
+    full_text_hits: ?i64 = null,
+    /// Number of hits from semantic search before merge.
+    semantic_hits: ?i64 = null,
+    /// Time spent merging results in milliseconds.
+    duration_ms: ?i64 = null,
+};
+
+/// Configuration for result fusion when combining multiple search indexes.
+pub const MergeConfig = struct {
+    strategy: ?MergeStrategy = null,
+    /// Named weights keyed by index name. `full_text` for the full-text search index; embedding index names for vector indexes. Unspecified indexes default to 1.0. Applied in both RRF and RSF.
+    weights: ?std.json.ArrayHashMap(f64) = null,
+    /// RSF normalization window size. Defaults to `limit`.
+    window_size: ?i64 = null,
+    /// RRF k constant (1/(k+rank)). Defaults to 60.0.
+    rank_constant: ?f64 = null,
+};
+
+/// A unified configuration for a reranking provider.
+pub const RerankerConfig = struct {
+    provider: RerankerProvider,
+    /// Field name to extract from documents for reranking.
+    field: ?[]const u8 = null,
+    /// Handlebars template to render document text for reranking.
+    template: ?[]const u8 = null,
+    /// The name of the reranking model (e.g., cross-encoder model name).
+    model: ?[]const u8 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    url: ?[]const u8 = null,
+    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
+    top_n: ?i64 = null,
+    /// Maximum number of chunks per document for long document handling.
+    max_chunks_per_doc: ?i64 = null,
+    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Path to service account JSON file. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    credentials_path: ?[]const u8 = null,
+};
+
+/// Defines how to select start/target nodes for graph queries
+pub const GraphNodeSelector = struct {
+    /// Explicit list of node keys
+    keys: ?[]const []const u8 = null,
+    /// Reference to search results to use as nodes: - "$full_text_results" - use full-text search results - "$embeddings_results.index_name" - use vector search results from specific index
+    result_ref: ?[]const u8 = null,
+    /// Maximum number of nodes to select from the referenced results
+    limit: ?i64 = null,
+    /// Filter which nodes to use as start/target
+    node_filter: ?NodeFilter = null,
+};
+
+/// Parameters for graph traversal and pathfinding
+pub const GraphQueryParams = struct {
+    /// Filter by edge types
+    edge_types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    /// Maximum traversal depth
+    max_depth: ?i64 = null,
+    /// Minimum edge weight
+    min_weight: ?f64 = null,
+    /// Maximum edge weight
+    max_weight: ?f64 = null,
+    /// Maximum number of results (traversal)
+    max_results: ?i64 = null,
+    /// Remove duplicate nodes (traversal)
+    deduplicate_nodes: ?bool = null,
+    /// Include path information (traversal)
+    include_paths: ?bool = null,
+    weight_mode: ?PathWeightMode = null,
+    /// Number of paths to find (k-shortest-paths)
+    k: ?i64 = null,
+    /// Filter which nodes to visit during traversal
+    node_filter: ?NodeFilter = null,
+    /// Graph algorithm to run (e.g., 'pagerank', 'betweenness')
+    algorithm: ?[]const u8 = null,
+    /// Parameters for the graph algorithm
+    algorithm_params: ?std.json.Value = null,
+};
+
+/// Image content for embedding (OpenAI-compatible format)
+pub const InferenceImageURLContentPart = struct {
+    type: []const u8,
+    image_url: InferenceImageURL,
+};
+
+/// Exactly one of `texts` or `images` must be provided. When using `images`, the server selects a compatible reader internally and processes the request as: read document text -> run structured extraction.
+pub const InferenceExtractRequest = struct {
+    /// Name of extractor model with 'extraction' capability
+    model: []const u8,
+    /// Texts to extract structured data from
+    texts: ?[]const []const u8 = null,
+    /// Optional images to extract structured data from. When provided, the server first reads document text with a compatible reader and then runs schema extraction on the read text.
+    images: ?[]const InferenceImageURL = null,
+    /// Optional read-stage prompt used only when `images` are provided. Passed through to the reader before schema extraction.
+    prompt: ?[]const u8 = null,
+    /// Maximum tokens for the read stage when `images` are provided. Ignored for text-only extraction requests.
+    max_tokens: ?i64 = null,
+    /// Extraction schema mapping structure names to field definitions. Each field is defined as "field_name::type" where type is "str" or "list". Optional choice fields: "field_name::[opt1|opt2]::str". If no type is specified, defaults to "str".
+    schema: std.json.ArrayHashMap([]const []const u8),
+    /// Score threshold for span extraction (0.0-1.0)
+    threshold: ?f32 = null,
+    /// If true, don't allow nested/overlapping entities
+    flat_ner: ?bool = null,
+    /// If true, include confidence scores in output
+    include_confidence: ?bool = null,
+    /// If true, include character offset spans in output
+    include_spans: ?bool = null,
+};
+
+pub const InferenceReadRequest = struct {
+    /// Name of reader model from models_dir/readers/
+    model: []const u8,
+    /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
+    images: []const InferenceImageURL,
+    /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
+    prompt: ?[]const u8 = null,
+    /// Maximum tokens to generate
+    max_tokens: ?i64 = null,
+};
+
+/// A single embedding result
+pub const InferenceEmbeddingObject = struct {
+    /// Object type, always "embedding"
+    object: []const u8,
+    /// Dense float vector for dense models, or a sparse vector object for sparse-capable models
+    embedding: ?std.json.Value = null,
+    /// Index of the input this embedding corresponds to
+    index: i64,
+};
+
+/// Audio chunking configuration for inference, including VAD options.
+pub const InferenceAudioChunkConfig = struct {
+    /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
+    window_duration_ms: ?i64 = null,
+    /// Overlap duration in milliseconds between audio chunks (default: 0).
+    overlap_duration_ms: ?i64 = null,
+    vad: ?InferenceVADOptions = null,
+};
+
+pub const InferenceRelation = struct {
+    /// The subject/head entity in the relationship
+    head: InferenceRecognizeEntity,
+    /// The object/tail entity in the relationship
+    tail: InferenceRecognizeEntity,
+    /// The relationship type
+    label: []const u8,
+    /// Confidence score for the relation (0.0 to 1.0)
+    score: f32,
+};
+
+pub const InferenceRecognizeRequest = struct {
+    /// Name of recognizer model from models_dir/recognizers/
+    model: []const u8,
+    /// Texts to extract entities from
+    texts: []const []const u8,
+    /// Custom entity labels to extract (GLiNER models only). When using a GLiNER model, you can specify any entity types to extract, enabling zero-shot NER without model retraining. If not provided, the model's default labels are used.
+    labels: ?[]const []const u8 = null,
+    /// Relation types to extract (for models with 'relations' capability). Only used when the model supports relation extraction (GLiNER multitask, REBEL). Relation extraction runs only when this array is provided and non-empty. GLiNER labels may be relation names (works_for), head-qualified labels (person::works_for), or head/tail-qualified labels (person::works_for::organization).
+    relation_labels: ?[]const []const u8 = null,
+    resolver: ?InferenceResolverConfig = null,
+};
+
+pub const InferenceClassifyObject = struct {
+    object: []const u8,
+    /// Original input text index.
+    index: i64,
+    /// Classification results for this input text.
+    classifications: []const InferenceClassifyResult,
+};
+
+pub const InferenceDocumentClassificationObject = struct {
+    object: []const u8,
+    index: i64,
+    checkpoint_path: []const u8,
+    prefix: []const u8,
+    input: std.json.Value,
+    features: InferenceDocumentClassificationFeatures,
+    best: ?std.json.Value = null,
+    scores: []const InferenceDocumentClassificationResult,
+};
+
+pub const InferenceDocumentTokenClassificationRequest = struct {
+    /// Name or path of the document token classification model directory or checkpoint
+    model: []const u8,
+    /// Labels in the same order expected by the checkpoint output head
+    labels: []const []const u8,
+    tokens: []const InferenceDocumentTokenBox,
+    /// Optional tensor prefix inside the safetensors checkpoint
+    prefix: ?[]const u8 = null,
+};
+
+pub const InferenceDocumentTokenClassificationPrediction = struct {
+    token_index: i64,
+    text: []const u8,
+    bbox: []const i64,
+    features: InferenceDocumentTokenClassificationFeatures,
+    best: ?std.json.Value = null,
+    scores: []const InferenceDocumentTokenClassificationResult,
+};
+
+pub const InferenceReadResult = struct {
+    /// Extracted text from the image
+    text: []const u8,
+    /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
+    fields: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
+    regions: ?[]const InferenceTextRegion = null,
+};
+
+pub const InferenceModelsResponse = struct {
+    /// Available chunking models (always includes "fixed")
+    chunkers: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available reranking models
+    rerankers: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available zero-shot classification models
+    classifiers: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available embedding models from models_dir/embedders/
+    embedders: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available extractor models (models with 'extraction' capability)
+    extractors: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available generator/LLM models from models_dir/generators/
+    generators: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available recognizer models from models_dir/recognizers/
+    recognizers: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available Seq2Seq rewriter models from models_dir/rewriters/
+    rewriters: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available reader/OCR models from models_dir/readers/
+    readers: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available transcriber/speech-to-text models from models_dir/transcribers/
+    transcribers: std.json.ArrayHashMap(InferenceModelInfo),
+};
+
+/// A tool (function) that the model can call
+pub const InferenceTool = struct {
+    /// The type of tool (currently only "function" is supported)
+    type: []const u8,
+    function: InferenceFunctionDefinition,
+};
+
+/// A tool call made by the model
+pub const InferenceToolCall = struct {
+    /// Unique identifier for this tool call
+    id: []const u8,
+    /// The type of tool call (currently only "function")
+    type: []const u8,
+    function: InferenceToolCallFunction,
+};
+
+pub const InferenceGenerateResponseFormat = struct {
+    /// Structured output mode
+    type: []const u8,
+    /// Optional schema payload for `type=json_schema`. Enforced during native constrained decoding and validated after generation.
+    json_schema: ?InferenceGenerateJsonSchemaConfig = null,
+};
+
+pub const InferenceRerankResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Rerank score objects, one per input prompt.
+    data: []const InferenceRerankObject,
+    /// Name of model used for reranking
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+pub const InferenceRewriteResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Rewritten text objects, one per input.
+    data: []const InferenceRewriteObject,
+    /// Name of model used for rewriting
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+pub const InferenceExtractResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Extraction result objects, one per input.
+    data: []const InferenceExtractObject,
+    /// Name of model used for extraction
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+pub const InferenceTranscribeResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Transcription result objects.
+    data: []const InferenceTranscribeObject,
+    /// Name of model used for transcription
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+/// Incremental tool call data for streaming
+pub const InferenceToolCallDelta = struct {
+    /// Index of the tool call in the array
+    index: ?i64 = null,
+    /// Unique identifier (only in first delta for this index)
+    id: ?[]const u8 = null,
+    /// The type of tool call (only in first delta)
+    type: ?[]const u8 = null,
+    function: ?InferenceToolCallFunctionDelta = null,
+};
+
+/// A chunk of content. Text chunks have mime_type text/plain.
+pub const InferenceChunk = struct {
+    /// The chunk text content
+    text: ?[]const u8 = null,
+    /// Character position in original text where chunk starts
+    start_char: ?i64 = null,
+    /// Character position in original text where chunk ends (exclusive)
+    end_char: ?i64 = null,
+    /// Base64-encoded binary data (valid WAV, PNG, etc.)
+    data: ?[]const u8 = null,
+    /// Audio: window start time in milliseconds
+    start_time_ms: ?f32 = null,
+    /// Audio: window end time in milliseconds
+    end_time_ms: ?f32 = null,
+    /// Animation: frame number
+    frame_index: ?i64 = null,
+    /// Animation: display delay in milliseconds
+    frame_delay_ms: ?i64 = null,
+    /// Sequence number of the chunk (0, 1, 2, ...)
+    id: i64,
+    /// MIME type: text/plain, audio/wav, image/png, etc.
+    mime_type: []const u8,
+};
+
+/// Logging configuration for inference services
+pub const InferenceschemasConfig = struct {
+    level: ?InferenceLevel = null,
+    style: ?InferenceStyle = null,
 };
 
 pub const ClusterTopology = struct {
@@ -1783,113 +4414,37 @@ pub const TransactionSessionCommitResponse = struct {
 
 pub const SSEStepCompleted = AgentStep;
 
-/// Result from the retrieval agent
-pub const RetrievalAgentResult = struct {
-    /// Unique response ID for logging and tracing
-    id: ?[]const u8 = null,
-    /// LLM model used for generation
-    model: ?[]const u8 = null,
-    /// Unix timestamp (seconds) when the response was created
-    created_at: ?i64 = null,
-    /// Current status of the bounded agent execution
-    status: AgentStatus,
-    /// Present when status is "incomplete" — explains why
-    incomplete_details: ?IncompleteDetails = null,
-    /// Token usage and resource statistics from this execution
-    usage: ?RetrievalAgentUsage = null,
-    /// Retrieved query hits
-    hits: []const QueryHit,
-    /// Shared bounded-agent execution trace for this retrieval run.
-    steps: ?[]const AgentStep = null,
-    /// Primary strategy that was used (optional in agentic mode)
-    strategy_used: ?RetrievalStrategy = null,
-    /// Correlation identifier for client-carried continuation.
-    session_id: ?[]const u8 = null,
-    /// Current internal iteration count for this bounded session.
-    iteration: ?i64 = null,
-    /// Number of user clarification turns already consumed in this session.
-    clarification_count: ?i64 = null,
-    /// Remaining internal reasoning/tool-use iterations for this session.
-    remaining_internal_iterations: ?i64 = null,
-    /// Remaining clarification turns allowed for this session.
-    remaining_user_clarifications: ?i64 = null,
-    /// Clarification questions exposed in the shared bounded-agent envelope.
-    questions: ?[]const AgentQuestion = null,
-    /// Filters that were applied during retrieval
-    applied_filters: ?[]const antfly_ai_openapi.FilterSpec = null,
-    /// Total number of tool calls made during retrieval
-    tool_calls_made: ?i64 = null,
-    /// Optional conversational context including tool calls and responses. Decisions remain the authoritative continuation input for bounded agent interactions.
-    messages: ?[]const antfly_generating_openapi.ChatMessage = null,
-    /// Query classification and transformation result. Present when steps.classification was configured. Includes strategy, semantic_query, sub_questions (decompose), step_back_query, and reasoning.
-    classification: ?antfly_ai_openapi.ClassificationTransformationResult = null,
-    /// Generated response in markdown format. Present when steps.generation was configured.
-    generation: ?[]const u8 = null,
-    /// Confidence in the generated response (requires steps.confidence)
-    generation_confidence: ?f32 = null,
-    /// Relevance of retrieved documents to the query (requires steps.confidence)
-    context_relevance: ?f32 = null,
-    /// Suggested follow-up questions (requires steps.followup)
-    followup_questions: ?[]const []const u8 = null,
-    /// Evaluation results when steps.eval was configured
-    eval_result: ?antfly_eval_openapi.EvalResult = null,
+pub const TraverseResponse = struct {
+    results: ?[]const TraversalResult = null,
+    /// Total number of results
+    count: ?i64 = null,
 };
 
-/// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
-pub const JoinClause = struct {
-    /// Name of the table to join with.
-    right_table: []const u8,
-    /// Type of join to perform. Defaults to "inner".
-    join_type: ?JoinType = null,
-    /// Join condition specifying which fields to match.
-    on: JoinCondition,
-    /// Optional filters to apply to the right table before joining. Use to reduce the amount of data being joined.
-    right_filters: ?JoinFilters = null,
-    /// Fields to include from the right table in the result. If not specified, all fields from the right table are included. Fields are prefixed with the right table name in the result.
-    right_fields: ?[]const []const u8 = null,
-    /// Optional hint for which join strategy to use. If not specified, the planner automatically selects based on table statistics.
-    strategy_hint: ?JoinStrategy = null,
-    /// Optional nested join for multi-way joins. The nested join operates on the result of the current join.
-    nested_join: ?std.json.Value = null,
+/// A step in a graph pattern query
+pub const PatternStep = struct {
+    /// Name for this node (reuse alias for cycle detection)
+    alias: ?[]const u8 = null,
+    /// Filter constraints for nodes at this step
+    node_filter: ?NodeFilter = null,
+    /// Edge to traverse to reach this step (null for first step)
+    edge: ?PatternEdgeStep = null,
 };
 
-/// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
-pub const QueryProfile = struct {
-    /// Shard-level execution statistics.
-    shards: ?ShardsProfile = null,
-    /// Join execution statistics (present when query used a join).
-    join: ?JoinProfile = null,
-    /// Reranking statistics (present when a reranker was used).
-    reranker: ?RerankerProfile = null,
-    /// Result merge statistics (present for hybrid search).
-    merge: ?MergeProfile = null,
+pub const PathFindResult = struct {
+    paths: ?[]const Path = null,
+    source: ?[]const u8 = null,
+    target: ?[]const u8 = null,
+    weight_mode: ?PathFindWeightMode = null,
+    paths_found: ?i64 = null,
+    search_time_ms: ?f64 = null,
 };
 
-pub const ReplicationSource = struct {
-    /// Type of the replication source. Currently only "postgres" is supported.
-    type: []const u8,
-    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables. Requires `wal_level=logical` on the source.
-    dsn: []const u8,
-    /// Name of the table in the PostgreSQL database to replicate from.
-    postgres_table: []const u8,
-    /// Template for constructing the Antfly document key from PG columns. A plain string (e.g., "id") uses that column's value directly. Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
-    key_template: ?[]const u8 = null,
-    /// PostgreSQL replication slot name. If omitted, auto-derived from the Antfly table and PG table names. Specify this when using pre-created slots (e.g., on Supabase or Neon).
-    slot_name: ?[]const u8 = null,
-    /// PostgreSQL publication name. If omitted, auto-derived and created automatically. Specify this when using pre-created publications.
-    publication_name: ?[]const u8 = null,
-    /// Transform operations applied on INSERT/UPDATE events. Values can reference PG columns via `{{column}}` syntax. If omitted, auto-generates `$set` for every column (passthrough mode).
-    on_update: ?[]const ReplicationTransformOp = null,
-    /// Transform operations applied on DELETE events. If omitted, auto-derives `$unset` ops from `on_update`'s `$set` paths (safe for multi-source). Use `$delete_document` op to delete the entire Antfly document.
-    on_delete: ?[]const ReplicationTransformOp = null,
-    /// Bleve-style filter query that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
-    publication_filter: ?std.json.Value = null,
-    /// Conditional routes for fan-out replication. Each route evaluates its `where` filter against every CDC row and, on match, writes to the specified `target_table`. Multiple routes can match the same row. When routes are present, the top-level `on_update`/`on_delete` are ignored — each route defines its own transforms.
-    routes: ?[]const ReplicationRoute = null,
-    /// When true, indicates this source was reseeded with exact cutover mode and must replay from a consistent snapshot before streaming.
-    require_exact_cutover: ?bool = null,
-    status: ?ReplicationSourceStatus = null,
-    action_hint: ?ReplicationSourceActionHint = null,
+/// A single match from a pattern query
+pub const PatternMatch = struct {
+    /// Map of alias to matched node
+    bindings: ?std.json.ArrayHashMap(GraphResultNode) = null,
+    /// Edges traversed in this match
+    path: ?[]const PathEdge = null,
 };
 
 pub const CreateUserRequest = struct {
@@ -1932,6 +4487,561 @@ pub const CreateApiKeyRequest = struct {
     row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
 };
 
+pub const QueryBuilderRequest = struct {
+    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
+    session_id: ?[]const u8 = null,
+    /// Structured answers provided by the user as part of client-carried continuation.
+    decisions: ?[]const AgentDecision = null,
+    /// If true, the agent may return clarification questions when needed.
+    interactive: ?bool = null,
+    /// Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting.
+    max_internal_iterations: ?i64 = null,
+    /// Maximum number of clarification turns the agent may request from the user.
+    max_user_clarifications: ?i64 = null,
+    /// Force a user-facing decision after this many unresolved internal passes.
+    require_decision_after: ?i64 = null,
+    /// Optional example documents to help the query builder infer field shapes and representative values. When omitted and the table has data but no schema, the server samples up to one document automatically.
+    example_documents: ?[]const std.json.Value = null,
+    /// Name of the table to build query for. If provided, uses table schema for field context.
+    table: ?[]const u8 = null,
+    /// Natural language description of the search intent
+    intent: []const u8,
+    /// List of searchable field names to consider. Overrides table schema if provided.
+    schema_fields: ?[]const []const u8 = null,
+    /// Optional strategy hint for the coordinator. Suggested values are `auto`, `full_text`, `semantic`, `hybrid`, `filter`, `tree`, and `graph`. Unknown values are accepted for forward compatibility and may fall back to `auto`.
+    mode: ?[]const u8 = null,
+    /// Preferred output artifact. Suggested values are `query_request`, `bleve`, and `filter_query`. The compatibility `query` field is still returned for existing clients.
+    output: ?[]const u8 = null,
+    /// Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`, `prefer_indexes`, and `require_executable`.
+    constraints: ?std.json.Value = null,
+    generator: ?GeneratorConfig = null,
+};
+
+/// Configuration for graph index type
+pub const GraphIndexConfig = struct {
+    /// Configuration for generating node summaries (enables tree navigation in AnswerAgent)
+    summarizer: ?GeneratorConfig = null,
+    /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
+    template: ?[]const u8 = null,
+    /// List of edge types with their configurations
+    edge_types: ?[]const EdgeTypeConfig = null,
+    /// Maximum number of edges per document (0 = unlimited)
+    max_edges_per_document: ?i64 = null,
+};
+
+/// A single link in a generator chain with optional retry and condition
+pub const ChainLink = struct {
+    generator: GeneratorConfig,
+    /// Retry configuration for this generator
+    retry: ?RetryConfig = null,
+    /// When to try the next generator in chain
+    condition: ?ChainCondition = null,
+};
+
+/// Configuration for inline evaluation of query results. Add to RAGRequest, QueryRequest, or AnswerAgentRequest.
+pub const EvalConfig = struct {
+    /// List of evaluators to run
+    evaluators: ?[]const EvaluatorName = null,
+    /// LLM configuration for judge-based evaluators. Falls back to default if not specified.
+    judge: ?GeneratorConfig = null,
+    /// Ground truth data for retrieval metrics
+    ground_truth: ?GroundTruth = null,
+    /// Evaluation options (k, thresholds, etc.)
+    options: ?EvalOptions = null,
+};
+
+/// Standalone evaluation request for POST /eval endpoint. Useful for testing evaluators without running a query.
+pub const EvalRequest = struct {
+    /// List of evaluators to run
+    evaluators: []const EvaluatorName,
+    /// LLM configuration for judge-based evaluators
+    judge: ?GeneratorConfig = null,
+    /// Ground truth data
+    ground_truth: ?GroundTruth = null,
+    /// Evaluation options
+    options: ?EvalOptions = null,
+    /// Original query/input to evaluate
+    query: ?[]const u8 = null,
+    /// Generated output to evaluate (optional for retrieval-only)
+    output: ?[]const u8 = null,
+    /// Retrieved documents/context
+    context: ?[]const std.json.Value = null,
+    /// IDs of retrieved documents (for retrieval metrics)
+    retrieved_ids: ?[]const []const u8 = null,
+};
+
+/// Configuration for the Antfly inference chunking provider. Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching. The model name maps to ONNX model directory names (similar to how Ollama works). **Chunking Models:** - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required) - Any other name will attempt to load from models/chunkers/{name}/ directory **Caching:** - L1: Memory cache with 2-minute TTL - L2: Persistent Pebble database - Singleflight deduplication for concurrent identical requests
+pub const AntflyChunkerConfig = struct {
+    /// Maximum number of chunks to generate per document.
+    max_chunks: ?i64 = null,
+    /// Confidence threshold for model-based chunking (0.0-1.0).
+    threshold: ?f32 = null,
+    text: ?TextChunkOptions = null,
+    audio: ?AudioChunkOptions = null,
+    /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    model: []const u8,
+};
+
+/// A rule for mapping dynamically detected fields. Templates are checked in order and the first matching template's mapping is used.
+pub const DynamicTemplate = struct {
+    /// Optional identifier for the template (useful for debugging)
+    name: ?[]const u8 = null,
+    /// Glob pattern for field name (last path element). Supports * and ** wildcards. Example: "*_text" matches "title_text", "body_text"
+    match: ?[]const u8 = null,
+    /// Exclusion pattern for field name. If it matches, the template is skipped. Example: "skip_*" would exclude fields like "skip_this"
+    unmatch: ?[]const u8 = null,
+    /// Glob pattern for the full dotted path. Supports ** for matching multiple segments. Example: "metadata.**" matches "metadata.author", "metadata.tags.primary"
+    path_match: ?[]const u8 = null,
+    /// Path exclusion pattern. If it matches the full path, the template is skipped.
+    path_unmatch: ?[]const u8 = null,
+    /// Filter by detected JSON type
+    match_mapping_type: ?[]const u8 = null,
+    mapping: ?TemplateFieldMapping = null,
+};
+
+pub const MultiMatchQuery = struct {
+    multi_match: MultiMatchBody,
+};
+
+pub const GeoShapeQuery = struct {
+    geometry: GeoShapeGeometry,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+/// Configuration for Google Custom Search API. Requires a Custom Search Engine (CSE) to be configured in Google Cloud Console. **Setup:** 1. Create a project at https://console.cloud.google.com 2. Enable Custom Search API 3. Create a Custom Search Engine at https://cse.google.com 4. Get API key and CSE ID **Docs:** https://developers.google.com/custom-search/v1/overview
+pub const GoogleSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Google API key (or set GOOGLE_CSE_API_KEY env var)
+    api_key: ?[]const u8 = null,
+    /// Custom Search Engine ID (or set GOOGLE_CSE_ID env var)
+    cse_id: ?[]const u8 = null,
+    /// Type of search to perform
+    search_type: ?[]const u8 = null,
+    /// Restrict results by date (e.g., 'd7' for last 7 days, 'm1' for last month)
+    date_restrict: ?[]const u8 = null,
+};
+
+/// Configuration for Microsoft Bing Web Search API. **Setup:** 1. Create Azure account at https://portal.azure.com 2. Create a Bing Search resource 3. Get API key from resource keys **Docs:** https://docs.microsoft.com/en-us/bing/search-apis/bing-web-search/overview
+pub const BingSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Bing Search API key (or set BING_SEARCH_API_KEY env var)
+    api_key: ?[]const u8 = null,
+    /// Bing API endpoint URL
+    endpoint: ?[]const u8 = null,
+    /// Filter results by freshness
+    freshness: ?[]const u8 = null,
+};
+
+/// Configuration for Serper.dev Google Search API. Serper provides a simpler alternative to Google Custom Search with competitive pricing and easy setup. **Setup:** 1. Sign up at https://serper.dev 2. Get API key from dashboard **Docs:** https://serper.dev/docs
+pub const SerperSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Serper API key (or set SERPER_API_KEY env var)
+    api_key: ?[]const u8 = null,
+    /// Type of search to perform
+    search_type: ?[]const u8 = null,
+    /// Time period filter: d=day, w=week, m=month, y=year
+    time_period: ?[]const u8 = null,
+};
+
+/// Configuration for Tavily AI Search API. Tavily is optimized for RAG and AI applications, providing pre-processed results with summaries and relevance scoring. **Setup:** 1. Sign up at https://tavily.com 2. Get API key from dashboard **Docs:** https://docs.tavily.com
+pub const TavilySearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Tavily API key (or set TAVILY_API_KEY env var)
+    api_key: ?[]const u8 = null,
+    /// Search depth: - basic: Fast search with standard results - advanced: Deeper search with more comprehensive results
+    search_depth: ?[]const u8 = null,
+    /// Include AI-generated answer summary
+    include_answer: ?bool = null,
+    /// Include raw HTML content of pages
+    include_raw_content: ?bool = null,
+    /// Only include results from these domains
+    include_domains: ?[]const []const u8 = null,
+    /// Exclude results from these domains
+    exclude_domains: ?[]const []const u8 = null,
+};
+
+/// Configuration for Brave Search API. Brave Search provides privacy-focused search with its own independent index. **Setup:** 1. Sign up at https://brave.com/search/api/ 2. Get API key from dashboard **Docs:** https://api.search.brave.com/app/documentation
+pub const BraveSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Brave Search API key (or set BRAVE_API_KEY env var)
+    api_key: ?[]const u8 = null,
+    /// Freshness filter: pd=day, pw=week, pm=month, py=year
+    freshness: ?[]const u8 = null,
+    /// Include text decorations (bold, italic markers)
+    text_decorations: ?bool = null,
+    /// Enable spellcheck suggestions
+    spellcheck: ?bool = null,
+};
+
+/// Configuration for DuckDuckGo Instant Answer API. DuckDuckGo provides limited free search without requiring an API key. Best for simple queries; may not return results for all searches. **Note:** This uses the Instant Answer API which has limitations. For production use, consider other providers. **Docs:** https://duckduckgo.com/api
+pub const DuckDuckGoSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Skip HTTP redirect for bang queries
+    no_redirect: ?bool = null,
+    /// Remove HTML from results
+    no_html: ?bool = null,
+};
+
+/// Configuration for chat agent tools. If `enabled_tools` is empty/omitted, defaults to: add_filter, ask_clarification, search. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
+pub const ChatToolsConfig = struct {
+    /// List of tools to enable. If empty, defaults to filter, clarification, and search.
+    enabled_tools: ?[]const ChatToolName = null,
+    /// Web search provider configuration. Required when websearch tool is enabled. See specs/openapi/antfly/websearch.yaml for provider-specific options.
+    websearch_config: ?WebSearchConfig = null,
+    /// URL fetching configuration. See specs/openapi/antfly/websearch.yaml for available options and security controls.
+    fetch_config: ?FetchConfig = null,
+    /// Maximum number of tool call iterations per turn. Prevents infinite loops in tool execution.
+    max_tool_iterations: ?i64 = null,
+};
+
+/// A content part for multimodal input (text, image URL, or inline media).
+pub const ContentPart = union(enum) {
+    media_content_part: *MediaContentPart,
+    image_url_content_part: *ImageURLContentPart,
+    text_content_part: *TextContentPart,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed.value;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "data",
+            "mime_type",
+        })) {
+            if (try parseStructuralVariant(MediaContentPart, allocator, source, options)) |parsed| return .{ .media_content_part = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "image_url",
+        })) {
+            if (try parseStructuralVariant(ImageURLContentPart, allocator, source, options)) |parsed| return .{ .image_url_content_part = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "text",
+        })) {
+            if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .media_content_part => |v| try jw.write(v.*),
+            .image_url_content_part => |v| try jw.write(v.*),
+            .text_content_part => |v| try jw.write(v.*),
+        }
+    }
+};
+
+/// Complete evaluation result
+pub const EvalResult = struct {
+    /// Scores organized by category
+    scores: ?EvalScores = null,
+    /// Aggregate statistics
+    summary: ?EvalSummary = null,
+    /// Total evaluation duration in milliseconds
+    duration_ms: ?i64 = null,
+};
+
+/// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
+pub const QueryProfile = struct {
+    /// Shard-level execution statistics.
+    shards: ?ShardsProfile = null,
+    /// Join execution statistics (present when query used a join).
+    join: ?JoinProfile = null,
+    /// Reranking statistics (present when a reranker was used).
+    reranker: ?RerankerProfile = null,
+    /// Result merge statistics (present for hybrid search).
+    merge: ?MergeProfile = null,
+};
+
+/// A content part for multimodal input (text, image URL, or inline media)
+pub const InferenceContentPart = union(enum) {
+    inference_media_content_part: *InferenceMediaContentPart,
+    inference_image_url_content_part: *InferenceImageURLContentPart,
+    inference_text_content_part: *InferenceTextContentPart,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed.value;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "data",
+            "mime_type",
+        })) {
+            if (try parseStructuralVariant(InferenceMediaContentPart, allocator, source, options)) |parsed| return .{ .inference_media_content_part = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "image_url",
+        })) {
+            if (try parseStructuralVariant(InferenceImageURLContentPart, allocator, source, options)) |parsed| return .{ .inference_image_url_content_part = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "text",
+        })) {
+            if (try parseStructuralVariant(InferenceTextContentPart, allocator, source, options)) |parsed| return .{ .inference_text_content_part = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .inference_media_content_part => |v| try jw.write(v.*),
+            .inference_image_url_content_part => |v| try jw.write(v.*),
+            .inference_text_content_part => |v| try jw.write(v.*),
+        }
+    }
+};
+
+/// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
+pub const InferenceEmbedResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// List of embedding objects
+    data: []const InferenceEmbeddingObject,
+    /// Model used for embedding generation
+    model: []const u8,
+    usage: InferenceEmbeddingUsage,
+};
+
+/// Configuration for chunking requests to Inference API. Combines shared text options with inference-specific audio/VAD options.
+pub const InferenceChunkConfig = struct {
+    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    model: ?[]const u8 = null,
+    /// Maximum number of chunks to generate per document.
+    max_chunks: ?i64 = null,
+    /// Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
+    threshold: ?f32 = null,
+    text: ?InferenceTextChunkOptions = null,
+    audio: ?InferenceAudioChunkConfig = null,
+};
+
+pub const InferenceRecognizeObject = struct {
+    object: []const u8,
+    /// Original input text index.
+    index: i64,
+    /// Entities recognized for this input text.
+    entities: []const InferenceRecognizeEntity,
+    /// Relations recognized for this input text. Only present when using a model with 'relations' capability (GLiNER multitask, REBEL).
+    relations: ?[]const InferenceRelation = null,
+};
+
+pub const InferenceClassifyResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Classification result objects, one per input text.
+    data: []const InferenceClassifyObject,
+    /// Name of model used for classification
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+pub const InferenceDocumentClassificationResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    data: []const InferenceDocumentClassificationObject,
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+pub const InferenceDocumentTokenClassificationObject = struct {
+    object: []const u8,
+    index: i64,
+    checkpoint_path: []const u8,
+    prefix: []const u8,
+    num_tokens: i64,
+    /// Each result is an array of ClassifyResult sorted by score descending.
+    predictions: []const InferenceDocumentTokenClassificationPrediction,
+};
+
+pub const InferenceReadObject = struct {
+    /// Extracted text from the image
+    text: []const u8,
+    /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
+    fields: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
+    regions: ?[]const InferenceTextRegion = null,
+    object: []const u8,
+    /// Original input image index.
+    index: i64,
+};
+
+pub const InferenceGenerateMessage = struct {
+    role: InferenceRole,
+    /// The generated message content (null when tool_calls is present)
+    content: ?[]const u8 = null,
+    /// Tool calls made by the model (only present when finish_reason is tool_calls)
+    tool_calls: ?[]const InferenceToolCall = null,
+};
+
+/// Delta content for streaming
+pub const InferenceGenerateDelta = struct {
+    role: ?InferenceRole = null,
+    /// Token content delta
+    content: ?[]const u8 = null,
+    /// Tool call deltas for streaming tool calls
+    tool_calls: ?[]const InferenceToolCallDelta = null,
+};
+
+/// A chunk result object. Text chunks have mime_type text/plain.
+pub const InferenceChunkObject = struct {
+    /// The chunk text content
+    text: ?[]const u8 = null,
+    /// Character position in original text where chunk starts
+    start_char: ?i64 = null,
+    /// Character position in original text where chunk ends (exclusive)
+    end_char: ?i64 = null,
+    /// Base64-encoded binary data (valid WAV, PNG, etc.)
+    data: ?[]const u8 = null,
+    /// Audio: window start time in milliseconds
+    start_time_ms: ?f32 = null,
+    /// Audio: window end time in milliseconds
+    end_time_ms: ?f32 = null,
+    /// Animation: frame number
+    frame_index: ?i64 = null,
+    /// Animation: display delay in milliseconds
+    frame_delay_ms: ?i64 = null,
+    /// Sequence number of the chunk (0, 1, 2, ...)
+    id: ?i64 = null,
+    /// MIME type: text/plain, audio/wav, image/png, etc.
+    mime_type: ?[]const u8 = null,
+    object: []const u8,
+    /// Position of this chunk object in the response data array.
+    index: i64,
+};
+
+pub const InferenceConfig = struct {
+    /// URL of the inference embedding/chunking service
+    api_url: []const u8,
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/recognizers/` - Recognition models (ONNX) - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+    models_dir: ?[]const u8 = null,
+    /// Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts.
+    content_security: ?InferenceContentSecurityConfig = null,
+    /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
+    s3_credentials: ?InferenceCredentials = null,
+    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading). Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading where all models are loaded at startup and never unloaded.
+    keep_alive: ?[]const u8 = null,
+    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
+    max_loaded_models: ?i64 = null,
+    /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
+    pool_size: ?i64 = null,
+    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Backends** (depend on build tags): - `go` - Pure Go inference (always available, CPU only, slowest) - `onnx` - ONNX Runtime (requires -tags="onnx,ORT", fastest) - `xla` - GoMLX XLA (requires -tags="xla,XLA", TPU/CUDA/CPU) **Devices**: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only **Examples**: - `["onnx", "xla", "go"]` - Try backends with auto device detection - `["onnx:cuda", "xla:tpu", "onnx:cpu", "go"]` - Prefer GPU, fall back to CPU - ` default: - onnx - xla - go
+    backend_priority: ?[]const []const u8 = null,
+    /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
+    max_concurrent_requests: ?i64 = null,
+    /// Maximum number of requests to queue when max_concurrent_requests is reached. When the queue is full, new requests receive 503 Service Unavailable with Retry-After header. Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+    max_queue_size: ?i64 = null,
+    /// Maximum time to wait for a request to complete, including queue wait time. Use Go duration format: "30s", "1m", "0" (no timeout, default). Requests exceeding this timeout receive 504 Gateway Timeout.
+    request_timeout: ?[]const u8 = null,
+    /// List of model names to preload at startup (Ollama-compatible). These models are loaded immediately when inference starts, avoiding first-request latency. Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5"). Only effective when keep_alive is non-zero (lazy loading mode).
+    preload: ?[]const []const u8 = null,
+    /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
+    max_memory_mb: ?i64 = null,
+    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup (as part of preload) - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
+    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
+    allow_downloads: ?bool = null,
+    log: ?InferenceschemasConfig = null,
+};
+
 /// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
 pub const BatchRequest = struct {
     /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
@@ -1943,94 +5053,42 @@ pub const BatchRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
-pub const QueryRequest = struct {
-    /// Name of the table to query. Optional for global queries.
-    table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
-    query: ?std.json.Value = null,
-    /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
-    full_text_search: ?std.json.Value = null,
-    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
-    semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
-    embedding_template: ?[]const u8 = null,
-    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
-    indexes: ?[]const []const u8 = null,
-    /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
-    filter_prefix: ?[]const u8 = null,
-    /// Antfly query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"`
-    filter_query: ?std.json.Value = null,
-    /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
-    exclusion_query: ?std.json.Value = null,
-    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
-    aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
-    /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
-    embeddings: ?std.json.ArrayHashMap(Embedding) = null,
-    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
-    search_effort: ?f32 = null,
-    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
+/// Declarative graph query to execute after full-text/vector searches
+pub const GraphQuery = struct {
+    type: GraphQueryType,
+    /// Graph index name (must be graph type)
+    index_name: []const u8,
+    /// Starting node(s) for the query
+    start_nodes: ?GraphNodeSelector = null,
+    /// Target nodes (for pathfinding only)
+    target_nodes: ?GraphNodeSelector = null,
+    /// Traversal/pathfinding parameters
+    params: ?GraphQueryParams = null,
+    /// Pattern steps for pattern query type
+    pattern: ?[]const PatternStep = null,
+    /// Which aliases to return from pattern query (empty = all)
+    return_aliases: ?[]const []const u8 = null,
+    /// Fetch full documents for graph results
+    include_documents: ?bool = null,
+    /// Include edge details for each node
+    include_edges: ?bool = null,
+    /// Which fields to return from documents
     fields: ?[]const []const u8 = null,
-    /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
-    limit: ?i64 = null,
-    /// Number of results to skip for pagination. Only available for full_text_search queries. Not supported for semantic_search due to vector index limitations.
-    offset: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
-    order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
-    search_after: ?[]const []const u8 = null,
-    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
-    search_before: ?[]const []const u8 = null,
-    /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
-    distance_under: ?f32 = null,
-    /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
-    distance_over: ?f32 = null,
-    /// Configuration for merging full-text and semantic search results. Only applies when both `full_text_search` and `semantic_search` are specified.
-    merge_config: ?antfly_indexes_openapi.MergeConfig = null,
-    /// If true, returns only the total count of matching documents without retrieving the actual documents. Useful for pagination and displaying result counts.
-    count: ?bool = null,
-    /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
-    profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
-    reranker: ?antfly_reranking_openapi.RerankerConfig = null,
-    analyses: ?Analyses = null,
-    /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
-    graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,
-    /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
-    expand_strategy: ?[]const u8 = null,
-    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
-    document_renderer: ?[]const u8 = null,
-    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
-    pruner: ?antfly_indexes_openapi.Pruner = null,
-    /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
-    join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
-    foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
 };
 
-pub const CreateTableRequest = struct {
-    /// Number of shards to create for the table. Data is partitioned across shards based on key ranges. **Sizing Guidelines:** - Small datasets (<100K docs): 1-3 shards - Medium datasets (100K-1M docs): 3-10 shards - Large datasets (>1M docs): 10+ shards More shards enable better parallelism but increase overhead. Choose based on expected data size and query patterns. **When to Add More Shards:** Antfly supports **online shard reallocation** without downtime. Add more shards when: - Individual shards exceed size thresholds (configurable) - Query latency increases due to large shard size - Need better parallelism for write-heavy workloads Use the internal `/reallocate` endpoint to trigger automatic shard splitting: ```bash POST /internal/v1/reallocate ``` This enqueues a reallocation request that the leader processes asynchronously, splitting large shards and redistributing data without service interruption. **Advantages over Elasticsearch:** - Automatic shard splitting (no manual reindexing required) - Online operation (no downtime) - Transparent to applications (keys remain accessible during reallocation)
-    num_shards: ?i64 = null,
-    /// Optional human-readable description of the table and its purpose. Useful for documentation and team collaboration.
-    description: ?[]const u8 = null,
-    /// Map of index name to index configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
-    indexes: ?std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig) = null,
-    /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
-    schema: ?antfly_schema_openapi.TableSchema = null,
-    /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
-    replication_sources: ?[]const ReplicationSource = null,
-};
-
-pub const Table = struct {
-    name: []const u8,
-    /// Optional description of the table.
-    description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig),
-    shards: std.json.ArrayHashMap(ShardConfig),
-    schema: ?antfly_schema_openapi.TableSchema = null,
-    /// Present only when the table is migrating between schema versions. Absent means the table is stable.
-    migration: ?TableMigration = null,
-    /// PostgreSQL CDC replication sources configured for this table.
-    replication_sources: ?[]const ReplicationSource = null,
+/// Results of a graph query
+pub const GraphQueryResult = struct {
+    type: GraphQueryType,
+    /// Result nodes
+    nodes: ?[]const GraphResultNode = null,
+    /// Result paths (for pathfinding queries)
+    paths: ?[]const Path = null,
+    /// Pattern matches (for pattern queries)
+    matches: ?[]const PatternMatch = null,
+    /// Total number of results
+    total: i64,
+    /// Query execution time
+    took: ?i64 = null,
 };
 
 /// API key creation response including the cleartext secret (shown once).
@@ -2055,6 +5113,186 @@ pub const ApiKeyWithSecret = struct {
     encoded: []const u8,
 };
 
+/// Configuration for the classification step. This step analyzes the query, selects the optimal retrieval strategy, and generates semantic transformations.
+pub const ClassificationStepConfig = struct {
+    /// Enable query classification and strategy selection
+    enabled: ?bool = null,
+    /// Generator to use for classification. If not specified, uses the default summarizer.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Include pre-retrieval reasoning explaining query analysis and strategy selection
+    with_reasoning: ?bool = null,
+    /// Override LLM strategy selection. If not set, the LLM chooses optimal strategy.
+    force_strategy: ?QueryStrategy = null,
+    /// Override semantic query mode selection.
+    force_semantic_mode: ?SemanticQueryMode = null,
+    /// Number of alternative query phrasings to generate
+    multi_phrase_count: ?i64 = null,
+};
+
+/// Configuration for the generation step. This step generates the final response from retrieved documents using the reasoning as context.
+pub const GenerationStepConfig = struct {
+    /// Enable generation from retrieved documents
+    enabled: ?bool = null,
+    /// Generator to use for generation. If not specified, uses the default summarizer.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Custom system prompt for answer generation
+    system_prompt: ?[]const u8 = null,
+    /// Custom guidance for generation tone, detail level, and style
+    generation_context: ?[]const u8 = null,
+};
+
+/// Configuration for generating follow-up questions. Uses a separate generator call which can use a cheaper/faster model.
+pub const FollowupStepConfig = struct {
+    /// Enable follow-up question generation
+    enabled: ?bool = null,
+    /// Generator for follow-up questions. If not specified, uses the answer step's generator.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Number of follow-up questions to generate
+    count: ?i64 = null,
+    /// Custom guidance for follow-up question focus and style
+    context: ?[]const u8 = null,
+};
+
+/// Configuration for confidence assessment. Evaluates answer quality and resource relevance. Can use a model calibrated for scoring tasks.
+pub const ConfidenceStepConfig = struct {
+    /// Enable confidence scoring
+    enabled: ?bool = null,
+    /// Generator for confidence assessment. If not specified, uses the answer step's generator.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Custom guidance for confidence assessment approach
+    context: ?[]const u8 = null,
+};
+
+/// A unified configuration for a chunking provider.
+pub const ChunkerConfig = struct {
+    /// Maximum number of chunks to generate per document.
+    max_chunks: ?i64 = null,
+    /// Confidence threshold for model-based chunking (0.0-1.0).
+    threshold: ?f32 = null,
+    text: ?TextChunkOptions = null,
+    audio: ?AudioChunkOptions = null,
+    /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    model: ?[]const u8 = null,
+    provider: ChunkerProvider,
+    /// Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
+    store_chunks: ?bool = null,
+    /// Configuration for full-text indexing of chunks in Bleve. When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field. When absent, chunks use :c: suffix and are only used for vector embeddings.
+    full_text_index: ?std.json.Value = null,
+};
+
+/// Schema definition for a table with multiple document types
+pub const TableSchema = struct {
+    /// Version of the schema. Used for migrations.
+    version: ?i64 = null,
+    /// Default type to use from the document_types.
+    default_type: ?[]const u8 = null,
+    /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
+    enforce_types: ?bool = null,
+    /// A map of type names to their document json schemas.
+    document_schemas: ?std.json.ArrayHashMap(DocumentSchema) = null,
+    /// The field containing the timestamp for TTL expiration (optional). Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
+    ttl_field: ?[]const u8 = null,
+    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses Go duration format (e.g., '24h', '7d', '168h').
+    ttl_duration: ?[]const u8 = null,
+    /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
+    dynamic_templates: ?[]const DynamicTemplate = null,
+};
+
+/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts: [{"type": "text", "text": "Hello"}]
+pub const ChatMessageContent = std.json.Value;
+
+/// OpenAI-compatible embedding request with inference multimodal content-part extension
+pub const InferenceEmbedRequest = struct {
+    /// Model name to use for embedding generation
+    model: []const u8,
+    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
+    input: std.json.Value,
+    /// Encoding format for the embeddings (only "float" supported)
+    encoding_format: ?[]const u8 = null,
+    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
+    dimensions: ?i64 = null,
+    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+    task_type: ?[]const u8 = null,
+    /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
+    input_type: ?[]const u8 = null,
+};
+
+/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
+pub const InferenceChatMessageContent = std.json.Value;
+
+pub const InferenceChunkRequest = struct {
+    /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` (backward compatible) - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
+    input: ?std.json.Value = null,
+    /// DEPRECATED: Use 'input' instead. Text to chunk.
+    text: ?[]const u8 = null,
+    config: ?InferenceChunkConfig = null,
+};
+
+pub const InferenceRecognizeResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Recognition result objects, one per input text.
+    data: []const InferenceRecognizeObject,
+    /// Name of model used for NER
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+pub const InferenceDocumentTokenClassificationResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    data: []const InferenceDocumentTokenClassificationObject,
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+pub const InferenceReadResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Read result objects, one per input image.
+    data: []const InferenceReadObject,
+    /// Name of model used for reading
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+pub const InferenceGenerateChoice = struct {
+    /// Index of this choice in the list
+    index: i64,
+    message: InferenceGenerateMessage,
+    finish_reason: InferenceFinishReason,
+    /// Log probability information (not supported, always null)
+    logprobs: ?std.json.Value = null,
+};
+
+pub const InferenceGenerateChunkChoice = struct {
+    index: i64,
+    delta: InferenceGenerateDelta,
+    finish_reason: ?InferenceFinishReason = null,
+};
+
+pub const InferenceChunkResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Array of chunk objects
+    data: []const InferenceChunkObject,
+    /// Chunking model actually used (may differ from requested if fallback occurred)
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+    /// Whether result was served from cache
+    cache_hit: bool,
+};
+
 /// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
 pub const MultiBatchRequest = struct {
     /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
@@ -2071,186 +5309,305 @@ pub const TransactionCommitRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
-/// A query in the retrieval pipeline. Extends QueryRequest with an optional tree search configuration. Each query specifies its own table. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
-pub const RetrievalQueryRequest = struct {
-    /// Name of the table to query. Optional for global queries.
-    table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
-    query: ?std.json.Value = null,
-    /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
-    full_text_search: ?std.json.Value = null,
-    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
-    semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
-    embedding_template: ?[]const u8 = null,
-    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
-    indexes: ?[]const []const u8 = null,
-    /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
-    filter_prefix: ?[]const u8 = null,
-    /// Antfly query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"`
-    filter_query: ?std.json.Value = null,
-    /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
-    exclusion_query: ?std.json.Value = null,
-    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
-    aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
-    /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
-    embeddings: ?std.json.ArrayHashMap(Embedding) = null,
-    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
-    search_effort: ?f32 = null,
-    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
-    fields: ?[]const []const u8 = null,
-    /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
-    limit: ?i64 = null,
-    /// Number of results to skip for pagination. Only available for full_text_search queries. Not supported for semantic_search due to vector index limitations.
-    offset: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
-    order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
-    search_after: ?[]const []const u8 = null,
-    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
-    search_before: ?[]const []const u8 = null,
-    /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
-    distance_under: ?f32 = null,
-    /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
-    distance_over: ?f32 = null,
-    /// Configuration for merging full-text and semantic search results. Only applies when both `full_text_search` and `semantic_search` are specified.
-    merge_config: ?antfly_indexes_openapi.MergeConfig = null,
-    /// If true, returns only the total count of matching documents without retrieving the actual documents. Useful for pagination and displaying result counts.
-    count: ?bool = null,
-    /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
-    profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
-    reranker: ?antfly_reranking_openapi.RerankerConfig = null,
-    analyses: ?Analyses = null,
-    /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
-    graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,
-    /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
-    expand_strategy: ?[]const u8 = null,
-    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
-    document_renderer: ?[]const u8 = null,
-    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
-    pruner: ?antfly_indexes_openapi.Pruner = null,
-    /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
-    join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
-    foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
-    /// Optional tree search configuration
-    tree_search: ?TreeSearchConfig = null,
+/// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
+pub const RetrievalAgentSteps = struct {
+    /// Tool configuration for the retrieval agent. Controls which tools are available and their settings. If not specified, tools are automatically determined from the table's available indexes.
+    tools: ?ChatToolsConfig = null,
+    /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
+    classification: ?ClassificationStepConfig = null,
+    /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
+    generation: ?GenerationStepConfig = null,
+    /// Configuration for generating follow-up questions. Requires steps.generation to be set.
+    followup: ?FollowupStepConfig = null,
+    /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
+    confidence: ?ConfidenceStepConfig = null,
+    /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
+    eval: ?EvalConfig = null,
 };
 
-/// DEPRECATED: Use RetrievalAgentRequest instead. Request for the answer agent. Accepts the old request format and internally delegates to the retrieval agent.
-pub const AnswerAgentRequest = struct {
-    /// User's natural language query
+/// DEPRECATED: Use RetrievalAgentSteps instead. Configuration for the answer agent's pipeline steps.
+pub const AnswerAgentSteps = struct {
+    /// Configuration for query classification and transformation.
+    classification: ?ClassificationStepConfig = null,
+    /// DEPRECATED: Use steps.generation on RetrievalAgentRequest instead. Configuration for answer generation from retrieved documents.
+    answer: ?GenerationStepConfig = null,
+    /// Configuration for generating follow-up questions.
+    followup: ?FollowupStepConfig = null,
+    /// Configuration for confidence assessment.
+    confidence: ?ConfidenceStepConfig = null,
+};
+
+/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
+pub const EmbeddingsIndexConfig = struct {
+    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
+    external: ?bool = null,
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    sparse: ?bool = null,
+    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    dimension: ?i64 = null,
+    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
+    field: ?[]const u8 = null,
+    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    /// Whether to use in-memory only storage (dense only)
+    mem_only: ?bool = null,
+    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
+    embedder: ?EmbedderConfig = null,
+    /// Configuration for the summarizer plugin (dense managed indexes only)
+    summarizer: ?GeneratorConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    chunker: ?ChunkerConfig = null,
+    /// Default number of results to return from search (sparse only)
+    top_k: ?i64 = null,
+    /// Minimum weight threshold for sparse vector entries (sparse only)
+    min_weight: ?f32 = null,
+    /// Number of documents per posting list chunk (sparse only)
+    chunk_size: ?i64 = null,
+};
+
+/// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
+pub const TableMigration = struct {
+    state: []const u8,
+    read_schema: TableSchema,
+};
+
+/// A message in a generation/chat conversation
+pub const ChatMessage = struct {
+    role: ChatMessageRole,
+    content: ChatMessageContent,
+    /// Tool calls made by the assistant (only for assistant role)
+    tool_calls: ?[]const ChatToolCall = null,
+    /// Results from tool executions (only for tool role)
+    tool_results: ?[]const ChatToolResult = null,
+};
+
+pub const InferenceRerankMultimodalDocument = struct {
+    /// Optional caller-provided document identifier
+    id: ?[]const u8 = null,
+    content: ChatMessageContent,
+};
+
+pub const InferenceChatMessage = struct {
+    role: InferenceRole,
+    content: ?ChatMessageContent = null,
+    /// Tool calls made by the assistant (only for role=assistant)
+    tool_calls: ?[]const InferenceToolCall = null,
+    /// ID of the tool call this message is responding to (only for role=tool)
+    tool_call_id: ?[]const u8 = null,
+};
+
+/// OpenAI-compatible chat completion response
+pub const InferenceGenerateResponse = struct {
+    /// A unique identifier for the chat completion
+    id: []const u8,
+    /// The object type, always "chat.completion"
+    object: []const u8,
+    /// Unix timestamp (seconds) when the completion was created
+    created: i64,
+    /// Model used for generation
+    model: []const u8,
+    /// List of completion choices (currently always 1)
+    choices: []const InferenceGenerateChoice,
+    usage: InferenceGenerateUsage,
+};
+
+/// Streaming generation chunk (SSE event data)
+pub const InferenceGenerateChunk = struct {
+    id: []const u8,
+    object: []const u8,
+    created: i64,
+    model: []const u8,
+    choices: []const InferenceGenerateChunkChoice,
+};
+
+/// Configuration for an index
+pub const IndexConfig = struct {
+    /// Name of the index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    type: IndexType,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// List of enrichment names to apply to documents before indexing. Enrichments must be defined at the table level.
+    enrichments: ?[]const []const u8 = null,
+};
+
+/// Result from the retrieval agent
+pub const RetrievalAgentResult = struct {
+    /// Unique response ID for logging and tracing
+    id: ?[]const u8 = null,
+    /// LLM model used for generation
+    model: ?[]const u8 = null,
+    /// Unix timestamp (seconds) when the response was created
+    created_at: ?i64 = null,
+    /// Current status of the bounded agent execution
+    status: AgentStatus,
+    /// Present when status is "incomplete" — explains why
+    incomplete_details: ?IncompleteDetails = null,
+    /// Token usage and resource statistics from this execution
+    usage: ?RetrievalAgentUsage = null,
+    /// Retrieved query hits
+    hits: []const QueryHit,
+    /// Shared bounded-agent execution trace for this retrieval run.
+    steps: ?[]const AgentStep = null,
+    /// Primary strategy that was used (optional in agentic mode)
+    strategy_used: ?RetrievalStrategy = null,
+    /// Correlation identifier for client-carried continuation.
+    session_id: ?[]const u8 = null,
+    /// Current internal iteration count for this bounded session.
+    iteration: ?i64 = null,
+    /// Number of user clarification turns already consumed in this session.
+    clarification_count: ?i64 = null,
+    /// Remaining internal reasoning/tool-use iterations for this session.
+    remaining_internal_iterations: ?i64 = null,
+    /// Remaining clarification turns allowed for this session.
+    remaining_user_clarifications: ?i64 = null,
+    /// Clarification questions exposed in the shared bounded-agent envelope.
+    questions: ?[]const AgentQuestion = null,
+    /// Filters that were applied during retrieval
+    applied_filters: ?[]const FilterSpec = null,
+    /// Total number of tool calls made during retrieval
+    tool_calls_made: ?i64 = null,
+    /// Optional conversational context including tool calls and responses. Decisions remain the authoritative continuation input for bounded agent interactions.
+    messages: ?[]const ChatMessage = null,
+    /// Query classification and transformation result. Present when steps.classification was configured. Includes strategy, semantic_query, sub_questions (decompose), step_back_query, and reasoning.
+    classification: ?ClassificationTransformationResult = null,
+    /// Generated response in markdown format. Present when steps.generation was configured.
+    generation: ?[]const u8 = null,
+    /// Confidence in the generated response (requires steps.confidence)
+    generation_confidence: ?f32 = null,
+    /// Relevance of retrieved documents to the query (requires steps.confidence)
+    context_relevance: ?f32 = null,
+    /// Suggested follow-up questions (requires steps.followup)
+    followup_questions: ?[]const []const u8 = null,
+    /// Evaluation results when steps.eval was configured
+    eval_result: ?EvalResult = null,
+};
+
+pub const InferenceRerankMultimodalRequest = struct {
+    /// Name of multimodal reranking model from models_dir/rerankers/
+    model: []const u8,
+    /// Text query for relevance scoring
     query: []const u8,
-    /// Queries to execute. Each query specifies its own table.
-    queries: []const QueryRequest,
-    /// DEPRECATED: Use stream on RetrievalAgentRequest instead. Enable SSE streaming vs JSON response.
-    with_streaming: ?bool = null,
-    /// Generator for LLM calls
-    generator: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// Chain of generators
-    chain: ?[]const antfly_generating_openapi.ChainLink = null,
-    /// Domain-specific knowledge for the agent
-    agent_knowledge: ?[]const u8 = null,
-    /// Maximum tokens for document context
-    max_context_tokens: ?i64 = null,
-    /// Tokens to reserve for overhead
-    reserve_tokens: ?i64 = null,
-    /// Step configuration
-    steps: ?AnswerAgentSteps = null,
-    /// DEPRECATED: Use steps.eval on RetrievalAgentRequest instead. Evaluation configuration (moved to steps.eval in new API).
-    eval: ?antfly_eval_openapi.EvalConfig = null,
-    /// DEPRECATED: Omit steps.generation on RetrievalAgentRequest instead. If true, skip the generation step.
-    without_generation: ?bool = null,
+    /// Documents expressed as text and image content parts
+    documents: []const InferenceRerankMultimodalDocument,
 };
 
-pub const TableStatus = struct {
+pub const InferenceGenerateRequest = struct {
+    /// Name of the generator model from models_dir/generators/
+    model: []const u8,
+    /// Conversation messages (OpenAI-compatible format)
+    messages: []const InferenceChatMessage,
+    /// Maximum tokens to generate
+    max_tokens: ?i64 = null,
+    /// Sampling temperature (0.0 = deterministic, higher = more random)
+    temperature: ?f32 = null,
+    /// Nucleus sampling probability
+    top_p: ?f32 = null,
+    /// Top-k sampling (inference extension, not in OpenAI API)
+    top_k: ?i64 = null,
+    /// If true, partial message deltas will be sent as SSE events
+    stream: ?bool = null,
+    /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
+    tools: ?[]const InferenceTool = null,
+    /// Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to top_p.
+    min_p: ?f32 = null,
+    /// Repetition penalty factor applied to previously generated tokens (1.0 = disabled, >1.0 penalizes, <1.0 encourages)
+    repetition_penalty: ?f32 = null,
+    /// Additive penalty based on token frequency in context (logit -= frequency_penalty * count)
+    frequency_penalty: ?f32 = null,
+    /// Additive penalty for tokens that appeared at all in context (logit -= presence_penalty if count > 0)
+    presence_penalty: ?f32 = null,
+    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+    response_format: ?InferenceGenerateResponseFormat = null,
+    /// inference-native grammar override. When set, this takes precedence over `response_format`. Grammar-constrained decoding is currently native-backend only.
+    grammar: ?[]const u8 = null,
+    /// inference-native speculative decoding extension. Path or model identifier for a smaller draft model.
+    draft_model: ?[]const u8 = null,
+    /// inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
+    speculative_k: ?i64 = null,
+    /// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
+    cache_dtype: ?[]const u8 = null,
+    /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+    cache_compaction_ratio: ?f32 = null,
+    /// Optional backend override for this request. `auto` keeps the node default behavior. `onnx` forces ONNX generation when the model/package supports it. `native`, `metal`, and `mlx` force the native host backend choice. `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and requires a PJRT plugin path via `TERMITE_XLA_PLUGIN`, `TERMITE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` to request WebGPU graph partition execution.
+    backend: ?[]const u8 = null,
+    /// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
+    mode: ?[]const u8 = null,
+    /// inference-native compiled graph target. `partitioned` attaches compiled executors to eligible graph partitions. `whole-model` requests a compiled backend only when it can own the full traced graph shape.
+    compiled_target: ?[]const u8 = null,
+    /// Controls how the model uses tools
+    tool_choice: ?InferenceToolChoice = null,
+};
+
+pub const IndexStatus = struct {
+    shard_status: std.json.ArrayHashMap(IndexStats),
+    config: IndexConfig,
+    status: IndexStats,
+};
+
+pub const CreateTableRequest = struct {
+    /// Number of shards to create for the table. Data is partitioned across shards based on key ranges. **Sizing Guidelines:** - Small datasets (<100K docs): 1-3 shards - Medium datasets (100K-1M docs): 3-10 shards - Large datasets (>1M docs): 10+ shards More shards enable better parallelism but increase overhead. Choose based on expected data size and query patterns. **When to Add More Shards:** Antfly supports **online shard reallocation** without downtime. Add more shards when: - Individual shards exceed size thresholds (configurable) - Query latency increases due to large shard size - Need better parallelism for write-heavy workloads Use the internal `/reallocate` endpoint to trigger automatic shard splitting: ```bash POST /internal/v1/reallocate ``` This enqueues a reallocation request that the leader processes asynchronously, splitting large shards and redistributing data without service interruption. **Advantages over Elasticsearch:** - Automatic shard splitting (no manual reindexing required) - Online operation (no downtime) - Transparent to applications (keys remain accessible during reallocation)
+    num_shards: ?i64 = null,
+    /// Optional human-readable description of the table and its purpose. Useful for documentation and team collaboration.
+    description: ?[]const u8 = null,
+    /// Map of index name to index configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
+    indexes: ?std.json.ArrayHashMap(IndexConfig) = null,
+    /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
+    schema: ?TableSchema = null,
+    /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
+    replication_sources: ?[]const ReplicationSource = null,
+};
+
+pub const Table = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig),
+    indexes: std.json.ArrayHashMap(IndexConfig),
     shards: std.json.ArrayHashMap(ShardConfig),
-    schema: ?antfly_schema_openapi.TableSchema = null,
+    schema: ?TableSchema = null,
     /// Present only when the table is migrating between schema versions. Absent means the table is stable.
     migration: ?TableMigration = null,
     /// PostgreSQL CDC replication sources configured for this table.
     replication_sources: ?[]const ReplicationSource = null,
-    storage_status: StorageStatus,
 };
 
-pub const QueryBuilderResult = struct {
-    /// Correlation identifier for client-carried continuation.
-    session_id: ?[]const u8 = null,
-    /// Number of internal passes consumed while producing this result.
-    iteration: ?i64 = null,
-    /// Number of user clarification turns already consumed in this interaction.
-    clarification_count: ?i64 = null,
-    /// Current status of the bounded query-builder execution.
-    status: ?AgentStatus = null,
-    /// Shared bounded-agent execution trace for this query-builder run.
-    steps: ?[]const AgentStep = null,
-    /// Remaining internal reasoning passes for this interaction.
-    remaining_internal_iterations: ?i64 = null,
-    /// Remaining clarification turns allowed for this interaction.
-    remaining_user_clarifications: ?i64 = null,
-    /// Clarification questions exposed in the shared bounded-agent envelope.
-    questions: ?[]const AgentQuestion = null,
-    /// Generated search query in native Bleve format. Can be used directly in QueryRequest.full_text_search or filter_query.
-    query: std.json.Value,
-    /// Antfly query request assembled by the coordinator. New clients should prefer this field when they want an executable Antfly query object.
-    query_request: ?QueryRequest = null,
-    /// Antfly retrieval query assembled by the coordinator when the requested artifact needs retrieval-only features such as tree_search. This is additive to query_request for clients that execute through the retrieval agent pipeline.
-    retrieval_query_request: ?RetrievalQueryRequest = null,
-    /// Specialist or strategy used to build the query, such as `full_text`, `filter`, or `hybrid`.
-    specialist: ?[]const u8 = null,
-    /// Optional machine-readable coordination plan for observability.
-    plan: ?std.json.Value = null,
-    /// Human-readable explanation of what the query does and why it was structured this way
-    explanation: ?[]const u8 = null,
-    /// Model's confidence in the generated query (0.0-1.0)
-    confidence: ?f64 = null,
-    /// Any issues, limitations, or assumptions made when generating the query
-    warnings: ?[]const []const u8 = null,
-};
-
-/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.
-pub const RetrievalAgentRequest = struct {
-    /// User's natural language query
-    query: []const u8,
-    /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available.
-    queries: []const RetrievalQueryRequest,
-    /// Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
-    messages: ?[]const antfly_generating_openapi.ChatMessage = null,
-    /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
-    agent_knowledge: ?[]const u8 = null,
-    /// Pre-applied filters from prior interactions. These are applied to all search tool invocations.
-    accumulated_filters: ?[]const antfly_ai_openapi.FilterSpec = null,
-    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
-    session_id: ?[]const u8 = null,
-    /// Structured answers provided by the user as part of client-carried continuation.
-    decisions: ?[]const AgentDecision = null,
-    /// If true, the agent may return clarification questions when needed.
-    interactive: ?bool = null,
-    /// Maximum number of internal tool-calling rounds. - 0: Pipeline mode — execute provided queries directly, no LLM loop - 1+: Agentic mode — LLM decides which tools to call
-    max_internal_iterations: ?i64 = null,
-    /// Maximum number of clarification turns the agent may request from the user.
-    max_user_clarifications: ?i64 = null,
-    /// Force a user-facing decision after this many unresolved internal passes.
-    require_decision_after: ?i64 = null,
-    /// Maximum tokens for document context in tool responses. Documents exceeding this limit are pruned to fit.
-    max_context_tokens: ?i64 = null,
-    /// Tokens to reserve for system prompt, answer generation, and other overhead. Subtracted from max_context_tokens to determine available context budget. Defaults to 4000 if max_context_tokens is set.
-    reserve_tokens: ?i64 = null,
-    /// Enable SSE streaming vs JSON response
-    stream: ?bool = null,
-    /// Generator for the retrieval agent's LLM calls
-    generator: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// Chain of generators
-    chain: ?[]const antfly_generating_openapi.ChainLink = null,
-    /// Tool and step configuration
-    steps: ?RetrievalAgentSteps = null,
-    /// Handlebars template for rendering documents in the generation prompt. Default uses TOON format for token efficiency. Requires steps.generation to be set.
-    document_renderer: ?[]const u8 = null,
+pub const AggregationRequest = struct {
+    type: AggregationType,
+    /// Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
+    field: ?[]const u8 = null,
+    /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
+    fields: ?[]const []const u8 = null,
+    /// Maximum number of buckets to return (for bucketing aggregations)
+    size: ?i64 = null,
+    /// Ranges for range aggregations
+    ranges: ?[]const AggregationRange = null,
+    /// Date ranges for date_range aggregations
+    date_ranges: ?[]const AggregationDateRange = null,
+    /// Fixed interval for histogram aggregations
+    interval: ?f32 = null,
+    /// Calendar-aware interval for date_histogram aggregations
+    calendar_interval: ?std.json.Value = null,
+    /// Origin for geohash_grid aggregation (format: "lat,lon") Example: "37.7749,-122.4194"
+    origin: ?[]const u8 = null,
+    /// Geohash precision (1-12) for geohash_grid aggregations
+    precision: ?i64 = null,
+    /// Distance ranges for geo_distance aggregations
+    distance_ranges: ?[]const DistanceRange = null,
+    /// Distance unit for geo_distance aggregations
+    unit: ?std.json.Value = null,
+    /// Minimum document count for a bucket to be included
+    min_doc_count: ?i64 = null,
+    /// Background filter for significant_terms aggregations
+    background_filter: ?std.json.Value = null,
+    /// Significance algorithm for significant_terms aggregations
+    algorithm: ?std.json.Value = null,
+    /// Algebraic join descriptor for bounded cross-table aggregation planning
+    algebraic_join: ?AlgebraicAggregationJoin = null,
+    /// Nested sub-aggregations
+    sub_aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
 };
 
 pub const AggregationBucket = struct {
@@ -2299,6 +5656,206 @@ pub const AggregationResult = struct {
     buckets: ?[]const AggregationBucket = null,
 };
 
+pub const TableStatus = struct {
+    name: []const u8,
+    /// Optional description of the table.
+    description: ?[]const u8 = null,
+    indexes: std.json.ArrayHashMap(IndexConfig),
+    shards: std.json.ArrayHashMap(ShardConfig),
+    schema: ?TableSchema = null,
+    /// Present only when the table is migrating between schema versions. Absent means the table is stable.
+    migration: ?TableMigration = null,
+    /// PostgreSQL CDC replication sources configured for this table.
+    replication_sources: ?[]const ReplicationSource = null,
+    storage_status: StorageStatus,
+};
+
+/// Request to scan keys in a table within a key range. If no range is specified, scans all keys in the table.
+pub const ScanKeysRequest = struct {
+    /// Start of the key range to scan (exclusive by default). Can be a full key or a prefix. If not specified, starts from the beginning of the table.
+    from: ?[]const u8 = null,
+    /// End of the key range to scan (inclusive by default). Can be a full key or a prefix. If not specified, scans to the end of the table.
+    to: ?[]const u8 = null,
+    /// If true, include keys matching 'from' in the results. Default: false (exclusive lower bound for pagination).
+    inclusive_from: ?bool = null,
+    /// If true, exclude keys matching 'to' from the results. Default: false (inclusive upper bound).
+    exclusive_to: ?bool = null,
+    /// List of fields to include in each result. If not specified, only returns the key. Supports: - Simple fields: "title", "author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings", "_summaries", "_chunks"
+    fields: ?[]const []const u8 = null,
+    /// Antfly query to filter documents. Only documents matching this query are included in results. Uses the sear library for efficient per-document matching without requiring a full index. Examples: - Status filtering: `{"query": "status:published"}` - Date ranges: `{"query": "created_at:>2023-01-01"}` - Field matching: `{"query": "category:technology"}`
+    filter_query: ?std.json.Value = null,
+    /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
+    limit: ?i64 = null,
+};
+
+pub const QueryBuilderResult = struct {
+    /// Correlation identifier for client-carried continuation.
+    session_id: ?[]const u8 = null,
+    /// Number of internal passes consumed while producing this result.
+    iteration: ?i64 = null,
+    /// Number of user clarification turns already consumed in this interaction.
+    clarification_count: ?i64 = null,
+    /// Current status of the bounded query-builder execution.
+    status: ?AgentStatus = null,
+    /// Shared bounded-agent execution trace for this query-builder run.
+    steps: ?[]const AgentStep = null,
+    /// Remaining internal reasoning passes for this interaction.
+    remaining_internal_iterations: ?i64 = null,
+    /// Remaining clarification turns allowed for this interaction.
+    remaining_user_clarifications: ?i64 = null,
+    /// Clarification questions exposed in the shared bounded-agent envelope.
+    questions: ?[]const AgentQuestion = null,
+    /// Generated search query in native Bleve format. Can be used directly in QueryRequest.full_text_search or filter_query.
+    query: std.json.Value,
+    /// Antfly query request assembled by the coordinator. New clients should prefer this field when they want an executable Antfly query object.
+    query_request: ?QueryRequest = null,
+    /// Antfly retrieval query assembled by the coordinator when the requested artifact needs retrieval-only features such as tree_search. This is additive to query_request for clients that execute through the retrieval agent pipeline.
+    retrieval_query_request: ?RetrievalQueryRequest = null,
+    /// Specialist or strategy used to build the query, such as `full_text`, `filter`, or `hybrid`.
+    specialist: ?[]const u8 = null,
+    /// Optional machine-readable coordination plan for observability.
+    plan: ?std.json.Value = null,
+    /// Human-readable explanation of what the query does and why it was structured this way
+    explanation: ?[]const u8 = null,
+    /// Model's confidence in the generated query (0.0-1.0)
+    confidence: ?f64 = null,
+    /// Any issues, limitations, or assumptions made when generating the query
+    warnings: ?[]const []const u8 = null,
+};
+
+/// A query in the retrieval pipeline. Extends QueryRequest with an optional tree search configuration. Each query specifies its own table. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
+pub const RetrievalQueryRequest = struct {
+    /// Name of the table to query. Optional for global queries.
+    table: ?[]const u8 = null,
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    query: ?std.json.Value = null,
+    /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
+    full_text_search: ?std.json.Value = null,
+    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
+    semantic_search: ?[]const u8 = null,
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    embedding_template: ?[]const u8 = null,
+    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
+    indexes: ?[]const []const u8 = null,
+    /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
+    filter_prefix: ?[]const u8 = null,
+    /// Antfly query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"`
+    filter_query: ?std.json.Value = null,
+    /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
+    exclusion_query: ?std.json.Value = null,
+    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
+    aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
+    /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
+    embeddings: ?std.json.ArrayHashMap(Embedding) = null,
+    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
+    search_effort: ?f32 = null,
+    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
+    fields: ?[]const []const u8 = null,
+    /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
+    limit: ?i64 = null,
+    /// Number of results to skip for pagination. Only available for full_text_search queries. Not supported for semantic_search due to vector index limitations.
+    offset: ?i64 = null,
+    /// Sort order for results. Array of sort fields with direction. Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
+    order_by: ?[]const SortField = null,
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    search_after: ?[]const []const u8 = null,
+    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    search_before: ?[]const []const u8 = null,
+    /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
+    distance_under: ?f32 = null,
+    /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
+    distance_over: ?f32 = null,
+    /// Configuration for merging full-text and semantic search results. Only applies when both `full_text_search` and `semantic_search` are specified.
+    merge_config: ?MergeConfig = null,
+    /// If true, returns only the total count of matching documents without retrieving the actual documents. Useful for pagination and displaying result counts.
+    count: ?bool = null,
+    /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
+    profile: ?bool = null,
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    reranker: ?RerankerConfig = null,
+    analyses: ?Analyses = null,
+    /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
+    graph_searches: ?std.json.ArrayHashMap(GraphQuery) = null,
+    /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
+    expand_strategy: ?[]const u8 = null,
+    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
+    document_renderer: ?[]const u8 = null,
+    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
+    pruner: ?Pruner = null,
+    /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
+    join: ?JoinClause = null,
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
+    /// Optional tree search configuration
+    tree_search: ?TreeSearchConfig = null,
+};
+
+/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.
+pub const RetrievalAgentRequest = struct {
+    /// User's natural language query
+    query: []const u8,
+    /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available.
+    queries: []const RetrievalQueryRequest,
+    /// Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
+    messages: ?[]const ChatMessage = null,
+    /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
+    agent_knowledge: ?[]const u8 = null,
+    /// Pre-applied filters from prior interactions. These are applied to all search tool invocations.
+    accumulated_filters: ?[]const FilterSpec = null,
+    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
+    session_id: ?[]const u8 = null,
+    /// Structured answers provided by the user as part of client-carried continuation.
+    decisions: ?[]const AgentDecision = null,
+    /// If true, the agent may return clarification questions when needed.
+    interactive: ?bool = null,
+    /// Maximum number of internal tool-calling rounds. - 0: Pipeline mode — execute provided queries directly, no LLM loop - 1+: Agentic mode — LLM decides which tools to call
+    max_internal_iterations: ?i64 = null,
+    /// Maximum number of clarification turns the agent may request from the user.
+    max_user_clarifications: ?i64 = null,
+    /// Force a user-facing decision after this many unresolved internal passes.
+    require_decision_after: ?i64 = null,
+    /// Maximum tokens for document context in tool responses. Documents exceeding this limit are pruned to fit.
+    max_context_tokens: ?i64 = null,
+    /// Tokens to reserve for system prompt, answer generation, and other overhead. Subtracted from max_context_tokens to determine available context budget. Defaults to 4000 if max_context_tokens is set.
+    reserve_tokens: ?i64 = null,
+    /// Enable SSE streaming vs JSON response
+    stream: ?bool = null,
+    /// Generator for the retrieval agent's LLM calls
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators
+    chain: ?[]const ChainLink = null,
+    /// Tool and step configuration
+    steps: ?RetrievalAgentSteps = null,
+    /// Handlebars template for rendering documents in the generation prompt. Default uses TOON format for token efficiency. Requires steps.generation to be set.
+    document_renderer: ?[]const u8 = null,
+};
+
+/// DEPRECATED: Use RetrievalAgentRequest instead. Request for the answer agent. Accepts the old request format and internally delegates to the retrieval agent.
+pub const AnswerAgentRequest = struct {
+    /// User's natural language query
+    query: []const u8,
+    /// Queries to execute. Each query specifies its own table.
+    queries: []const QueryRequest,
+    /// DEPRECATED: Use stream on RetrievalAgentRequest instead. Enable SSE streaming vs JSON response.
+    with_streaming: ?bool = null,
+    /// Generator for LLM calls
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators
+    chain: ?[]const ChainLink = null,
+    /// Domain-specific knowledge for the agent
+    agent_knowledge: ?[]const u8 = null,
+    /// Maximum tokens for document context
+    max_context_tokens: ?i64 = null,
+    /// Tokens to reserve for overhead
+    reserve_tokens: ?i64 = null,
+    /// Step configuration
+    steps: ?AnswerAgentSteps = null,
+    /// DEPRECATED: Use steps.eval on RetrievalAgentRequest instead. Evaluation configuration (moved to steps.eval in new API).
+    eval: ?EvalConfig = null,
+    /// DEPRECATED: Omit steps.generation on RetrievalAgentRequest instead. If true, skip the generation step.
+    without_generation: ?bool = null,
+};
+
 /// DEPRECATED: Use RetrievalAgentResult instead. Result from the answer agent.
 pub const AnswerAgentResult = struct {
     /// DEPRECATED: Use generation on RetrievalAgentResult instead. Generated answer in markdown format.
@@ -2308,13 +5865,105 @@ pub const AnswerAgentResult = struct {
     /// Relevance of retrieved documents to the query
     context_relevance: ?f32 = null,
     /// DEPRECATED: Use classification on RetrievalAgentResult instead. Query classification and transformation result.
-    classification_transformation: ?antfly_ai_openapi.ClassificationTransformationResult = null,
+    classification_transformation: ?ClassificationTransformationResult = null,
     /// DEPRECATED: Use hits on RetrievalAgentResult instead. Query results grouped by table.
     query_results: ?[]const QueryResult = null,
     /// Suggested follow-up questions
     followup_questions: ?[]const []const u8 = null,
     /// Evaluation results
-    eval_result: ?antfly_eval_openapi.EvalResult = null,
+    eval_result: ?EvalResult = null,
+};
+
+pub const QueryRequest = struct {
+    /// Name of the table to query. Optional for global queries.
+    table: ?[]const u8 = null,
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    query: ?std.json.Value = null,
+    /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
+    full_text_search: ?std.json.Value = null,
+    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
+    semantic_search: ?[]const u8 = null,
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    embedding_template: ?[]const u8 = null,
+    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
+    indexes: ?[]const []const u8 = null,
+    /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
+    filter_prefix: ?[]const u8 = null,
+    /// Antfly query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"`
+    filter_query: ?std.json.Value = null,
+    /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
+    exclusion_query: ?std.json.Value = null,
+    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
+    aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
+    /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
+    embeddings: ?std.json.ArrayHashMap(Embedding) = null,
+    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
+    search_effort: ?f32 = null,
+    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
+    fields: ?[]const []const u8 = null,
+    /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
+    limit: ?i64 = null,
+    /// Number of results to skip for pagination. Only available for full_text_search queries. Not supported for semantic_search due to vector index limitations.
+    offset: ?i64 = null,
+    /// Sort order for results. Array of sort fields with direction. Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
+    order_by: ?[]const SortField = null,
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    search_after: ?[]const []const u8 = null,
+    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    search_before: ?[]const []const u8 = null,
+    /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
+    distance_under: ?f32 = null,
+    /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
+    distance_over: ?f32 = null,
+    /// Configuration for merging full-text and semantic search results. Only applies when both `full_text_search` and `semantic_search` are specified.
+    merge_config: ?MergeConfig = null,
+    /// If true, returns only the total count of matching documents without retrieving the actual documents. Useful for pagination and displaying result counts.
+    count: ?bool = null,
+    /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
+    profile: ?bool = null,
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    reranker: ?RerankerConfig = null,
+    analyses: ?Analyses = null,
+    /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
+    graph_searches: ?std.json.ArrayHashMap(GraphQuery) = null,
+    /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
+    expand_strategy: ?[]const u8 = null,
+    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
+    document_renderer: ?[]const u8 = null,
+    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
+    pruner: ?Pruner = null,
+    /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
+    join: ?JoinClause = null,
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
+};
+
+/// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
+pub const JoinClause = struct {
+    /// Name of the table to join with.
+    right_table: []const u8,
+    /// Type of join to perform. Defaults to "inner".
+    join_type: ?JoinType = null,
+    /// Join condition specifying which fields to match.
+    on: JoinCondition,
+    /// Optional filters to apply to the right table before joining. Use to reduce the amount of data being joined.
+    right_filters: ?JoinFilters = null,
+    /// Fields to include from the right table in the result. If not specified, all fields from the right table are included. Fields are prefixed with the right table name in the result.
+    right_fields: ?[]const []const u8 = null,
+    /// Optional hint for which join strategy to use. If not specified, the planner automatically selects based on table statistics.
+    strategy_hint: ?JoinStrategy = null,
+    /// Optional nested join for multi-way joins. The nested join operates on the result of the current join.
+    nested_join: ?std.json.Value = null,
+};
+
+/// Filters to apply to a table before joining.
+pub const JoinFilters = struct {
+    /// Antfly query to filter rows before joining.
+    filter_query: ?std.json.Value = null,
+    /// Key prefix filter for the table.
+    filter_prefix: ?[]const u8 = null,
+    /// Maximum number of rows to include from this table.
+    limit: ?i64 = null,
 };
 
 /// Responses from multiple query operations.
@@ -2330,7 +5979,7 @@ pub const QueryResult = struct {
     /// Analysis results like PCA and t-SNE per index embeddings.
     analyses: ?std.json.ArrayHashMap(AnalysesResult) = null,
     /// Results from declarative graph queries.
-    graph_results: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQueryResult) = null,
+    graph_results: ?std.json.ArrayHashMap(GraphQueryResult) = null,
     /// Detailed execution profile (present when `profile: true` in request).
     profile: ?std.json.Value = null,
     /// Duration of the query in milliseconds.
@@ -2341,4 +5990,301 @@ pub const QueryResult = struct {
     @"error": ?[]const u8 = null,
     /// Which table this result came from
     table: ?[]const u8 = null,
+};
+
+pub const ReplicationSource = struct {
+    /// Type of the replication source. Currently only "postgres" is supported.
+    type: []const u8,
+    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables. Requires `wal_level=logical` on the source.
+    dsn: []const u8,
+    /// Name of the table in the PostgreSQL database to replicate from.
+    postgres_table: []const u8,
+    /// Template for constructing the Antfly document key from PG columns. A plain string (e.g., "id") uses that column's value directly. Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
+    key_template: ?[]const u8 = null,
+    /// PostgreSQL replication slot name. If omitted, auto-derived from the Antfly table and PG table names. Specify this when using pre-created slots (e.g., on Supabase or Neon).
+    slot_name: ?[]const u8 = null,
+    /// PostgreSQL publication name. If omitted, auto-derived and created automatically. Specify this when using pre-created publications.
+    publication_name: ?[]const u8 = null,
+    /// Transform operations applied on INSERT/UPDATE events. Values can reference PG columns via `{{column}}` syntax. If omitted, auto-generates `$set` for every column (passthrough mode).
+    on_update: ?[]const ReplicationTransformOp = null,
+    /// Transform operations applied on DELETE events. If omitted, auto-derives `$unset` ops from `on_update`'s `$set` paths (safe for multi-source). Use `$delete_document` op to delete the entire Antfly document.
+    on_delete: ?[]const ReplicationTransformOp = null,
+    /// Bleve-style filter query that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
+    publication_filter: ?std.json.Value = null,
+    /// Conditional routes for fan-out replication. Each route evaluates its `where` filter against every CDC row and, on match, writes to the specified `target_table`. Multiple routes can match the same row. When routes are present, the top-level `on_update`/`on_delete` are ignored — each route defines its own transforms.
+    routes: ?[]const ReplicationRoute = null,
+    /// When true, indicates this source was reseeded with exact cutover mode and must replay from a consistent snapshot before streaming.
+    require_exact_cutover: ?bool = null,
+    status: ?ReplicationSourceStatus = null,
+    action_hint: ?ReplicationSourceActionHint = null,
+};
+
+pub const ReplicationRoute = struct {
+    /// Name of the Antfly table to write matching rows to. The table must already exist.
+    target_table: []const u8,
+    /// Bleve-style filter query evaluated against each CDC row. Only rows matching this filter are written to `target_table`. If omitted, all rows match (equivalent to `match_all`).
+    where: ?std.json.Value = null,
+    /// Override the source-level `key_template` for this route. If omitted, the source-level template is used.
+    key_template: ?[]const u8 = null,
+    /// Transform operations for INSERT/UPDATE events on this route. If omitted, auto-generates `$set` for every column (passthrough mode).
+    on_update: ?[]const ReplicationTransformOp = null,
+    /// Transform operations for DELETE events on this route. If omitted, auto-derives from this route's `on_update` paths.
+    on_delete: ?[]const ReplicationTransformOp = null,
+};
+
+pub const ConjunctionQuery = struct {
+    conjuncts: []const Query,
+    boost: ?Boost = null,
+};
+
+pub const DisjunctionQuery = struct {
+    disjuncts: []const Query,
+    boost: ?Boost = null,
+    min: ?f64 = null,
+};
+
+pub const BooleanQuery = struct {
+    must: ?ConjunctionQuery = null,
+    should: ?DisjunctionQuery = null,
+    must_not: ?DisjunctionQuery = null,
+    filter: ?Query = null,
+    boost: ?Boost = null,
+};
+
+pub const Query = union(enum) {
+    date_range_string_query: *DateRangeStringQuery,
+    match_query: *MatchQuery,
+    boolean_query: *BooleanQuery,
+    numeric_range_query: *NumericRangeQuery,
+    term_range_query: *TermRangeQuery,
+    fuzzy_query: *FuzzyQuery,
+    match_phrase_query: *MatchPhraseQuery,
+    disjunction_query: *DisjunctionQuery,
+    geo_bounding_box_query: *GeoBoundingBoxQuery,
+    geo_distance_query: *GeoDistanceQuery,
+    multi_phrase_query: *MultiPhraseQuery,
+    phrase_query: *PhraseQuery,
+    bool_field_query: *BoolFieldQuery,
+    conjunction_query: *ConjunctionQuery,
+    doc_id_query: *DocIdQuery,
+    geo_bounding_polygon_query: *GeoBoundingPolygonQuery,
+    geo_shape_query: *GeoShapeQuery,
+    ip_range_query: *IPRangeQuery,
+    match_all_query: *MatchAllQuery,
+    match_none_query: *MatchNoneQuery,
+    multi_match_query: *MultiMatchQuery,
+    prefix_query: *PrefixQuery,
+    query_string_query: *QueryStringQuery,
+    regexp_query: *RegexpQuery,
+    term_query: *TermQuery,
+    wildcard_query: *WildcardQuery,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed.value;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "start",
+            "end",
+            "inclusive_start",
+            "inclusive_end",
+            "datetime_parser",
+        })) {
+            if (try parseStructuralVariant(DateRangeStringQuery, allocator, source, options)) |parsed| return .{ .date_range_string_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match",
+            "analyzer",
+            "prefix_length",
+            "fuzziness",
+            "operator",
+        })) {
+            if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "must",
+            "should",
+            "must_not",
+            "filter",
+        })) {
+            if (try parseStructuralVariant(BooleanQuery, allocator, source, options)) |parsed| return .{ .boolean_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "min",
+            "max",
+            "inclusive_min",
+            "inclusive_max",
+        })) {
+            if (try parseStructuralVariant(NumericRangeQuery, allocator, source, options)) |parsed| return .{ .numeric_range_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "min",
+            "max",
+            "inclusive_min",
+            "inclusive_max",
+        })) {
+            if (try parseStructuralVariant(TermRangeQuery, allocator, source, options)) |parsed| return .{ .term_range_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "term",
+            "prefix_length",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(FuzzyQuery, allocator, source, options)) |parsed| return .{ .fuzzy_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match_phrase",
+            "analyzer",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(MatchPhraseQuery, allocator, source, options)) |parsed| return .{ .match_phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "disjuncts",
+            "min",
+        })) {
+            if (try parseStructuralVariant(DisjunctionQuery, allocator, source, options)) |parsed| return .{ .disjunction_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "top_left",
+            "bottom_right",
+        })) {
+            if (try parseStructuralVariant(GeoBoundingBoxQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_box_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "location",
+            "distance",
+        })) {
+            if (try parseStructuralVariant(GeoDistanceQuery, allocator, source, options)) |parsed| return .{ .geo_distance_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "terms",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(MultiPhraseQuery, allocator, source, options)) |parsed| return .{ .multi_phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "terms",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(PhraseQuery, allocator, source, options)) |parsed| return .{ .phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "bool",
+        })) {
+            if (try parseStructuralVariant(BoolFieldQuery, allocator, source, options)) |parsed| return .{ .bool_field_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "conjuncts",
+        })) {
+            if (try parseStructuralVariant(ConjunctionQuery, allocator, source, options)) |parsed| return .{ .conjunction_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ids",
+        })) {
+            if (try parseStructuralVariant(DocIdQuery, allocator, source, options)) |parsed| return .{ .doc_id_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "polygon_points",
+        })) {
+            if (try parseStructuralVariant(GeoBoundingPolygonQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_polygon_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "geometry",
+        })) {
+            if (try parseStructuralVariant(GeoShapeQuery, allocator, source, options)) |parsed| return .{ .geo_shape_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "cidr",
+        })) {
+            if (try parseStructuralVariant(IPRangeQuery, allocator, source, options)) |parsed| return .{ .ip_range_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match_all",
+        })) {
+            if (try parseStructuralVariant(MatchAllQuery, allocator, source, options)) |parsed| return .{ .match_all_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match_none",
+        })) {
+            if (try parseStructuralVariant(MatchNoneQuery, allocator, source, options)) |parsed| return .{ .match_none_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "multi_match",
+        })) {
+            if (try parseStructuralVariant(MultiMatchQuery, allocator, source, options)) |parsed| return .{ .multi_match_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "prefix",
+        })) {
+            if (try parseStructuralVariant(PrefixQuery, allocator, source, options)) |parsed| return .{ .prefix_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "query",
+        })) {
+            if (try parseStructuralVariant(QueryStringQuery, allocator, source, options)) |parsed| return .{ .query_string_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "regexp",
+        })) {
+            if (try parseStructuralVariant(RegexpQuery, allocator, source, options)) |parsed| return .{ .regexp_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "term",
+        })) {
+            if (try parseStructuralVariant(TermQuery, allocator, source, options)) |parsed| return .{ .term_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "wildcard",
+        })) {
+            if (try parseStructuralVariant(WildcardQuery, allocator, source, options)) |parsed| return .{ .wildcard_query = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .date_range_string_query => |v| try jw.write(v.*),
+            .match_query => |v| try jw.write(v.*),
+            .boolean_query => |v| try jw.write(v.*),
+            .numeric_range_query => |v| try jw.write(v.*),
+            .term_range_query => |v| try jw.write(v.*),
+            .fuzzy_query => |v| try jw.write(v.*),
+            .match_phrase_query => |v| try jw.write(v.*),
+            .disjunction_query => |v| try jw.write(v.*),
+            .geo_bounding_box_query => |v| try jw.write(v.*),
+            .geo_distance_query => |v| try jw.write(v.*),
+            .multi_phrase_query => |v| try jw.write(v.*),
+            .phrase_query => |v| try jw.write(v.*),
+            .bool_field_query => |v| try jw.write(v.*),
+            .conjunction_query => |v| try jw.write(v.*),
+            .doc_id_query => |v| try jw.write(v.*),
+            .geo_bounding_polygon_query => |v| try jw.write(v.*),
+            .geo_shape_query => |v| try jw.write(v.*),
+            .ip_range_query => |v| try jw.write(v.*),
+            .match_all_query => |v| try jw.write(v.*),
+            .match_none_query => |v| try jw.write(v.*),
+            .multi_match_query => |v| try jw.write(v.*),
+            .prefix_query => |v| try jw.write(v.*),
+            .query_string_query => |v| try jw.write(v.*),
+            .regexp_query => |v| try jw.write(v.*),
+            .term_query => |v| try jw.write(v.*),
+            .wildcard_query => |v| try jw.write(v.*),
+        }
+    }
 };

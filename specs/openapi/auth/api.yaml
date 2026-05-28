@@ -10,8 +10,8 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
 servers:
-  - url: /auth/v1
-    description: Auth API server
+  - url: /
+    description: Antfly server root; auth routes are served under /auth/v1
 security:
   - BasicAuth: []
   - ApiKeyAuth: []

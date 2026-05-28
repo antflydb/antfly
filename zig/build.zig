@@ -726,6 +726,11 @@ fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     return join.addOutputFileArg("openapi.public.joined.yaml");
 }
 
+fn addPrefixedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
+    const join = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{});
+    return join.addOutputFileArg("openapi.public.prefixed.yaml");
+}
+
 fn addPublicOpenApiModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -765,7 +770,7 @@ fn addPublicClientOpenApiModule(
         target,
         optimize,
         openapi_codegen,
-        addJoinedPublicOpenApiSpec(b),
+        addPrefixedPublicOpenApiSpec(b),
         "antfly_client_openapi",
         "antfly_client_openapi",
         "types,client",
@@ -918,7 +923,7 @@ fn addOpenApiRegenStep(
             .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
             .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", "types,client", &.{
+        addOpenApiRegenRun(b, openapi_codegen, addPrefixedPublicOpenApiSpec(b), "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", "types,client", &.{
             .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
             .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_ai_openapi" },

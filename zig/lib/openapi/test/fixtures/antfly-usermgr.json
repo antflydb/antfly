@@ -15,8 +15,8 @@
   },
   "servers": [
     {
-      "url": "/auth/v1",
-      "description": "Main API server"
+      "url": "/",
+      "description": "Antfly server root; auth routes are served under /auth/v1"
     }
   ],
   "security": [
