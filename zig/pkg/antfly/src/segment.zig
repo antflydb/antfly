@@ -46,6 +46,9 @@ const magic: [4]u8 = "AFSM".*; // AntFly SegMent
 const segment_version: u32 = 2; // v2: big-endian footer + CRC32 + Snappy stored fields
 const stored_fields_version_compressed_per_doc: u8 = 2;
 const stored_fields_version_uncompressed_offsets: u8 = 3;
+const stored_fields_version_block_compressed: u8 = 4;
+const stored_fields_block_doc_target: usize = 128;
+const stored_fields_v4_doc_entry_size: usize = 24;
 
 /// Fixed footer size (big-endian, at end of segment):
 ///   [numDocs: u64 BE]           8
@@ -68,6 +71,15 @@ pub const SectionType = enum(u16) {
 
 pub const doc_ordinals_field = "\x00__antfly_doc_ordinals";
 
+pub const SegmentLayoutStats = struct {
+    stored_fields_bytes: u64 = 0,
+    inverted_text_bytes: u64 = 0,
+    typed_doc_values_bytes: u64 = 0,
+    doc_ordinals_bytes: u64 = 0,
+    other_section_bytes: u64 = 0,
+    section_index_bytes: u64 = 0,
+};
+
 // ============================================================================
 // Segment writer
 // ============================================================================
@@ -80,6 +92,8 @@ pub const SegmentWriter = struct {
     compression_bytes: std.ArrayListUnmanaged(u8),
     doc_count: u32 = 0,
     last_stored_compress_ns: u64 = 0,
+    last_stored_raw_bytes: u64 = 0,
+    last_stored_compressed_bytes: u64 = 0,
 
     pub fn init(alloc: Allocator) SegmentWriter {
         return .{
@@ -193,42 +207,12 @@ pub const SegmentWriter = struct {
     ///   [sections index (BE)]
     ///   [footer (40 bytes, BE)]
     pub fn build(self: *SegmentWriter) ![]u8 {
-        var out = std.ArrayListUnmanaged(u8).empty;
-        defer out.deinit(self.alloc);
-        try out.ensureTotalCapacity(self.alloc, self.estimatedBuildSize());
-
-        // 1. Write stored fields
-        const stored_offset: u64 = out.items.len;
-        try self.writeStoredFields(&out);
-
-        // 2. Write field sections
-        for (self.fields.items) |*field| {
-            for (field.sections.items) |*section| {
-                section.offset = out.items.len;
-                try out.appendSlice(self.alloc, section.data);
-                section.length = section.data.len;
-                self.alloc.free(section.data);
-                section.data = &.{};
-            }
-        }
-
-        // 3. Write sections index (big-endian)
-        const sections_index_offset: u64 = out.items.len;
-        try self.writeSectionIndex(&out);
-
-        // 4. Write footer (big-endian, 40 bytes)
-        const footer_start = out.items.len;
-        try appendU64BE(self.alloc, &out, @intCast(self.doc_count));
-        try appendU64BE(self.alloc, &out, stored_offset);
-        try appendU64BE(self.alloc, &out, sections_index_offset);
-        try appendU32BE(self.alloc, &out, 0); // chunkMode (0 = default)
-        try appendU32BE(self.alloc, &out, segment_version);
-        // CRC32 over everything before the CRC + magic (last 8 bytes)
-        const crc = std.hash.Crc32.hash(out.items[0 .. footer_start + 32]);
-        try appendU32BE(self.alloc, &out, crc);
-        try out.appendSlice(self.alloc, &magic);
-
-        return try out.toOwnedSlice(self.alloc);
+        var sink_impl = MemorySegmentSink.init(self.alloc);
+        errdefer sink_impl.deinit();
+        try sink_impl.out.ensureTotalCapacity(self.alloc, self.estimatedBuildSize());
+        var sink = sink_impl.sink();
+        try self.writeToSink(&sink);
+        return try sink_impl.finishOwned();
     }
 
     /// Write the final segment file bytes into `sink`.
@@ -265,10 +249,11 @@ pub const SegmentWriter = struct {
     }
 
     fn estimatedBuildSize(self: *const SegmentWriter) usize {
-        var total: usize = 1 + 4 + self.stored_fields.items.len * 8;
+        var total: usize = 1 + 4 + 4 + 4 + 8 + self.stored_fields.items.len * stored_fields_v4_doc_entry_size;
+        total +|= @as(usize, if (self.stored_fields.items.len == 0) 0 else (self.stored_fields.items.len - 1) / stored_fields_block_doc_target + 1) * 8;
         for (self.stored_fields.items) |doc| {
-            total +|= 2 + doc.id.len + 4;
-            total +|= doc.data.len;
+            total +|= doc.id.len;
+            total +|= 4 + doc.data.len;
         }
 
         for (self.fields.items) |field| {
@@ -342,34 +327,71 @@ pub const SegmentWriter = struct {
 
     fn writeStoredFieldsToSink(self: *SegmentWriter, sink: *SegmentSink) !void {
         const num_docs: u32 = @intCast(self.stored_fields.items.len);
-        const section_start = sink.len();
-
-        try sink.appendByte(stored_fields_version_uncompressed_offsets);
+        try sink.appendByte(stored_fields_version_block_compressed);
         self.last_stored_compress_ns = 0;
+        self.last_stored_raw_bytes = 0;
+        self.last_stored_compressed_bytes = 0;
         try sinkAppendU32LE(sink, num_docs);
+        const num_blocks: u32 = if (num_docs == 0) 0 else @intCast((@as(usize, num_docs) - 1) / stored_fields_block_doc_target + 1);
+        try sinkAppendU32LE(sink, num_blocks);
+        try sinkAppendU32LE(sink, stored_fields_block_doc_target);
+        const id_bytes_len_pos = sink.len();
+        try sinkAppendU64LE(sink, 0);
 
-        const offset_table_start = sink.len();
-        try sink.appendNTimes(0, @as(usize, num_docs) * 8);
+        const doc_table_start = sink.len();
+        try sink.appendNTimes(0, @as(usize, num_docs) * stored_fields_v4_doc_entry_size);
+        const block_offsets_start = sink.len();
+        try sink.appendNTimes(0, @as(usize, num_blocks) * 8);
 
+        const id_bytes_start = sink.len();
         for (self.stored_fields.items, 0..) |*doc, i| {
-            const doc_offset: u64 = @intCast(sink.len() - section_start);
-            const off_pos = offset_table_start + i * 8;
-            try sink.writeAt(off_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, doc_offset))));
-
-            try sinkAppendU16LE(sink, @intCast(doc.id.len));
+            const id_offset: u64 = @intCast(sink.len() - id_bytes_start);
             try sink.appendSlice(doc.id);
+            const entry_pos = doc_table_start + i * stored_fields_v4_doc_entry_size;
+            try sink.writeAt(entry_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, id_offset))));
+            try sink.writeAt(entry_pos + 8, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(doc.id.len))))));
+        }
+        const id_bytes_len: u64 = @intCast(sink.len() - id_bytes_start);
+        try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, id_bytes_len))));
 
-            if (doc.is_compressed) {
-                const compress_start = platform_time.monotonicNs();
-                const decoded = try snappy.decode(self.alloc, doc.data);
-                defer self.alloc.free(decoded);
-                self.last_stored_compress_ns +|= platform_time.monotonicNs() - compress_start;
-                try sinkAppendU32LE(sink, @intCast(decoded.len));
-                try sink.appendSlice(decoded);
-            } else {
-                try sinkAppendU32LE(sink, @intCast(doc.data.len));
-                try sink.appendSlice(doc.data);
+        const data_start = sink.len();
+        var doc_index: usize = 0;
+        for (0..num_blocks) |block_idx| {
+            var chunk = std.ArrayListUnmanaged(u8).empty;
+            defer chunk.deinit(self.alloc);
+            chunk.clearRetainingCapacity();
+
+            const block_end = @min(doc_index + stored_fields_block_doc_target, self.stored_fields.items.len);
+            while (doc_index < block_end) : (doc_index += 1) {
+                const doc = &self.stored_fields.items[doc_index];
+                const doc_offset: u32 = @intCast(chunk.items.len);
+                var decoded: ?[]u8 = null;
+                defer if (decoded) |bytes| self.alloc.free(bytes);
+                const raw_data = if (doc.is_compressed) blk: {
+                    const decode_start = platform_time.monotonicNs();
+                    decoded = try snappy.decode(self.alloc, doc.data);
+                    self.last_stored_compress_ns +|= platform_time.monotonicNs() - decode_start;
+                    break :blk decoded.?;
+                } else doc.data;
+                self.last_stored_raw_bytes +|= raw_data.len;
+                try appendU32LE(self.alloc, &chunk, @intCast(raw_data.len));
+                try chunk.appendSlice(self.alloc, raw_data);
+
+                const entry_pos = doc_table_start + doc_index * stored_fields_v4_doc_entry_size;
+                try sink.writeAt(entry_pos + 12, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(block_idx))))));
+                try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, doc_offset))));
+                try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(raw_data.len))))));
             }
+
+            const encode_start = platform_time.monotonicNs();
+            const compressed = try snappy.encode(self.alloc, chunk.items);
+            defer self.alloc.free(compressed);
+            self.last_stored_compress_ns +|= platform_time.monotonicNs() - encode_start;
+            self.last_stored_compressed_bytes +|= compressed.len;
+            try sink.appendSlice(compressed);
+
+            const block_end_offset: u64 = @intCast(sink.len() - data_start);
+            try sink.writeAt(block_offsets_start + @as(usize, block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
         }
     }
 
@@ -553,6 +575,29 @@ pub const SegmentReader = struct {
         return null;
     }
 
+    pub fn layoutStats(self: *const SegmentReader) SegmentLayoutStats {
+        var stats = SegmentLayoutStats{};
+        var stored_end: usize = @intCast(self.index_offset);
+        for (self.fields) |*field| {
+            for (field.sections) |*section| {
+                const offset: usize = @intCast(section.offset);
+                const length: u64 = section.length;
+                if (offset >= self.stored_offset and offset < stored_end) stored_end = offset;
+                switch (section.section_type) {
+                    .inverted_text => stats.inverted_text_bytes +|= length,
+                    .typed_doc_values => stats.typed_doc_values_bytes +|= length,
+                    .doc_ordinals => stats.doc_ordinals_bytes +|= length,
+                    else => stats.other_section_bytes +|= length,
+                }
+            }
+        }
+        const stored_start: usize = @intCast(self.stored_offset);
+        if (stored_end >= stored_start) stats.stored_fields_bytes = @intCast(stored_end - stored_start);
+        const footer_start = self.data.len - footer_size;
+        if (footer_start >= self.index_offset) stats.section_index_bytes = @intCast(footer_start - @as(usize, @intCast(self.index_offset)));
+        return stats;
+    }
+
     /// Get an inverted index reader for a field.
     pub fn invertedIndex(self: *const SegmentReader, field_name: []const u8) !?inverted.InvertedIndexReader {
         const section_data = self.getSection(field_name, .inverted_text) orelse return null;
@@ -562,7 +607,9 @@ pub const SegmentReader = struct {
     pub const StoredDocRef = struct { id: []const u8, data: []const u8 };
 
     /// Read stored document by index. v2 segments return Snappy-compressed
-    /// data; v1/v3 segments return raw stored data.
+    /// data; v1/v3 segments return raw stored data. v4 block-compressed
+    /// segments return the document id and an empty data slice; use
+    /// `storedDocDecompressed` when stored data is required.
     pub fn storedDoc(self: *const SegmentReader, doc_idx: u32) ?StoredDocRef {
         var pos: usize = @intCast(self.stored_offset);
         const ver = self.data[pos];
@@ -570,6 +617,11 @@ pub const SegmentReader = struct {
         const num_docs = std.mem.readInt(u32, self.data[pos..][0..4], .little);
         pos += 4;
         if (doc_idx >= num_docs) return null;
+
+        if (ver == stored_fields_version_block_compressed) {
+            const loc = self.v4StoredDocLocation(pos, doc_idx) orelse return null;
+            return .{ .id = loc.id, .data = &.{} };
+        }
 
         if (ver >= stored_fields_version_compressed_per_doc) {
             // v2/v3: offset table for O(1) access
@@ -610,6 +662,18 @@ pub const SegmentReader = struct {
     pub fn storedDocDecompressed(self: *const SegmentReader, doc_idx: u32) !?struct { id: []const u8, data: []u8 } {
         const raw = self.storedDoc(doc_idx) orelse return null;
         const ver = self.data[@intCast(self.stored_offset)];
+        if (ver == stored_fields_version_block_compressed) {
+            const loc = self.v4StoredDocLocation(@intCast(self.stored_offset + 1 + 4), doc_idx) orelse return null;
+            const compressed = self.data[loc.block_start..loc.block_end];
+            const block = try snappy.decode(self.alloc, compressed);
+            defer self.alloc.free(block);
+            if (loc.doc_offset > block.len or block.len - loc.doc_offset < 4) return error.InvalidSegment;
+            const data_len = std.mem.readInt(u32, block[loc.doc_offset..][0..4], .little);
+            const data_start = loc.doc_offset + 4;
+            if (data_start > block.len or data_len > block.len - data_start) return error.InvalidSegment;
+            if (data_len != loc.raw_len) return error.InvalidSegment;
+            return .{ .id = loc.id, .data = try self.alloc.dupe(u8, block[data_start..][0..data_len]) };
+        }
         if (ver == stored_fields_version_compressed_per_doc) {
             const decompressed = try snappy.decode(self.alloc, raw.data);
             return .{ .id = raw.id, .data = decompressed };
@@ -620,7 +684,53 @@ pub const SegmentReader = struct {
     }
 
     pub fn storedDocsAreCompressed(self: *const SegmentReader) bool {
-        return self.data[@intCast(self.stored_offset)] == stored_fields_version_compressed_per_doc;
+        const ver = self.data[@intCast(self.stored_offset)];
+        return ver == stored_fields_version_compressed_per_doc or ver == stored_fields_version_block_compressed;
+    }
+
+    const V4StoredDocLocation = struct {
+        id: []const u8,
+        block_start: usize,
+        block_end: usize,
+        doc_offset: usize,
+        raw_len: u32,
+    };
+
+    fn v4StoredDocLocation(self: *const SegmentReader, header_pos_after_doc_count: usize, doc_idx: u32) ?V4StoredDocLocation {
+        var pos = header_pos_after_doc_count;
+        const num_blocks = std.mem.readInt(u32, self.data[pos..][0..4], .little);
+        pos += 4;
+        _ = std.mem.readInt(u32, self.data[pos..][0..4], .little);
+        pos += 4;
+        const id_bytes_len = std.mem.readInt(u64, self.data[pos..][0..8], .little);
+        pos += 8;
+
+        const doc_table_start = pos;
+        const block_offsets_start = doc_table_start + @as(usize, self.doc_count) * stored_fields_v4_doc_entry_size;
+        const id_bytes_start = block_offsets_start + @as(usize, num_blocks) * 8;
+        const data_start = id_bytes_start + @as(usize, @intCast(id_bytes_len));
+        const entry_pos = doc_table_start + @as(usize, doc_idx) * stored_fields_v4_doc_entry_size;
+        if (entry_pos + stored_fields_v4_doc_entry_size > self.data.len) return null;
+        const id_offset = std.mem.readInt(u64, self.data[entry_pos..][0..8], .little);
+        const id_len = std.mem.readInt(u32, self.data[entry_pos + 8 ..][0..4], .little);
+        const block_idx = std.mem.readInt(u32, self.data[entry_pos + 12 ..][0..4], .little);
+        const doc_offset = std.mem.readInt(u32, self.data[entry_pos + 16 ..][0..4], .little);
+        const raw_len = std.mem.readInt(u32, self.data[entry_pos + 20 ..][0..4], .little);
+        if (block_idx >= num_blocks) return null;
+        const id_start = id_bytes_start + @as(usize, @intCast(id_offset));
+        if (id_start > self.data.len or id_len > self.data.len - id_start) return null;
+        const block_end_offset = std.mem.readInt(u64, self.data[block_offsets_start + @as(usize, block_idx) * 8 ..][0..8], .little);
+        const block_start_offset: u64 = if (block_idx == 0) 0 else std.mem.readInt(u64, self.data[block_offsets_start + (@as(usize, block_idx) - 1) * 8 ..][0..8], .little);
+        const block_start = data_start + @as(usize, @intCast(block_start_offset));
+        const block_end = data_start + @as(usize, @intCast(block_end_offset));
+        if (block_start > self.data.len or block_end > self.data.len or block_start > block_end) return null;
+        return .{
+            .id = self.data[id_start..][0..id_len],
+            .block_start = block_start,
+            .block_end = block_end,
+            .doc_offset = @intCast(doc_offset),
+            .raw_len = raw_len,
+        };
     }
 
     pub fn docOrdinal(self: *const SegmentReader, doc_idx: u32) !?u32 {
@@ -912,37 +1022,74 @@ fn countLiveDocs(inputs: []const MergeInput) u32 {
 }
 
 fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_count: u32) !void {
-    const section_start = sink.len();
-    try sink.appendByte(stored_fields_version_uncompressed_offsets);
+    try sink.appendByte(stored_fields_version_block_compressed);
     try sinkAppendU32LE(sink, doc_count);
+    const num_blocks: u32 = if (doc_count == 0) 0 else @intCast((@as(usize, doc_count) - 1) / stored_fields_block_doc_target + 1);
+    try sinkAppendU32LE(sink, num_blocks);
+    try sinkAppendU32LE(sink, stored_fields_block_doc_target);
+    const id_bytes_len_pos = sink.len();
+    try sinkAppendU64LE(sink, 0);
 
-    const offset_table_start = sink.len();
-    try sink.appendNTimes(0, @as(usize, doc_count) * 8);
+    const doc_table_start = sink.len();
+    try sink.appendNTimes(0, @as(usize, doc_count) * stored_fields_v4_doc_entry_size);
+    const block_offsets_start = sink.len();
+    try sink.appendNTimes(0, @as(usize, num_blocks) * 8);
 
+    const id_bytes_start = sink.len();
     var out_doc_id: u32 = 0;
     for (inputs) |input| {
         for (0..input.reader.doc_count) |doc_id_usize| {
             const doc_id: u32 = @intCast(doc_id_usize);
             if (input.isDeleted(doc_id)) continue;
             const doc = input.reader.storedDoc(doc_id) orelse continue;
-            const doc_offset: u64 = @intCast(sink.len() - section_start);
-            const offset_pos = offset_table_start + @as(usize, out_doc_id) * 8;
-            try sink.writeAt(offset_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, doc_offset))));
-
-            try sinkAppendU16LE(sink, @intCast(doc.id.len));
             try sink.appendSlice(doc.id);
-
-            if (input.reader.storedDocsAreCompressed()) {
-                const decoded = try snappy.decode(alloc, doc.data);
-                defer alloc.free(decoded);
-                try sinkAppendU32LE(sink, @intCast(decoded.len));
-                try sink.appendSlice(decoded);
-            } else {
-                try sinkAppendU32LE(sink, @intCast(doc.data.len));
-                try sink.appendSlice(doc.data);
-            }
+            const entry_pos = doc_table_start + @as(usize, out_doc_id) * stored_fields_v4_doc_entry_size;
+            const id_offset: u64 = @intCast(sink.len() - id_bytes_start - doc.id.len);
+            try sink.writeAt(entry_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, id_offset))));
+            try sink.writeAt(entry_pos + 8, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(doc.id.len))))));
             out_doc_id += 1;
         }
+    }
+    const id_bytes_len: u64 = @intCast(sink.len() - id_bytes_start);
+    try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, id_bytes_len))));
+
+    const data_start = sink.len();
+    out_doc_id = 0;
+    var block_idx: u32 = 0;
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    for (inputs) |input| {
+        for (0..input.reader.doc_count) |doc_id_usize| {
+            const doc_id: u32 = @intCast(doc_id_usize);
+            if (input.isDeleted(doc_id)) continue;
+            if (out_doc_id > 0 and out_doc_id % stored_fields_block_doc_target == 0) {
+                const compressed = try snappy.encode(alloc, chunk.items);
+                defer alloc.free(compressed);
+                try sink.appendSlice(compressed);
+                const block_end_offset: u64 = @intCast(sink.len() - data_start);
+                try sink.writeAt(block_offsets_start + @as(usize, block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
+                block_idx += 1;
+                chunk.clearRetainingCapacity();
+            }
+
+            const stored = (try input.reader.storedDocDecompressed(doc_id)) orelse continue;
+            defer alloc.free(stored.data);
+            const doc_offset: u32 = @intCast(chunk.items.len);
+            try appendU32LE(alloc, &chunk, @intCast(stored.data.len));
+            try chunk.appendSlice(alloc, stored.data);
+            const entry_pos = doc_table_start + @as(usize, out_doc_id) * stored_fields_v4_doc_entry_size;
+            try sink.writeAt(entry_pos + 12, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, block_idx))));
+            try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, doc_offset))));
+            try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(stored.data.len))))));
+            out_doc_id += 1;
+        }
+    }
+    if (doc_count > 0) {
+        const compressed = try snappy.encode(alloc, chunk.items);
+        defer alloc.free(compressed);
+        try sink.appendSlice(compressed);
+        const block_end_offset: u64 = @intCast(sink.len() - data_start);
+        try sink.writeAt(block_offsets_start + @as(usize, block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
     }
 }
 
@@ -1112,6 +1259,10 @@ fn appendU64LE(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), val: u64) !vo
     try out.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, val))));
 }
 
+fn sinkAppendU64LE(sink: *SegmentSink, val: u64) !void {
+    try sink.appendSlice(&@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, val))));
+}
+
 fn appendU16BE(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), val: u16) !void {
     try out.appendSlice(alloc, &@as([2]u8, @bitCast(std.mem.nativeToBig(u16, val))));
 }
@@ -1255,6 +1406,46 @@ test "segment merge" {
     try std.testing.expect(reader.storedDoc(1) != null);
     try std.testing.expect(reader.storedDoc(2) != null);
     try std.testing.expect(reader.storedDoc(3) == null);
+}
+
+test "segment block-compressed stored fields cross block boundary" {
+    const alloc = std.testing.allocator;
+
+    var writer = SegmentWriter.init(alloc);
+    defer writer.deinit();
+
+    var id_buf: [32]u8 = undefined;
+    var data_buf: [96]u8 = undefined;
+    for (0..(stored_fields_block_doc_target + 7)) |i| {
+        const id = try std.fmt.bufPrint(&id_buf, "doc-{d}", .{i});
+        const data = try std.fmt.bufPrint(&data_buf, "{{\"ordinal\":{d},\"body\":\"stored field block boundary\"}}", .{i});
+        try writer.addStoredDoc(id, data);
+    }
+
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+
+    var reader = try SegmentReader.init(alloc, bytes);
+    defer reader.deinit();
+
+    try std.testing.expect(reader.storedDocsAreCompressed());
+    try std.testing.expect(writer.last_stored_raw_bytes > writer.last_stored_compressed_bytes);
+    try std.testing.expectEqual(@as(u32, @intCast(stored_fields_block_doc_target + 7)), reader.doc_count);
+
+    const first_ref = reader.storedDoc(0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("doc-0", first_ref.id);
+    try std.testing.expectEqual(@as(usize, 0), first_ref.data.len);
+
+    const boundary = (try reader.storedDocDecompressed(@intCast(stored_fields_block_doc_target))) orelse return error.TestExpectedEqual;
+    defer alloc.free(boundary.data);
+    try std.testing.expectEqualStrings("doc-128", boundary.id);
+    try std.testing.expect(std.mem.indexOf(u8, boundary.data, "\"ordinal\":128") != null);
+
+    const last_doc_id: u32 = @intCast(stored_fields_block_doc_target + 6);
+    const last = (try reader.storedDocDecompressed(last_doc_id)) orelse return error.TestExpectedEqual;
+    defer alloc.free(last.data);
+    try std.testing.expectEqualStrings("doc-134", last.id);
+    try std.testing.expect(std.mem.indexOf(u8, last.data, "\"ordinal\":134") != null);
 }
 
 test "segment doc ordinal sidecar roundtrip and merge preserve live order" {

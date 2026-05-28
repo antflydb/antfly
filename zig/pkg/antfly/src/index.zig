@@ -69,6 +69,20 @@ pub const SegmentData = union(enum) {
         };
     }
 
+    pub fn madviseAccessPattern(self: SegmentData) void {
+        switch (self) {
+            .heap => {},
+            .mmap => |data| adviseMappedRandom(data),
+        }
+    }
+
+    pub fn madviseDiscardCleanPages(self: SegmentData) void {
+        switch (self) {
+            .heap => {},
+            .mmap => |data| adviseMappedDontNeed(data),
+        }
+    }
+
     pub fn deinit(self: *SegmentData, alloc: Allocator) void {
         switch (self.*) {
             .heap => |data| alloc.free(data),
@@ -77,6 +91,24 @@ pub const SegmentData = union(enum) {
             },
         }
         self.* = undefined;
+    }
+
+    fn adviseMappedRandom(data: []align(std.heap.page_size_min) u8) void {
+        switch (builtin.os.tag) {
+            .linux, .emscripten, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd => adviseMapped(data, std.c.MADV.RANDOM),
+            else => {},
+        }
+    }
+
+    fn adviseMappedDontNeed(data: []align(std.heap.page_size_min) u8) void {
+        switch (builtin.os.tag) {
+            .linux, .emscripten, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd => adviseMapped(data, std.c.MADV.DONTNEED),
+            else => {},
+        }
+    }
+
+    fn adviseMapped(data: []align(std.heap.page_size_min) u8, advice: u32) void {
+        std.posix.madvise(data.ptr, data.len, advice) catch {};
     }
 };
 
@@ -661,6 +693,7 @@ pub const IndexWriter = struct {
                 }
             }
         }
+        for (new_segments) |*seg| seg.data.madviseDiscardCleanPages();
 
         const new_snap = try self.alloc.create(IndexSnapshot);
         new_snap.* = .{
@@ -760,6 +793,7 @@ pub const IndexWriter = struct {
         var global_field_lens = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
         errdefer global_field_lens.deinit(self.alloc);
         try addSegmentFieldLens(self.alloc, &global_field_lens, &reader);
+        owned.?.madviseDiscardCleanPages();
 
         const new_snap = try self.alloc.create(IndexSnapshot);
         errdefer self.alloc.destroy(new_snap);

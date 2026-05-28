@@ -291,6 +291,8 @@ pub const BuildTextProfile = struct {
     section_attach_ns: u64 = 0,
     stored_doc_attach_ns: u64 = 0,
     stored_compress_ns: u64 = 0,
+    stored_raw_bytes: u64 = 0,
+    stored_compressed_bytes: u64 = 0,
     segment_assembly_ns: u64 = 0,
     segment_encode_ns: u64 = 0,
     doc_arena_peak_bytes: u64 = 0,
@@ -842,6 +844,8 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
             p.stored_compress_ns +|= seg_writer.last_stored_compress_ns;
             p.segment_encode_ns +|= platform_time.monotonicNs() - segment_encode_start_ns;
         }
+        p.stored_raw_bytes +|= seg_writer.last_stored_raw_bytes;
+        p.stored_compressed_bytes +|= seg_writer.last_stored_compressed_bytes;
         p.segment_bytes +|= @intCast(sink.len() - segment_start_len);
         if (profile_working_set) {
             p.segment_sink_bytes = @intCast(sink.len() - segment_start_len);

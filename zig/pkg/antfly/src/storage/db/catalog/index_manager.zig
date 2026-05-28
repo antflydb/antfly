@@ -223,6 +223,11 @@ const TextMemoryAttributionStats = struct {
     text_mmap_segment_bytes: u64 = 0,
     text_heap_segment_bytes: u64 = 0,
     text_max_segment_bytes: u64 = 0,
+    stored_fields_bytes: u64 = 0,
+    inverted_text_bytes: u64 = 0,
+    typed_doc_values_bytes: u64 = 0,
+    doc_ordinals_bytes: u64 = 0,
+    section_index_bytes: u64 = 0,
     configured_lmdb_main_map_bytes: u64 = 0,
     configured_lmdb_wal_map_bytes: u64 = 0,
 };
@@ -1679,6 +1684,12 @@ pub const IndexManager = struct {
                     .mmap => stats.text_mmap_segment_bytes +|= bytes,
                     .heap => stats.text_heap_segment_bytes +|= bytes,
                 }
+                const layout = seg.reader.layoutStats();
+                stats.stored_fields_bytes +|= layout.stored_fields_bytes;
+                stats.inverted_text_bytes +|= layout.inverted_text_bytes;
+                stats.typed_doc_values_bytes +|= layout.typed_doc_values_bytes;
+                stats.doc_ordinals_bytes +|= layout.doc_ordinals_bytes;
+                stats.section_index_bytes +|= layout.section_index_bytes;
             }
         }
         return stats;
@@ -1743,6 +1754,17 @@ pub const IndexManager = struct {
                 text_stats.text_max_segment_bytes,
                 text_stats.configured_lmdb_main_map_bytes,
                 text_stats.configured_lmdb_wal_map_bytes,
+            },
+        );
+        std.log.info(
+            "antfly_bench_memory_segment_layout label={s} stored_fields_bytes={d} inverted_text_bytes={d} typed_doc_values_bytes={d} doc_ordinals_bytes={d} section_index_bytes={d}",
+            .{
+                label,
+                text_stats.stored_fields_bytes,
+                text_stats.inverted_text_bytes,
+                text_stats.typed_doc_values_bytes,
+                text_stats.doc_ordinals_bytes,
+                text_stats.section_index_bytes,
             },
         );
         std.log.info(
@@ -6672,8 +6694,6 @@ pub const IndexManager = struct {
         var projection_alloc_stats = PhaseAllocStats{};
         var text_build_profile = introducer_mod.BuildTextProfile{};
         var segment_alloc_stats = PhaseAllocStats{};
-        var segment_tracking = PhaseTrackingAllocator.init(self.alloc, &segment_alloc_stats);
-        const segment_alloc = if (detailed_profile_enabled) segment_tracking.allocator() else self.alloc;
         const segment_build_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
         var indexed_any = false;
         var segment_bytes: usize = 0;
@@ -6784,6 +6804,10 @@ pub const IndexManager = struct {
                         .profile_timings = detailed_profile_enabled,
                         .profile_working_set = detailed_profile_enabled,
                     };
+                    var segment_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    defer segment_arena_state.deinit();
+                    var segment_tracking = PhaseTrackingAllocator.init(segment_arena_state.allocator(), &segment_alloc_stats);
+                    const segment_alloc = if (detailed_profile_enabled) segment_tracking.allocator() else segment_arena_state.allocator();
                     var build_ctx = TextSegmentSinkBuildContext{
                         .alloc = segment_alloc,
                         .projection_batch = chunk,

@@ -880,6 +880,7 @@ pub const PersistentIndex = struct {
                     try stale_active_ids.append(alloc, seg_id);
                     continue;
                 };
+                segment_data.madviseAccessPattern();
                 errdefer segment_data.deinit(alloc);
                 writer.addSegmentWithIdData(seg_id, segment_data) catch |err| {
                     if (isStaleActiveSegmentDataError(err)) {
@@ -1072,6 +1073,7 @@ pub const PersistentIndex = struct {
         if (self.segment_files != null) {
             const materialize_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
             segment_data = try self.materializeSegmentData(seg_id, owned.?);
+            segment_data.?.madviseAccessPattern();
             if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
         }
         errdefer {
@@ -1190,6 +1192,7 @@ pub const PersistentIndex = struct {
 
         const map_segment_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         var segment_data: ?index_mod.SegmentData = .fromMapped(try mapSegmentFile(path));
+        segment_data.?.madviseAccessPattern();
         if (profile_enabled) map_segment_ns = platform_time.monotonicNs() - map_segment_start_ns;
         errdefer {
             if (segment_data) |*data| data.deinit(self.alloc);
