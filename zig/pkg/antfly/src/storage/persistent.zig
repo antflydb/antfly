@@ -100,13 +100,23 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     return std.c.getenv(name);
 }
 
+fn envEnabled(name: [*:0]const u8) bool {
+    const raw_z = getenv(name) orelse return false;
+    const raw = std.mem.span(raw_z);
+    return !(std.mem.eql(u8, raw, "0") or
+        std.ascii.eqlIgnoreCase(raw, "false") or
+        std.ascii.eqlIgnoreCase(raw, "no"));
+}
+
 fn benchPersistentPublishEnabled() bool {
     switch (bench_persistent_publish_cache.load(.monotonic)) {
         1 => return false,
         2 => return true,
         else => {},
     }
-    const enabled = getenv("ANTFLY_BENCH_PERSISTENT_PUBLISH") != null or getenv("ANTFLY_BENCH_METRICS") != null;
+    const enabled = envEnabled("ANTFLY_BENCH_PERSISTENT_PUBLISH") or
+        envEnabled("ANTFLY_BENCH_TEXT_METRICS") or
+        envEnabled("ANTFLY_BENCH_TEXT_PROFILE");
     bench_persistent_publish_cache.store(if (enabled) 2 else 1, .monotonic);
     return enabled;
 }
@@ -1018,6 +1028,11 @@ pub const PersistentIndex = struct {
         var materialize_ns: u64 = 0;
         var persist_ns: u64 = 0;
         var writer_publish_ns: u64 = 0;
+        const begin_write_ns: u64 = 0;
+        const build_sink_ns: u64 = 0;
+        const finish_write_ns: u64 = 0;
+        const map_segment_ns: u64 = 0;
+        const key_range_ns: u64 = 0;
         var wal_truncate_ns: u64 = 0;
         const uses_segment_wal = self.segment_files == null;
 
@@ -1076,7 +1091,7 @@ pub const PersistentIndex = struct {
 
         if (profile_enabled) {
             std.log.info(
-                "antfly_bench_text_publish seg_id={d} bytes={d} total_ms={d} wal_append_ms={d} reserve_id_ms={d} materialize_ms={d} persist_ms={d} writer_publish_ms={d} wal_truncate_ms={d} file_backed={} uses_segment_wal={}",
+                "antfly_bench_text_publish seg_id={d} bytes={d} total_ms={d} wal_append_ms={d} reserve_id_ms={d} materialize_ms={d} begin_write_ms={d} build_sink_ms={d} finish_write_ms={d} map_segment_ms={d} key_range_ms={d} persist_ms={d} writer_publish_ms={d} wal_truncate_ms={d} file_backed={} uses_segment_wal={}",
                 .{
                     seg_id,
                     segment_bytes.len,
@@ -1084,6 +1099,11 @@ pub const PersistentIndex = struct {
                     nsToMs(wal_append_ns),
                     nsToMs(reserve_id_ns),
                     nsToMs(materialize_ns),
+                    nsToMs(begin_write_ns),
+                    nsToMs(build_sink_ns),
+                    nsToMs(finish_write_ns),
+                    nsToMs(map_segment_ns),
+                    nsToMs(key_range_ns),
                     nsToMs(persist_ns),
                     nsToMs(writer_publish_ns),
                     nsToMs(wal_truncate_ns),
@@ -1119,6 +1139,11 @@ pub const PersistentIndex = struct {
         const total_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         var reserve_id_ns: u64 = 0;
         var materialize_ns: u64 = 0;
+        var begin_write_ns: u64 = 0;
+        var build_sink_ns: u64 = 0;
+        var finish_write_ns: u64 = 0;
+        var map_segment_ns: u64 = 0;
+        var key_range_ns: u64 = 0;
         var persist_ns: u64 = 0;
         var writer_publish_ns: u64 = 0;
 
@@ -1131,26 +1156,36 @@ pub const PersistentIndex = struct {
         defer store.allocator.free(path);
 
         const materialize_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        const begin_write_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         var writer = try store.storage.beginAtomicWrite(self.alloc, path);
+        if (profile_enabled) begin_write_ns = platform_time.monotonicNs() - begin_write_start_ns;
         var writer_active = true;
         errdefer if (writer_active) writer.abort();
 
         var sink_adapter = AtomicSegmentSink{ .writer = &writer };
         var sink = sink_adapter.sink();
+        const build_sink_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         try build_fn(ctx, &sink);
         const segment_len = sink.len();
+        if (profile_enabled) build_sink_ns = platform_time.monotonicNs() - build_sink_start_ns;
 
         writer_active = false;
+        const finish_write_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         try writer.finish();
+        if (profile_enabled) finish_write_ns = platform_time.monotonicNs() - finish_write_start_ns;
         if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
 
+        const map_segment_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         var segment_data: ?index_mod.SegmentData = .fromMapped(try mapSegmentFile(path));
+        if (profile_enabled) map_segment_ns = platform_time.monotonicNs() - map_segment_start_ns;
         errdefer {
             if (segment_data) |*data| data.deinit(self.alloc);
             self.deleteSegmentFile(seg_id);
         }
 
+        const key_range_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         var key_range = try extractSegmentKeyRange(self.alloc, segment_data.?.bytes());
+        if (profile_enabled) key_range_ns = platform_time.monotonicNs() - key_range_start_ns;
         defer key_range.deinit(self.alloc);
 
         const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
@@ -1172,7 +1207,7 @@ pub const PersistentIndex = struct {
 
         if (profile_enabled) {
             std.log.info(
-                "antfly_bench_text_publish seg_id={d} bytes={d} total_ms={d} wal_append_ms={d} reserve_id_ms={d} materialize_ms={d} persist_ms={d} writer_publish_ms={d} wal_truncate_ms={d} file_backed={} uses_segment_wal={}",
+                "antfly_bench_text_publish seg_id={d} bytes={d} total_ms={d} wal_append_ms={d} reserve_id_ms={d} materialize_ms={d} begin_write_ms={d} build_sink_ms={d} finish_write_ms={d} map_segment_ms={d} key_range_ms={d} persist_ms={d} writer_publish_ms={d} wal_truncate_ms={d} file_backed={} uses_segment_wal={}",
                 .{
                     seg_id,
                     segment_len,
@@ -1180,6 +1215,11 @@ pub const PersistentIndex = struct {
                     0,
                     nsToMs(reserve_id_ns),
                     nsToMs(materialize_ns),
+                    nsToMs(begin_write_ns),
+                    nsToMs(build_sink_ns),
+                    nsToMs(finish_write_ns),
+                    nsToMs(map_segment_ns),
+                    nsToMs(key_range_ns),
                     nsToMs(persist_ns),
                     nsToMs(writer_publish_ns),
                     0,

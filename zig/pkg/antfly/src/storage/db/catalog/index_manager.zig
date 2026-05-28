@@ -80,6 +80,7 @@ var hbc_bulk_rebuild_leaf_min_members_cache: std.atomic.Value(usize) = .init(0);
 var hbc_defer_bulk_leaf_splits_cache: std.atomic.Value(u8) = .init(0);
 var hbc_defer_bulk_quantized_rebuild_cache: std.atomic.Value(u8) = .init(0);
 var bench_hbc_metrics_cache: std.atomic.Value(u8) = .init(0);
+var bench_text_metrics_cache: std.atomic.Value(u8) = .init(0);
 var bench_text_profile_cache: std.atomic.Value(u8) = .init(0);
 var text_build_memory_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_doc_scratch_retained_bytes_cache: std.atomic.Value(usize) = .init(0);
@@ -6526,7 +6527,7 @@ pub const IndexManager = struct {
         if (source_docs.len == 0) return .{};
 
         const detailed_profile_enabled = textBenchProfileEnabled();
-        const metrics_enabled = benchMetricsEnabled() or detailed_profile_enabled;
+        const metrics_enabled = textBenchMetricsEnabled() or detailed_profile_enabled;
         const total_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
         var ordinals_ns: u64 = 0;
         var projection_ns: u64 = 0;
@@ -6651,10 +6652,12 @@ pub const IndexManager = struct {
                         .observed_field_analyzers = &.{},
                     };
                     const build_options = introducer_mod.BuildTextOptions{
-                        .profile = if (detailed_profile_enabled) &text_build_profile else null,
+                        .profile = if (metrics_enabled) &text_build_profile else null,
                         .resource_manager = self.resource_manager,
                         .build_memory_target_bytes = target_build_memory_bytes,
                         .doc_scratch_retained_bytes = doc_scratch_retained_bytes,
+                        .profile_timings = detailed_profile_enabled,
+                        .profile_working_set = detailed_profile_enabled,
                     };
                     var build_ctx = TextSegmentSinkBuildContext{
                         .alloc = segment_alloc,
@@ -8301,6 +8304,26 @@ pub const IndexManager = struct {
             std.ascii.eqlIgnoreCase(raw, "false") or
             std.ascii.eqlIgnoreCase(raw, "no"));
         bench_text_profile_cache.store(if (enabled) 2 else 1, .monotonic);
+        return enabled;
+    }
+
+    fn textBenchMetricsEnabled() bool {
+        const cached = bench_text_metrics_cache.load(.monotonic);
+        if (cached != 0) return cached == 2;
+        if (comptime builtin.os.tag == .freestanding) {
+            bench_text_metrics_cache.store(1, .monotonic);
+            return false;
+        }
+        const raw_z = getenv("ANTFLY_BENCH_TEXT_METRICS") orelse
+            getenv("ANTFLY_BENCH_TEXT_PROFILE") orelse {
+            bench_text_metrics_cache.store(1, .monotonic);
+            return false;
+        };
+        const raw = std.mem.span(raw_z);
+        const enabled = !(std.mem.eql(u8, raw, "0") or
+            std.ascii.eqlIgnoreCase(raw, "false") or
+            std.ascii.eqlIgnoreCase(raw, "no"));
+        bench_text_metrics_cache.store(if (enabled) 2 else 1, .monotonic);
         return enabled;
     }
 
