@@ -6643,8 +6643,9 @@ pub const IndexManager = struct {
                 const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
                 const lsm_state = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)];
                 const lsm_stats = self.snapshotLsmMaintenanceStats();
+                const lsm_cache_stats: lsm_backend_mod.cache.Stats = if (self.lsm_cache) |cache| cache.snapshotStats() else .{};
                 std.log.info(
-                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d}",
+                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_block_inserts={d} lsm_cache_block_evictions={d}",
                     .{
                         entry.config.name,
                         source_docs.len,
@@ -6665,6 +6666,13 @@ pub const IndexManager = struct {
                         lsm_stats.immutable_memtables,
                         lsm_stats.total_run_bytes,
                         lsm_stats.total_runs,
+                        lsm_cache_stats.entry_count,
+                        lsm_cache_stats.run_state.used_bytes,
+                        lsm_cache_stats.run_table_raw.used_bytes,
+                        lsm_cache_stats.run_table_index.used_bytes,
+                        lsm_cache_stats.run_table_block.used_bytes,
+                        lsm_cache_stats.run_table_block.inserts,
+                        lsm_cache_stats.run_table_block.evictions,
                     },
                 );
             }

@@ -43,6 +43,7 @@ pub const KindStats = struct {
     evictions: u64 = 0,
     invalidations: u64 = 0,
     waits: u64 = 0,
+    used_bytes: usize = 0,
 };
 
 pub const Stats = struct {
@@ -179,14 +180,22 @@ pub const Cache = struct {
             };
         }
 
-        fn snapshot(self: *const AtomicStats, used_bytes: usize, entry_count: usize) Stats {
+        fn snapshot(self: *const AtomicStats, used_bytes: usize, entry_count: usize, kind_bytes: [@typeInfo(Kind).@"enum".fields.len]usize) Stats {
+            var run_state = self.run_state.snapshot();
+            var run_table_raw = self.run_table_raw.snapshot();
+            var run_table_index = self.run_table_index.snapshot();
+            var run_table_block = self.run_table_block.snapshot();
+            run_state.used_bytes = kind_bytes[@intFromEnum(Kind.run_state)];
+            run_table_raw.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_raw)];
+            run_table_index.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_index)];
+            run_table_block.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_block)];
             return .{
                 .used_bytes = used_bytes,
                 .entry_count = entry_count,
-                .run_state = self.run_state.snapshot(),
-                .run_table_raw = self.run_table_raw.snapshot(),
-                .run_table_index = self.run_table_index.snapshot(),
-                .run_table_block = self.run_table_block.snapshot(),
+                .run_state = run_state,
+                .run_table_raw = run_table_raw,
+                .run_table_index = run_table_index,
+                .run_table_block = run_table_block,
             };
         }
     };
@@ -196,6 +205,12 @@ pub const Cache = struct {
     shards: []Shard,
     used_bytes: std.atomic.Value(usize) = .init(0),
     entry_count: std.atomic.Value(usize) = .init(0),
+    kind_bytes: [@typeInfo(Kind).@"enum".fields.len]std.atomic.Value(usize) = .{
+        .init(0),
+        .init(0),
+        .init(0),
+        .init(0),
+    },
     access_clock: CounterU64 = .init(0),
     evict_cursor: std.atomic.Value(usize) = .init(0),
     pressure_target_bytes: std.atomic.Value(usize) = .init(0),
@@ -248,7 +263,9 @@ pub const Cache = struct {
     }
 
     pub fn snapshotStats(self: *const Cache) Stats {
-        return self.stats.snapshot(self.currentBytes(), self.entryCount());
+        var by_kind: [@typeInfo(Kind).@"enum".fields.len]usize = undefined;
+        inline for (0..by_kind.len) |i| by_kind[i] = self.kind_bytes[i].load(.monotonic);
+        return self.stats.snapshot(self.currentBytes(), self.entryCount(), by_kind);
     }
 
     pub fn valueAllocator(self: *const Cache) Allocator {
@@ -493,6 +510,7 @@ pub const Cache = struct {
         gop.value_ptr.* = entry;
         self.linkEntryLocked(shard, entry);
         _ = self.used_bytes.fetchAdd(byte_cost, .monotonic);
+        _ = self.kind_bytes[@intFromEnum(kind)].fetchAdd(byte_cost, .monotonic);
         _ = self.entry_count.fetchAdd(1, .monotonic);
         self.bumpInsert(kind);
         if (locked) shard.mutex.unlock();
@@ -583,6 +601,7 @@ pub const Cache = struct {
         std.debug.assert(entry.ref_count == 0);
         self.unlinkEntryLocked(shard, entry);
         _ = self.used_bytes.fetchSub(entry.byte_cost, .monotonic);
+        _ = self.kind_bytes[@intFromEnum(entry.kind)].fetchSub(entry.byte_cost, .monotonic);
         _ = self.entry_count.fetchSub(1, .monotonic);
         self.bumpEviction(entry.kind);
         entry.deinit(self.allocator);

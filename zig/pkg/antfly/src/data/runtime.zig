@@ -235,7 +235,9 @@ const RaftTableApplyStateMachine = struct {
         self: *RaftTableApplyStateMachine,
         storage: *antfly.public_api.ProvisionedGroupStorage,
     ) void {
-        self.write_cache.lsm_cache = &storage.lsm_cache;
+        // Apply/write replay should not populate the shared query-side LSM
+        // block cache. This keeps indexing memory separate from read caching.
+        self.write_cache.lsm_cache = null;
         self.write_cache.hbc_cache = &storage.hbc_cache;
         self.write_cache.resource_manager = &storage.resource_manager;
         self.write_cache.backend_runtime = storage.backend_runtime;
@@ -669,6 +671,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.dense_routing_working_set,
         resource_manager_mod.Slice.derived_replay_window,
         resource_manager_mod.Slice.full_text_pending_segments,
+        resource_manager_mod.Slice.full_text_build_working_set,
         resource_manager_mod.Slice.derived_backlog,
         resource_manager_mod.Slice.text_merge_buffers,
         resource_manager_mod.Slice.algebraic_tensor_accumulators,
