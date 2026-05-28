@@ -6568,102 +6568,108 @@ pub const IndexManager = struct {
 
         var source_start: usize = 0;
         while (source_start < source_docs_with_ordinals.len) {
-            var projection_arena_state = std.heap.ArenaAllocator.init(self.alloc);
-            defer projection_arena_state.deinit();
-            var projection_tracking = PhaseTrackingAllocator.init(projection_arena_state.allocator(), &projection_alloc_stats);
-            const projection_alloc = if (detailed_profile_enabled) projection_tracking.allocator() else projection_arena_state.allocator();
-            var observed_field_analyzers = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
-            defer observed_field_analyzers.deinit(projection_alloc);
-            var projected_source_ends = std.ArrayListUnmanaged(usize).empty;
-            defer projected_source_ends.deinit(projection_alloc);
-            var builder = mapper.TextProjectionBatchBuilder.init(projection_alloc, entry.text_analysis, entry.runtime_schema, &observed_field_analyzers);
-            defer builder.deinit();
+            var next_source_start = source_start;
+            {
+                var projection_arena_state = std.heap.ArenaAllocator.init(self.alloc);
+                defer projection_arena_state.deinit();
+                var projection_tracking = PhaseTrackingAllocator.init(projection_arena_state.allocator(), &projection_alloc_stats);
+                const projection_alloc = if (detailed_profile_enabled) projection_tracking.allocator() else projection_arena_state.allocator();
+                var observed_field_analyzers = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
+                defer observed_field_analyzers.deinit(projection_alloc);
+                var builder = mapper.TextProjectionBatchBuilder.init(projection_alloc, entry.text_analysis, entry.runtime_schema, &observed_field_analyzers);
+                defer builder.deinit();
 
-            var source_end = source_start;
-            var projection_doc_limit: usize = 0;
-            while (source_end < source_docs_with_ordinals.len) {
-                const projection_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
-                const previous_projection_docs = builder.text_docs.items.len;
-                try builder.appendSourceDoc(source_docs_with_ordinals[source_end]);
-                if (metrics_enabled) projection_ns +|= platform_time.monotonicNs() - projection_start_ns;
-                source_end += 1;
-                if (builder.text_docs.items.len > previous_projection_docs) {
-                    try projected_source_ends.append(projection_alloc, source_end);
+                var source_end = source_start;
+                var projection_doc_limit: usize = 0;
+                var projected_build_bytes: u64 = 0;
+                var projected_segment_bytes: u64 = 0;
+                while (source_end < source_docs_with_ordinals.len) {
+                    const projection_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
+                    const previous_projection_docs = builder.text_docs.items.len;
+                    try builder.appendSourceDoc(source_docs_with_ordinals[source_end]);
+                    if (metrics_enabled) projection_ns +|= platform_time.monotonicNs() - projection_start_ns;
+                    source_end += 1;
+
+                    if (builder.text_docs.items.len == previous_projection_docs) {
+                        next_source_start = source_end;
+                        continue;
+                    }
+
+                    const projected_doc = builder.text_docs.items[builder.text_docs.items.len - 1];
+                    const doc_build_bytes = introducer_mod.estimateTextDocumentBuildMemoryBytes(projected_doc);
+                    const doc_segment_bytes = introducer_mod.estimateTextDocumentSegmentBytes(projected_doc);
+                    const next_build_bytes = projected_build_bytes +| doc_build_bytes;
+                    const next_segment_bytes = projected_segment_bytes +| doc_segment_bytes;
+                    if (previous_projection_docs > 0 and (next_build_bytes > target_build_memory_bytes or next_segment_bytes > target_segment_bytes)) {
+                        projection_doc_limit = previous_projection_docs;
+                        next_source_start = source_end - 1;
+                        break;
+                    }
+
+                    projected_build_bytes = next_build_bytes;
+                    projected_segment_bytes = next_segment_bytes;
+                    projection_doc_limit = builder.text_docs.items.len;
+                    next_source_start = source_end;
+                    if (projection_doc_limit >= max_text_projection_docs_per_segment_build) break;
                 }
 
-                const batch = builder.batch();
-                if (batch.docs.len == 0) {
-                    source_start = source_end;
+                const projection_batch = mapper.TextProjectionBatch{
+                    .docs = builder.text_docs.items[0..projection_doc_limit],
+                    .observed_field_analyzers = builder.batch().observed_field_analyzers,
+                };
+                if (projection_batch.docs.len == 0) {
+                    source_start = @max(source_start + 1, next_source_start);
                     continue;
                 }
-                const split = introducer_mod.splitTextDocumentsForBuildBudget(batch.docs, 0, .{
-                    .target_build_memory_bytes = target_build_memory_bytes,
-                    .target_segment_bytes = target_segment_bytes,
-                });
-                if (split.end < batch.docs.len or split.reason != .end or batch.docs.len >= max_text_projection_docs_per_segment_build) {
-                    projection_doc_limit = split.end;
-                    source_end = projected_source_ends.items[split.end - 1];
-                    break;
+                projection_doc_count += projection_batch.docs.len;
+                observed_field_analyzer_count += projection_batch.observed_field_analyzers.len;
+                if (detailed_profile_enabled) memory_after_projection = process_memory.snapshot();
+                if (projection_batch.observed_field_analyzers.len > 0) {
+                    const analyzer_merge_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
+                    try mergeObservedTextFieldAnalyzers(self, store, entry, projection_batch.observed_field_analyzers);
+                    if (metrics_enabled) analyzer_merge_ns +|= platform_time.monotonicNs() - analyzer_merge_start_ns;
+                }
+                if (detailed_profile_enabled) memory_after_analyzer_merge = process_memory.snapshot();
+
+                var start: usize = 0;
+                while (start < projection_batch.docs.len) {
+                    const split = introducer_mod.splitTextDocumentsForBuildBudget(projection_batch.docs, start, .{
+                        .target_build_memory_bytes = target_build_memory_bytes,
+                        .target_segment_bytes = target_segment_bytes,
+                    });
+                    const end = split.end;
+                    switch (split.reason) {
+                        .build_memory => flush_build_memory_count +|= 1,
+                        .segment_bytes => flush_segment_bytes_count +|= 1,
+                        .end => flush_end_count +|= 1,
+                    }
+                    if (split.oversized_doc) oversized_doc_count +|= 1;
+                    estimated_build_bytes_peak = @max(estimated_build_bytes_peak, split.estimated_build_bytes);
+                    estimated_segment_bytes_peak = @max(estimated_segment_bytes_peak, split.estimated_segment_bytes);
+                    const chunk: mapper.TextProjectionBatch = .{
+                        .docs = projection_batch.docs[start..end],
+                        .observed_field_analyzers = &.{},
+                    };
+                    const build_options = introducer_mod.BuildTextOptions{
+                        .profile = if (detailed_profile_enabled) &text_build_profile else null,
+                        .resource_manager = self.resource_manager,
+                        .build_memory_target_bytes = target_build_memory_bytes,
+                        .doc_scratch_retained_bytes = doc_scratch_retained_bytes,
+                    };
+                    var build_ctx = TextSegmentSinkBuildContext{
+                        .alloc = segment_alloc,
+                        .projection_batch = chunk,
+                        .text_analysis = entry.text_analysis,
+                        .build_options = build_options,
+                    };
+                    const built_len = try entry.persistent.indexSegmentFromSinkBuilder(&build_ctx, buildTextSegmentIntoSink);
+                    segment_bytes += built_len;
+                    segment_count += 1;
+                    indexed_any = true;
+                    start = end;
                 }
             }
-
-            if (projection_doc_limit == 0) projection_doc_limit = builder.text_docs.items.len;
-            const projection_batch = mapper.TextProjectionBatch{
-                .docs = builder.text_docs.items[0..projection_doc_limit],
-                .observed_field_analyzers = builder.batch().observed_field_analyzers,
-            };
-            if (projection_batch.docs.len == 0) {
-                source_start = @max(source_start + 1, source_end);
-                continue;
-            }
-            projection_doc_count += projection_batch.docs.len;
-            observed_field_analyzer_count += projection_batch.observed_field_analyzers.len;
-            if (detailed_profile_enabled) memory_after_projection = process_memory.snapshot();
-            if (projection_batch.observed_field_analyzers.len > 0) {
-                const analyzer_merge_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
-                try mergeObservedTextFieldAnalyzers(self, store, entry, projection_batch.observed_field_analyzers);
-                if (metrics_enabled) analyzer_merge_ns +|= platform_time.monotonicNs() - analyzer_merge_start_ns;
-            }
-            if (detailed_profile_enabled) memory_after_analyzer_merge = process_memory.snapshot();
-
-            var start: usize = 0;
-            while (start < projection_batch.docs.len) {
-                const split = introducer_mod.splitTextDocumentsForBuildBudget(projection_batch.docs, start, .{
-                    .target_build_memory_bytes = target_build_memory_bytes,
-                    .target_segment_bytes = target_segment_bytes,
-                });
-                const end = split.end;
-                switch (split.reason) {
-                    .build_memory => flush_build_memory_count +|= 1,
-                    .segment_bytes => flush_segment_bytes_count +|= 1,
-                    .end => flush_end_count +|= 1,
-                }
-                if (split.oversized_doc) oversized_doc_count +|= 1;
-                estimated_build_bytes_peak = @max(estimated_build_bytes_peak, split.estimated_build_bytes);
-                estimated_segment_bytes_peak = @max(estimated_segment_bytes_peak, split.estimated_segment_bytes);
-                const chunk: mapper.TextProjectionBatch = .{
-                    .docs = projection_batch.docs[start..end],
-                    .observed_field_analyzers = &.{},
-                };
-                const build_options = introducer_mod.BuildTextOptions{
-                    .profile = if (detailed_profile_enabled) &text_build_profile else null,
-                    .resource_manager = self.resource_manager,
-                    .build_memory_target_bytes = target_build_memory_bytes,
-                    .doc_scratch_retained_bytes = doc_scratch_retained_bytes,
-                };
-                var build_ctx = TextSegmentSinkBuildContext{
-                    .alloc = segment_alloc,
-                    .projection_batch = chunk,
-                    .text_analysis = entry.text_analysis,
-                    .build_options = build_options,
-                };
-                const built_len = try entry.persistent.indexSegmentFromSinkBuilder(&build_ctx, buildTextSegmentIntoSink);
-                segment_bytes += built_len;
-                segment_count += 1;
-                indexed_any = true;
-                start = end;
-            }
-            source_start = source_end;
+            source_start = next_source_start;
         }
         text_build_profile.build_memory_target_bytes = @intCast(target_build_memory_bytes);
         text_build_profile.flush_build_memory_count = flush_build_memory_count;
