@@ -57,18 +57,63 @@ const ExtraSection = struct {
     data: []const u8,
 };
 
+const FieldPostingsBuilder = struct {
+    active: bool = false,
+    builder: inverted.InvertedIndexBuilder = undefined,
+
+    fn init(alloc: Allocator) !FieldPostingsBuilder {
+        return .{
+            .active = true,
+            .builder = inverted.InvertedIndexBuilder.init(alloc, .{}),
+        };
+    }
+
+    fn deinit(self: *FieldPostingsBuilder, alloc: Allocator) void {
+        _ = alloc;
+        if (!self.active) return;
+        self.builder.deinit();
+        self.active = false;
+        self.builder = undefined;
+    }
+
+    fn addDocument(self: *FieldPostingsBuilder, doc_idx: u32, hits: []const inverted.InvertedIndexBuilder.TermHit) !void {
+        try self.builder.addDocument(doc_idx, hits);
+    }
+
+    fn buildAlloc(self: *FieldPostingsBuilder, output_alloc: Allocator) ![]u8 {
+        return try self.builder.buildAlloc(output_alloc);
+    }
+};
+
+fn deinitFieldPostingsBuilders(
+    alloc: Allocator,
+    builders: *std.StringHashMapUnmanaged(FieldPostingsBuilder),
+) void {
+    var it = builders.valueIterator();
+    while (it.next()) |builder| builder.deinit(alloc);
+    builders.deinit(alloc);
+}
+
+fn ensureFieldPostingsBuilder(
+    alloc: Allocator,
+    builders: *std.StringHashMapUnmanaged(FieldPostingsBuilder),
+    field_name: []const u8,
+) !*FieldPostingsBuilder {
+    const gop = try builders.getOrPut(alloc, field_name);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = field_name;
+        gop.value_ptr.* = try FieldPostingsBuilder.init(alloc);
+    }
+    return gop.value_ptr;
+}
+
 fn buildSegmentWithExtraSections(
     alloc: Allocator,
     batch: Batch,
     extra_sections: []const ExtraSection,
 ) ![]u8 {
-    // Group term hits by field
-    var field_builders = std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder).empty;
-    defer {
-        var it = field_builders.valueIterator();
-        while (it.next()) |b| b.deinit();
-        field_builders.deinit(alloc);
-    }
+    var field_builders = std.StringHashMapUnmanaged(FieldPostingsBuilder).empty;
+    defer deinitFieldPostingsBuilders(alloc, &field_builders);
 
     var seg_writer = segment_mod.SegmentWriter.init(alloc);
     defer seg_writer.deinit();
@@ -83,11 +128,8 @@ fn buildSegmentWithExtraSections(
 
         // Process each field's term hits
         for (doc.fields) |field| {
-            const gop = try field_builders.getOrPut(alloc, field.field_name);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = inverted.InvertedIndexBuilder.init(alloc, .{});
-            }
-            try gop.value_ptr.addDocument(@intCast(doc_idx), field.hits);
+            const builder = try ensureFieldPostingsBuilder(alloc, &field_builders, field.field_name);
+            try builder.addDocument(@intCast(doc_idx), field.hits);
 
             // Ensure field exists in segment
             const fi_gop = try field_indices.getOrPut(alloc, field.field_name);
@@ -111,16 +153,18 @@ fn buildSegmentWithExtraSections(
     var fit = field_builders.iterator();
     while (fit.next()) |entry| {
         const field_name = entry.key_ptr.*;
-        const inv_data = try entry.value_ptr.build();
+        const inv_data = try entry.value_ptr.buildAlloc(alloc);
         errdefer alloc.free(inv_data);
 
         if (inv_data.len == 0) {
             alloc.free(inv_data);
+            entry.value_ptr.deinit(alloc);
             continue;
         }
 
         const field_idx = field_indices.get(field_name).?;
         try seg_writer.addSectionOwned(field_idx, .inverted_text, inv_data);
+        entry.value_ptr.deinit(alloc);
     }
 
     // Attach any additional field sections, such as typed doc values.
@@ -236,6 +280,21 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
     text_analysis: TextAnalysisConfig,
     options: BuildTextOptions,
 ) ![]u8 {
+    var sink_impl = segment_mod.MemorySegmentSink.init(alloc);
+    errdefer sink_impl.deinit();
+    var sink = sink_impl.sink();
+    try writeSegmentFromTextWithAnalysisOptions(alloc, docs, default_analyzer, text_analysis, options, &sink);
+    return try sink_impl.finishOwned();
+}
+
+pub fn writeSegmentFromTextWithAnalysisOptions(
+    alloc: Allocator,
+    docs: []const TextDocument,
+    default_analyzer: *const analysis_mod.Analyzer,
+    text_analysis: TextAnalysisConfig,
+    options: BuildTextOptions,
+    sink: *segment_mod.SegmentSink,
+) !void {
     const profile = options.profile;
     if (profile) |p| {
         p.doc_count +|= @intCast(docs.len);
@@ -247,12 +306,8 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
         typed_sections.deinit(alloc);
     }
 
-    var field_builders = std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder).empty;
-    defer {
-        var it = field_builders.valueIterator();
-        while (it.next()) |b| b.deinit();
-        field_builders.deinit(alloc);
-    }
+    var field_builders = std.StringHashMapUnmanaged(FieldPostingsBuilder).empty;
+    defer deinitFieldPostingsBuilders(alloc, &field_builders);
 
     var seg_writer = segment_mod.SegmentWriter.init(alloc);
     defer seg_writer.deinit();
@@ -366,12 +421,8 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
                 if (hits.items.len == 0) continue;
 
                 const field_name = field_entry.key_ptr.*;
-                const builder_gop = try field_builders.getOrPut(alloc, field_name);
-                if (!builder_gop.found_existing) {
-                    builder_gop.key_ptr.* = field_name;
-                    builder_gop.value_ptr.* = inverted.InvertedIndexBuilder.init(alloc, .{});
-                }
-                try builder_gop.value_ptr.addDocument(@intCast(doc_idx), hits.items);
+                const builder = try ensureFieldPostingsBuilder(alloc, &field_builders, field_name);
+                try builder.addDocument(@intCast(doc_idx), hits.items);
 
                 const field_index_gop = try field_indices.getOrPut(alloc, field_name);
                 if (!field_index_gop.found_existing) {
@@ -425,16 +476,18 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
     var fit = field_builders.iterator();
     while (fit.next()) |entry| {
         const field_name = entry.key_ptr.*;
-        const inv_data = try entry.value_ptr.build();
+        const inv_data = try entry.value_ptr.buildAlloc(alloc);
         errdefer alloc.free(inv_data);
 
         if (inv_data.len == 0) {
             alloc.free(inv_data);
+            entry.value_ptr.deinit(alloc);
             continue;
         }
 
         const field_idx = field_indices.get(field_name).?;
         try seg_writer.addSectionOwned(field_idx, .inverted_text, inv_data);
+        entry.value_ptr.deinit(alloc);
     }
 
     for (typed_sections.items) |*section| {
@@ -450,14 +503,14 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
     if (profile) |p| p.section_attach_ns +|= platform_time.monotonicNs() - section_attach_start_ns;
 
     const segment_assembly_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
-    const segment = try seg_writer.build();
+    const segment_start_len = sink.len();
+    try seg_writer.writeToSink(sink);
     if (profile) |p| {
         p.segment_assembly_ns +|= platform_time.monotonicNs() - segment_assembly_start_ns;
         p.stored_compress_ns +|= seg_writer.last_stored_compress_ns;
         p.segment_encode_ns +|= platform_time.monotonicNs() - segment_encode_start_ns;
-        p.segment_bytes +|= @intCast(segment.len);
+        p.segment_bytes +|= @intCast(sink.len() - segment_start_len);
     }
-    return segment;
 }
 
 const TermAcc = struct {
@@ -498,7 +551,7 @@ fn cachedFieldAnalyzer(
 fn addSingleTextFieldToBuilders(
     alloc: Allocator,
     doc_alloc: Allocator,
-    field_builders: *std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder),
+    field_builders: *std.StringHashMapUnmanaged(FieldPostingsBuilder),
     field_indices: *std.StringHashMapUnmanaged(u16),
     seg_writer: *segment_mod.SegmentWriter,
     analyzer_cache: *std.StringHashMapUnmanaged(*const analysis_mod.Analyzer),
@@ -585,19 +638,15 @@ fn tokenTermsAreUnique(tokens: []const analysis_mod.Token) bool {
 
 fn addFieldHitsToBuilder(
     alloc: Allocator,
-    field_builders: *std.StringHashMapUnmanaged(inverted.InvertedIndexBuilder),
+    field_builders: *std.StringHashMapUnmanaged(FieldPostingsBuilder),
     field_indices: *std.StringHashMapUnmanaged(u16),
     seg_writer: *segment_mod.SegmentWriter,
     doc_idx: u32,
     field_name: []const u8,
     hits: []const inverted.InvertedIndexBuilder.TermHit,
 ) !void {
-    const builder_gop = try field_builders.getOrPut(alloc, field_name);
-    if (!builder_gop.found_existing) {
-        builder_gop.key_ptr.* = field_name;
-        builder_gop.value_ptr.* = inverted.InvertedIndexBuilder.init(alloc, .{});
-    }
-    try builder_gop.value_ptr.addDocument(doc_idx, hits);
+    const builder = try ensureFieldPostingsBuilder(alloc, field_builders, field_name);
+    try builder.addDocument(doc_idx, hits);
 
     const field_index_gop = try field_indices.getOrPut(alloc, field_name);
     if (!field_index_gop.found_existing) {

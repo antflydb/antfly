@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const vector_codec = @import("antfly_vector").codec;
 const regex_mod = @import("antfly_regex");
 const introducer_mod = @import("../../introducer.zig");
+const segment_mod = @import("../../segment.zig");
 const analysis_mod = @import("../../search/analysis.zig");
 const schema_api = @import("../../schema/mod.zig");
 const runtime_schema = @import("../schema.zig");
@@ -129,7 +130,7 @@ pub const BuildTextSegmentResult = struct {
     }
 };
 
-pub const default_text_segment_target_bytes: usize = 256 * 1024 * 1024;
+pub const default_text_segment_target_bytes: usize = 32 * 1024 * 1024;
 
 pub const BuildTextSegmentsOptions = struct {
     target_segment_bytes: usize = default_text_segment_target_bytes,
@@ -404,6 +405,19 @@ fn buildTextSegmentFromProjectionBatchWithProfile(
     });
 }
 
+pub fn writeTextSegmentFromProjectionBatchToSink(
+    alloc: Allocator,
+    projection_batch: TextProjectionBatch,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    profile: ?*introducer_mod.BuildTextProfile,
+    sink: *segment_mod.SegmentSink,
+) !void {
+    if (projection_batch.docs.len == 0) return;
+    try introducer_mod.writeSegmentFromTextWithAnalysisOptions(alloc, projection_batch.docs, &analysis_mod.default_analyzer, text_analysis, .{
+        .profile = profile,
+    }, sink);
+}
+
 pub fn buildTextSegmentsFromProjectionBatch(
     alloc: Allocator,
     projection_batch: TextProjectionBatch,
@@ -442,7 +456,7 @@ pub fn freeTextSegments(alloc: Allocator, segments: [][]u8) void {
     if (segments.len > 0) alloc.free(segments);
 }
 
-fn splitProjectionDocsEnd(docs: []const introducer_mod.TextDocument, start: usize, target_bytes: usize) usize {
+pub fn splitProjectionDocsEnd(docs: []const introducer_mod.TextDocument, start: usize, target_bytes: usize) usize {
     var total: usize = 0;
     var end = start;
     while (end < docs.len) : (end += 1) {

@@ -207,6 +207,8 @@ pub const SegmentWriter = struct {
                 section.offset = out.items.len;
                 try out.appendSlice(self.alloc, section.data);
                 section.length = section.data.len;
+                self.alloc.free(section.data);
+                section.data = &.{};
             }
         }
 
@@ -227,6 +229,39 @@ pub const SegmentWriter = struct {
         try out.appendSlice(self.alloc, &magic);
 
         return try out.toOwnedSlice(self.alloc);
+    }
+
+    /// Write the final segment file bytes into `sink`.
+    ///
+    /// This is the file-backed analogue of `build()`: it preserves the same
+    /// on-disk layout while avoiding a heap allocation for the final segment
+    /// buffer. As with `build()`, attached section buffers are consumed.
+    pub fn writeToSink(self: *SegmentWriter, sink: *SegmentSink) !void {
+        const stored_offset: u64 = @intCast(sink.len());
+        try self.writeStoredFieldsToSink(sink);
+
+        for (self.fields.items) |*field| {
+            for (field.sections.items) |*section| {
+                section.offset = sink.len();
+                try sink.appendSlice(section.data);
+                section.length = section.data.len;
+                self.alloc.free(section.data);
+                section.data = &.{};
+            }
+        }
+
+        const sections_index_offset: u64 = @intCast(sink.len());
+        try self.writeSectionIndexToSink(sink);
+
+        const footer_start = sink.len();
+        try sinkAppendU64BE(sink, @intCast(self.doc_count));
+        try sinkAppendU64BE(sink, stored_offset);
+        try sinkAppendU64BE(sink, sections_index_offset);
+        try sinkAppendU32BE(sink, 0);
+        try sinkAppendU32BE(sink, segment_version);
+        const crc = try sink.crc32Prefix(footer_start + 32);
+        try sinkAppendU32BE(sink, crc);
+        try sink.appendSlice(&magic);
     }
 
     fn estimatedBuildSize(self: *const SegmentWriter) usize {
@@ -305,6 +340,39 @@ pub const SegmentWriter = struct {
         }
     }
 
+    fn writeStoredFieldsToSink(self: *SegmentWriter, sink: *SegmentSink) !void {
+        const num_docs: u32 = @intCast(self.stored_fields.items.len);
+        const section_start = sink.len();
+
+        try sink.appendByte(stored_fields_version_uncompressed_offsets);
+        self.last_stored_compress_ns = 0;
+        try sinkAppendU32LE(sink, num_docs);
+
+        const offset_table_start = sink.len();
+        try sink.appendNTimes(0, @as(usize, num_docs) * 8);
+
+        for (self.stored_fields.items, 0..) |*doc, i| {
+            const doc_offset: u64 = @intCast(sink.len() - section_start);
+            const off_pos = offset_table_start + i * 8;
+            try sink.writeAt(off_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, doc_offset))));
+
+            try sinkAppendU16LE(sink, @intCast(doc.id.len));
+            try sink.appendSlice(doc.id);
+
+            if (doc.is_compressed) {
+                const compress_start = platform_time.monotonicNs();
+                const decoded = try snappy.decode(self.alloc, doc.data);
+                defer self.alloc.free(decoded);
+                self.last_stored_compress_ns +|= platform_time.monotonicNs() - compress_start;
+                try sinkAppendU32LE(sink, @intCast(decoded.len));
+                try sink.appendSlice(decoded);
+            } else {
+                try sinkAppendU32LE(sink, @intCast(doc.data.len));
+                try sink.appendSlice(doc.data);
+            }
+        }
+    }
+
     fn writeSectionIndex(self: *SegmentWriter, out: *std.ArrayListUnmanaged(u8)) !void {
         // Sections index format (big-endian):
         //   [num_fields: u16 BE]
@@ -325,6 +393,21 @@ pub const SegmentWriter = struct {
                 try appendU16BE(self.alloc, out, @intFromEnum(section.section_type));
                 try appendU64BE(self.alloc, out, @intCast(section.offset));
                 try appendU64BE(self.alloc, out, @intCast(section.length));
+            }
+        }
+    }
+
+    fn writeSectionIndexToSink(self: *SegmentWriter, sink: *SegmentSink) !void {
+        try sinkAppendU16BE(sink, @intCast(self.fields.items.len));
+        for (self.fields.items) |*field| {
+            try sinkAppendU16BE(sink, @intCast(field.name.len));
+            try sink.appendSlice(field.name);
+            try sinkAppendU16BE(sink, @intCast(field.sections.items.len));
+
+            for (field.sections.items) |*section| {
+                try sinkAppendU16BE(sink, @intFromEnum(section.section_type));
+                try sinkAppendU64BE(sink, @intCast(section.offset));
+                try sinkAppendU64BE(sink, @intCast(section.length));
             }
         }
     }

@@ -203,7 +203,7 @@ pub fn mergeSegmentsBounded(
     if (live_docs == 0) return try alloc.alloc([]u8, 0);
 
     const target_bytes = @max(@as(usize, 1), options.target_segment_bytes);
-    if (live_docs <= 1 or total_input_bytes <= target_bytes) {
+    if (live_docs <= 1) {
         const segments = try alloc.alloc([]u8, 1);
         errdefer alloc.free(segments);
         segments[0] = try segment_mod.mergeSegmentInputs(alloc, inputs);
@@ -224,10 +224,16 @@ pub fn mergeSegmentsBounded(
 
     var window_start: u32 = 0;
     while (window_start < live_docs) {
-        const window_end = @min(live_docs, window_start + docs_per_segment);
-        const segment = try mergeLiveDocWindow(alloc, inputs, window_start, window_end);
+        var window_len = @min(docs_per_segment, live_docs - window_start);
+        const segment = while (true) {
+            const window_end = window_start + window_len;
+            const candidate = try mergeLiveDocWindow(alloc, inputs, window_start, window_end);
+            if (candidate.len <= target_bytes or window_len == 1) break candidate;
+            alloc.free(candidate);
+            window_len = @max(@as(u32, 1), window_len / 2);
+        };
         try outputs.append(alloc, segment);
-        window_start = window_end;
+        window_start += window_len;
     }
 
     return try outputs.toOwnedSlice(alloc);

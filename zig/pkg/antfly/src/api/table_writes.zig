@@ -19,6 +19,7 @@ const scraping = @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const backups_api = @import("backups.zig");
+const metadata_admin = @import("../metadata/admin.zig");
 const metadata_mod = @import("../metadata/mod.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -4332,18 +4333,25 @@ pub const ProvisionedTableWriteSource = struct {
             grouped.deinit(alloc);
         }
 
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+        defer metadata_admin.freeRangeRefs(alloc, ranges);
+        if (ranges.len == 0) return null;
+
         for (req.writes) |write| {
-            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, write.key)) orelse return null;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, write.key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.writes.append(alloc, write);
         }
         for (req.deletes) |key| {
-            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse return null;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.deletes.append(alloc, key);
         }
         for (req.transforms) |transform| {
-            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, transform.key)) orelse return null;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, transform.key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.transforms.append(alloc, transform);
         }
@@ -5335,18 +5343,25 @@ pub const HostedProvisionedTableWriteSource = struct {
             grouped.deinit(alloc);
         }
 
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+        defer metadata_admin.freeRangeRefs(alloc, ranges);
+        if (ranges.len == 0) return null;
+
         for (req.writes) |write| {
-            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, write.key)) orelse return null;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, write.key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.writes.append(alloc, write);
         }
         for (req.deletes) |key| {
-            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse return null;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.deletes.append(alloc, key);
         }
         for (req.transforms) |transform| {
-            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, transform.key)) orelse return null;
+            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, transform.key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.transforms.append(alloc, transform);
         }

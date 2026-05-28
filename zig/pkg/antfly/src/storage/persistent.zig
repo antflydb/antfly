@@ -305,6 +305,63 @@ const SegmentFileStore = struct {
     }
 };
 
+const AtomicSegmentSink = struct {
+    writer: *storage_io.AtomicWriteSink,
+
+    fn sink(self: *AtomicSegmentSink) segment_mod.SegmentSink {
+        return .{
+            .ptr = self,
+            .vtable = &atomic_segment_sink_vtable,
+        };
+    }
+
+    fn len(ptr: *anyopaque) usize {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        return self.writer.len();
+    }
+
+    fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        try self.writer.appendSlice(bytes);
+    }
+
+    fn appendByte(ptr: *anyopaque, byte: u8) !void {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        try self.writer.appendByte(byte);
+    }
+
+    fn appendNTimes(ptr: *anyopaque, byte: u8, count: usize) !void {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        var buf: [4096]u8 = undefined;
+        @memset(&buf, byte);
+        var remaining = count;
+        while (remaining > 0) {
+            const n = @min(remaining, buf.len);
+            try self.writer.appendSlice(buf[0..n]);
+            remaining -= n;
+        }
+    }
+
+    fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        try self.writer.writeAt(offset, bytes);
+    }
+
+    fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        return try self.writer.crc32Prefix(len_prefix);
+    }
+};
+
+const atomic_segment_sink_vtable = segment_mod.SegmentSink.VTable{
+    .len = AtomicSegmentSink.len,
+    .append_slice = AtomicSegmentSink.appendSlice,
+    .append_byte = AtomicSegmentSink.appendByte,
+    .append_ntimes = AtomicSegmentSink.appendNTimes,
+    .write_at = AtomicSegmentSink.writeAt,
+    .crc32_prefix = AtomicSegmentSink.crc32Prefix,
+};
+
 fn walCommitBackendForOptions(backend: lmdb.CommitBackend) wal_mod.CommitBackend {
     return switch (backend) {
         .sync => .sync,
@@ -501,6 +558,8 @@ pub const PersistentIndex = struct {
         .begin_write = beginWriteMainTxn,
         .begin_batch = beginWriteMainTxn,
     });
+
+    pub const SegmentSinkBuildFn = *const fn (*anyopaque, *segment_mod.SegmentSink) anyerror!void;
 
     const MainTxn = struct {
         read: ?backend_erased.NamespaceReadTxn = null,
@@ -1033,6 +1092,103 @@ pub const PersistentIndex = struct {
                 },
             );
         }
+    }
+
+    /// Build and publish one segment directly into the persistent segment
+    /// artifact when native segment files are available.
+    ///
+    /// Memory-only and synthetic storage backends fall back to the heap-backed
+    /// `indexSegmentOwned` path because they cannot mmap the final segment file.
+    pub fn indexSegmentFromSinkBuilder(
+        self: *PersistentIndex,
+        ctx: *anyopaque,
+        build_fn: SegmentSinkBuildFn,
+    ) !usize {
+        if (self.segment_files == null or self.segment_files.?.storage_owner == null) {
+            var sink_impl = segment_mod.MemorySegmentSink.init(self.alloc);
+            errdefer sink_impl.deinit();
+            var sink = sink_impl.sink();
+            try build_fn(ctx, &sink);
+            const segment_len = sink.len();
+            const owned = try sink_impl.finishOwned();
+            try self.indexSegmentOwned(owned);
+            return segment_len;
+        }
+
+        const profile_enabled = benchPersistentPublishEnabled();
+        const total_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        var reserve_id_ns: u64 = 0;
+        var materialize_ns: u64 = 0;
+        var persist_ns: u64 = 0;
+        var writer_publish_ns: u64 = 0;
+
+        const reserve_id_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        const seg_id = self.reserveSegmentId();
+        if (profile_enabled) reserve_id_ns = platform_time.monotonicNs() - reserve_id_start_ns;
+
+        const store = &self.segment_files.?;
+        const path = try store.pathAlloc(seg_id);
+        defer store.allocator.free(path);
+
+        const materialize_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        var writer = try store.storage.beginAtomicWrite(self.alloc, path);
+        var writer_active = true;
+        errdefer if (writer_active) writer.abort();
+
+        var sink_adapter = AtomicSegmentSink{ .writer = &writer };
+        var sink = sink_adapter.sink();
+        try build_fn(ctx, &sink);
+        const segment_len = sink.len();
+
+        writer_active = false;
+        try writer.finish();
+        if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
+
+        var segment_data: ?index_mod.SegmentData = .fromMapped(try mapSegmentFile(path));
+        errdefer {
+            if (segment_data) |*data| data.deinit(self.alloc);
+            self.deleteSegmentFile(seg_id);
+        }
+
+        var key_range = try extractSegmentKeyRange(self.alloc, segment_data.?.bytes());
+        defer key_range.deinit(self.alloc);
+
+        const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try self.saveSegmentRange(&txn, seg_id, key_range);
+        try self.updateActiveSegments(&txn, seg_id, .add);
+        const lsn_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, self.committed_lsn));
+        try txn.put(.meta, meta_committed_lsn, &lsn_bytes);
+        try txn.commit();
+        if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
+
+        const writer_publish_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        try self.writer.addSegmentWithIdData(seg_id, segment_data.?);
+        segment_data = null;
+        if (profile_enabled) writer_publish_ns = platform_time.monotonicNs() - writer_publish_start_ns;
+
+        if (profile_enabled) {
+            std.log.info(
+                "antfly_bench_text_publish seg_id={d} bytes={d} total_ms={d} wal_append_ms={d} reserve_id_ms={d} materialize_ms={d} persist_ms={d} writer_publish_ms={d} wal_truncate_ms={d} file_backed={} uses_segment_wal={}",
+                .{
+                    seg_id,
+                    segment_len,
+                    nsToMs(platform_time.monotonicNs() - total_start_ns),
+                    0,
+                    nsToMs(reserve_id_ns),
+                    nsToMs(materialize_ns),
+                    nsToMs(persist_ns),
+                    nsToMs(writer_publish_ns),
+                    0,
+                    true,
+                    false,
+                },
+            );
+        }
+        return segment_len;
     }
 
     /// Get current snapshot (lock-free, delegates to IndexWriter).
