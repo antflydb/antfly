@@ -39,6 +39,7 @@ pub const BackendFactory = struct {
     http: *httpx.Client,
     local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
+    termite_api_key: ?[]const u8 = null,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -55,6 +56,7 @@ pub const BackendFactory = struct {
     pub const Options = struct {
         local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
+        termite_api_key: ?[]const u8 = null,
     };
 
     pub fn initWithOptions(
@@ -67,6 +69,7 @@ pub const BackendFactory = struct {
             .http = http,
             .local_termite_provider = options.local_termite_provider,
             .secret_store = options.secret_store,
+            .termite_api_key = options.termite_api_key,
         };
     }
 
@@ -79,7 +82,7 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.local_termite_provider, self.secret_store);
+        return try BackendState.init(alloc, self.http, cfg, self.local_termite_provider, self.secret_store, self.termite_api_key);
     }
 };
 
@@ -101,13 +104,17 @@ const BackendState = struct {
         cfg: GeneratorConfig,
         local_termite_provider: ?managed_embedder.LocalTermiteProvider,
         secret_store: ?*common_secrets.FileStore,
+        termite_api_key: ?[]const u8,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
 
         state.alloc = alloc;
         state.cfg = cfg;
-        state.api_key = try common_secrets.SecretValue.initConfig(alloc, cfg.api_key);
+        state.api_key = switch (cfg.provider) {
+            .termite, .antfly => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key orelse termite_api_key, "ANTFLY_TERMITE_API_KEY"),
+            else => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
+        };
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
         state.auth_header_cache = .{};
         state.secret_store = secret_store;
@@ -170,7 +177,14 @@ const BackendState = struct {
                 }
                 break :blk try provider.generator().generate(alloc, model, inference_messages);
             },
-            .termite => |*provider| try provider.generator().generate(alloc, model, inference_messages),
+            .termite => |*provider| blk: {
+                if (self.api_key) |*api_key_ref| {
+                    const auth_header = try self.auth_header_cache.getOwned(self.alloc, alloc, api_key_ref, self.secret_store);
+                    defer alloc.free(auth_header);
+                    try provider.setAuthorizationHeader(auth_header);
+                }
+                break :blk try provider.generator().generate(alloc, model, inference_messages);
+            },
             .local_termite => |local| blk: {
                 const generate_text = local.generate_text orelse return error.UnsupportedGeneratorProvider;
                 const roles = try alloc.alloc([]const u8, messages.len);
