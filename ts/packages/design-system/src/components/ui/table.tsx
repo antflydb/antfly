@@ -18,18 +18,14 @@ function Table({ className, ...props }: React.ComponentProps<"table">) {
 
 function TableHeader({ className, ...props }: React.ComponentProps<"thead">) {
   return (
-    <>
-      <style>{`
-        thead[data-slot="table-header"] tr:hover {
-          background-color: transparent !important;
-        }
-      `}</style>
-      <thead
-        data-slot="table-header"
-        className={cn("[&>tr]:border-b-2", className)}
-        {...props}
-      />
-    </>
+    <thead
+      data-slot="table-header"
+      className={cn(
+        "[&>tr]:border-b-[1.5px] [&>tr]:border-border-strong [&>tr:hover]:bg-transparent",
+        className
+      )}
+      {...props}
+    />
   );
 }
 
