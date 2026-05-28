@@ -66,11 +66,20 @@ jobs:
   playwright:
     needs: [test]
     timeout-minutes: 60
-    runs-on: ubuntu-latest
+    runs-on: arc-antfly-heavy
+    env:
+      PNPM_STORE_PATH: /mnt/cache/pnpm-store
+      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+      XDG_CACHE_HOME: ${{ runner.temp }}/xdg
+      TMPDIR: ${{ runner.temp }}/tmp
     defaults:
       run:
         working-directory: ts
     steps:
+      - name: Prepare cache directories
+        run: mkdir -p "$PNPM_STORE_PATH" "$PLAYWRIGHT_BROWSERS_PATH" "$XDG_CACHE_HOME" "$TMPDIR"
+        working-directory: .
+
       - uses: actions/checkout@v6
 
       - name: Install pnpm
@@ -83,6 +92,9 @@ jobs:
           node-version: lts/*
           cache: 'pnpm'
           cache-dependency-path: ts/pnpm-lock.yaml
+
+      - name: Configure pnpm cache
+        run: pnpm config set store-dir "$PNPM_STORE_PATH"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

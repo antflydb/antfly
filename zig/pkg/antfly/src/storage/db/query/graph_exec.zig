@@ -1297,6 +1297,12 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
                 if (!(try jsonDocMatchesPatternFilter(alloc, key, doc, item))) return false;
             }
         }
+        if (bool_query.object.get("filter")) |filter| {
+            if (filter != .array or filter.array.items.len == 0) return error.InvalidArgument;
+            for (filter.array.items) |item| {
+                if (!(try jsonDocMatchesPatternFilter(alloc, key, doc, item))) return false;
+            }
+        }
 
         var saw_should = false;
         if (bool_query.object.get("should")) |should| {
@@ -1320,7 +1326,7 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
         }
 
         if (bool_query.object.count() == 0) return error.InvalidArgument;
-        if (!saw_should and bool_query.object.get("must") == null and bool_query.object.get("must_not") == null) {
+        if (!saw_should and bool_query.object.get("must") == null and bool_query.object.get("filter") == null and bool_query.object.get("must_not") == null) {
             return error.InvalidArgument;
         }
         return true;
@@ -1395,6 +1401,12 @@ pub fn patternFilterNeedsStoredDoc(filter_query: std.json.Value) !bool {
                 if (try patternFilterNeedsStoredDoc(item)) return true;
             }
         }
+        if (bool_query.object.get("filter")) |filter| {
+            if (filter != .array or filter.array.items.len == 0) return error.InvalidArgument;
+            for (filter.array.items) |item| {
+                if (try patternFilterNeedsStoredDoc(item)) return true;
+            }
+        }
 
         var saw_should = false;
         if (bool_query.object.get("should")) |should| {
@@ -1413,7 +1425,7 @@ pub fn patternFilterNeedsStoredDoc(filter_query: std.json.Value) !bool {
         }
 
         if (bool_query.object.count() == 0) return error.InvalidArgument;
-        if (!saw_should and bool_query.object.get("must") == null and bool_query.object.get("must_not") == null) {
+        if (!saw_should and bool_query.object.get("must") == null and bool_query.object.get("filter") == null and bool_query.object.get("must_not") == null) {
             return error.InvalidArgument;
         }
         return false;
@@ -1590,7 +1602,11 @@ pub fn compilePatternFilter(alloc: Allocator, filter_query: std.json.Value) anye
     if (filter_query.object.get("bool")) |bool_query| {
         if (bool_query != .object) return error.InvalidArgument;
         var compiled = CompiledPatternFilter.BoolQuery{};
-        if (bool_query.object.get("must")) |must| compiled.must = try compilePatternFilterArray(alloc, must);
+        var must = std.ArrayListUnmanaged(CompiledPatternFilter).empty;
+        errdefer must.deinit(alloc);
+        if (bool_query.object.get("filter")) |filter| try appendCompiledPatternFilterArray(alloc, &must, filter);
+        if (bool_query.object.get("must")) |must_value| try appendCompiledPatternFilterArray(alloc, &must, must_value);
+        if (must.items.len > 0) compiled.must = try must.toOwnedSlice(alloc);
         if (bool_query.object.get("should")) |should| compiled.should = try compilePatternFilterArray(alloc, should);
         if (bool_query.object.get("must_not")) |must_not| compiled.must_not = try compilePatternFilterArray(alloc, must_not);
         if (bool_query.object.count() == 0) return error.InvalidArgument;
@@ -1628,6 +1644,18 @@ fn compilePatternFilterArray(alloc: Allocator, items: std.json.Value) anyerror![
         compiled[i] = try compilePatternFilter(alloc, item);
     }
     return compiled;
+}
+
+fn appendCompiledPatternFilterArray(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(CompiledPatternFilter),
+    items: std.json.Value,
+) anyerror!void {
+    if (items != .array or items.array.items.len == 0) return error.InvalidArgument;
+    try out.ensureUnusedCapacity(alloc, items.array.items.len);
+    for (items.array.items) |item| {
+        out.appendAssumeCapacity(try compilePatternFilter(alloc, item));
+    }
 }
 
 fn compilePatternFieldPath(alloc: Allocator, field: []const u8) !CompiledPatternFilter.FieldPath {
@@ -2868,6 +2896,16 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     , .{});
     defer parsed_terms_with_null.deinit();
 
+    var parsed_bool_with_filter = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool":{"must":[{"term":{"published":"true"}}],"filter":[{"term":{"tag":"mango"}}]}}
+    , .{});
+    defer parsed_bool_with_filter.deinit();
+
+    var parsed_bool_with_filter_miss = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool":{"must":[{"term":{"published":"true"}}],"filter":[{"term":{"tag":"missing"}}]}}
+    , .{});
+    defer parsed_bool_with_filter_miss.deinit();
+
     var parsed_geo_doc = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"published":true,"tag":"mango","score":5.0,"ip":"10.1.2.3","location":{"lon":-122.4194,"lat":37.7749},"meta":{"deleted_at":"2026-01-01T00:00:00Z","archived":false,"optional":null}}
     , .{});
@@ -2888,6 +2926,15 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_path_exists.value));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_path_term_bool.value));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_terms_with_null.value));
+    try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_bool_with_filter.value));
+    try std.testing.expect(!(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_bool_with_filter_miss.value)));
+
+    var compiled_arena = std.heap.ArenaAllocator.init(alloc);
+    defer compiled_arena.deinit();
+    const compiled = try compilePatternFilter(compiled_arena.allocator(), parsed_bool_with_filter.value);
+    try std.testing.expect(compiled == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), compiled.bool_query.must.len);
+    try std.testing.expect(try compiled.matches(alloc, "doc:b", parsed_geo_doc.value));
 }
 
 test "executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents" {
