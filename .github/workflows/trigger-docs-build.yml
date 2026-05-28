@@ -9,7 +9,6 @@ on:
       - 'examples/**'
       - 'docs/**'
       - 'go/pkg/operator/docs/**'
-      - 'go/pkg/termite/registry/index.json'
 
 jobs:
   trigger:

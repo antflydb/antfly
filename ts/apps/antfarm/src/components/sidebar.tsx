@@ -537,8 +537,8 @@ export function AppSidebar({
           </SidebarGroup>
         )}
 
-        {/* Termite Management */}
-        {currentProduct === "termite" && (
+        {/* Inference Management */}
+        {currentProduct === "inference" && (
           <>
             <SidebarGroup>
               <SidebarGroupLabel className="mono-label">Management</SidebarGroupLabel>

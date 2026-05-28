@@ -142,7 +142,7 @@ export type RerankerConfig = components["schemas"]["RerankerConfig"];
 export type GeneratorConfig = components["schemas"]["GeneratorConfig"];
 export type EmbedderProvider = components["schemas"]["EmbedderProvider"];
 export const embedderProviders: components["schemas"]["EmbedderProvider"][] = [
-  "termite",
+  "antfly",
   "ollama",
   "gemini",
   "vertex",
@@ -154,13 +154,13 @@ export const embedderProviders: components["schemas"]["EmbedderProvider"][] = [
 ];
 export type GeneratorProvider = components["schemas"]["GeneratorProvider"];
 export const generatorProviders: components["schemas"]["GeneratorProvider"][] = [
+  "antfly",
   "ollama",
   "gemini",
   "openai",
   "anthropic",
   "vertex",
   "cohere",
-  "termite",
   "openrouter",
 ];
 

@@ -27,5 +27,5 @@
   "artifacts": {
     "root": "/tmp/termite-grpo-text-qwen2-fast"
   },
-  "backend": "blas"
+  "backend": "native"
 }

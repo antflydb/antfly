@@ -109,8 +109,8 @@ function AppContent() {
                       </>
                     )}
 
-                    {/* Termite routes */}
-                    {isProductEnabled("termite") && (
+                    {/* Inference routes */}
+                    {isProductEnabled("inference") && (
                       <>
                         <Route path="/models" element={<ModelsPage />} />
                         <Route path="/playground/chunk" element={<ChunkingPlaygroundPage />} />

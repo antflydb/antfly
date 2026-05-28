@@ -21,7 +21,7 @@ import {
   SelectValue,
   Textarea,
 } from "@antfly/design-system";
-import { type EmbedResponse, TermiteClient } from "@antfly/sdk";
+import { type EmbedResponse, InferenceClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ArrowDownUp,
@@ -152,7 +152,7 @@ function SimilarityBar({ score, maxScore }: { score: number; maxScore: number })
 }
 
 const EmbeddingPlaygroundPage: React.FC = () => {
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const [query, setQuery] = useState("");
   const [documents, setDocuments] = useState<string[]>([""]);
   const [selectedModel, setSelectedModel] = useState("");
@@ -167,16 +167,16 @@ const EmbeddingPlaygroundPage: React.FC = () => {
   const [showSparklines, setShowSparklines] = useState(true);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: termiteApiUrl }),
-    [termiteApiUrl]
+  const inferenceClient = useMemo(
+    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
+    [inferenceApiUrl]
   );
 
   // Fetch available embedder models
   useEffect(() => {
     const fetchModels = async () => {
       try {
-        const response = await fetchWithRetry(`${termiteApiUrl}/ai/v1/models`);
+        const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/models`);
         if (response.ok) {
           const data: ModelsResponse = await response.json();
           const embedders = Object.keys(data.embedders || {});
@@ -193,7 +193,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
       }
     };
     fetchModels();
-  }, [termiteApiUrl]);
+  }, [inferenceApiUrl]);
 
   const handleEmbed = async () => {
     const nonEmptyDocs = documents.filter((d) => d.trim());
@@ -227,7 +227,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
     try {
       // Embed query and all documents in one call
       const allTexts = [query, ...nonEmptyDocs];
-      const response: EmbedResponse = await termiteClient.embed(selectedModel, allTexts);
+      const response: EmbedResponse = await inferenceClient.embed(selectedModel, allTexts);
 
       const embeddings = response.data
         .map((item) => item.embedding)
@@ -258,7 +258,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
         return;
       }
       setError(
-        err instanceof Error ? err.message : `Failed to connect to Termite at ${termiteApiUrl}`
+        err instanceof Error ? err.message : `Failed to connect to Inference at ${inferenceApiUrl}`
       );
     } finally {
       setIsLoading(false);

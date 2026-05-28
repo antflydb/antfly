@@ -39,7 +39,7 @@ import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { fetchWithRetry } from "@/lib/utils";
 
-// RecognizeResponse types matching Termite /api/recognize
+// RecognizeResponse types matching Inference /api/recognize
 interface RecognizeEntity {
   text: string;
   label: string;
@@ -196,7 +196,7 @@ function getModelName(model: string): string {
 }
 
 const KnowledgeGraphPlaygroundPage: React.FC = () => {
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -286,7 +286,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/ai/v1/models`, {
+        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -321,7 +321,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       }
     })();
     return () => controller.abort();
-  }, [termiteApiUrl]);
+  }, [inferenceApiUrl]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
@@ -394,7 +394,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         }
       }
 
-      const response = await fetchWithRetry(`${termiteApiUrl}/ai/v1/recognize`, {
+      const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/recognize`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -418,12 +418,12 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       setError(
         err instanceof Error
           ? err.message
-          : "Failed to connect to Termite. Make sure Termite is running."
+          : "Failed to connect to Inference. Make sure Inference is running."
       );
     } finally {
       setIsLoading(false);
     }
-  }, [inputText, selectedModel, isRebelModel, entityLabels, relationLabels, config, termiteApiUrl]);
+  }, [inputText, selectedModel, isRebelModel, entityLabels, relationLabels, config, inferenceApiUrl]);
 
   // Cmd+Enter shortcut
   useEffect(() => {

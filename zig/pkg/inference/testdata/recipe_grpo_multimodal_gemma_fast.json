@@ -28,5 +28,5 @@
   "artifacts": {
     "root": "/tmp/termite-grpo-multimodal-gemma-fast"
   },
-  "backend": "blas"
+  "backend": "native"
 }

@@ -41,6 +41,7 @@ pub const TranscribeRequest = types.TranscribeRequest;
 pub const TranscribeResponse = types.TranscribeResponse;
 pub const ModelInfo = types.ModelInfo;
 pub const ModelsResponse = types.ModelsResponse;
+pub const BackendRuntimes = types.BackendRuntimes;
 pub const Tool = types.Tool;
 pub const FunctionDefinition = types.FunctionDefinition;
 pub const ToolCall = types.ToolCall;

@@ -904,10 +904,19 @@ components:
           items:
             type: string
           description: List of capabilities this model supports (omitted when empty)
+        inputs:
+          type: array
+          items:
+            type: string
+          description: List of input modalities this model accepts, such as `text`, `image`, or `audio`
 
     ModelsResponse:
       type: object
       required:
+        - object
+        - data
+        - allow_downloads
+        - backends
         - chunkers
         - rerankers
         - embedders
@@ -919,6 +928,23 @@ components:
         - readers
         - transcribers
       properties:
+        object:
+          type: string
+          enum:
+            - list
+          description: OpenAI-compatible response object type.
+        data:
+          type: array
+          description: OpenAI-compatible flat model list for generation/embedding models.
+          items:
+            type: object
+            additionalProperties: true
+        allow_downloads:
+          type: boolean
+          description: Whether clients should show model download commands.
+          default: true
+        backends:
+          $ref: '#/components/schemas/BackendRuntimes'
         chunkers:
           type: object
           additionalProperties:
@@ -969,6 +995,39 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/ModelInfo'
           description: Available transcriber/speech-to-text models from models_dir/transcribers/
+
+    BackendRuntimes:
+      type: object
+      description: Runtime backends compiled into this inference server.
+      properties:
+        native:
+          type: boolean
+          description: Whether the native CPU backend is built into this runtime
+          example: true
+        onnx:
+          type: boolean
+          description: Whether the ONNX Runtime backend is built into this runtime
+          example: false
+        metal:
+          type: boolean
+          description: Whether the Metal backend is built into this runtime
+          example: true
+        mlx:
+          type: boolean
+          description: Whether the MLX backend is built into this runtime
+          example: true
+        cuda:
+          type: boolean
+          description: Whether the CUDA backend is built into this runtime
+          example: false
+        xla:
+          type: boolean
+          description: Whether the PJRT/XLA backend is built into this runtime
+          example: false
+        wasm:
+          type: boolean
+          description: Whether the WASM backend is built into this runtime
+          example: false
 
     # Tool Calling Types (OpenAI-compatible)
     Tool:
@@ -1410,24 +1469,25 @@ components:
             Antfly inference tries entries in order and uses the first available backend+device
             combination that supports the model.
 
-            **Backends** (depend on build tags):
-            - `go` - Pure Go inference (always available, CPU only, slowest)
-            - `onnx` - ONNX Runtime (requires -tags="onnx,ORT", fastest)
-            - `xla` - GoMLX XLA (requires -tags="xla,XLA", TPU/CUDA/CPU)
+            **Backends** (depend on build flags):
+            - `native` - Native CPU backend
+            - `onnx` - ONNX Runtime backend
+            - `metal` - Apple Metal backend
+            - `mlx` - MLX backend
+            - `cuda` - NVIDIA CUDA backend
+            - `xla` - PJRT/XLA compiled backend
 
             **Devices**:
             - `auto` - Auto-detect best available (default)
             - `cuda` - NVIDIA CUDA GPU
-            - `coreml` - Apple CoreML (macOS only, used by ONNX)
             - `tpu` - Google TPU (used by XLA)
             - `cpu` - Force CPU only
 
             **Examples**:
-            - `["onnx", "xla", "go"]` - Try backends with auto device detection
-            - `["onnx:cuda", "xla:tpu", "onnx:cpu", "go"]` - Prefer GPU, fall back to CPU
-            - `["onnx:coreml", "go"]` - macOS with CoreML acceleration
-          default: [onnx, xla, go]
-          example: ["onnx:cuda", "xla:tpu", "onnx:cpu", "xla:cpu", "go"]
+            - `["native", "onnx", "xla"]` - Try backends with auto device detection
+            - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+          default: [native, onnx, xla]
+          example: ["cuda", "onnx:cuda", "xla:tpu", "native"]
         max_concurrent_requests:
           type: integer
           description: |

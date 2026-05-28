@@ -65,7 +65,7 @@ Run a one-shot probe:
   "what is antfly inference zig" \
   "antfly inference is a zig inference server with native model runtimes" \
   --tokenizer-dir /Users/tim/.cache/bge-reranker-base \
-  --backend blas
+  --backend native
 ```
 
 Run the bounded BLAS-vs-MLX TP verifier:

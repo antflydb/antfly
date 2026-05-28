@@ -22,5 +22,5 @@
   "artifacts": {
     "root": "/tmp/termite-dpo-text-gemma-fast"
   },
-  "backend": "blas"
+  "backend": "native"
 }

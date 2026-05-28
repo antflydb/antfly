@@ -13,7 +13,7 @@ pkg/
   antfly-client/     Zig client package
   antfly-embedded/   Embedded Antfly package and WASM smoke surface
   inference/         Inference runtime, OpenAPI server, tools, web UI
-  termite-client/    Zig inference client package
+  inference-client/  Zig inference client package
 
 go/pkg/antfly/lib/
   audio/             Shared audio decode and PCM boundary

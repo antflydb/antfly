@@ -16,23 +16,23 @@ const SERVER_INFO: Record<string, ServerInfo> = {
     port: 8080,
     hint: "Make sure the Antfly server is running on localhost:8080",
   },
-  termite: {
-    name: "Termite",
+  inference: {
+    name: "Inference",
     port: 11433,
-    hint: "Make sure the Termite server is running (check Settings for URL)",
+    hint: "Make sure the Inference server is running (check Settings for URL)",
   },
 };
 
 export function ConnectionStatusBanner() {
-  const { antfly, termite, retry } = useConnectionStatus();
+  const { antfly, inference, retry } = useConnectionStatus();
   const [dismissed, setDismissed] = useState(false);
 
   // Reset dismissed state when both servers reconnect
   useEffect(() => {
-    if (antfly === "connected" && termite === "connected") {
+    if (antfly === "connected" && inference === "connected") {
       setDismissed(false);
     }
-  }, [antfly, termite]);
+  }, [antfly, inference]);
 
   const handleDismiss = () => {
     setDismissed(true);
@@ -43,14 +43,14 @@ export function ConnectionStatusBanner() {
   if (isProductEnabled("antfly") && antfly === "disconnected") {
     disconnectedServers.push("antfly");
   }
-  if (isProductEnabled("termite") && termite === "disconnected") {
-    disconnectedServers.push("termite");
+  if (isProductEnabled("inference") && inference === "disconnected") {
+    disconnectedServers.push("inference");
   }
 
   // Check if any server is still checking
   const isChecking =
     (isProductEnabled("antfly") && antfly === "checking") ||
-    (isProductEnabled("termite") && termite === "checking");
+    (isProductEnabled("inference") && inference === "checking");
 
   // Don't show if dismissed, checking, or all connected
   if (dismissed || isChecking || disconnectedServers.length === 0) {

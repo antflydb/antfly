@@ -8,13 +8,14 @@ SCRIPTS_PY ?= uv run --project scripts --locked python
 # Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
 GO := GOWORK=off GOEXPERIMENT=simd go
 ANTFLY_GO_MODULE := ./go/pkg/antfly
+GO_INFERENCE_RUNTIME_MODULE := ./go/pkg/termite
 
 # Go modules outside of the Antfly product module
 GO_SUBMODULES := \
 	./go/e2e \
 	./go/pkg/sdk \
+	$(GO_INFERENCE_RUNTIME_MODULE) \
 	./go/pkg/proxy/antfly \
-	./go/pkg/proxy/termite \
 	./go/pkg/libaf \
 	./go/pkg/operator \
 	./go/pkg/docsaf \
@@ -23,8 +24,7 @@ GO_SUBMODULES := \
 	./go/pkg/evalaf/plugins/antfly \
 	./go/pkg/genkit/antfly \
 	./go/pkg/genkit/openrouter \
-	./go/pkg/memoryaf \
-	./go/pkg/termite
+	./go/pkg/memoryaf
 
 # ====================================================================================
 # General Commands
@@ -295,7 +295,7 @@ E2E_MEMLIMIT ?= 16GiB
 e2e-deps: download-omni-deps
 
 e2e: e2e-deps
-	@echo "Running E2E tests with ONNX+XLA build (Termite provider)..."
+	@echo "Running E2E tests with ONNX+XLA build (Antfly inference provider)..."
 	@echo "This will download models on first run (embedder, chunker, reranker, generator)."
 	@echo "Platform: $(E2E_PLATFORM)"
 ifdef E2E_TEST
@@ -311,7 +311,7 @@ endif
 	export LD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
 	export DYLD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
 	export RUN_EVAL_TESTS=true && \
-	export E2E_PROVIDER=termite && \
+	export E2E_PROVIDER=antfly && \
 	cd go/e2e && $(GO) test -v -tags="onnx,ORT,xla,XLA" -timeout $(E2E_TIMEOUT) $(if $(E2E_TEST),-run '$(E2E_TEST)') ./...
 
 
@@ -446,8 +446,8 @@ show-ingress:
 # ====================================================================================
 
 .PHONY: operator-build operator-test operator-docker-build operator-lint \
-        termite-build termite-test termite-lint \
-        termite-client-test termite-client-lint
+        inference-runtime-build inference-runtime-test inference-runtime-lint \
+        sdk-test sdk-lint
 
 operator-build: ## Build the antfly-operator binary
 	(cd ./go/pkg/operator && $(MAKE) build)
@@ -461,17 +461,17 @@ operator-lint: ## Run linter on antfly-operator
 operator-docker-build: ## Build antfly-operator Docker image
 	docker build -t antfly-operator:latest -f ./go/pkg/operator/Dockerfile .
 
-termite-build: ## Build the termite binary (pure Go)
-	(cd ./go/pkg/termite && $(GO) build -o ../../termite ./cmd)
+inference-runtime-build: ## Build the Go inference runtime module
+	(cd $(GO_INFERENCE_RUNTIME_MODULE) && $(GO) build ./...)
 
-termite-test: ## Run termite unit tests (pure Go)
-	(cd ./go/pkg/termite && $(GO) test ./...)
+inference-runtime-test: ## Run Go inference runtime tests
+	(cd $(GO_INFERENCE_RUNTIME_MODULE) && $(GO) test ./...)
 
-termite-lint: ## Run linter on termite
-	(cd ./go/pkg/termite && $(GO) vet ./...)
+inference-runtime-lint: ## Run Go inference runtime linter
+	(cd $(GO_INFERENCE_RUNTIME_MODULE) && $(GO) vet ./...)
 
-termite-client-test: ## Run termite-client tests
+sdk-test: ## Run SDK tests
 	(cd ./go/pkg/sdk && $(GO) test ./...)
 
-termite-client-lint: ## Run linter on termite-client
+sdk-lint: ## Run SDK linter
 	(cd ./go/pkg/sdk && $(GO) vet ./...)

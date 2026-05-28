@@ -20,5 +20,5 @@
   "artifacts": {
     "root": "/tmp/termite-recipe-colqwen2"
   },
-  "backend": "blas"
+  "backend": "native"
 }

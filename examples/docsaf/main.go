@@ -424,10 +424,10 @@ func createEmbeddingIndex(embeddingModel, chunkerModel string, targetTokens, ove
 		return nil, fmt.Errorf("failed to configure embedder: %w", err)
 	}
 
-	// Configure chunker via Termite
+	// Configure chunker via Antfly inference.
 	// Model can be "fixed-bert-tokenizer", "fixed-bpe-tokenizer", or any ONNX model directory name
 	chunker := antfly.ChunkerConfig{}
-	err = chunker.FromTermiteChunkerConfig(antfly.TermiteChunkerConfig{
+	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
 		Model: chunkerModel,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  targetTokens,

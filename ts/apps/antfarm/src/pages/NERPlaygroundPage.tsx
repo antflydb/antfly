@@ -46,7 +46,7 @@ import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { fetchWithRetry } from "@/lib/utils";
 
-// NER response types matching Termite API
+// NER response types matching Inference API
 interface NEREntity {
   text: string;
   label: string;
@@ -238,7 +238,7 @@ const EXTRACT_SAMPLES = {
 };
 
 const RecognizePlaygroundPage: React.FC = () => {
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -391,7 +391,7 @@ const RecognizePlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/ai/v1/models`, {
+        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -416,7 +416,7 @@ const RecognizePlaygroundPage: React.FC = () => {
       }
     })();
     return () => controller.abort();
-  }, [termiteApiUrl]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [inferenceApiUrl]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Update selected model when mode changes
   useEffect(() => {
@@ -494,7 +494,7 @@ const RecognizePlaygroundPage: React.FC = () => {
 
     try {
       if (mode === "recognize") {
-        const response = await fetchWithRetry(`${termiteApiUrl}/ai/v1/recognize`, {
+        const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/recognize`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -519,7 +519,7 @@ const RecognizePlaygroundPage: React.FC = () => {
           apiSchema[structure.name] = structure.fields.map((f) => `${f.name}::${f.type}`);
         }
 
-        const response = await fetchWithRetry(`${termiteApiUrl}/ai/v1/extract`, {
+        const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/extract`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -549,7 +549,7 @@ const RecognizePlaygroundPage: React.FC = () => {
       setError(
         err instanceof Error
           ? err.message
-          : "Failed to connect to Termite. Make sure Termite is running."
+          : "Failed to connect to Inference. Make sure Inference is running."
       );
     } finally {
       setIsLoading(false);
@@ -558,7 +558,7 @@ const RecognizePlaygroundPage: React.FC = () => {
     inputText,
     selectedModel,
     labels,
-    termiteApiUrl,
+    inferenceApiUrl,
     mode,
     schema,
     extractThreshold,

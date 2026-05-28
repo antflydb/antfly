@@ -22,5 +22,5 @@
   "artifacts": {
     "root": "/tmp/termite-dpo-text-qwen2-fast"
   },
-  "backend": "blas"
+  "backend": "native"
 }

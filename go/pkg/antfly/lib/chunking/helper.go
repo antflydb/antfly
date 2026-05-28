@@ -18,7 +18,7 @@ import (
 	"context"
 	"fmt"
 
-	libtermite "github.com/antflydb/antfly/go/pkg/antfly/lib/termite"
+	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/inference"
 	"go.uber.org/zap"
 )
 
@@ -77,7 +77,7 @@ func NewChunkingHelper(name string, config ChunkerConfig, logger *zap.Logger) (*
 			return nil, fmt.Errorf("failed to extract antfly chunker config: %w", err)
 		}
 
-		inferenceURL := libtermite.ResolveURL(antflyConfig.ApiUrl)
+		inferenceURL := libinference.ResolveURL(antflyConfig.ApiUrl)
 		if inferenceURL == "" {
 			return nil, fmt.Errorf("antfly chunker configured but no inference URL available")
 		}

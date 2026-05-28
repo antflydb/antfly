@@ -31,11 +31,11 @@ const ChunkingForm: React.FC<ChunkingFormProps> = ({ fieldPrefix = "" }) => {
 
   return (
     <>
-      {/* Hidden provider field - always "termite" */}
+      {/* Hidden provider field - always "antfly" */}
       <FormField
         control={control}
         name={`${prefix}provider`}
-        render={({ field }) => <input type="hidden" {...field} value="termite" />}
+        render={({ field }) => <input type="hidden" {...field} value="antfly" />}
       />
 
       <FormField
@@ -177,12 +177,12 @@ const ChunkingForm: React.FC<ChunkingFormProps> = ({ fieldPrefix = "" }) => {
               name={`${prefix}api_url`}
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Termite API URL</FormLabel>
+                  <FormLabel>Inference API URL</FormLabel>
                   <FormControl>
                     <Input type="text" {...field} placeholder="http://localhost:11433" />
                   </FormControl>
                   <p className="text-sm text-muted-foreground">
-                    Override the default Termite service URL (leave empty to use cluster default)
+                    Override the default Inference service URL (leave empty to use cluster default)
                   </p>
                   <FormMessage />
                 </FormItem>

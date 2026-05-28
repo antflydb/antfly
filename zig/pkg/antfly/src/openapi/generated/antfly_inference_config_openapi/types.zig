@@ -203,6 +203,26 @@ pub const TranscribeResponse = struct {
 pub const ModelInfo = struct {
     /// List of capabilities this model supports (omitted when empty)
     capabilities: ?[]const []const u8 = null,
+    /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
+    inputs: ?[]const []const u8 = null,
+};
+
+/// Runtime backends compiled into this inference server.
+pub const BackendRuntimes = struct {
+    /// Whether the native CPU backend is built into this runtime
+    native: ?bool = null,
+    /// Whether the ONNX Runtime backend is built into this runtime
+    onnx: ?bool = null,
+    /// Whether the Metal backend is built into this runtime
+    metal: ?bool = null,
+    /// Whether the MLX backend is built into this runtime
+    mlx: ?bool = null,
+    /// Whether the CUDA backend is built into this runtime
+    cuda: ?bool = null,
+    /// Whether the PJRT/XLA backend is built into this runtime
+    xla: ?bool = null,
+    /// Whether the WASM backend is built into this runtime
+    wasm: ?bool = null,
 };
 
 /// Definition of a function that can be called by the model
@@ -329,7 +349,7 @@ pub const Config = struct {
     max_loaded_models: ?i64 = null,
     /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
     pool_size: ?i64 = null,
-    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Backends** (depend on build tags): - `go` - Pure Go inference (always available, CPU only, slowest) - `onnx` - ONNX Runtime (requires -tags="onnx,ORT", fastest) - `xla` - GoMLX XLA (requires -tags="xla,XLA", TPU/CUDA/CPU) **Devices**: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `coreml` - Apple CoreML (macOS only, used by ONNX) - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only **Examples**: - `["onnx", "xla", "go"]` - Try backends with auto device detection - `["onnx:cuda", "xla:tpu", "onnx:cpu", "go"]` - Prefer GPU, fall back to CPU - `["onnx:coreml", "go"]` - macOS with CoreML acceleration
+    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Backends** (depend on build flags): - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `mlx` - MLX backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend **Devices**: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
     backend_priority: ?[]const []const u8 = null,
     /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
     max_concurrent_requests: ?i64 = null,
@@ -432,6 +452,13 @@ pub const ReadResult = struct {
 };
 
 pub const ModelsResponse = struct {
+    /// OpenAI-compatible response object type.
+    object: []const u8,
+    /// OpenAI-compatible flat model list for generation/embedding models.
+    data: []const std.json.Value,
+    /// Whether clients should show model download commands.
+    allow_downloads: bool,
+    backends: BackendRuntimes,
     /// Available chunking models (always includes "fixed")
     chunkers: std.json.ArrayHashMap(ModelInfo),
     /// Available reranking models

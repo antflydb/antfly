@@ -399,7 +399,7 @@ zig build train-eval-entity-cleanup-head -- <train_cache.json> <eval_cache.json>
 ```
 
 Current `prepare-gliner2-entity-cleanup-cache` defaults:
-- `backend=blas`
+- `backend=native`
 - `max_examples=128`
 - `max_length=256`
 - `max_span_width=8`
@@ -429,7 +429,7 @@ Command:
 zig build run-gliner2-entity-cleanup-smoke-workflow -- \
   /tmp/gliner2_base /tmp/gliner2_adapter \
   /tmp/train_cleanup.jsonl /tmp/eval_cleanup.jsonl /tmp/out \
-  train eval blas 64 32 256 8 1 3 0.05 0.01 32
+  train eval native 64 32 256 8 1 3 0.05 0.01 32
 ```
 
 ## File-Level Task List

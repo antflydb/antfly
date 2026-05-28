@@ -9,7 +9,7 @@ import {
   CommandList,
   CommandSeparator,
 } from "@antfly/design-system";
-import { TermiteClient } from "@antfly/sdk";
+import { InferenceClient } from "@antfly/sdk";
 import {
   ArrowUpDown,
   ClipboardCheck,
@@ -67,13 +67,13 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   const navigate = useNavigate();
 
   const { theme, setTheme } = useTheme();
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const showLocalAdminRoutes = !isExternalAuthMode();
 
-  // Create TermiteClient for semantic search
-  const termiteClient = React.useMemo(
-    () => new TermiteClient({ baseUrl: termiteApiUrl }),
-    [termiteApiUrl]
+  // Create InferenceClient for semantic search
+  const inferenceClient = React.useMemo(
+    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
+    [inferenceApiUrl]
   );
 
   const isCommandAvailable = React.useCallback(
@@ -163,7 +163,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     setIsSearching(true);
     const timer = setTimeout(async () => {
       try {
-        const results = await semanticSearch(searchValue, termiteClient);
+        const results = await semanticSearch(searchValue, inferenceClient);
         const filteredResults = results.filter((result) => isCommandAvailable(result.item));
         setSemanticResults(filteredResults);
       } catch (e) {
@@ -174,7 +174,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     }, 300);
 
     return () => clearTimeout(timer);
-  }, [searchValue, hasStringMatches, termiteClient, isCommandAvailable]);
+  }, [searchValue, hasStringMatches, inferenceClient, isCommandAvailable]);
 
   // Reset search state when dialog closes
   React.useEffect(() => {

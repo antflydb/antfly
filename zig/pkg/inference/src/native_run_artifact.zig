@@ -2963,8 +2963,8 @@ pub fn printUsage() void {
         \\output shapes; --compare-host adds a traced native output comparison.
         \\Use --validate/--dry-run for load-only validation without execution; package
         \\validation reports artifact/prefill/decode counts and runtime ownership.
-        \\PJRT/XLA HLO artifacts require TERMITE_XLA_PLUGIN, TERMITE_PJRT_PLUGIN,
-        \\or PJRT_PLUGIN_PATH.
+        \\PJRT/XLA HLO artifacts require ANTFLY_INFERENCE_XLA_PLUGIN,
+        \\ANTFLY_INFERENCE_PJRT_PLUGIN, PJRT_PLUGIN_PATH, or PJRT_PLUGIN.
         \\
     , .{});
 }

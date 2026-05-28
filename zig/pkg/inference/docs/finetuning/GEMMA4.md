@@ -7,13 +7,13 @@ This plan gates Gemma4 LoRA fine-tuning before distributed MLX work. The target 
 Default command:
 
 ```sh
-zig build termite-run-gemma4-lora-pilot-workflow -- text /Users/tim/models/gemma-4-e2b-it /tmp/gemma4-text-pilot --count 1000 --backend mlx --epochs 1
+zig build run-gemma4-lora-pilot-workflow -- text /Users/tim/models/gemma-4-e2b-it /tmp/gemma4-text-pilot --count 1000 --backend mlx --epochs 1
 ```
 
 Recommended larger run:
 
 ```sh
-zig build termite-run-gemma4-lora-pilot-workflow -- text /Users/tim/models/gemma-4-e2b-it /tmp/gemma4-text-pilot-10k --count 10000 --max-examples 10000 --eval-max-examples 128 --backend mlx --epochs 2
+zig build run-gemma4-lora-pilot-workflow -- text /Users/tim/models/gemma-4-e2b-it /tmp/gemma4-text-pilot-10k --count 10000 --max-examples 10000 --eval-max-examples 128 --backend mlx --epochs 2
 ```
 
 Acceptance gates:
@@ -28,7 +28,7 @@ Acceptance gates:
 Default generated dataset command:
 
 ```sh
-zig build termite-run-gemma4-lora-pilot-workflow -- multimodal /Users/tim/models/gemma-4-e2b-it /tmp/gemma4-mm-pilot --projector /Users/tim/models/gemma-4-e2b-it/mmproj-gemma-4-E2B-it-bf16.gguf --image-path /tmp/gemma4-mm-smoke/images/red.png --count 100 --backend mlx --epochs 1
+zig build run-gemma4-lora-pilot-workflow -- multimodal /Users/tim/models/gemma-4-e2b-it /tmp/gemma4-mm-pilot --projector /Users/tim/models/gemma-4-e2b-it/mmproj-gemma-4-E2B-it-bf16.gguf --image-path /tmp/gemma4-mm-smoke/images/red.png --count 100 --backend mlx --epochs 1
 ```
 
 Use `--dataset <jsonl>` for a real image dataset. The JSONL should use `gemma_chat/v1` rows with image content parts; the workflow still verifies projector fingerprinting and cache reporting.

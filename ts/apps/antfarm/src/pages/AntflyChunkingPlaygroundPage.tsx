@@ -22,7 +22,7 @@ import {
   Separator,
   Textarea,
 } from "@antfly/design-system";
-import { type ChunkResponse, TermiteClient } from "@antfly/sdk";
+import { type ChunkResponse, InferenceClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ClipboardCopy,
@@ -59,7 +59,7 @@ function isTextChunk(chunk: ChunkResult): chunk is TextChunkResult {
 }
 
 const DEFAULT_CONFIG: ChunkConfig = {
-  provider: "termite",
+  provider: "antfly",
   strategy: "fixed",
   model: "fixed",
   target_tokens: 500,
@@ -69,7 +69,7 @@ const DEFAULT_CONFIG: ChunkConfig = {
   threshold: 0.5,
 };
 
-// Color palette for chunk visualization (matches Termite playground)
+// Color palette for chunk visualization (matches Inference playground)
 const CHUNK_COLORS = [
   "af-chart-surface af-chart-surface-1",
   "af-chart-surface af-chart-surface-2",
@@ -108,7 +108,7 @@ function extractDocumentText(source: Record<string, unknown>): string {
 }
 
 const AntflyChunkingPlaygroundPage: React.FC = () => {
-  const { client, termiteApiUrl } = useApiConfig();
+  const { client, inferenceApiUrl } = useApiConfig();
   const { selectedTable, selectedIndex } = useTable();
 
   const [config, setConfig] = useState<ChunkConfig>(DEFAULT_CONFIG);
@@ -127,9 +127,9 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
   const [isSearching, setIsSearching] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: termiteApiUrl }),
-    [termiteApiUrl]
+  const inferenceClient = useMemo(
+    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
+    [inferenceApiUrl]
   );
 
   const estimateTokens = (text: string): number => {
@@ -214,7 +214,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
     try {
       const actualSeparator = config.separator.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
 
-      const data = await termiteClient.chunk(
+      const data = await inferenceClient.chunk(
         inputText,
         {
           model: config.model,
@@ -234,7 +234,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
       setError(
-        err instanceof Error ? err.message : `Failed to connect to Termite at ${termiteApiUrl}`
+        err instanceof Error ? err.message : `Failed to connect to Inference at ${inferenceApiUrl}`
       );
     } finally {
       setIsLoading(false);

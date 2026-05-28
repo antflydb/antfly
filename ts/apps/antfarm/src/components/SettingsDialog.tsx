@@ -27,32 +27,32 @@ interface SettingsDialogProps {
 
 interface SettingsFormValues {
   apiUrl: string;
-  termiteUrl: string;
+  inferenceUrl: string;
 }
 
 export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
-  const { apiUrl, setApiUrl, resetToDefault, termiteApiUrl, setTermiteApiUrl, resetTermiteApiUrl } =
+  const { apiUrl, setApiUrl, resetToDefault, inferenceApiUrl, setInferenceApiUrl, resetInferenceApiUrl } =
     useApiConfig();
   const [isOpen, setIsOpen] = useState(false);
 
   const form = useForm<SettingsFormValues>({
-    defaultValues: { apiUrl, termiteUrl: termiteApiUrl },
+    defaultValues: { apiUrl, inferenceUrl: inferenceApiUrl },
   });
 
   const handleSave = (data: SettingsFormValues) => {
     setApiUrl(data.apiUrl);
-    setTermiteApiUrl(data.termiteUrl);
+    setInferenceApiUrl(data.inferenceUrl);
     setIsOpen(false);
   };
 
   const handleReset = () => {
     resetToDefault();
-    resetTermiteApiUrl();
-    form.reset({ apiUrl, termiteUrl: termiteApiUrl });
+    resetInferenceApiUrl();
+    form.reset({ apiUrl, inferenceUrl: inferenceApiUrl });
   };
 
   const handleCancel = () => {
-    form.reset({ apiUrl, termiteUrl: termiteApiUrl });
+    form.reset({ apiUrl, inferenceUrl: inferenceApiUrl });
     setIsOpen(false);
   };
 
@@ -69,7 +69,7 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
         <DialogHeader>
           <DialogTitle>API Settings</DialogTitle>
           <DialogDescription>
-            Configure the Antfly and Termite servers to connect to. This is useful when accessing
+            Configure the Antfly and Inference servers to connect to. This is useful when accessing
             the dashboard remotely or connecting to different servers.
           </DialogDescription>
         </DialogHeader>
@@ -96,22 +96,22 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
 
           <FormField
             control={form.control}
-            name="termiteUrl"
+            name="inferenceUrl"
             render={({ field }) => (
               <FormItem>
-                <FormLabel>Termite API URL</FormLabel>
+                <FormLabel>Inference API URL</FormLabel>
                 <FormControl>
                   <Input placeholder="http://localhost:11433" {...field} />
                 </FormControl>
                 <FormDescription>
                   Current:{" "}
-                  <code className="text-xs bg-muted px-1 py-0.5 rounded">{termiteApiUrl}</code>
+                  <code className="text-xs bg-muted px-1 py-0.5 rounded">{inferenceApiUrl}</code>
                 </FormDescription>
                 <FormDescription className="text-xs">
                   Examples:{" "}
                   <code className="bg-muted px-1 py-0.5 rounded">http://localhost:11433</code>{" "}
                   (default),{" "}
-                  <code className="bg-muted px-1 py-0.5 rounded">https://termite.company.com</code>
+                  <code className="bg-muted px-1 py-0.5 rounded">https://inference.company.com</code>
                 </FormDescription>
               </FormItem>
             )}

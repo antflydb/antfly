@@ -69,7 +69,7 @@ export interface TableSchema {
 }
 
 export interface ChunkerConfig {
-  provider: "termite" | "mock";
+  provider: "antfly" | "mock";
   strategy: "hugot" | "fixed";
   api_url?: string;
   target_tokens?: number;

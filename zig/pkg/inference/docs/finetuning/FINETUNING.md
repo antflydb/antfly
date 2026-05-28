@@ -103,7 +103,7 @@ For a no-download recipe-layer verifier, use:
 antfly inference finetune smoke-fast
 ```
 
-`smoke-fast` runs quick dry-runs across every family adapter fixture, executes synthetic no-download GLiNER2, Qwen2, and Gemma4 recipe cases plus the fast scalar DPO/GRPO recipes, verifies the normalized run artifacts reach `status = "succeeded"`, and writes a suite summary at `/tmp/termite-finetune-smoke-fast/fast_smoke_summary.json` by default.
+`smoke-fast` runs quick dry-runs across every family adapter fixture, executes synthetic no-download GLiNER2, Qwen2, and Gemma4 recipe cases plus the fast scalar DPO/GRPO recipes, verifies the normalized run artifacts reach `status = "succeeded"`, and writes a suite summary at `/tmp/antfly-inference-finetune-smoke-fast/fast_smoke_summary.json` by default.
 
 ### GLiNER2 Production Readiness
 
@@ -115,10 +115,10 @@ per-label calibration work continues:
 
 ```sh
 zig build -Dmetal=true gliner2-production-readiness -- \
-  /private/tmp/termite-models/gliner2 \
+  /private/tmp/antfly-inference-models/gliner2 \
   /private/tmp/gliner2-conll2003-train-200.jsonl \
   /private/tmp/gliner2-conll2003-train-200.jsonl \
-  /private/tmp/termite-gliner2-metal-prod-gate \
+  /private/tmp/antfly-inference-gliner2-metal-prod-gate \
   person,organization,location \
   --production-metal-gate \
   --semantic-golden "Microsoft opened an office in London" Microsoft organization 0.03 \
@@ -247,13 +247,13 @@ reloaded adapter, and optional materialization. Use `--dry-run
 | `vlm-retrieval` | `colqwen2` | `prepare-colqwen2-inputs` → `bootstrap-colqwen2-lora` → `train-eval-colqwen2-lora-bundle` |
 | `sft`, `lora-sft`, `qlora-sft`, `dpo`, `grpo` | `qwen3_5`, Chandra OCR text-only | direct Qwen autodiff trainer route for text JSONL recipes; still requires real-weight CPU and MLX/Metal smokes before production readiness |
 
-The runner first looks for a peer executable next to `termite`. If it is not installed, it falls back to the existing `zig build <tool> -- ...` build step from the package root, preserving today's build-step workflow.
+The runner first looks for a peer tool executable next to the current Antfly inference executable. If it is not installed, it falls back to the existing `zig build <tool> -- ...` build step from the package root, preserving today's build-step workflow.
 
 ### Run Artifacts
 
 Non-dry runs write a normalized manifest at `artifacts.manifest_path` or `<artifacts.root>/recipe_run_manifest.json`.
 
-The manifest schema version is `termite_finetune_recipe_run/v1` and records:
+The manifest schema version is `antfly_inference_finetune_recipe_run/v1` and records:
 
 - the original parsed recipe
 - artifact root
@@ -899,7 +899,7 @@ Report contents: dataset stats, bootstrap summary, initial adapter inspection, t
 
 - No full-backbone LayoutLMv3 fine-tuning
 - No distributed training or mixed precision on this path
-- Task heads are bounded termite-owned implementations
+- Task heads are bounded Antfly inference-owned implementations
 
 ---
 
@@ -923,7 +923,7 @@ usage: train-fused-chunker --data <path> --output <dir> [options]
   --seed <n>                Random seed (default: 42)
   --lora-rank <n>           LoRA rank (default: 0 = disabled)
   --intermediate-size <n>   ModernBERT intermediate_size (default: 1152)
-  --backend blas|mlx|auto   Compute backend (default: auto)
+  --backend native|mlx|auto   Compute backend (default: auto)
   --grad-accum <n>          Gradient accumulation steps (default: 1)
   --schedule-free           Use Schedule-Free AdamW
   --neftune-alpha <f>       NEFTune noise magnitude (default: 0.0=disabled)
@@ -975,7 +975,7 @@ usage: train-eval-reranker-lora-surrogate <model-dir> <adapter-dir>
     [train-split] [eval-split]
 
 Flags:
-  --backend auto|blas|mlx   Compute backend (default: auto)
+  --backend auto|native|mlx   Compute backend (default: auto)
   --max-examples <n>        Max training examples (default: 128)
   --epochs <n>              Number of epochs (default: 1)
   --learning-rate <f>       Learning rate (default: 0.001)
@@ -1194,7 +1194,7 @@ Flags:
   --grad-accum <n>              Gradient accumulation steps (default: 1)
   --llrd-decay <f>              Surrogate-only layer-wise LR decay (default: 1.0=disabled)
   --schedule-free               Surrogate-only Schedule-Free AdamW (default: false)
-  --backend auto|mlx|blas       Compute backend (default: auto)
+  --backend auto|mlx|native       Compute backend (default: auto)
 ```
 
 Trainer mode behavior:

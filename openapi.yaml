@@ -16542,6 +16542,10 @@ components:
     InferenceModelsResponse:
       type: object
       required:
+        - object
+        - data
+        - allow_downloads
+        - backends
         - chunkers
         - rerankers
         - embedders
@@ -16553,6 +16557,23 @@ components:
         - readers
         - transcribers
       properties:
+        object:
+          type: string
+          enum:
+            - list
+          description: OpenAI-compatible response object type.
+        data:
+          type: array
+          description: OpenAI-compatible flat model list for generation/embedding models.
+          items:
+            type: object
+            additionalProperties: true
+        allow_downloads:
+          type: boolean
+          description: Whether clients should show model download commands.
+          default: true
+        backends:
+          $ref: '#/components/schemas/InferenceBackendRuntimes'
         chunkers:
           type: object
           additionalProperties:
@@ -16903,9 +16924,9 @@ components:
 
             `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and
 
-            requires a PJRT plugin path via `TERMITE_XLA_PLUGIN`, `TERMITE_PJRT_PLUGIN`,
+            requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`,
 
-            `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+            `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
 
             `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
 
@@ -17214,13 +17235,19 @@ components:
             combination that supports the model.
 
 
-            **Backends** (depend on build tags):
+            **Backends** (depend on build flags):
 
-            - `go` - Pure Go inference (always available, CPU only, slowest)
+            - `native` - Native CPU backend
 
-            - `onnx` - ONNX Runtime (requires -tags="onnx,ORT", fastest)
+            - `onnx` - ONNX Runtime backend
 
-            - `xla` - GoMLX XLA (requires -tags="xla,XLA", TPU/CUDA/CPU)
+            - `metal` - Apple Metal backend
+
+            - `mlx` - MLX backend
+
+            - `cuda` - NVIDIA CUDA backend
+
+            - `xla` - PJRT/XLA compiled backend
 
 
             **Devices**:
@@ -17236,23 +17263,18 @@ components:
 
             **Examples**:
 
-            - `["onnx", "xla", "go"]` - Try backends with auto device detection
+            - `["native", "onnx", "xla"]` - Try backends with auto device detection
 
-            - `["onnx:cuda", "xla:tpu", "onnx:cpu", "go"]` - Prefer GPU, fall back to CPU
-
-            - `          default:
-
+            - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+          default:
+            - native
             - onnx
-
             - xla
-
-            - go
           example:
+            - cuda
             - onnx:cuda
             - xla:tpu
-            - onnx:cpu
-            - xla:cpu
-            - go
+            - native
         max_concurrent_requests:
           type: integer
           description: >
@@ -17352,8 +17374,9 @@ components:
           default: true
         log:
           $ref: '#/components/schemas/Inferenceschemas-Config'
-    InferenceBackendCapabilities:
+    InferenceBackendRuntimes:
       type: object
+      description: Runtime backends compiled into this inference server.
       properties:
         native:
           type: boolean
@@ -17363,10 +17386,22 @@ components:
           type: boolean
           description: Whether the ONNX Runtime backend is built into this runtime
           example: false
+        metal:
+          type: boolean
+          description: Whether the Metal backend is built into this runtime
+          example: true
         mlx:
           type: boolean
           description: Whether the MLX backend is built into this runtime
           example: true
+        cuda:
+          type: boolean
+          description: Whether the CUDA backend is built into this runtime
+          example: false
+        xla:
+          type: boolean
+          description: Whether the PJRT/XLA backend is built into this runtime
+          example: false
         wasm:
           type: boolean
           description: Whether the WASM backend is built into this runtime

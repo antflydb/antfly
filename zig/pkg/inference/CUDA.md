@@ -351,7 +351,7 @@ portable `compute_75` PTX.
 ### Phase 1: Capability Probe
 
 - Implement `CudaDriver` dynamic loader.
-- Add `antfly inference cuda-info` or a smoke flag that prints driver version, selected
+- Add an internal smoke probe that prints driver version, selected
   device, compute capability, total memory if available, and artifact mode.
 - Test no-CUDA machines: probe returns unavailable without crashing.
 - Test CUDA machines: probe succeeds without CUDA toolkit in the container.
@@ -427,7 +427,7 @@ portable `compute_75` PTX.
 - Validate that `libcuda.so.1` comes from the NVIDIA driver mount.
 - Run:
   - no-CUDA startup fallback
-  - `cuda-info`
+  - CUDA smoke probe
   - dense linear parity smoke
   - `Q8_0`, `Q4_0`, `Q4_K` synthetic parity
   - real GGUF generation with CUDA counters

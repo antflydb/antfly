@@ -111,7 +111,7 @@ const RandomSparseDataset1k = "random-sparse-1k.gob"
 
 // SparseWikiDataset consists of sparse embeddings from the Tantivy Wiki Articles
 // dataset (same source as WikiDataset), created using the SPLADE model
-// (naver/splade-cocondenser-ensembledistil) via Termite.
+// (naver/splade-cocondenser-ensembledistil) via Inference.
 const SparseWikiDataset = "sparse-wiki-1k.gob"
 
 // SparseDataEntry is a gob-serializable sparse vector entry.

@@ -1,4 +1,4 @@
-# Combined proxy CI for the antfly and termite proxy library modules.
+# Proxy CI for the Antfly proxy library module.
 
 name: Proxy Tests
 
@@ -35,6 +35,3 @@ jobs:
 
       - name: Test antfly-proxy
         run: cd go/pkg/proxy/antfly && GOWORK=off go test ./...
-
-      - name: Test termite-proxy
-        run: cd go/pkg/proxy/termite && GOWORK=off go test ./...

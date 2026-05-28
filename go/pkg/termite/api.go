@@ -39,6 +39,7 @@ import (
 	json "github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/libaf/s3"
 	"github.com/antflydb/antfly/go/pkg/libaf/scraping"
+	"github.com/antflydb/antfly/go/pkg/termite/lib/backends"
 	termchunking "github.com/antflydb/antfly/go/pkg/termite/lib/chunking"
 	"github.com/antflydb/antfly/go/pkg/termite/lib/classification"
 	"github.com/antflydb/antfly/go/pkg/termite/lib/generation"
@@ -149,19 +150,55 @@ func capsMapToModelInfoMap(caps map[string][]string) map[string]ModelInfo {
 	return m
 }
 
+func backendRuntimesFromAvailable() BackendRuntimes {
+	var runtimes BackendRuntimes
+	for _, backend := range backends.ListAvailable() {
+		switch backend.Type() {
+		case backends.BackendONNX:
+			runtimes.Onnx = true
+		case backends.BackendXLA:
+			runtimes.Xla = true
+		case backends.BackendCoreML:
+			runtimes.Metal = true
+		}
+	}
+	return runtimes
+}
+
+func appendOpenAIModelData(data []map[string]interface{}, names map[string]ModelInfo, seen map[string]struct{}) []map[string]interface{} {
+	created := time.Now().Unix()
+	for name := range names {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		data = append(data, map[string]interface{}{
+			"id":       name,
+			"object":   "model",
+			"created":  created,
+			"owned_by": "antfly-inference",
+		})
+	}
+	return data
+}
+
 // ListModels implements ServerInterface
 func (t *TermiteAPI) ListModels(w http.ResponseWriter, r *http.Request) {
 	resp := ModelsResponse{
-		Chunkers:     map[string]ModelInfo{},
-		Rerankers:    map[string]ModelInfo{},
-		Embedders:    map[string]ModelInfo{},
-		Generators:   map[string]ModelInfo{},
-		Recognizers:  map[string]ModelInfo{},
-		Extractors:   map[string]ModelInfo{},
-		Rewriters:    map[string]ModelInfo{},
-		Classifiers:  map[string]ModelInfo{},
-		Readers:      map[string]ModelInfo{},
-		Transcribers: map[string]ModelInfo{},
+		Object:         ModelsResponseObjectList,
+		Data:           []map[string]interface{}{},
+		AllowDownloads: t.node.allowDownloads,
+		Backends:       backendRuntimesFromAvailable(),
+		Chunkers:       map[string]ModelInfo{},
+		Rerankers:      map[string]ModelInfo{},
+		Embedders:      map[string]ModelInfo{},
+		Generators:     map[string]ModelInfo{},
+		Recognizers:    map[string]ModelInfo{},
+		Extractors:     map[string]ModelInfo{},
+		Rewriters:      map[string]ModelInfo{},
+		Classifiers:    map[string]ModelInfo{},
+		Readers:        map[string]ModelInfo{},
+		Transcribers:   map[string]ModelInfo{},
 	}
 
 	if t.node.chunker != nil {
@@ -212,6 +249,10 @@ func (t *TermiteAPI) ListModels(w http.ResponseWriter, r *http.Request) {
 	if t.node.transcriberRegistry != nil {
 		resp.Transcribers = stringsToModelInfoMap(t.node.transcriberRegistry.List())
 	}
+
+	seenOpenAIModels := map[string]struct{}{}
+	resp.Data = appendOpenAIModelData(resp.Data, resp.Embedders, seenOpenAIModels)
+	resp.Data = appendOpenAIModelData(resp.Data, resp.Generators, seenOpenAIModels)
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {

@@ -1382,7 +1382,7 @@ func (si *SparseIndex) computeEnrichmentsSimple(
 		return nil, nil, fmt.Errorf("waiting for rate limiter: %w", err)
 	}
 
-	// Generate sparse embeddings via Termite
+	// Generate sparse embeddings via Antfly inference.
 	vecs, err := sparseEmb.SparseEmbed(ctx, prompts)
 	if err != nil {
 		si.logger.Warn("Failed to generate sparse embeddings in pre-enrichment",

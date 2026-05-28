@@ -18,7 +18,7 @@ The documents are processed page-by-page, chunked for semantic search, and made 
 
 - Go 1.21+
 - Zig 0.16.0+
-- Running Zig Antfly swarm with Termite models
+- Running Zig Antfly swarm with Antfly inference models
 
 ### 1. Build and Start Zig Antfly
 
@@ -39,9 +39,9 @@ omitted here.
 
 ```bash
 cd zig
-./zig-out/bin/antfly termite pull antflydb/clipclap:gguf:Q4_K --tasks embedders
-./zig-out/bin/antfly termite pull Xenova/trocr-base-printed --tasks readers
-./zig-out/bin/antfly termite pull fastino/gliner2-base-v1:native --tasks recognizers
+./zig-out/bin/antfly inference pull antflydb/clipclap:gguf:Q4_K --tasks embedders
+./zig-out/bin/antfly inference pull Xenova/trocr-base-printed --tasks readers
+./zig-out/bin/antfly inference pull fastino/gliner2-base-v1:native --tasks recognizers
 ```
 
 ### 3. Build the Tool
@@ -84,7 +84,7 @@ export EPSTEIN_ZIP="/path/to/T9/DataSet_10.zip"
 # Process PDFs into page records. --split-pages enables direct PDF viewing.
 ./epstein prepare --dir "$EPSTEIN_DOCS_DIR" --split-pages
 
-# Optional: OCR low-quality pages through Zig Termite.
+# Optional: OCR low-quality pages through Zig Antfly inference.
 ./epstein enrich --input epstein-docs.json --dir "$EPSTEIN_DOCS_DIR"
 
 # Optional: add entity metadata to each page record.
@@ -139,8 +139,8 @@ Flags:
               Split PDFs into individual page PDFs for direct viewing
   --zip       Path to ZIP archive containing PDFs (repeatable)
   --enable-ocr
-              Enable OCR fallback through Termite readers
-  --ocr-url   Termite URL (default: ANTFLY_TERMITE_URL or http://localhost:8080)
+              Enable OCR fallback through Antfly inference readers
+  --ocr-url   Antfly inference URL (default: ANTFLY_INFERENCE_URL or http://localhost:8080)
   --ocr-models
               OCR models to try (default: Xenova/trocr-base-printed)
 ```
@@ -160,7 +160,7 @@ Flags:
   --dry-run         Preview changes without applying
   --num-shards      Number of shards (default: 1)
   --batch-size      Batch size for linear merge (default: 25)
-  --termite-url     Termite root URL for chunking; table config stores its /ai/v1 route (default: ANTFLY_TERMITE_URL or http://localhost:8080)
+  --inference-url     Antfly inference root URL for chunking; table config stores its /ai/v1 route (default: ANTFLY_INFERENCE_URL or http://localhost:8080)
   --embedding-model Embedding model (default: antflydb/clipclap)
   --chunker-model   Chunker model (default: fixed-bert-tokenizer)
   --target-tokens   Target tokens per chunk (default: 512)
@@ -187,7 +187,7 @@ Runs a second OCR/vision pass over prepared JSON and writes a new JSON file.
 Flags:
   --input       Input JSON file (default: epstein-docs.json)
   --output      Output JSON file (default: {input-base}-enriched.json)
-  --termite-url Termite URL (default: ANTFLY_TERMITE_URL or http://localhost:8080)
+  --inference-url Antfly inference URL (default: ANTFLY_INFERENCE_URL or http://localhost:8080)
   --model       Reader model (default: Xenova/trocr-base-printed)
   --category    ocr, vision, quality, or all (default: ocr)
   --dir         Base directory for resolving split page PDFs
@@ -196,7 +196,7 @@ Flags:
 
 ### `entities`
 
-Adds Termite NER metadata to prepared or enriched JSON records.
+Adds Antfly inference NER metadata to prepared or enriched JSON records.
 
 ```bash
 ./epstein entities [flags]
@@ -204,11 +204,11 @@ Adds Termite NER metadata to prepared or enriched JSON records.
 Flags:
   --input           Input JSON file (default: epstein-docs.json)
   --output          Output JSON file (default: {input-base}-entities.json)
-  --termite-url     Termite URL (default: ANTFLY_TERMITE_URL or http://localhost:8080)
+  --inference-url     Antfly inference URL (default: ANTFLY_INFERENCE_URL or http://localhost:8080)
   --model           Recognizer model (default: fastino/gliner2-base-v1)
   --labels          Entity labels to extract
   --relation-labels Relation labels to extract (default: associated with, communicated with, traveled to, visited, worked for, represented by, mentioned in, located in)
-  --batch-size      Text windows per Termite recognize request (default: 16)
+  --batch-size      Text windows per Antfly inference recognize request (default: 16)
   --max-chars       Maximum characters per recognizer window (default: 3000)
   --overlap-chars   Characters of overlap between recognizer windows (default: 300)
   --reprocess       Re-process records that already have entities

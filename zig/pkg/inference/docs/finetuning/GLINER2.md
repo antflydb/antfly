@@ -270,7 +270,7 @@ Still not implemented:
 
 GLiNER2 finetuning in `antfly-inference-zig` is now:
 - real
-- termite-owned
+- Antfly inference-owned
 - exercised on actual local artifacts
 
 But it is still a bounded finetuning stack centered on:

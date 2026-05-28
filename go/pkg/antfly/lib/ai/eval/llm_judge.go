@@ -21,7 +21,7 @@ import (
 	"slices"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/ai"
-	libtermite "github.com/antflydb/antfly/go/pkg/antfly/lib/termite"
+	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/inference"
 	evalafEval "github.com/antflydb/antfly/go/pkg/evalaf/eval"
 	evalafGenkit "github.com/antflydb/antfly/go/pkg/evalaf/genkit"
 	genkitAI "github.com/firebase/genkit/go/ai"
@@ -222,7 +222,7 @@ func InitGenkit(ctx context.Context, config *ai.GeneratorConfig) (*genkit.Genkit
 		if c.ApiUrl != nil {
 			configURL = *c.ApiUrl
 		}
-		apiURL := libtermite.ResolveURL(configURL)
+		apiURL := libinference.ResolveURL(configURL)
 		if apiURL == "" {
 			return nil, "", fmt.Errorf("antfly inference: api_url is required (set via config or ANTFLY_INFERENCE_URL env var)")
 		}

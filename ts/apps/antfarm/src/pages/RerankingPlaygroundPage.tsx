@@ -74,7 +74,7 @@ const SAMPLE_DATA = {
 };
 
 const RerankingPlaygroundPage: React.FC = () => {
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -141,7 +141,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/ai/v1/models`, {
+        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -163,7 +163,7 @@ const RerankingPlaygroundPage: React.FC = () => {
       }
     })();
     return () => controller.abort();
-  }, [termiteApiUrl]);
+  }, [inferenceApiUrl]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
@@ -211,7 +211,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     const startTime = performance.now();
 
     try {
-      const response = await fetchWithRetry(`${termiteApiUrl}/ai/v1/rerank`, {
+      const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/rerank`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -237,12 +237,12 @@ const RerankingPlaygroundPage: React.FC = () => {
       setError(
         err instanceof Error
           ? err.message
-          : "Failed to connect to Termite. Make sure Termite is running."
+          : "Failed to connect to Inference. Make sure Inference is running."
       );
     } finally {
       setIsLoading(false);
     }
-  }, [query, documents, selectedModel, termiteApiUrl]);
+  }, [query, documents, selectedModel, inferenceApiUrl]);
 
   // Cmd+Enter shortcut
   useEffect(() => {

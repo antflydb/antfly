@@ -602,7 +602,7 @@ func TestPipelineEnricher_ChunkKeyWithSummarizer(t *testing.T) {
 
 // TestPipelineEnricher_ChunkKeySummarizationRouting verifies chunk keys route to summarization when both enrichers present
 
-// TestPipelineEnricher_FullPipelineIntegration tests the complete doc→chunk→summary→embed pipeline with real Termite
+// TestPipelineEnricher_FullPipelineIntegration tests the complete doc→chunk→summary→embed pipeline with real Antfly inference.
 // This test requires ONNX models in models/chunkers/ directory (enables ONNX-based chunking)
 //
 // To run this test:
@@ -610,14 +610,14 @@ func TestPipelineEnricher_ChunkKeyWithSummarizer(t *testing.T) {
 //  1. Ensure ONNX models are in models/chunkers/chonky-mmbert-small-multilingual-1/:
 //     ls models/chunkers/chonky-mmbert-small-multilingual-1/model.onnx
 //
-//  2. Run the test (Termite is started automatically as an embedded service):
+//  2. Run the test (Antfly inference is started automatically as an embedded service):
 //     go test -v ./go/pkg/antfly/src/store/indexes -run TestPipelineEnricher_FullPipelineIntegration
 //
 // The test automatically:
-// - Starts an embedded Termite service on port 18433
+// - Starts an embedded Antfly inference service on port 18433
 // - Loads ONNX models from models/chunkers/ directory
 // - Runs the full doc→chunk→summary→embed pipeline synchronously
-// - Shuts down Termite when the test completes
+// - Shuts down Antfly inference when the test completes
 //
 // This test verifies:
 // - Documents are chunked using ONNX-based semantic chunking with neural networks

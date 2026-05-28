@@ -92,6 +92,7 @@ pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
     content_security: ?scraping.ContentSecurityConfig = null,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
+    allow_downloads: bool = true,
     keep_alive_ms: u64 = 300_000,
     max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
@@ -2089,7 +2090,7 @@ pub const Node = struct {
             const plugin_path = pjrt_plugin_path orelse
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
-                    .message = "xla backend requires TERMITE_XLA_PLUGIN or TERMITE_PJRT_PLUGIN",
+                    .message = "xla backend requires ANTFLY_INFERENCE_XLA_PLUGIN, ANTFLY_INFERENCE_PJRT_PLUGIN, PJRT_PLUGIN_PATH, or PJRT_PLUGIN",
                 });
             pjrt_client = pjrt_lib.pjrt.Client.init(plugin_path) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
@@ -4086,7 +4087,24 @@ pub const Node = struct {
         }
         try buf.appendSlice(a, "{\"object\":\"list\",\"data\":[");
         try buf.appendSlice(a, openai_data.items);
-        try buf.appendSlice(a, "],");
+        try buf.appendSlice(a, "],\"allow_downloads\":");
+        try buf.appendSlice(a, if (self.config.allow_downloads) "true" else "false");
+        try buf.appendSlice(a, ",\"backends\":{");
+        try buf.appendSlice(a, "\"native\":");
+        try buf.appendSlice(a, if (build_options.enable_native) "true" else "false");
+        try buf.appendSlice(a, ",\"onnx\":");
+        try buf.appendSlice(a, if (build_options.enable_onnx) "true" else "false");
+        try buf.appendSlice(a, ",\"metal\":");
+        try buf.appendSlice(a, if (build_options.enable_metal) "true" else "false");
+        try buf.appendSlice(a, ",\"mlx\":");
+        try buf.appendSlice(a, if (build_options.enable_mlx) "true" else "false");
+        try buf.appendSlice(a, ",\"cuda\":");
+        try buf.appendSlice(a, if (build_options.enable_cuda) "true" else "false");
+        try buf.appendSlice(a, ",\"xla\":");
+        try buf.appendSlice(a, if (build_options.enable_pjrt) "true" else "false");
+        try buf.appendSlice(a, ",\"wasm\":");
+        try buf.appendSlice(a, if (build_options.enable_wasm) "true" else "false");
+        try buf.appendSlice(a, "},");
         try buf.appendSlice(a, body.items);
         try buf.append(a, '}');
 
@@ -4186,9 +4204,11 @@ pub const Node = struct {
             .status = "ready",
             .backends = .{
                 .native = build_options.enable_native,
-                .onnx = true,
-                .onnx_runtime = build_options.enable_onnx,
+                .onnx = build_options.enable_onnx,
+                .metal = build_options.enable_metal,
                 .mlx = build_options.enable_mlx,
+                .cuda = build_options.enable_cuda,
+                .xla = build_options.enable_pjrt,
                 .wasm = build_options.enable_wasm,
             },
             .models = .{

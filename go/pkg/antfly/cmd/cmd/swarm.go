@@ -27,8 +27,8 @@ import (
 	"syscall"
 	"time"
 
+	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/inference"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/pebbleutils"
-	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/termite"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/metadata"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"

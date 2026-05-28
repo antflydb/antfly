@@ -1,11 +1,11 @@
 // Product configuration for conditional builds
 // Set VITE_PRODUCTS environment variable to control which products are enabled
 // Examples:
-//   VITE_PRODUCTS=termite          - Termite-only build
+//   VITE_PRODUCTS=inference          - Inference-only build
 //   VITE_PRODUCTS=antfly           - Antfly-only build
-//   VITE_PRODUCTS=antfly,termite   - Full antfarm (default)
+//   VITE_PRODUCTS=antfly,inference   - Full antfarm (default)
 
-export type ProductId = "antfly" | "termite";
+export type ProductId = "antfly" | "inference";
 
 export interface Product {
   id: ProductId;
@@ -39,9 +39,9 @@ export const PRODUCTS: Record<ProductId, Product> = {
       "/playground/chunking",
     ],
   },
-  termite: {
-    id: "termite",
-    name: "Termite",
+  inference: {
+    id: "inference",
+    name: "Inference",
     description: "ML inference playgrounds",
     defaultRoute: "/playground/chunk",
     routes: [
@@ -64,16 +64,16 @@ const parseEnabledProducts = (): ProductId[] => {
 
   if (!envValue) {
     // Default: enable all products
-    return ["antfly", "termite"];
+    return ["antfly", "inference"];
   }
 
   const products = envValue
     .split(",")
     .map((p) => p.trim().toLowerCase())
-    .filter((p): p is ProductId => p === "antfly" || p === "termite");
+    .filter((p): p is ProductId => p === "antfly" || p === "inference");
 
   // If no valid products found, enable all
-  return products.length > 0 ? products : ["antfly", "termite"];
+  return products.length > 0 ? products : ["antfly", "inference"];
 };
 
 export const enabledProducts = parseEnabledProducts();
@@ -92,7 +92,7 @@ export const getDefaultRoute = (): string => {
 
 // Determine which product owns a given pathname by checking each product's
 // routes list. Longer prefixes are checked first so "/playground/chunking"
-// matches termite before a hypothetical "/" catch-all matches antfly.
+// matches inference before a hypothetical "/" catch-all matches antfly.
 export function productForPath(pathname: string): ProductId | undefined {
   let best: { product: ProductId; len: number } | undefined;
   for (const product of enabledProducts) {

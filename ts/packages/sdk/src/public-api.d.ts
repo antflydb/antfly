@@ -1448,7 +1448,7 @@ export interface paths {
          *     2. Render any templates
          *     3. Send pre-rendered text strings as `prompts`
          *
-         *     This design keeps Termite stateless and allows clients to customize rendering logic.
+         *     This design keeps inference stateless and allows clients to customize rendering logic.
          *
          *     ## Models
          *
@@ -1931,26 +1931,6 @@ export interface paths {
          *     Models are discovered at service startup and cached.
          */
         get: operations["listModels"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/ai/v1/version": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get version information
-         * @description Returns Termite version, git commit, build time, and Go runtime version.
-         */
-        get: operations["getVersion"];
         put?: never;
         post?: never;
         delete?: never;
@@ -4169,7 +4149,7 @@ export interface components {
              *     Example:
              *     ```json
              *     {
-             *       "provider": "termite",
+             *       "provider": "antfly",
              *       "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
              *       "field": "content"
              *     }
@@ -5622,9 +5602,9 @@ export interface components {
             truncate?: "NONE" | "START" | "END";
         };
         /**
-         * @description Configuration for the Termite embedding provider.
+         * @description Configuration for the Antfly inference embedding provider.
          *
-         *     Termite is Antfly's built-in ML service for local embeddings using ONNX models.
+         *     Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
          *     It provides embedding generation with multi-tier caching (memory + persistent).
          *
          *     **Features:**
@@ -5637,12 +5617,12 @@ export interface components {
          *
          *     Models are loaded from the `models/embedders/{name}/` directory.
          * @example {
-         *       "provider": "termite",
+         *       "provider": "antfly",
          *       "model": "bge-base-en-v1.5",
          *       "api_url": "http://localhost:8082"
          *     }
          */
-        TermiteEmbedderConfig: {
+        AntflyEmbedderConfig: {
             /**
              * @description The embedding model name (maps to models/embedders/{name}/ directory).
              * @example bge-base-en-v1.5
@@ -5650,33 +5630,16 @@ export interface components {
             model: string;
             /**
              * Format: uri
-             * @description The URL of the Termite API endpoint. Can also be set via ANTFLY_TERMITE_URL environment variable.
+             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
              * @example http://localhost:8082
              */
             api_url?: string;
         };
         /**
-         * @description Configuration for the built-in Antfly embedding provider.
-         *
-         *     Uses an embedded INT8-quantized all-MiniLM-L6-v2 ONNX model bundled directly
-         *     in the binary. No external service, API key, or model download required.
-         *
-         *     **Model:** all-MiniLM-L6-v2 (384 dimensions, text-only)
-         *
-         *     **Features:**
-         *     - Zero configuration — works out of the box
-         *     - No network access required
-         *     - Pure Go inference via GoMLX
-         * @example {
-         *       "provider": "antfly"
-         *     }
-         */
-        AntflyEmbedderConfig: Record<string, never>;
-        /**
          * @description The embedding provider to use.
          * @enum {string}
          */
-        EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "mock" | "termite" | "antfly";
+        EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "mock" | "antfly";
         /**
          * @description A unified configuration for an embedding provider.
          *
@@ -5856,7 +5819,7 @@ export interface components {
          *       "model": "text-embedding-3-small"
          *     }
          */
-        EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["TermiteEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+        EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
             provider: components["schemas"]["EmbedderProvider"];
             /**
              * @description Declare that this model supports non-text content (images, audio, video, PDFs),
@@ -5976,8 +5939,8 @@ export interface components {
             /** @description HTTP response timeout in seconds for Ollama API calls. */
             timeout?: number;
         };
-        /** @description Configuration for the Termite generative AI provider. */
-        TermiteGeneratorConfig: {
+        /** @description Configuration for the Antfly inference generative AI provider. */
+        AntflyGeneratorConfig: {
             /**
              * @description The name of the generator model.
              * @example onnxruntime/Gemma-3-ONNX
@@ -5985,7 +5948,7 @@ export interface components {
             model: string;
             /**
              * Format: uri
-             * @description The URL of the Termite API endpoint.
+             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
              */
             api_url?: string;
             /**
@@ -6002,7 +5965,7 @@ export interface components {
             top_p?: number;
             /** @description Top-k sampling parameter. */
             top_k?: number;
-            /** @description HTTP response timeout in seconds for Termite API calls. */
+            /** @description HTTP response timeout in seconds for Inference API calls. */
             timeout?: number;
         };
         /** @description Configuration for the OpenAI generative AI provider. */
@@ -6170,7 +6133,7 @@ export interface components {
          * @description The generative AI provider to use.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "anthropic" | "cohere" | "termite" | "antfly" | "mock";
+        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "anthropic" | "cohere" | "antfly" | "mock";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -6180,7 +6143,7 @@ export interface components {
          *       "max_tokens": 2048
          *     }
          */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["TermiteGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["CohereGeneratorConfig"]) & {
+        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["CohereGeneratorConfig"]) & {
             provider: components["schemas"]["GeneratorProvider"];
         };
         /** @description Options specific to text chunking. */
@@ -6212,9 +6175,9 @@ export interface components {
             audio?: components["schemas"]["AudioChunkOptions"];
         };
         /**
-         * @description Configuration for the Termite chunking provider.
+         * @description Configuration for the Antfly inference chunking provider.
          *
-         *     Termite is a centralized HTTP service that provides chunking with multi-tier caching.
+         *     Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
          *     The model name maps to ONNX model directory names (similar to how Ollama works).
          *
          *     **Chunking Models:**
@@ -6226,7 +6189,7 @@ export interface components {
          *     - L2: Persistent Pebble database
          *     - Singleflight deduplication for concurrent identical requests
          * @example {
-         *       "provider": "termite",
+         *       "provider": "antfly",
          *       "api_url": "http://localhost:8080",
          *       "model": "fixed",
          *       "max_chunks": 50,
@@ -6237,10 +6200,10 @@ export interface components {
          *       }
          *     }
          */
-        TermiteChunkerConfig: components["schemas"]["ChunkOptions"] & {
+        AntflyChunkerConfig: components["schemas"]["ChunkOptions"] & {
             /**
              * Format: uri
-             * @description The URL of the Termite API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_TERMITE_URL environment variable.
+             * @description The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
              * @example http://localhost:8080
              */
             api_url?: string;
@@ -6252,41 +6215,14 @@ export interface components {
             model: string;
         };
         /**
-         * @description Configuration for the local Antfly chunking provider.
-         *
-         *     This provider runs chunking directly within the storage node process,
-         *     without requiring an external Termite service. It uses simple fixed-size
-         *     tokenizer-based chunking with no caching overhead.
-         *
-         *     **Use this when:**
-         *     - Running single-node deployments (swarm mode)
-         *     - You don't need embedding/chunk caching across nodes
-         *     - You want minimal setup complexity
-         *
-         *     **Use Termite instead when:**
-         *     - Running multi-node clusters where caching reduces costs
-         *     - You need ONNX-accelerated chunking models
-         *     - You want persistent chunk/embedding caches
-         * @example {
-         *       "provider": "antfly",
-         *       "max_chunks": 50,
-         *       "text": {
-         *         "target_tokens": 500,
-         *         "overlap_tokens": 50,
-         *         "separator": "\n\n"
-         *       }
-         *     }
-         */
-        AntflyChunkerConfig: components["schemas"]["ChunkOptions"];
-        /**
          * @description The chunking provider to use.
          * @enum {string}
          */
-        ChunkerProvider: "mock" | "termite" | "antfly";
+        ChunkerProvider: "mock" | "antfly";
         /**
          * @description A unified configuration for a chunking provider.
          * @example {
-         *       "provider": "termite",
+         *       "provider": "antfly",
          *       "model": "fixed",
          *       "text": {
          *         "target_tokens": 500,
@@ -6294,7 +6230,7 @@ export interface components {
          *       }
          *     }
          */
-        ChunkerConfig: (components["schemas"]["TermiteChunkerConfig"] | components["schemas"]["AntflyChunkerConfig"]) & {
+        ChunkerConfig: components["schemas"]["AntflyChunkerConfig"] & {
             provider: components["schemas"]["ChunkerProvider"];
             /**
              * @description Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
@@ -7322,11 +7258,11 @@ export interface components {
             enabled_tools?: components["schemas"]["ChatToolName"][];
             /**
              * @description Web search provider configuration. Required when websearch tool is enabled.
-             *     See go/pkg/antfly/lib/websearch/openapi.yaml for provider-specific options.
+             *     See specs/openapi/antfly/websearch.yaml for provider-specific options.
              */
             websearch_config?: components["schemas"]["WebSearchConfig"];
             /**
-             * @description URL fetching configuration. See go/pkg/antfly/lib/websearch/openapi.yaml
+             * @description URL fetching configuration. See specs/openapi/antfly/websearch.yaml
              *     for available options and security controls.
              */
             fetch_config?: components["schemas"]["FetchConfig"];
@@ -7560,10 +7496,51 @@ export interface components {
             options?: components["schemas"]["EvalOptions"];
         };
         /**
-         * @description Role of the message sender in the conversation
+         * @description Role of the message sender in a generation/chat conversation
          * @enum {string}
          */
         ChatMessageRole: "user" | "assistant" | "system" | "tool";
+        /** @description Text content for multimodal input. */
+        TextContentPart: {
+            /** @enum {string} */
+            type: "text";
+            /** @description Text content. */
+            text: string;
+        };
+        /** @description Image URL or data URI. */
+        ImageURL: {
+            /**
+             * @description URL or data URI (data:image/png;base64,...).
+             * @example data:image/png;base64,iVBORw0KGgo...
+             */
+            url: string;
+        };
+        /** @description Image content in OpenAI-compatible format. */
+        ImageURLContentPart: {
+            /** @enum {string} */
+            type: "image_url";
+            image_url: components["schemas"]["ImageURL"];
+        };
+        /** @description Inline binary media content (audio, image, etc.). */
+        MediaContentPart: {
+            /** @enum {string} */
+            type: "media";
+            /**
+             * Format: byte
+             * @description Base64-encoded binary data.
+             */
+            data: string;
+            /** @description MIME type (audio/wav, image/gif, image/png, etc.). */
+            mime_type: string;
+        };
+        /** @description A content part for multimodal input (text, image URL, or inline media). */
+        ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"];
+        /**
+         * @description Message content. Supports two formats:
+         *     - Simple string: "Hello, how are you?"
+         *     - Array of content parts: [{"type": "text", "text": "Hello"}]
+         */
+        ChatMessageContent: string | components["schemas"]["ContentPart"][];
         /** @description A tool call made by the assistant */
         ChatToolCall: {
             /** @description Unique identifier for this tool call */
@@ -7586,11 +7563,10 @@ export interface components {
             /** @description Error message if tool execution failed */
             error?: string;
         };
-        /** @description A message in the conversation history */
+        /** @description A message in a generation/chat conversation */
         ChatMessage: {
             role: components["schemas"]["ChatMessageRole"];
-            /** @description Text content of the message */
-            content: string;
+            content: components["schemas"]["ChatMessageContent"];
             /** @description Tool calls made by the assistant (only for assistant role) */
             tool_calls?: components["schemas"]["ChatToolCall"][];
             /** @description Results from tool executions (only for tool role) */
@@ -7730,24 +7706,24 @@ export interface components {
          * @description The reranking provider to use.
          * @enum {string}
          */
-        RerankerProvider: "antfly" | "ollama" | "termite" | "cohere" | "vertex";
+        RerankerProvider: "antfly" | "ollama" | "cohere" | "vertex";
         /**
-         * @description Configuration for the built-in Antfly reranking provider.
-         *
-         *     Uses an embedded INT8-quantized cross-encoder/ms-marco-MiniLM-L-6-v2 ONNX model
-         *     bundled directly in the binary. No external service, API key, or model download required.
-         *
-         *     **Model:** cross-encoder/ms-marco-MiniLM-L-6-v2 (6-layer MiniLM cross-encoder)
-         *
-         *     **Features:**
-         *     - Zero configuration — works out of the box
-         *     - No network access required
-         *     - Pure Go inference via GoMLX
+         * @description Configuration for the Antfly inference reranking provider.
          * @example {
-         *       "provider": "antfly"
+         *       "provider": "antfly",
+         *       "model": "mixedbread-ai/mxbai-rerank-base-v1",
+         *       "url": "http://localhost:8080"
          *     }
          */
-        AntflyRerankerConfig: Record<string, never>;
+        AntflyRerankerConfig: {
+            /** @description The name of the reranking model (e.g., cross-encoder model name). */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+             */
+            url?: string;
+        };
         /** @description Configuration for the Ollama reranking provider. */
         OllamaRerankerConfig: {
             /** @description The name of the Ollama model to use for reranking. */
@@ -7755,16 +7731,6 @@ export interface components {
             /**
              * Format: uri
              * @description The URL of the Ollama API endpoint.
-             */
-            url?: string;
-        };
-        /** @description Configuration for the Termite reranking provider. */
-        TermiteRerankerConfig: {
-            /** @description The name of the reranking model (e.g., cross-encoder model name). */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Termite API endpoint.
              */
             url?: string;
         };
@@ -7843,7 +7809,7 @@ export interface components {
             field?: string;
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
-        } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["TermiteRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
         /**
          * @description Type of graph query to execute
          * @enum {string}
@@ -8091,19 +8057,19 @@ export interface components {
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
         };
-        TermiteError: {
+        InferenceError: {
             /** @description Error message */
             error: string;
         };
         /** @description Text content for embedding */
-        TermiteTextContentPart: {
+        InferenceTextContentPart: {
             /** @enum {string} */
             type: "text";
             /** @description Text content to embed */
             text: string;
         };
         /** @description Image URL or data URI */
-        TermiteImageURL: {
+        InferenceImageURL: {
             /**
              * @description URL or data URI (data:image/png;base64,...)
              * @example data:image/png;base64,iVBORw0KGgo...
@@ -8111,13 +8077,13 @@ export interface components {
             url: string;
         };
         /** @description Image content for embedding (OpenAI-compatible format) */
-        TermiteImageURLContentPart: {
+        InferenceImageURLContentPart: {
             /** @enum {string} */
             type: "image_url";
-            image_url: components["schemas"]["TermiteImageURL"];
+            image_url: components["schemas"]["InferenceImageURL"];
         };
         /** @description Inline binary media content (audio, image, etc.) */
-        TermiteMediaContentPart: {
+        InferenceMediaContentPart: {
             /** @enum {string} */
             type: "media";
             /**
@@ -8129,9 +8095,9 @@ export interface components {
             mime_type: string;
         };
         /** @description A content part for multimodal input (text, image URL, or inline media) */
-        TermiteContentPart: components["schemas"]["TermiteTextContentPart"] | components["schemas"]["TermiteImageURLContentPart"] | components["schemas"]["TermiteMediaContentPart"];
-        /** @description OpenAI-compatible embedding request with Termite multimodal content-part extension */
-        TermiteEmbedRequest: {
+        InferenceContentPart: components["schemas"]["InferenceTextContentPart"] | components["schemas"]["InferenceImageURLContentPart"] | components["schemas"]["InferenceMediaContentPart"];
+        /** @description OpenAI-compatible embedding request with inference multimodal content-part extension */
+        InferenceEmbedRequest: {
             /** @description Model name to use for embedding generation */
             model: string;
             /**
@@ -8141,7 +8107,7 @@ export interface components {
              *     - an array of strings
              *     - an array of OpenAI-style content parts for multimodal embedding
              */
-            input: string | string[] | components["schemas"]["TermiteContentPart"][];
+            input: string | string[] | components["schemas"]["ContentPart"][];
             /**
              * @description Encoding format for the embeddings (only "float" supported)
              * @default float
@@ -8163,34 +8129,34 @@ export interface components {
             input_type?: "search_query" | "search_document" | "query" | "document" | "classification" | "clustering";
         };
         /** @description OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors */
-        TermiteEmbedResponse: {
+        InferenceEmbedResponse: {
             /**
              * @description Object type, always "list"
              * @enum {string}
              */
             object: "list";
             /** @description List of embedding objects */
-            data: components["schemas"]["TermiteEmbeddingObject"][];
+            data: components["schemas"]["InferenceEmbeddingObject"][];
             /** @description Model used for embedding generation */
             model: string;
-            usage: components["schemas"]["TermiteEmbeddingUsage"];
+            usage: components["schemas"]["InferenceEmbeddingUsage"];
         };
         /** @description A sparse vector with parallel index/value arrays, sorted by index ascending */
-        TermiteSparseVector: {
+        InferenceSparseVector: {
             /** @description Token IDs from the model vocabulary (sorted ascending) */
             indices: number[];
             /** @description Corresponding weights for each index (always positive) */
             values: number[];
         };
         /** @description A chunk of content. Text chunks have mime_type text/plain. */
-        TermiteChunk: (components["schemas"]["TermiteTextContent"] | components["schemas"]["TermiteBinaryContent"]) & {
+        InferenceChunk: (components["schemas"]["InferenceTextContent"] | components["schemas"]["InferenceBinaryContent"]) & {
             /** @description Sequence number of the chunk (0, 1, 2, ...) */
             id: number;
             /** @description MIME type: text/plain, audio/wav, image/png, etc. */
             mime_type: string;
         };
-        /** @description Options for Voice Activity Detection (VAD) based audio segmentation. Termite-specific. */
-        TermiteVADOptions: {
+        /** @description Options for Voice Activity Detection (VAD) based audio segmentation. inference-specific. */
+        InferenceVADOptions: {
             /** @description Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300. */
             min_silence_duration_ms?: number;
             /** @description Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250. */
@@ -8200,19 +8166,19 @@ export interface components {
             /** @description Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000. */
             max_segment_duration_ms?: number;
         };
-        /** @description Audio chunking configuration for Termite, including VAD options. */
-        TermiteAudioChunkConfig: {
+        /** @description Audio chunking configuration for inference, including VAD options. */
+        InferenceAudioChunkConfig: {
             /** @description Window duration in milliseconds for fixed-window audio chunking (default: 30000). */
             window_duration_ms?: number;
             /** @description Overlap duration in milliseconds between audio chunks (default: 0). */
             overlap_duration_ms?: number;
-            vad?: components["schemas"]["TermiteVADOptions"];
+            vad?: components["schemas"]["InferenceVADOptions"];
         };
         /**
-         * @description Configuration for chunking requests to Termite API.
-         *     Combines shared text options with Termite-specific audio/VAD options.
+         * @description Configuration for chunking requests to Inference API.
+         *     Combines shared text options with inference-specific audio/VAD options.
          */
-        TermiteChunkConfig: {
+        InferenceChunkConfig: {
             /**
              * @description The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
              * @default fixed
@@ -8226,24 +8192,24 @@ export interface components {
              * @description Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
              */
             threshold?: number;
-            text?: components["schemas"]["TermiteTextChunkOptions"];
-            audio?: components["schemas"]["TermiteAudioChunkConfig"];
+            text?: components["schemas"]["InferenceTextChunkOptions"];
+            audio?: components["schemas"]["InferenceAudioChunkConfig"];
         };
-        TermiteChunkRequest: {
+        InferenceChunkRequest: {
             /**
              * @description Input content to chunk. Supports two formats:
              *     - Text string: `"This is a long document..."` (backward compatible)
              *     - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
              *     - ContentPart: `{"type": "text", "text": "..."}`
              */
-            input?: string | components["schemas"]["TermiteContentPart"];
+            input?: string | components["schemas"]["ContentPart"];
             /**
              * @deprecated
              * @description DEPRECATED: Use 'input' instead. Text to chunk.
              * @example This is a long document that needs to be split into smaller chunks...
              */
             text?: string;
-            config?: components["schemas"]["TermiteChunkConfig"];
+            config?: components["schemas"]["InferenceChunkConfig"];
         };
         /**
          * @example {
@@ -8277,31 +8243,31 @@ export interface components {
          *       "cache_hit": false
          *     }
          */
-        TermiteChunkResponse: {
+        InferenceChunkResponse: {
             /**
              * @description Object type, always "list"
              * @enum {string}
              */
             object: "list";
             /** @description Array of chunk objects */
-            data: components["schemas"]["TermiteChunkObject"][];
+            data: components["schemas"]["InferenceChunkObject"][];
             /**
              * @description Chunking model actually used (may differ from requested if fallback occurred)
              * @example fixed
              */
             model: string;
-            usage: components["schemas"]["TermiteGenerateUsage"];
+            usage: components["schemas"]["InferenceGenerateUsage"];
             /** @description Whether result was served from cache */
             cache_hit: boolean;
         };
         /** @description A chunk result object. Text chunks have mime_type text/plain. */
-        TermiteChunkObject: components["schemas"]["TermiteChunk"] & {
+        InferenceChunkObject: components["schemas"]["InferenceChunk"] & {
             /** @enum {string} */
             object: "chunk";
             /** @description Position of this chunk object in the response data array. */
             index: number;
         };
-        TermiteRerankRequest: {
+        InferenceRerankRequest: {
             /**
              * @description Name of reranking model from models_dir/rerankers/
              * @example BAAI/bge-reranker-v2-m3
@@ -8322,12 +8288,12 @@ export interface components {
              */
             prompts: string[];
         };
-        TermiteRerankMultimodalDocument: {
+        InferenceRerankMultimodalDocument: {
             /** @description Optional caller-provided document identifier */
             id?: string;
-            content: components["schemas"]["TermiteChatMessageContent"];
+            content: components["schemas"]["ChatMessageContent"];
         };
-        TermiteRerankMultimodalRequest: {
+        InferenceRerankMultimodalRequest: {
             /**
              * @description Name of multimodal reranking model from models_dir/rerankers/
              * @example vidore/colqwen2-v1.0
@@ -8339,21 +8305,21 @@ export interface components {
              */
             query: string;
             /** @description Documents expressed as text and image content parts */
-            documents: components["schemas"]["TermiteRerankMultimodalDocument"][];
+            documents: components["schemas"]["InferenceRerankMultimodalDocument"][];
         };
-        TermiteRerankResponse: {
+        InferenceRerankResponse: {
             /**
              * @description Object type, always "list"
              * @enum {string}
              */
             object: "list";
             /** @description Rerank score objects, one per input prompt. */
-            data: components["schemas"]["TermiteRerankObject"][];
+            data: components["schemas"]["InferenceRerankObject"][];
             /** @description Name of model used for reranking */
             model: string;
-            usage: components["schemas"]["TermiteGenerateUsage"];
+            usage: components["schemas"]["InferenceGenerateUsage"];
         };
-        TermiteRerankObject: {
+        InferenceRerankObject: {
             /** @enum {string} */
             object: "rerank.score";
             /** @description Original prompt index. */
@@ -8364,7 +8330,7 @@ export interface components {
              */
             score: number;
         };
-        TermiteRecognizeEntity: {
+        InferenceRecognizeEntity: {
             /**
              * @description The entity text
              * @example John Smith
@@ -8392,7 +8358,7 @@ export interface components {
              */
             score: number;
         };
-        TermiteRecognizeRequest: {
+        InferenceRecognizeRequest: {
             /**
              * @description Name of recognizer model from models_dir/recognizers/
              * @example dslim/bert-base-NER
@@ -8433,14 +8399,14 @@ export interface components {
              *     ]
              */
             relation_labels?: string[];
-            resolver?: components["schemas"]["TermiteResolverConfig"];
+            resolver?: components["schemas"]["InferenceResolverConfig"];
         };
         /**
          * @description Configuration for entity resolution. When present in a RecognizeRequest,
          *     the response entities and relations are deduplicated via entity resolution
          *     (e.g., "Elon Musk" and "Musk" are merged into a single entity).
          */
-        TermiteResolverConfig: {
+        InferenceResolverConfig: {
             /**
              * Format: float
              * @description Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
@@ -8475,11 +8441,11 @@ export interface components {
              */
             track_provenance?: boolean;
         };
-        TermiteRelation: {
+        InferenceRelation: {
             /** @description The subject/head entity in the relationship */
-            head: components["schemas"]["TermiteRecognizeEntity"];
+            head: components["schemas"]["InferenceRecognizeEntity"];
             /** @description The object/tail entity in the relationship */
-            tail: components["schemas"]["TermiteRecognizeEntity"];
+            tail: components["schemas"]["InferenceRecognizeEntity"];
             /**
              * @description The relationship type
              * @example founded
@@ -8492,32 +8458,32 @@ export interface components {
              */
             score: number;
         };
-        TermiteRecognizeResponse: {
+        InferenceRecognizeResponse: {
             /**
              * @description Object type, always "list"
              * @enum {string}
              */
             object: "list";
             /** @description Recognition result objects, one per input text. */
-            data: components["schemas"]["TermiteRecognizeObject"][];
+            data: components["schemas"]["InferenceRecognizeObject"][];
             /** @description Name of model used for NER */
             model: string;
-            usage: components["schemas"]["TermiteGenerateUsage"];
+            usage: components["schemas"]["InferenceGenerateUsage"];
         };
-        TermiteRecognizeObject: {
+        InferenceRecognizeObject: {
             /** @enum {string} */
             object: "recognition";
             /** @description Original input text index. */
             index: number;
             /** @description Entities recognized for this input text. */
-            entities: components["schemas"]["TermiteRecognizeEntity"][];
+            entities: components["schemas"]["InferenceRecognizeEntity"][];
             /**
              * @description Relations recognized for this input text. Only present when using
              *     a model with 'relations' capability (GLiNER multitask, REBEL).
              */
-            relations?: components["schemas"]["TermiteRelation"][];
+            relations?: components["schemas"]["InferenceRelation"][];
         };
-        TermiteRewriteRequest: {
+        InferenceRewriteRequest: {
             /**
              * @description Name of Seq2Seq rewriter model from models_dir/rewriters/
              * @example lmqg/flan-t5-small-squad-qg
@@ -8531,19 +8497,19 @@ export interface components {
              */
             inputs: string[];
         };
-        TermiteRewriteResponse: {
+        InferenceRewriteResponse: {
             /**
              * @description Object type, always "list"
              * @enum {string}
              */
             object: "list";
             /** @description Rewritten text objects, one per input. */
-            data: components["schemas"]["TermiteRewriteObject"][];
+            data: components["schemas"]["InferenceRewriteObject"][];
             /** @description Name of model used for rewriting */
             model: string;
-            usage: components["schemas"]["TermiteGenerateUsage"];
+            usage: components["schemas"]["InferenceGenerateUsage"];
         };
-        TermiteRewriteObject: {
+        InferenceRewriteObject: {
             /** @enum {string} */
             object: "rewrite";
             /** @description Original input text index. */
@@ -8551,7 +8517,7 @@ export interface components {
             /** @description Rewritten texts for this input, one per beam. */
             texts: string[];
         };
-        TermiteClassifyRequest: {
+        InferenceClassifyRequest: {
             /**
              * @description Name of classifier model from models_dir/classifiers/
              * @example MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
@@ -8589,7 +8555,7 @@ export interface components {
              */
             multi_label?: boolean;
         };
-        TermiteClassifyResult: {
+        InferenceClassifyResult: {
             /**
              * @description The predicted class/category
              * @example positive
@@ -8602,27 +8568,27 @@ export interface components {
              */
             score: number;
         };
-        TermiteClassifyResponse: {
+        InferenceClassifyResponse: {
             /**
              * @description Object type, always "list"
              * @enum {string}
              */
             object: "list";
             /** @description Classification result objects, one per input text. */
-            data: components["schemas"]["TermiteClassifyObject"][];
+            data: components["schemas"]["InferenceClassifyObject"][];
             /** @description Name of model used for classification */
             model: string;
-            usage: components["schemas"]["TermiteGenerateUsage"];
+            usage: components["schemas"]["InferenceGenerateUsage"];
         };
-        TermiteClassifyObject: {
+        InferenceClassifyObject: {
             /** @enum {string} */
             object: "classification";
             /** @description Original input text index. */
             index: number;
             /** @description Classification results for this input text. */
-            classifications: components["schemas"]["TermiteClassifyResult"][];
+            classifications: components["schemas"]["InferenceClassifyResult"][];
         };
-        TermiteDocumentClassificationRequest: {
+        InferenceDocumentClassificationRequest: {
             /**
              * @description Name or path of the document classification model directory or checkpoint
              * @example acme/layoutdoc-invoice-sequence
@@ -8654,7 +8620,7 @@ export interface components {
              */
             prefix?: string;
         };
-        TermiteDocumentClassificationFeatures: {
+        InferenceDocumentClassificationFeatures: {
             num_tokens: number;
             image_width: number;
             image_height: number;
@@ -8674,22 +8640,22 @@ export interface components {
             /** Format: float */
             center_darkness: number;
         };
-        TermiteDocumentClassificationResult: {
+        InferenceDocumentClassificationResult: {
             label: string;
             /** Format: float */
             score: number;
         };
-        TermiteDocumentClassificationResponse: {
+        InferenceDocumentClassificationResponse: {
             /**
              * @description Object type, always "list"
              * @enum {string}
              */
             object: "list";
-            data: components["schemas"]["TermiteDocumentClassificationObject"][];
+            data: components["schemas"]["InferenceDocumentClassificationObject"][];
             model: string;
-            usage: components["schemas"]["TermiteGenerateUsage"];
+            usage: components["schemas"]["InferenceGenerateUsage"];
         };
-        TermiteDocumentClassificationObject: {
+        InferenceDocumentClassificationObject: {
             /** @enum {string} */
             object: "document.classification";
             index: number;
@@ -8699,11 +8665,11 @@ export interface components {
                 image_path: string;
                 num_tokens: number;
             };
-            features: components["schemas"]["TermiteDocumentClassificationFeatures"];
-            best?: components["schemas"]["TermiteDocumentClassificationResult"] | null;
-            scores: components["schemas"]["TermiteDocumentClassificationResult"][];
+            features: components["schemas"]["InferenceDocumentClassificationFeatures"];
+            best?: components["schemas"]["InferenceDocumentClassificationResult"] | null;
+            scores: components["schemas"]["InferenceDocumentClassificationResult"][];
         };
-        TermiteDocumentTokenBox: {
+        InferenceDocumentTokenBox: {
             text: string;
             /**
              * @description Bounding box normalized to the same 0-1000 layout space used by training
@@ -8716,7 +8682,7 @@ export interface components {
              */
             bbox: number[];
         };
-        TermiteDocumentTokenClassificationRequest: {
+        InferenceDocumentTokenClassificationRequest: {
             /**
              * @description Name or path of the document token classification model directory or checkpoint
              * @example acme/layoutdoc-token-tags
@@ -8731,7 +8697,7 @@ export interface components {
              *     ]
              */
             labels: string[];
-            tokens: components["schemas"]["TermiteDocumentTokenBox"][];
+            tokens: components["schemas"]["InferenceDocumentTokenBox"][];
             /**
              * @description Optional tensor prefix inside the safetensors checkpoint
              * @default layoutdoc_token_head
@@ -8739,7 +8705,7 @@ export interface components {
              */
             prefix?: string;
         };
-        TermiteDocumentTokenClassificationFeatures: {
+        InferenceDocumentTokenClassificationFeatures: {
             text_length: number;
             bbox: number[];
             /** Format: float */
@@ -8751,30 +8717,30 @@ export interface components {
             /** Format: float */
             bbox_phase_sin: number;
         };
-        TermiteDocumentTokenClassificationResult: {
+        InferenceDocumentTokenClassificationResult: {
             label: string;
             /** Format: float */
             score: number;
         };
-        TermiteDocumentTokenClassificationPrediction: {
+        InferenceDocumentTokenClassificationPrediction: {
             token_index: number;
             text: string;
             bbox: number[];
-            features: components["schemas"]["TermiteDocumentTokenClassificationFeatures"];
-            best?: components["schemas"]["TermiteDocumentTokenClassificationResult"] | null;
-            scores: components["schemas"]["TermiteDocumentTokenClassificationResult"][];
+            features: components["schemas"]["InferenceDocumentTokenClassificationFeatures"];
+            best?: components["schemas"]["InferenceDocumentTokenClassificationResult"] | null;
+            scores: components["schemas"]["InferenceDocumentTokenClassificationResult"][];
         };
-        TermiteDocumentTokenClassificationResponse: {
+        InferenceDocumentTokenClassificationResponse: {
             /**
              * @description Object type, always "list"
              * @enum {string}
              */
             object: "list";
-            data: components["schemas"]["TermiteDocumentTokenClassificationObject"][];
+            data: components["schemas"]["InferenceDocumentTokenClassificationObject"][];
             model: string;
-            usage: components["schemas"]["TermiteGenerateUsage"];
+            usage: components["schemas"]["InferenceGenerateUsage"];
         };
-        TermiteDocumentTokenClassificationObject: {
+        InferenceDocumentTokenClassificationObject: {
             /** @enum {string} */
             object: "document.token_classification";
             index: number;
@@ -8782,14 +8748,14 @@ export interface components {
             prefix: string;
             num_tokens: number;
             /** @description Each result is an array of ClassifyResult sorted by score descending. */
-            predictions: components["schemas"]["TermiteDocumentTokenClassificationPrediction"][];
+            predictions: components["schemas"]["InferenceDocumentTokenClassificationPrediction"][];
         };
         /**
          * @description Exactly one of `texts` or `images` must be provided.
          *     When using `images`, the server selects a compatible reader internally
          *     and processes the request as: read document text -> run structured extraction.
          */
-        TermiteExtractRequest: {
+        InferenceExtractRequest: {
             /**
              * @description Name of extractor model with 'extraction' capability
              * @example fastino/gliner2-base-v1
@@ -8807,7 +8773,7 @@ export interface components {
              *     When provided, the server first reads document text with a compatible reader
              *     and then runs schema extraction on the read text.
              */
-            images?: components["schemas"]["TermiteImageURL"][];
+            images?: components["schemas"]["InferenceImageURL"][];
             /**
              * @description Optional read-stage prompt used only when `images` are provided.
              *     Passed through to the reader before schema extraction.
@@ -8858,7 +8824,7 @@ export interface components {
              */
             include_spans?: boolean;
         };
-        TermiteExtractFieldValue: {
+        InferenceExtractFieldValue: {
             /**
              * @description The extracted text value
              * @example John Smith
@@ -8881,19 +8847,19 @@ export interface components {
              */
             end?: number;
         };
-        TermiteExtractResponse: {
+        InferenceExtractResponse: {
             /**
              * @description Object type, always "list"
              * @enum {string}
              */
             object: "list";
             /** @description Extraction result objects, one per input. */
-            data: components["schemas"]["TermiteExtractObject"][];
+            data: components["schemas"]["InferenceExtractObject"][];
             /** @description Name of model used for extraction */
             model: string;
-            usage: components["schemas"]["TermiteGenerateUsage"];
+            usage: components["schemas"]["InferenceGenerateUsage"];
         };
-        TermiteExtractObject: {
+        InferenceExtractObject: {
             /** @enum {string} */
             object: "extraction";
             /** @description Original input index. */
@@ -8909,7 +8875,7 @@ export interface components {
                 }[];
             };
         };
-        TermiteReadRequest: {
+        InferenceReadRequest: {
             /**
              * @description Name of reader model from models_dir/readers/
              * @example microsoft/trocr-base-printed
@@ -8925,7 +8891,7 @@ export interface components {
              *       }
              *     ]
              */
-            images: components["schemas"]["TermiteImageURL"][];
+            images: components["schemas"]["InferenceImageURL"][];
             /**
              * @description Optional task prompt for document understanding models.
              *     - TrOCR: Not used (pure OCR)
@@ -8944,7 +8910,7 @@ export interface components {
              */
             max_tokens?: number;
         };
-        TermiteTextRegion: {
+        InferenceTextRegion: {
             /** @description Recognized text within the region */
             text: string;
             /** @description Bounding box [x1, y1, x2, y2] in pixel coordinates */
@@ -8954,7 +8920,7 @@ export interface components {
             /** @description Semantic label from layout analysis (e.g., text, title, table) */
             label?: string;
         };
-        TermiteReadResult: {
+        InferenceReadResult: {
             /**
              * @description Extracted text from the image
              * @example Invoice Total: $123.45
@@ -8977,27 +8943,27 @@ export interface components {
              * @description Individual text regions with bounding boxes and recognized text.
              *     Populated by multi-stage OCR models (Surya, PaddleOCR).
              */
-            regions?: components["schemas"]["TermiteTextRegion"][];
+            regions?: components["schemas"]["InferenceTextRegion"][];
         };
-        TermiteReadResponse: {
+        InferenceReadResponse: {
             /**
              * @description Object type, always "list"
              * @enum {string}
              */
             object: "list";
             /** @description Read result objects, one per input image. */
-            data: components["schemas"]["TermiteReadObject"][];
+            data: components["schemas"]["InferenceReadObject"][];
             /** @description Name of model used for reading */
             model: string;
-            usage: components["schemas"]["TermiteGenerateUsage"];
+            usage: components["schemas"]["InferenceGenerateUsage"];
         };
-        TermiteReadObject: components["schemas"]["TermiteReadResult"] & {
+        InferenceReadObject: components["schemas"]["InferenceReadResult"] & {
             /** @enum {string} */
             object: "read";
             /** @description Original input image index. */
             index: number;
         };
-        TermiteTranscribeRequest: {
+        InferenceTranscribeRequest: {
             /**
              * @description Name of transcriber model from models_dir/transcribers/
              * @example openai/whisper-tiny
@@ -9014,19 +8980,19 @@ export interface components {
              */
             language?: string;
         };
-        TermiteTranscribeResponse: {
+        InferenceTranscribeResponse: {
             /**
              * @description Object type, always "list"
              * @enum {string}
              */
             object: "list";
             /** @description Transcription result objects. */
-            data: components["schemas"]["TermiteTranscribeObject"][];
+            data: components["schemas"]["InferenceTranscribeObject"][];
             /** @description Name of model used for transcription */
             model: string;
-            usage: components["schemas"]["TermiteGenerateUsage"];
+            usage: components["schemas"]["InferenceGenerateUsage"];
         };
-        TermiteTranscribeObject: {
+        InferenceTranscribeObject: {
             /** @enum {string} */
             object: "transcription";
             /** @description Input audio index. */
@@ -9043,65 +9009,80 @@ export interface components {
             language?: string;
         };
         /** @description Information about a model including its capabilities */
-        TermiteModelInfo: {
+        InferenceModelInfo: {
             /** @description List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring. */
             capabilities?: string[];
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
             inputs?: string[];
         };
-        TermiteModelsResponse: {
+        InferenceModelsResponse: {
+            /**
+             * @description OpenAI-compatible response object type.
+             * @enum {string}
+             */
+            object: "list";
+            /** @description OpenAI-compatible flat model list for generation/embedding models. */
+            data: {
+                [key: string]: unknown;
+            }[];
+            /**
+             * @description Whether clients should show model download commands.
+             * @default true
+             */
+            allow_downloads: boolean;
+            backends: components["schemas"]["InferenceBackendRuntimes"];
             /** @description Available chunking models (always includes "fixed") */
             chunkers: {
-                [key: string]: components["schemas"]["TermiteModelInfo"];
+                [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available reranking models */
             rerankers: {
-                [key: string]: components["schemas"]["TermiteModelInfo"];
+                [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available zero-shot classification models */
             classifiers: {
-                [key: string]: components["schemas"]["TermiteModelInfo"];
+                [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available embedding models from models_dir/embedders/ */
             embedders: {
-                [key: string]: components["schemas"]["TermiteModelInfo"];
+                [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available extractor models (models with 'extraction' capability) */
             extractors: {
-                [key: string]: components["schemas"]["TermiteModelInfo"];
+                [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available generator/LLM models from models_dir/generators/ */
             generators: {
-                [key: string]: components["schemas"]["TermiteModelInfo"];
+                [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available recognizer models from models_dir/recognizers/ */
             recognizers: {
-                [key: string]: components["schemas"]["TermiteModelInfo"];
+                [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available Seq2Seq rewriter models from models_dir/rewriters/ */
             rewriters: {
-                [key: string]: components["schemas"]["TermiteModelInfo"];
+                [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available reader/OCR models from models_dir/readers/ */
             readers: {
-                [key: string]: components["schemas"]["TermiteModelInfo"];
+                [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available transcriber/speech-to-text models from models_dir/transcribers/ */
             transcribers: {
-                [key: string]: components["schemas"]["TermiteModelInfo"];
+                [key: string]: components["schemas"]["InferenceModelInfo"];
             };
         };
         /** @description A tool (function) that the model can call */
-        TermiteTool: {
+        InferenceTool: {
             /**
              * @description The type of tool (currently only "function" is supported)
              * @enum {string}
              */
             type: "function";
-            function: components["schemas"]["TermiteFunctionDefinition"];
+            function: components["schemas"]["InferenceFunctionDefinition"];
         };
         /** @description Definition of a function that can be called by the model */
-        TermiteFunctionDefinition: {
+        InferenceFunctionDefinition: {
             /**
              * @description The name of the function to call
              * @example get_weather
@@ -9137,7 +9118,7 @@ export interface components {
             strict?: boolean;
         };
         /** @description A tool call made by the model */
-        TermiteToolCall: {
+        InferenceToolCall: {
             /**
              * @description Unique identifier for this tool call
              * @example call_abc123
@@ -9148,10 +9129,10 @@ export interface components {
              * @enum {string}
              */
             type: "function";
-            function: components["schemas"]["TermiteToolCallFunction"];
+            function: components["schemas"]["InferenceToolCallFunction"];
         };
         /** @description The function called by the model */
-        TermiteToolCallFunction: {
+        InferenceToolCallFunction: {
             /**
              * @description The name of the function called
              * @example get_weather
@@ -9170,7 +9151,7 @@ export interface components {
          *     - "required": Model must call at least one tool
          *     - object: Force a specific function to be called
          */
-        TermiteToolChoice: ("auto" | "none" | "required") | {
+        InferenceToolChoice: ("auto" | "none" | "required") | {
             /** @enum {string} */
             type: "function";
             function: {
@@ -9182,34 +9163,34 @@ export interface components {
          * @description The role of a message sender in a conversation
          * @enum {string}
          */
-        TermiteRole: "system" | "user" | "assistant" | "tool";
+        InferenceRole: "system" | "user" | "assistant" | "tool";
         /**
          * @description Reason why generation stopped
          * @enum {string}
          */
-        TermiteFinishReason: "stop" | "length" | "tool_calls" | "content_filter" | "function_call";
+        InferenceFinishReason: "stop" | "length" | "tool_calls" | "content_filter" | "function_call";
         /**
          * @description Message content. Supports two formats:
          *     - Simple string: "Hello, how are you?"
          *     - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
          */
-        TermiteChatMessageContent: string | components["schemas"]["TermiteContentPart"][];
-        TermiteChatMessage: {
-            role: components["schemas"]["TermiteRole"];
-            content?: components["schemas"]["TermiteChatMessageContent"];
+        InferenceChatMessageContent: string | components["schemas"]["ContentPart"][];
+        InferenceChatMessage: {
+            role: components["schemas"]["InferenceRole"];
+            content?: components["schemas"]["ChatMessageContent"];
             /** @description Tool calls made by the assistant (only for role=assistant) */
-            tool_calls?: components["schemas"]["TermiteToolCall"][];
+            tool_calls?: components["schemas"]["InferenceToolCall"][];
             /** @description ID of the tool call this message is responding to (only for role=tool) */
             tool_call_id?: string;
         };
-        TermiteGenerateRequest: {
+        InferenceGenerateRequest: {
             /**
              * @description Name of the generator model from models_dir/generators/
              * @example google/gemma-3-1b-it
              */
             model: string;
             /** @description Conversation messages (OpenAI-compatible format) */
-            messages: components["schemas"]["TermiteChatMessage"][];
+            messages: components["schemas"]["InferenceChatMessage"][];
             /**
              * @description Maximum tokens to generate
              * @default 256
@@ -9230,7 +9211,7 @@ export interface components {
              */
             top_p?: number;
             /**
-             * @description Top-k sampling (Termite extension, not in OpenAI API)
+             * @description Top-k sampling (inference extension, not in OpenAI API)
              * @default 50
              */
             top_k?: number;
@@ -9243,7 +9224,7 @@ export interface components {
              * @description List of tools (functions) the model can call.
              *     Only supported by models with tool_call_format configured.
              */
-            tools?: components["schemas"]["TermiteTool"][];
+            tools?: components["schemas"]["InferenceTool"][];
             /**
              * Format: float
              * @description Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to top_p.
@@ -9272,28 +9253,28 @@ export interface components {
              * @description Structured output control. OpenAI-compatible entry point for requesting JSON output.
              *     `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
              */
-            response_format?: components["schemas"]["TermiteGenerateResponseFormat"];
+            response_format?: components["schemas"]["InferenceGenerateResponseFormat"];
             /**
-             * @description Termite-native grammar override. When set, this takes precedence over `response_format`.
+             * @description inference-native grammar override. When set, this takes precedence over `response_format`.
              *     Grammar-constrained decoding is currently native-backend only.
              */
             grammar?: string;
-            /** @description Termite-native speculative decoding extension. Path or model identifier for a smaller draft model. */
+            /** @description inference-native speculative decoding extension. Path or model identifier for a smaller draft model. */
             draft_model?: string;
             /**
-             * @description Termite-native speculative decoding extension. Number of draft tokens proposed per verification round.
+             * @description inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
              * @default 4
              */
             speculative_k?: number;
             /**
-             * @description Termite-native KV cache quantization format. Lower precision reduces memory usage but may
+             * @description inference-native KV cache quantization format. Lower precision reduces memory usage but may
              *     affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
              * @enum {string}
              */
             cache_dtype?: "f16" | "f32" | "int8" | "fp8" | "int4";
             /**
              * Format: float
-             * @description Termite-native KV cache compaction ratio applied after prefill via Attention Matching.
+             * @description inference-native KV cache compaction ratio applied after prefill via Attention Matching.
              *     Selects a subset of keys and fits new values via OLS to preserve attention behavior.
              *     0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
              */
@@ -9304,39 +9285,39 @@ export interface components {
              *     `onnx` forces ONNX generation when the model/package supports it.
              *     `native`, `metal`, and `mlx` force the native host backend choice.
              *     `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and
-             *     requires a PJRT plugin path via `TERMITE_XLA_PLUGIN`, `TERMITE_PJRT_PLUGIN`,
-             *     `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+             *     requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`,
+             *     `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
              *     `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
              *     `mode: "compiled"` to request WebGPU graph partition execution.
              * @enum {string}
              */
             backend?: "auto" | "onnx" | "native" | "metal" | "mlx" | "xla" | "webgpu";
             /**
-             * @description Termite-native graph execution mode. `eager` keeps the direct runtime path when possible.
-             *     `compiled` runs Termite graph planning, partitioning, and backend executor attachment.
+             * @description inference-native graph execution mode. `eager` keeps the direct runtime path when possible.
+             *     `compiled` runs inference graph planning, partitioning, and backend executor attachment.
              * @enum {string}
              */
             mode?: "eager" | "compiled";
             /**
-             * @description Termite-native compiled graph target. `partitioned` attaches compiled executors to eligible
+             * @description inference-native compiled graph target. `partitioned` attaches compiled executors to eligible
              *     graph partitions. `whole-model` requests a compiled backend only when it can own the full
              *     traced graph shape.
              * @enum {string}
              */
             compiled_target?: "partitioned" | "whole-model";
             /** @description Controls how the model uses tools */
-            tool_choice?: components["schemas"]["TermiteToolChoice"];
+            tool_choice?: components["schemas"]["InferenceToolChoice"];
         };
-        TermiteGenerateResponseFormat: {
+        InferenceGenerateResponseFormat: {
             /**
              * @description Structured output mode
              * @enum {string}
              */
             type: "text" | "json_object" | "json_schema";
             /** @description Optional schema payload for `type=json_schema`. Enforced during native constrained decoding and validated after generation. */
-            json_schema?: components["schemas"]["TermiteGenerateJsonSchemaConfig"];
+            json_schema?: components["schemas"]["InferenceGenerateJsonSchemaConfig"];
         };
-        TermiteGenerateJsonSchemaConfig: {
+        InferenceGenerateJsonSchemaConfig: {
             /** @description Schema name */
             name?: string;
             /** @description Whether output should strictly follow the schema */
@@ -9347,7 +9328,7 @@ export interface components {
             };
         };
         /** @description OpenAI-compatible chat completion response */
-        TermiteGenerateResponse: {
+        InferenceGenerateResponse: {
             /**
              * @description A unique identifier for the chat completion
              * @example chatcmpl-abc123
@@ -9366,25 +9347,25 @@ export interface components {
             /** @description Model used for generation */
             model: string;
             /** @description List of completion choices (currently always 1) */
-            choices: components["schemas"]["TermiteGenerateChoice"][];
-            usage: components["schemas"]["TermiteGenerateUsage"];
+            choices: components["schemas"]["InferenceGenerateChoice"][];
+            usage: components["schemas"]["InferenceGenerateUsage"];
         };
-        TermiteGenerateChoice: {
+        InferenceGenerateChoice: {
             /** @description Index of this choice in the list */
             index: number;
-            message: components["schemas"]["TermiteGenerateMessage"];
-            finish_reason: components["schemas"]["TermiteFinishReason"];
+            message: components["schemas"]["InferenceGenerateMessage"];
+            finish_reason: components["schemas"]["InferenceFinishReason"];
             /** @description Log probability information (not supported, always null) */
             logprobs?: Record<string, never> | null;
         };
-        TermiteGenerateMessage: {
-            role: components["schemas"]["TermiteRole"];
+        InferenceGenerateMessage: {
+            role: components["schemas"]["InferenceRole"];
             /** @description The generated message content (null when tool_calls is present) */
             content?: string | null;
             /** @description Tool calls made by the model (only present when finish_reason is tool_calls) */
-            tool_calls?: components["schemas"]["TermiteToolCall"][];
+            tool_calls?: components["schemas"]["InferenceToolCall"][];
         };
-        TermiteGenerateUsage: {
+        InferenceGenerateUsage: {
             /** @description Number of tokens in the prompt */
             prompt_tokens: number;
             /** @description Number of tokens in the completion */
@@ -9393,29 +9374,29 @@ export interface components {
             total_tokens: number;
         };
         /** @description Streaming generation chunk (SSE event data) */
-        TermiteGenerateChunk: {
+        InferenceGenerateChunk: {
             id: string;
             /** @enum {string} */
             object: "chat.completion.chunk";
             created: number;
             model: string;
-            choices: components["schemas"]["TermiteGenerateChunkChoice"][];
+            choices: components["schemas"]["InferenceGenerateChunkChoice"][];
         };
-        TermiteGenerateChunkChoice: {
+        InferenceGenerateChunkChoice: {
             index: number;
-            delta: components["schemas"]["TermiteGenerateDelta"];
-            finish_reason?: components["schemas"]["TermiteFinishReason"];
+            delta: components["schemas"]["InferenceGenerateDelta"];
+            finish_reason?: components["schemas"]["InferenceFinishReason"];
         };
         /** @description Delta content for streaming */
-        TermiteGenerateDelta: {
-            role?: components["schemas"]["TermiteRole"];
+        InferenceGenerateDelta: {
+            role?: components["schemas"]["InferenceRole"];
             /** @description Token content delta */
             content?: string | null;
             /** @description Tool call deltas for streaming tool calls */
-            tool_calls?: components["schemas"]["TermiteToolCallDelta"][];
+            tool_calls?: components["schemas"]["InferenceToolCallDelta"][];
         };
         /** @description Incremental tool call data for streaming */
-        TermiteToolCallDelta: {
+        InferenceToolCallDelta: {
             /** @description Index of the tool call in the array */
             index?: number;
             /** @description Unique identifier (only in first delta for this index) */
@@ -9425,38 +9406,40 @@ export interface components {
              * @enum {string}
              */
             type?: "function";
-            function?: components["schemas"]["TermiteToolCallFunctionDelta"];
+            function?: components["schemas"]["InferenceToolCallFunctionDelta"];
         };
         /** @description Incremental function call data for streaming */
-        TermiteToolCallFunctionDelta: {
+        InferenceToolCallFunctionDelta: {
             /** @description Function name (only in first delta) */
             name?: string;
             /** @description Incremental arguments JSON string */
             arguments?: string;
         };
-        TermiteConfig: {
+        InferenceConfig: {
             /**
              * Format: uri
-             * @description URL of the Termite embedding/chunking service
+             * @description URL of the inference embedding/chunking service
              * @example http://localhost:8080
              */
             api_url: string;
+            /** @description API key used when calling an authenticated shared Antfly inference API. */
+            api_key?: string;
             /**
-             * @description Base directory containing model subdirectories. Termite auto-discovers models from:
+             * @description Base directory containing model subdirectories. Antfly inference auto-discovers models from:
              *     - `{models_dir}/embedders/` - Embedding models (ONNX)
              *     - `{models_dir}/chunkers/` - Chunking models (ONNX)
              *     - `{models_dir}/rerankers/` - Reranking models (ONNX)
              *     - `{models_dir}/recognizers/` - Recognition models (ONNX)
              *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
              *
-             *     Defaults to ~/.termite/models (set via viper). If not set, only built-in fixed chunking is available.
-             * @example ~/.termite/models
+             *     Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+             * @example ~/.antfly/inference/models
              */
             models_dir?: string;
             /** @description Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts. */
-            content_security?: components["schemas"]["TermiteContentSecurityConfig"];
+            content_security?: components["schemas"]["InferenceContentSecurityConfig"];
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
-            s3_credentials?: components["schemas"]["TermiteCredentials"];
+            s3_credentials?: components["schemas"]["InferenceCredentials"];
             /**
              * @description How long to keep models loaded in memory after last use (Ollama-compatible).
              *     Models are automatically unloaded after this duration of inactivity.
@@ -9488,13 +9471,16 @@ export interface components {
              * @description Backend priority order for model loading with optional device specifiers.
              *     Format: `backend` or `backend:device` where device defaults to `auto`.
              *
-             *     Termite tries entries in order and uses the first available backend+device
+             *     Antfly inference tries entries in order and uses the first available backend+device
              *     combination that supports the model.
              *
-             *     **Backends** (depend on build tags):
-             *     - `go` - Pure Go inference (always available, CPU only, slowest)
-             *     - `onnx` - ONNX Runtime (requires -tags="onnx,ORT", fastest)
-             *     - `xla` - GoMLX XLA (requires -tags="xla,XLA", TPU/CUDA/CPU)
+             *     **Backends** (depend on build flags):
+             *     - `native` - Native CPU backend
+             *     - `onnx` - ONNX Runtime backend
+             *     - `metal` - Apple Metal backend
+             *     - `mlx` - MLX backend
+             *     - `cuda` - NVIDIA CUDA backend
+             *     - `xla` - PJRT/XLA compiled backend
              *
              *     **Devices**:
              *     - `auto` - Auto-detect best available (default)
@@ -9503,18 +9489,18 @@ export interface components {
              *     - `cpu` - Force CPU only
              *
              *     **Examples**:
-             *     - `["onnx", "xla", "go"]` - Try backends with auto device detection
-             *     - `["onnx:cuda", "xla:tpu", "onnx:cpu", "go"]` - Prefer GPU, fall back to CPU
-             *     - `          default:
-             *     - onnx
-             *     - xla
-             *     - go
+             *     - `["native", "onnx", "xla"]` - Try backends with auto device detection
+             *     - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+             * @default [
+             *       "native",
+             *       "onnx",
+             *       "xla"
+             *     ]
              * @example [
+             *       "cuda",
              *       "onnx:cuda",
              *       "xla:tpu",
-             *       "onnx:cpu",
-             *       "xla:cpu",
-             *       "go"
+             *       "native"
              *     ]
              */
             backend_priority?: string[];
@@ -9544,7 +9530,7 @@ export interface components {
             request_timeout?: string;
             /**
              * @description List of model names to preload at startup (Ollama-compatible).
-             *     These models are loaded immediately when Termite starts, avoiding first-request latency.
+             *     These models are loaded immediately when inference starts, avoiding first-request latency.
              *     Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5").
              *     Only effective when keep_alive is non-zero (lazy loading mode).
              * @example [
@@ -9589,42 +9575,10 @@ export interface components {
              * @default true
              */
             allow_downloads?: boolean;
-            log?: components["schemas"]["Termiteschemas-Config"];
+            log?: components["schemas"]["Inferenceschemas-Config"];
         };
-        TermiteVersionResponse: {
-            /**
-             * @description Termite version
-             * @example v1.0.0
-             */
-            version: string;
-            /**
-             * @description Git commit hash
-             * @example abc1234
-             */
-            git_commit: string;
-            /**
-             * @description Build timestamp
-             * @example 2024-01-15T10:30:00Z
-             */
-            build_time: string;
-            /**
-             * @description Go runtime version
-             * @example go1.25.0
-             */
-            go_version: string;
-            /**
-             * @description Termite runtime implementation
-             * @example termite-zig
-             */
-            runtime?: string;
-            backends?: components["schemas"]["TermiteBackendCapabilities"];
-            /**
-             * @description Whether model downloads are allowed in this deployment
-             * @example true
-             */
-            allow_downloads?: boolean;
-        };
-        TermiteBackendCapabilities: {
+        /** @description Runtime backends compiled into this inference server. */
+        InferenceBackendRuntimes: {
             /**
              * @description Whether the native CPU backend is built into this runtime
              * @example true
@@ -9636,10 +9590,25 @@ export interface components {
              */
             onnx?: boolean;
             /**
+             * @description Whether the Metal backend is built into this runtime
+             * @example true
+             */
+            metal?: boolean;
+            /**
              * @description Whether the MLX backend is built into this runtime
              * @example true
              */
             mlx?: boolean;
+            /**
+             * @description Whether the CUDA backend is built into this runtime
+             * @example false
+             */
+            cuda?: boolean;
+            /**
+             * @description Whether the PJRT/XLA backend is built into this runtime
+             * @example false
+             */
+            xla?: boolean;
             /**
              * @description Whether the WASM backend is built into this runtime
              * @example false
@@ -9647,7 +9616,7 @@ export interface components {
             wasm?: boolean;
         };
         /** @description Options specific to text chunking. */
-        TermiteTextChunkOptions: {
+        InferenceTextChunkOptions: {
             /** @description Target number of tokens per chunk. */
             target_tokens?: number;
             /** @description Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers. */
@@ -9656,7 +9625,7 @@ export interface components {
             separator?: string;
         };
         /** @description Text content with character offsets. */
-        TermiteTextContent: {
+        InferenceTextContent: {
             /** @description The chunk text content */
             text: string;
             /** @description Character position in original text where chunk starts */
@@ -9665,7 +9634,7 @@ export interface components {
             end_char: number;
         };
         /** @description Binary media content with format-specific metadata. */
-        TermiteBinaryContent: {
+        InferenceBinaryContent: {
             /**
              * Format: byte
              * @description Base64-encoded binary data (valid WAV, PNG, etc.)
@@ -9686,7 +9655,7 @@ export interface components {
             /** @description Animation: display delay in milliseconds */
             frame_delay_ms?: number;
         };
-        TermiteContentSecurityConfig: {
+        InferenceContentSecurityConfig: {
             /**
              * @description Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts are allowed (except private IPs if block_private_ips is true).
              * @example [
@@ -9733,7 +9702,7 @@ export interface components {
              */
             user_agent?: string;
         };
-        TermiteCredentials: {
+        InferenceCredentials: {
             /**
              * @description S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
              * @example s3.amazonaws.com
@@ -9766,33 +9735,33 @@ export interface components {
          * @example info
          * @enum {string}
          */
-        TermiteLevel: "debug" | "info" | "warn" | "error";
+        InferenceLevel: "debug" | "info" | "warn" | "error";
         /**
          * @description Logging output format style. 'terminal' for colorized console, 'json' for structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
          * @default terminal
          * @example terminal
          * @enum {string}
          */
-        TermiteStyle: "terminal" | "json" | "logfmt" | "noop";
-        /** @description Logging configuration for Termite services */
-        "Termiteschemas-Config": {
-            level?: components["schemas"]["TermiteLevel"];
-            style?: components["schemas"]["TermiteStyle"];
+        InferenceStyle: "terminal" | "json" | "logfmt" | "noop";
+        /** @description Logging configuration for inference services */
+        "Inferenceschemas-Config": {
+            level?: components["schemas"]["InferenceLevel"];
+            style?: components["schemas"]["InferenceStyle"];
         };
         /** @description A single embedding result */
-        TermiteEmbeddingObject: {
+        InferenceEmbeddingObject: {
             /**
              * @description Object type, always "embedding"
              * @enum {string}
              */
             object: "embedding";
             /** @description Dense float vector for dense models, or a sparse vector object for sparse-capable models */
-            embedding?: number[] | components["schemas"]["TermiteSparseVector"];
+            embedding?: number[] | components["schemas"]["InferenceSparseVector"];
             /** @description Index of the input this embedding corresponds to */
             index: number;
         };
         /** @description Token usage information */
-        TermiteEmbeddingUsage: {
+        InferenceEmbeddingUsage: {
             /** @description Number of tokens in the input */
             prompt_tokens: number;
             /** @description Total tokens used */
@@ -12343,7 +12312,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteEmbedRequest"];
+                "application/json": components["schemas"]["InferenceEmbedRequest"];
             };
         };
         responses: {
@@ -12353,7 +12322,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteEmbedResponse"];
+                    "application/json": components["schemas"]["InferenceEmbedResponse"];
                 };
             };
             /** @description Invalid request */
@@ -12362,7 +12331,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -12371,7 +12340,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -12380,7 +12349,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -12394,7 +12363,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteChunkRequest"];
+                "application/json": components["schemas"]["InferenceChunkRequest"];
             };
         };
         responses: {
@@ -12404,7 +12373,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteChunkResponse"];
+                    "application/json": components["schemas"]["InferenceChunkResponse"];
                 };
             };
             /** @description Invalid request */
@@ -12413,7 +12382,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -12422,7 +12391,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -12436,7 +12405,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteRerankMultimodalRequest"];
+                "application/json": components["schemas"]["InferenceRerankMultimodalRequest"];
             };
         };
         responses: {
@@ -12446,7 +12415,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteRerankResponse"];
+                    "application/json": components["schemas"]["InferenceRerankResponse"];
                 };
             };
             /** @description Invalid request or unsupported model */
@@ -12455,7 +12424,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -12464,7 +12433,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Multimodal reranking contract recognized but encoder path not implemented yet */
@@ -12473,7 +12442,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -12487,7 +12456,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteRerankRequest"];
+                "application/json": components["schemas"]["InferenceRerankRequest"];
             };
         };
         responses: {
@@ -12497,7 +12466,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteRerankResponse"];
+                    "application/json": components["schemas"]["InferenceRerankResponse"];
                 };
             };
             /** @description Invalid request */
@@ -12506,7 +12475,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -12515,7 +12484,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -12524,7 +12493,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Reranking service unavailable (no models configured) */
@@ -12533,7 +12502,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -12547,7 +12516,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteGenerateRequest"];
+                "application/json": components["schemas"]["InferenceGenerateRequest"];
             };
         };
         responses: {
@@ -12560,8 +12529,8 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteGenerateResponse"];
-                    "text/event-stream": components["schemas"]["TermiteGenerateChunk"];
+                    "application/json": components["schemas"]["InferenceGenerateResponse"];
+                    "text/event-stream": components["schemas"]["InferenceGenerateChunk"];
                 };
             };
             /** @description Invalid request */
@@ -12570,7 +12539,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -12579,7 +12548,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -12588,7 +12557,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Generation service unavailable (no models configured) */
@@ -12597,7 +12566,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -12611,7 +12580,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteGenerateRequest"];
+                "application/json": components["schemas"]["InferenceGenerateRequest"];
             };
         };
         responses: {
@@ -12624,8 +12593,8 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteGenerateResponse"];
-                    "text/event-stream": components["schemas"]["TermiteGenerateChunk"];
+                    "application/json": components["schemas"]["InferenceGenerateResponse"];
+                    "text/event-stream": components["schemas"]["InferenceGenerateChunk"];
                 };
             };
             /** @description Invalid request */
@@ -12634,7 +12603,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -12643,7 +12612,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -12652,7 +12621,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Generation service unavailable (no models configured) */
@@ -12661,7 +12630,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -12675,7 +12644,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteRecognizeRequest"];
+                "application/json": components["schemas"]["InferenceRecognizeRequest"];
             };
         };
         responses: {
@@ -12685,7 +12654,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteRecognizeResponse"];
+                    "application/json": components["schemas"]["InferenceRecognizeResponse"];
                 };
             };
             /** @description Invalid request */
@@ -12694,7 +12663,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -12703,7 +12672,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -12712,7 +12681,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Recognition service unavailable (no models configured) */
@@ -12721,7 +12690,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -12735,7 +12704,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteClassifyRequest"];
+                "application/json": components["schemas"]["InferenceClassifyRequest"];
             };
         };
         responses: {
@@ -12745,7 +12714,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteClassifyResponse"];
+                    "application/json": components["schemas"]["InferenceClassifyResponse"];
                 };
             };
             /** @description Invalid request */
@@ -12754,7 +12723,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -12763,7 +12732,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -12772,7 +12741,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -12786,7 +12755,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteDocumentClassificationRequest"];
+                "application/json": components["schemas"]["InferenceDocumentClassificationRequest"];
             };
         };
         responses: {
@@ -12796,7 +12765,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteDocumentClassificationResponse"];
+                    "application/json": components["schemas"]["InferenceDocumentClassificationResponse"];
                 };
             };
             /** @description Invalid request */
@@ -12805,7 +12774,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model or image not found */
@@ -12814,7 +12783,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -12823,7 +12792,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -12837,7 +12806,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteDocumentTokenClassificationRequest"];
+                "application/json": components["schemas"]["InferenceDocumentTokenClassificationRequest"];
             };
         };
         responses: {
@@ -12847,7 +12816,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteDocumentTokenClassificationResponse"];
+                    "application/json": components["schemas"]["InferenceDocumentTokenClassificationResponse"];
                 };
             };
             /** @description Invalid request */
@@ -12856,7 +12825,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -12865,7 +12834,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -12874,7 +12843,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Classification service unavailable (no models configured) */
@@ -12883,7 +12852,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -12897,7 +12866,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteRewriteRequest"];
+                "application/json": components["schemas"]["InferenceRewriteRequest"];
             };
         };
         responses: {
@@ -12907,7 +12876,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteRewriteResponse"];
+                    "application/json": components["schemas"]["InferenceRewriteResponse"];
                 };
             };
             /** @description Invalid request */
@@ -12916,7 +12885,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -12925,7 +12894,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -12934,7 +12903,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Generation service unavailable (no models configured) */
@@ -12943,7 +12912,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -12957,7 +12926,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteReadRequest"];
+                "application/json": components["schemas"]["InferenceReadRequest"];
             };
         };
         responses: {
@@ -12967,7 +12936,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteReadResponse"];
+                    "application/json": components["schemas"]["InferenceReadResponse"];
                 };
             };
             /** @description Invalid request */
@@ -12976,7 +12945,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -12985,7 +12954,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -12994,7 +12963,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Reader service unavailable (no models configured) */
@@ -13003,7 +12972,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -13017,7 +12986,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteTranscribeRequest"];
+                "application/json": components["schemas"]["InferenceTranscribeRequest"];
             };
         };
         responses: {
@@ -13027,7 +12996,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteTranscribeResponse"];
+                    "application/json": components["schemas"]["InferenceTranscribeResponse"];
                 };
             };
             /** @description Invalid request */
@@ -13036,7 +13005,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -13045,7 +13014,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -13054,7 +13023,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Transcription service unavailable (no models configured) */
@@ -13063,7 +13032,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -13077,7 +13046,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteExtractRequest"];
+                "application/json": components["schemas"]["InferenceExtractRequest"];
             };
         };
         responses: {
@@ -13087,7 +13056,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteExtractResponse"];
+                    "application/json": components["schemas"]["InferenceExtractResponse"];
                 };
             };
             /** @description Invalid request */
@@ -13096,7 +13065,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -13105,7 +13074,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -13114,7 +13083,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Extraction service unavailable (no models configured) */
@@ -13123,7 +13092,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -13143,7 +13112,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteModelsResponse"];
+                    "application/json": components["schemas"]["InferenceModelsResponse"];
                 };
             };
             /** @description Bad request */
@@ -13152,7 +13121,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -13161,36 +13130,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-        };
-    };
-    getVersion: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Version information */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteVersionResponse"];
-                };
-            };
-            /** @description Bad request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };
@@ -13204,7 +13144,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteEmbedRequest"];
+                "application/json": components["schemas"]["InferenceEmbedRequest"];
             };
         };
         responses: {
@@ -13214,7 +13154,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteEmbedResponse"];
+                    "application/json": components["schemas"]["InferenceEmbedResponse"];
                 };
             };
             /** @description Invalid request */
@@ -13223,7 +13163,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Model not found */
@@ -13232,7 +13172,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
             /** @description Internal server error */
@@ -13241,7 +13181,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteError"];
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };

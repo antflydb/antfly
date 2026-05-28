@@ -59,7 +59,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       return false;
     }
 
-    // Termite has no auth - skip the check when Antfly is not enabled
+    // Inference has no auth - skip the check when Antfly is not enabled
     if (!isProductEnabled("antfly")) {
       return false;
     }

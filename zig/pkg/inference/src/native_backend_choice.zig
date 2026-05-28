@@ -115,7 +115,9 @@ pub fn forcesGraphMode(choice: Choice) bool {
 
 pub fn pjrtPluginPathFromEnv(allocator: std.mem.Allocator) !?[:0]u8 {
     if (!build_options.enable_pjrt) return null;
-    const raw = platform.env.getenv("TERMITE_XLA_PLUGIN") orelse
+    const raw = platform.env.getenv("ANTFLY_INFERENCE_XLA_PLUGIN") orelse
+        platform.env.getenv("ANTFLY_INFERENCE_PJRT_PLUGIN") orelse
+        platform.env.getenv("TERMITE_XLA_PLUGIN") orelse
         platform.env.getenv("TERMITE_PJRT_PLUGIN") orelse
         platform.env.getenv("PJRT_PLUGIN_PATH") orelse
         platform.env.getenv("PJRT_PLUGIN") orelse

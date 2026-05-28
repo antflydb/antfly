@@ -4,8 +4,8 @@ Search your image collection using text descriptions or find visually similar im
 
 ## Prerequisites
 
-- Antfly running with Termite and ONNX Runtime (CLIP requires ONNX)
-- CLIP model: `antfly termite pull openai/clip-vit-base-patch32`
+- Antfly running with Antfly inference and ONNX Runtime (CLIP requires ONNX)
+- CLIP model: `antfly inference pull openai/clip-vit-base-patch32`
 
 ## Step 1: Create the Table
 
@@ -73,4 +73,4 @@ curl -o mmir_dataset.tsv.gz "https://storage.googleapis.com/gresearch/wit-retrie
 ## Related
 
 - [Multimodal Guide](/docs/guides/multimodal) - PDFs, audio, and remote content
-- [Termite Models](/termite) - Available CLIP variants
+- [Inference Models](/inference) - Available CLIP variants

@@ -57,11 +57,11 @@ Test using a template
 	  -template "{{.title}}: {{.description}} [{{range .tags}}{{.}}, {{end}}]" \
 	  -output sampletemp-768d-10.gob
 
-Generate sparse embeddings via Termite
+Generate sparse embeddings via Inference
 
 	go run main.go \
 	  -sparse \
-	  -termite-url http://localhost:8850 \
+	  -inference-url http://localhost:8850 \
 	  -model splade-v3 \
 	  -prompts wiki-articles-1000.json \
 	  -field body \
@@ -112,12 +112,12 @@ func main() {
 		sparse = flag.Bool(
 			"sparse",
 			false,
-			"Generate sparse embeddings instead of dense (uses Termite SPLADE model)",
+			"Generate sparse embeddings instead of dense (uses Inference SPLADE model)",
 		)
-		termiteURL = flag.String(
-			"termite-url",
+		inferenceURL = flag.String(
+			"inference-url",
 			"http://localhost:8850",
-			"Termite service URL for sparse embedding generation",
+			"Antfly inference service URL for sparse embedding generation",
 		)
 	)
 	flag.Parse()
@@ -130,7 +130,7 @@ func main() {
 
 	// Sparse model-based generation
 	if *sparse {
-		generateSparseFromModel(*termiteURL, *model, *output, *promptFile, *promptField, *promptTemplate)
+		generateSparseFromModel(*inferenceURL, *model, *output, *promptFile, *promptField, *promptTemplate)
 		return
 	}
 
@@ -418,7 +418,7 @@ func generateRandomSparse(count int, output string) {
 	fmt.Printf("  - Type: random sparse\n")
 }
 
-func generateSparseFromModel(termiteURL, model, output, promptFile, promptField, promptTemplate string) {
+func generateSparseFromModel(inferenceURL, model, output, promptFile, promptField, promptTemplate string) {
 	if model == "" {
 		log.Fatal("Model name is required for sparse generation. Use -model flag")
 	}
@@ -440,17 +440,17 @@ func generateSparseFromModel(termiteURL, model, output, promptFile, promptField,
 		log.Fatal("No prompts found in the provided file")
 	}
 
-	// Create Termite client (implements SparseEmbedder)
-	embedder, err := embeddings.NewTermiteClient(termiteURL, model, nil)
+	// Create Inference client (implements SparseEmbedder)
+	embedder, err := embeddings.NewAntflyClient(inferenceURL, model, nil)
 	if err != nil {
-		log.Fatalf("Failed to create Termite client: %v", err)
+		log.Fatalf("Failed to create Inference client: %v", err)
 	}
 	sparseEmbedder, ok := embedder.(embeddings.SparseEmbedder)
 	if !ok {
-		log.Fatal("Termite client does not support sparse embeddings")
+		log.Fatal("Inference client does not support sparse embeddings")
 	}
 
-	fmt.Printf("Generating sparse embeddings for %d prompts using Termite/%s...\n", len(prompts), model)
+	fmt.Printf("Generating sparse embeddings for %d prompts using Inference/%s...\n", len(prompts), model)
 
 	ctx := context.Background()
 	batchSize := 100
@@ -480,7 +480,7 @@ func generateSparseFromModel(termiteURL, model, output, promptFile, promptField,
 	saveSparseDataset(dataset, output)
 	fmt.Printf("Dataset summary:\n")
 	fmt.Printf("  - Vectors: %d\n", len(allVecs))
-	fmt.Printf("  - Type: sparse (Termite/%s)\n", model)
+	fmt.Printf("  - Type: sparse (Inference/%s)\n", model)
 }
 
 func saveSparseDataset(dataset testutils.SparseDataset, output string) {

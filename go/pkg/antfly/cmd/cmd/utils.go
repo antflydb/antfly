@@ -21,14 +21,14 @@ import (
 	"reflect"
 	"sync/atomic"
 
+	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/inference"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/scraping"
-	libtermite "github.com/antflydb/antfly/go/pkg/antfly/lib/termite"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/libaf/healthserver"
 	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/libaf/logging"
-	"github.com/antflydb/antfly/go/pkg/termite"
+	inference "github.com/antflydb/antfly/go/pkg/termite"
 	"github.com/go-viper/mapstructure/v2"
 	gojson "github.com/goccy/go-json"
 	"github.com/spf13/pflag"
@@ -168,7 +168,7 @@ func parseConfigWithOptions(v *viper.Viper, opts parseConfigOptions) (*common.Co
 	// Set default inference URL from config so all consumers (embeddings,
 	// generators, rerankers, chunkers) can resolve it without explicit config.
 	if config.Inference.ApiUrl != "" {
-		libtermite.SetDefaultURL(config.Inference.ApiUrl)
+		libinference.SetDefaultURL(config.Inference.ApiUrl)
 	}
 
 	// Initialize all named providers from config
@@ -233,7 +233,7 @@ func parsePeers(clusterJSON string) (common.Peers, error) {
 // inferenceConfigWithSecurity returns a copy of the inference config with security
 // settings inherited from the top-level remote content config when the inference
 // config does not define its own.
-func inferenceConfigWithSecurity(config *common.Config) termite.Config {
+func inferenceConfigWithSecurity(config *common.Config) inference.Config {
 	tc := config.Inference
 	if scraping.IsSecurityConfigEmpty(tc.ContentSecurity) &&
 		!scraping.IsSecurityConfigEmpty(config.RemoteContent.Security) {
