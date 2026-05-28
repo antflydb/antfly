@@ -294,9 +294,42 @@ fn parseReaderSource(alloc: Allocator, source_text: []const u8, source_parts_jso
         }
     }
 
+    return try parseReaderSourceText(alloc, source_text);
+}
+
+fn parseReaderSourceText(alloc: Allocator, source_text: []const u8) !ReaderSource {
+    const trimmed = std.mem.trim(u8, source_text, &std.ascii.whitespace);
+    if (trimmed.len > 0 and (trimmed[0] == '[' or trimmed[0] == '"')) {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch |err| switch (err) {
+            std.mem.Allocator.Error.OutOfMemory => return err,
+            else => null,
+        };
+        if (parsed) |*value| {
+            defer value.deinit();
+            switch (value.value) {
+                .string => |url| return try singleReaderImage(alloc, url),
+                .array => |array| {
+                    var images = std.ArrayListUnmanaged([]const u8).empty;
+                    errdefer {
+                        for (images.items) |image| alloc.free(@constCast(image));
+                        images.deinit(alloc);
+                    }
+                    for (array.items) |item| {
+                        if (item == .string) try images.append(alloc, try alloc.dupe(u8, item.string));
+                    }
+                    return .{ .images = try images.toOwnedSlice(alloc) };
+                },
+                else => {},
+            }
+        }
+    }
+    return try singleReaderImage(alloc, source_text);
+}
+
+fn singleReaderImage(alloc: Allocator, url: []const u8) !ReaderSource {
     const images = try alloc.alloc([]const u8, 1);
     errdefer alloc.free(images);
-    images[0] = try alloc.dupe(u8, source_text);
+    images[0] = try alloc.dupe(u8, url);
     return .{ .images = images };
 }
 
@@ -392,6 +425,22 @@ test "asset producer runtime parses reader multimodal parts" {
     defer source.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), source.images.len);
     try std.testing.expectEqualStrings("read", source.prompt.?);
+}
+
+test "asset producer runtime parses reader string array source" {
+    const alloc = std.testing.allocator;
+    var source = try parseReaderSource(alloc, "[\"data:image/png;base64,aaa\",\"data:image/jpeg;base64,bbb\"]", null);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), source.images.len);
+    try std.testing.expectEqualStrings("data:image/png;base64,aaa", source.images[0]);
+    try std.testing.expectEqualStrings("data:image/jpeg;base64,bbb", source.images[1]);
+}
+
+test "asset producer runtime parses empty reader array source as empty input" {
+    const alloc = std.testing.allocator;
+    var source = try parseReaderSource(alloc, "[]", null);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), source.images.len);
 }
 
 fn expectOpenAiMultimodalGeneratorRequest(req: httpx.testing_mod.RequestInfo) !void {

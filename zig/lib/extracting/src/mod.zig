@@ -148,9 +148,6 @@ pub const Registry = struct {
         }
         const gop = try self.configs.getOrPut(self.allocator, key);
         if (gop.found_existing) {
-            self.allocator.free(key);
-            var tmp = owned;
-            tmp.deinit(self.allocator);
             return error.DuplicateExtractionProviderName;
         }
         gop.key_ptr.* = key;
@@ -201,7 +198,6 @@ pub const Runtime = struct {
         errdefer self.allocator.free(key);
         const gop = try self.extractors.getOrPut(self.allocator, key);
         if (gop.found_existing) {
-            self.allocator.free(key);
             extractor.deinit();
             return error.DuplicateExtractionProviderName;
         }
@@ -468,6 +464,21 @@ test "extracting accepts canonical extract response" {
     );
     defer alloc.free(canonical);
     try std.testing.expect(std.mem.indexOf(u8, canonical, "\"object\":\"extraction\"") != null);
+}
+
+test "extracting registry duplicate provider error does not double free config" {
+    const alloc = std.testing.allocator;
+    var registry = Registry.init(alloc);
+    defer registry.deinit();
+
+    try registry.registerConfig("ner", .{ .provider = .antfly, .model = "local-extractor" });
+    try std.testing.expectError(error.DuplicateExtractionProviderName, registry.registerConfig("ner", .{
+        .provider = .pioneer,
+        .model = "gliner2",
+        .url = "https://api.example.test",
+        .api_key = "test-key",
+        .schema_json = "{\"entities\":[\"person\"]}",
+    }));
 }
 
 test "extracting first result returns asset value" {

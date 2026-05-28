@@ -889,14 +889,20 @@ fn convertLocalGenerateMessage(
     const role = message.role.toSlice();
     const content = message.content orelse {
         const text = try alloc.dupe(u8, "");
+        var text_owned = true;
+        errdefer if (text_owned) alloc.free(text);
         try owner.owned_texts.append(alloc, text);
+        text_owned = false;
         return .{ .role = role, .content = text };
     };
 
     return switch (content) {
         .text => |text_value| blk: {
             const text = try alloc.dupe(u8, text_value);
+            var text_owned = true;
+            errdefer if (text_owned) alloc.free(text);
             try owner.owned_texts.append(alloc, text);
+            text_owned = false;
             break :blk .{ .role = role, .content = text };
         },
         .parts => |parts| try convertLocalGenerateParts(alloc, owner, role, parts),
@@ -928,25 +934,30 @@ fn convertLocalGenerateParts(
             },
             .image_url => |image_url| {
                 const decoded = try decodeLocalGenerateDataUri(alloc, image_url.url, null);
-                errdefer alloc.free(decoded.data);
+                var decoded_owned = true;
+                errdefer if (decoded_owned) alloc.free(decoded.data);
                 if (!std.mem.startsWith(u8, decoded.mime_type, "image/")) {
                     return error.UnsupportedGeneratorProvider;
                 }
                 try images.append(alloc, decoded.data);
                 try out_parts.append(alloc, .{ .image = images.items.len - 1 });
                 try owner.owned_media.append(alloc, decoded.data);
+                decoded_owned = false;
             },
             .media => |media| {
                 const decoded = try decodeLocalGenerateDataUri(alloc, media.data, media.mime_type);
-                errdefer alloc.free(decoded.data);
+                var decoded_owned = true;
+                errdefer if (decoded_owned) alloc.free(decoded.data);
                 if (std.mem.startsWith(u8, decoded.mime_type, "image/")) {
                     try images.append(alloc, decoded.data);
                     try out_parts.append(alloc, .{ .image = images.items.len - 1 });
                     try owner.owned_media.append(alloc, decoded.data);
+                    decoded_owned = false;
                 } else if (std.mem.startsWith(u8, decoded.mime_type, "audio/")) {
                     try audio.append(alloc, decoded.data);
                     try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
                     try owner.owned_media.append(alloc, decoded.data);
+                    decoded_owned = false;
                 } else {
                     return error.UnsupportedGeneratorProvider;
                 }
@@ -955,20 +966,32 @@ fn convertLocalGenerateParts(
     }
 
     const text = try text_buf.toOwnedSlice(alloc);
+    var text_owned = true;
+    errdefer if (text_owned) alloc.free(text);
     try owner.owned_texts.append(alloc, text);
+    text_owned = false;
     const image_slice = if (images.items.len > 0) blk: {
         const slice = try images.toOwnedSlice(alloc);
+        var slice_owned = true;
+        errdefer if (slice_owned) alloc.free(slice);
         try owner.owned_slices.append(alloc, slice);
+        slice_owned = false;
         break :blk slice;
     } else null;
     const audio_slice = if (audio.items.len > 0) blk: {
         const slice = try audio.toOwnedSlice(alloc);
+        var slice_owned = true;
+        errdefer if (slice_owned) alloc.free(slice);
         try owner.owned_slices.append(alloc, slice);
+        slice_owned = false;
         break :blk slice;
     } else null;
     const content_parts = if (out_parts.items.len > 0) blk: {
         const slice = try out_parts.toOwnedSlice(alloc);
+        var slice_owned = true;
+        errdefer if (slice_owned) alloc.free(slice);
         try owner.owned_parts.append(alloc, slice);
+        slice_owned = false;
         break :blk slice;
     } else null;
 

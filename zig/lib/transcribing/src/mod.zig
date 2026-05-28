@@ -124,7 +124,6 @@ pub const Runtime = struct {
         errdefer self.allocator.free(key);
         const gop = try self.transcribers.getOrPut(self.allocator, key);
         if (gop.found_existing) {
-            self.allocator.free(key);
             transcriber.deinit();
             return error.DuplicateTranscribingProviderName;
         }
@@ -205,8 +204,6 @@ pub const Registry = struct {
 
         const gop = try self.configs.getOrPut(self.allocator, key);
         if (gop.found_existing) {
-            self.allocator.free(key);
-            deinitConfigValue(self.allocator, owned);
             return error.DuplicateTranscribingProviderName;
         }
         gop.key_ptr.* = key;
@@ -822,6 +819,20 @@ test "transcribing registry preserves named providers and default" {
     const explicit_cfg = try registry.getConfig("whisper-remote");
     try std.testing.expectEqual(Provider.openai, explicit_cfg.provider);
     try std.testing.expectEqualStrings("whisper-1", explicit_cfg.model.?);
+}
+
+test "transcribing registry duplicate provider error does not double free config" {
+    const alloc = std.testing.allocator;
+    var registry = Registry.init(alloc);
+    defer registry.deinit();
+
+    try registry.registerConfig("speech", .{ .provider = .antfly, .model = "transcriber-model" });
+    try std.testing.expectError(error.DuplicateTranscribingProviderName, registry.registerConfig("speech", .{
+        .provider = .vertex,
+        .model = "latest_long",
+        .project_id = "proj",
+        .credentials_path = "/tmp/does-not-matter.json",
+    }));
 }
 
 test "transcribing runtime loads termite provider and transcribes data uri input" {

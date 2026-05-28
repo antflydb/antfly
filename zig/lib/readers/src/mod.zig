@@ -141,7 +141,6 @@ pub const Runtime = struct {
         errdefer self.allocator.free(key);
         const gop = try self.readers.getOrPut(self.allocator, key);
         if (gop.found_existing) {
-            self.allocator.free(key);
             reader.deinit();
             return error.DuplicateReaderProviderName;
         }
@@ -208,8 +207,6 @@ pub const Registry = struct {
         errdefer deinitConfigValue(self.allocator, owned);
         const gop = try self.configs.getOrPut(self.allocator, key);
         if (gop.found_existing) {
-            self.allocator.free(key);
-            deinitConfigValue(self.allocator, owned);
             return error.DuplicateReaderProviderName;
         }
         gop.key_ptr.* = key;
@@ -653,6 +650,20 @@ test "reader registry preserves named providers" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("ocr", parsed.defaultProviderName().?);
     try std.testing.expectEqual(Provider.antfly, (try parsed.getConfig(null)).provider);
+}
+
+test "reader registry duplicate provider error does not double free config" {
+    const alloc = std.testing.allocator;
+    var registry = Registry.init(alloc);
+    defer registry.deinit();
+
+    try registry.registerConfig("ocr", .{ .provider = .antfly, .model = "reader-model" });
+    try std.testing.expectError(error.DuplicateReaderProviderName, registry.registerConfig("ocr", .{
+        .provider = .vertex,
+        .model = "gemini-test",
+        .project_id = "proj",
+        .credentials_path = "/tmp/does-not-matter.json",
+    }));
 }
 
 test "vertex reader exchanges service account credentials and sends bearer auth" {
