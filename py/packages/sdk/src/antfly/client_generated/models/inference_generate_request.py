@@ -66,8 +66,8 @@ class InferenceGenerateRequest:
             `onnx` forces ONNX generation when the model/package supports it.
             `native`, `metal`, and `mlx` force the native host backend choice.
             `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and
-            requires a PJRT plugin path via `TERMITE_XLA_PLUGIN`, `TERMITE_PJRT_PLUGIN`,
-            `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+            requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`,
+            `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
             `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
             `mode: "compiled"` to request WebGPU graph partition execution.
         mode (InferenceGenerateRequestMode | Unset): inference-native graph execution mode. `eager` keeps the direct

@@ -6,9 +6,13 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.inference_models_response_object import InferenceModelsResponseObject
+
 if TYPE_CHECKING:
+    from ..models.inference_backend_runtimes import InferenceBackendRuntimes
     from ..models.inference_models_response_chunkers import InferenceModelsResponseChunkers
     from ..models.inference_models_response_classifiers import InferenceModelsResponseClassifiers
+    from ..models.inference_models_response_data_item import InferenceModelsResponseDataItem
     from ..models.inference_models_response_embedders import InferenceModelsResponseEmbedders
     from ..models.inference_models_response_extractors import InferenceModelsResponseExtractors
     from ..models.inference_models_response_generators import InferenceModelsResponseGenerators
@@ -26,6 +30,10 @@ T = TypeVar("T", bound="InferenceModelsResponse")
 class InferenceModelsResponse:
     """
     Attributes:
+        object_ (InferenceModelsResponseObject): OpenAI-compatible response object type.
+        data (list[InferenceModelsResponseDataItem]): OpenAI-compatible flat model list for generation/embedding models.
+        allow_downloads (bool): Whether clients should show model download commands. Default: True.
+        backends (InferenceBackendRuntimes): Runtime backends compiled into this inference server.
         chunkers (InferenceModelsResponseChunkers): Available chunking models (always includes "fixed")
         rerankers (InferenceModelsResponseRerankers): Available reranking models
         classifiers (InferenceModelsResponseClassifiers): Available zero-shot classification models
@@ -39,6 +47,9 @@ class InferenceModelsResponse:
             models_dir/transcribers/
     """
 
+    object_: InferenceModelsResponseObject
+    data: list[InferenceModelsResponseDataItem]
+    backends: InferenceBackendRuntimes
     chunkers: InferenceModelsResponseChunkers
     rerankers: InferenceModelsResponseRerankers
     classifiers: InferenceModelsResponseClassifiers
@@ -49,9 +60,21 @@ class InferenceModelsResponse:
     rewriters: InferenceModelsResponseRewriters
     readers: InferenceModelsResponseReaders
     transcribers: InferenceModelsResponseTranscribers
+    allow_downloads: bool = True
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        object_ = self.object_.value
+
+        data = []
+        for data_item_data in self.data:
+            data_item = data_item_data.to_dict()
+            data.append(data_item)
+
+        allow_downloads = self.allow_downloads
+
+        backends = self.backends.to_dict()
+
         chunkers = self.chunkers.to_dict()
 
         rerankers = self.rerankers.to_dict()
@@ -76,6 +99,10 @@ class InferenceModelsResponse:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "object": object_,
+                "data": data,
+                "allow_downloads": allow_downloads,
+                "backends": backends,
                 "chunkers": chunkers,
                 "rerankers": rerankers,
                 "classifiers": classifiers,
@@ -93,8 +120,10 @@ class InferenceModelsResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_backend_runtimes import InferenceBackendRuntimes
         from ..models.inference_models_response_chunkers import InferenceModelsResponseChunkers
         from ..models.inference_models_response_classifiers import InferenceModelsResponseClassifiers
+        from ..models.inference_models_response_data_item import InferenceModelsResponseDataItem
         from ..models.inference_models_response_embedders import InferenceModelsResponseEmbedders
         from ..models.inference_models_response_extractors import InferenceModelsResponseExtractors
         from ..models.inference_models_response_generators import InferenceModelsResponseGenerators
@@ -105,6 +134,19 @@ class InferenceModelsResponse:
         from ..models.inference_models_response_transcribers import InferenceModelsResponseTranscribers
 
         d = dict(src_dict)
+        object_ = InferenceModelsResponseObject(d.pop("object"))
+
+        data = []
+        _data = d.pop("data")
+        for data_item_data in _data:
+            data_item = InferenceModelsResponseDataItem.from_dict(data_item_data)
+
+            data.append(data_item)
+
+        allow_downloads = d.pop("allow_downloads")
+
+        backends = InferenceBackendRuntimes.from_dict(d.pop("backends"))
+
         chunkers = InferenceModelsResponseChunkers.from_dict(d.pop("chunkers"))
 
         rerankers = InferenceModelsResponseRerankers.from_dict(d.pop("rerankers"))
@@ -126,6 +168,10 @@ class InferenceModelsResponse:
         transcribers = InferenceModelsResponseTranscribers.from_dict(d.pop("transcribers"))
 
         inference_models_response = cls(
+            object_=object_,
+            data=data,
+            allow_downloads=allow_downloads,
+            backends=backends,
             chunkers=chunkers,
             rerankers=rerankers,
             classifiers=classifiers,

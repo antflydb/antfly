@@ -190,7 +190,7 @@ from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
-from .inference_backend_capabilities import InferenceBackendCapabilities
+from .inference_backend_runtimes import InferenceBackendRuntimes
 from .inference_binary_content import InferenceBinaryContent
 from .inference_chat_message import InferenceChatMessage
 from .inference_chunk import InferenceChunk
@@ -281,9 +281,11 @@ from .inference_model_info import InferenceModelInfo
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
 from .inference_models_response_classifiers import InferenceModelsResponseClassifiers
+from .inference_models_response_data_item import InferenceModelsResponseDataItem
 from .inference_models_response_embedders import InferenceModelsResponseEmbedders
 from .inference_models_response_extractors import InferenceModelsResponseExtractors
 from .inference_models_response_generators import InferenceModelsResponseGenerators
+from .inference_models_response_object import InferenceModelsResponseObject
 from .inference_models_response_readers import InferenceModelsResponseReaders
 from .inference_models_response_recognizers import InferenceModelsResponseRecognizers
 from .inference_models_response_rerankers import InferenceModelsResponseRerankers
@@ -713,7 +715,7 @@ __all__ = (
     "IndexStatusShardStatus",
     "IndexType",
     "InferenceAudioChunkConfig",
-    "InferenceBackendCapabilities",
+    "InferenceBackendRuntimes",
     "InferenceBinaryContent",
     "InferenceChatMessage",
     "InferenceChunk",
@@ -802,9 +804,11 @@ __all__ = (
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
     "InferenceModelsResponseClassifiers",
+    "InferenceModelsResponseDataItem",
     "InferenceModelsResponseEmbedders",
     "InferenceModelsResponseExtractors",
     "InferenceModelsResponseGenerators",
+    "InferenceModelsResponseObject",
     "InferenceModelsResponseReaders",
     "InferenceModelsResponseRecognizers",
     "InferenceModelsResponseRerankers",

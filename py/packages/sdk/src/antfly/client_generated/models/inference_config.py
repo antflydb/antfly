@@ -57,10 +57,13 @@ class InferenceConfig:
             Antfly inference tries entries in order and uses the first available backend+device
             combination that supports the model.
 
-            **Backends** (depend on build tags):
-            - `go` - Pure Go inference (always available, CPU only, slowest)
-            - `onnx` - ONNX Runtime (requires -tags="onnx,ORT", fastest)
-            - `xla` - GoMLX XLA (requires -tags="xla,XLA", TPU/CUDA/CPU)
+            **Backends** (depend on build flags):
+            - `native` - Native CPU backend
+            - `onnx` - ONNX Runtime backend
+            - `metal` - Apple Metal backend
+            - `mlx` - MLX backend
+            - `cuda` - NVIDIA CUDA backend
+            - `xla` - PJRT/XLA compiled backend
 
             **Devices**:
             - `auto` - Auto-detect best available (default)
@@ -69,13 +72,9 @@ class InferenceConfig:
             - `cpu` - Force CPU only
 
             **Examples**:
-            - `["onnx", "xla", "go"]` - Try backends with auto device detection
-            - `["onnx:cuda", "xla:tpu", "onnx:cpu", "go"]` - Prefer GPU, fall back to CPU
-            - `          default:
-            - onnx
-            - xla
-            - go
-             Example: ['onnx:cuda', 'xla:tpu', 'onnx:cpu', 'xla:cpu', 'go'].
+            - `["native", "onnx", "xla"]` - Try backends with auto device detection
+            - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+             Example: ['cuda', 'onnx:cuda', 'xla:tpu', 'native'].
         max_concurrent_requests (int | Unset): Maximum number of concurrent inference requests allowed.
             Additional requests will be queued up to max_queue_size.
             Set to 0 for unlimited (default).
