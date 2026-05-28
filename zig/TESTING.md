@@ -167,6 +167,54 @@ TERMITE_BIN=./zig-out/bin/termite uv run --project e2e/termite pytest -q \
   e2e/termite
 ```
 
+The GitHub `e2e-base` job uses shared scripts so the same path can be run
+locally:
+
+```sh
+scripts/ci/zig-e2e-base-linux.sh
+```
+
+Pass pytest selectors after the script name to run a focused Antfly E2E loop.
+Termite E2E is skipped for focused runs unless `RUN_TERMITE_E2E=1` is set:
+
+```sh
+SKIP_BUILD=1 scripts/ci/zig-e2e-base-linux.sh \
+  e2e/antfly/test_auth.py -k test_stateful_auth_enforces_table_permissions
+```
+
+To reproduce the Linux amd64 CI environment locally from macOS or another host,
+build and run the CI image:
+
+```sh
+docker buildx build --platform linux/amd64 -f zig/Dockerfile.ci \
+  -t antfly-zig-ci:local --load .
+
+docker run --rm --platform linux/amd64 \
+  -v "$PWD":/workspace \
+  -w /workspace \
+  antfly-zig-ci:local
+```
+
+Focused Docker runs use the same script arguments:
+
+```sh
+docker run --rm --platform linux/amd64 \
+  -v "$PWD":/workspace \
+  -w /workspace \
+  antfly-zig-ci:local \
+  scripts/ci/zig-e2e-base-linux.sh e2e/antfly/test_auth.py -k auth
+```
+
+Useful script controls:
+
+- `SKIP_BUILD=1`: reuse existing `zig/zig-out/bin/antfly`.
+- `RUN_TERMITE_E2E=0`: skip Termite base E2E in the default run.
+- `ANTFLY_E2E_VENV` and `TERMITE_E2E_VENV`: override the script-managed
+  virtualenv paths, which default under `/tmp` so Docker runs do not rewrite
+  project-local `.venv` directories.
+- `ANTFLY_CI_ZIG_TARGET`, `ANTFLY_CI_ZIG_CPU`, and `ANTFLY_CI_ZIG_OPTIMIZE`:
+  override the binary build target, CPU, or optimization mode.
+
 Unmarked E2E tests are expected to be safe for `e2e-base`. Mark tests that
 require PostgreSQL, object stores, real model weights, browsers/WebGPU, or
 long-running scenarios so they stay in `e2e-full`.
@@ -236,6 +284,21 @@ The Termite fixtures can also target an already-running service:
 ```sh
 TERMITE_URL=http://127.0.0.1:8080 uv run --project e2e/termite pytest -q e2e/termite
 TERMITE_URL=https://termite.example.com TERMITE_TOKEN=... uv run --project e2e/termite pytest -q e2e/termite
+```
+
+## TypeScript Components
+
+Run the focused components checks through the same helper used for local CI
+debugging:
+
+```sh
+scripts/ci/ts-components.sh
+```
+
+Pass Vitest selectors after the script name when narrowing a failure:
+
+```sh
+scripts/ci/ts-components.sh src/Listener.test.tsx -t config
 ```
 
 Common Termite E2E environment variables:

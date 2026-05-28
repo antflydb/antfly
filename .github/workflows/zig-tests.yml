@@ -84,6 +84,7 @@ jobs:
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/**' \
+            ':(glob)scripts/ci/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/zig-container.yml
@@ -95,6 +96,7 @@ jobs:
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/**' \
+            ':(glob)scripts/ci/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/zig-container.yml
@@ -261,6 +263,7 @@ jobs:
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
       TERMITE_HOME: /mnt/cache/antfly/zig/termite
+      ANTFLY_CI_TRACE: "1"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -287,35 +290,12 @@ jobs:
         uses: astral-sh/setup-uv@v8.1.0
 
       - name: Build E2E binaries
-        shell: bash
-        working-directory: zig
-        run: |
-          set -euo pipefail
-          zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=Debug install-antfly
-          # shellcheck disable=SC2016
-          printf '%s\n' '#!/usr/bin/env sh' 'exec "$(dirname "$0")/antfly" termite "$@"' > zig-out/bin/termite
-          chmod +x zig-out/bin/antfly zig-out/bin/termite
+        run: scripts/ci/zig-build-e2e-binaries.sh
 
-      - name: Run Antfly base E2E
-        working-directory: zig
+      - name: Run base E2E
         env:
-          ANTFLY_BIN: ./zig-out/bin/antfly
-          ANTFLY_LSM_OPEN_DEBUG: "1"
-          ANTFLY_FS_PATH_DEBUG: "1"
-        run: |
-          chmod +x ./zig-out/bin/antfly ./zig-out/bin/termite
-          uv run --project e2e/antfly pytest -q -x \
-            -m "not objectstore_integration and not swarm_integration and not real_model and not postgres_integration and not slow" \
-            e2e/antfly
-
-      - name: Run Termite base E2E
-        working-directory: zig
-        env:
-          TERMITE_BIN: ./zig-out/bin/termite
-        run: |
-          uv run --project e2e/termite pytest -q -x \
-            -m "not slow and not multimodal and not model_integration and not browser_integration" \
-            e2e/termite
+          SKIP_BUILD: "1"
+        run: scripts/ci/zig-e2e-base-linux.sh
 
   e2e-full:
     needs: changes
@@ -352,14 +332,7 @@ jobs:
         uses: astral-sh/setup-uv@v8.1.0
 
       - name: Build E2E binaries
-        shell: bash
-        working-directory: zig
-        run: |
-          set -euo pipefail
-          zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=Debug install-antfly
-          # shellcheck disable=SC2016
-          printf '%s\n' '#!/usr/bin/env sh' 'exec "$(dirname "$0")/antfly" termite "$@"' > zig-out/bin/termite
-          chmod +x zig-out/bin/antfly zig-out/bin/termite
+        run: scripts/ci/zig-build-e2e-binaries.sh
 
       - name: Run Antfly full E2E
         working-directory: zig
