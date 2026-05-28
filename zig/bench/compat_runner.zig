@@ -110,7 +110,12 @@ fn runCase(alloc: std.mem.Allocator, case_dir: []const u8) !void {
             .dense_embedder = deterministic.interface(),
         },
     });
-    defer db.close();
+    defer {
+        db.runUntilIdle() catch |err| {
+            std.debug.print("compat runner DB drain before close failed case={s} err={s}\n", .{ case_dir, @errorName(err) });
+        };
+        db.close();
+    }
     var txn_ids = std.StringHashMapUnmanaged(db_mod.types.TxnId).empty;
     var lease_observer = CompatReadableLeaseObserver{};
     defer {
@@ -123,6 +128,7 @@ fn runCase(alloc: std.mem.Allocator, case_dir: []const u8) !void {
     try loadEnrichments(alloc, &db, case_dir);
     try loadIndexes(alloc, &db, case_dir);
     try applyOps(alloc, &db, &txn_ids, std.mem.span(tmp_path), case_dir);
+    try db.runUntilIdle();
     try runQueriesAndValidate(alloc, &db, txn_ids, case_dir, &lease_observer);
 
     std.debug.print("PASS {s}\n", .{case_dir});
@@ -1173,7 +1179,10 @@ fn expectJsonEqual(actual: std.json.Value, expected: std.json.Value) !void {
             try std.testing.expect(actual == .object);
             var it = obj.iterator();
             while (it.next()) |entry| {
-                const actual_value = actual.object.get(entry.key_ptr.*) orelse return error.InvalidCompatCase;
+                const actual_value = actual.object.get(entry.key_ptr.*) orelse {
+                    std.debug.print("compat JSON object missing expected key={s}\n", .{entry.key_ptr.*});
+                    return error.InvalidCompatCase;
+                };
                 try expectJsonEqual(actual_value, entry.value_ptr.*);
             }
         },
