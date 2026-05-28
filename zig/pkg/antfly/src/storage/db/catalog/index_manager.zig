@@ -81,22 +81,27 @@ var hbc_defer_bulk_leaf_splits_cache: std.atomic.Value(u8) = .init(0);
 var hbc_defer_bulk_quantized_rebuild_cache: std.atomic.Value(u8) = .init(0);
 var bench_hbc_metrics_cache: std.atomic.Value(u8) = .init(0);
 var bench_text_profile_cache: std.atomic.Value(u8) = .init(0);
+var text_build_memory_target_bytes_cache: std.atomic.Value(usize) = .init(0);
+var text_doc_scratch_retained_bytes_cache: std.atomic.Value(usize) = .init(0);
+var text_segment_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
+var text_projection_source_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var sparse_replay_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
 const default_merge_policy = merger_mod.MergePolicy{
     .max_segments_per_tier = 10,
     .max_segment_size = 64 * 1024 * 1024,
     .floor_segment_size = 16 * 1024,
 };
-const default_text_segment_build_target_bytes: usize = 32 * 1024 * 1024;
-const default_text_projection_source_build_target_bytes: usize = 16 * 1024 * 1024;
+const default_text_segment_build_target_bytes: usize = 16 * 1024 * 1024;
+const default_text_projection_source_build_target_bytes: usize = 8 * 1024 * 1024;
+const default_text_build_memory_target_bytes: usize = 96 * 1024 * 1024;
+const default_text_doc_scratch_retained_bytes: usize = 1024 * 1024;
 const force_merge_max_segments_at_once = 16;
 
 const TextSegmentSinkBuildContext = struct {
     alloc: Allocator,
     projection_batch: mapper.TextProjectionBatch,
     text_analysis: introducer_mod.TextAnalysisConfig,
-    profile: ?*introducer_mod.BuildTextProfile,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
+    build_options: introducer_mod.BuildTextOptions,
 };
 
 fn buildTextSegmentIntoSink(ctx_any: *anyopaque, sink: *segment_mod.SegmentSink) !void {
@@ -105,8 +110,7 @@ fn buildTextSegmentIntoSink(ctx_any: *anyopaque, sink: *segment_mod.SegmentSink)
         ctx.alloc,
         ctx.projection_batch,
         ctx.text_analysis,
-        ctx.profile,
-        ctx.resource_manager,
+        ctx.build_options,
         sink,
     );
 }
@@ -6374,14 +6378,15 @@ pub const IndexManager = struct {
         entry: *TextIndex,
         docs: []const mapper.MapperDoc,
     ) !TextBatchMutationStats {
-        if (docs.len <= max_text_projection_docs_per_segment_build and estimatedMapperDocsBytes(docs) <= default_text_projection_source_build_target_bytes) {
+        const source_target_bytes = textProjectionSourceBuildTargetBytes();
+        if (docs.len <= max_text_projection_docs_per_segment_build and estimatedMapperDocsBytes(docs) <= source_target_bytes) {
             return try self.indexTextProjectionDocs(store, entry, docs);
         }
 
         var stats = TextBatchMutationStats{};
         var start: usize = 0;
         while (start < docs.len) {
-            const end = splitMapperDocsEnd(docs, start, default_text_projection_source_build_target_bytes);
+            const end = splitMapperDocsEnd(docs, start, source_target_bytes);
             const chunk_stats = try self.indexTextProjectionDocs(store, entry, docs[start..end]);
             stats.noteIndex(chunk_stats.indexed_any);
             stats.noteDelete(chunk_stats.deleted_any);
@@ -6435,14 +6440,15 @@ pub const IndexManager = struct {
         entry: *TextIndex,
         source_docs: []const mapper.TextProjectionSourceDoc,
     ) !TextBatchMutationStats {
-        if (source_docs.len <= max_text_projection_docs_per_segment_build and estimatedTextProjectionSourceDocsBytes(source_docs) <= default_text_projection_source_build_target_bytes) {
+        const source_target_bytes = textProjectionSourceBuildTargetBytes();
+        if (source_docs.len <= max_text_projection_docs_per_segment_build and estimatedTextProjectionSourceDocsBytes(source_docs) <= source_target_bytes) {
             return try self.indexPreparedTextProjectionSourceDocsWithArena(arena, store, entry, source_docs);
         }
 
         var stats = TextBatchMutationStats{};
         var start: usize = 0;
         while (start < source_docs.len) {
-            const end = splitTextProjectionSourceDocsEnd(source_docs, start, default_text_projection_source_build_target_bytes);
+            const end = splitTextProjectionSourceDocsEnd(source_docs, start, source_target_bytes);
             var chunk_arena_state = std.heap.ArenaAllocator.init(self.alloc);
             defer chunk_arena_state.deinit();
             const chunk_stats = try self.indexPreparedTextProjectionSourceDocsWithArena(
@@ -6529,7 +6535,6 @@ pub const IndexManager = struct {
         var index_segment_ns: u64 = 0;
         const memory_start: process_memory.Stats = if (detailed_profile_enabled) process_memory.snapshot() else .{};
 
-        var observed_field_analyzers = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
         var ordinals_alloc_stats = PhaseAllocStats{};
         var ordinals_tracking = PhaseTrackingAllocator.init(arena, &ordinals_alloc_stats);
         const ordinals_alloc = if (detailed_profile_enabled) ordinals_tracking.allocator() else arena;
@@ -6539,19 +6544,6 @@ pub const IndexManager = struct {
         const memory_after_ordinals: process_memory.Stats = if (detailed_profile_enabled) process_memory.snapshot() else .{};
 
         var projection_alloc_stats = PhaseAllocStats{};
-        var projection_tracking = PhaseTrackingAllocator.init(arena, &projection_alloc_stats);
-        const projection_alloc = if (detailed_profile_enabled) projection_tracking.allocator() else arena;
-        const projection_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
-        const projection_batch = try mapper.buildTextProjectionBatchFromSource(projection_alloc, source_docs_with_ordinals, entry.text_analysis, entry.runtime_schema, &observed_field_analyzers);
-        if (metrics_enabled) projection_ns = platform_time.monotonicNs() - projection_start_ns;
-        const memory_after_projection: process_memory.Stats = if (detailed_profile_enabled) process_memory.snapshot() else .{};
-        if (projection_batch.observed_field_analyzers.len > 0) {
-            const analyzer_merge_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
-            try mergeObservedTextFieldAnalyzers(self, store, entry, projection_batch.observed_field_analyzers);
-            if (metrics_enabled) analyzer_merge_ns = platform_time.monotonicNs() - analyzer_merge_start_ns;
-        }
-        const memory_after_analyzer_merge: process_memory.Stats = if (detailed_profile_enabled) process_memory.snapshot() else .{};
-
         var text_build_profile = introducer_mod.BuildTextProfile{};
         var segment_alloc_stats = PhaseAllocStats{};
         var segment_tracking = PhaseTrackingAllocator.init(self.alloc, &segment_alloc_stats);
@@ -6560,27 +6552,126 @@ pub const IndexManager = struct {
         var indexed_any = false;
         var segment_bytes: usize = 0;
         var segment_count: usize = 0;
-        const target_segment_bytes = @max(@as(usize, 1), default_text_segment_build_target_bytes);
-        var start: usize = 0;
-        while (start < projection_batch.docs.len) {
-            const end = mapper.splitProjectionDocsEnd(projection_batch.docs, start, target_segment_bytes);
-            const chunk: mapper.TextProjectionBatch = .{
-                .docs = projection_batch.docs[start..end],
-                .observed_field_analyzers = &.{},
+        var projection_doc_count: usize = 0;
+        var observed_field_analyzer_count: usize = 0;
+        const target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes());
+        const target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes());
+        const doc_scratch_retained_bytes = textDocScratchRetainedBytes();
+        var flush_build_memory_count: u64 = 0;
+        var flush_segment_bytes_count: u64 = 0;
+        var flush_end_count: u64 = 0;
+        var oversized_doc_count: u64 = 0;
+        var estimated_build_bytes_peak: u64 = 0;
+        var estimated_segment_bytes_peak: u64 = 0;
+        var memory_after_projection: process_memory.Stats = .{};
+        var memory_after_analyzer_merge: process_memory.Stats = .{};
+
+        var source_start: usize = 0;
+        while (source_start < source_docs_with_ordinals.len) {
+            var projection_arena_state = std.heap.ArenaAllocator.init(self.alloc);
+            defer projection_arena_state.deinit();
+            var projection_tracking = PhaseTrackingAllocator.init(projection_arena_state.allocator(), &projection_alloc_stats);
+            const projection_alloc = if (detailed_profile_enabled) projection_tracking.allocator() else projection_arena_state.allocator();
+            var observed_field_analyzers = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
+            defer observed_field_analyzers.deinit(projection_alloc);
+            var projected_source_ends = std.ArrayListUnmanaged(usize).empty;
+            defer projected_source_ends.deinit(projection_alloc);
+            var builder = mapper.TextProjectionBatchBuilder.init(projection_alloc, entry.text_analysis, entry.runtime_schema, &observed_field_analyzers);
+            defer builder.deinit();
+
+            var source_end = source_start;
+            var projection_doc_limit: usize = 0;
+            while (source_end < source_docs_with_ordinals.len) {
+                const projection_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
+                const previous_projection_docs = builder.text_docs.items.len;
+                try builder.appendSourceDoc(source_docs_with_ordinals[source_end]);
+                if (metrics_enabled) projection_ns +|= platform_time.monotonicNs() - projection_start_ns;
+                source_end += 1;
+                if (builder.text_docs.items.len > previous_projection_docs) {
+                    try projected_source_ends.append(projection_alloc, source_end);
+                }
+
+                const batch = builder.batch();
+                if (batch.docs.len == 0) {
+                    source_start = source_end;
+                    continue;
+                }
+                const split = introducer_mod.splitTextDocumentsForBuildBudget(batch.docs, 0, .{
+                    .target_build_memory_bytes = target_build_memory_bytes,
+                    .target_segment_bytes = target_segment_bytes,
+                });
+                if (split.end < batch.docs.len or split.reason != .end or batch.docs.len >= max_text_projection_docs_per_segment_build) {
+                    projection_doc_limit = split.end;
+                    source_end = projected_source_ends.items[split.end - 1];
+                    break;
+                }
+            }
+
+            if (projection_doc_limit == 0) projection_doc_limit = builder.text_docs.items.len;
+            const projection_batch = mapper.TextProjectionBatch{
+                .docs = builder.text_docs.items[0..projection_doc_limit],
+                .observed_field_analyzers = builder.batch().observed_field_analyzers,
             };
-            var build_ctx = TextSegmentSinkBuildContext{
-                .alloc = segment_alloc,
-                .projection_batch = chunk,
-                .text_analysis = entry.text_analysis,
-                .profile = if (detailed_profile_enabled) &text_build_profile else null,
-                .resource_manager = self.resource_manager,
-            };
-            const built_len = try entry.persistent.indexSegmentFromSinkBuilder(&build_ctx, buildTextSegmentIntoSink);
-            segment_bytes += built_len;
-            segment_count += 1;
-            indexed_any = true;
-            start = end;
+            if (projection_batch.docs.len == 0) {
+                source_start = @max(source_start + 1, source_end);
+                continue;
+            }
+            projection_doc_count += projection_batch.docs.len;
+            observed_field_analyzer_count += projection_batch.observed_field_analyzers.len;
+            if (detailed_profile_enabled) memory_after_projection = process_memory.snapshot();
+            if (projection_batch.observed_field_analyzers.len > 0) {
+                const analyzer_merge_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
+                try mergeObservedTextFieldAnalyzers(self, store, entry, projection_batch.observed_field_analyzers);
+                if (metrics_enabled) analyzer_merge_ns +|= platform_time.monotonicNs() - analyzer_merge_start_ns;
+            }
+            if (detailed_profile_enabled) memory_after_analyzer_merge = process_memory.snapshot();
+
+            var start: usize = 0;
+            while (start < projection_batch.docs.len) {
+                const split = introducer_mod.splitTextDocumentsForBuildBudget(projection_batch.docs, start, .{
+                    .target_build_memory_bytes = target_build_memory_bytes,
+                    .target_segment_bytes = target_segment_bytes,
+                });
+                const end = split.end;
+                switch (split.reason) {
+                    .build_memory => flush_build_memory_count +|= 1,
+                    .segment_bytes => flush_segment_bytes_count +|= 1,
+                    .end => flush_end_count +|= 1,
+                }
+                if (split.oversized_doc) oversized_doc_count +|= 1;
+                estimated_build_bytes_peak = @max(estimated_build_bytes_peak, split.estimated_build_bytes);
+                estimated_segment_bytes_peak = @max(estimated_segment_bytes_peak, split.estimated_segment_bytes);
+                const chunk: mapper.TextProjectionBatch = .{
+                    .docs = projection_batch.docs[start..end],
+                    .observed_field_analyzers = &.{},
+                };
+                const build_options = introducer_mod.BuildTextOptions{
+                    .profile = if (detailed_profile_enabled) &text_build_profile else null,
+                    .resource_manager = self.resource_manager,
+                    .build_memory_target_bytes = target_build_memory_bytes,
+                    .doc_scratch_retained_bytes = doc_scratch_retained_bytes,
+                };
+                var build_ctx = TextSegmentSinkBuildContext{
+                    .alloc = segment_alloc,
+                    .projection_batch = chunk,
+                    .text_analysis = entry.text_analysis,
+                    .build_options = build_options,
+                };
+                const built_len = try entry.persistent.indexSegmentFromSinkBuilder(&build_ctx, buildTextSegmentIntoSink);
+                segment_bytes += built_len;
+                segment_count += 1;
+                indexed_any = true;
+                start = end;
+            }
+            source_start = source_end;
         }
+        text_build_profile.build_memory_target_bytes = @intCast(target_build_memory_bytes);
+        text_build_profile.flush_build_memory_count = flush_build_memory_count;
+        text_build_profile.flush_segment_bytes_count = flush_segment_bytes_count;
+        text_build_profile.flush_end_count = flush_end_count;
+        text_build_profile.oversized_doc_count = oversized_doc_count;
+        text_build_profile.estimated_build_bytes = estimated_build_bytes_peak;
+        text_build_profile.estimated_segment_bytes = estimated_segment_bytes_peak;
         if (metrics_enabled) segment_build_ns = platform_time.monotonicNs() - segment_build_start_ns;
         const memory_after_segment_build: process_memory.Stats = if (detailed_profile_enabled) process_memory.snapshot() else .{};
 
@@ -6588,25 +6679,41 @@ pub const IndexManager = struct {
         if (metrics_enabled) {
             index_segment_ns = platform_time.monotonicNs() - index_segment_start_ns;
             std.log.info(
-                "antfly_bench_text_index index={s} source_docs={d} projection_docs={d} observed_analyzers={d} segments={d} segment_bytes={d} total_ms={d} ordinals_ms={d} projection_ms={d} analyzer_merge_ms={d} segment_build_ms={d} index_segment_ms={d} text_docs={d} text_fields={d} tokens={d} term_hits={d} typed_values={d} analyzer_ms={d} term_accum_ms={d} hit_materialize_ms={d} typed_collect_ms={d} typed_build_ms={d} stored_attach_ms={d} section_attach_ms={d} stored_compress_ms={d} segment_assembly_ms={d} segment_encode_ms={d}",
+                "antfly_bench_text_index index={s} source_docs={d} projection_docs={d} observed_analyzers={d} segments={d} segment_bytes={d} build_memory_target_bytes={d} doc_scratch_retained_bytes={d} estimated_build_peak_bytes={d} estimated_segment_peak_bytes={d} flush_build_memory={d} flush_segment_bytes={d} flush_end={d} oversized_docs={d} text_docs={d} text_fields={d} tokens={d} term_hits={d} typed_values={d}",
                 .{
                     entry.config.name,
                     source_docs.len,
-                    projection_batch.docs.len,
-                    projection_batch.observed_field_analyzers.len,
+                    projection_doc_count,
+                    observed_field_analyzer_count,
                     segment_count,
                     segment_bytes,
+                    target_build_memory_bytes,
+                    doc_scratch_retained_bytes,
+                    estimated_build_bytes_peak,
+                    estimated_segment_bytes_peak,
+                    flush_build_memory_count,
+                    flush_segment_bytes_count,
+                    flush_end_count,
+                    oversized_doc_count,
+                    text_build_profile.doc_count,
+                    text_build_profile.text_field_count,
+                    text_build_profile.token_count,
+                    text_build_profile.term_hit_count,
+                    text_build_profile.typed_value_count,
+                },
+            );
+            std.log.info(
+                "antfly_bench_text_index_timing index={s} source_docs={d} projection_docs={d} total_ms={d} ordinals_ms={d} projection_ms={d} analyzer_merge_ms={d} segment_build_ms={d} index_segment_ms={d} analyzer_ms={d} term_accum_ms={d} hit_materialize_ms={d} typed_collect_ms={d} typed_build_ms={d} stored_attach_ms={d} section_attach_ms={d} stored_compress_ms={d} segment_assembly_ms={d} segment_encode_ms={d}",
+                .{
+                    entry.config.name,
+                    source_docs.len,
+                    projection_doc_count,
                     nsToMs(platform_time.monotonicNs() - total_start_ns),
                     nsToMs(ordinals_ns),
                     nsToMs(projection_ns),
                     nsToMs(analyzer_merge_ns),
                     nsToMs(segment_build_ns),
                     nsToMs(index_segment_ns),
-                    text_build_profile.doc_count,
-                    text_build_profile.text_field_count,
-                    text_build_profile.token_count,
-                    text_build_profile.term_hit_count,
-                    text_build_profile.typed_value_count,
                     nsToMs(text_build_profile.analyzer_ns),
                     nsToMs(text_build_profile.term_accum_ns),
                     nsToMs(text_build_profile.hit_materialize_ns),
@@ -6633,7 +6740,7 @@ pub const IndexManager = struct {
                     .{
                         entry.config.name,
                         source_docs.len,
-                        projection_batch.docs.len,
+                        projection_doc_count,
                         segment_count,
                         ft_pending.used_bytes,
                         ft_pending.peak_bytes,
@@ -6668,7 +6775,7 @@ pub const IndexManager = struct {
                 .{
                     entry.config.name,
                     source_docs.len,
-                    projection_batch.docs.len,
+                    projection_doc_count,
                     segment_count,
                     ordinals_alloc_stats.total_alloc_bytes,
                     ordinals_alloc_stats.total_free_bytes,
@@ -6695,7 +6802,7 @@ pub const IndexManager = struct {
                 .{
                     entry.config.name,
                     source_docs.len,
-                    projection_batch.docs.len,
+                    projection_doc_count,
                     segment_count,
                     memory_start.resident_bytes,
                     memory_after_ordinals.resident_bytes,
@@ -6712,16 +6819,30 @@ pub const IndexManager = struct {
                 },
             );
             std.log.info(
-                "antfly_bench_text_working_set index={s} source_docs={d} projection_docs={d} segments={d} doc_arena_peak_bytes={d} field_postings_estimated_bytes={d} typed_doc_values_estimated_bytes={d} stored_docs_estimated_bytes={d} section_bytes={d} fst_and_term_metadata_bytes={d} segment_sink_bytes={d} resource_peak_bytes={d} builder_rss_before_bytes={d} builder_rss_after_analyze_bytes={d} builder_rss_after_postings_build_bytes={d} builder_rss_after_sections_bytes={d} builder_rss_after_publish_bytes={d}",
+                "antfly_bench_text_working_set index={s} source_docs={d} projection_docs={d} segments={d} build_memory_target_bytes={d} doc_scratch_retained_bytes={d} estimated_build_peak_bytes={d} estimated_segment_peak_bytes={d} flush_build_memory={d} flush_segment_bytes={d} flush_end={d} oversized_docs={d} doc_arena_peak_bytes={d} peak_doc_scratch_bytes={d} builder_scratch_peak_bytes={d} field_postings_estimated_bytes={d} typed_doc_values_estimated_bytes={d} stored_docs_estimated_bytes={d} postings_live_bytes={d} typed_live_bytes={d} section_live_bytes={d} sink_live_bytes={d} section_bytes={d} fst_and_term_metadata_bytes={d} segment_sink_bytes={d} resource_peak_bytes={d} builder_rss_before_bytes={d} builder_rss_after_analyze_bytes={d} builder_rss_after_postings_build_bytes={d} builder_rss_after_sections_bytes={d} builder_rss_after_publish_bytes={d}",
                 .{
                     entry.config.name,
                     source_docs.len,
-                    projection_batch.docs.len,
+                    projection_doc_count,
                     segment_count,
+                    text_build_profile.build_memory_target_bytes,
+                    text_build_profile.doc_scratch_retained_bytes,
+                    text_build_profile.estimated_build_bytes,
+                    text_build_profile.estimated_segment_bytes,
+                    text_build_profile.flush_build_memory_count,
+                    text_build_profile.flush_segment_bytes_count,
+                    text_build_profile.flush_end_count,
+                    text_build_profile.oversized_doc_count,
                     text_build_profile.doc_arena_peak_bytes,
+                    text_build_profile.peak_doc_scratch_bytes,
+                    text_build_profile.builder_scratch_peak_bytes,
                     text_build_profile.field_postings_estimated_bytes,
                     text_build_profile.typed_doc_values_estimated_bytes,
                     text_build_profile.stored_docs_estimated_bytes,
+                    text_build_profile.postings_live_bytes,
+                    text_build_profile.typed_live_bytes,
+                    text_build_profile.section_live_bytes,
+                    text_build_profile.sink_live_bytes,
                     text_build_profile.section_bytes,
                     text_build_profile.fst_and_term_metadata_bytes,
                     text_build_profile.segment_sink_bytes,
@@ -8175,6 +8296,50 @@ pub const IndexManager = struct {
             std.ascii.eqlIgnoreCase(raw, "no"));
         bench_text_profile_cache.store(if (enabled) 2 else 1, .monotonic);
         return enabled;
+    }
+
+    fn textSegmentBuildTargetBytes() usize {
+        const cached = text_segment_build_target_bytes_cache.load(.monotonic);
+        if (cached != 0) return cached - 1;
+        const value = @max(@as(usize, 1), stressEnvUsize(
+            "ANTFLY_TEXT_SEGMENT_BUILD_TARGET_BYTES",
+            default_text_segment_build_target_bytes,
+        ));
+        text_segment_build_target_bytes_cache.store(value +% 1, .monotonic);
+        return value;
+    }
+
+    fn textBuildMemoryTargetBytes() usize {
+        const cached = text_build_memory_target_bytes_cache.load(.monotonic);
+        if (cached != 0) return cached - 1;
+        const value = @max(@as(usize, 1), stressEnvUsize(
+            "ANTFLY_TEXT_BUILD_MEMORY_TARGET_BYTES",
+            default_text_build_memory_target_bytes,
+        ));
+        text_build_memory_target_bytes_cache.store(value +% 1, .monotonic);
+        return value;
+    }
+
+    fn textDocScratchRetainedBytes() usize {
+        const cached = text_doc_scratch_retained_bytes_cache.load(.monotonic);
+        if (cached != 0) return cached - 1;
+        const value = stressEnvUsize(
+            "ANTFLY_TEXT_DOC_SCRATCH_RETAINED_BYTES",
+            default_text_doc_scratch_retained_bytes,
+        );
+        text_doc_scratch_retained_bytes_cache.store(value +% 1, .monotonic);
+        return value;
+    }
+
+    fn textProjectionSourceBuildTargetBytes() usize {
+        const cached = text_projection_source_build_target_bytes_cache.load(.monotonic);
+        if (cached != 0) return cached - 1;
+        const value = @max(@as(usize, 1), stressEnvUsize(
+            "ANTFLY_TEXT_PROJECTION_SOURCE_BUILD_TARGET_BYTES",
+            default_text_projection_source_build_target_bytes,
+        ));
+        text_projection_source_build_target_bytes_cache.store(value +% 1, .monotonic);
+        return value;
     }
 
     fn sparseReplayProfileEnabled() bool {

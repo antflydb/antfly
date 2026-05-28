@@ -59,6 +59,40 @@ const ExtraSection = struct {
     data: []const u8,
 };
 
+const default_build_memory_target_bytes: usize = 96 * 1024 * 1024;
+const default_doc_scratch_retained_bytes: usize = 1024 * 1024;
+
+const TextBuildScratch = struct {
+    hits: std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit) = .empty,
+    positions: std.ArrayListUnmanaged(u32) = .empty,
+
+    fn reset(self: *TextBuildScratch, alloc: Allocator, retained_bytes: usize) void {
+        resetScratchList(inverted.InvertedIndexBuilder.TermHit, alloc, &self.hits, retained_bytes);
+        resetScratchList(u32, alloc, &self.positions, retained_bytes);
+    }
+
+    fn deinit(self: *TextBuildScratch, alloc: Allocator) void {
+        self.hits.deinit(alloc);
+        self.positions.deinit(alloc);
+    }
+
+    fn estimatedMemoryBytes(self: *const TextBuildScratch) u64 {
+        return (@as(u64, @intCast(self.hits.capacity)) * @sizeOf(inverted.InvertedIndexBuilder.TermHit)) +
+            (@as(u64, @intCast(self.positions.capacity)) * @sizeOf(u32));
+    }
+};
+
+fn resetScratchList(comptime T: type, alloc: Allocator, list: *std.ArrayListUnmanaged(T), retained_bytes: usize) void {
+    const retained: u64 = @intCast(retained_bytes);
+    const capacity_bytes = @as(u64, @intCast(list.capacity)) * @sizeOf(T);
+    if (capacity_bytes > retained) {
+        list.deinit(alloc);
+        list.* = .empty;
+    } else {
+        list.clearRetainingCapacity();
+    }
+}
+
 const FieldPostingsBuilder = struct {
     active: bool = false,
     builder: inverted.InvertedIndexBuilder = undefined,
@@ -236,6 +270,8 @@ pub const BuildTextOptions = struct {
     infer_type_dynamic_paths: []const []const u8 = &.{},
     profile: ?*BuildTextProfile = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    build_memory_target_bytes: usize = default_build_memory_target_bytes,
+    doc_scratch_retained_bytes: usize = default_doc_scratch_retained_bytes,
 };
 
 pub const BuildTextProfile = struct {
@@ -263,6 +299,20 @@ pub const BuildTextProfile = struct {
     fst_and_term_metadata_bytes: u64 = 0,
     segment_sink_bytes: u64 = 0,
     resource_peak_bytes: u64 = 0,
+    build_memory_target_bytes: u64 = 0,
+    doc_scratch_retained_bytes: u64 = 0,
+    peak_doc_scratch_bytes: u64 = 0,
+    builder_scratch_peak_bytes: u64 = 0,
+    postings_live_bytes: u64 = 0,
+    typed_live_bytes: u64 = 0,
+    section_live_bytes: u64 = 0,
+    sink_live_bytes: u64 = 0,
+    flush_build_memory_count: u64 = 0,
+    flush_segment_bytes_count: u64 = 0,
+    flush_end_count: u64 = 0,
+    oversized_doc_count: u64 = 0,
+    estimated_build_bytes: u64 = 0,
+    estimated_segment_bytes: u64 = 0,
     rss_before: u64 = 0,
     rss_after_analyze: u64 = 0,
     rss_after_postings_build: u64 = 0,
@@ -299,16 +349,119 @@ const TextBuildResourceTracker = struct {
 fn estimateTextDocInputBytes(docs: []const TextDocument) u64 {
     var total: u64 = 0;
     for (docs) |doc| {
-        total +|= @intCast(doc.id.len + doc.stored_data.len);
-        total +|= @as(u64, @intCast(doc.text_fields.len)) * (@sizeOf(TextField) + 16);
-        for (doc.text_fields) |field| {
-            total +|= @intCast(field.field_name.len + field.text.len);
-        }
-        if (doc.typed_fields) |typed_fields| {
-            total +|= @as(u64, @intCast(typed_fields.len)) * (@sizeOf(TypedFieldValue) + 16);
-        }
+        total +|= estimateTextDocumentInputBytes(doc);
     }
     return total;
+}
+
+fn estimateTextDocumentInputBytes(doc: TextDocument) u64 {
+    var total: u64 = @intCast(doc.id.len + doc.stored_data.len);
+    total +|= @as(u64, @intCast(doc.text_fields.len)) * (@sizeOf(TextField) + 16);
+    for (doc.text_fields) |field| {
+        total +|= @intCast(field.field_name.len + field.text.len);
+    }
+    if (doc.typed_fields) |typed_fields| {
+        total +|= @as(u64, @intCast(typed_fields.len)) * (@sizeOf(TypedFieldValue) + 16);
+    }
+    return total;
+}
+
+pub fn estimateTextDocumentSegmentBytes(doc: TextDocument) u64 {
+    var total: u64 = 64 + @as(u64, @intCast(doc.id.len + doc.stored_data.len));
+    for (doc.text_fields) |field| {
+        total +|= 16 + @as(u64, @intCast(field.field_name.len + field.text.len));
+    }
+    if (doc.typed_fields) |typed_fields| {
+        total +|= @as(u64, @intCast(typed_fields.len)) * 32;
+        for (typed_fields) |field| total +|= @intCast(field.field_name.len);
+    }
+    return total;
+}
+
+pub fn estimateTextDocumentBuildMemoryBytes(doc: TextDocument) u64 {
+    var text_bytes: u64 = 0;
+    for (doc.text_fields) |field| {
+        text_bytes +|= @intCast(field.field_name.len + field.text.len);
+    }
+    const typed_count: u64 = if (doc.typed_fields) |typed_fields| @intCast(typed_fields.len) else 0;
+    const field_count: u64 = @intCast(doc.text_fields.len);
+    return estimateTextDocumentInputBytes(doc) +
+        estimateStoredDocBytes(&.{doc}) +
+        text_bytes * 4 +
+        field_count * 384 +
+        typed_count * 128 +
+        1024;
+}
+
+pub const TextBuildSplitReason = enum {
+    end,
+    build_memory,
+    segment_bytes,
+};
+
+pub const TextBuildSplitOptions = struct {
+    target_build_memory_bytes: usize = default_build_memory_target_bytes,
+    target_segment_bytes: usize = std.math.maxInt(usize),
+};
+
+pub const TextBuildSplit = struct {
+    end: usize,
+    reason: TextBuildSplitReason,
+    estimated_build_bytes: u64,
+    estimated_segment_bytes: u64,
+    oversized_doc: bool = false,
+};
+
+pub fn splitTextDocumentsForBuildBudget(
+    docs: []const TextDocument,
+    start: usize,
+    options: TextBuildSplitOptions,
+) TextBuildSplit {
+    const target_build: u64 = @max(@as(u64, 1), @as(u64, @intCast(options.target_build_memory_bytes)));
+    const target_segment: u64 = @max(@as(u64, 1), @as(u64, @intCast(options.target_segment_bytes)));
+    var end = start;
+    var build_bytes: u64 = 0;
+    var segment_bytes: u64 = 0;
+    while (end < docs.len) {
+        const doc_build_bytes = estimateTextDocumentBuildMemoryBytes(docs[end]);
+        const doc_segment_bytes = estimateTextDocumentSegmentBytes(docs[end]);
+        const next_build_bytes = build_bytes +| doc_build_bytes;
+        const next_segment_bytes = segment_bytes +| doc_segment_bytes;
+        if (end > start and next_build_bytes > target_build) {
+            return .{
+                .end = end,
+                .reason = .build_memory,
+                .estimated_build_bytes = build_bytes,
+                .estimated_segment_bytes = segment_bytes,
+            };
+        }
+        if (end > start and next_segment_bytes > target_segment) {
+            return .{
+                .end = end,
+                .reason = .segment_bytes,
+                .estimated_build_bytes = build_bytes,
+                .estimated_segment_bytes = segment_bytes,
+            };
+        }
+        end += 1;
+        build_bytes = next_build_bytes;
+        segment_bytes = next_segment_bytes;
+        if (end == start + 1 and (build_bytes > target_build or segment_bytes > target_segment)) {
+            return .{
+                .end = end,
+                .reason = if (build_bytes > target_build) .build_memory else .segment_bytes,
+                .estimated_build_bytes = build_bytes,
+                .estimated_segment_bytes = segment_bytes,
+                .oversized_doc = true,
+            };
+        }
+    }
+    return .{
+        .end = end,
+        .reason = .end,
+        .estimated_build_bytes = build_bytes,
+        .estimated_segment_bytes = segment_bytes,
+    };
 }
 
 fn estimateStoredDocBytes(docs: []const TextDocument) u64 {
@@ -396,6 +549,8 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
     const profile = options.profile;
     if (profile) |p| {
         p.doc_count +|= @intCast(docs.len);
+        p.build_memory_target_bytes = @intCast(options.build_memory_target_bytes);
+        p.doc_scratch_retained_bytes = @intCast(options.doc_scratch_retained_bytes);
     }
     noteBuildMemorySample(profile, "rss_before");
 
@@ -440,8 +595,12 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
     var doc_arena_state = std.heap.ArenaAllocator.init(alloc);
     defer doc_arena_state.deinit();
 
+    var scratch = TextBuildScratch{};
+    defer scratch.deinit(alloc);
+
     for (docs, 0..) |text_doc, doc_idx| {
-        _ = doc_arena_state.reset(.retain_capacity);
+        _ = doc_arena_state.reset(.{ .retain_with_limit = options.doc_scratch_retained_bytes });
+        scratch.reset(alloc, options.doc_scratch_retained_bytes);
         const doc_alloc = doc_arena_state.allocator();
 
         const stored_attach_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
@@ -466,6 +625,7 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
                     default_analyzer,
                     text_analysis,
                     profile,
+                    &scratch,
                 );
             }
         } else {
@@ -508,12 +668,11 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
             const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
             var field_it = field_maps.iterator();
             while (field_it.next()) |field_entry| {
-                // Convert to TermHit slice
-                var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
+                scratch.hits.clearRetainingCapacity();
 
                 var it = field_entry.value_ptr.term_map.iterator();
                 while (it.next()) |entry| {
-                    try hits.append(doc_alloc, .{
+                    try scratch.hits.append(alloc, .{
                         .term = entry.key_ptr.*,
                         .freq = entry.value_ptr.freq,
                         .norm = field_entry.value_ptr.token_offset,
@@ -522,11 +681,11 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
                     if (profile) |p| p.term_hit_count +|= 1;
                 }
 
-                if (hits.items.len == 0) continue;
+                if (scratch.hits.items.len == 0) continue;
 
                 const field_name = field_entry.key_ptr.*;
                 const builder = try ensureFieldPostingsBuilder(alloc, &field_builders, field_name);
-                try builder.addDocument(@intCast(doc_idx), hits.items);
+                try builder.addDocument(@intCast(doc_idx), scratch.hits.items);
 
                 const field_index_gop = try field_indices.getOrPut(alloc, field_name);
                 if (!field_index_gop.found_existing) {
@@ -556,11 +715,17 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
             try collectTypedFieldValues(alloc, text_doc.stored_data, @intCast(doc_idx), &typed_fields, text_analysis, doc_options);
         }
         if (profile) |p| p.typed_collect_ns +|= platform_time.monotonicNs() - typed_collect_start_ns;
+        if (profile) |p| {
+            p.peak_doc_scratch_bytes = @max(p.peak_doc_scratch_bytes, @as(u64, @intCast(doc_arena_state.queryCapacity())));
+            p.builder_scratch_peak_bytes = @max(p.builder_scratch_peak_bytes, scratch.estimatedMemoryBytes());
+        }
     }
     if (profile) |p| {
         p.stored_docs_estimated_bytes = estimateStoredDocBytes(docs);
         p.field_postings_estimated_bytes = estimateFieldPostingsBuilderBytes(&field_builders);
         p.typed_doc_values_estimated_bytes = estimateTypedDocValuesBytes(&typed_fields);
+        p.postings_live_bytes = p.field_postings_estimated_bytes;
+        p.typed_live_bytes = p.typed_doc_values_estimated_bytes;
         p.doc_arena_peak_bytes = @max(p.doc_arena_peak_bytes, p.field_postings_estimated_bytes + p.typed_doc_values_estimated_bytes);
     }
     noteBuildMemorySample(profile, "rss_after_analyze");
@@ -609,6 +774,7 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         if (profile) |p| {
             p.section_bytes = section_bytes;
             p.field_postings_estimated_bytes = estimateFieldPostingsBuilderBytes(&field_builders);
+            p.postings_live_bytes = p.field_postings_estimated_bytes;
             p.fst_and_term_metadata_bytes = @max(p.fst_and_term_metadata_bytes, section_bytes);
         }
         try resource_tracker.adjust(input_estimated_bytes +
@@ -631,8 +797,11 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
     if (profile) |p| p.section_attach_ns +|= platform_time.monotonicNs() - section_attach_start_ns;
     if (profile) |p| {
         p.section_bytes = section_bytes;
+        p.section_live_bytes = section_bytes;
         p.field_postings_estimated_bytes = estimateFieldPostingsBuilderBytes(&field_builders);
         p.typed_doc_values_estimated_bytes = estimateTypedDocValuesBytes(&typed_fields);
+        p.postings_live_bytes = p.field_postings_estimated_bytes;
+        p.typed_live_bytes = p.typed_doc_values_estimated_bytes;
         p.fst_and_term_metadata_bytes = @max(p.fst_and_term_metadata_bytes, section_bytes);
     }
     noteBuildMemorySample(profile, "rss_after_postings_build");
@@ -647,6 +816,7 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         p.segment_encode_ns +|= platform_time.monotonicNs() - segment_encode_start_ns;
         p.segment_bytes +|= @intCast(sink.len() - segment_start_len);
         p.segment_sink_bytes = @intCast(sink.len() - segment_start_len);
+        p.sink_live_bytes = p.segment_sink_bytes;
     }
     noteBuildMemorySample(profile, "rss_after_sections");
     try resource_tracker.adjust(section_bytes + @as(u64, @intCast(sink.len() - segment_start_len)));
@@ -700,6 +870,7 @@ fn addSingleTextFieldToBuilders(
     default_analyzer: *const analysis_mod.Analyzer,
     text_analysis: TextAnalysisConfig,
     profile: ?*BuildTextProfile,
+    scratch: *TextBuildScratch,
 ) !void {
     if (profile) |p| p.text_field_count +|= 1;
     const analyzer = try cachedFieldAnalyzer(alloc, analyzer_cache, field, default_analyzer, text_analysis);
@@ -716,23 +887,26 @@ fn addSingleTextFieldToBuilders(
         if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
 
         const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
-        const positions = try doc_alloc.alloc(u32, tokens.len);
-        var hits = try doc_alloc.alloc(inverted.InvertedIndexBuilder.TermHit, tokens.len);
+        scratch.positions.clearRetainingCapacity();
+        scratch.hits.clearRetainingCapacity();
+        try scratch.positions.ensureTotalCapacity(alloc, tokens.len);
+        try scratch.hits.ensureTotalCapacity(alloc, tokens.len);
         const norm: u32 = @intCast(tokens.len);
-        for (tokens, 0..) |tok, i| {
-            positions[i] = tok.position;
-            hits[i] = .{
+        for (tokens) |tok| {
+            scratch.positions.appendAssumeCapacity(tok.position);
+            const pos_index = scratch.positions.items.len - 1;
+            scratch.hits.appendAssumeCapacity(.{
                 .term = tok.term,
                 .freq = 1,
                 .norm = norm,
-                .positions = positions[i .. i + 1],
-            };
+                .positions = scratch.positions.items[pos_index .. pos_index + 1],
+            });
         }
         if (profile) |p| {
-            p.term_hit_count +|= @intCast(hits.len);
+            p.term_hit_count +|= @intCast(scratch.hits.items.len);
             p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
         }
-        try addFieldHitsToBuilder(alloc, field_builders, field_indices, seg_writer, doc_idx, field.field_name, hits);
+        try addFieldHitsToBuilder(alloc, field_builders, field_indices, seg_writer, doc_idx, field.field_name, scratch.hits.items);
         return;
     }
 
@@ -750,10 +924,10 @@ fn addSingleTextFieldToBuilders(
     if (profile) |p| p.term_accum_ns +|= platform_time.monotonicNs() - term_accum_start_ns;
 
     const hit_materialize_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
-    var hits = std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit).empty;
+    scratch.hits.clearRetainingCapacity();
     var it = field_acc.term_map.iterator();
     while (it.next()) |entry| {
-        try hits.append(doc_alloc, .{
+        try scratch.hits.append(alloc, .{
             .term = entry.key_ptr.*,
             .freq = entry.value_ptr.freq,
             .norm = field_acc.token_offset,
@@ -762,9 +936,9 @@ fn addSingleTextFieldToBuilders(
         if (profile) |p| p.term_hit_count +|= 1;
     }
     if (profile) |p| p.hit_materialize_ns +|= platform_time.monotonicNs() - hit_materialize_start_ns;
-    if (hits.items.len == 0) return;
+    if (scratch.hits.items.len == 0) return;
 
-    try addFieldHitsToBuilder(alloc, field_builders, field_indices, seg_writer, doc_idx, field.field_name, hits.items);
+    try addFieldHitsToBuilder(alloc, field_builders, field_indices, seg_writer, doc_idx, field.field_name, scratch.hits.items);
 }
 
 fn tokenTermsAreUnique(tokens: []const analysis_mod.Token) bool {
@@ -2145,6 +2319,55 @@ test "buildSegmentFromTextWithAnalysisOptions records build profile" {
     try std.testing.expect(profile.stored_docs_estimated_bytes > 0);
     try std.testing.expect(profile.field_postings_estimated_bytes > 0);
     try std.testing.expect(profile.section_bytes > 0);
+}
+
+test "splitTextDocumentsForBuildBudget flushes on build memory before segment bytes" {
+    const docs = [_]TextDocument{
+        .{
+            .id = "doc1",
+            .stored_data = "{}",
+            .text_fields = &.{.{ .field_name = "body", .text = "alpha beta gamma delta epsilon" }},
+        },
+        .{
+            .id = "doc2",
+            .stored_data = "{}",
+            .text_fields = &.{.{ .field_name = "body", .text = "zeta eta theta iota kappa" }},
+        },
+        .{
+            .id = "doc3",
+            .stored_data = "{}",
+            .text_fields = &.{.{ .field_name = "body", .text = "lambda mu nu xi omicron" }},
+        },
+    };
+    const first_estimate = estimateTextDocumentBuildMemoryBytes(docs[0]);
+    const split = splitTextDocumentsForBuildBudget(&docs, 0, .{
+        .target_build_memory_bytes = @intCast(first_estimate + 1),
+        .target_segment_bytes = std.math.maxInt(usize),
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), split.end);
+    try std.testing.expectEqual(TextBuildSplitReason.build_memory, split.reason);
+    try std.testing.expect(!split.oversized_doc);
+    try std.testing.expect(split.estimated_build_bytes > 0);
+}
+
+test "splitTextDocumentsForBuildBudget keeps oversized single document" {
+    const docs = [_]TextDocument{
+        .{
+            .id = "doc1",
+            .stored_data = "{}",
+            .text_fields = &.{.{ .field_name = "body", .text = "alpha beta gamma delta epsilon" }},
+        },
+    };
+    const split = splitTextDocumentsForBuildBudget(&docs, 0, .{
+        .target_build_memory_bytes = 1,
+        .target_segment_bytes = std.math.maxInt(usize),
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), split.end);
+    try std.testing.expectEqual(TextBuildSplitReason.build_memory, split.reason);
+    try std.testing.expect(split.oversized_doc);
+    try std.testing.expect(split.estimated_build_bytes > 1);
 }
 
 test "buildSegmentFromTextWithAnalysisOptions accounts and releases full text working set" {

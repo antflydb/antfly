@@ -23,7 +23,3 @@ pub fn cOrFallback(fallback: std.mem.Allocator) std.mem.Allocator {
 pub fn processAllocator(fallback: std.mem.Allocator) std.mem.Allocator {
     return cOrFallback(fallback);
 }
-
-pub fn serverProcessAllocator(fallback: std.mem.Allocator) std.mem.Allocator {
-    return fallback;
-}

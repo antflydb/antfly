@@ -143,7 +143,7 @@ fn runtimeInit(init: std.process.Init) std.process.Init {
 
 fn runtimeAllocator(init: std.process.Init) std.mem.Allocator {
     const fallback = if (!builtin.single_threaded) std.heap.smp_allocator else init.gpa;
-    return platform.allocator.serverProcessAllocator(fallback);
+    return platform.allocator.processAllocator(fallback);
 }
 
 test "main cmd compiles" {
