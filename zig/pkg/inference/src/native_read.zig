@@ -285,7 +285,7 @@ fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: termite read <model-dir> <image-path> [--backend auto|onnx|native|metal|mlx] [--prompt <prompt>] [--max-tokens <n>] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3]
+        \\usage: antfly inference read <model-dir> <image-path> [--backend auto|onnx|native|metal|mlx] [--prompt <prompt>] [--max-tokens <n>] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3]
         \\  Runs local document/image reading and prints a JSON response to stdout.
         \\
     , .{});

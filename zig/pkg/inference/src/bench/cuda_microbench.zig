@@ -188,7 +188,7 @@ fn wantsHelp(args: []const []const u8) bool {
 
 fn printUsage() void {
     print(
-        \\usage: termite bench-cuda [--warmup-iters N] [--measure-iters N]
+        \\usage: antfly inference bench-cuda [--warmup-iters N] [--measure-iters N]
         \\                         [--model <clipclap-model-dir>] [--text <prompt>] [--full-iters N]
         \\
         \\Benchmarks CUDA Q4_K linear kernels on CLIP/CLAP-sized shapes. If --model is

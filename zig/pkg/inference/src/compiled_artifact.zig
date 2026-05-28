@@ -137,7 +137,7 @@ pub const LocatedArtifact = struct {
 
 pub fn defaultArtifactRoot(allocator: std.mem.Allocator) ![]u8 {
     const home = platform.env.getenv("HOME") orelse return allocator.dupe(u8, "./artifacts");
-    return std.fs.path.join(allocator, &.{ home, ".termite", "artifacts" });
+    return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "artifacts" });
 }
 
 pub fn defaultArtifactDirForModel(
@@ -563,11 +563,11 @@ test "PJRT binding helpers classify semantic input and KV bindings" {
     }));
 }
 
-test "defaultArtifactDirForModel uses ~/.termite/artifacts layout when HOME is set" {
+test "defaultArtifactDirForModel uses ~/.antfly/inference/artifacts layout when HOME is set" {
     if (platform.env.getenv("HOME")) |home| {
         const path = try defaultArtifactDirForModel(std.testing.allocator, "/tmp/ggml-org/gemma-4-e2b-it-gguf", "onnx");
         defer std.testing.allocator.free(path);
-        const expected_prefix = try std.fs.path.join(std.testing.allocator, &.{ home, ".termite", "artifacts" });
+        const expected_prefix = try std.fs.path.join(std.testing.allocator, &.{ home, ".antfly", "inference", "artifacts" });
         defer std.testing.allocator.free(expected_prefix);
         try std.testing.expect(std.mem.startsWith(u8, path, expected_prefix));
         try std.testing.expect(std.mem.endsWith(u8, path, "ggml-org/gemma-4-e2b-it-gguf/onnx"));

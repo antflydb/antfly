@@ -5693,8 +5693,8 @@ fn readFileMax(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_b
 
 fn usage() void {
     print(
-        \\usage: termite finetune run <recipe.json> [--dry-run]
-        \\       termite finetune smoke-fast [--out-root <path>]
+        \\usage: antfly inference finetune run <recipe.json> [--dry-run]
+        \\       antfly inference finetune smoke-fast [--out-root <path>]
         \\
         \\recipe kinds: sft, lora-sft, qlora-sft, dpo, grpo, reranker, vlm-retrieval
         \\common fields: model, dataset, adapter, optimizer, eval, artifacts

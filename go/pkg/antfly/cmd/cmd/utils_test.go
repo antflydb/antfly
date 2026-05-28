@@ -341,7 +341,7 @@ replication_factor: 6
 }
 
 func TestParseConfigCommandSpecificMetadataValidation(t *testing.T) {
-	t.Run("termite_does_not_require_metadata_and_defaults_api_url", func(t *testing.T) {
+	t.Run("inference_does_not_require_metadata_and_defaults_api_url", func(t *testing.T) {
 		v := viper.New()
 		v.SetConfigType("yaml")
 		require.NoError(t, v.ReadConfig(strings.NewReader(`{}`)))
@@ -384,7 +384,7 @@ metadata:
 	})
 }
 
-func TestParseConfigTermiteURL(t *testing.T) {
+func TestParseConfigInferenceURL(t *testing.T) {
 	configYAML := `
 metadata:
   orchestration_urls:

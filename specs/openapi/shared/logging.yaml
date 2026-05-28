@@ -1,8 +1,8 @@
 openapi: "3.0.3"
 info:
   version: v1alpha1
-  title: Antfly Termite Logging Configuration
-  description: Logging configuration schema for Termite services.
+  title: Antfly Inference Logging Configuration
+  description: Logging configuration schema for Antfly inference services.
 
 components:
   schemas:
@@ -30,7 +30,7 @@ components:
 
     Config:
       type: object
-      description: Logging configuration for Termite services
+      description: Logging configuration for Antfly inference services
       properties:
         level:
           $ref: "#/components/schemas/Level"

@@ -235,7 +235,7 @@ fn parseArgs(args: []const []const u8) !Options {
 
 fn printUsage() void {
     print(
-        \\usage: termite export <model-dir> --target safetensors [--output <path>] [--dry-run]
+        \\usage: antfly inference export <model-dir> --target safetensors [--output <path>] [--dry-run]
         \\
         \\Exports dense tensor sources from ONNX, GGUF, or safetensors-backed models
         \\to a safetensors file. Packed GGUF quantized tensors are not exported yet.

@@ -2258,10 +2258,10 @@ fn parsePjrtParameterExportMode(raw: []const u8) ?PjrtParameterExportMode {
 
 pub fn printUsage() void {
     print(
-        \\usage: termite compile-artifact <model-dir> <prompt> [--backend onnx|xla] [--attention-mode auto|full_recompute|paged_prefill|paged_decode] [--onnx-weight-mode dense|q8_0_weight_only] [--onnx-weight-policy SUBSTRING=MODE] [--onnx-reuse-initializers-from <artifact.onnx>] [--onnx-import-from <semantic-decoder.onnx>] [--onnx-semantic-entrypoint] [--artifact-role prefill|decode] [--xla-artifact-kind hlo|executable] [--xla-parameter-mode embedded|inputs] [--xla-package-decode-max-seq-len N] [--debug-output-node N] [--output <path>] [--list-partitions] [--list-op-nodes <op>] [--list-node-window N] [--list-node-window-radius N] [--best-partition] [--partition-index N] [--node-index N] [--node-range START END] [--node-closure] [--node-neighborhood N] [--seq-len N] [--query-seq-len N] [--no-chat-template] [--raw-prompt]
+        \\usage: antfly inference compile-artifact <model-dir> <prompt> [--backend onnx|xla] [--attention-mode auto|full_recompute|paged_prefill|paged_decode] [--onnx-weight-mode dense|q8_0_weight_only] [--onnx-weight-policy SUBSTRING=MODE] [--onnx-reuse-initializers-from <artifact.onnx>] [--onnx-import-from <semantic-decoder.onnx>] [--onnx-semantic-entrypoint] [--artifact-role prefill|decode] [--xla-artifact-kind hlo|executable] [--xla-parameter-mode embedded|inputs] [--xla-package-decode-max-seq-len N] [--debug-output-node N] [--output <path>] [--list-partitions] [--list-op-nodes <op>] [--list-node-window N] [--list-node-window-radius N] [--best-partition] [--partition-index N] [--node-index N] [--node-range START END] [--node-closure] [--node-neighborhood N] [--seq-len N] [--query-seq-len N] [--no-chat-template] [--raw-prompt]
         \\
         \\Compiles a traced generation graph into an offline artifact for a concrete shape.
-        \\  default artifact dir mirrors model layout: ~/.termite/artifacts/<owner>/<model>/<backend>/...
+        \\  default artifact dir mirrors model layout: ~/.antfly/inference/artifacts/<owner>/<model>/<backend>/...
         \\  backend=onnx   emits a self-contained ONNX file
         \\  attention-mode selects the traced attention ABI; auto preserves the generation path
         \\  onnx-weight-mode controls the default ONNX initializer export mode

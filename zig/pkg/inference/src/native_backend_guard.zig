@@ -48,9 +48,9 @@ pub fn checkMlx(mlx_built: bool, mlx_metal_available: bool) ?Failure {
 
 pub fn printFailure(failure: Failure) void {
     switch (failure) {
-        .metal_not_built => print("error: Metal backend is not built into this termite binary\n", .{}),
+        .metal_not_built => print("error: Metal backend is not built into this Antfly inference runtime\n", .{}),
         .metal_unavailable => print("error: Metal backend requires a Metal-capable environment; Metal is unavailable here\n", .{}),
-        .mlx_not_built => print("error: MLX backend is not built into this termite binary\n", .{}),
+        .mlx_not_built => print("error: MLX backend is not built into this Antfly inference runtime\n", .{}),
         .mlx_metal_unavailable => print("error: Metal/MLX backends require a Metal-capable environment; Metal is unavailable here\n", .{}),
     }
 }

@@ -179,7 +179,7 @@ type Config struct {
 	HealthPort int                 `json:"health_port,omitempty,omitzero"`
 	Inference  externalRef9.Config `json:"inference,omitempty,omitzero"`
 
-	// Log Logging configuration for Termite services
+	// Log Logging configuration for Antfly inference services
 	Log externalRef7.Config `json:"log,omitempty,omitzero"`
 
 	// MaxShardSizeBytes Maximum size of a shard in bytes. Used to determine when to split shards.

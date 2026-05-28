@@ -4811,7 +4811,7 @@ fn parseArgs(args: []const []const u8) !Options {
 
 fn printUsage() void {
     print(
-        \\usage: termite export <model-dir> --target gguf [--output <path>] [--projector-output <path>] [--projector-format auto|termite|clip] [--format q1_0|q2_k|q3_k|q4_0|q4_1|q5_0|q5_1|q4_k|q5_k|q6_k|q8_k|q8_0|q8_1] [--quantize-include <csv-prefixes>] [--quantize-exclude <csv-prefixes>] [--dry-run]
+        \\usage: antfly inference export <model-dir> --target gguf [--output <path>] [--projector-output <path>] [--projector-format auto|termite|clip] [--format q1_0|q2_k|q3_k|q4_0|q4_1|q5_0|q5_1|q4_k|q5_k|q6_k|q8_k|q8_0|q8_1] [--quantize-include <csv-prefixes>] [--quantize-exclude <csv-prefixes>] [--dry-run]
         \\
         \\Exports a native model directory to a serialized GGUF file.
         \\Dense export is currently implemented for bert, t5, whisper, clip, clap, florence, layoutlmv3, and deberta plus gpt2, gpt_neo, gpt_neox, gptj, llama, mistral, qwen2, gemma, bitnet, and phi families. GPT-2 export applies the same hybrid quantization policy as other dense families, with Conv1D tensors quantized on their transformed GGUF row layout; GPT-NeoX split query_key_value export currently keeps those split tensors dense while other eligible tensors may quantize.

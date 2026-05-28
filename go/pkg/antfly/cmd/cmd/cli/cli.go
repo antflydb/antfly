@@ -172,7 +172,7 @@ func RegisterCommands(parent *cobra.Command) {
 	}
 
 	// Chain client init onto parent's PersistentPreRunE, but only
-	// trigger for CLI subcommands (not swarm/metadata/store/termite).
+	// trigger for CLI subcommands (not swarm/metadata/store/inference).
 	origPreRunE := parent.PersistentPreRunE
 	parent.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		if origPreRunE != nil {
@@ -230,7 +230,7 @@ func addSearchFlags(cmd *cobra.Command) {
 	cmd.Flags().String("filter-prefix", "", "Filter results by key prefix (e.g., 'user:' to only return keys starting with 'user:')")
 	cmd.Flags().String("filter-query", "", "Bleve query string for filtering results (applied as an AND condition)")
 	cmd.Flags().String("exclusion-query", "", "Bleve query string for excluding results (applied as a NOT condition)")
-	cmd.Flags().String("reranker", "", `JSON string defining reranker configuration (e.g. '{"provider":"termite","model":"mxbai-rerank-base-v1","field":"body"}')`)
+	cmd.Flags().String("reranker", "", `JSON string defining reranker configuration (e.g. '{"provider":"antfly","model":"mxbai-rerank-base-v1","field":"body"}')`)
 	cmd.Flags().String("pruner", "", `JSON string defining pruner configuration for filtering low-relevance results (e.g. '{"min_score_ratio":0.5}' or '{"max_score_gap_percent":30}')`)
 	_ = cmd.MarkFlagRequired("table")
 }

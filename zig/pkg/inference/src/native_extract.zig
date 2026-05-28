@@ -278,7 +278,7 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
 
 fn printUsage() void {
     print(
-        \\usage: termite extract <model-dir> <text> <schema-json> [--backend auto|native|metal|mlx] [--relation-label LABEL]...
+        \\usage: antfly inference extract <model-dir> <text> <schema-json> [--backend auto|native|metal|mlx] [--relation-label LABEL]...
         \\  Runs native local extraction and prints a JSON response to stdout.
         \\
     , .{});

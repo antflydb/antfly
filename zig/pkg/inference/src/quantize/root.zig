@@ -51,7 +51,7 @@ pub fn mainWithCommand(allocator: Allocator, io: std.Io, args: []const []const u
 
 fn printUsage(command_name: []const u8) void {
     print(
-        \\usage: termite {s} <model-dir> [--target onnx|gguf|safetensors] [--format <format>] [--output <path>] [options]
+        \\usage: antfly inference {s} <model-dir> [--target onnx|gguf|safetensors] [--format <format>] [--output <path>] [options]
         \\
         \\ONNX target options:
         \\  --format q8_0              Create an ONNX external-data Q8_0 variant (default)

@@ -1474,5 +1474,5 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
 }
 
 fn printUsage() void {
-    print("usage: termite compare <native-model-dir> <reference-model-dir> <prompt> [--image path] [--image-features-only] [--onnx-prompt-embeddings-only] [--backend auto|native|mlx] [--top-k N] [--no-chat-template]\n", .{});
+    print("usage: antfly inference compare <native-model-dir> <reference-model-dir> <prompt> [--image path] [--image-features-only] [--onnx-prompt-embeddings-only] [--backend auto|native|mlx] [--top-k N] [--no-chat-template]\n", .{});
 }

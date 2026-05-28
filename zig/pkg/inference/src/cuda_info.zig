@@ -86,7 +86,7 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
 
 fn printUsage() void {
     print(
-        \\usage: termite cuda-info [--smoke]
+        \\usage: antfly inference cuda-info [--smoke]
         \\
         \\  --smoke   Run embedded PTX smoke checks for fill, dense f32 ops, Q8_0, and Q4_0.
         \\

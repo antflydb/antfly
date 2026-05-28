@@ -103,7 +103,7 @@ const DefaultShutdownTimeout = 30 * time.Second
 // RunAsTermite runs a standalone Termite HTTP server bound to config.ApiUrl.
 // If readyC is non-nil, it will be closed when the server is ready to accept requests.
 func RunAsTermite(ctx context.Context, zl *zap.Logger, config Config, readyC chan struct{}) {
-	zl = zl.Named("termite")
+	zl = zl.Named("inference")
 
 	u, err := url.Parse(config.ApiUrl)
 	if err != nil {
@@ -174,7 +174,7 @@ func RunAsTermite(ctx context.Context, zl *zap.Logger, config Config, readyC cha
 // registries, caches, and the session manager are started eagerly; call
 // node.Close() to release them. Fatal logs any initialization failure.
 func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *TermiteNode {
-	zl.Info("Starting termite node", zap.Any("config", config))
+	zl.Info("Starting inference node", zap.Any("config", config))
 
 	var (
 		err      error

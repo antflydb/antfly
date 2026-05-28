@@ -262,7 +262,7 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
 
 fn printUsage() void {
     print(
-        \\usage: termite recognize <model-dir> <text> [--label NAME]... [--backend auto|native|metal|mlx|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required]
+        \\usage: antfly inference recognize <model-dir> <text> [--label NAME]... [--backend auto|native|metal|mlx|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required]
         \\  Runs native local recognition and prints a JSON response to stdout.
         \\  --graph-runtime selects how the GLiNER head executes:
         \\    interpreter (default) -- eager forward via gliner_head.forwardCt

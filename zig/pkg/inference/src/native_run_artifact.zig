@@ -2952,8 +2952,8 @@ fn parseArgs(args: []const []const u8) !Options {
 
 pub fn printUsage() void {
     print(
-        \\usage: termite run-artifact <artifact-or-manifest> <prompt> [--no-chat-template] [--raw-prompt] [--compare-host]
-        \\       termite run-artifact <artifact-or-manifest> [--validate|--dry-run]
+        \\usage: antfly inference run-artifact <artifact-or-manifest> <prompt> [--no-chat-template] [--raw-prompt] [--compare-host]
+        \\       antfly inference run-artifact <artifact-or-manifest> [--validate|--dry-run]
         \\
         \\<artifact-or-manifest> may be a raw artifact path, a .inference.json sidecar,
         \\or a .termite-package.json package manifest.

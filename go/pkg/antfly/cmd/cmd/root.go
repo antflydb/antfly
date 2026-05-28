@@ -98,8 +98,8 @@ func init() {
 		viper.SetDefault("log_style", "logfmt")
 	}
 
-	// Termite defaults
-	viper.SetDefault("termite.models_dir", common.DefaultModelsDir())
+	// Inference defaults
+	viper.SetDefault("inference.models_dir", common.DefaultModelsDir())
 }
 
 // initConfig reads in config file and ENV variables if set.

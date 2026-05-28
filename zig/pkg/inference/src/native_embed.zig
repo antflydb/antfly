@@ -467,7 +467,7 @@ fn ensureRequestedMetalHostedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: termite embed <model-dir> [--backend auto|onnx|native|metal|mlx|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--print-timing] [--text <text>]... [--image <path>]... [--audio <path>]...
+        \\usage: antfly inference embed <model-dir> [--backend auto|onnx|native|metal|mlx|cuda] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--print-timing] [--text <text>]... [--image <path>]... [--audio <path>]...
         \\  Runs local embedding and prints a JSON response to stdout.
         \\  Input order is preserved across repeated --text/--image/--audio flags.
         \\  graph-runtime controls imported static graph execution; default is environment fallback, then interpreter.
