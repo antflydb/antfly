@@ -23,6 +23,9 @@ const httpx = @import("httpx");
 const api = @import("termite_api");
 const scraping = @import("antfly_scraping");
 const jsonschema = @import("antfly_jsonschema");
+const antfly_readers = @import("antfly_readers");
+const antfly_transcribing = @import("antfly_transcribing");
+const antfly_extracting = @import("antfly_extracting");
 const lib_chunker = @import("termite_chunker");
 const backends_mod = @import("../backends/backends.zig");
 const session_factory = @import("../architectures/session_factory.zig");
@@ -675,6 +678,312 @@ pub const Node = struct {
         var result = try pipeline.generate(messages, .{ .max_tokens = configured_max_tokens, .prefill_chunk_size = 256 });
         defer result.deinit();
         return try allocator.dupe(u8, result.text);
+    }
+
+    pub fn readImagesDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: antfly_readers.Request,
+    ) ![]antfly_readers.Result {
+        if (request.images.len == 0) return try allocator.alloc(antfly_readers.Result, 0);
+        try self.request_queue.acquire();
+        defer self.releaseSlot();
+        self.metrics.incRequest("read.local");
+        defer self.metrics.decActive();
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "readers");
+
+        var reader = try readers_mod.LoadedReader.loadFromDir(
+            allocator,
+            model_path,
+            &self.session_manager,
+            &self.model_manager,
+        );
+        defer reader.deinit();
+
+        const out = try allocator.alloc(antfly_readers.Result, request.images.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*item| antfly_readers.deinitResult(allocator, item);
+            allocator.free(out);
+        }
+
+        for (request.images, 0..) |image_url, i| {
+            var downloaded = try downloadRemoteContent(self, allocator, image_url);
+            defer downloaded.deinit(allocator);
+
+            var result = try reader.read(downloaded.data, .{
+                .prompt = request.prompt,
+                .max_tokens = if (request.max_tokens) |mt| @intCast(mt) else null,
+            });
+            defer result.deinit();
+
+            out[i] = .{
+                .text = try allocator.dupe(u8, result.text),
+                .fields_json = try readerFieldsJsonAlloc(allocator, result.fields),
+                .regions_json = try readerRegionsJsonAlloc(allocator, result.regions),
+            };
+            initialized = i + 1;
+        }
+
+        return out;
+    }
+
+    pub fn transcribeAudioDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: antfly_transcribing.Request,
+    ) !antfly_transcribing.Response {
+        try self.request_queue.acquire();
+        defer self.releaseSlot();
+        self.metrics.incRequest("transcribe.local");
+        defer self.metrics.decActive();
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "transcribers");
+
+        const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
+        const tokenizer_mod = @import("termite_tokenizer");
+        const hf_tokenizer = @import("termite_hf_tokenizer");
+        var encoder_session: backends_mod.Session = undefined;
+        var decoder_session: backends_mod.Session = undefined;
+        var close_encoder = false;
+        defer if (close_encoder) encoder_session.close();
+        var close_decoder = false;
+        defer if (close_decoder) decoder_session.close();
+        var tokenizer: tokenizer_mod.Tokenizer = undefined;
+        var hf_tok_owned: ?*hf_tokenizer.HfTokenizer = null;
+        defer if (hf_tok_owned) |hf_tok| hf_tok.deinitSelf();
+
+        if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
+            defer allocator.free(paths.encoder);
+            defer allocator.free(paths.decoder);
+
+            encoder_session = try self.session_manager.loadModel(paths.encoder);
+            close_encoder = true;
+            decoder_session = try self.session_manager.loadModel(paths.decoder);
+            close_decoder = true;
+
+            const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_path});
+            defer allocator.free(tok_path);
+            const tok_bytes = try c_file.readFile(allocator, tok_path);
+            defer allocator.free(tok_bytes);
+            hf_tok_owned = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tok_bytes);
+            if (hf_tok_owned) |hf_tok| tokenizer = hf_tok.tokenizer();
+        } else |_| {
+            const model = try self.model_manager.loadFromDir(model_path);
+            if (session_factory.getWhisperConfig(model.session) == null) return error.UnsupportedTranscriberProvider;
+            encoder_session = model.session;
+            decoder_session = model.session;
+            tokenizer = model.getTokenizer();
+        }
+
+        const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
+        const forced_ids = loadForcedDecoderIds(allocator, model_path);
+        defer if (forced_ids) |f| allocator.free(f);
+
+        const transcription = @import("../pipelines/transcription.zig");
+        var pipeline = transcription.TranscriptionPipeline.init(
+            allocator,
+            encoder_session,
+            decoder_session,
+            tokenizer,
+            .{
+                .max_length = dec_config.max_length,
+                .decoder_start_token_id = dec_config.decoder_start_token_id,
+                .eos_token_id = dec_config.eos_token_id,
+                .language = request.language,
+                .forced_decoder_ids = forced_ids,
+            },
+        );
+
+        var downloaded_audio: ?scraping.DownloadedContent = null;
+        defer if (downloaded_audio) |*downloaded| downloaded.deinit(allocator);
+        const decoded_audio = if (std.mem.startsWith(u8, request.url, "data:"))
+            try decodeDataUri(allocator, request.url)
+        else blk: {
+            downloaded_audio = try downloadRemoteContent(self, allocator, request.url);
+            break :blk DecodedDataUri{
+                .mime_type = downloaded_audio.?.content_type,
+                .data = downloaded_audio.?.data,
+            };
+        };
+        defer if (downloaded_audio == null) decoded_audio.deinit(allocator);
+
+        const decode_options = audio_mod.DecodeOptions{ .mime_hint = decoded_audio.mime_type };
+        if (!audio_mod.canDecodeWithOptions(decoded_audio.data, decode_options)) return error.UnsupportedAudioInput;
+        var result = try pipeline.transcribeWithOptions(decoded_audio.data, decode_options);
+        defer result.deinit();
+
+        return .{
+            .text = try allocator.dupe(u8, result.text),
+            .language = if (result.language) |language| try allocator.dupe(u8, language) else null,
+        };
+    }
+
+    pub fn extractDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: antfly_extracting.Request,
+    ) !antfly_extracting.Response {
+        try self.request_queue.acquire();
+        defer self.releaseSlot();
+        self.metrics.incRequest("extract.local");
+        defer self.metrics.decActive();
+
+        const body_json = try extractionRequestJsonAlloc(allocator, model_name, request);
+        defer allocator.free(body_json);
+        var parsed = try api.server.parseExtractBody(allocator, body_json);
+        defer parsed.deinit();
+        const body = parsed.value;
+
+        if (body.model.len == 0) return error.InvalidExtractionRequest;
+        const has_entities = if (body.schema.entities) |entities| entities.len > 0 else false;
+        const has_relations = if (body.schema.relations) |relations| relations.len > 0 else false;
+        const has_classifications = if (body.schema.classifications) |classifications| classifications.len > 0 else false;
+        const has_structures = if (body.schema.structures) |structures| structures.map.count() > 0 else false;
+        if (!has_entities and !has_relations and !has_classifications and !has_structures) return error.InvalidExtractionRequest;
+        if (body.inputs.len == 0) return error.InvalidExtractionRequest;
+
+        var extracted_inputs = try canonicalExtractionInputs(allocator, body.inputs);
+        defer extracted_inputs.deinit(allocator);
+        if (extracted_inputs.hasTexts() == extracted_inputs.hasImages()) return error.InvalidExtractionRequest;
+        if (extracted_inputs.hasImages()) return error.UnsupportedExtractionProvider;
+
+        const texts = extracted_inputs.texts.items;
+        const prompt_tokens = estimateTextsTokens(texts);
+
+        if ((has_entities or has_relations) and !has_structures and !has_classifications) {
+            const relation_labels = try canonicalRelationLabels(allocator, body.schema.relations);
+            defer allocator.free(relation_labels);
+            return .{
+                .allocator = allocator,
+                .json = try self.extractEntitiesCanonicalJsonDirect(allocator, body.model, texts, body.schema.entities, relation_labels, prompt_tokens),
+            };
+        }
+
+        if (has_classifications and !has_entities and !has_relations and !has_structures) {
+            return .{
+                .allocator = allocator,
+                .json = try self.extractClassificationsCanonicalJsonDirect(allocator, body.model, texts, body.schema.classifications.?, prompt_tokens),
+            };
+        }
+
+        return error.UnsupportedExtractionProvider;
+    }
+
+    fn extractEntitiesCanonicalJsonDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name_raw: []const u8,
+        texts: []const []const u8,
+        labels: ?[]const []const u8,
+        relation_labels: []const []const u8,
+        prompt_tokens: usize,
+    ) ![]u8 {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_name: ?[]const u8 = if (model_name_raw.len > 0) model_name_raw else null;
+        const model_path = try self.resolveModelPath(io_impl.io(), model_name, "recognizers");
+        if (rebel_mod.isRebelModel(allocator, model_path)) return error.UnsupportedExtractionProvider;
+
+        const model = try self.model_manager.loadFromDir(model_path);
+        if (model.isGlinerModel()) {
+            var pipeline = model.glinerPipeline(allocator);
+            if (relation_labels.len > 0) {
+                if (!model.supportsRelationExtraction() or !pipeline.supportsRelationExtraction()) return error.UnsupportedExtractionProvider;
+                const extracted = try pipeline.extractRelationsBatch(texts, labels, relation_labels);
+                defer {
+                    for (extracted.entities) |entities| {
+                        for (entities) |entity| allocator.free(entity.text);
+                        allocator.free(entities);
+                    }
+                    allocator.free(extracted.entities);
+                    for (extracted.relations) |relations| {
+                        for (relations) |*relation| relation.deinit(allocator);
+                        allocator.free(relations);
+                    }
+                    allocator.free(extracted.relations);
+                }
+                return try buildCanonicalEntityExtractionJsonAlloc(allocator, model_name_raw, extracted.entities, extracted.relations, prompt_tokens);
+            }
+
+            const all_entities = try pipeline.recognizeBatch(texts, labels);
+            defer freeEntityBatches(allocator, all_entities);
+            const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, try model.getCleanupHead(), texts, all_entities);
+            defer if (cleaned_entities) |entities| freeEntityBatches(allocator, entities);
+            return try buildCanonicalEntityExtractionJsonAlloc(allocator, model_name_raw, cleaned_entities orelse all_entities, null, prompt_tokens);
+        }
+
+        if (relation_labels.len > 0) return error.UnsupportedExtractionProvider;
+        var pipeline = model.nerPipeline(allocator);
+        const all_entities = try pipeline.recognizeBatch(texts);
+        defer freeEntityBatches(allocator, all_entities);
+        const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, try model.getCleanupHead(), texts, all_entities);
+        defer if (cleaned_entities) |entities| freeEntityBatches(allocator, entities);
+        return try buildCanonicalEntityExtractionJsonAlloc(allocator, model_name_raw, cleaned_entities orelse all_entities, null, prompt_tokens);
+    }
+
+    fn extractClassificationsCanonicalJsonDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name_raw: []const u8,
+        texts: []const []const u8,
+        schemas: anytype,
+        prompt_tokens: usize,
+    ) ![]u8 {
+        if (schemas.len == 0) return error.InvalidExtractionRequest;
+        const schema = schemas[0];
+        const model_name: ?[]const u8 = if (model_name_raw.len > 0) model_name_raw else null;
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+
+        if (self.resolveModelPath(io, model_name, "classifiers")) |model_path| {
+            const model = try self.model_manager.loadFromDir(model_path);
+            const entailment_idx: ?usize = if (model.manifest.id2label) |labels| blk: {
+                for (labels, 0..) |label, i| {
+                    if (std.mem.eql(u8, label, "entailment") or std.mem.eql(u8, label, "ENTAILMENT")) break :blk i;
+                }
+                break :blk null;
+            } else null;
+            const config = @import("../pipelines/classification.zig").ClassificationConfig{
+                .max_length = model.manifest.max_position_embeddings,
+                .hypothesis_template = "This example is {}.",
+                .multi_label = schema.multi_label orelse false,
+                .entailment_index = entailment_idx,
+            };
+            var pipeline = model.classificationPipeline(allocator, config);
+            const all_results = try pipeline.classifyBatch(texts, schema.labels);
+            defer {
+                for (all_results) |results| allocator.free(results);
+                allocator.free(all_results);
+            }
+            return try buildCanonicalClassificationExtractionJsonAlloc(allocator, model_name_raw, schema.name, all_results, prompt_tokens);
+        } else |_| {}
+
+        if (self.resolveModelPath(io, model_name, "recognizers")) |model_path| {
+            const model = try self.model_manager.loadFromDir(model_path);
+            if (!model.isGlinerModel() or !model.supportsClassification()) return error.ModelNotFound;
+            var pipeline = model.glinerPipeline(allocator);
+            const all_results = try pipeline.classifyBatch(texts, schema.labels, .{
+                .threshold = 0.0,
+                .multi_label = schema.multi_label orelse false,
+            });
+            defer {
+                for (all_results) |results| allocator.free(results);
+                allocator.free(all_results);
+            }
+            return try buildCanonicalClassificationExtractionJsonAlloc(allocator, model_name_raw, schema.name, all_results, prompt_tokens);
+        } else |_| {}
+
+        return error.ModelNotFound;
     }
 
     /// Resolve a model name to a directory path.
@@ -3745,6 +4054,22 @@ pub const Node = struct {
         };
     }
 
+    fn readerFieldsJsonAlloc(alloc: std.mem.Allocator, fields: []const readers_mod.Field) !?[]u8 {
+        if (fields.len == 0) return null;
+        var map: std.json.ArrayHashMap([]const u8) = .{};
+        defer map.map.deinit(alloc);
+        try map.map.ensureTotalCapacity(alloc, fields.len);
+        for (fields) |field| {
+            map.map.putAssumeCapacity(field.name, field.value);
+        }
+        return try std.json.Stringify.valueAlloc(alloc, map, .{});
+    }
+
+    fn readerRegionsJsonAlloc(alloc: std.mem.Allocator, regions: []const readers_mod.Region) !?[]u8 {
+        if (regions.len == 0) return null;
+        return try std.json.Stringify.valueAlloc(alloc, regions, .{});
+    }
+
     pub fn transcribeAudio(self: *Node, ctx: *httpx.Context) !httpx.Response {
         var parsed = (try ctx.parseJson(api.TranscribeRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -4814,6 +5139,138 @@ fn buildCanonicalClassificationExtractionResponse(
         .data = data,
         .usage = tokenUsage(prompt_tokens, 0),
     });
+}
+
+fn extractionRequestJsonAlloc(alloc: std.mem.Allocator, model_name: []const u8, req: antfly_extracting.Request) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try out.appendSlice(alloc, "{\"model\":");
+    try appendJsonString(alloc, &out, model_name);
+    try out.appendSlice(alloc, ",\"inputs\":[");
+    for (req.inputs, 0..) |input, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        var wrote = false;
+        if (input.id) |id| {
+            try out.appendSlice(alloc, "\"id\":");
+            try appendJsonString(alloc, &out, id);
+            wrote = true;
+        }
+        if (wrote) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "\"content\":");
+        try out.appendSlice(alloc, input.content_json);
+        if (input.tokens_json) |tokens_json| {
+            try out.appendSlice(alloc, ",\"tokens\":");
+            try out.appendSlice(alloc, tokens_json);
+        }
+        if (input.metadata_json) |metadata_json| {
+            try out.appendSlice(alloc, ",\"metadata\":");
+            try out.appendSlice(alloc, metadata_json);
+        }
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "],\"schema\":");
+    try out.appendSlice(alloc, if (req.schema_json.len > 0) req.schema_json else "{}");
+    if (req.options_json.len > 0 and !std.mem.eql(u8, req.options_json, "{}")) {
+        try out.appendSlice(alloc, ",\"options\":");
+        try out.appendSlice(alloc, req.options_json);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn buildCanonicalEntityExtractionJsonAlloc(
+    allocator: std.mem.Allocator,
+    model_name: []const u8,
+    all_entities: []const []const @import("../pipelines/ner.zig").Entity,
+    all_relations: ?[]const []const gliner_mod.Relation,
+    prompt_tokens: usize,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const data = try alloc.alloc(CanonicalExtractionObject, all_entities.len);
+    for (all_entities, 0..) |entities, i| {
+        const out_entities = try alloc.alloc(CanonicalExtractionEntity, entities.len);
+        for (entities, 0..) |entity, entity_index| {
+            const entity_id = try std.fmt.allocPrint(alloc, "e{d}", .{entity_index});
+            out_entities[entity_index] = .{
+                .id = entity_id,
+                .local_id = entity_id,
+                .label = entity.label,
+                .text = entity.text,
+                .start = @intCast(entity.start),
+                .end = @intCast(entity.end),
+                .score = entity.score,
+            };
+        }
+
+        const out_relations: ?[]const CanonicalExtractionRelation = if (all_relations) |relations_by_input| blk: {
+            const relations = if (i < relations_by_input.len) relations_by_input[i] else &.{};
+            const relation_values = try alloc.alloc(CanonicalExtractionRelation, relations.len);
+            for (relations, 0..) |relation, relation_index| {
+                relation_values[relation_index] = .{
+                    .type = relation.label,
+                    .source = .{ .entity_index = findCanonicalEntityIndex(entities, relation.head) },
+                    .target = .{ .entity_index = findCanonicalEntityIndex(entities, relation.tail) },
+                    .score = relation.score,
+                };
+            }
+            break :blk relation_values;
+        } else null;
+
+        data[i] = .{
+            .entities = out_entities,
+            .relations = out_relations,
+        };
+    }
+
+    return try std.json.Stringify.valueAlloc(allocator, .{
+        .object = "extraction",
+        .model = model_name,
+        .data = data,
+        .usage = tokenUsage(prompt_tokens, 0),
+    }, .{});
+}
+
+fn buildCanonicalClassificationExtractionJsonAlloc(
+    allocator: std.mem.Allocator,
+    model_name: []const u8,
+    classification_name: []const u8,
+    all_results: anytype,
+    prompt_tokens: usize,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const data = try alloc.alloc(CanonicalExtractionObject, all_results.len);
+    for (all_results, 0..) |results, i| {
+        const classifications = try alloc.alloc(CanonicalExtractionClassification, results.len);
+        for (results, 0..) |result, j| {
+            classifications[j] = .{
+                .name = classification_name,
+                .label = result.label,
+                .score = result.score,
+            };
+        }
+        data[i] = .{ .classifications = classifications };
+    }
+
+    return try std.json.Stringify.valueAlloc(allocator, .{
+        .object = "extraction",
+        .model = model_name,
+        .data = data,
+        .usage = tokenUsage(prompt_tokens, 0),
+    }, .{});
+}
+
+fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
 }
 
 fn buildCanonicalStructureExtractionResponse(

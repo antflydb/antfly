@@ -80,3 +80,49 @@ func TestChatMessagesToGenKitPreservesMultimodalParts(t *testing.T) {
 		t.Fatalf("inline media part = %#v", parts[3])
 	}
 }
+
+func TestChatMessagesToGenKitChecksContentPartDiscriminators(t *testing.T) {
+	wrongTextPart := aimessages.ContentPart{}
+	if err := wrongTextPart.FromTextContentPart(aimessages.TextContentPart{
+		Type: aimessages.TextContentPartType("media"),
+		Text: "should be ignored",
+	}); err != nil {
+		t.Fatalf("wrong text part: %v", err)
+	}
+
+	wrongImagePart := aimessages.ContentPart{}
+	if err := wrongImagePart.FromImageURLContentPart(aimessages.ImageURLContentPart{
+		Type:     aimessages.ImageURLContentPartType("text"),
+		ImageUrl: aimessages.ImageURL{Url: "data:image/png;base64,aaa"},
+	}); err != nil {
+		t.Fatalf("wrong image part: %v", err)
+	}
+
+	audioURL := "https://example.test/audio.wav"
+	audioMime := "audio/wav"
+	wrongMediaPart := aimessages.ContentPart{}
+	if err := wrongMediaPart.FromMediaContentPart(aimessages.MediaContentPart{
+		Type:     aimessages.MediaContentPartType("image_url"),
+		Url:      &audioURL,
+		MimeType: &audioMime,
+	}); err != nil {
+		t.Fatalf("wrong media part: %v", err)
+	}
+
+	content := aimessages.ChatMessageContent{}
+	if err := content.FromChatMessageContent1([]aimessages.ContentPart{
+		wrongTextPart,
+		wrongImagePart,
+		wrongMediaPart,
+	}); err != nil {
+		t.Fatalf("content: %v", err)
+	}
+
+	messages := ChatMessagesToGenKit([]ChatMessage{{
+		Role:    ChatMessageRoleUser,
+		Content: &content,
+	}})
+	if len(messages) != 0 {
+		t.Fatalf("got %d messages, want 0: %#v", len(messages), messages)
+	}
+}

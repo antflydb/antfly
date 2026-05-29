@@ -134,7 +134,7 @@ pub const Runtime = struct {
         var source = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
         defer source.deinit(alloc);
 
-        if (cfg_parsed.value.provider == .antfly and cfg_parsed.value.resolvedUrl() == null) {
+        if (isLocalReaderProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
             const local = self.local_termite_provider orelse return error.UnsupportedReaderProvider;
             const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
             const results = try read_images(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
@@ -177,7 +177,7 @@ pub const Runtime = struct {
         });
         defer cfg_parsed.deinit();
 
-        if (cfg_parsed.value.provider == .antfly and cfg_parsed.value.resolvedUrl() == null) {
+        if (isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
             const local = self.local_termite_provider orelse return error.UnsupportedTranscriberProvider;
             const transcribe_audio = local.transcribe_audio orelse return error.UnsupportedTranscriberProvider;
             var result = try transcribe_audio(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
@@ -223,7 +223,7 @@ pub const Runtime = struct {
             .options_json = cfg.options_json,
         };
 
-        var response = if (cfg.provider == .antfly and cfg.resolvedUrl() == null) blk: {
+        var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
             const local = self.local_termite_provider orelse return error.UnsupportedExtractionProvider;
             const extract_fn = local.extract orelse return error.UnsupportedExtractionProvider;
             break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request);
@@ -236,6 +236,18 @@ pub const Runtime = struct {
         return try alloc.dupe(u8, response.json);
     }
 };
+
+fn isLocalReaderProvider(provider: readers.Provider, url: ?[]const u8) bool {
+    return (provider == .antfly or provider == .termite) and url == null;
+}
+
+fn isLocalTranscriberProvider(provider: transcribing.Provider, url: ?[]const u8) bool {
+    return (provider == .antfly or provider == .termite) and url == null;
+}
+
+fn isLocalExtractionProvider(provider: extracting.Provider, url: ?[]const u8) bool {
+    return (provider == .antfly or provider == .termite) and url == null;
+}
 
 const ReaderSource = struct {
     images: []const []const u8,

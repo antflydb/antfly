@@ -775,6 +775,9 @@ fn localTermiteProvider(node: *termite.server.Node) antfly.inference.managed_emb
         .rerank_texts = localTermiteRerankTexts,
         .generate_text = localTermiteGenerateText,
         .generate_messages = localTermiteGenerateMessages,
+        .read_images = localTermiteReadImages,
+        .transcribe_audio = localTermiteTranscribeAudio,
+        .extract = localTermiteExtract,
     };
 }
 
@@ -844,6 +847,36 @@ fn localTermiteGenerateMessages(
     var converted = try convertLocalGenerateMessages(alloc, messages);
     defer converted.deinit(alloc);
     return try node.generateMessagesDirect(alloc, model, converted.messages);
+}
+
+fn localTermiteReadImages(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.readers.Request,
+) anyerror![]antfly.readers.Result {
+    const node: *termite.server.Node = @ptrCast(@alignCast(ptr));
+    return try node.readImagesDirect(alloc, model, request);
+}
+
+fn localTermiteTranscribeAudio(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.transcribing.Request,
+) anyerror!antfly.transcribing.Response {
+    const node: *termite.server.Node = @ptrCast(@alignCast(ptr));
+    return try node.transcribeAudioDirect(alloc, model, request);
+}
+
+fn localTermiteExtract(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.extracting.Request,
+) anyerror!antfly.extracting.Response {
+    const node: *termite.server.Node = @ptrCast(@alignCast(ptr));
+    return try node.extractDirect(alloc, model, request);
 }
 
 const LocalGenerateMessages = struct {
@@ -946,7 +979,8 @@ fn convertLocalGenerateParts(
                 decoded_owned = false;
             },
             .media => |media| {
-                const decoded = try decodeLocalGenerateDataUri(alloc, media.data, media.mime_type);
+                const raw = media.url orelse media.data;
+                const decoded = try decodeLocalGenerateDataUri(alloc, raw, media.mime_type);
                 var decoded_owned = true;
                 errdefer if (decoded_owned) alloc.free(decoded.data);
                 if (std.mem.startsWith(u8, decoded.mime_type, "image/")) {
@@ -1809,6 +1843,31 @@ const RecordingServer = struct {
 test "swarm runtime module compiles" {
     _ = run;
     _ = runFromIterator;
+}
+
+test "swarm runtime local generator accepts media url data uris" {
+    const alloc = std.testing.allocator;
+    const messages = [_]antfly.inference.ChatMessage{.{
+        .role = .user,
+        .content = .{ .parts = &.{
+            .{ .text = "describe" },
+            .{ .media = .{
+                .url = "data:image/png;base64,AQI=",
+                .mime_type = "image/png",
+            } },
+        } },
+    }};
+
+    var converted = try convertLocalGenerateMessages(alloc, &messages);
+    defer converted.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), converted.messages.len);
+    const message = converted.messages[0];
+    try std.testing.expectEqualStrings("describe", message.content);
+    try std.testing.expectEqual(@as(usize, 1), message.image_bytes.?.len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, message.image_bytes.?[0]);
+    try std.testing.expectEqual(@as(usize, 2), message.content_parts.?.len);
+    try std.testing.expectEqual(@as(usize, 0), message.content_parts.?[1].image);
 }
 
 test "swarm runtime leaves auth disabled unless config or cli enables it" {

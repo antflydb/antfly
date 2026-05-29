@@ -1559,6 +1559,9 @@ pub fn build(b: *std.Build) void {
     readers_mod.addImport("httpx", httpx_mod);
     readers_mod.addImport("termite_api", termite_api_mod);
     readers_mod.addImport("antfly_google", google_mod);
+    termite_server_mod.addImport("antfly_readers", readers_mod);
+    termite_server_mod.addImport("antfly_transcribing", transcribing_mod);
+    termite_server_mod.addImport("antfly_extracting", extracting_mod);
     const synthesizing_mod = b.createModule(.{
         .root_source_file = b.path("lib/synthesizing/src/mod.zig"),
         .target = target,

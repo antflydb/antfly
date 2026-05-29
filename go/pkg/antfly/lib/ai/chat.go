@@ -462,15 +462,15 @@ func chatContentToGenKitParts(content *ChatMessageContent) []*ai.Part {
 	}
 	parts := make([]*ai.Part, 0, len(contentParts))
 	for _, contentPart := range contentParts {
-		if textPart, err := contentPart.AsTextContentPart(); err == nil && textPart.Text != "" {
+		if textPart, err := contentPart.AsTextContentPart(); err == nil && textPart.Type == aimessages.TextContentPartTypeText && textPart.Text != "" {
 			parts = append(parts, ai.NewTextPart(textPart.Text))
 			continue
 		}
-		if imagePart, err := contentPart.AsImageURLContentPart(); err == nil && imagePart.ImageUrl.Url != "" {
+		if imagePart, err := contentPart.AsImageURLContentPart(); err == nil && imagePart.Type == aimessages.ImageURLContentPartTypeImageUrl && imagePart.ImageUrl.Url != "" {
 			parts = append(parts, ai.NewMediaPart(contentTypeFromMediaURL(imagePart.ImageUrl.Url), imagePart.ImageUrl.Url))
 			continue
 		}
-		if mediaPart, err := contentPart.AsMediaContentPart(); err == nil {
+		if mediaPart, err := contentPart.AsMediaContentPart(); err == nil && mediaPart.Type == aimessages.MediaContentPartTypeMedia {
 			if part := mediaContentPartToGenKit(mediaPart); part != nil {
 				parts = append(parts, part)
 			}
@@ -541,7 +541,7 @@ func chatContentToText(content *ChatMessageContent) string {
 	}
 	var builder strings.Builder
 	for _, contentPart := range contentParts {
-		if textPart, err := contentPart.AsTextContentPart(); err == nil {
+		if textPart, err := contentPart.AsTextContentPart(); err == nil && textPart.Type == aimessages.TextContentPartTypeText {
 			builder.WriteString(textPart.Text)
 		}
 	}
