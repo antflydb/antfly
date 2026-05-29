@@ -4,6 +4,7 @@ Captured on 2026-05-29 from worktree commit `7d13cfc14c60` with `WAIT_CATCHUP=30
 Updated on 2026-05-29 from worktree commit `4ad4b59f5dd9` after the v15 prefix-run term dictionary and compact postings metadata codec changes.
 Updated on 2026-05-29 from worktree commit `14dfe7f28446` after the v16 per-section norms codec change. The initial v16 top-level health metric under-reported norms because shard aggregation omitted `inverted_norm_bytes`; direct segment parsing showed the norm artifacts were present on disk.
 Updated on 2026-05-29 from worktree commit `89a0e73e71d7` after byte-budgeted stored-field blocks.
+Updated on 2026-05-29 from worktree commit `d255fecf291d` after caching per-segment layout stats and adding merge/retire clean-page advice.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -20,6 +21,82 @@ Latest v16 artifacts:
 Latest stored-block-cap artifacts:
 
 `work-log/do8018/releasefast-baseline-20260529-122215/`
+
+Latest layout-cache/page-advice artifacts:
+
+`work-log/do8018/releasefast-baseline-20260529-123427/`
+
+## Latest Layout-Cache Metrics Off
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Load time: 37.679355958s
+- Async catch-up time: 16.851997875s
+- Catch-up complete: true
+- Throughput: 1,873.84 records/sec, 5.72 MiB/sec
+- `ps` RSS: 1,189,199,872 bytes
+- Process footprint metric: 139,351,992 bytes
+- Live malloc metric: 64,649,392 bytes
+- Malloc zone metric: 148,111,360 bytes
+- vmmap footprint: 139,355,750 bytes
+- vmmap peak footprint: 862,034,329 bytes
+- vmmap mapped-file resident: 533,725,184 bytes
+- vmmap malloc allocated: 15,938,355 bytes
+- Final full-text segment files: 7
+- Final full-text segment bytes: 533,722,486
+- Stored fields bytes: 127,416,442
+- Inverted bytes: 402,266,056
+- Inverted norms bytes: 21,790,557
+- Inverted postings bytes: 273,274,095
+- Inverted term dictionary bytes: 101,326,596
+- Term block bytes: 96,190,950
+- Term index bytes: 2,596,922
+- Term FST bytes: 2,476,564
+- Typed doc values bytes: 3,438,357
+- Doc ordinal bytes: 282,455
+- Section index bytes: 318,896
+- Text merges completed: 100
+- Full-text build peak bytes: 163,222,864
+- Full-text pending peak bytes: 533,818,260
+- Text merge buffer peak bytes: 261,072,840
+- LSM compaction peak bytes: 67,648,368
+- LSM in-memory state peak bytes: 35,419,809
+
+## Latest Layout-Cache Metrics On
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Load time: 40.21371225s
+- Async catch-up time: 19.834223958s
+- Catch-up complete: true
+- Throughput: 1,755.74 records/sec, 5.36 MiB/sec
+- `ps` RSS: 1,173,716,992 bytes
+- Process footprint metric: 154,473,944 bytes
+- Live malloc metric: 68,008,208 bytes
+- Malloc zone metric: 148,996,096 bytes
+- vmmap footprint: 155,189,248 bytes
+- vmmap peak footprint: 744,279,244 bytes
+- vmmap mapped-file resident: 518,835,404 bytes
+- vmmap malloc allocated: 16,882,073 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 518,796,682
+- Stored fields bytes: 127,491,815
+- Inverted bytes: 387,210,961
+- Inverted norms bytes: 11,440,900
+- Inverted postings bytes: 264,474,445
+- Inverted term dictionary bytes: 105,577,127
+- Term block bytes: 100,132,018
+- Term index bytes: 2,739,739
+- Term FST bytes: 2,633,190
+- Typed doc values bytes: 3,443,302
+- Doc ordinal bytes: 282,460
+- Section index bytes: 367,824
+- Text merges completed: 97
+- Full-text build peak bytes: 136,639,703
+- Full-text pending peak bytes: 519,553,028
+- Text merge buffer peak bytes: 117,712,340
+- LSM compaction peak bytes: 67,447,216
+- LSM in-memory state peak bytes: 35,251,321
 
 ## Latest Stored-Block-Cap Metrics Off
 
@@ -318,3 +395,5 @@ After the v16 codec change, postings fell again to ~265-267 MiB, with norms stor
 The stored-field section in the v16 metrics-off artifacts was ~127.5 MiB: ~123.6 MiB compressed payload, ~244.8 MiB raw payload, and ~3.9 MiB metadata. Fixed 128-doc stored-field blocks produced a worst raw block of ~16.3 MiB, so the next codec step capped stored-field blocks by raw bytes as well as doc count.
 
 After the stored-block-cap change, stored-field bytes stayed around ~127.4-127.5 MiB and load time improved to ~35.1s metrics-off / ~38.1s metrics-on. The final block-compressed payload was ~123.6 MiB, raw payload was ~245.1 MiB, and the segment set used 704 stored-field blocks metrics-off / 687 metrics-on. The worst raw block is now ~5.5 MiB, down from ~16.3 MiB, because a single oversized document still occupies a block by itself; ordinary multi-doc blocks are capped at the 512 KiB raw target. RSS is still not live-heap dominated: final `ps` RSS is ~1.11-1.20 GiB, live malloc is ~82-88 MiB, vmmap malloc allocated is ~28 MiB, and mapped-file resident bytes closely track final full-text segment bytes at ~522-525 MiB. The next RSS slice should focus on segment mapping residency, reader release cleanup, and allocator-retained pages after transient merge/build work.
+
+After caching per-segment layout stats and adding clean-page advice on merge sources/retired segments, normal metrics scrapes no longer need to re-parse mmap-backed segment bytes for section attribution. The post-change ReleaseFast run shows the expected allocator-side improvement but not a final RSS breakthrough: vmmap malloc allocated fell from ~28 MiB to ~16 MiB, health live malloc fell to ~65-68 MiB, and metrics-on vmmap peak footprint fell from ~857 MiB to ~744 MiB. Final `ps` RSS stayed around ~1.17-1.19 GiB because mapped-file resident bytes still closely track final segment bytes (~519-534 MiB) and macOS allocator/library resident pages remain counted in RSS. Metrics-off varied to 7 final segments and a larger 533.7 MiB segment set, so the remaining target is still the full-text segment bytes plus mmap/page-cache residency policy, not hidden live heap.
