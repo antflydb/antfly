@@ -88,7 +88,7 @@ pub const QueryPlanningContext = struct {
     free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
-    termite_api_key: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
 
     fn adminSnapshot(self: QueryPlanningContext) !metadata_api.AdminSnapshot {
         return try self.admin_snapshot(self.ptr);
@@ -115,7 +115,7 @@ pub fn planSemanticQuery(
     var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, table.indexes_json, .{
         .antfly_provider = planning.antfly_provider,
         .remote_content = planning.remote_content,
-        .termite_api_key = planning.termite_api_key,
+        .inference_api_key = planning.inference_api_key,
     });
     defer runtime.deinit();
 

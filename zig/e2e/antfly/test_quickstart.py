@@ -257,7 +257,7 @@ def test_public_search_fields_projection(serverless_api):
     projected = json.loads(search["hits"][0]["body"])
     assert projected == {"metadata": {"author": "Ada"}, "title": "Alpha"}
 
-def test_public_hybrid_quickstart_pipeline(backup_api, termite_reranker):
+def test_public_hybrid_quickstart_pipeline(backup_api, inference_reranker):
     table_name = f"quickstart_hybrid_{__import__('time').time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -348,7 +348,7 @@ def test_public_hybrid_quickstart_pipeline(backup_api, termite_reranker):
                     "reranker": {
                         "provider": "antfly",
                         "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                        "url": termite_reranker,
+                        "url": inference_reranker,
                         "field": "body",
                         "top_n": 2,
                     },
@@ -407,7 +407,7 @@ def test_public_hybrid_quickstart_pipeline(backup_api, termite_reranker):
                     "reranker": {
                         "provider": "antfly",
                         "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                        "url": termite_reranker,
+                        "url": inference_reranker,
                         "field": "body",
                         "top_n": 2,
                     },
@@ -435,7 +435,7 @@ def test_public_hybrid_quickstart_pipeline(backup_api, termite_reranker):
     assert rrf_profile["reranker"]["model"] == "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
-def test_public_hybrid_quickstart_supports_weighted_merge_and_template_reranking(backup_api, termite_reranker):
+def test_public_hybrid_quickstart_supports_weighted_merge_and_template_reranking(backup_api, inference_reranker):
     table_name = f"quickstart_hybrid_template_{__import__('time').time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -528,7 +528,7 @@ def test_public_hybrid_quickstart_supports_weighted_merge_and_template_reranking
                     "reranker": {
                         "provider": "antfly",
                         "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                        "url": termite_reranker,
+                        "url": inference_reranker,
                         "template": "title={{title}}\nbody={{body}}",
                         "top_n": 2,
                     },
@@ -558,7 +558,7 @@ def test_public_hybrid_quickstart_supports_weighted_merge_and_template_reranking
     assert profile["reranker"]["model"] == "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
-def test_public_managed_semantic_hybrid_quickstart_pipeline(backup_api, openai_embedder, termite_reranker):
+def test_public_managed_semantic_hybrid_quickstart_pipeline(backup_api, openai_embedder, inference_reranker):
     table_name = f"quickstart_managed_hybrid_{__import__('time').time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -640,7 +640,7 @@ def test_public_managed_semantic_hybrid_quickstart_pipeline(backup_api, openai_e
                     "reranker": {
                         "provider": "antfly",
                         "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                        "url": termite_reranker,
+                        "url": inference_reranker,
                         "field": "body",
                         "top_n": 2,
                     },
@@ -808,7 +808,7 @@ def test_public_managed_chunked_semantic_full_index_pipeline(backup_api, openai_
     assert any(chunk["body"].startswith("beta") for chunk in chunks)
 
 
-def test_public_managed_antfly_chunked_semantic_full_index_pipeline(backup_api, termite_embedder):
+def test_public_managed_antfly_chunked_semantic_full_index_pipeline(backup_api, inference_embedder):
     table_name = f"quickstart_antfly_chunked_semantic_{__import__('time').time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -825,11 +825,11 @@ def test_public_managed_antfly_chunked_semantic_full_index_pipeline(backup_api, 
                 "embedder": {
                     "provider": "antfly",
                     "model": "antfly-embed-v1",
-                    "api_url": termite_embedder,
+                    "api_url": inference_embedder,
                 },
                 "chunker": {
                     "provider": "antfly",
-                    "api_url": termite_embedder,
+                    "api_url": inference_embedder,
                     "model": "antfly-chunker-v1",
                     "store_chunks": True,
                     "text": {
@@ -896,10 +896,10 @@ def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup
     table_name = f"quickstart_antfly_clipclap_semantic_{__import__('time').time_ns()}"
 
     try:
-        warmup = backup_api.termite_embed(CLIPCLAP_MODEL, "alpha body", timeout_s=120.0)
+        warmup = backup_api.inference_embed(CLIPCLAP_MODEL, "alpha body", timeout_s=120.0)
     except requests.HTTPError as exc:
         if exc.response is not None and exc.response.status_code in {400, 404}:
-            pytest.skip(f"Embedded Termite ClipClap model unavailable: {exc}")
+            pytest.skip(f"Embedded Antfly inference ClipClap model unavailable: {exc}")
         raise
     warmup_embedding = warmup["data"][0]["embedding"]
     assert len(warmup_embedding) == 512
@@ -935,10 +935,10 @@ def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(real_cl
     table_name = f"quickstart_antfly_clipclap_chunked_{__import__('time').time_ns()}"
 
     try:
-        warmup = backup_api.termite_embed(CLIPCLAP_MODEL, "alpha body", timeout_s=120.0)
+        warmup = backup_api.inference_embed(CLIPCLAP_MODEL, "alpha body", timeout_s=120.0)
     except requests.HTTPError as exc:
         if exc.response is not None and exc.response.status_code in {400, 404}:
-            pytest.skip(f"Embedded Termite ClipClap model unavailable: {exc}")
+            pytest.skip(f"Embedded Antfly inference ClipClap model unavailable: {exc}")
         raise
     warmup_embedding = warmup["data"][0]["embedding"]
     assert len(warmup_embedding) == 512

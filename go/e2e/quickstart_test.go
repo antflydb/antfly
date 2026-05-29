@@ -27,7 +27,7 @@ import (
 )
 
 // TestE2E_Quickstart mirrors the quickstart guide: creates a table with a
-// Termite BGE text embedder and a CLIP image embedder, inserts documents with
+// Antfly inference BGE text embedder and a CLIP image embedder, inserts documents with
 // thumbnail URLs, and runs text search, image search, hybrid search, and RAG.
 func TestE2E_Quickstart(t *testing.T) {
 	if testing.Short() {
@@ -43,31 +43,31 @@ func TestE2E_Quickstart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// Start swarm with Termite for BGE + CLIP + Gemma-3-ONNX.
-	t.Log("Starting Antfly swarm with Termite...")
+	// Start swarm with Antfly inference for BGE + CLIP + Gemma-3-ONNX.
+	t.Log("Starting Antfly swarm with Antfly inference...")
 	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{})
 	defer swarm.Cleanup()
 
-	termiteURL := GetTermiteURL()
-	if termiteURL == "" {
-		t.Fatal("Termite URL not set — swarm should have started Termite")
+	inferenceURL := GetInferenceURL()
+	if inferenceURL == "" {
+		t.Fatal("Antfly inference URL not set — swarm should have started Antfly inference")
 	}
 
 	tableName := "wikipedia"
 
 	// --- Create table with two indexes matching quickstart guide ---
 
-	// Text embedder: BGE via Termite
+	// Text embedder: BGE via Antfly inference
 	bgeEmbedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model:  "BAAI/bge-small-en-v1.5",
-		ApiUrl: termiteURL,
+		ApiUrl: inferenceURL,
 	})
 	require.NoError(t, err)
 
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
 		Model:  "fixed",
-		ApiUrl: termiteURL,
+		ApiUrl: inferenceURL,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  200,
 			OverlapTokens: 25,
@@ -86,10 +86,10 @@ func TestE2E_Quickstart(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Image embedder: CLIP via Termite
+	// Image embedder: CLIP via Antfly inference
 	clipEmbedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model:  "openai/clip-vit-base-patch32",
-		ApiUrl: termiteURL,
+		ApiUrl: inferenceURL,
 	})
 	require.NoError(t, err)
 
@@ -228,7 +228,7 @@ func TestE2E_Quickstart(t *testing.T) {
 	t.Log("Running hybrid search with reranker...")
 	rerankerConfig, err := antfly.NewRerankerConfig(antfly.AntflyRerankerConfig{
 		Model: "mixedbread-ai/mxbai-rerank-base-v1",
-		Url:   termiteURL,
+		Url:   inferenceURL,
 	})
 	require.NoError(t, err)
 	rerankerConfig.Field = "body"

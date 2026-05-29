@@ -164,4 +164,26 @@ func TestHTTPHandler_HealthTreatsMissingNamespaceTableAsAvailable(t *testing.T) 
 	if !status.Antfly {
 		t.Fatal("expected antfly to be reported available")
 	}
+	if status.Extractor {
+		t.Fatal("expected extractor to be reported disabled")
+	}
+}
+
+func TestHTTPHandler_HealthReportsExtractorAvailability(t *testing.T) {
+	handler := NewHTTPHandler(newTestHandler(newMockClient(), &mockExtractor{}), nil)
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var status HealthStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode health: %v", err)
+	}
+	if !status.Extractor {
+		t.Fatal("expected extractor to be reported available")
+	}
 }

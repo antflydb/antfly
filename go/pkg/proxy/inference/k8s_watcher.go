@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package proxy implements Kubernetes integration for the Termite proxy.
+// Package proxy implements Kubernetes integration for the Inference proxy.
 package proxy
 
 import (
@@ -38,25 +38,25 @@ import (
 )
 
 const (
-	defaultTermiteAPIPort    int64 = 11433
-	defaultTermiteHealthPort int64 = 4200
+	defaultInferenceAPIPort    int64 = 11433
+	defaultInferenceHealthPort int64 = 4200
 )
 
-// ExternalTermitePoolGVR is the GroupVersionResource for ExternalTermitePool.
-var ExternalTermitePoolGVR = schema.GroupVersionResource{
+// ExternalInferencePoolGVR is the GroupVersionResource for ExternalInferencePool.
+var ExternalInferencePoolGVR = schema.GroupVersionResource{
 	Group:    "antfly.io",
 	Version:  "v1alpha1",
-	Resource: "externaltermitepools",
+	Resource: "externalinferencepools",
 }
 
-// K8sWatcher watches Kubernetes endpoints for Termite pods
+// K8sWatcher watches Kubernetes endpoints for Inference pods
 type K8sWatcher struct {
 	proxy         *Proxy
 	clientset     *kubernetes.Clientset
 	dynamicClient dynamic.Interface
 	namespace     string
 
-	// Label selector for Termite pods
+	// Label selector for Inference pods
 	labelSelector labels.Selector
 
 	externalMu    sync.Mutex
@@ -67,7 +67,7 @@ type K8sWatcher struct {
 type K8sWatcherConfig struct {
 	Kubeconfig    string
 	Namespace     string
-	LabelSelector string // e.g., "app.kubernetes.io/name=termite"
+	LabelSelector string // e.g., "app.kubernetes.io/name=inference"
 }
 
 // NewK8sWatcher creates a new Kubernetes watcher
@@ -146,7 +146,7 @@ func (w *K8sWatcher) Start(ctx context.Context) error {
 
 	externalFactory, externalPoolInformer, err := w.externalPoolInformer()
 	if err != nil {
-		log.Printf("termite proxy: external termite pool watch disabled: %v", err)
+		log.Printf("inference proxy: external inference pool watch disabled: %v", err)
 	}
 
 	factory.Start(ctx.Done())
@@ -177,7 +177,7 @@ func (w *K8sWatcher) externalPoolInformer() (dynamicinformer.DynamicSharedInform
 		factory = dynamicinformer.NewDynamicSharedInformerFactory(w.dynamicClient, 30*time.Second)
 	}
 
-	informer := factory.ForResource(ExternalTermitePoolGVR).Informer()
+	informer := factory.ForResource(ExternalInferencePoolGVR).Informer()
 	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    w.onExternalPoolAdd,
 		UpdateFunc: w.onExternalPoolUpdate,
@@ -194,7 +194,7 @@ func (w *K8sWatcher) waitForOptionalExternalPoolSync(ctx context.Context, inform
 	defer cancel()
 
 	if !cache.WaitForCacheSync(syncCtx.Done(), informer.HasSynced) && ctx.Err() == nil {
-		log.Printf("termite proxy: external termite pool watch did not sync; continuing without external pool discovery")
+		log.Printf("inference proxy: external inference pool watch did not sync; continuing without external pool discovery")
 	}
 }
 
@@ -250,12 +250,12 @@ func (w *K8sWatcher) processExternalPool(obj any) {
 		if apiService == "" {
 			continue
 		}
-		apiPort := getExternalInt(endpoint, "apiPort", defaultTermiteAPIPort)
+		apiPort := getExternalInt(endpoint, "apiPort", defaultInferenceAPIPort)
 		healthService := strings.TrimSpace(getExternalString(endpoint, "healthServiceRef", apiService))
 		if healthService == "" {
 			healthService = apiService
 		}
-		healthPort := getExternalInt(endpoint, "healthPort", defaultTermiteHealthPort)
+		healthPort := getExternalInt(endpoint, "healthPort", defaultInferenceHealthPort)
 
 		apiURL := serviceURL(apiService, u.GetNamespace(), apiPort)
 		healthURL := serviceURL(healthService, u.GetNamespace(), healthPort) + "/readyz"
@@ -309,15 +309,15 @@ func (w *K8sWatcher) processEndpointSlice(endpointSlice *discoveryv1.EndpointSli
 	// Get the service name from the kubernetes.io/service-name label
 	serviceName := endpointSlice.Labels["kubernetes.io/service-name"]
 
-	// Check if this is a Termite service
-	if !strings.HasPrefix(serviceName, "termite-") && endpointSlice.Labels["app.kubernetes.io/name"] != "termite" {
+	// Check if this is a Inference service
+	if !strings.HasPrefix(serviceName, "inference-") && endpointSlice.Labels["app.kubernetes.io/name"] != "inference" {
 		return
 	}
 
 	// Get pool name from service name or labels
 	pool := endpointSlice.Labels["antfly.io/pool"]
 	if pool == "" {
-		pool = strings.TrimPrefix(serviceName, "termite-")
+		pool = strings.TrimPrefix(serviceName, "inference-")
 	}
 
 	// Get workload type from labels
@@ -421,7 +421,7 @@ func endpointSlicePort(endpointSlice *discoveryv1.EndpointSlice) int {
 func podPort(pod *corev1.Pod) int {
 	port := 11433
 	for _, container := range pod.Spec.Containers {
-		if container.Name == "termite" {
+		if container.Name == "inference" {
 			for _, p := range container.Ports {
 				if p.Name == "http" || p.Name == "api" {
 					port = int(p.ContainerPort)

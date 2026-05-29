@@ -42,9 +42,9 @@ func TestE2E_PortableBackupRestore(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Start Antfly swarm without Termite (no ML models needed)
+	// Start Antfly swarm without Antfly inference (no ML models needed)
 	t.Log("Starting Antfly swarm...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
+	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
 	defer swarm.Cleanup()
 
 	tableName := "portable_backup_test"

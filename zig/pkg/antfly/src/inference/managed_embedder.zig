@@ -85,7 +85,7 @@ pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
-    termite_api_key: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
 };
 
 pub const QueryTemplateError = error{
@@ -713,7 +713,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         defer embedder_cfg.deinit(alloc);
         if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
         _ = parseEmbedderProvider(embedder_cfg) catch return error.UnsupportedCreateTableRequest;
-        const embedder_json = try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.termite_api_key);
+        const embedder_json = try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.inference_api_key);
         defer alloc.free(embedder_json);
 
         var out = std.ArrayListUnmanaged(u8).empty;
@@ -769,7 +769,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         defer embedder_cfg.deinit(alloc);
         _ = try parseEmbedderProvider(embedder_cfg);
         if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
-        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.termite_api_key);
+        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.inference_api_key);
     } else null;
     defer if (embedder_json) |raw| alloc.free(raw);
     if (!external and embedder_json == null and chunker_json == null) return error.InvalidCreateTableRequest;
@@ -962,7 +962,7 @@ fn buildManagedEmbeddingEntry(
         .openai => try common_secrets.SecretValue.initConfigOrEnv(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
         .antfly => try common_secrets.SecretValue.initConfigOrEnv(
             alloc,
-            embedder_cfg.api_key orelse options.termite_api_key,
+            embedder_cfg.api_key orelse options.inference_api_key,
             "ANTFLY_INFERENCE_API_KEY",
         ),
         .ollama, .bedrock => null,
@@ -1926,23 +1926,23 @@ fn stringifyManagedEmbedderConfigAlloc(
     alloc: std.mem.Allocator,
     cfg: embeddings_types.Config,
     raw_value: std.json.Value,
-    termite_api_key: ?[]const u8,
+    inference_api_key: ?[]const u8,
 ) ![]u8 {
     const base_json = try embeddings_types.stringifyAlloc(alloc, cfg);
     defer alloc.free(base_json);
 
     const requests_per_minute = configObjectU32(raw_value, "requests_per_minute");
     const burst = configObjectU32(raw_value, "burst");
-    const default_termite_api_key = if (cfg.api_key == null and isAntflyProvider(try parseEmbedderProvider(cfg)))
-        termite_api_key
+    const default_inference_api_key = if (cfg.api_key == null and isAntflyProvider(try parseEmbedderProvider(cfg)))
+        inference_api_key
     else
         null;
-    if (requests_per_minute == null and burst == null and default_termite_api_key == null) return try alloc.dupe(u8, base_json);
+    if (requests_per_minute == null and burst == null and default_inference_api_key == null) return try alloc.dupe(u8, base_json);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.appendSlice(alloc, base_json[0 .. base_json.len - 1]);
-    if (default_termite_api_key) |api_key| {
+    if (default_inference_api_key) |api_key| {
         try out.appendSlice(alloc, ",\"api_key\":");
         try appendJsonString(alloc, &out, api_key);
     }

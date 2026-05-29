@@ -55,7 +55,7 @@ import (
 
 const (
 	// InferenceAPIPort is the port the Inference API server listens on.
-	// This must match TERMITE_API_URL in the container image (default: http://0.0.0.0:8080).
+	// This must match ANTFLY_INFERENCE_URL in the container image (default: http://0.0.0.0:8080).
 	InferenceAPIPort = 8080
 )
 
@@ -235,7 +235,7 @@ func (r *InferencePoolReconciler) reconcileConfigMap(ctx context.Context, pool *
 		return fmt.Errorf("failed to generate complete config: %w", err)
 	}
 
-	// Build model list for environment variables (backward compatibility)
+	// Build model list for environment variables (inference runtime metadata)
 	models := make([]string, 0, len(pool.Spec.Models.Preload))
 	for _, m := range pool.Spec.Models.Preload {
 		models = append(models, m.Name)
@@ -250,11 +250,11 @@ func (r *InferencePoolReconciler) reconcileConfigMap(ctx context.Context, pool *
 		Data: map[string]string{
 			// Config file for --config flag
 			"config.json": completeConfig,
-			// Environment variables (backward compatibility)
-			"TERMITE_MODELS":           strings.Join(models, ","),
-			"TERMITE_POOL":             pool.Name,
-			"TERMITE_WORKLOAD_TYPE":    string(pool.Spec.WorkloadType),
-			"TERMITE_LOADING_STRATEGY": string(pool.Spec.Models.LoadingStrategy),
+			// Environment variables (inference runtime metadata)
+			"ANTFLY_INFERENCE_MODELS":           strings.Join(models, ","),
+			"ANTFLY_INFERENCE_POOL":             pool.Name,
+			"ANTFLY_INFERENCE_WORKLOAD_TYPE":    string(pool.Spec.WorkloadType),
+			"ANTFLY_INFERENCE_LOADING_STRATEGY": string(pool.Spec.Models.LoadingStrategy),
 		},
 	}
 

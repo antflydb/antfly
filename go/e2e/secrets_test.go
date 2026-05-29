@@ -49,9 +49,9 @@ func TestE2E_SecretsAPI(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// Start swarm — no Termite needed, secrets are metadata-only.
-	t.Log("Starting Antfly swarm (no Termite)...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
+	// Start swarm — no Antfly inference needed, secrets are metadata-only.
+	t.Log("Starting Antfly swarm (no Antfly inference)...")
+	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
 	defer swarm.Cleanup()
 
 	baseURL := swarm.MetadataAPIURL + "/db/v1"

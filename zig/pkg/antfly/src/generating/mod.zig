@@ -39,7 +39,7 @@ pub const BackendFactory = struct {
     http: *httpx.Client,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
-    termite_api_key: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -56,7 +56,7 @@ pub const BackendFactory = struct {
     pub const Options = struct {
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
-        termite_api_key: ?[]const u8 = null,
+        inference_api_key: ?[]const u8 = null,
     };
 
     pub fn initWithOptions(
@@ -69,7 +69,7 @@ pub const BackendFactory = struct {
             .http = http,
             .antfly_provider = options.antfly_provider,
             .secret_store = options.secret_store,
-            .termite_api_key = options.termite_api_key,
+            .inference_api_key = options.inference_api_key,
         };
     }
 
@@ -82,7 +82,7 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.termite_api_key);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key);
     }
 };
 
@@ -104,7 +104,7 @@ const BackendState = struct {
         cfg: GeneratorConfig,
         embedded_antfly_provider: ?managed_embedder.AntflyProvider,
         secret_store: ?*common_secrets.FileStore,
-        termite_api_key: ?[]const u8,
+        inference_api_key: ?[]const u8,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
@@ -112,7 +112,7 @@ const BackendState = struct {
         state.alloc = alloc;
         state.cfg = cfg;
         state.api_key = switch (cfg.provider) {
-            .antfly => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key orelse termite_api_key, "ANTFLY_INFERENCE_API_KEY"),
+            .antfly => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key orelse inference_api_key, "ANTFLY_INFERENCE_API_KEY"),
             else => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
         };
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);

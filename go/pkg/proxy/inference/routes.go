@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package proxy implements route matching for TermiteRoute CRDs.
+// Package proxy implements route matching for InferenceProxy CRDs.
 package proxy
 
 import (
@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-// Route represents a compiled TermiteRoute for fast matching
+// Route represents a compiled InferenceProxy for fast matching
 type Route struct {
 	Name     string
 	Priority int32

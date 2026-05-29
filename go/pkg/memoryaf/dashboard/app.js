@@ -176,7 +176,7 @@
       els.metricTotal.textContent = String(stats.total_memories || 0);
       els.metricNamespace.textContent = state.identity.namespace || "default";
       els.metricHealth.textContent = health.status || "unknown";
-      els.metricExtractor.textContent = health.termite ? "Configured" : "Disabled";
+      els.metricExtractor.textContent = health.extractor ? "Available" : "Disabled";
 
       renderBars(els.chartTypes, stats.by_type || {});
       renderBars(els.chartProjects, stats.by_project || {});
@@ -199,7 +199,7 @@
         serverRow("Description", info.description),
         serverRow("Health", health.status),
         serverRow("Antfly", health.antfly ? "reachable by configuration" : "unavailable"),
-        serverRow("Extractor", health.termite ? "configured" : "disabled"),
+        serverRow("Extractor", health.extractor ? "available" : "disabled"),
       ].join("");
     } catch (error) {
       els.serverInfo.innerHTML = emptyState(error.message);

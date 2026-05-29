@@ -134,7 +134,7 @@ func TestProxyRequestRetriesRetryableStatus(t *testing.T) {
 			}, nil
 		}),
 	}
-	p.RegisterEndpoint("http://termite.internal", "primary", WorkloadTypeGeneral)
+	p.RegisterEndpoint("http://inference.internal", "primary", WorkloadTypeGeneral)
 	p.Router().RouteManager().AddRoute(&Route{
 		Name:       "default/retry",
 		Operations: map[OperationType]bool{OperationType("embed"): true},
@@ -563,8 +563,8 @@ func TestForwardRequestSendsUpstreamAuthorization(t *testing.T) {
 			}, nil
 		}),
 	}
-	p.RegisterEndpoint("http://termite.internal", "default", WorkloadTypeGeneral)
-	p.registry.UpdateModels("http://termite.internal", []string{"model-a"})
+	p.RegisterEndpoint("http://inference.internal", "default", WorkloadTypeGeneral)
+	p.registry.UpdateModels("http://inference.internal", []string{"model-a"})
 
 	req := httptest.NewRequest(http.MethodPost, "/ai/v1/embed", bytes.NewBufferString(`{"model":"model-a"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -600,8 +600,8 @@ func TestResolveRequestDoesNotAdvanceBurstRoundRobinState(t *testing.T) {
 		Operation: OperationType("embed"),
 		Model:     "model-a",
 		Headers: map[string]string{
-			"Content-Type":            "application/json",
-			"X-Termite-Workload-Type": string(WorkloadTypeBurst),
+			"Content-Type":                     "application/json",
+			"X-Antfly-Inference-Workload-Type": string(WorkloadTypeBurst),
 		},
 		Timestamp: time.Now(),
 	})
@@ -616,8 +616,8 @@ func TestResolveRequestDoesNotAdvanceBurstRoundRobinState(t *testing.T) {
 			Operation: OperationType("embed"),
 			Model:     "model-a",
 			Headers: map[string]string{
-				"Content-Type":            "application/json",
-				"X-Termite-Workload-Type": string(WorkloadTypeBurst),
+				"Content-Type":                     "application/json",
+				"X-Antfly-Inference-Workload-Type": string(WorkloadTypeBurst),
 			},
 			Timestamp: time.Now(),
 		})
@@ -637,8 +637,8 @@ func TestResolveRequestDoesNotAdvanceBurstRoundRobinState(t *testing.T) {
 		Operation: OperationType("embed"),
 		Model:     "model-a",
 		Headers: map[string]string{
-			"Content-Type":            "application/json",
-			"X-Termite-Workload-Type": string(WorkloadTypeBurst),
+			"Content-Type":                     "application/json",
+			"X-Antfly-Inference-Workload-Type": string(WorkloadTypeBurst),
 		},
 		Timestamp: time.Now(),
 	})

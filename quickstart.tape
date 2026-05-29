@@ -80,7 +80,7 @@ Type@60ms `  --semantic-search "theory of relativity and physics" \`
 Enter
 Type@60ms `  -i title_body --fields "title,url" --limit 10 \`
 Enter
-Type@60ms `  --reranker '{"provider": "termite", "model": "mixedbread-ai/mxbai-rerank-base-v1", "field": "body"}' \`
+Type@60ms `  --reranker '{"provider": "antfly", "model": "mixedbread-ai/mxbai-rerank-base-v1", "field": "body"}' \`
 Enter
 Type@60ms `  --pruner '{"min_score_ratio": 0.01}'`
 Enter

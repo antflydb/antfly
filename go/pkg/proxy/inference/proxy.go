@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package proxy implements a model-aware routing proxy for Termite TPU instances.
+// Package proxy implements a model-aware routing proxy for inference instances.
 package proxy
 
 import (
@@ -40,7 +40,7 @@ import (
 var (
 	requestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "termite_proxy_requests_total",
+			Name: "antfly_inference_proxy_requests_total",
 			Help: "Total requests by pool, model, and status",
 		},
 		[]string{"pool", "model", "operation", "status"},
@@ -48,7 +48,7 @@ var (
 
 	queueDepth = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "termite_proxy_queue_depth",
+			Name: "antfly_inference_proxy_queue_depth",
 			Help: "Current queue depth per pool",
 		},
 		[]string{"pool"},
@@ -56,7 +56,7 @@ var (
 
 	requestLatency = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "termite_proxy_request_duration_seconds",
+			Name:    "antfly_inference_proxy_request_duration_seconds",
 			Help:    "Request latency by pool and model",
 			Buckets: []float64{.01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
 		},
@@ -65,15 +65,15 @@ var (
 
 	modelLoaded = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "termite_proxy_model_loaded",
-			Help: "Whether a model is loaded on a Termite (1=loaded, 0=not loaded)",
+			Name: "antfly_inference_proxy_model_loaded",
+			Help: "Whether a model is loaded on an Inference runtime (1=loaded, 0=not loaded)",
 		},
 		[]string{"pool", "endpoint", "model"},
 	)
 
 	endpointHealth = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "termite_proxy_endpoint_healthy",
+			Name: "antfly_inference_proxy_endpoint_healthy",
 			Help: "Whether an endpoint is healthy (1=healthy, 0=unhealthy)",
 		},
 		[]string{"pool", "endpoint"},
@@ -81,7 +81,7 @@ var (
 
 	activeConnections = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "termite_proxy_active_connections",
+			Name: "antfly_inference_proxy_active_connections",
 			Help: "Active connections per endpoint",
 		},
 		[]string{"pool", "endpoint"},
@@ -98,7 +98,7 @@ const (
 	WorkloadTypeGeneral    WorkloadType = "general"
 )
 
-// Endpoint represents a single Termite instance
+// Endpoint represents a single inference instance
 type Endpoint struct {
 	Address      string
 	HealthURL    string
@@ -224,7 +224,7 @@ func (cb *CircuitBreaker) ReleaseReservation() {
 	}
 }
 
-// ModelRegistry tracks which models are available on which Termites
+// ModelRegistry tracks which models are available on which inference runtimes
 type ModelRegistry struct {
 	endpoints map[string]*Endpoint   // address -> endpoint
 	models    map[string][]*Endpoint // model -> endpoints with model
@@ -955,7 +955,7 @@ type Config struct {
 	ListenAddr            string
 	DefaultPool           string
 	RefreshInterval       time.Duration
-	EnableRouteWatching   bool        // Enable watching TermiteRoute CRs
+	EnableRouteWatching   bool        // Enable watching InferenceProxy CRs
 	RouteWatchNamespace   string      // Namespace to watch for routes (empty for all)
 	RouteWatchKubeconfig  string      // Optional kubeconfig path for route watching
 	UpstreamAuthorization string      // Optional Authorization header value for upstream refreshes and requests
@@ -1118,7 +1118,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, operation s
 		Model:     req.Model,
 		Headers:   headers,
 		Source: VerifiedSource{
-			Table: firstHeader(r, "X-Termite-Source-Table", "X-Antfly-Table"),
+			Table: firstHeader(r, "X-Antfly-Source-Table", "X-Antfly-Table"),
 		},
 		Timestamp: start,
 	})

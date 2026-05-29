@@ -42,7 +42,7 @@ import (
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db"
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
-	"github.com/antflydb/antfly/go/pkg/termite"
+	inferenceRuntime "github.com/antflydb/antfly/go/pkg/termite"
 	"github.com/antflydb/antfly/go/pkg/termite/lib/modelregistry"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
@@ -219,7 +219,7 @@ func ensureCLIPModel(t *testing.T, modelsDir string) string {
 // 1. Downloads CLIP model if not present
 // 2. Starts a fake S3 server and uploads test images
 // 3. Configures RemoteContent.S3 credentials pointing to fake S3
-// 4. Starts Antfly swarm with Termite and CLIP model
+// 4. Starts Antfly swarm with Antfly inference and CLIP model
 // 5. Creates a table with an index using {{remoteMedia url=image_url}} template
 // 6. Inserts documents with S3 URLs
 // 7. Verifies documents are indexed and searchable
@@ -270,7 +270,7 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	})
 	t.Log("Configured remote content with fake S3 credentials")
 
-	// Step 4: Start Antfly swarm with Termite
+	// Step 4: Start Antfly swarm with Antfly inference
 	db.DefaultPebbleCacheSizeMB = 16 // Reduce memory usage
 
 	logger := GetTestLogger(t)
@@ -282,13 +282,13 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	metadataRaftPort := GetFreePort(t)
 	storeAPIPort := GetFreePort(t)
 	storeRaftPort := GetFreePort(t)
-	termiteAPIPort := GetFreePort(t)
+	inferenceAPIPort := GetFreePort(t)
 
 	metadataAPIURL := fmt.Sprintf("http://localhost:%d", metadataAPIPort)
 	metadataRaftURL := fmt.Sprintf("http://localhost:%d", metadataRaftPort)
 	storeAPIURL := fmt.Sprintf("http://localhost:%d", storeAPIPort)
 	storeRaftURL := fmt.Sprintf("http://localhost:%d", storeRaftPort)
-	termiteAPIURL := fmt.Sprintf("http://localhost:%d", termiteAPIPort)
+	inferenceAPIURL := fmt.Sprintf("http://localhost:%d", inferenceAPIPort)
 
 	// Create config
 	config := CreateTestConfig(t, dataDir, nodeID)
@@ -296,14 +296,14 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 		nodeID.String(): metadataAPIURL,
 	}
 
-	// Configure Termite with CLIP model
-	config.Inference = termite.Config{
-		ApiUrl:          termiteAPIURL,
+	// Configure Antfly inference with CLIP model
+	config.Inference = inferenceRuntime.Config{
+		ApiUrl:          inferenceAPIURL,
 		ModelsDir:       modelsDir,
 		MaxLoadedModels: 2,
 		PoolSize:        1,
 	}
-	t.Logf("Configured Termite with models directory: %s", modelsDir)
+	t.Logf("Configured Antfly inference with models directory: %s", modelsDir)
 
 	// Clean any existing raft logs
 	CleanupAntflyData(t, dataDir, nodeID)
@@ -315,24 +315,24 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	// Create readiness channels
 	metadataReadyC := make(chan struct{})
 	storeReadyC := make(chan struct{})
-	termiteReadyC := make(chan struct{})
+	inferenceReadyC := make(chan struct{})
 
-	// Start Termite server
-	go termite.RunAsTermite(
+	// Start Antfly inference server
+	go inferenceRuntime.RunAsTermite(
 		swarmCtx,
-		logger.Named("termite"),
+		logger.Named("antfly inference"),
 		config.Inference,
-		termiteReadyC,
+		inferenceReadyC,
 	)
 
-	// Wait for Termite to be ready
+	// Wait for Antfly inference to be ready
 	select {
-	case <-termiteReadyC:
-		logger.Info("Termite server ready")
-		SetTermiteURL(termiteAPIURL)
-		libinference.SetDefaultURL(termiteAPIURL)
+	case <-inferenceReadyC:
+		logger.Info("Antfly inference server ready")
+		SetInferenceURL(inferenceAPIURL)
+		libinference.SetDefaultURL(inferenceAPIURL)
 	case <-time.After(60 * time.Second):
-		t.Fatal("Timeout waiting for Termite server to be ready")
+		t.Fatal("Timeout waiting for Antfly inference server to be ready")
 	}
 
 	// Start metadata server
@@ -407,7 +407,7 @@ func TestRemoteContentWithCLIP(t *testing.T) {
 	embedderConfig.Provider = oapi.EmbedderProviderAntfly
 	err = embedderConfig.FromAntflyEmbedderConfig(oapi.AntflyEmbedderConfig{
 		Model:  clipModelName,
-		ApiUrl: GetTermiteURL(),
+		ApiUrl: GetInferenceURL(),
 	})
 	require.NoError(t, err)
 
@@ -603,7 +603,7 @@ func createTestAudioWAV(t *testing.T, sampleRate int, durationSec float64, frequ
 // This test:
 // 1. Downloads CLIP and CLAP models if not present
 // 2. Starts a fake S3 server and uploads test images and audio
-// 3. Starts Antfly swarm with Termite serving both models
+// 3. Starts Antfly swarm with Antfly inference serving both models
 // 4. Creates a table with two indexes: image_embeddings (CLIP) and audio_embeddings (CLAP)
 // 5. Inserts documents with S3 URLs for images and audio
 // 6. Queries both indexes and verifies results
@@ -660,7 +660,7 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 		DefaultS3: "test",
 	})
 
-	// Step 4: Start Antfly swarm with Termite
+	// Step 4: Start Antfly swarm with Antfly inference
 	db.DefaultPebbleCacheSizeMB = 16
 
 	logger := GetTestLogger(t)
@@ -671,20 +671,20 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 	metadataRaftPort := GetFreePort(t)
 	storeAPIPort := GetFreePort(t)
 	storeRaftPort := GetFreePort(t)
-	termiteAPIPort := GetFreePort(t)
+	inferenceAPIPort := GetFreePort(t)
 
 	metadataAPIURL := fmt.Sprintf("http://localhost:%d", metadataAPIPort)
 	metadataRaftURL := fmt.Sprintf("http://localhost:%d", metadataRaftPort)
 	storeAPIURL := fmt.Sprintf("http://localhost:%d", storeAPIPort)
 	storeRaftURL := fmt.Sprintf("http://localhost:%d", storeRaftPort)
-	termiteAPIURL := fmt.Sprintf("http://localhost:%d", termiteAPIPort)
+	inferenceAPIURL := fmt.Sprintf("http://localhost:%d", inferenceAPIPort)
 
 	config := CreateTestConfig(t, dataDir, nodeID)
 	config.Metadata.OrchestrationUrls = map[string]string{
 		nodeID.String(): metadataAPIURL,
 	}
-	config.Inference = termite.Config{
-		ApiUrl:          termiteAPIURL,
+	config.Inference = inferenceRuntime.Config{
+		ApiUrl:          inferenceAPIURL,
 		ModelsDir:       modelsDir,
 		MaxLoadedModels: 4, // CLIP + CLAP (each has text + media sub-models)
 		PoolSize:        1,
@@ -698,17 +698,17 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 
 	metadataReadyC := make(chan struct{})
 	storeReadyC := make(chan struct{})
-	termiteReadyC := make(chan struct{})
+	inferenceReadyC := make(chan struct{})
 
-	go termite.RunAsTermite(swarmCtx, logger.Named("termite"), config.Inference, termiteReadyC)
+	go inferenceRuntime.RunAsTermite(swarmCtx, logger.Named("antfly inference"), config.Inference, inferenceReadyC)
 
 	select {
-	case <-termiteReadyC:
-		logger.Info("Termite server ready")
-		SetTermiteURL(termiteAPIURL)
-		libinference.SetDefaultURL(termiteAPIURL)
+	case <-inferenceReadyC:
+		logger.Info("Antfly inference server ready")
+		SetInferenceURL(inferenceAPIURL)
+		libinference.SetDefaultURL(inferenceAPIURL)
 	case <-time.After(60 * time.Second):
-		t.Fatal("Timeout waiting for Termite server to be ready")
+		t.Fatal("Timeout waiting for Antfly inference server to be ready")
 	}
 
 	peers := common.Peers{{ID: nodeID, URL: metadataRaftURL}}
@@ -751,7 +751,7 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 	// CLIP embedder config
 	var clipEmbedder oapi.EmbedderConfig
 	clipEmbedder.Provider = oapi.EmbedderProviderAntfly
-	err = clipEmbedder.FromAntflyEmbedderConfig(oapi.AntflyEmbedderConfig{Model: clipModelName, ApiUrl: GetTermiteURL()})
+	err = clipEmbedder.FromAntflyEmbedderConfig(oapi.AntflyEmbedderConfig{Model: clipModelName, ApiUrl: GetInferenceURL()})
 	require.NoError(t, err)
 
 	var imageIndex oapi.IndexConfig
@@ -767,7 +767,7 @@ func TestRemoteContentWithCLIPAndCLAP(t *testing.T) {
 	// CLAP embedder config
 	var clapEmbedder oapi.EmbedderConfig
 	clapEmbedder.Provider = oapi.EmbedderProviderAntfly
-	err = clapEmbedder.FromAntflyEmbedderConfig(oapi.AntflyEmbedderConfig{Model: clapModelName, ApiUrl: GetTermiteURL()})
+	err = clapEmbedder.FromAntflyEmbedderConfig(oapi.AntflyEmbedderConfig{Model: clapModelName, ApiUrl: GetInferenceURL()})
 	require.NoError(t, err)
 
 	var audioIndex oapi.IndexConfig

@@ -267,7 +267,7 @@ func (p *Proxy) resolveResolveRequest(ctx context.Context, req ResolveRequest, r
 		Operation:          req.Operation,
 		Model:              req.Model,
 		Headers:            req.Headers,
-		SourceTable:        firstNonEmpty(req.Source.Table, headerValue(req.Headers, "X-Termite-Source-Table", "X-Antfly-Table")),
+		SourceTable:        firstNonEmpty(req.Source.Table, headerValue(req.Headers, "X-Antfly-Source-Table", "X-Antfly-Table")),
 		SourceOrganization: req.Source.OrganizationID,
 		SourceProject:      req.Source.ProjectID,
 		SourceAPIKey:       req.Source.APIKeyPrefix,
@@ -324,7 +324,7 @@ func (p *Proxy) resolve(ctx context.Context, routeReq *RouteRequest, headers map
 	}
 
 	if pool == "" {
-		pool = headerValue(headers, "X-Termite-Pool")
+		pool = headerValue(headers, "X-Antfly-Inference-Pool")
 	}
 	if pool == "" {
 		pool = p.defaultPool
@@ -402,7 +402,7 @@ func noEligibleDestinationsError() *ResolutionError {
 }
 
 func resolveWorkloadType(operation OperationType, headers map[string]string) WorkloadType {
-	workloadType := WorkloadType(headerValue(headers, "X-Termite-Workload-Type"))
+	workloadType := WorkloadType(headerValue(headers, "X-Antfly-Inference-Workload-Type"))
 	if workloadType != "" {
 		return workloadType
 	}

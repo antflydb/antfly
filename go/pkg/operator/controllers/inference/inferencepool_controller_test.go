@@ -99,10 +99,10 @@ var _ = Describe("InferencePool Controller", func() {
 				return err == nil
 			}, timeout, interval).Should(BeTrue())
 
-			Expect(createdConfigMap.Data["TERMITE_MODELS"]).To(Equal("bge-small-en-v1.5"))
-			Expect(createdConfigMap.Data["TERMITE_POOL"]).To(Equal(poolName))
-			Expect(createdConfigMap.Data["TERMITE_WORKLOAD_TYPE"]).To(Equal("general"))
-			Expect(createdConfigMap.Data["TERMITE_LOADING_STRATEGY"]).To(Equal("eager"))
+			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_MODELS"]).To(Equal("bge-small-en-v1.5"))
+			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_POOL"]).To(Equal(poolName))
+			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_WORKLOAD_TYPE"]).To(Equal("general"))
+			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_LOADING_STRATEGY"]).To(Equal("eager"))
 
 			// Verify the StatefulSet was created
 			stsLookupKey := types.NamespacedName{Name: poolName, Namespace: poolNamespace}
@@ -354,7 +354,7 @@ var _ = Describe("InferencePool Controller", func() {
 				return err == nil
 			}, timeout, interval).Should(BeTrue())
 
-			Expect(createdConfigMap.Data["TERMITE_MODELS"]).To(Equal("bge-small-en-v1.5:quantized"))
+			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_MODELS"]).To(Equal("bge-small-en-v1.5:quantized"))
 
 			// Cleanup
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())

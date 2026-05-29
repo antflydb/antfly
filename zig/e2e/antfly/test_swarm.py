@@ -12,7 +12,7 @@
 # Elastic License 2.0 for the specific language governing permissions and
 # limitations.
 
-"""Live swarm integration tests using antfly swarm with embedded termite."""
+"""Live swarm integration tests using antfly swarm with embedded inference."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from typing import Any
 import pytest
 import requests
 
-from conftest import antfly_public_api_url, termite_public_api_url
+from conftest import antfly_public_api_url, inference_public_api_url
 from helpers import wait_until
 
 
@@ -38,13 +38,13 @@ pytestmark = pytest.mark.swarm_integration
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
-DEFAULT_TERMITE_MODELS_DIR = Path("~/.termite/models").expanduser()
-DEFAULT_TERMITE_MODEL_NAME = "ggml-org/gemma-4-e2b-it-gguf"
-DEFAULT_TERMITE_SWARM_HOST_BUDGET_MB = 0
-DEFAULT_TERMITE_SWARM_BACKEND_BUDGET_MB = 12288
-DEFAULT_TERMITE_SWARM_COMBINED_BUDGET_MB = 16384
-DEFAULT_TERMITE_SWARM_KV_BUDGET_MB = 0
-DEFAULT_TERMITE_SWARM_SCRATCH_BUDGET_MB = 0
+DEFAULT_INFERENCE_MODELS_DIR = Path("~/.antfly/inference/models").expanduser()
+DEFAULT_INFERENCE_MODEL_NAME = "ggml-org/gemma-4-e2b-it-gguf"
+DEFAULT_INFERENCE_SWARM_HOST_BUDGET_MB = 0
+DEFAULT_INFERENCE_SWARM_BACKEND_BUDGET_MB = 12288
+DEFAULT_INFERENCE_SWARM_COMBINED_BUDGET_MB = 16384
+DEFAULT_INFERENCE_SWARM_KV_BUDGET_MB = 0
+DEFAULT_INFERENCE_SWARM_SCRATCH_BUDGET_MB = 0
 
 
 def _integration_enabled(env_name: str) -> bool:
@@ -140,27 +140,27 @@ def _model_exists(models_dir: Path, model_name: str) -> bool:
     return any(path.exists() for path in _candidate_model_dirs(models_dir, model_name))
 
 
-class EmbeddedTermiteSwarmServer:
+class EmbeddedInferenceSwarmServer:
     def __init__(
         self,
         binary: str,
         models_dir: Path,
         model_name: str,
         *,
-        termite_budget_mb: dict[str, int] | None = None,
+        inference_budget_mb: dict[str, int] | None = None,
         host: str = "127.0.0.1",
     ):
         self.binary = binary
         self.models_dir = models_dir
         self.model_name = model_name
         self.host = host
-        self.termite_budget_mb = termite_budget_mb or {}
+        self.inference_budget_mb = inference_budget_mb or {}
         self.public_port = _find_free_port()
         self.health_port = _find_free_port()
         self.public_url = f"http://{host}:{self.public_port}"
         self.url = antfly_public_api_url(self.public_url)
         self.health_url = f"http://{host}:{self.health_port}"
-        self.inference_api_url = termite_public_api_url(self.public_url)
+        self.inference_api_url = inference_public_api_url(self.public_url)
         self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-swarm-e2e-")
         self.root = Path(self.tempdir.name)
         self.log_path = self.root / "server.log"
@@ -190,11 +190,11 @@ class EmbeddedTermiteSwarmServer:
             str(self.root / "snapshots"),
         ]
         for flag_name, value in (
-            ("--termite-host-budget-mb", self.termite_budget_mb.get("host", 0)),
-            ("--termite-backend-budget-mb", self.termite_budget_mb.get("backend", 0)),
-            ("--termite-combined-budget-mb", self.termite_budget_mb.get("combined", 0)),
-            ("--termite-kv-budget-mb", self.termite_budget_mb.get("kv", 0)),
-            ("--termite-scratch-budget-mb", self.termite_budget_mb.get("scratch", 0)),
+            ("--inference-host-budget-mb", self.inference_budget_mb.get("host", 0)),
+            ("--inference-backend-budget-mb", self.inference_budget_mb.get("backend", 0)),
+            ("--inference-combined-budget-mb", self.inference_budget_mb.get("combined", 0)),
+            ("--inference-kv-budget-mb", self.inference_budget_mb.get("kv", 0)),
+            ("--inference-scratch-budget-mb", self.inference_budget_mb.get("scratch", 0)),
         ):
             if value > 0:
                 command.extend([flag_name, str(value)])
@@ -211,7 +211,7 @@ class EmbeddedTermiteSwarmServer:
         if not _wait_for_server(self.inference_api_url, timeout_s=120.0, path="/models"):
             self.stop()
             logs = _read_log_tail(self.log_path)
-            raise RuntimeError(f"Embedded termite server failed to start at {self.inference_api_url}\n{logs}")
+            raise RuntimeError(f"Embedded inference server failed to start at {self.inference_api_url}\n{logs}")
 
     def debug_logs(self) -> str:
         self.log_file.flush()
@@ -230,7 +230,7 @@ class EmbeddedTermiteSwarmServer:
         self.tempdir.cleanup()
 
 
-def _warm_termite_generator(api_url: str, model_name: str) -> None:
+def _warm_inference_generator(api_url: str, model_name: str) -> None:
     response = requests.post(
         f"{api_url}/generate",
         json={
@@ -246,47 +246,47 @@ def _warm_termite_generator(api_url: str, model_name: str) -> None:
 
 @pytest.fixture(scope="session")
 def embedded_swarm_runtime():
-    if not _integration_enabled("TERMITE_SWARM_TESTS"):
-        pytest.skip("Set TERMITE_SWARM_TESTS=1 to run live termite swarm tests")
+    if not _integration_enabled("ANTFLY_INFERENCE_SWARM_TESTS"):
+        pytest.skip("Set ANTFLY_INFERENCE_SWARM_TESTS=1 to run live inference swarm tests")
 
     binary = _resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"Antfly binary not found: {binary}")
 
     models_dir = Path(
-        os.environ.get("TERMITE_SWARM_MODELS_DIR", str(DEFAULT_TERMITE_MODELS_DIR))
+        os.environ.get("ANTFLY_INFERENCE_SWARM_MODELS_DIR", str(DEFAULT_INFERENCE_MODELS_DIR))
     ).expanduser().resolve()
     if not models_dir.exists():
-        pytest.skip(f"Termite models directory not found: {models_dir}")
+        pytest.skip(f"Antfly inference models directory not found: {models_dir}")
 
-    model_name = os.environ.get("TERMITE_SWARM_MODEL_NAME", DEFAULT_TERMITE_MODEL_NAME)
+    model_name = os.environ.get("ANTFLY_INFERENCE_SWARM_MODEL_NAME", DEFAULT_INFERENCE_MODEL_NAME)
     if not _model_exists(models_dir, model_name):
         pytest.skip(
-            "Termite generator model not found under "
+            "Antfly inference generator model not found under "
             f"{models_dir}. Pull it with: antfly inference pull hf:{_normalize_model_ref_for_path(model_name)}"
         )
 
-    termite_budget_mb = {
-        "host": _env_int("TERMITE_SWARM_HOST_BUDGET_MB", DEFAULT_TERMITE_SWARM_HOST_BUDGET_MB),
+    inference_budget_mb = {
+        "host": _env_int("ANTFLY_INFERENCE_SWARM_HOST_BUDGET_MB", DEFAULT_INFERENCE_SWARM_HOST_BUDGET_MB),
         "backend": _env_int(
-            "TERMITE_SWARM_BACKEND_BUDGET_MB", DEFAULT_TERMITE_SWARM_BACKEND_BUDGET_MB
+            "ANTFLY_INFERENCE_SWARM_BACKEND_BUDGET_MB", DEFAULT_INFERENCE_SWARM_BACKEND_BUDGET_MB
         ),
         "combined": _env_int(
-            "TERMITE_SWARM_COMBINED_BUDGET_MB", DEFAULT_TERMITE_SWARM_COMBINED_BUDGET_MB
+            "ANTFLY_INFERENCE_SWARM_COMBINED_BUDGET_MB", DEFAULT_INFERENCE_SWARM_COMBINED_BUDGET_MB
         ),
-        "kv": _env_int("TERMITE_SWARM_KV_BUDGET_MB", DEFAULT_TERMITE_SWARM_KV_BUDGET_MB),
+        "kv": _env_int("ANTFLY_INFERENCE_SWARM_KV_BUDGET_MB", DEFAULT_INFERENCE_SWARM_KV_BUDGET_MB),
         "scratch": _env_int(
-            "TERMITE_SWARM_SCRATCH_BUDGET_MB", DEFAULT_TERMITE_SWARM_SCRATCH_BUDGET_MB
+            "ANTFLY_INFERENCE_SWARM_SCRATCH_BUDGET_MB", DEFAULT_INFERENCE_SWARM_SCRATCH_BUDGET_MB
         ),
     }
 
-    server = EmbeddedTermiteSwarmServer(
+    server = EmbeddedInferenceSwarmServer(
         binary,
         models_dir,
         model_name,
-        termite_budget_mb=termite_budget_mb,
+        inference_budget_mb=inference_budget_mb,
     )
-    _warm_termite_generator(server.inference_api_url, model_name)
+    _warm_inference_generator(server.inference_api_url, model_name)
     yield {
         "base_url": server.url,
         "public_url": server.public_url,
@@ -294,7 +294,7 @@ def embedded_swarm_runtime():
         "inference_api_url": server.inference_api_url,
         "model": model_name,
         "models_dir": str(models_dir),
-        "termite_budget_mb": termite_budget_mb,
+        "inference_budget_mb": inference_budget_mb,
         "logs": server.debug_logs,
     }
     server.stop()
@@ -460,7 +460,7 @@ def test_swarm_health_endpoints(embedded_swarm_runtime):
     assert unknown.status_code == 404
 
 
-def test_swarm_retrieval_generation_with_live_termite(embedded_swarm_api, embedded_swarm_runtime):
+def test_swarm_retrieval_generation_with_live_inference(embedded_swarm_api, embedded_swarm_runtime):
     table_name = f"swarm_generation_{time.time_ns()}"
     created = embedded_swarm_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -531,7 +531,7 @@ def test_swarm_retrieval_generation_with_live_termite(embedded_swarm_api, embedd
     assert result["steps"][-1]["name"] == "generation"
 
 
-def test_swarm_retrieval_streaming_with_live_termite(embedded_swarm_api, embedded_swarm_runtime):
+def test_swarm_retrieval_streaming_with_live_inference(embedded_swarm_api, embedded_swarm_runtime):
     table_name = f"swarm_streaming_{time.time_ns()}"
     created = embedded_swarm_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -597,7 +597,7 @@ def test_swarm_retrieval_streaming_with_live_termite(embedded_swarm_api, embedde
     assert any(isinstance(chunk, str) and chunk.strip() for chunk in generation_chunks)
 
 
-def test_swarm_cli_retrieval_non_streaming_with_live_termite(embedded_swarm_api, embedded_swarm_cli, embedded_swarm_runtime):
+def test_swarm_cli_retrieval_non_streaming_with_live_inference(embedded_swarm_api, embedded_swarm_cli, embedded_swarm_runtime):
     table_name = f"swarm_cli_generation_{time.time_ns()}"
     created = embedded_swarm_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -675,7 +675,7 @@ def test_swarm_cli_retrieval_non_streaming_with_live_termite(embedded_swarm_api,
     assert result["followup_questions"]
 
 
-def test_swarm_cli_retrieval_streaming_with_live_termite(embedded_swarm_api, embedded_swarm_cli, embedded_swarm_runtime):
+def test_swarm_cli_retrieval_streaming_with_live_inference(embedded_swarm_api, embedded_swarm_cli, embedded_swarm_runtime):
     table_name = f"swarm_cli_streaming_{time.time_ns()}"
     created = embedded_swarm_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name

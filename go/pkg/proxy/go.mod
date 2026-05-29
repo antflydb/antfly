@@ -1,6 +1,6 @@
-module github.com/antflydb/antfly/go/pkg/proxy/termite
+module github.com/antflydb/antfly/go/pkg/proxy
 
-go 1.26.0
+go 1.26
 
 require (
 	github.com/prometheus/client_golang v1.23.2

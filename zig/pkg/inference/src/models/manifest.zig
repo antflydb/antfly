@@ -1767,13 +1767,13 @@ test "manifest treats merged jina qwen3 task repo as embedder" {
 test "load sparse fixture preserves max position embeddings" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const models_dir = if (std.c.getenv("TERMITE_MODELS_DIR")) |value|
+    const models_dir = if (std.c.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value|
         std.mem.span(value)
     else blk: {
         const home = std.c.getenv("HOME") orelse return error.SkipZigTest;
-        break :blk try std.fs.path.join(allocator, &.{ std.mem.span(home), ".termite", "models" });
+        break :blk try std.fs.path.join(allocator, &.{ std.mem.span(home), ".antfly", "inference", "models" });
     };
-    defer if (std.c.getenv("TERMITE_MODELS_DIR") == null) allocator.free(models_dir);
+    defer if (std.c.getenv("ANTFLY_INFERENCE_MODELS_DIR") == null) allocator.free(models_dir);
     const model_dir = try std.fs.path.join(allocator, &.{ models_dir, "sparse-encoder-testing", "splade-bert-tiny-nq-onnx" });
     defer allocator.free(model_dir);
 

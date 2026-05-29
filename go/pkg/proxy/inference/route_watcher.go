@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package proxy implements Kubernetes integration for TermiteRoute watching.
+// Package proxy implements Kubernetes integration for InferenceProxy watching.
 package proxy
 
 import (
@@ -34,14 +34,14 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-// TermiteRouteGVR is the GroupVersionResource for TermiteRoute
-var TermiteRouteGVR = schema.GroupVersionResource{
+// InferenceProxyGVR is the GroupVersionResource for InferenceProxy
+var InferenceProxyGVR = schema.GroupVersionResource{
 	Group:    "antfly.io",
 	Version:  "v1alpha1",
-	Resource: "termiteroutes",
+	Resource: "inferenceproxies",
 }
 
-// RouteWatcher watches TermiteRoute CRs and updates the RouteManager
+// RouteWatcher watches InferenceProxy CRs and updates the RouteManager
 type RouteWatcher struct {
 	routeManager *RouteManager
 	client       dynamic.Interface
@@ -55,7 +55,7 @@ type RouteWatcherConfig struct {
 	Namespace  string // empty for all namespaces
 }
 
-// NewRouteWatcher creates a new TermiteRoute watcher
+// NewRouteWatcher creates a new InferenceProxy watcher
 func NewRouteWatcher(routeManager *RouteManager, cfg RouteWatcherConfig, logger *zap.Logger) (*RouteWatcher, error) {
 	var config *rest.Config
 	var err error
@@ -86,7 +86,7 @@ func NewRouteWatcher(routeManager *RouteManager, cfg RouteWatcherConfig, logger 
 	}, nil
 }
 
-// Start begins watching TermiteRoute resources
+// Start begins watching InferenceProxy resources
 func (w *RouteWatcher) Start(ctx context.Context) error {
 	var factory dynamicinformer.DynamicSharedInformerFactory
 	if w.namespace != "" {
@@ -100,7 +100,7 @@ func (w *RouteWatcher) Start(ctx context.Context) error {
 		factory = dynamicinformer.NewDynamicSharedInformerFactory(w.client, 30*time.Second)
 	}
 
-	informer := factory.ForResource(TermiteRouteGVR).Informer()
+	informer := factory.ForResource(InferenceProxyGVR).Informer()
 
 	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    w.onRouteAdd,
@@ -115,10 +115,10 @@ func (w *RouteWatcher) Start(ctx context.Context) error {
 
 	// Wait for cache sync
 	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
-		return fmt.Errorf("failed to sync TermiteRoute cache")
+		return fmt.Errorf("failed to sync InferenceProxy cache")
 	}
 
-	w.logger.Info("TermiteRoute watcher started", zap.String("namespace", w.namespace))
+	w.logger.Info("InferenceProxy watcher started", zap.String("namespace", w.namespace))
 
 	<-ctx.Done()
 	return nil
@@ -127,7 +127,7 @@ func (w *RouteWatcher) Start(ctx context.Context) error {
 func (w *RouteWatcher) onRouteAdd(obj any) {
 	route, err := w.convertRoute(obj)
 	if err != nil {
-		w.logger.Error("failed to convert TermiteRoute", zap.Error(err))
+		w.logger.Error("failed to convert InferenceProxy", zap.Error(err))
 		return
 	}
 
@@ -138,7 +138,7 @@ func (w *RouteWatcher) onRouteAdd(obj any) {
 func (w *RouteWatcher) onRouteUpdate(oldObj, newObj any) {
 	route, err := w.convertRoute(newObj)
 	if err != nil {
-		w.logger.Error("failed to convert TermiteRoute", zap.Error(err))
+		w.logger.Error("failed to convert InferenceProxy", zap.Error(err))
 		return
 	}
 
@@ -158,7 +158,7 @@ func (w *RouteWatcher) onRouteDelete(obj any) {
 	w.logger.Info("removed route", zap.String("name", name))
 }
 
-// convertRoute converts an unstructured TermiteRoute to the proxy's Route type
+// convertRoute converts an unstructured InferenceProxy to the proxy's Route type
 func (w *RouteWatcher) convertRoute(obj any) (*Route, error) {
 	u, ok := obj.(*unstructured.Unstructured)
 	if !ok {

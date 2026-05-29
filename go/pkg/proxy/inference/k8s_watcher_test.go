@@ -20,7 +20,7 @@ func TestEndpointSliceDeleteUsesDiscoveredPort(t *testing.T) {
 	port := int32(8080)
 	w.onEndpointSliceDelete(&discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels: map[string]string{"kubernetes.io/service-name": "termite-pool-a"},
+			Labels: map[string]string{"kubernetes.io/service-name": "inference-pool-a"},
 		},
 		Ports: []discoveryv1.EndpointPort{
 			{Name: strPtr("http"), Port: &port},
@@ -47,7 +47,7 @@ func TestPodDeleteUsesContainerPort(t *testing.T) {
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
 				{
-					Name: "termite",
+					Name: "inference",
 					Ports: []corev1.ContainerPort{
 						{Name: "http", ContainerPort: 9090},
 					},

@@ -36,8 +36,8 @@ type NERClient struct {
 }
 
 // NewNERClient creates an NER client using the official inference SDK.
-func NewNERClient(termiteURL, nerModel string, nerLabels []string, logger *zap.Logger) (*NERClient, error) {
-	tc, err := inferenceclient.NewInferenceClient(termiteURL, &http.Client{
+func NewNERClient(inferenceURL, nerModel string, nerLabels []string, logger *zap.Logger) (*NERClient, error) {
+	tc, err := inferenceclient.NewInferenceClient(inferenceURL, &http.Client{
 		Timeout: 10 * time.Second,
 	})
 	if err != nil {
@@ -86,8 +86,8 @@ func (c *NERClient) setAvailable(v bool) {
 	c.mu.Unlock()
 }
 
-// Extract implements the Extractor interface using Termite GLiNER2.
-// Returns empty extractions if Termite is unavailable (graceful degradation).
+// Extract implements the Extractor interface using Antfly inference GLiNER2.
+// Returns empty extractions if Antfly inference is unavailable (graceful degradation).
 func (c *NERClient) Extract(ctx context.Context, texts []string, opts ExtractOptions) ([]Extraction, error) {
 	if !c.isAvailable(ctx) {
 		out := make([]Extraction, len(texts))
@@ -101,7 +101,7 @@ func (c *NERClient) Extract(ctx context.Context, texts []string, opts ExtractOpt
 
 	resp, err := c.client.Recognize(ctx, c.nerModel, texts, labels)
 	if err != nil {
-		c.logger.Warn("Termite NER request failed", zap.Error(err))
+		c.logger.Warn("Antfly inference NER request failed", zap.Error(err))
 		out := make([]Extraction, len(texts))
 		return out, nil
 	}

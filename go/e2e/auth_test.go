@@ -43,8 +43,8 @@ func TestE2E_Auth(t *testing.T) {
 	// Start swarm with auth enabled.
 	t.Log("Starting Antfly swarm with auth enabled...")
 	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{
-		DisableTermite: true,
-		EnableAuth:     true,
+		DisableInference: true,
+		EnableAuth:       true,
 	})
 	defer swarm.Cleanup()
 
@@ -199,8 +199,8 @@ func TestE2E_ApiKeys(t *testing.T) {
 	// Start swarm with auth enabled.
 	t.Log("Starting Antfly swarm with auth enabled...")
 	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{
-		DisableTermite: true,
-		EnableAuth:     true,
+		DisableInference: true,
+		EnableAuth:       true,
 	})
 	defer swarm.Cleanup()
 

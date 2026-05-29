@@ -163,9 +163,9 @@ func testPipelineRetrieval(t *testing.T, ctx context.Context, client *antfly.Ant
 				Description:      "Query about Raft configuration",
 			},
 			{
-				Query:            "What embedding models does Termite support?",
-				ExpectedKeywords: []string{"embedding", "termite", "model"},
-				Description:      "Query about Termite embedding support",
+				Query:            "What embedding models does Antfly inference support?",
+				ExpectedKeywords: []string{"embedding", "antfly inference", "model"},
+				Description:      "Query about Antfly inference embedding support",
 			},
 			{
 				Query:            "How do I create a table with vector indexes?",
@@ -290,9 +290,9 @@ func testFullPipeline(t *testing.T, ctx context.Context, client *antfly.AntflyCl
 			Description:      "Configuration query",
 		},
 		{
-			Query:            "What is Termite and how does it integrate with Antfly?",
-			ExpectedKeywords: []string{"termite", "embedding", "rerank"},
-			Description:      "Termite integration query",
+			Query:            "What is Antfly inference and how does it integrate with Antfly?",
+			ExpectedKeywords: []string{"antfly inference", "embedding", "rerank"},
+			Description:      "Antfly inference integration query",
 		},
 	}
 
@@ -487,12 +487,12 @@ func testAgentic(t *testing.T, ctx context.Context, client *antfly.AntflyClient,
 		var hitCount int
 
 		req := antfly.RetrievalAgentRequest{
-			Query: "What embedding models does Termite support?",
+			Query: "What embedding models does Antfly inference support?",
 			Queries: []antfly.RetrievalQueryRequest{
 				{
 					Table:          cfg.tableName,
 					Indexes:        []string{"embeddings"},
-					SemanticSearch: "termite embedding models",
+					SemanticSearch: "antfly inference embedding models",
 				},
 			},
 			Generator:             cfg.generator,

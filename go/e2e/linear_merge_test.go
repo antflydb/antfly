@@ -34,7 +34,7 @@ func TestLinearMerge_IdempotentSync(t *testing.T) {
 
 	ctx := testContext(t, 2*time.Minute)
 
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
+	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
 	t.Cleanup(swarm.Cleanup)
 
 	tableName := "test_idempotent_sync"

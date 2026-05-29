@@ -117,7 +117,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
             .source = self.server.source,
             .antfly_provider = self.server.antfly_provider,
             .remote_content = self.server.cfg.remote_content,
-            .termite_api_key = self.server.cfg.termite_api_key,
+            .inference_api_key = self.server.cfg.inference_api_key,
         };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
@@ -152,7 +152,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
             .source = self.server.source,
             .antfly_provider = self.server.antfly_provider,
             .remote_content = self.server.cfg.remote_content,
-            .termite_api_key = self.server.cfg.termite_api_key,
+            .inference_api_key = self.server.cfg.inference_api_key,
         };
         const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
         defer alloc.free(encoded);
@@ -212,7 +212,7 @@ pub const ApiHttpServerConfig = struct {
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
-    termite_api_key: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
     user_manager: ?*usermgr.UserManager = null,
     session_router: ?table_router.HostedGroupRouter = null,
     session_executor: ?http_common.RequestExecutor = null,
@@ -232,7 +232,7 @@ pub const SemanticStatusResolver = struct {
     source: StatusSource,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
-    termite_api_key: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
 
     pub fn iface(self: *SemanticStatusResolver) query_contract.SemanticResolver {
         return .{
@@ -259,7 +259,7 @@ pub const SemanticStatusResolver = struct {
             .free_admin_snapshot = self.source.vtable.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
             .antfly_provider = self.antfly_provider,
             .remote_content = self.remote_content,
-            .termite_api_key = self.termite_api_key,
+            .inference_api_key = self.inference_api_key,
         }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
     }
 };
@@ -2101,7 +2101,7 @@ pub const ApiHttpServer = struct {
             const QueryBuilderGenerationRunner = struct {
                 antfly_provider: ?managed_embedder.AntflyProvider,
                 secret_store: ?*common_secrets.FileStore,
-                termite_api_key: ?[]const u8,
+                inference_api_key: ?[]const u8,
 
                 fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
                     return .{
@@ -2121,10 +2121,10 @@ pub const ApiHttpServer = struct {
                     defer io_impl.deinit();
                     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
                     defer client.deinit();
-                    return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .termite_api_key = runner.termite_api_key }, messages);
+                    return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
                 }
             };
-            var generation_runner = QueryBuilderGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .termite_api_key = self.cfg.termite_api_key };
+            var generation_runner = QueryBuilderGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .inference_api_key = self.cfg.inference_api_key };
             var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
             const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
                 error.InvalidQueryBuilderRequest => return try jsonErrorResponse(self.alloc, 400, "invalid query builder request"),
@@ -2641,7 +2641,7 @@ pub const ApiHttpServer = struct {
                     .source = runner.server.source,
                     .antfly_provider = runner.server.antfly_provider,
                     .remote_content = runner.server.cfg.remote_content,
-                    .termite_api_key = runner.server.cfg.termite_api_key,
+                    .inference_api_key = runner.server.cfg.inference_api_key,
                 };
                 var query_req = query_api.parsePublicQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
@@ -2700,7 +2700,7 @@ pub const ApiHttpServer = struct {
         const RetrievalGenerationRunner = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
-            termite_api_key: ?[]const u8,
+            inference_api_key: ?[]const u8,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -2720,10 +2720,10 @@ pub const ApiHttpServer = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(inner_alloc, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .termite_api_key = runner.termite_api_key }, messages);
+                return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .termite_api_key = self.cfg.termite_api_key };
+        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .inference_api_key = self.cfg.inference_api_key };
 
         var query_runner = RetrievalQueryRunner{
             .server = self,
@@ -2823,7 +2823,7 @@ pub const ApiHttpServer = struct {
                     .source = runner.server.source,
                     .antfly_provider = runner.server.antfly_provider,
                     .remote_content = runner.server.cfg.remote_content,
-                    .termite_api_key = runner.server.cfg.termite_api_key,
+                    .inference_api_key = runner.server.cfg.inference_api_key,
                 };
                 var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
@@ -2882,7 +2882,7 @@ pub const ApiHttpServer = struct {
         const RetrievalGenerationRunner = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
-            termite_api_key: ?[]const u8,
+            inference_api_key: ?[]const u8,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -2902,10 +2902,10 @@ pub const ApiHttpServer = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .termite_api_key = runner.termite_api_key }, messages);
+                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .termite_api_key = self.cfg.termite_api_key };
+        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .inference_api_key = self.cfg.inference_api_key };
 
         var query_runner = RetrievalQueryRunner{
             .server = self,
@@ -4851,7 +4851,7 @@ pub const ApiHttpServer = struct {
             .source = self.source,
             .antfly_provider = self.antfly_provider,
             .remote_content = self.cfg.remote_content,
-            .termite_api_key = self.cfg.termite_api_key,
+            .inference_api_key = self.cfg.inference_api_key,
         };
         var query_req = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, body) catch |err| {
             std.log.warn("public table query parse failed table={s} err={}", .{ table_name, err });
@@ -4900,7 +4900,7 @@ pub const ApiHttpServer = struct {
             .source = self.source,
             .antfly_provider = self.antfly_provider,
             .remote_content = self.cfg.remote_content,
-            .termite_api_key = self.cfg.termite_api_key,
+            .inference_api_key = self.cfg.inference_api_key,
         };
         var owned = try query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, query_body);
         errdefer owned.deinit(alloc);
@@ -5044,7 +5044,7 @@ pub const ApiHttpServer = struct {
                 .antfly_provider = self.antfly_provider,
                 .secret_store = self.cfg.secret_store,
                 .remote_content = self.cfg.remote_content,
-                .termite_api_key = self.cfg.termite_api_key,
+                .inference_api_key = self.cfg.inference_api_key,
             },
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
@@ -5056,7 +5056,7 @@ pub const ApiHttpServer = struct {
             .antfly_provider = self.antfly_provider,
             .secret_store = self.cfg.secret_store,
             .remote_content = self.cfg.remote_content,
-            .termite_api_key = self.cfg.termite_api_key,
+            .inference_api_key = self.cfg.inference_api_key,
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,

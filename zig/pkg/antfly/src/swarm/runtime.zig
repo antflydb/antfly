@@ -46,11 +46,11 @@ const CliConfig = struct {
     local_node_id: ?u64 = null,
     auth_enabled: ?bool = null,
     inference_models_dir: ?[]const u8 = null,
-    antfly_host_budget_mb: usize = 0,
-    antfly_backend_budget_mb: usize = 0,
-    antfly_combined_budget_mb: usize = 0,
-    antfly_kv_budget_mb: usize = 0,
-    antfly_scratch_budget_mb: usize = 0,
+    inference_host_budget_mb: usize = 0,
+    inference_backend_budget_mb: usize = 0,
+    inference_combined_budget_mb: usize = 0,
+    inference_kv_budget_mb: usize = 0,
+    inference_scratch_budget_mb: usize = 0,
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
@@ -591,9 +591,9 @@ pub fn runFromIterator(
     // directly, and the public Antfly routes are registered on the unified
     // server for compatibility with external clients.
     var antfly_node_cfg = inference.server.NodeConfig{
-        .models_dir = resolveAntflyModelsDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
+        .models_dir = resolveInferenceModelsDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
             antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir),
-        .generation_budget_overrides = resolveAntflyBudgetOverrides(cli),
+        .generation_budget_overrides = resolveInferenceBudgetOverrides(cli),
     };
     if (loaded_config) |*cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
@@ -682,7 +682,7 @@ pub fn runFromIterator(
             .swarm_mode = true,
             .secret_store = &secret_store,
             .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
-            .termite_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
+            .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
             .user_manager = if (user_manager) |*manager| manager else null,
         },
         .backend_runtime = node_backend_runtime.ptr(),
@@ -1296,24 +1296,24 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.inference_models_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--antfly-host-budget-mb")) {
-            cfg.antfly_host_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--inference-host-budget-mb")) {
+            cfg.inference_host_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--antfly-backend-budget-mb")) {
-            cfg.antfly_backend_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--inference-backend-budget-mb")) {
+            cfg.inference_backend_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--antfly-combined-budget-mb")) {
-            cfg.antfly_combined_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--inference-combined-budget-mb")) {
+            cfg.inference_combined_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--antfly-kv-budget-mb")) {
-            cfg.antfly_kv_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--inference-kv-budget-mb")) {
+            cfg.inference_kv_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--antfly-scratch-budget-mb")) {
-            cfg.antfly_scratch_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--inference-scratch-budget-mb")) {
+            cfg.inference_scratch_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -1509,19 +1509,19 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
     return false;
 }
 
-fn resolveAntflyModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
+fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
     if (cli.inference_models_dir) |value| return value;
     if (cfg) |loaded| return loaded.inference.models_dir;
     return null;
 }
 
-fn resolveAntflyBudgetOverrides(cli: CliConfig) antfly.inference_runtime.ServerBudgetOverrides {
+fn resolveInferenceBudgetOverrides(cli: CliConfig) antfly.inference_runtime.ServerBudgetOverrides {
     return .{
-        .host_limit_bytes = mbToBytes(cli.antfly_host_budget_mb),
-        .backend_limit_bytes = mbToBytes(cli.antfly_backend_budget_mb),
-        .combined_limit_bytes = mbToBytes(cli.antfly_combined_budget_mb),
-        .kv_limit_bytes = mbToBytes(cli.antfly_kv_budget_mb),
-        .scratch_limit_bytes = mbToBytes(cli.antfly_scratch_budget_mb),
+        .host_limit_bytes = mbToBytes(cli.inference_host_budget_mb),
+        .backend_limit_bytes = mbToBytes(cli.inference_backend_budget_mb),
+        .combined_limit_bytes = mbToBytes(cli.inference_combined_budget_mb),
+        .kv_limit_bytes = mbToBytes(cli.inference_kv_budget_mb),
+        .scratch_limit_bytes = mbToBytes(cli.inference_scratch_budget_mb),
     };
 }
 
@@ -1541,12 +1541,12 @@ fn printUsage() void {
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
         \\  --tick-ms <ms>                        Sleep interval while serving (default: 25)
-        \\  --models-dir <path>                   Embedded antfly models directory (default: ~/.antfly/models)
-        \\  --antfly-host-budget-mb <n>          Embedded antfly native generation host budget override
-        \\  --antfly-backend-budget-mb <n>       Embedded antfly native generation backend budget override
-        \\  --antfly-combined-budget-mb <n>      Embedded antfly native generation combined budget override
-        \\  --antfly-kv-budget-mb <n>            Embedded antfly native generation KV cache budget override
-        \\  --antfly-scratch-budget-mb <n>       Embedded antfly native generation scratch budget override
+        \\  --models-dir <path>                   Embedded inference models directory (default: ~/.antfly/inference/models)
+        \\  --inference-host-budget-mb <n>        Embedded inference native generation host budget override
+        \\  --inference-backend-budget-mb <n>     Embedded inference native generation backend budget override
+        \\  --inference-combined-budget-mb <n>    Embedded inference native generation combined budget override
+        \\  --inference-kv-budget-mb <n>          Embedded inference native generation KV cache budget override
+        \\  --inference-scratch-budget-mb <n>     Embedded inference native generation scratch budget override
         \\  --data-dir <path>                     Local Antfly data directory root
         \\  --replica-root-dir <path>             Replica root directory
         \\  --replica-catalog-path <path>         Replica catalog file path
@@ -1760,10 +1760,10 @@ test "antfly config uses cli override before common config" {
 
     const cli = CliConfig{
         .inference_models_dir = "/tmp/from-cli",
-        .antfly_backend_budget_mb = 8192,
+        .inference_backend_budget_mb = 8192,
     };
-    try std.testing.expectEqualStrings("/tmp/from-cli", resolveAntflyModelsDir(cli, &cfg).?);
-    try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), resolveAntflyBudgetOverrides(cli).backend_limit_bytes);
+    try std.testing.expectEqualStrings("/tmp/from-cli", resolveInferenceModelsDir(cli, &cfg).?);
+    try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), resolveInferenceBudgetOverrides(cli).backend_limit_bytes);
 }
 
 test "swarm public api caps keep alive request reuse" {
@@ -1771,29 +1771,29 @@ test "swarm public api caps keep alive request reuse" {
     try std.testing.expect(public_api_max_requests_per_connection < 1000);
 }
 
-test "parse cli accepts antfly budget overrides" {
+test "parse cli accepts inference budget overrides" {
     var argv = [_][*:0]const u8{
-        "--antfly-host-budget-mb",
+        "--inference-host-budget-mb",
         "4096",
-        "--antfly-backend-budget-mb",
+        "--inference-backend-budget-mb",
         "12288",
-        "--antfly-combined-budget-mb",
+        "--inference-combined-budget-mb",
         "16384",
-        "--antfly-kv-budget-mb",
+        "--inference-kv-budget-mb",
         "2048",
-        "--antfly-scratch-budget-mb",
+        "--inference-scratch-budget-mb",
         "1024",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const cfg = try parseCli(&iter);
-    try std.testing.expectEqual(@as(usize, 4096), cfg.antfly_host_budget_mb);
-    try std.testing.expectEqual(@as(usize, 12288), cfg.antfly_backend_budget_mb);
-    try std.testing.expectEqual(@as(usize, 16384), cfg.antfly_combined_budget_mb);
-    try std.testing.expectEqual(@as(usize, 2048), cfg.antfly_kv_budget_mb);
-    try std.testing.expectEqual(@as(usize, 1024), cfg.antfly_scratch_budget_mb);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.inference_host_budget_mb);
+    try std.testing.expectEqual(@as(usize, 12288), cfg.inference_backend_budget_mb);
+    try std.testing.expectEqual(@as(usize, 16384), cfg.inference_combined_budget_mb);
+    try std.testing.expectEqual(@as(usize, 2048), cfg.inference_kv_budget_mb);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.inference_scratch_budget_mb);
 }
 
-test "antfly config falls back to common config" {
+test "inference config falls back to common config" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
@@ -1806,7 +1806,7 @@ test "antfly config falls back to common config" {
     };
     defer cfg.deinit();
 
-    try std.testing.expectEqualStrings("/tmp/antfly-models", resolveAntflyModelsDir(.{}, &cfg).?);
+    try std.testing.expectEqualStrings("/tmp/antfly-models", resolveInferenceModelsDir(.{}, &cfg).?);
 }
 
 test "swarm runtime resolves paths from common storage base dir" {

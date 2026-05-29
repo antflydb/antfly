@@ -173,7 +173,7 @@ def test_retrieval_agent_pipeline_query(backup_api):
     assert result["steps"][0]["name"] == "pipeline"
 
 
-def test_retrieval_agent_generation_step(backup_api, termite_generator):
+def test_retrieval_agent_generation_step(backup_api, inference_generator):
     table_name = f"retrieval_generation_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -197,7 +197,7 @@ def test_retrieval_agent_generation_step(backup_api, termite_generator):
                 "generator": {
                     "provider": "antfly",
                     "model": "local-generator",
-                    "api_url": termite_generator,
+                    "api_url": inference_generator,
                     "api_key": "test-key",
                 },
                 "steps": {
@@ -224,7 +224,7 @@ def test_retrieval_agent_generation_step(backup_api, termite_generator):
     assert result["steps"][1]["name"] == "generation"
 
 
-def test_retrieval_agent_inline_eval_step(backup_api, termite_generator):
+def test_retrieval_agent_inline_eval_step(backup_api, inference_generator):
     table_name = f"retrieval_eval_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -254,7 +254,7 @@ def test_retrieval_agent_inline_eval_step(backup_api, termite_generator):
                 "generator": {
                     "provider": "antfly",
                     "model": "local-generator",
-                    "api_url": termite_generator,
+                    "api_url": inference_generator,
                     "api_key": "test-key",
                 },
                 "steps": {
@@ -269,7 +269,7 @@ def test_retrieval_agent_inline_eval_step(backup_api, termite_generator):
                         "judge": {
                             "provider": "antfly",
                             "model": "judge",
-                            "api_url": termite_generator,
+                            "api_url": inference_generator,
                             "api_key": "test-key",
                         },
                         "ground_truth": {
@@ -300,7 +300,7 @@ def test_retrieval_agent_inline_eval_step(backup_api, termite_generator):
     assert result["steps"][-1]["name"] == "eval"
 
 
-def test_retrieval_agent_streaming_eval_sse(backup_api, termite_generator):
+def test_retrieval_agent_streaming_eval_sse(backup_api, inference_generator):
     table_name = f"retrieval_eval_stream_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -330,7 +330,7 @@ def test_retrieval_agent_streaming_eval_sse(backup_api, termite_generator):
             "generator": {
                 "provider": "antfly",
                 "model": "local-generator",
-                "api_url": termite_generator,
+                "api_url": inference_generator,
                 "api_key": "test-key",
             },
             "steps": {
@@ -345,7 +345,7 @@ def test_retrieval_agent_streaming_eval_sse(backup_api, termite_generator):
                     "judge": {
                         "provider": "antfly",
                         "model": "judge",
-                        "api_url": termite_generator,
+                        "api_url": inference_generator,
                         "api_key": "test-key",
                     },
                     "ground_truth": {
@@ -670,7 +670,7 @@ def test_retrieval_agent_tree_search_from_roots(backup_api):
     assert "doc:child" in _hit_ids(result)
 
 
-def test_retrieval_agent_tree_search_generation(backup_api, termite_generator):
+def test_retrieval_agent_tree_search_generation(backup_api, inference_generator):
     table_name = f"retrieval_tree_generation_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -733,7 +733,7 @@ def test_retrieval_agent_tree_search_generation(backup_api, termite_generator):
                         "generator": {
                             "provider": "antfly",
                             "model": "local-generator",
-                            "api_url": termite_generator,
+                            "api_url": inference_generator,
                             "api_key": "test-key",
                         },
                         "steps": {
@@ -769,7 +769,7 @@ def test_retrieval_agent_tree_search_generation(backup_api, termite_generator):
     assert len(result["followup_questions"]) == 2
 
 
-def test_retrieval_agent_classification_confidence_followup(backup_api, termite_generator):
+def test_retrieval_agent_classification_confidence_followup(backup_api, inference_generator):
     table_name = f"retrieval_classify_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -792,7 +792,7 @@ def test_retrieval_agent_classification_confidence_followup(backup_api, termite_
             "generator": {
                 "provider": "antfly",
                 "model": "local-generator",
-                "api_url": termite_generator,
+                "api_url": inference_generator,
                 "api_key": "test-key",
             },
             "steps": {
@@ -839,7 +839,7 @@ def test_retrieval_agent_classification_can_decompose_queries(backup_api):
         table_name,
         inserts={
             "doc:a": {"title": "raft", "body": "raft consensus in antfly"},
-            "doc:b": {"title": "termite", "body": "termite embeddings and reranking"},
+            "doc:b": {"title": "inference", "body": "antfly embeddings and reranking"},
         },
         sync_level="full_index",
     )
@@ -849,7 +849,7 @@ def test_retrieval_agent_classification_can_decompose_queries(backup_api):
         lambda: backup_api.post(
             "/agents/retrieval",
             {
-                "query": "Compare raft consensus and termite embeddings",
+                "query": "Compare raft consensus and antfly embeddings",
                 "stream": False,
                 "steps": {
                     "classification": {
@@ -874,7 +874,7 @@ def test_retrieval_agent_classification_can_decompose_queries(backup_api):
     assert len(result["classification"]["sub_questions"]) >= 2
 
 
-def test_retrieval_agent_streaming_sse(backup_api, termite_generator):
+def test_retrieval_agent_streaming_sse(backup_api, inference_generator):
     table_name = f"retrieval_streaming_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -898,7 +898,7 @@ def test_retrieval_agent_streaming_sse(backup_api, termite_generator):
             "generator": {
                 "provider": "antfly",
                 "model": "local-generator",
-                "api_url": termite_generator,
+                "api_url": inference_generator,
                 "api_key": "test-key",
             },
             "steps": {
