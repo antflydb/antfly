@@ -6,8 +6,8 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/antflydb/antfly-ts.git",
-    "directory": "packages/design-system"
+    "url": "git+https://github.com/antflydb/antfly.git",
+    "directory": "ts/packages/design-system"
   },
   "keywords": [
     "antfly",
