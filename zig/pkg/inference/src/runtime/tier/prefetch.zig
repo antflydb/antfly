@@ -63,7 +63,7 @@ pub fn Queue(comptime Item: type) type {
 
         pub fn lock(self: *Self) void {
             while (!self.mutex.tryLock()) {
-                std.Thread.yield() catch {};
+                platform.time.yieldBriefly();
             }
         }
 

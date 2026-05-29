@@ -134,7 +134,7 @@ fn writeSafetensors(
     defer header.deinit();
     const writer = &header.writer;
 
-    try writer.writeAll("{\"__metadata__\":{\"format\":\"termite\"}");
+    try writer.writeAll("{\"__metadata__\":{\"format\":\"antfly-inference\"}");
     var offset: u64 = 0;
     for (plan.tensors) |tensor| {
         try writer.writeByte(',');
@@ -257,7 +257,7 @@ test "writeSafetensors emits sorted header and tensor payloads" {
     var plan = try buildPlan(allocator, access);
     defer plan.deinit(allocator);
 
-    const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/termite-safetensors-export-{d}", .{std.posix.system.getpid()});
+    const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/antfly-inference-safetensors-export-{d}", .{std.posix.system.getpid()});
     defer allocator.free(dir_path);
     compat.cwd().deleteTree(compat.io(), dir_path) catch {};
     try compat.cwd().createDirPath(compat.io(), dir_path);

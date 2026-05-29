@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Termite Web Model Chat</title>
+  <title>Antfly Inference Web Model Chat</title>
   <style>
     :root {
       --bg: #f3ede2;
@@ -265,10 +265,10 @@
 <body>
   <div class="page">
     <section class="hero">
-      <div class="kicker">Embedded WASM Termite</div>
+      <div class="kicker">Embedded Antfly Inference WASM</div>
       <h1>Model generation in the browser</h1>
       <p class="subhead">
-        Point the page at a local `~/.termite/models` directory, discover supported model bundles, and run them directly in the page.
+        Point the page at a local `~/.antfly/inference/models` directory, discover supported model bundles, and run them directly in the page.
         Local GGUF generation bundles, Hugging Face SafeTensors GPT bundles, Whisper transcription bundles, GLiNER extraction bundles, local T5-style text-to-text bundles, local BERT-style embedding bundles, and CLIP text-embedding bundles are supported today; remote URL mode still targets GGUF.
       </p>
     </section>
@@ -297,7 +297,7 @@
           <select id="discoveredModel" disabled>
             <option value="">No supported model bundles discovered yet</option>
           </select>
-          <p class="mini" id="pickerHint">Use this in Chrome-class browsers to pick `~/.termite/models` once and list supported local model bundles from that directory. The page currently supports local decoder GGUF bundles, GGUF `mmproj` sidecars, and Hugging Face GPT/T5/Whisper/GLiNER/encoder/CLIP SafeTensors bundles.</p>
+          <p class="mini" id="pickerHint">Use this in Chrome-class browsers to pick `~/.antfly/inference/models` once and list supported local model bundles from that directory. The page currently supports local decoder GGUF bundles, GGUF `mmproj` sidecars, and Hugging Face GPT/T5/Whisper/GLiNER/encoder/CLIP SafeTensors bundles.</p>
         </div>
 
         <div class="field">
@@ -317,10 +317,10 @@
           <button id="loadBtn" class="primary" disabled>Load Model</button>
           <button id="unloadBtn" class="ghost" disabled>Unload</button>
         </div>
-        <p class="mini" id="loadHint" style="margin-top:0.65rem;">Waiting for Termite Web to initialize.</p>
+        <p class="mini" id="loadHint" style="margin-top:0.65rem;">Waiting for Antfly Inference Web to initialize.</p>
         <p class="mini" id="runtimeHint">Runtime: initializing…</p>
 
-        <div id="status" class="status" style="margin-top:0.85rem;">Initializing Termite Web…</div>
+        <div id="status" class="status" style="margin-top:0.85rem;">Initializing Antfly Inference Web…</div>
         <div class="progress" style="margin-top:0.8rem;"><span id="progressBar"></span></div>
 
         <div class="metrics" id="modelMetrics"></div>
@@ -438,7 +438,7 @@
     import { computePromptModeState } from './runtime/page-prompt.js';
     import { computeLoadWarnings, computeMetricEntries } from './runtime/page-summary.js';
 
-    const termite = new InferenceWeb();
+    const inferenceRuntime = new InferenceWeb();
 
     const modelFileInput = document.getElementById('modelFile');
     const discoveredModelInput = document.getElementById('discoveredModel');
@@ -488,7 +488,7 @@
     let loadedModelTask = null;
     let loadedDiscoveredModel = null;
     let currentRuntimeMode = 'direct';
-    let termiteReady = false;
+    let inferenceReady = false;
     let generationRunning = false;
     const GGUF_PROBE_BYTES = 64 * 1024 * 1024;
     const MAX_BROWSER_WASM32_GGUF_BYTES = 3.5 * 1024 ** 3;
@@ -628,7 +628,7 @@
     }
 
     function hasElectronBridge() {
-      return typeof window.termiteElectron === 'object' && window.termiteElectron != null;
+      return typeof window.antflyInferenceElectron === 'object' && window.antflyInferenceElectron != null;
     }
 
     function hasModelsDirectoryBridge() {
@@ -715,7 +715,7 @@
     }
 
     async function scanElectronModelsDirectory(dirPath = null) {
-      const scan = await window.termiteElectron.scanModelsDirectory(dirPath);
+      const scan = await window.antflyInferenceElectron.scanModelsDirectory(dirPath);
       discoveredModels = await buildDiscoveredModelEntries(scan.files, {
         readJsonFile: readJsonDescriptor,
       });
@@ -732,8 +732,8 @@
     async function pickModelsDirectory() {
       if (hasElectronBridge()) {
         try {
-          setStatus('Scanning ~/.termite/models in Electron…');
-          const chosenPath = await window.termiteElectron.chooseModelsDirectory();
+          setStatus('Scanning ~/.antfly/inference/models in Electron…');
+          const chosenPath = await window.antflyInferenceElectron.chooseModelsDirectory();
           if (!chosenPath) {
             setStatus('Models directory picker canceled.');
             return;
@@ -772,9 +772,9 @@
       }
 
       try {
-        setStatus('Choose ~/.termite/models in the browser picker…');
+        setStatus('Choose ~/.antfly/inference/models in the browser picker…');
         const dirHandle = await window.showDirectoryPicker({
-          id: 'termite-models-dir',
+          id: 'antfly-inference-models-dir',
           mode: 'read',
         });
         pickedModelsDirHandle = dirHandle;
@@ -846,7 +846,7 @@
     }
 
     function currentRuntimeMemoryModel() {
-      return termite.memoryModel ?? termite.abi?.memoryModel ?? null;
+      return inferenceRuntime.memoryModel ?? inferenceRuntime.abi?.memoryModel ?? null;
     }
 
     function workerModeSupported() {
@@ -871,7 +871,7 @@
     function updateLoadAvailability() {
       const state = computeLoadAvailability({
         sourceMode: sourceModeInput.value,
-        termiteReady,
+        inferenceReady,
         hasDirectoryPicker: hasModelsDirectoryBridge(),
         hasSingleFile: Boolean(modelFileInput.files?.[0]),
         hasDiscoveredModel: Boolean(selectedDiscoveredModel()),
@@ -902,8 +902,8 @@
         setStatus('Enter a GGUF URL first.');
         return;
       }
-      if (!termiteReady) {
-        setStatus('Termite Web is still initializing. Wait for the initialized status and try again.');
+      if (!inferenceReady) {
+        setStatus('Antfly Inference Web is still initializing. Wait for the initialized status and try again.');
         return;
       }
 
@@ -973,7 +973,7 @@
 
             setStatus('Loading tokenizer from local Hugging Face bundle…');
             const tokenizerJson = await readTextDescriptor(discoveredModel.tokenizerFile);
-            tokenizerHandle = await termite.loadTokenizer(tokenizerJson);
+            tokenizerHandle = await inferenceRuntime.loadTokenizer(tokenizerJson);
             if (loadedModelTask === 'extract') {
               extractionTokenIds = extractGlinerSpecialTokenIds(tokenizerJson);
             }
@@ -1023,33 +1023,33 @@
             const start = performance.now();
             if (loadedModelTask === 'generate') {
               setStatus('Streaming GPT SafeTensors from local bundle…');
-              modelHandle = await termite.streamLoadGptModel(localModelSource, modelConfig, {
+              modelHandle = await inferenceRuntime.streamLoadGptModel(localModelSource, modelConfig, {
                 family: modelConfig.model_type,
                 onProgress: ({ loaded, total }) => setProgress(loaded, total || fileLike?.size || discoveredModel.modelFile.sizeBytes || 1),
               });
             } else if (loadedModelTask === 'transcribe') {
               setStatus('Loading Whisper SafeTensors from local bundle…');
-              modelHandle = await termite.loadWhisperModel(localModelSource, modelConfig);
+              modelHandle = await inferenceRuntime.loadWhisperModel(localModelSource, modelConfig);
               setProgress(1, 1);
             } else if (loadedModelTask === 'extract') {
               setStatus('Loading GLiNER SafeTensors from local bundle…');
-              modelHandle = await termite.loadGlinerModel(localModelSource, modelConfig);
+              modelHandle = await inferenceRuntime.loadGlinerModel(localModelSource, modelConfig);
               setProgress(1, 1);
             } else if (loadedModelTask === 'relations' || (loadedModelTask === 'seq2seq' && String(modelConfig?.model_type ?? '').toLowerCase() === 'bart')) {
               setStatus('Loading BART/REBEL SafeTensors from local bundle…');
-              modelHandle = await termite.loadFlorenceModel(localModelSource, modelConfig);
+              modelHandle = await inferenceRuntime.loadFlorenceModel(localModelSource, modelConfig);
               setProgress(1, 1);
             } else if (loadedModelTask === 'seq2seq') {
               setStatus('Loading seq2seq SafeTensors from local bundle…');
-              modelHandle = await termite.loadT5Model(localModelSource, modelConfig);
+              modelHandle = await inferenceRuntime.loadT5Model(localModelSource, modelConfig);
               setProgress(1, 1);
             } else if (loadedModelTask === 'clip-embed') {
               setStatus('Loading CLIP SafeTensors from local bundle…');
-              modelHandle = await termite.loadClipModel(localModelSource, modelConfig);
+              modelHandle = await inferenceRuntime.loadClipModel(localModelSource, modelConfig);
               setProgress(1, 1);
             } else {
               setStatus('Loading encoder SafeTensors from local bundle…');
-              modelHandle = await termite.loadModel(localModelSource, modelConfig, { format: 'safetensors' });
+              modelHandle = await inferenceRuntime.loadModel(localModelSource, modelConfig, { format: 'safetensors' });
               setProgress(1, 1);
             }
             const elapsed = (performance.now() - start).toFixed(0);
@@ -1071,20 +1071,20 @@
             setProgress(0.15, 1);
 
             setStatus('Inferring GPT config from GGUF metadata…');
-            modelConfig = await termite.inferGptConfigFromGguf(modelProbeBytes);
+            modelConfig = await inferenceRuntime.inferGptConfigFromGguf(modelProbeBytes);
             setProgress(0.3, 1);
 
             setStatus('Loading tokenizer from GGUF metadata…');
-            tokenizerHandle = await termite.loadTokenizer(modelProbeBytes, { format: 'gguf' });
+            tokenizerHandle = await inferenceRuntime.loadTokenizer(modelProbeBytes, { format: 'gguf' });
             setProgress(0.45, 1);
 
             setStatus('Inferring chat template from GGUF metadata…');
-            chatTemplate = await termite.inferChatTemplateFromGguf(modelProbeBytes);
+            chatTemplate = await inferenceRuntime.inferChatTemplateFromGguf(modelProbeBytes);
             setProgress(0.55, 1);
 
             setStatus('Streaming GPT model from GGUF…');
             const start = performance.now();
-            modelHandle = await termite.streamLoadGgufModel(ggufSource, modelConfig, {
+            modelHandle = await inferenceRuntime.streamLoadGgufModel(ggufSource, modelConfig, {
               onProgress: ({ loaded, total }) => setProgress(loaded, total || fileLike?.size || discoveredModel?.modelFile?.sizeBytes || 1),
             });
             if (discoveredModel?.projectorFile) {
@@ -1092,7 +1092,7 @@
               const projectorSource = discoveredModel.projectorFile.url
                 ? discoveredModel.projectorFile.url
                 : await discoveredModel.projectorFile.handle.getFile();
-              const projector = await termite.loadProjectorGguf(projectorSource);
+              const projector = await inferenceRuntime.loadProjectorGguf(projectorSource);
               projectorHandle = projector.handle;
               projectorKind = projector.kind;
             }
@@ -1107,14 +1107,14 @@
         } else {
           loadedModelTask = 'generate';
           setStatus('Inferring GPT config from GGUF URL…');
-          modelConfig = await termite.inferGptConfigFromGguf(modelUrl);
+          modelConfig = await inferenceRuntime.inferGptConfigFromGguf(modelUrl);
           setProgress(0.2, 1);
 
           const useStreaming = streamLoadInput.value === 'stream';
           const start = performance.now();
           if (useStreaming) {
             setStatus('Streaming GGUF model and auto-loading tokenizer…');
-            modelHandle = await termite.streamLoadGgufModel(modelUrl, modelConfig, {
+            modelHandle = await inferenceRuntime.streamLoadGgufModel(modelUrl, modelConfig, {
               autoLoadTokenizer: true,
               onProgress: ({ loaded, total }) => setProgress(loaded, total || 1),
               onTokenizerLoaded: ({ tokenizerHandle: handle, chatTemplate: template }) => {
@@ -1124,13 +1124,13 @@
             });
           } else {
             setStatus('Loading tokenizer from GGUF URL…');
-            tokenizerHandle = await termite.loadTokenizer(modelUrl, { format: 'gguf' });
+            tokenizerHandle = await inferenceRuntime.loadTokenizer(modelUrl, { format: 'gguf' });
             setProgress(0.45, 1);
             setStatus('Inferring chat template from GGUF URL…');
-            chatTemplate = await termite.inferChatTemplateFromGguf(modelUrl);
+            chatTemplate = await inferenceRuntime.inferChatTemplateFromGguf(modelUrl);
             setProgress(0.55, 1);
             setStatus('Loading GPT model from GGUF URL…');
-            modelHandle = await termite.loadGptModel(modelUrl, modelConfig, { format: 'gguf' });
+            modelHandle = await inferenceRuntime.loadGptModel(modelUrl, modelConfig, { format: 'gguf' });
             setProgress(1, 1);
           }
           const elapsed = (performance.now() - start).toFixed(0);
@@ -1167,16 +1167,16 @@
 
     async function unloadModel({ silent = false } = {}) {
       if (projectorHandle != null) {
-        termite.unloadProjector(projectorHandle);
+        inferenceRuntime.unloadProjector(projectorHandle);
         projectorHandle = null;
         projectorKind = null;
       }
       if (modelHandle != null) {
-        termite.unloadModel(modelHandle);
+        inferenceRuntime.unloadModel(modelHandle);
         modelHandle = null;
       }
       if (tokenizerHandle != null) {
-        termite.unloadTokenizer(tokenizerHandle);
+        inferenceRuntime.unloadTokenizer(tokenizerHandle);
         tokenizerHandle = null;
       }
       revokeActiveModelObjectUrl();
@@ -1205,8 +1205,8 @@
 
     async function generate() {
       if (!modelHandle || !tokenizerHandle || !modelConfig || generationRunning) return;
-      if (!termiteReady) {
-        setStatus('Termite Web is not initialized.');
+      if (!inferenceReady) {
+        setStatus('Antfly Inference Web is not initialized.');
         return;
       }
 
@@ -1224,7 +1224,7 @@
       try {
         if (loadedModelTask === 'embed') {
           const maxIds = Math.max(8, Math.min(Number(modelConfig.max_position_embeddings) || 512, 2048));
-          const rawIds = await Promise.resolve(termite.tokenizeRaw(tokenizerHandle, prompt, maxIds));
+          const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, prompt, maxIds));
           const tokenIds = Array.from(rawIds);
           if (tokenIds.length === 0) {
             throw new Error('Prompt tokenization returned no tokens');
@@ -1232,7 +1232,7 @@
           const attentionMask = new Array(tokenIds.length).fill(1);
           setStatus(`Embedding ${tokenIds.length} prompt tokens…`);
           promptMetaEl.textContent = `Prompt tokens: ${tokenIds.length}. Running single-text embedding in direct mode.`;
-          const embedding = await Promise.resolve(termite.embed(modelHandle, tokenIds, attentionMask, 1, tokenIds.length));
+          const embedding = await Promise.resolve(inferenceRuntime.embed(modelHandle, tokenIds, attentionMask, 1, tokenIds.length));
           const preview = Array.from(embedding.slice(0, Math.min(16, embedding.length))).map((v) => Number(v).toFixed(5));
           outputEl.textContent = JSON.stringify({
             mode: 'embed',
@@ -1245,14 +1245,14 @@
 
         if (loadedModelTask === 'clip-embed') {
           const maxIds = Math.max(8, Math.min(Number(modelConfig.text_config?.max_position_embeddings) || Number(modelConfig.max_position_embeddings) || 77, 256));
-          const rawIds = await Promise.resolve(termite.tokenizeRaw(tokenizerHandle, prompt, maxIds));
+          const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, prompt, maxIds));
           const tokenIds = Array.from(rawIds);
           if (tokenIds.length === 0) {
             throw new Error('Prompt tokenization returned no tokens');
           }
           setStatus(`Embedding ${tokenIds.length} prompt tokens with CLIP…`);
           promptMetaEl.textContent = `Prompt tokens: ${tokenIds.length}. Running CLIP text embedding in direct mode.`;
-          const embedding = await Promise.resolve(termite.clipEmbedText(modelHandle, tokenIds, 1, tokenIds.length));
+          const embedding = await Promise.resolve(inferenceRuntime.clipEmbedText(modelHandle, tokenIds, 1, tokenIds.length));
           const preview = Array.from(embedding.slice(0, Math.min(16, embedding.length))).map((v) => Number(v).toFixed(5));
           outputEl.textContent = JSON.stringify({
             mode: 'clip-embed',
@@ -1277,7 +1277,7 @@
           setStatus(`Extracting entities across ${effectiveLabels.length} label(s)…`);
           promptMetaEl.textContent = `Candidate labels: ${effectiveLabels.join(', ')}. Running GLiNER span extraction in ${currentRuntimeMode} mode.`;
           const start = performance.now();
-          const entities = await Promise.resolve(termite.gliner(
+          const entities = await Promise.resolve(inferenceRuntime.gliner(
             modelHandle,
             tokenizerHandle,
             prompt,
@@ -1301,7 +1301,7 @@
 
         if (loadedModelTask === 'relations') {
           const maxIds = Math.max(8, Math.min(Number(modelConfig.max_position_embeddings) || 1024, 2048));
-          const rawIds = await Promise.resolve(termite.tokenizeRaw(tokenizerHandle, prompt, maxIds));
+          const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, prompt, maxIds));
           const inputIds = Array.from(rawIds);
           if (inputIds.length === 0) {
             throw new Error('Prompt tokenization returned no tokens');
@@ -1317,12 +1317,12 @@
           setStatus(`Encoding ${inputIds.length} REBEL prompt tokens…`);
           promptMetaEl.textContent = `Prompt tokens: ${inputIds.length}. Running BART/REBEL encoder-decoder relation extraction in direct mode.`;
           const start = performance.now();
-          const encoderHidden = await Promise.resolve(termite.florenceEncodeText(modelHandle, inputIds, 1, inputIds.length));
+          const encoderHidden = await Promise.resolve(inferenceRuntime.florenceEncodeText(modelHandle, inputIds, 1, inputIds.length));
           const encSeq = inputIds.length;
           const generatedIds = [decoderStartTokenId];
           const outputIds = [];
           for (let step = 0; step < maxTokens; step++) {
-            const logits = await Promise.resolve(termite.florenceDecode(
+            const logits = await Promise.resolve(inferenceRuntime.florenceDecode(
               modelHandle,
               generatedIds,
               encoderHidden,
@@ -1344,11 +1344,11 @@
             if (nextToken === eosTokenId) break;
             generatedIds.push(nextToken);
             outputIds.push(nextToken);
-            outputEl.textContent = termite.decodeTokens(tokenizerHandle, outputIds);
+            outputEl.textContent = inferenceRuntime.decodeTokens(tokenizerHandle, outputIds);
             setStatus(`Extracting relations… ${step + 1}/${maxTokens} tokens`);
           }
 
-          const generatedText = outputIds.length > 0 ? termite.decodeTokens(tokenizerHandle, outputIds) : '';
+          const generatedText = outputIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, outputIds) : '';
           const triplets = parseRebelTriplets(generatedText, relationConfig ?? defaultRebelConfig());
           const relationOutput = tripletsToRelationOutput(prompt, triplets);
           const elapsed = performance.now() - start;
@@ -1370,7 +1370,7 @@
             throw new Error('Select an audio clip to transcribe.');
           }
           setStatus(`Preprocessing audio ${audioFile.name} for Whisper…`);
-          const mel = await termite.preprocessWhisperAudio(audioFile);
+          const mel = await inferenceRuntime.preprocessWhisperAudio(audioFile);
           const nMels = Number(mel.nMels);
           const timeSteps = Number(mel.nFrames);
           if (!Number.isFinite(nMels) || !Number.isFinite(timeSteps) || nMels <= 0 || timeSteps <= 0) {
@@ -1380,7 +1380,7 @@
           setStatus(`Encoding ${timeSteps} Whisper mel frames…`);
           promptMetaEl.textContent = `Audio frames: ${timeSteps}. Running Whisper encoder-decoder transcription in direct mode.`;
           const start = performance.now();
-          const encoderHidden = await Promise.resolve(termite.whisperEncode(modelHandle, mel.data, 1, timeSteps));
+          const encoderHidden = await Promise.resolve(inferenceRuntime.whisperEncode(modelHandle, mel.data, 1, timeSteps));
           const dModel = Number(modelConfig.d_model ?? modelConfig.hidden_size ?? 0);
           if (!Number.isFinite(dModel) || dModel <= 0) {
             throw new Error('Whisper config does not expose a valid d_model');
@@ -1401,7 +1401,7 @@
           const tokens = [decoderStartTokenId];
           const generatedIds = [];
           for (let step = 0; step < maxTokens; step++) {
-            const logits = await Promise.resolve(termite.whisperDecode(
+            const logits = await Promise.resolve(inferenceRuntime.whisperDecode(
               modelHandle,
               tokens,
               encoderHidden,
@@ -1424,13 +1424,13 @@
             tokens.push(nextToken);
             generatedIds.push(nextToken);
             outputEl.textContent = generatedIds.length > 0
-              ? termite.decodeTokens(tokenizerHandle, generatedIds)
+              ? inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds)
               : '[No text generated yet]';
             setStatus(`Transcribing… ${step + 1}/${maxTokens} tokens`);
           }
 
           const elapsed = performance.now() - start;
-          const finalText = generatedIds.length > 0 ? termite.decodeTokens(tokenizerHandle, generatedIds) : '';
+          const finalText = generatedIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds) : '';
           outputEl.textContent = finalText || '[No text generated before EOS]';
           setStatus(
             `Transcribed ${generatedIds.length} tokens from ${audioFile.name} in ${elapsed.toFixed(0)}ms (${generatedIds.length > 0 ? (elapsed / generatedIds.length).toFixed(1) : '0.0'} ms/token).`
@@ -1441,7 +1441,7 @@
         if (loadedModelTask === 'seq2seq') {
           if (String(modelConfig?.model_type ?? '').toLowerCase() === 'bart') {
             const maxIds = Math.max(8, Math.min(Number(modelConfig.max_position_embeddings) || 1024, 2048));
-            const rawIds = await Promise.resolve(termite.tokenizeRaw(tokenizerHandle, prompt, maxIds));
+            const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, prompt, maxIds));
             const inputIds = Array.from(rawIds);
             if (inputIds.length === 0) {
               throw new Error('Prompt tokenization returned no tokens');
@@ -1457,12 +1457,12 @@
             setStatus(`Encoding ${inputIds.length} BART prompt tokens…`);
             promptMetaEl.textContent = `Prompt tokens: ${inputIds.length}. Running BART-style encoder-decoder generation in direct mode.`;
             const start = performance.now();
-            const encoderHidden = await Promise.resolve(termite.florenceEncodeText(modelHandle, inputIds, 1, inputIds.length));
+            const encoderHidden = await Promise.resolve(inferenceRuntime.florenceEncodeText(modelHandle, inputIds, 1, inputIds.length));
             const encSeq = inputIds.length;
             const generatedIds = [decoderStartTokenId];
             const outputIds = [];
             for (let step = 0; step < maxTokens; step++) {
-              const logits = await Promise.resolve(termite.florenceDecode(
+              const logits = await Promise.resolve(inferenceRuntime.florenceDecode(
                 modelHandle,
                 generatedIds,
                 encoderHidden,
@@ -1484,11 +1484,11 @@
               if (nextToken === eosTokenId) break;
               generatedIds.push(nextToken);
               outputIds.push(nextToken);
-              outputEl.textContent = termite.decodeTokens(tokenizerHandle, outputIds);
+              outputEl.textContent = inferenceRuntime.decodeTokens(tokenizerHandle, outputIds);
               setStatus(`Generating… ${step + 1}/${maxTokens} tokens`);
             }
             const elapsed = performance.now() - start;
-            const finalText = outputIds.length > 0 ? termite.decodeTokens(tokenizerHandle, outputIds) : '';
+            const finalText = outputIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, outputIds) : '';
             outputEl.textContent = finalText || '[No text generated before EOS]';
             setStatus(
               `Generated ${outputIds.length} seq2seq tokens in ${elapsed.toFixed(0)}ms (${outputIds.length > 0 ? (elapsed / outputIds.length).toFixed(1) : '0.0'} ms/token).`
@@ -1497,7 +1497,7 @@
           }
 
           const maxIds = Math.max(8, Math.min(Number(modelConfig.n_positions) || Number(modelConfig.max_position_embeddings) || 512, 2048));
-          const rawIds = await Promise.resolve(termite.tokenizeRaw(tokenizerHandle, prompt, maxIds));
+          const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, prompt, maxIds));
           const inputIds = Array.from(rawIds);
           if (inputIds.length === 0) {
             throw new Error('Prompt tokenization returned no tokens');
@@ -1517,7 +1517,7 @@
           setStatus(`Generating seq2seq output from ${inputIds.length} prompt tokens…`);
           promptMetaEl.textContent = `Prompt tokens: ${inputIds.length}. Running T5-style encoder-decoder generation in direct mode.`;
           const start = performance.now();
-          const outputIds = termite.t5Generate(modelHandle, vocabSize, inputIds, attentionMask, {
+          const outputIds = inferenceRuntime.t5Generate(modelHandle, vocabSize, inputIds, attentionMask, {
             maxTokens,
             decoderStartTokenId,
             eosTokenId,
@@ -1526,13 +1526,13 @@
             topP,
             onToken: (tokenId, step) => {
               generatedIds.push(tokenId);
-              outputEl.textContent = termite.decodeTokens(tokenizerHandle, generatedIds);
+              outputEl.textContent = inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds);
               setStatus(`Generating… ${step + 1}/${maxTokens} tokens`);
             },
           });
           const elapsed = performance.now() - start;
           const finalIds = outputIds.length > 0 ? outputIds : generatedIds;
-          const finalText = finalIds.length > 0 ? termite.decodeTokens(tokenizerHandle, finalIds) : '';
+          const finalText = finalIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, finalIds) : '';
           outputEl.textContent = finalText || '[No text generated before EOS]';
           setStatus(
             `Generated ${finalIds.length} seq2seq tokens in ${elapsed.toFixed(0)}ms (${finalIds.length > 0 ? (elapsed / finalIds.length).toFixed(1) : '0.0'} ms/token).`
@@ -1543,7 +1543,7 @@
         if (loadedModelTask === 'generate' && supportsBrowserMultimodal(loadedModelTask, modelConfig, projectorKind) && (((imageInput.files?.length ?? 0) > 0) || ((audioInput.files?.length ?? 0) > 0))) {
           const useTemplate = !!chatTemplate && useChatTemplateInput.checked;
           const renderedPrompt = useTemplate
-            ? await termite.renderChatPrompt(tokenizerHandle, chatTemplate, prompt, {
+            ? await inferenceRuntime.renderChatPrompt(tokenizerHandle, chatTemplate, prompt, {
                 systemPrompt: systemPromptInput.value.trim(),
                 addGenerationPrompt: true,
               })
@@ -1566,26 +1566,26 @@
                   throw new Error('The external Gemma 3 browser path does not support audio inputs yet.');
                 }
                 const expandedPrompt = buildExpandedMultimodalPrompt(renderedPrompt, modelConfig, imageBitmaps.length);
-                const rawIds = await Promise.resolve(termite.tokenizeRaw(tokenizerHandle, expandedPrompt, 8192));
+                const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, expandedPrompt, 8192));
                 const promptIds = Array.from(rawIds);
                 const imageOffsets = imageOffsetsFromExpandedTokenIds(promptIds, modelConfig, imageBitmaps.length);
                 const imageSize = Number(modelConfig?.vision_config?.image_size ?? modelConfig?.vision_image_size ?? 0);
                 if (imageSize <= 0) {
                   throw new Error('Multimodal config does not expose a valid vision image_size');
                 }
-                const imageTensors = imageBitmaps.map((bitmap) => termite.preprocessImageBrowser(bitmap, imageSize));
+                const imageTensors = imageBitmaps.map((bitmap) => inferenceRuntime.preprocessImageBrowser(bitmap, imageSize));
                 const channels = 3 * imageSize * imageSize;
                 const pixelValues = new Float32Array(imageTensors.length * channels);
                 for (let i = 0; i < imageTensors.length; i++) {
                   pixelValues.set(imageTensors[i], i * channels);
                 }
                 setStatus(`Encoding ${imageBitmaps.length} image(s) through the external Gemma 3 projector…`);
-                const imageEmbeddings = termite.gptProjectorVisionEncode(modelHandle, projectorHandle, pixelValues, imageBitmaps.length);
+                const imageEmbeddings = inferenceRuntime.gptProjectorVisionEncode(modelHandle, projectorHandle, pixelValues, imageBitmaps.length);
                 const maxLen = Math.max(promptIds.length + maxTokens + 8, modelConfig.max_position_embeddings ?? 0, 2048);
                 const generatedIds = [];
                 const start = performance.now();
                 promptMetaEl.textContent = `Prompt tokens: ${promptIds.length}. Running external-projector Gemma 3 multimodal GPT prefill with ${imageBitmaps.length} image(s).`;
-                await termite.gptGenerateMultimodal(modelHandle, vocabSize, promptIds, imageEmbeddings, imageOffsets, {
+                await inferenceRuntime.gptGenerateMultimodal(modelHandle, vocabSize, promptIds, imageEmbeddings, imageOffsets, {
                   maxTokens,
                   maxLen,
                   temperature,
@@ -1594,12 +1594,12 @@
                   eosTokenId,
                   onToken: (tokenId, step) => {
                     generatedIds.push(tokenId);
-                    outputEl.textContent = termite.decodeTokens(tokenizerHandle, generatedIds);
+                    outputEl.textContent = inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds);
                     setStatus(`Generating multimodal response… ${step + 1}/${maxTokens} tokens`);
                   },
                 });
                 const elapsed = performance.now() - start;
-                const finalText = generatedIds.length > 0 ? termite.decodeTokens(tokenizerHandle, generatedIds) : '';
+                const finalText = generatedIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds) : '';
                 outputEl.textContent = finalText || '[No text generated before EOS]';
                 setStatus(
                   `Generated ${generatedIds.length} multimodal tokens in ${elapsed.toFixed(0)}ms (${generatedIds.length > 0 ? (elapsed / generatedIds.length).toFixed(1) : '0.0'} ms/token).`
@@ -1625,13 +1625,13 @@
               let tokensPerAudio = [];
               if (imageBytes.length > 0) {
                 setStatus('Encoding the selected image through the external Gemma 4 projector…');
-                const encodedImage = termite.gptProjectorImageEncode(projectorHandle, imageBytes[0]);
+                const encodedImage = inferenceRuntime.gptProjectorImageEncode(projectorHandle, imageBytes[0]);
                 imageEmbeddings = encodedImage.embeddings;
                 tokensPerImage = encodedImage.tokensPerImage;
               }
               if (audioBytes.length > 0) {
                 setStatus('Encoding the selected audio clip through the external Gemma 4 projector…');
-                const encodedAudio = termite.gptProjectorAudioEncode(projectorHandle, audioBytes[0]);
+                const encodedAudio = inferenceRuntime.gptProjectorAudioEncode(projectorHandle, audioBytes[0]);
                 audioEmbeddings = encodedAudio.embeddings;
                 tokensPerAudio = encodedAudio.tokensPerAudio;
               }
@@ -1639,13 +1639,13 @@
                 throw new Error('Select an image or audio file for external Gemma 4 multimodal generation.');
               }
               const expandedPrompt = buildExpandedGemma4MultimodalPrompt(renderedPrompt, tokensPerImage, tokensPerAudio);
-              const rawIds = await Promise.resolve(termite.tokenizeRaw(tokenizerHandle, expandedPrompt, 8192));
+              const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, expandedPrompt, 8192));
               const promptIds = Array.from(rawIds);
               const maxLen = Math.max(promptIds.length + maxTokens + 8, modelConfig.max_position_embeddings ?? 0, 2048);
               const generatedIds = [];
               const start = performance.now();
               promptMetaEl.textContent = `Prompt tokens: ${promptIds.length}. Running external-projector Gemma 4 multimodal GPT prefill${tokensPerImage.length > 0 && tokensPerAudio.length > 0 ? ' with image + audio' : tokensPerImage.length > 0 ? ' with image' : ' with audio'}.`;
-              await termite.gptGenerateMultimodalGemma4(modelHandle, tokenizerHandle, vocabSize, promptIds, imageEmbeddings, tokensPerImage, audioEmbeddings, tokensPerAudio, {
+              await inferenceRuntime.gptGenerateMultimodalGemma4(modelHandle, tokenizerHandle, vocabSize, promptIds, imageEmbeddings, tokensPerImage, audioEmbeddings, tokensPerAudio, {
                 maxTokens,
                 maxLen,
                 temperature,
@@ -1654,12 +1654,12 @@
                 eosTokenId,
                 onToken: (tokenId, step) => {
                   generatedIds.push(tokenId);
-                  outputEl.textContent = termite.decodeTokens(tokenizerHandle, generatedIds);
+                  outputEl.textContent = inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds);
                   setStatus(`Generating multimodal response… ${step + 1}/${maxTokens} tokens`);
                 },
               });
               const elapsed = performance.now() - start;
-              const finalText = generatedIds.length > 0 ? termite.decodeTokens(tokenizerHandle, generatedIds) : '';
+              const finalText = generatedIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds) : '';
               outputEl.textContent = finalText || '[No text generated before EOS]';
               setStatus(
                 `Generated ${generatedIds.length} multimodal tokens in ${elapsed.toFixed(0)}ms (${generatedIds.length > 0 ? (elapsed / generatedIds.length).toFixed(1) : '0.0'} ms/token).`
@@ -1677,26 +1677,26 @@
           const imageBitmaps = await loadSelectedImages();
           try {
             const expandedPrompt = buildExpandedMultimodalPrompt(renderedPrompt, modelConfig, imageBitmaps.length);
-            const rawIds = await Promise.resolve(termite.tokenizeRaw(tokenizerHandle, expandedPrompt, 8192));
+            const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, expandedPrompt, 8192));
             const promptIds = Array.from(rawIds);
             const imageOffsets = imageOffsetsFromExpandedTokenIds(promptIds, modelConfig, imageBitmaps.length);
             const imageSize = Number(modelConfig?.vision_config?.image_size ?? modelConfig?.vision_image_size ?? 0);
             if (imageSize <= 0) {
               throw new Error('Multimodal config does not expose a valid vision image_size');
             }
-            const imageTensors = imageBitmaps.map((bitmap) => termite.preprocessImageBrowser(bitmap, imageSize));
+            const imageTensors = imageBitmaps.map((bitmap) => inferenceRuntime.preprocessImageBrowser(bitmap, imageSize));
             const channels = 3 * imageSize * imageSize;
             const pixelValues = new Float32Array(imageTensors.length * channels);
             for (let i = 0; i < imageTensors.length; i++) {
               pixelValues.set(imageTensors[i], i * channels);
             }
             setStatus(`Encoding ${imageBitmaps.length} image(s) for multimodal generation…`);
-            const imageEmbeddings = termite.gptVisionEncode(modelHandle, pixelValues, imageBitmaps.length);
+            const imageEmbeddings = inferenceRuntime.gptVisionEncode(modelHandle, pixelValues, imageBitmaps.length);
             const maxLen = Math.max(promptIds.length + maxTokens + 8, modelConfig.max_position_embeddings ?? 0, 2048);
             const generatedIds = [];
             const start = performance.now();
             promptMetaEl.textContent = `Prompt tokens: ${promptIds.length}. Running integrated multimodal GPT prefill with ${imageBitmaps.length} image(s).`;
-            await termite.gptGenerateMultimodal(modelHandle, vocabSize, promptIds, imageEmbeddings, imageOffsets, {
+            await inferenceRuntime.gptGenerateMultimodal(modelHandle, vocabSize, promptIds, imageEmbeddings, imageOffsets, {
               maxTokens,
               maxLen,
               temperature,
@@ -1705,12 +1705,12 @@
               eosTokenId,
               onToken: (tokenId, step) => {
                 generatedIds.push(tokenId);
-                outputEl.textContent = termite.decodeTokens(tokenizerHandle, generatedIds);
+                outputEl.textContent = inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds);
                 setStatus(`Generating multimodal response… ${step + 1}/${maxTokens} tokens`);
               },
             });
             const elapsed = performance.now() - start;
-            const finalText = generatedIds.length > 0 ? termite.decodeTokens(tokenizerHandle, generatedIds) : '';
+            const finalText = generatedIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds) : '';
             outputEl.textContent = finalText || '[No text generated before EOS]';
             setStatus(
               `Generated ${generatedIds.length} multimodal tokens in ${elapsed.toFixed(0)}ms (${generatedIds.length > 0 ? (elapsed / generatedIds.length).toFixed(1) : '0.0'} ms/token).`
@@ -1723,12 +1723,12 @@
 
         const useTemplate = !!chatTemplate && useChatTemplateInput.checked;
         const renderedPrompt = useTemplate
-          ? await termite.renderChatPrompt(tokenizerHandle, chatTemplate, prompt, {
+          ? await inferenceRuntime.renderChatPrompt(tokenizerHandle, chatTemplate, prompt, {
               systemPrompt: systemPromptInput.value.trim(),
               addGenerationPrompt: true,
             })
           : prompt;
-        const rawIds = await Promise.resolve(termite.tokenizeRaw(tokenizerHandle, renderedPrompt, 4096));
+        const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, renderedPrompt, 4096));
         const promptIds = Array.from(rawIds);
         const bosTokenId = firstTokenId(modelConfig.bos_token_id);
         const eosTokenId = firstTokenId(modelConfig.eos_token_id);
@@ -1758,7 +1758,7 @@
           ? `Prompt tokens: ${promptIds.length}. Rendered through the available chat template with GPT KV-cache generation in direct mode.`
           : `Prompt tokens: ${promptIds.length}. Raw prompt mode with GPT KV-cache generation in direct mode.`;
 
-        await termite.gptGenerateCached(modelHandle, vocabSize, promptIds, {
+        await inferenceRuntime.gptGenerateCached(modelHandle, vocabSize, promptIds, {
           maxTokens,
           maxLen,
           temperature,
@@ -1767,7 +1767,7 @@
           eosTokenId,
           onToken: (tokenId, step) => {
             generatedIds.push(tokenId);
-            const text = termite.decodeTokens(tokenizerHandle, generatedIds);
+            const text = inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds);
             outputEl.textContent = text;
             setStatus(`Generating… ${step + 1}/${maxTokens} tokens`);
           },
@@ -1775,7 +1775,7 @@
 
         const elapsed = performance.now() - start;
         const finalText = generatedIds.length > 0
-          ? termite.decodeTokens(tokenizerHandle, generatedIds)
+          ? inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds)
           : '';
         outputEl.textContent = finalText || '[No text generated before EOS]';
         setStatus(
@@ -1791,7 +1791,7 @@
 
     async function init() {
       try {
-        termiteReady = false;
+        inferenceReady = false;
         let gpuOps = null;
         let webgpuNote = null;
         let workerMode = false;
@@ -1821,24 +1821,24 @@
           }
         }
 
-        await termite.init(undefined, {
+        await inferenceRuntime.init(undefined, {
           gpu: gpuOps,
           worker: workerMode,
           workerUrl: new URL(`./inference-worker.js?v=${MODULE_CACHE_BUST}`, location.href),
         });
         currentRuntimeMode = workerMode ? 'worker' : 'direct';
-        termiteReady = true;
+        inferenceReady = true;
         runtimeHintEl.textContent = `Runtime: initialized (${gpuOps ? 'WASM + WebGPU' : 'WASM SIMD'}, ${currentRuntimeMemoryModel() ?? 'unknown ABI'}, ${currentRuntimeMode}${webgpuNote ? `; ${gpuOps ? 'WebGPU note' : 'WebGPU fallback'}: ${webgpuNote}` : ''}).`;
         if (hasElectronBridge()) {
-          pickerHintEl.textContent = 'Electron can scan the default ~/.termite/models directory directly, or let you choose another local models directory.';
+          pickerHintEl.textContent = 'Electron can scan the default ~/.antfly/inference/models directory directly, or let you choose another local models directory.';
           try {
-            const defaultDir = await window.termiteElectron.getDefaultModelsDirectory();
+            const defaultDir = await window.antflyInferenceElectron.getDefaultModelsDirectory();
             await scanElectronModelsDirectory(defaultDir);
             if (discoveredModels.length > 0) {
-              setStatus(`Initialized (${gpuOps ? 'WASM + WebGPU' : 'WASM SIMD'}, ${currentRuntimeMode}). Discovered ${discoveredModels.length} local model bundle${discoveredModels.length === 1 ? '' : 's'} under ~/.termite/models.`);
+              setStatus(`Initialized (${gpuOps ? 'WASM + WebGPU' : 'WASM SIMD'}, ${currentRuntimeMode}). Discovered ${discoveredModels.length} local model bundle${discoveredModels.length === 1 ? '' : 's'} under ~/.antfly/inference/models.`);
             }
           } catch (err) {
-            pickerHintEl.textContent = `Electron is available, but automatic ~/.termite/models scanning failed: ${err.message}`;
+            pickerHintEl.textContent = `Electron is available, but automatic ~/.antfly/inference/models scanning failed: ${err.message}`;
           }
         } else if (!hasDirectoryPicker()) {
           pickerHintEl.textContent = 'This browser does not support the File System Access directory picker. Use the single GGUF file picker, or switch to a Chrome-class browser for directory-based model discovery.';
@@ -1849,7 +1849,7 @@
         refreshPromptMode();
         updateActionButton();
       } catch (err) {
-        termiteReady = false;
+        inferenceReady = false;
         runtimeHintEl.textContent = `Runtime: initialization failed: ${err.message}`;
         setStatus(`Initialization failed: ${err.message}`);
         updateLoadAvailability();

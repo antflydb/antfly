@@ -22,10 +22,10 @@ const pjrt_compiler = @import("pjrt_compiler.zig");
 const pjrt_executor = @import("pjrt_executor.zig");
 
 pub const ArtifactLoadMode = enum {
-    /// Termite stores HLO bytes and compiles them through the configured PJRT
+    /// Antfly inference stores HLO bytes and compiles them through the configured PJRT
     /// plugin when the artifact is loaded.
     hlo_compile_on_load,
-    /// Future mode: Termite stores/loads a plugin-native executable artifact
+    /// Antfly inference stores/loads a plugin-native executable artifact
     /// without recompiling HLO on load.
     load_only_executable,
 };

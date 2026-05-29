@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Runtime owner for static Termite graphs.
+// Runtime owner for static Antfly inference graphs.
 //
 // Frontends such as ONNX import and traced model capture produce `ml.graph.Graph`.
 // This runtime owns the execution strategy for that graph: eager interpreter,

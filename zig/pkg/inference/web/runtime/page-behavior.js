@@ -39,7 +39,7 @@ export function hasIntegratedVisionConfig(config) {
 }
 
 export function isGemma3ProjectorKind(projectorKind) {
-  return projectorKind === 'termite_gemma3';
+  return projectorKind === 'antfly_gemma3';
 }
 
 export function isGemma4ImageProjectorKind(projectorKind) {

@@ -19,7 +19,7 @@
 // 2. Native autoregressive decoding — for native/MLX backends using GPT arch forward pass
 //
 // The native path runs gpt_arch.forward() to get logits, samples the next token,
-// and loops until EOS or max_tokens. Matches Go termite's TextGenerationPipeline.
+// and loops until EOS or max_tokens. Matches Go inference's TextGenerationPipeline.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -1356,7 +1356,7 @@ pub const NativeGenerationPipeline = struct {
             debugGenerationStage("multimodal collected images={d} audio={d}", .{ images.len, audio_clips.len });
 
             if (self.gguf_projector_path) |projector_path| {
-                if (projector_format_mod.isTermite(try projector_format_mod.detectPath(allocator, projector_path))) {
+                if (projector_format_mod.isAntfly(try projector_format_mod.detectPath(allocator, projector_path))) {
                     if (has_audio) return error.NativeAudioGenerationNotImplemented;
                     if (!self.gpt_config.isMultimodal()) return error.InvalidModelForGeneration;
                     const model_dir = self.model_dir orelse return error.MissingModelDirForMultimodal;

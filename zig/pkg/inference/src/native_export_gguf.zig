@@ -61,12 +61,12 @@ const QuantizationMode = enum {
 
 const ProjectorFormat = enum {
     auto,
-    termite,
+    antfly,
     clip,
 };
 
 const ResolvedProjectorFormat = enum {
-    termite,
+    antfly,
     clip,
 };
 
@@ -392,7 +392,7 @@ fn isColqwenBundleExportManifest(manifest: manifest_mod.ModelManifest) bool {
 
 fn isClipclapExportManifest(manifest: manifest_mod.ModelManifest) bool {
     return std.mem.eql(u8, manifest.config_model_arch, "clipclap") or
-        std.mem.eql(u8, manifest.termite_bundle_family, "clipclap_gguf_bundle/v1");
+        std.mem.eql(u8, manifest.inference_bundle_family, "clipclap_gguf_bundle/v1");
 }
 
 const colqwen_required_sidecars = [_][]const u8{
@@ -522,7 +522,7 @@ fn writeColqwenBundleMarker(
     out_dir: []const u8,
     output_path: []const u8,
 ) !void {
-    const bundle_marker_path = try std.fs.path.join(allocator, &.{ out_dir, "termite_bundle.json" });
+    const bundle_marker_path = try std.fs.path.join(allocator, &.{ out_dir, "antfly_inference_bundle.json" });
     defer allocator.free(bundle_marker_path);
     const gguf_name = std.fs.path.basename(output_path);
     const marker_json = try std.json.Stringify.valueAlloc(allocator, .{
@@ -831,7 +831,7 @@ fn writeClipclapBundleMarker(
     clip_name: []const u8,
     clap_name: []const u8,
 ) !void {
-    const bundle_marker_path = try std.fs.path.join(allocator, &.{ bundle_dir, "termite_bundle.json" });
+    const bundle_marker_path = try std.fs.path.join(allocator, &.{ bundle_dir, "antfly_inference_bundle.json" });
     defer allocator.free(bundle_marker_path);
     const marker_json = try std.json.Stringify.valueAlloc(allocator, .{
         .family = "clipclap_gguf_bundle/v1",
@@ -1177,7 +1177,7 @@ fn buildGlinerHeadMetadataEntries(allocator: std.mem.Allocator) ![]gguf_mod.form
     }
     try entries.append(allocator, .{
         .key = try allocator.dupe(u8, "general.architecture"),
-        .value = .{ .string = try allocator.dupe(u8, "termite-gliner-head") },
+        .value = .{ .string = try allocator.dupe(u8, "antfly-gliner-head") },
     });
     try entries.append(allocator, .{
         .key = try allocator.dupe(u8, "general.alignment"),
@@ -1335,7 +1335,7 @@ fn copyGlinerBundleAssets(
 }
 
 fn writeGlinerBundleMarker(allocator: std.mem.Allocator, out_dir: []const u8, output_path: []const u8) !void {
-    const marker_path = try std.fs.path.join(allocator, &.{ out_dir, "termite_bundle.json" });
+    const marker_path = try std.fs.path.join(allocator, &.{ out_dir, "antfly_inference_bundle.json" });
     defer allocator.free(marker_path);
     const encoder_name = std.fs.path.basename(output_path);
     const marker_bytes = try std.json.Stringify.valueAlloc(allocator, .{
@@ -1696,7 +1696,7 @@ fn buildExportPlans(
 
     const projector_plan = if (projector_tensors.items.len > 0 and manifest.gguf_projector_path == null)
         ExportPlan{
-            .metadata_owned = try buildProjectorMetadataEntries(allocator, manifest, gpt_config, resolved_projector_format orelse .termite),
+            .metadata_owned = try buildProjectorMetadataEntries(allocator, manifest, gpt_config, resolved_projector_format orelse .antfly),
             .borrowed_metadata_file = null,
             .tensors = try projector_tensors.toOwnedSlice(allocator),
         }
@@ -3202,8 +3202,8 @@ fn resolveRequestedProjectorFormat(
 ) !?ResolvedProjectorFormat {
     if (projector_source_path) |path| {
         const detected_kind = try projector_format_mod.detectPath(allocator, path);
-        const detected: ResolvedProjectorFormat = if (projector_format_mod.isTermite(detected_kind))
-            .termite
+        const detected: ResolvedProjectorFormat = if (projector_format_mod.isAntfly(detected_kind))
+            .antfly
         else if (projector_format_mod.isClip(detected_kind))
             .clip
         else
@@ -3211,13 +3211,13 @@ fn resolveRequestedProjectorFormat(
 
         return switch (requested) {
             .auto => detected,
-            .termite => if (detected == .termite) .termite else error.UnsupportedRequestedProjectorFormat,
+            .antfly => if (detected == .antfly) .antfly else error.UnsupportedRequestedProjectorFormat,
             .clip => if (detected == .clip) .clip else error.UnsupportedRequestedProjectorFormat,
         };
     }
 
     return switch (requested) {
-        .auto, .termite => .termite,
+        .auto, .antfly => .antfly,
         .clip => null,
     };
 }
@@ -3229,12 +3229,12 @@ fn buildProjectorMetadataEntries(
     format: ResolvedProjectorFormat,
 ) ![]gguf_mod.format.MetadataEntry {
     return switch (format) {
-        .termite => buildTermiteProjectorMetadataEntries(allocator, manifest, config),
+        .antfly => buildAntflyProjectorMetadataEntries(allocator, manifest, config),
         .clip => error.UnsupportedCanonicalProjectorExport,
     };
 }
 
-fn buildTermiteProjectorMetadataEntries(
+fn buildAntflyProjectorMetadataEntries(
     allocator: std.mem.Allocator,
     manifest: manifest_mod.ModelManifest,
     config: gpt_mod.Config,
@@ -3247,7 +3247,7 @@ fn buildTermiteProjectorMetadataEntries(
 
     try entries.append(allocator, .{
         .key = try allocator.dupe(u8, "general.architecture"),
-        .value = .{ .string = try allocator.dupe(u8, "termite-projector") },
+        .value = .{ .string = try allocator.dupe(u8, "antfly-projector") },
     });
     try entries.append(allocator, .{
         .key = try allocator.dupe(u8, "general.alignment"),
@@ -3481,7 +3481,7 @@ fn formatUnsupportedModelDryRunReport(
     }
     switch (reason) {
         .composite_wrapper => try writer.writeAll("reason: this model family is a composite wrapper over another backbone and does not have a standalone GGUF export contract yet\n"),
-        .unsupported_architecture => try writer.writeAll("reason: this model family does not currently have a GGUF export path in Termite\n"),
+        .unsupported_architecture => try writer.writeAll("reason: this model family does not currently have a GGUF export path in Antfly inference\n"),
     }
     return text.toOwnedSlice();
 }
@@ -4811,7 +4811,7 @@ fn parseArgs(args: []const []const u8) !Options {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference export <model-dir> --target gguf [--output <path>] [--projector-output <path>] [--projector-format auto|termite|clip] [--format q1_0|q2_k|q3_k|q4_0|q4_1|q5_0|q5_1|q4_k|q5_k|q6_k|q8_k|q8_0|q8_1] [--quantize-include <csv-prefixes>] [--quantize-exclude <csv-prefixes>] [--dry-run]
+        \\usage: antfly inference export <model-dir> --target gguf [--output <path>] [--projector-output <path>] [--projector-format auto|antfly|clip] [--format q1_0|q2_k|q3_k|q4_0|q4_1|q5_0|q5_1|q4_k|q5_k|q6_k|q8_k|q8_0|q8_1] [--quantize-include <csv-prefixes>] [--quantize-exclude <csv-prefixes>] [--dry-run]
         \\
         \\Exports a native model directory to a serialized GGUF file.
         \\Dense export is currently implemented for bert, t5, whisper, clip, clap, florence, layoutlmv3, and deberta plus gpt2, gpt_neo, gpt_neox, gptj, llama, mistral, qwen2, gemma, bitnet, and phi families. GPT-2 export applies the same hybrid quantization policy as other dense families, with Conv1D tensors quantized on their transformed GGUF row layout; GPT-NeoX split query_key_value export currently keeps those split tensors dense while other eligible tensors may quantize.
@@ -4822,7 +4822,7 @@ fn printUsage() void {
 
 fn parseProjectorFormat(value: []const u8) ?ProjectorFormat {
     if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
-    if (std.ascii.eqlIgnoreCase(value, "termite")) return .termite;
+    if (std.ascii.eqlIgnoreCase(value, "antfly")) return .antfly;
     if (std.ascii.eqlIgnoreCase(value, "clip")) return .clip;
     return null;
 }
@@ -5692,7 +5692,7 @@ test "multimodal export synthesizes projector gguf from integrated tensors" {
     var projector_parsed = try gguf_mod.format.parse(allocator, projector_raw);
     defer projector_parsed.deinit(allocator);
     const projector_view = gguf_mod.metadata.View.init(&projector_parsed);
-    try std.testing.expectEqualStrings("termite-projector", projector_view.getString("general.architecture").?);
+    try std.testing.expectEqualStrings("antfly-projector", projector_view.getString("general.architecture").?);
     try std.testing.expectEqualStrings("integrated-multimodal", projector_view.getString("inference.projector.kind").?);
     try std.testing.expectEqualStrings("gemma3", projector_view.getString("inference.projector.source_architecture").?);
     try std.testing.expectEqual(@as(u64, 2), projector_view.getU64("inference.projector.mm_tokens_per_image").?);
@@ -6519,7 +6519,7 @@ test "gliner2 export writes split encoder gguf bundle" {
     const head_path = try std.fs.path.join(allocator, &.{ export_dir, "gliner_head.gguf" });
     defer allocator.free(head_path);
     try std.testing.expect(c_file.fileExists(allocator, head_path));
-    const bundle_marker_path = try std.fs.path.join(allocator, &.{ export_dir, "termite_bundle.json" });
+    const bundle_marker_path = try std.fs.path.join(allocator, &.{ export_dir, "antfly_inference_bundle.json" });
     defer allocator.free(bundle_marker_path);
     try std.testing.expect(c_file.fileExists(allocator, bundle_marker_path));
 
@@ -6528,7 +6528,7 @@ test "gliner2 export writes split encoder gguf bundle" {
     try std.testing.expect(exported_manifest.gguf_path != null);
     try std.testing.expect(exported_manifest.gliner_head_gguf_path != null);
     try std.testing.expectEqualStrings("gliner2", exported_manifest.gliner_model_type);
-    try std.testing.expectEqualStrings("gliner2_split_bundle/v1", exported_manifest.termite_bundle_family);
+    try std.testing.expectEqualStrings("gliner2_split_bundle/v1", exported_manifest.inference_bundle_family);
 }
 
 test "gliner2 export preserves requested encoder basename in bundle marker" {
@@ -6593,7 +6593,7 @@ test "gliner2 export preserves requested encoder basename in bundle marker" {
     defer allocator.free(out_path);
     try exportModelDirToGguf(allocator, dir_path, out_path, .none);
 
-    const bundle_marker_path = try std.fs.path.join(allocator, &.{ export_dir, "termite_bundle.json" });
+    const bundle_marker_path = try std.fs.path.join(allocator, &.{ export_dir, "antfly_inference_bundle.json" });
     defer allocator.free(bundle_marker_path);
     const marker_bytes = try c_file.readFile(allocator, bundle_marker_path);
     defer allocator.free(marker_bytes);
@@ -6807,7 +6807,7 @@ test "colqwen bundle export keeps visual weights integrated and preserves sideca
     try std.testing.expect(catalog.find("visual.patch_embed.proj.weight") != null);
     try std.testing.expect(catalog.find("visual.merger.mlp.2.weight") != null);
 
-    const bundle_marker_path = try std.fs.path.join(allocator, &.{ export_dir, "termite_bundle.json" });
+    const bundle_marker_path = try std.fs.path.join(allocator, &.{ export_dir, "antfly_inference_bundle.json" });
     defer allocator.free(bundle_marker_path);
     try std.testing.expect(c_file.fileExists(allocator, bundle_marker_path));
     const exported_model_manifest_path = try std.fs.path.join(allocator, &.{ export_dir, "model_manifest.json" });
@@ -6832,7 +6832,7 @@ test "colqwen bundle export keeps visual weights integrated and preserves sideca
     try std.testing.expect(exported_manifest.gguf_projector_path == null);
     try std.testing.expect(exported_manifest.hasCapability("colqwen"));
     try std.testing.expect(exported_manifest.hasCapability("multimodal_late_interaction"));
-    try std.testing.expectEqualStrings("colqwen2_gguf_bundle/v1", exported_manifest.termite_bundle_family);
+    try std.testing.expectEqualStrings("colqwen2_gguf_bundle/v1", exported_manifest.inference_bundle_family);
 }
 
 test "exported colqwen bundle loads and prepares multimodal reranker prompts" {
@@ -7997,7 +7997,7 @@ fn writeMinimalQuantizedGgufFixture(allocator: std.mem.Allocator, path: []const 
 }
 
 fn testScratchDir(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    const root = try std.fmt.allocPrint(allocator, "termite-export-gguf-tests-{d}", .{std.posix.system.getpid()});
+    const root = try std.fmt.allocPrint(allocator, "antfly-inference-export-gguf-tests-{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
     const dir_path = try std.fs.path.join(allocator, &.{ "/tmp", root, name });
     errdefer allocator.free(dir_path);
@@ -8029,8 +8029,8 @@ fn writeMinimalProjectorFixture(
         .{ .key = "clip.vision.image_size", .value = .{ .u32 = 224 } },
         .{ .key = "clip.vision.patch_size", .value = .{ .u32 = 14 } },
     };
-    const termite_metadata = [_]gguf_mod.format.MetadataEntry{
-        .{ .key = "general.architecture", .value = .{ .string = "termite-projector" } },
+    const antfly_metadata = [_]gguf_mod.format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "antfly-projector" } },
         .{ .key = "inference.projector.source_architecture", .value = .{ .string = "gemma3" } },
         .{ .key = "inference.projector.text_hidden_size", .value = .{ .u32 = 4 } },
         .{ .key = "inference.projector.vision_hidden_size", .value = .{ .u32 = 8 } },
@@ -8043,7 +8043,7 @@ fn writeMinimalProjectorFixture(
     };
     const metadata: []const gguf_mod.format.MetadataEntry = switch (format) {
         .clip => &clip_metadata,
-        .termite => &termite_metadata,
+        .antfly => &antfly_metadata,
     };
     var layout = try gguf_mod.writer.buildLayout(allocator, metadata, &.{});
     defer layout.deinit(allocator);

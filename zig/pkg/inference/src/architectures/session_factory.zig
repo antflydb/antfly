@@ -88,13 +88,13 @@ const metal_runtime = if (build_options.enable_metal) @import("../backends/metal
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {};
 
 fn directQuantEnabled() bool {
-    return !platform.env.getenvBool("TERMITE_NATIVE_DISABLE_DIRECT_QUANT");
+    return !platform.env.getenvBool("ANTFLY_INFERENCE_NATIVE_DISABLE_DIRECT_QUANT");
 }
 
 fn mlxQuantExecutionMode(direct_quant_enabled: bool) MlxQuantExecutionMode {
     if (!direct_quant_enabled) return .prefer_backend_dense;
 
-    const slice = platform.env.getenv("TERMITE_MLX_QUANT_MODE") orelse return .device_native;
+    const slice = platform.env.getenv("ANTFLY_INFERENCE_MLX_QUANT_MODE") orelse return .device_native;
     if (std.ascii.eqlIgnoreCase(slice, "dense") or std.ascii.eqlIgnoreCase(slice, "prefer_backend_dense")) {
         return .prefer_backend_dense;
     }
@@ -108,16 +108,16 @@ fn mlxQuantExecutionMode(direct_quant_enabled: bool) MlxQuantExecutionMode {
 }
 
 fn mlxEagerDenseMaxBytes() u64 {
-    const mb = platform.env.getenvUsize("TERMITE_MLX_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
+    const mb = platform.env.getenvUsize("ANTFLY_INFERENCE_MLX_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
     return mb * 1024 * 1024;
 }
 
 fn forceMlxEagerDenseLoadDebug() bool {
-    return platform.env.getenvBool("TERMITE_FORCE_MLX_EAGER_DENSE");
+    return platform.env.getenvBool("ANTFLY_INFERENCE_FORCE_MLX_EAGER_DENSE");
 }
 
 fn disablePrefetchWorkerDebug() bool {
-    return platform.env.getenvBool("TERMITE_DISABLE_PREFETCH_WORKER");
+    return platform.env.getenvBool("ANTFLY_INFERENCE_DISABLE_PREFETCH_WORKER");
 }
 
 fn graphRuntimeStrategyEnabled(strategy: ?graph_runtime.Strategy) bool {
@@ -125,24 +125,24 @@ fn graphRuntimeStrategyEnabled(strategy: ?graph_runtime.Strategy) bool {
 }
 
 fn glinerProfileEnabled() bool {
-    return platform.env.getenvBool("TERMITE_GLINER_PROFILE");
+    return platform.env.getenvBool("ANTFLY_INFERENCE_GLINER_PROFILE");
 }
 
 fn glinerArchitectureAuditEnabled() bool {
-    return platform.env.getenvBool("TERMITE_GLINER_ARCH_AUDIT");
+    return platform.env.getenvBool("ANTFLY_INFERENCE_GLINER_ARCH_AUDIT");
 }
 
 fn glinerSessionFrameEnabled() bool {
-    if (platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_SESSION_FRAME")) return false;
+    if (platform.env.getenvBool("ANTFLY_INFERENCE_METAL_DISABLE_GLINER_SESSION_FRAME")) return false;
     return true;
 }
 
 fn glinerDenseQkvScratchEnabled() bool {
-    return !platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED");
+    return !platform.env.getenvBool("ANTFLY_INFERENCE_METAL_DISABLE_DENSE_QKV_PACKED");
 }
 
 fn glinerHeadCustomMlp2Enabled() bool {
-    if (platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_HEAD_CUSTOM_MLP2")) return false;
+    if (platform.env.getenvBool("ANTFLY_INFERENCE_METAL_DISABLE_GLINER_HEAD_CUSTOM_MLP2")) return false;
     return true;
 }
 
@@ -949,7 +949,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
 /// initialized via `Client.initFromEnv` which searches for the plugin in:
 ///   1. `PJRT_PLUGIN_PATH` env var
 ///   2. `~/Library/Application Support/go-xla/pjrt_c_api_cpu_plugin.dylib`
-///   3. `~/.termite/pjrt/darwin-arm64/pjrt_c_api_cpu_plugin.dylib`
+///   3. `~/.antfly/pjrt/darwin-arm64/pjrt_c_api_cpu_plugin.dylib`
 ///
 /// If the plugin is not found, the session is created anyway but without a
 /// PJRT client (falls back to pure BLAS execution — no XLA-compiled
@@ -1646,7 +1646,7 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
             defer allocator.free(model_type);
             if (mf.gliner_model_type.len > 0) {
                 // Split GLiNER bundles keep the DeBERTa encoder config in
-                // config.json and use termite_bundle/gliner_config sidecars
+                // config.json and use antfly_inference_bundle/gliner_config sidecars
                 // to identify the GLiNER wrapper.
                 var cfg = try deberta_mod.parseConfig(allocator, config_bytes);
                 try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);

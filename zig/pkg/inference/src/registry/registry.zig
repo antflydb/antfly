@@ -822,7 +822,7 @@ fn synthesizePulledModelManifestJson(
 /// A model dir contains config.json, tokenizer.json, genai_config.json, a GGUF file, or an onnx/ subdir.
 fn isModelDir(io: Io, path: []const u8) bool {
     const allocator = if (build_options.link_libc) std.heap.c_allocator else std.heap.smp_allocator;
-    const indicators = [_][]const u8{ "config.json", "tokenizer.json", "genai_config.json", "termite_metadata.json" };
+    const indicators = [_][]const u8{ "config.json", "tokenizer.json", "genai_config.json", "antfly_metadata.json" };
     for (indicators) |filename| {
         const file_path = std.fs.path.join(allocator, &.{ path, filename }) catch continue;
         defer allocator.free(file_path);
@@ -891,7 +891,7 @@ test "discover skips empty owner subdirectories and keeps multistage readers" {
 
     try tmp.dir.createDirPath(io, "readers/monkt/paddleocr-onnx");
     try tmp.dir.writeFile(io, .{
-        .sub_path = "readers/monkt/paddleocr-onnx/termite_metadata.json",
+        .sub_path = "readers/monkt/paddleocr-onnx/antfly_metadata.json",
         .data =
         \\{
         \\  "model_type": "paddleocr",
@@ -1008,7 +1008,7 @@ test "synthesized pulled manifest does not infer sparse from path name alone" {
 
 /// Resolve a model name by variant suffix.
 /// If `requested` isn't found in the directory, looks for entries prefixed with
-/// "requested-" and returns the shortest match. Matches Go termite's resolveVariant.
+/// "requested-" and returns the shortest match. Matches Go inference's resolveVariant.
 /// Uses Io-based dir iteration (Zig 0.16).
 pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8) ?[]const u8 {
     const prefix = std.fmt.allocPrint(allocator, "{s}-", .{requested}) catch return null;

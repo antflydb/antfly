@@ -867,7 +867,7 @@ test "ClipClap ONNX quantize writes suffixed variants beside defaults" {
         try std.testing.expectEqualStrings(data_name, external.location);
     }
 
-    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "termite_variants.json" });
+    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
     defer allocator.free(variants_path);
     const variants = try c_file.readFile(allocator, variants_path);
     defer allocator.free(variants);

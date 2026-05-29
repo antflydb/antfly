@@ -108,7 +108,7 @@ fn maskedEmbeddingArgmax(
     const cluster_size = vocab_size / num_centroids;
     var best_token: usize = 0;
     var best_score = -std.math.inf(f32);
-    const use_inverse_ordering = getenvBool("TERMITE_GEMMA4_MTP_INVERSE_TOKEN_ORDERING");
+    const use_inverse_ordering = getenvBool("ANTFLY_INFERENCE_GEMMA4_MTP_INVERSE_TOKEN_ORDERING");
     for (top_centroids) |centroid| {
         const start = centroid * cluster_size;
         const end = start + cluster_size;

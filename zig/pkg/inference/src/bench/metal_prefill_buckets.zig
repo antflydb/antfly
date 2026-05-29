@@ -24,10 +24,10 @@ fn envOrDefault(allocator: std.mem.Allocator, comptime name: [:0]const u8, defau
 }
 
 fn defaultGemma4ModelPath(allocator: std.mem.Allocator) ![]u8 {
-    if (try getEnvVarOwned(allocator, "TERMITE_GEMMA4_MODEL")) |value| return value;
+    if (try getEnvVarOwned(allocator, "ANTFLY_INFERENCE_GEMMA4_MODEL")) |value| return value;
     const home = (try getEnvVarOwned(allocator, "HOME")) orelse return error.HomeNotSet;
     defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".termite/models/ggml-org/gemma-4-e2b-it-gguf" });
+    return std.fs.path.join(allocator, &.{ home, ".antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf" });
 }
 
 fn makePrompt(allocator: std.mem.Allocator, words: usize) ![]u8 {
@@ -43,7 +43,7 @@ fn makePrompt(allocator: std.mem.Allocator, words: usize) ![]u8 {
 fn runBucket(
     io: std.Io,
     allocator: std.mem.Allocator,
-    termite_bin: []const u8,
+    antfly_bin: []const u8,
     model: []const u8,
     backend: []const u8,
     decode_count: []const u8,
@@ -58,7 +58,8 @@ fn runBucket(
 
     var child = try std.process.spawn(io, .{
         .argv = &.{
-            termite_bin,
+            antfly_bin,
+            "inference",
             "generate",
             model,
             prompt,
@@ -86,15 +87,15 @@ pub fn main() !void {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    const termite_bin = try envOrDefault(allocator, "TERMITE_BIN", "./zig-out/bin/termite");
+    const antfly_bin = try envOrDefault(allocator, "ANTFLY_BIN", "./zig-out/bin/antfly");
     const model = try defaultGemma4ModelPath(allocator);
     defer allocator.free(model);
-    const backend = try envOrDefault(allocator, "TERMITE_BENCH_BACKEND", "metal");
-    const prefill_decode_count = try envOrDefault(allocator, "TERMITE_BENCH_PREFILL_DECODE_COUNT", "4");
-    const decode_count = try envOrDefault(allocator, "TERMITE_BENCH_DECODE_COUNT", "16");
+    const backend = try envOrDefault(allocator, "ANTFLY_INFERENCE_BENCH_BACKEND", "metal");
+    const prefill_decode_count = try envOrDefault(allocator, "ANTFLY_INFERENCE_BENCH_PREFILL_DECODE_COUNT", "4");
+    const decode_count = try envOrDefault(allocator, "ANTFLY_INFERENCE_BENCH_DECODE_COUNT", "16");
 
-    try runBucket(io, allocator, termite_bin, model, backend, prefill_decode_count, "pp10", 10, 1);
-    try runBucket(io, allocator, termite_bin, model, backend, prefill_decode_count, "pp128", 128, 119);
-    try runBucket(io, allocator, termite_bin, model, backend, prefill_decode_count, "pp512", 512, 503);
-    try runBucket(io, allocator, termite_bin, model, backend, decode_count, "tg16", 10, 1);
+    try runBucket(io, allocator, antfly_bin, model, backend, prefill_decode_count, "pp10", 10, 1);
+    try runBucket(io, allocator, antfly_bin, model, backend, prefill_decode_count, "pp128", 128, 119);
+    try runBucket(io, allocator, antfly_bin, model, backend, prefill_decode_count, "pp512", 512, 503);
+    try runBucket(io, allocator, antfly_bin, model, backend, decode_count, "tg16", 10, 1);
 }

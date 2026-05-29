@@ -23,7 +23,7 @@
 //   4. Run ONNX inference → [1, num_spans, num_labels] logits
 //   5. Apply sigmoid, threshold, and flat NER deduplication
 //
-// Matches Go termite's lib/pipelines/gliner.go (GLiNER2 path).
+// Matches Go inference's lib/pipelines/gliner.go (GLiNER2 path).
 
 const std = @import("std");
 const backends = @import("../backends/backends.zig");

@@ -159,7 +159,7 @@ var active_node: ?*Node = null;
 var active_models_dir: ?[]const u8 = null;
 
 fn embedTimingEnabled() bool {
-    return platform.env.getenvBoolDefault("TERMITE_EMBED_TIMING", false);
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_EMBED_TIMING", false);
 }
 
 fn embedTimingNowNs() u128 {
@@ -179,7 +179,7 @@ fn logEmbedTiming(phase: []const u8, count: usize, start_ns: u128) void {
     if (start_ns == 0) return;
     const now = embedTimingNowNs();
     const elapsed_us = if (now > start_ns) @divTrunc(now - start_ns, 1000) else 0;
-    std.log.info("termite embed timing phase={s} count={d} elapsed_us={d}", .{ phase, count, elapsed_us });
+    std.log.info("antfly inference embed timing phase={s} count={d} elapsed_us={d}", .{ phase, count, elapsed_us });
 }
 
 fn allocCompletionId(allocator: std.mem.Allocator) ![]u8 {
@@ -306,7 +306,7 @@ fn appendOpenAiModelEntry(
     try jsonEncodeString(buf, allocator, model_id);
     const metadata = try std.fmt.allocPrint(
         allocator,
-        ",\"object\":\"model\",\"created\":{d},\"owned_by\":\"termite\"}}",
+        ",\"object\":\"model\",\"created\":{d},\"owned_by\":\"antfly\"}}",
         .{created},
     );
     defer allocator.free(metadata);
@@ -669,7 +669,7 @@ pub const Node = struct {
 
     /// Resolve a model name to a directory path.
     /// Supports: absolute path, "hf:owner/name:variant", "owner/name", variant resolution.
-    /// Matches Go termite's resolveModel: exact match → re-scan → variant resolution.
+    /// Matches Go inference's resolveModel: exact match → re-scan → variant resolution.
     /// When task_type is provided (e.g. "embedders"), also searches models_dir/task_type/.
     pub fn resolveModelPath(self: *Node, io: std.Io, name: ?[]const u8, task_type: ?[]const u8) ![]const u8 {
         if (name) |raw| {
@@ -4161,17 +4161,17 @@ pub const Node = struct {
 
         // Scheduler metrics (computed on-the-fly from loaded models)
         const aggregate = runtime.scheduler.native_generate.aggregateStats(node.model_manager.loaded);
-        try appendPromMetric(&writer.writer, "termite_native_scheduler_waiting_requests", "gauge", "Waiting native scheduler requests across loaded models", aggregate.snapshot.waiting_requests);
-        try appendPromMetric(&writer.writer, "termite_native_scheduler_prefill_requests", "gauge", "Prefill-phase native scheduler requests across loaded models", aggregate.snapshot.prefill_requests);
-        try appendPromMetric(&writer.writer, "termite_native_scheduler_decode_requests", "gauge", "Decode-phase native scheduler requests across loaded models", aggregate.snapshot.decode_requests);
-        try appendPromMetric(&writer.writer, "termite_native_scheduler_active_units", "gauge", "Active native scheduler units across loaded models", aggregate.snapshot.active_units);
-        try appendPromMetric(&writer.writer, "termite_native_scheduler_step_batches_total", "counter", "Total unified scheduler steps (one fused forward pass per step)", aggregate.stats.step_batches_total);
-        try appendPromMetric(&writer.writer, "termite_native_scheduler_step_prefill_items_total", "counter", "Total prefill items packed into unified scheduler steps", aggregate.stats.step_prefill_items_total);
-        try appendPromMetric(&writer.writer, "termite_native_scheduler_step_decode_items_total", "counter", "Total decode items packed into unified scheduler steps", aggregate.stats.step_decode_items_total);
-        try appendPromMetric(&writer.writer, "termite_native_scheduler_step_query_tokens_total", "counter", "Total query tokens fused across unified scheduler steps", aggregate.stats.step_query_tokens_total);
-        try appendPromMetric(&writer.writer, "termite_native_scheduler_step_singleton_batches_total", "counter", "Total unified scheduler steps that contained only the leader item", aggregate.stats.step_singleton_batches_total);
-        try appendPromMetric(&writer.writer, "termite_native_scheduler_step_kv_block_skips_total", "counter", "Total pending items skipped due to per-step KV-block budget", aggregate.stats.step_kv_block_skips_total);
-        try appendPromMetric(&writer.writer, "termite_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_waiting_requests", "gauge", "Waiting native scheduler requests across loaded models", aggregate.snapshot.waiting_requests);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_prefill_requests", "gauge", "Prefill-phase native scheduler requests across loaded models", aggregate.snapshot.prefill_requests);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_requests", "gauge", "Decode-phase native scheduler requests across loaded models", aggregate.snapshot.decode_requests);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_active_units", "gauge", "Active native scheduler units across loaded models", aggregate.snapshot.active_units);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batches_total", "counter", "Total unified scheduler steps (one fused forward pass per step)", aggregate.stats.step_batches_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_prefill_items_total", "counter", "Total prefill items packed into unified scheduler steps", aggregate.stats.step_prefill_items_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_decode_items_total", "counter", "Total decode items packed into unified scheduler steps", aggregate.stats.step_decode_items_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_query_tokens_total", "counter", "Total query tokens fused across unified scheduler steps", aggregate.stats.step_query_tokens_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_singleton_batches_total", "counter", "Total unified scheduler steps that contained only the leader item", aggregate.stats.step_singleton_batches_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_kv_block_skips_total", "counter", "Total pending items skipped due to per-step KV-block budget", aggregate.stats.step_kv_block_skips_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
         try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
         try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
 
@@ -4602,12 +4602,12 @@ fn appendPromMetric(writer: *std.Io.Writer, name: []const u8, metric_type: []con
 }
 
 fn appendResidentProjectionMetrics(writer: *std.Io.Writer, stats: embedding_mod.ResidentProjectionStats) !void {
-    try appendPromMetric(writer, "termite_embed_resident_projection_text_success_total", "counter", "Total successful text resident projection attempts", stats.text_success);
-    try appendPromMetric(writer, "termite_embed_resident_projection_text_fallback_total", "counter", "Total text resident projection fallbacks", stats.text_fallback);
-    try appendPromMetric(writer, "termite_embed_resident_projection_image_success_total", "counter", "Total successful image resident projection attempts", stats.image_success);
-    try appendPromMetric(writer, "termite_embed_resident_projection_image_fallback_total", "counter", "Total image resident projection fallbacks", stats.image_fallback);
-    try appendPromMetric(writer, "termite_embed_resident_projection_audio_success_total", "counter", "Total successful audio resident projection attempts", stats.audio_success);
-    try appendPromMetric(writer, "termite_embed_resident_projection_audio_fallback_total", "counter", "Total audio resident projection fallbacks", stats.audio_fallback);
+    try appendPromMetric(writer, "antfly_inference_embed_resident_projection_text_success_total", "counter", "Total successful text resident projection attempts", stats.text_success);
+    try appendPromMetric(writer, "antfly_inference_embed_resident_projection_text_fallback_total", "counter", "Total text resident projection fallbacks", stats.text_fallback);
+    try appendPromMetric(writer, "antfly_inference_embed_resident_projection_image_success_total", "counter", "Total successful image resident projection attempts", stats.image_success);
+    try appendPromMetric(writer, "antfly_inference_embed_resident_projection_image_fallback_total", "counter", "Total image resident projection fallbacks", stats.image_fallback);
+    try appendPromMetric(writer, "antfly_inference_embed_resident_projection_audio_success_total", "counter", "Total successful audio resident projection attempts", stats.audio_success);
+    try appendPromMetric(writer, "antfly_inference_embed_resident_projection_audio_fallback_total", "counter", "Total audio resident projection fallbacks", stats.audio_fallback);
 }
 
 fn appendGraphExecutorMetrics(writer: *std.Io.Writer, stats: graph_mod.executor_stats.ExecutionStats) !void {
@@ -4647,8 +4647,8 @@ test "resident projection metrics render counters" {
         .audio_fallback = 6,
     });
     const output = writer.writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "termite_embed_resident_projection_text_success_total 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "termite_embed_resident_projection_audio_fallback_total 6\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_embed_resident_projection_text_success_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_embed_resident_projection_audio_fallback_total 6\n") != null);
 }
 
 test "graph executor metrics render counters" {
@@ -4881,7 +4881,7 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
 }
 
-test "root operational routes stay outside termite API prefix" {
+test "root operational routes stay outside inference API prefix" {
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
 
@@ -5667,7 +5667,7 @@ fn buildEmbedSparseResponse(
     };
 }
 
-test "termite embeddings validates encoding format and dimensions" {
+test "Antfly inference embeddings validates encoding format and dimensions" {
     try validateEmbeddingEncodingFormat(null);
     try validateEmbeddingEncodingFormat("float");
     try std.testing.expectError(error.UnsupportedEncodingFormat, validateEmbeddingEncodingFormat("base64"));
@@ -5808,7 +5808,7 @@ fn expectJsonNumber(expected: f64, value: std.json.Value) !void {
     try std.testing.expectEqual(expected, actual);
 }
 
-test "termite embeddings dense response supports truncation" {
+test "Antfly inference embeddings dense response supports truncation" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -5830,7 +5830,7 @@ test "termite embeddings dense response supports truncation" {
     try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("usage").?.object.get("total_tokens").?.integer);
 }
 
-test "termite embeddings sparse response uses the shared embedding field" {
+test "Antfly inference embeddings sparse response uses the shared embedding field" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -5860,7 +5860,7 @@ test "termite embeddings sparse response uses the shared embedding field" {
     try std.testing.expectEqual(@as(i64, 11), parsed.value.object.get("usage").?.object.get("total_tokens").?.integer);
 }
 
-test "termite embed request parser accepts multimodal content parts" {
+test "Antfly inference embed request parser accepts multimodal content parts" {
     const alloc = std.testing.allocator;
     const body =
         \\{
@@ -5896,7 +5896,7 @@ test "termite embed request parser accepts multimodal content parts" {
     try std.testing.expectEqualStrings("hello world", inputs.texts.items[0].text);
 }
 
-test "termite embed request parser accepts mixed strings and content parts" {
+test "Antfly inference embed request parser accepts mixed strings and content parts" {
     const alloc = std.testing.allocator;
     const body =
         \\{
@@ -5934,7 +5934,7 @@ test "termite embed request parser accepts mixed strings and content parts" {
     try std.testing.expectEqual(@as(usize, 2), inputs.audio.items[0].index);
 }
 
-test "termite embed media-only usage does not require text tokens" {
+test "Antfly inference embed media-only usage does not require text tokens" {
     const alloc = std.testing.allocator;
     const body =
         \\{
@@ -5967,7 +5967,7 @@ test "termite embed media-only usage does not require text tokens" {
     try std.testing.expectEqual(@as(usize, 0), estimateParsedDenseEmbedPromptTokens(&inputs));
 }
 
-test "termite embed parser accepts data uri media payloads" {
+test "Antfly inference embed parser accepts data uri media payloads" {
     const alloc = std.testing.allocator;
     const body =
         \\{
@@ -5998,7 +5998,7 @@ test "termite embed parser accepts data uri media payloads" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, inputs.images.items[0].bytes);
 }
 
-test "termite embed parser rejects mismatched data uri media mime type" {
+test "Antfly inference embed parser rejects mismatched data uri media mime type" {
     const alloc = std.testing.allocator;
     const body =
         \\{
@@ -6028,7 +6028,7 @@ test "termite embed parser rejects mismatched data uri media mime type" {
     );
 }
 
-test "termite sparse embed parser rejects multimodal content parts" {
+test "Antfly inference sparse embed parser rejects multimodal content parts" {
     const alloc = std.testing.allocator;
     const body =
         \\[
@@ -6487,5 +6487,5 @@ fn appendBase64Json(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 
 fn graphModeEnabled() bool {
     if (comptime @import("builtin").os.tag == .freestanding) return false;
-    return platform.env.getenvBool("TERMITE_GRAPH_MODE");
+    return platform.env.getenvBool("ANTFLY_INFERENCE_GRAPH_MODE");
 }

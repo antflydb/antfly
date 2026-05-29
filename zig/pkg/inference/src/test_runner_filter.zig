@@ -56,13 +56,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     const test_fn_list = builtin.test_functions;
-    const list_tests_path = getenvSpan("TERMITE_TEST_LIST_FILE");
+    const list_tests_path = getenvSpan("ANTFLY_INFERENCE_TEST_LIST_FILE");
     if (list_tests_path) |path| {
         try writeSelectedRuntimeTests(path, test_fn_list, filters.items);
         return;
     }
-    const runtime_offset = getenvUsize("TERMITE_TEST_RUNTIME_OFFSET") orelse 0;
-    const runtime_limit = getenvUsize("TERMITE_TEST_RUNTIME_LIMIT") orelse std.math.maxInt(usize);
+    const runtime_offset = getenvUsize("ANTFLY_INFERENCE_TEST_RUNTIME_OFFSET") orelse 0;
+    const runtime_limit = getenvUsize("ANTFLY_INFERENCE_TEST_RUNTIME_LIMIT") orelse std.math.maxInt(usize);
 
     var matched_count: usize = 0;
     var selected_count: usize = 0;
@@ -163,10 +163,10 @@ fn writeSelectedRuntimeTests(path: []const u8, test_fn_list: []const std.builtin
 }
 
 fn writeRuntimeTestProgress(index: usize, name: []const u8) void {
-    if (getenvSpan("TERMITE_TEST_CURRENT_FILE")) |path| {
+    if (getenvSpan("ANTFLY_INFERENCE_TEST_CURRENT_FILE")) |path| {
         writeRuntimeCurrentTestPath(path, name) catch {};
     }
-    if (getenvSpan("TERMITE_TEST_TRACE_FILE")) |path| {
+    if (getenvSpan("ANTFLY_INFERENCE_TEST_TRACE_FILE")) |path| {
         appendRuntimeTracePath(path, index, name) catch {};
     }
 }

@@ -23,7 +23,7 @@
 // This is a pipeline concern, not a backend concern. The backend just provides
 // Sessions that can run forward passes. This pipeline orchestrates them.
 //
-// Matches Go termite's lib/pipelines/encoder_decoder.go pattern.
+// Matches Go inference's lib/pipelines/encoder_decoder.go pattern.
 
 const std = @import("std");
 const backends = @import("../backends/backends.zig");

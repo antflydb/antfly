@@ -18,22 +18,22 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PKG_DIR="$ROOT_DIR/pkg/inference"
 
-TERMITE_BIN="${TERMITE_BIN:-$PKG_DIR/zig-out/bin/termite}"
-MODEL_DIR="${TERMITE_GEMMA4_MODEL:-$HOME/.termite/models/ggml-org/gemma-4-e2b-it-gguf}"
-PROMPT="${TERMITE_GEMMA4_PREFILL_PROMPT:-hi}"
-MAX_TOKENS="${TERMITE_GEMMA4_PREFILL_MAX_TOKENS:-4}"
-EXPECTED_TOKEN_IDS="${TERMITE_GEMMA4_EXPECTED_TOKEN_IDS:-10979 236888 2088 740}"
-OUT_DIR="${OUT_DIR:-/tmp/termite-metal-gemma4-prefill-frame-test}"
+ANTFLY_BIN="${ANTFLY_BIN:-$PKG_DIR/zig-out/bin/antfly}"
+MODEL_DIR="${ANTFLY_INFERENCE_GEMMA4_MODEL:-$HOME/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf}"
+PROMPT="${ANTFLY_INFERENCE_GEMMA4_PREFILL_PROMPT:-hi}"
+MAX_TOKENS="${ANTFLY_INFERENCE_GEMMA4_PREFILL_MAX_TOKENS:-4}"
+EXPECTED_TOKEN_IDS="${ANTFLY_INFERENCE_GEMMA4_EXPECTED_TOKEN_IDS:-10979 236888 2088 740}"
+OUT_DIR="${OUT_DIR:-/tmp/antfly-inference-metal-gemma4-prefill-frame-test}"
 
-if [[ ! -x "$TERMITE_BIN" ]]; then
-  echo "termite binary not executable: $TERMITE_BIN" >&2
+if [[ ! -x "$ANTFLY_BIN" ]]; then
+  echo "antfly binary not executable: $ANTFLY_BIN" >&2
   echo "build it first, for example: cd pkg/inference && zig build -Doptimize=ReleaseFast -Dmetal=true -Dmlx=false -Donnx=false -Dpjrt=false" >&2
   exit 2
 fi
 
 if [[ ! -d "$MODEL_DIR" ]]; then
   echo "Gemma4 model directory not found: $MODEL_DIR" >&2
-  echo "set TERMITE_GEMMA4_MODEL to the local GGUF model directory" >&2
+  echo "set ANTFLY_INFERENCE_GEMMA4_MODEL to the local GGUF model directory" >&2
   exit 2
 fi
 
@@ -46,7 +46,7 @@ run_case() {
   echo "running $label..." >&2
   (
     cd "$ROOT_DIR"
-    "$@" "$TERMITE_BIN" generate "$MODEL_DIR" "$PROMPT" \
+    "$@" "$ANTFLY_BIN" inference generate "$MODEL_DIR" "$PROMPT" \
       --backend metal \
       --max-tokens "$MAX_TOKENS" \
       --print-token-ids \

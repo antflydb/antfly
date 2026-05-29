@@ -51,7 +51,7 @@ pub fn isMultiStageModelDir(allocator: std.mem.Allocator, model_dir: []const u8)
 }
 
 pub fn loadFromDir(allocator: std.mem.Allocator, model_dir: []const u8) !MultiStageMetadata {
-    const path = try std.fmt.allocPrint(allocator, "{s}/termite_metadata.json", .{model_dir});
+    const path = try std.fmt.allocPrint(allocator, "{s}/antfly_metadata.json", .{model_dir});
     defer allocator.free(path);
 
     const bytes = try c_file.readFile(allocator, path);
@@ -137,7 +137,7 @@ test "parses multistage reader metadata" {
     defer dir.cleanup();
 
     try dir.dir.writeFile(std.testing.io, .{
-        .sub_path = "termite_metadata.json",
+        .sub_path = "antfly_metadata.json",
         .data =
         \\{
         \\  "model_type": "paddleocr",
@@ -179,7 +179,7 @@ test "parses vision2seq recognition stage metadata" {
     defer dir.cleanup();
 
     try dir.dir.writeFile(std.testing.io, .{
-        .sub_path = "termite_metadata.json",
+        .sub_path = "antfly_metadata.json",
         .data =
         \\{
         \\  "model_type": "surya",

@@ -18,12 +18,12 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
-model_dir="${TERMITE_RERANK_MODEL_DIR:-/Users/tim/.cache/bge-reranker-base}"
-tokenizer_dir="${TERMITE_RERANK_TOKENIZER_DIR:-$model_dir}"
-query="${TERMITE_RERANK_QUERY:-what is termite zig}"
-document="${TERMITE_RERANK_DOCUMENT:-termite is a zig inference server with native model runtimes}"
-tolerance="${TERMITE_RERANK_SCORE_TOLERANCE:-0.0005}"
-world_size="${TERMITE_RERANK_TP_WORLD_SIZE:-2}"
+model_dir="${ANTFLY_INFERENCE_RERANK_MODEL_DIR:-/Users/tim/.cache/bge-reranker-base}"
+tokenizer_dir="${ANTFLY_INFERENCE_RERANK_TOKENIZER_DIR:-$model_dir}"
+query="${ANTFLY_INFERENCE_RERANK_QUERY:-what is Antfly inference}"
+document="${ANTFLY_INFERENCE_RERANK_DOCUMENT:-Antfly inference is a Zig inference runtime with native model runtimes}"
+tolerance="${ANTFLY_INFERENCE_RERANK_SCORE_TOLERANCE:-0.0005}"
+world_size="${ANTFLY_INFERENCE_RERANK_TP_WORLD_SIZE:-2}"
 
 if [[ ! -f "$model_dir/model.safetensors" ]]; then
   echo "missing model weights at $model_dir/model.safetensors" >&2
@@ -35,13 +35,13 @@ if [[ ! -f "$tokenizer_dir/tokenizer.json" ]]; then
   exit 1
 fi
 
-ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache-termite-rerank-probe \
-ZIG_LOCAL_CACHE_DIR=/tmp/zig-local-cache-termite-rerank-probe \
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache-antfly-inference-rerank-probe \
+ZIG_LOCAL_CACHE_DIR=/tmp/zig-local-cache-antfly-inference-rerank-probe \
 zigup run master build probe-cross-encoder-rerank
 
 blas_output="$({
-  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache-termite-rerank-probe \
-  ZIG_LOCAL_CACHE_DIR=/tmp/zig-local-cache-termite-rerank-probe \
+  ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache-antfly-inference-rerank-probe \
+  ZIG_LOCAL_CACHE_DIR=/tmp/zig-local-cache-antfly-inference-rerank-probe \
   ./zig-out/bin/probe-cross-encoder-rerank \
     "$model_dir" \
     "$query" \
@@ -57,7 +57,7 @@ grep -q '^score=' <<<"$blas_output"
 
 blas_score="$(awk -F= '/^score=/{print $2}' <<<"$blas_output" | tail -n1)"
 
-tmpdir="$(mktemp -d /tmp/termite-rerank-tp.XXXXXX)"
+tmpdir="$(mktemp -d /tmp/antfly-inference-rerank-tp.XXXXXX)"
 trap 'rm -rf "$tmpdir"' EXIT
 hostfile="$tmpdir/hosts.json"
 {
@@ -85,8 +85,8 @@ for ((rank=0; rank<world_size; rank++)); do
     export MLX_RANK="$rank"
     export MLX_HOSTFILE="$hostfile"
     export TERMITE_MLX_ALLOW_CPU_STREAM_WITHOUT_METAL=1
-    ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache-termite-rerank-probe \
-    ZIG_LOCAL_CACHE_DIR=/tmp/zig-local-cache-termite-rerank-probe \
+    ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache-antfly-inference-rerank-probe \
+    ZIG_LOCAL_CACHE_DIR=/tmp/zig-local-cache-antfly-inference-rerank-probe \
     ./zig-out/bin/probe-cross-encoder-rerank \
       "$model_dir" \
       "$query" \

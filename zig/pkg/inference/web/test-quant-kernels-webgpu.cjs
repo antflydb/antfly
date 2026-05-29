@@ -45,14 +45,14 @@ for (const key of Object.keys(pkg)) {
   if (key.startsWith('GPU')) globalThis[key] = pkg[key];
 }
 
-const TERMITE_ROOT = path.resolve(__dirname, '..');
+const INFERENCE_ROOT = path.resolve(__dirname, '..');
 const SHADERS_DIR = path.join(__dirname, 'shaders');
 
 // Locate the helper binary in either of the two places `zig build dequant-cli`
 // might leave it.
 const DEQUANT_CANDIDATES = [
-  path.join(TERMITE_ROOT, 'zig-out/bin/dequant_cli'),
-  path.join(TERMITE_ROOT, 'scripts/dequant_cli'),
+  path.join(INFERENCE_ROOT, 'zig-out/bin/dequant_cli'),
+  path.join(INFERENCE_ROOT, 'scripts/dequant_cli'),
 ];
 const DEQUANT_CLI = DEQUANT_CANDIDATES.find((p) => fs.existsSync(p));
 if (!DEQUANT_CLI) {

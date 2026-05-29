@@ -21,7 +21,7 @@ const TransposeAttrs = ml.graph.node.TransposeAttrs;
 /// Return the effective transpose permutation.
 ///
 /// ONNX represents a missing `perm` attribute as an empty permutation, which
-/// means "reverse all axes". Termite's graph stores that as `num_axes == 0`.
+/// means "reverse all axes". Antfly inference graph stores that as `num_axes == 0`.
 pub fn effectivePerm(attrs: TransposeAttrs, rank: usize, buf: *[max_rank]u8) []const u8 {
     if (attrs.num_axes != 0) {
         @memcpy(buf[0..attrs.num_axes], attrs.perm[0..attrs.num_axes]);

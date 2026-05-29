@@ -46,7 +46,7 @@ fn isClipclapModelDir(allocator: Allocator, model_dir: []const u8) !bool {
     var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
     defer manifest.deinit();
     return std.mem.eql(u8, manifest.config_model_arch, "clipclap") or
-        std.mem.eql(u8, manifest.termite_bundle_family, "clipclap_gguf_bundle/v1");
+        std.mem.eql(u8, manifest.inference_bundle_family, "clipclap_gguf_bundle/v1");
 }
 
 fn runExportGguf(allocator: Allocator, io: std.Io, opts: options.Options, base_args: []const []const u8) !void {

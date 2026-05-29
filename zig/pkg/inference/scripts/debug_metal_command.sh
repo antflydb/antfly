@@ -32,28 +32,28 @@ SAMPLE_INTERVAL_MS="${SAMPLE_INTERVAL_MS:-5}"
 WATCH_PATTERN="${WATCH_PATTERN:-}"
 RUN_CWD="${RUN_CWD:-$CALLER_DIR}"
 LABEL="${LABEL:-metal-command}"
-ALLOW_BROAD_METAL_TEST="${TERMITE_ALLOW_BROAD_METAL_TEST:-0}"
-ALLOW_BROAD_METAL_UNIT_CHUNK="${TERMITE_ALLOW_BROAD_METAL_UNIT_CHUNK:-0}"
-SKIP_POSTCAPTURE="${TERMITE_METAL_SKIP_POSTCAPTURE:-0}"
+ALLOW_BROAD_METAL_TEST="${ANTFLY_INFERENCE_ALLOW_BROAD_METAL_TEST:-0}"
+ALLOW_BROAD_METAL_UNIT_CHUNK="${ANTFLY_INFERENCE_ALLOW_BROAD_METAL_UNIT_CHUNK:-0}"
+SKIP_POSTCAPTURE="${ANTFLY_INFERENCE_METAL_SKIP_POSTCAPTURE:-0}"
 PREBUILD_ONLY="${PREBUILD_ONLY:-0}"
 LAUNCH_ONLY="${LAUNCH_ONLY:-0}"
-LAUNCH_ONLY_FILTER="${LAUNCH_ONLY_FILTER:-__termite_no_matching_tests__}"
+LAUNCH_ONLY_FILTER="${LAUNCH_ONLY_FILTER:-__antfly_inference_no_matching_tests__}"
 PREBUILT_TEST_BINARY="${PREBUILT_TEST_BINARY:-}"
-SYNC_MARKERS="${TERMITE_METAL_SYNC_MARKERS:-1}"
+SYNC_MARKERS="${ANTFLY_INFERENCE_METAL_SYNC_MARKERS:-1}"
 REVERSE_TESTS="${REVERSE_TESTS:-0}"
 TEST_OFFSET="${TEST_OFFSET:-0}"
 TEST_LIMIT="${TEST_LIMIT:-0}"
-RUNTIME_CURRENT_FILE="${TERMITE_TEST_CURRENT_FILE:-}"
-RUNTIME_TRACE_FILE="${TERMITE_TEST_TRACE_FILE:-}"
-RUNTIME_TEST_OFFSET="${TERMITE_TEST_RUNTIME_OFFSET:-}"
-RUNTIME_TEST_LIMIT="${TERMITE_TEST_RUNTIME_LIMIT:-}"
+RUNTIME_CURRENT_FILE="${ANTFLY_INFERENCE_TEST_CURRENT_FILE:-}"
+RUNTIME_TRACE_FILE="${ANTFLY_INFERENCE_TEST_TRACE_FILE:-}"
+RUNTIME_TEST_OFFSET="${ANTFLY_INFERENCE_TEST_RUNTIME_OFFSET:-}"
+RUNTIME_TEST_LIMIT="${ANTFLY_INFERENCE_TEST_RUNTIME_LIMIT:-}"
 
 usage() {
   cat >&2 <<EOF
 Usage:
   bash pkg/inference/scripts/debug_metal_command.sh command [options] -- <command> [args...]
   bash pkg/inference/scripts/debug_metal_command.sh -- <command> [args...]
-  bash pkg/inference/scripts/debug_metal_command.sh embed [options] -- <termite embed args...>
+  bash pkg/inference/scripts/debug_metal_command.sh embed [options] -- <antfly inference embed args...>
   bash pkg/inference/scripts/debug_metal_command.sh e2e [options] [pytest -k expression]
   bash pkg/inference/scripts/debug_metal_command.sh unit [options] [test-name-regex]
 
@@ -83,38 +83,38 @@ Unit mode environment:
   TEST_OFFSET=N         Skip the first N matched tests after optional reversal.
   TEST_LIMIT=N          Run at most N matched tests after optional offset. Use
                         0 for no limit.
-  TERMITE_TEST_RUNTIME_OFFSET=N
+  ANTFLY_INFERENCE_TEST_RUNTIME_OFFSET=N
                         Skip the first N tests in the Zig runner's selected
                         builtin order, inside the test process.
-  TERMITE_TEST_RUNTIME_LIMIT=N
+  ANTFLY_INFERENCE_TEST_RUNTIME_LIMIT=N
                         Run at most N tests in the Zig runner's selected
                         builtin order, inside the test process.
-  TERMITE_TEST_TRACE_FILE=PATH
+  ANTFLY_INFERENCE_TEST_TRACE_FILE=PATH
                         Append and fsync each test start inside the Zig test
                         runner. Unit mode sets this automatically.
   RESUME=1              Resume an existing --out-dir, skipping PASS entries
   RESUME_SKIP_CURRENT=1 Also skip current_test.txt from an interrupted run
                         (default when RESUME=1)
-  TERMITE_METAL_SKIP_POSTCAPTURE=1
+  ANTFLY_INFERENCE_METAL_SKIP_POSTCAPTURE=1
                         Skip log-show and diagnostic report copying after a
                         command exits. Useful for watchdog bisection when the
                         per-test stdout/exit status and progress markers are
                         enough.
-  TERMITE_METAL_SYNC_MARKERS=0
+  ANTFLY_INFERENCE_METAL_SYNC_MARKERS=0
                         Do not call sync after updating debug breadcrumbs.
-  TERMITE_ALLOW_BROAD_METAL_TEST=1
+  ANTFLY_INFERENCE_ALLOW_BROAD_METAL_TEST=1
                         Override the safety guard that refuses unfiltered
                         "zig build test" in command mode.
-  TERMITE_ALLOW_BROAD_METAL_UNIT_CHUNK=1
+  ANTFLY_INFERENCE_ALLOW_BROAD_METAL_UNIT_CHUNK=1
                         Override the safety guard that refuses running every
                         matched Metal unit test in one chunk/process.
 
 Examples:
   bash pkg/inference/scripts/debug_metal_command.sh unit 'metal_compute|metal_runtime'
   LIST_ONLY=1 bash pkg/inference/scripts/debug_metal_command.sh unit 'MetalTensor|ReservedHiddenCarrier'
-  bash pkg/inference/scripts/debug_metal_command.sh embed -- ~/.termite/models/antflydb/clipclap --text 'hello world'
+  bash pkg/inference/scripts/debug_metal_command.sh embed -- ~/.antfly/inference/models/antflydb/clipclap --text 'hello world'
   bash pkg/inference/scripts/debug_metal_command.sh e2e test_audio_embedding
-  bash pkg/inference/scripts/debug_metal_command.sh command -- ./zig-out/bin/termite --help
+  bash pkg/inference/scripts/debug_metal_command.sh command -- ./zig-out/bin/antfly inference --help
 EOF
 }
 
@@ -180,7 +180,7 @@ is_broad_zig_build_test_command() {
   if [[ "$1" != "zig" || "$2" != "build" ]]; then
     return 1
   fi
-  if [[ "$3" != "test" && "$3" != "termite-test" ]]; then
+  if [[ "$3" != "test" ]]; then
     return 1
   fi
   if is_filtered_zig_test_command "$@"; then
@@ -197,8 +197,7 @@ refuse_broad_zig_test_if_needed() {
     return 0
   fi
   cat >&2 <<EOF
-Refusing unfiltered "zig build test" or "zig build termite-test" through the
-Metal debug wrapper.
+Refusing unfiltered "zig build test" through the Metal debug wrapper.
 
 The broad test target can launch many Metal runtime tests in one process and
 has previously produced a system watchdog reboot without preserving the failing
@@ -207,7 +206,7 @@ test name. Use the unit isolator instead:
   LIST_ONLY=1 bash pkg/inference/scripts/debug_metal_command.sh unit 'metal|Metal'
   RUN_MODE=isolated USE_PREBUILT_UNIT=1 bash pkg/inference/scripts/debug_metal_command.sh unit --api-validate 'metal|Metal'
 
-To override intentionally, set TERMITE_ALLOW_BROAD_METAL_TEST=1.
+To override intentionally, set ANTFLY_INFERENCE_ALLOW_BROAD_METAL_TEST=1.
 EOF
   return 126
 }
@@ -239,7 +238,7 @@ Command:
 $(cat "$OUT_DIR/command.txt")
 
 Use unit mode so each test or chunk gets its own bundle and progress marker.
-Override with TERMITE_ALLOW_BROAD_METAL_TEST=1 only when deliberately running
+Override with ANTFLY_INFERENCE_ALLOW_BROAD_METAL_TEST=1 only when deliberately running
 the full suite.
 EOF
     echo "$refused_status" >"$OUT_DIR/exitcode.txt"
@@ -354,26 +353,26 @@ EOF
 
   set +e
   if [[ "$METAL_VALIDATE" == "1" && "$METAL_SHADER_VALIDATE" == "1" ]]; then
-    TERMITE_TEST_CURRENT_FILE="$RUNTIME_CURRENT_FILE" \
-    TERMITE_TEST_TRACE_FILE="$RUNTIME_TRACE_FILE" \
-    TERMITE_TEST_RUNTIME_OFFSET="$RUNTIME_TEST_OFFSET" \
-    TERMITE_TEST_RUNTIME_LIMIT="$RUNTIME_TEST_LIMIT" \
+    ANTFLY_INFERENCE_TEST_CURRENT_FILE="$RUNTIME_CURRENT_FILE" \
+    ANTFLY_INFERENCE_TEST_TRACE_FILE="$RUNTIME_TRACE_FILE" \
+    ANTFLY_INFERENCE_TEST_RUNTIME_OFFSET="$RUNTIME_TEST_OFFSET" \
+    ANTFLY_INFERENCE_TEST_RUNTIME_LIMIT="$RUNTIME_TEST_LIMIT" \
     MTL_DEBUG_LAYER=1 \
     MTL_SHADER_VALIDATION=1 \
     "$@" >"$OUT_DIR/stdout.txt" 2>&1 &
   elif [[ "$METAL_VALIDATE" == "1" ]]; then
-    TERMITE_TEST_CURRENT_FILE="$RUNTIME_CURRENT_FILE" \
-    TERMITE_TEST_TRACE_FILE="$RUNTIME_TRACE_FILE" \
-    TERMITE_TEST_RUNTIME_OFFSET="$RUNTIME_TEST_OFFSET" \
-    TERMITE_TEST_RUNTIME_LIMIT="$RUNTIME_TEST_LIMIT" \
+    ANTFLY_INFERENCE_TEST_CURRENT_FILE="$RUNTIME_CURRENT_FILE" \
+    ANTFLY_INFERENCE_TEST_TRACE_FILE="$RUNTIME_TRACE_FILE" \
+    ANTFLY_INFERENCE_TEST_RUNTIME_OFFSET="$RUNTIME_TEST_OFFSET" \
+    ANTFLY_INFERENCE_TEST_RUNTIME_LIMIT="$RUNTIME_TEST_LIMIT" \
     MTL_DEBUG_LAYER=1 \
     env -u MTL_SHADER_VALIDATION \
     "$@" >"$OUT_DIR/stdout.txt" 2>&1 &
   else
-    TERMITE_TEST_CURRENT_FILE="$RUNTIME_CURRENT_FILE" \
-    TERMITE_TEST_TRACE_FILE="$RUNTIME_TRACE_FILE" \
-    TERMITE_TEST_RUNTIME_OFFSET="$RUNTIME_TEST_OFFSET" \
-    TERMITE_TEST_RUNTIME_LIMIT="$RUNTIME_TEST_LIMIT" \
+    ANTFLY_INFERENCE_TEST_CURRENT_FILE="$RUNTIME_CURRENT_FILE" \
+    ANTFLY_INFERENCE_TEST_TRACE_FILE="$RUNTIME_TRACE_FILE" \
+    ANTFLY_INFERENCE_TEST_RUNTIME_OFFSET="$RUNTIME_TEST_OFFSET" \
+    ANTFLY_INFERENCE_TEST_RUNTIME_LIMIT="$RUNTIME_TEST_LIMIT" \
     env -u MTL_DEBUG_LAYER -u MTL_SHADER_VALIDATION \
     "$@" >"$OUT_DIR/stdout.txt" 2>&1 &
   fi
@@ -427,7 +426,7 @@ EOF
     --style compact \
     --start "$start_local" \
     --predicate '
-      process == "termite" OR
+      process == "antfly" OR
       process == "test" OR
       process == "WindowServer" OR
       senderImagePath CONTAINS[c] "AGX" OR
@@ -586,7 +585,7 @@ run_embed_mode() {
     esac
   done
 
-  run_capture ./zig-out/bin/termite embed "${normalized_args[@]}" --backend metal
+  run_capture ./zig-out/bin/antfly inference embed "${normalized_args[@]}" --backend metal
 }
 
 run_e2e_mode() {
@@ -594,7 +593,7 @@ run_e2e_mode() {
     LABEL="metal-e2e"
   fi
   RUN_CWD="$ROOT_DIR"
-  WATCH_PATTERN="${WATCH_PATTERN:-termite run --host 127.0.0.1}"
+  WATCH_PATTERN="${WATCH_PATTERN:-antfly inference run --host 127.0.0.1}"
 
   local test_expr="test_mixed_text_image_batch"
   while [[ "$#" -gt 0 ]]; do
@@ -657,8 +656,8 @@ run_e2e_mode() {
   fi
 
   run_capture env \
-    TERMITE_PREFERRED_BACKEND=metal \
-    TERMITE_BIN=./pkg/inference/zig-out/bin/termite \
+    ANTFLY_INFERENCE_PREFERRED_BACKEND=metal \
+    ANTFLY_BIN=./zig-out/bin/antfly \
     uv run --project e2e/inference \
     pytest -q -s -c e2e/inference/pyproject.toml e2e/inference/test_embed.py -k "$test_expr"
 }
@@ -795,7 +794,7 @@ prebuild_unit_test_binary() {
   local test_binary
   test_binary="$(find_newest_test_binary "$stamp_file")"
   if [[ -z "$test_binary" || ! -x "$test_binary" ]]; then
-    test_binary="$PKG_DIR/zig-out/bin/termite-tests"
+    test_binary="$PKG_DIR/zig-out/bin/antfly-inference-tests"
   fi
   if [[ -z "$test_binary" || ! -x "$test_binary" ]]; then
     test_binary="$(find_newest_test_binary "$stamp_file" 0)"
@@ -823,7 +822,7 @@ refresh_unit_tests_from_prebuilt_binary() {
   local all_tests_file="$unit_out_dir/runtime-tests-all.txt"
   local refreshed_file="$unit_out_dir/runtime-tests-selected.txt"
 
-  TERMITE_TEST_LIST_FILE="$all_tests_file" "$test_binary"
+  ANTFLY_INFERENCE_TEST_LIST_FILE="$all_tests_file" "$test_binary"
   rg "$test_name_regex" "$all_tests_file" >"$refreshed_file"
   mv "$refreshed_file" "$test_list_file"
   flush_debug_markers
@@ -898,7 +897,7 @@ run_unit_mode() {
   local use_prebuilt="${USE_PREBUILT_UNIT:-1}"
   local prebuild_only="${PREBUILD_ONLY:-0}"
   local launch_only="${LAUNCH_ONLY:-0}"
-  local launch_only_filter="${LAUNCH_ONLY_FILTER:-__termite_no_matching_tests__}"
+  local launch_only_filter="${LAUNCH_ONLY_FILTER:-__antfly_inference_no_matching_tests__}"
   local prebuilt_test_binary_env="${PREBUILT_TEST_BINARY:-}"
   local reverse_tests="${REVERSE_TESTS:-0}"
   local test_offset="${TEST_OFFSET:-0}"
@@ -1078,7 +1077,7 @@ This would run every selected Metal unit test in one process, which can lose the
 failing test name if the system watchdog resets. Use isolated mode or smaller
 chunks, then resume from progress.tsv after a reboot.
 
-Override intentionally with TERMITE_ALLOW_BROAD_METAL_UNIT_CHUNK=1.
+Override intentionally with ANTFLY_INFERENCE_ALLOW_BROAD_METAL_UNIT_CHUNK=1.
 EOF
     echo "Refusing unsafe broad Metal unit chunk. Details: $unit_out_dir/refused.txt" >&2
     flush_debug_markers

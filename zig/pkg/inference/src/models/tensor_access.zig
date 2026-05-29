@@ -881,7 +881,7 @@ fn appendString(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8),
 }
 
 fn testScratchDir(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    const root = try std.fmt.allocPrint(allocator, "termite-model-tests-{d}", .{std.posix.system.getpid()});
+    const root = try std.fmt.allocPrint(allocator, "antfly-inference-model-tests-{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
     const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", root, name });
     errdefer allocator.free(dir_path);

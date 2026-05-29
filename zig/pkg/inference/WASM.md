@@ -53,7 +53,7 @@ targets:
 - native Dawn WebGPU: Antfly inference stays a native binary and links Dawn's WebGPU C
   API, using Dawn to target Metal, Vulkan, or D3D12 under the hood
 
-Do not link Chromium into the `termite` binary for this path. Chromium/Electron
+Do not link Chromium into the Antfly inference binary for this path. Chromium/Electron
 remains the hosted app or sidecar path. The native CLI backend should link Dawn
 directly.
 
@@ -104,7 +104,7 @@ Files to update:
 |---|---|
 | `src/backends/backends.zig` | Add `BackendType.dawn` or map native Dawn to a `webgpu` backend type; include availability, priority, and direct session loading. |
 | `src/native_backend_choice.zig` | Allow `webgpu` on native builds when `enable_dawn` is true, or add an explicit `dawn` choice. |
-| `src/termite.zig` / `src/termite_internal.zig` | Import the native Dawn compute/backend modules when enabled. |
+| `src/inference.zig` / `src/inference_internal.zig` | Import the native Dawn compute/backend modules when enabled. |
 | `src/architectures/session_factory.zig` | Add `createDawnSession(...)`. |
 | `src/backends/session.zig` users | Ensure sessions can report the native WebGPU backend consistently. |
 | `src/native_backend_guard.zig` | Add friendly errors for Dawn not built, no adapter, no device, and unsupported platform. |
@@ -322,7 +322,7 @@ BERT (`src/architectures/bert.zig`) uses only **9 ops**:
 
 Phases 1–7 are fully implemented and working. The WASM SIMD backend runs BERT inference end-to-end in the browser.
 
-**Build**: `~/bin/zig build -Dwasm=true wasm` → `zig-out/bin/termite.wasm` (1.2 MB, ReleaseSafe)
+**Build**: `~/bin/zig build -Dwasm=true wasm` → `zig-out/bin/antfly-inference.wasm` (1.2 MB, ReleaseSafe)
 
 **What was built:**
 
@@ -471,7 +471,7 @@ const gpu = new WebGPUOps();
 await gpu.init();
 
 const t = new InferenceWeb();
-await t.init('termite.wasm', { gpu, worker: true });
+await t.init('antfly-inference.wasm', { gpu, worker: true });
 
 const model = await t.loadModel('model.gguf', config);
 const emb = await t.embed(model, ids, mask, 1, 128);  // async in worker mode
@@ -481,7 +481,7 @@ const emb = await t.embed(model, ids, mask, 1, 128);  // async in worker mode
 
 ```javascript
 const t = new InferenceWeb();
-await t.init('termite.wasm');  // no gpu, no worker — pure SIMD
+await t.init('antfly-inference.wasm');  // no gpu, no worker — pure SIMD
 const emb = t.embed(model, ids, mask, 1, 128);  // sync
 ```
 
@@ -561,10 +561,10 @@ GPU shader dispatch for the bottleneck ops added in Phases 10-13.
 
 ### Phase 15: ONNX Runtime Web Integration ✅ COMPLETE
 
-Optional support for running ONNX-only models (e.g. mxbai-rerank-base-v1) alongside native `termite.wasm`. Purely JS-side — no Zig changes needed.
+Optional support for running ONNX-only models (e.g. mxbai-rerank-base-v1) alongside native `antfly-inference.wasm`. Purely JS-side — no Zig changes needed.
 
 **Architecture:** Two independent WASM modules on the same page:
-- `termite.wasm` (~1.2 MB) — native Zig backend for SafeTensors/GGUF models
+- `antfly-inference.wasm` (~1.2 MB) — native Zig backend for SafeTensors/GGUF models
 - `ort-wasm-simd-threaded.wasm` (~6 MB gzipped) — pre-built ONNX Runtime from npm `onnxruntime-web`
 
 **JS API (lazy, optional — zero cost if not used):**
@@ -576,7 +576,7 @@ Optional support for running ONNX-only models (e.g. mxbai-rerank-base-v1) alongs
 ```javascript
 import * as ort from 'onnxruntime-web';
 const t = new InferenceWeb();
-await t.init('termite.wasm');
+await t.init('antfly-inference.wasm');
 await t.initOnnx(ort, { wasmPaths: '/wasm/' });
 const session = await t.loadOnnxModel('reranker.onnx', {
   executionProviders: ['webgpu', 'wasm'],
@@ -868,7 +868,7 @@ Fixed out-of-bounds crashes when running models stored as float16 (e.g., Florenc
 | `build.zig` | `enable_wasm` option, WASM executable target with ReleaseSafe, tokenizer modules |
 | `src/backends/backends.zig` | `.wasm` backend enum, system deps guarded behind `!enable_wasm` |
 | `src/ops/ops.zig` | `.wasm` added to `BackendKind` |
-| `src/termite.zig` | Conditional `wasm_compute` import |
+| `src/inference.zig` | Conditional `wasm_compute` import |
 | `src/backends/native.zig` | Target-aware SIMD vector width (4-wide on wasm32, 8-wide native) |
 | `src/backends/activations.zig` | Target-aware SIMD vector width |
 | `src/models/bert.zig` | `num_labels` field for reranker config |
@@ -890,7 +890,7 @@ Architecture code (`bert.zig`, `clip.zig`, `whisper.zig`, `clap.zig`, `florence.
 | `src/ops/wasm_compute.zig` | ComputeBackend VTable — all ops via WASM SIMD, optional GPU dispatch |
 | `src/ops/wasm_extern.zig` | Extern declarations for WebGPU JS bridge (matmul, attention, causal attention, cross attention) |
 | `web/inference-web.js` | JS glue, `InferenceWeb` class — direct/worker mode, all model APIs, optional ONNX |
-| `web/test-wasm-path.mjs` | Shared test helper for resolving `termite-wasm32.wasm` / `termite-wasm64.wasm` with legacy fallback |
+| `web/test-wasm-path.mjs` | Shared test helper for resolving `antfly-inference-wasm32.wasm` / `antfly-inference-wasm64.wasm` with legacy fallback |
 | `web/test-wasm-runtime.mjs` | Shared Node test helper for ABI-safe WASM instantiation, alloc/free, and typed-array access |
 | `web/webgpu-ops.js` | `WebGPUOps` class — device init, 5 shader pipelines, compute dispatch, worker handler |
 | `web/inference-worker.js` | Web Worker for WASM with sync GPU downloads via `Atomics.wait()`, ONNX handlers |
@@ -1164,8 +1164,8 @@ Current status:
 - T5 encoder-decoder loading / encode / decode / cached-decode has started moving out of `src/wasm_entry.zig` into `src/web/t5_api.zig`
 - the export surface is now split into `src/web/exports_core.zig` and `src/web/exports_generation.zig`, with `src/wasm_entry.zig` reduced to a thin freestanding root that imports those shims
 - build-time profile selection now uses explicit `src/wasm_entry_wasm32.zig` / `src/wasm_entry_wasm64.zig` roots and `src/web/exports_wasm32.zig` / `src/web/exports_wasm64.zig` shims instead of a single generic root
-- the build now emits `zig-out/bin/termite-wasm32.wasm` and `zig-out/bin/termite-wasm64.wasm`; the `wasm32` build also installs `zig-out/bin/termite.wasm` as a compatibility alias
-- `web/inference-web.js` and `web/inference-worker.js` now understand profile-specific artifact names, default `wasmMemoryModel` to `auto`, probe `memory64` support before instantiation, and fall back from `termite-wasm64.wasm` / `termite-wasm32.wasm` to legacy `termite.wasm`
+- the build now emits `zig-out/bin/antfly-inference-wasm32.wasm` and `zig-out/bin/antfly-inference-wasm64.wasm`; the `wasm32` build also installs `zig-out/bin/antfly-inference.wasm` as a compatibility alias
+- `web/inference-web.js` and `web/inference-worker.js` now understand profile-specific artifact names, default `wasmMemoryModel` to `auto`, probe `memory64` support before instantiation, and fall back from `antfly-inference-wasm64.wasm` / `antfly-inference-wasm32.wasm` to legacy `antfly-inference.wasm`
 - the local Node-based wasm tests now share `web/test-wasm-path.mjs`, which resolves profile-specific artifacts first and can be steered with `ANTFLY_INFERENCE_WASM_MEMORY_MODEL=wasm32|wasm64`
 - the raw Node tests now share `web/test-wasm-runtime.mjs`, including `test-wasm.mjs`, `test-t5-wasm.mjs`, `test-mt5-wasm.mjs`, `test-rerank-wasm.mjs`, `test-gpt-wasm.mjs`, `test-gliner-wasm.mjs`, `test-clip-wasm.mjs`, `test-whisper-wasm.mjs`, `test-clap-wasm.mjs`, `test-florence-wasm.mjs`, `test-gemma3-q4-wasm.mjs`, and `test-gemma3-vision-wasm.mjs`, so their alloc/free, pointer sizes, and typed-array views are ABI-safe for both `wasm32` and `wasm64`
 - `web/runtime/safetensors-stream.js` now provides the true header-first SafeTensors streaming path for `streamLoadGptModel()`, and both `web/inference-web.js` and `web/inference-worker.js` use it to register one weight at a time from the fetch stream instead of concatenating the entire file before load
@@ -1297,7 +1297,7 @@ The current Electron shell is intentionally thin. It exists to give the existing
 
 ## Verification
 
-1. **Build**: `~/bin/zig build -Dwasm=true wasm` → `zig-out/bin/termite.wasm` (~1.2 MB, ReleaseSafe)
+1. **Build**: `~/bin/zig build -Dwasm=true wasm` → `zig-out/bin/antfly-inference.wasm` (~1.2 MB, ReleaseSafe)
 2. **Build (WebGPU)**: `~/bin/zig build -Dwasm=true -Dwebgpu=true wasm`
 3. **Build (Experimental wasm64 target)**: `~/bin/zig build -Dwasm=true -Dwasm-memory-model=wasm64 wasm`
 4. **E2E tests** (all pass for the current wasm32 path):

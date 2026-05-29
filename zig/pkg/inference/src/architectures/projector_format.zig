@@ -21,7 +21,7 @@ const compat = @import("../io/compat.zig");
 
 pub const Kind = enum {
     unknown,
-    termite_gemma3,
+    antfly_gemma3,
     clip_gemma4_image,
     clip_gemma4_audio,
     clip_gemma4_image_audio,
@@ -43,9 +43,9 @@ pub fn detectFile(file: *const gguf_format.File) Kind {
     const view = gguf_metadata.View.init(file);
     const arch = view.getString("general.architecture") orelse return .unknown;
 
-    if (std.mem.eql(u8, arch, "termite-projector")) {
+    if (std.mem.eql(u8, arch, "antfly-projector")) {
         const source_arch = view.getString("inference.projector.source_architecture") orelse return .unknown;
-        if (std.mem.eql(u8, source_arch, "gemma3")) return .termite_gemma3;
+        if (std.mem.eql(u8, source_arch, "gemma3")) return .antfly_gemma3;
         return .unknown;
     }
 
@@ -66,8 +66,8 @@ pub fn detectFile(file: *const gguf_format.File) Kind {
     return .unknown;
 }
 
-pub fn isTermite(kind: Kind) bool {
-    return kind == .termite_gemma3;
+pub fn isAntfly(kind: Kind) bool {
+    return kind == .antfly_gemma3;
 }
 
 pub fn isClip(kind: Kind) bool {
@@ -79,24 +79,24 @@ pub fn isClip(kind: Kind) bool {
 
 test "detect termite gemma3 projector" {
     const allocator = std.testing.allocator;
-    const path = try std.fs.path.join(allocator, &.{ "/tmp", "termite-projector-format-gemma3.gguf" });
+    const path = try std.fs.path.join(allocator, &.{ "/tmp", "antfly-projector-format-gemma3.gguf" });
     defer allocator.free(path);
     defer compat.cwd().deleteFile(compat.io(), path) catch {};
 
     const metadata = [_]gguf_mod.format.MetadataEntry{
-        .{ .key = "general.architecture", .value = .{ .string = "termite-projector" } },
+        .{ .key = "general.architecture", .value = .{ .string = "antfly-projector" } },
         .{ .key = "inference.projector.source_architecture", .value = .{ .string = "gemma3" } },
     };
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = layout.header_bytes });
 
-    try std.testing.expectEqual(Kind.termite_gemma3, try detectPath(allocator, path));
+    try std.testing.expectEqual(Kind.antfly_gemma3, try detectPath(allocator, path));
 }
 
 test "detect clip gemma4 image projector" {
     const allocator = std.testing.allocator;
-    const path = try std.fs.path.join(allocator, &.{ "/tmp", "termite-projector-format-clip-image.gguf" });
+    const path = try std.fs.path.join(allocator, &.{ "/tmp", "antfly-projector-format-clip-image.gguf" });
     defer allocator.free(path);
     defer compat.cwd().deleteFile(compat.io(), path) catch {};
 
@@ -113,7 +113,7 @@ test "detect clip gemma4 image projector" {
 
 test "detect unknown projector metadata" {
     const allocator = std.testing.allocator;
-    const path = try std.fs.path.join(allocator, &.{ "/tmp", "termite-projector-format-unknown.gguf" });
+    const path = try std.fs.path.join(allocator, &.{ "/tmp", "antfly-projector-format-unknown.gguf" });
     defer allocator.free(path);
     defer compat.cwd().deleteFile(compat.io(), path) catch {};
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Termite: ML inference service for embeddings, chunking, and reranking.
+// Antfly inference: ML service for embeddings, chunking, and reranking.
 // Zig implementation with ONNX Runtime, MLX, and native backends.
 
 const build_options = @import("build_options");

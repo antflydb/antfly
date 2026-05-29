@@ -88,7 +88,7 @@ Runs repeated reranks in-process on one loaded model session for BLAS and 2-rank
 Server-lifecycle benchmark:
 
 ```bash
-ANTFLY_INFERENCE_BIN=/Users/tim/Documents/af/antfly-inference-zig/zig-out/bin/termite \
+ANTFLY_BIN=/Users/tim/Documents/af/antfly-inference-zig/zig-out/bin/antfly \
 ANTFLY_INFERENCE_RERANK_SERVER_BENCH_REPEAT=4 \
 bash ./scripts/benchmark_cross_encoder_rerank_server.sh
 ```

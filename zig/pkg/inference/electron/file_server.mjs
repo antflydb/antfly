@@ -130,7 +130,7 @@ export function createStaticServer({ webRoot, getAllowedFileRoots }) {
   const normalizedWebRoot = resolve(webRoot);
   return createServer((req, res) => {
     const url = new URL(req.url || '/', 'http://localhost');
-    if (url.pathname === '/__termite__/file') {
+    if (url.pathname === '/__antfly_inference__/file') {
       const rawPath = url.searchParams.get('path');
       if (!rawPath) {
         res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });

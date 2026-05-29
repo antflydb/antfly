@@ -30,8 +30,8 @@ test('pathIsInside requires true path containment', () => {
 });
 
 test('resolveAllowedFilePath rejects paths outside allowed model roots', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'termite-models-'));
-  const outside = await mkdtemp(join(tmpdir(), 'termite-outside-'));
+  const root = await mkdtemp(join(tmpdir(), 'antfly-inference-models-'));
+  const outside = await mkdtemp(join(tmpdir(), 'antfly-inference-outside-'));
   assert.equal(resolveAllowedFilePath(join(root, 'model.gguf'), [root]), join(root, 'model.gguf'));
   assert.equal(resolveAllowedFilePath(join(outside, 'secret.txt'), [root]), null);
   assert.equal(resolveAllowedFilePath('relative.gguf', [root]), null);
@@ -40,8 +40,8 @@ test('resolveAllowedFilePath rejects paths outside allowed model roots', async (
 test('file endpoint streams only files under allowed model roots', async () => {
   const webRoot = await mkdtemp(join(tmpdir(), 'inference-web-'));
   await writeFile(join(webRoot, 'index.html'), '<!doctype html>');
-  const modelRoot = await mkdtemp(join(tmpdir(), 'termite-models-'));
-  const outsideRoot = await mkdtemp(join(tmpdir(), 'termite-outside-'));
+  const modelRoot = await mkdtemp(join(tmpdir(), 'antfly-inference-models-'));
+  const outsideRoot = await mkdtemp(join(tmpdir(), 'antfly-inference-outside-'));
   const modelPath = join(modelRoot, 'model.gguf');
   const secretPath = join(outsideRoot, 'secret.txt');
   await writeFile(modelPath, 'model-bytes');
@@ -53,11 +53,11 @@ test('file endpoint streams only files under allowed model roots', async () => {
   });
 
   await withServer(server, async (origin) => {
-    const allowed = await fetch(`${origin}/__termite__/file?path=${encodeURIComponent(modelPath)}`);
+    const allowed = await fetch(`${origin}/__antfly_inference__/file?path=${encodeURIComponent(modelPath)}`);
     assert.equal(allowed.status, 200);
     assert.equal(await allowed.text(), 'model-bytes');
 
-    const forbidden = await fetch(`${origin}/__termite__/file?path=${encodeURIComponent(secretPath)}`);
+    const forbidden = await fetch(`${origin}/__antfly_inference__/file?path=${encodeURIComponent(secretPath)}`);
     assert.equal(forbidden.status, 403);
     assert.equal(await forbidden.text(), 'Forbidden\n');
   });

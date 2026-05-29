@@ -251,11 +251,7 @@ fn graphExecDiag(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn graphNowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
-        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
-        else => return 0,
-    }
+    return platform.time.monotonicNs();
 }
 
 fn graphElapsedNs(start_ns: u64, end_ns: u64) u64 {
@@ -268,14 +264,7 @@ fn nsToMs(ns: u64) f64 {
 }
 
 fn currentResidentBytes() usize {
-    const usage = std.posix.getrusage(std.posix.rusage.SELF);
-    if (usage.maxrss <= 0) return 0;
-    const maxrss: usize = @intCast(usage.maxrss);
-    return switch (@import("builtin").os.tag) {
-        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => maxrss,
-        .linux => std.math.mul(usize, maxrss, 1024) catch std.math.maxInt(usize),
-        else => maxrss,
-    };
+    return platform.time.residentBytes();
 }
 
 /// Compute which nodes are reachable from graph outputs (walking

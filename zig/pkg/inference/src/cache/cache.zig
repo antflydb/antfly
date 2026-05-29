@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Result cache with TTL expiration and singleflight deduplication.
-// Mirrors the Go Termite caching strategy.
+// Mirrors the legacy Go inference caching strategy.
 
 const std = @import("std");
 const libc = @cImport(@cInclude("time.h"));

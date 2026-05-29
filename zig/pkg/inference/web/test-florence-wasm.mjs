@@ -26,13 +26,13 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { instantiateTermiteWasm } from './test-wasm-runtime.mjs';
+import { instantiateAntflyInferenceWasm } from './test-wasm-runtime.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, '..');
 
 // Load WASM module
-const { wasm, alloc, free, bytesIn, write, read, view, offset, size } = await instantiateTermiteWasm(root);
+const { wasm, alloc, free, bytesIn, write, read, view, offset, size } = await instantiateAntflyInferenceWasm(root);
 
 const modelDir = path.join(root, 'models', 'microsoft', 'Florence-2-base');
 const modelPath = path.join(modelDir, 'model.safetensors');

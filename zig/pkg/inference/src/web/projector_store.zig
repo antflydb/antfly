@@ -72,8 +72,8 @@ pub const ProjectorStore = struct {
 
 fn projectorFixtureBytes(allocator: std.mem.Allocator, kind: projector_format_mod.Kind) ![]u8 {
     const metadata: []const gguf_mod.format.MetadataEntry = switch (kind) {
-        .termite_gemma3 => &[_]gguf_mod.format.MetadataEntry{
-            .{ .key = "general.architecture", .value = .{ .string = "termite-projector" } },
+        .antfly_gemma3 => &[_]gguf_mod.format.MetadataEntry{
+            .{ .key = "general.architecture", .value = .{ .string = "antfly-projector" } },
             .{ .key = "inference.projector.source_architecture", .value = .{ .string = "gemma3" } },
         },
         .clip_gemma4_image => &[_]gguf_mod.format.MetadataEntry{
@@ -101,18 +101,18 @@ fn projectorFixtureBytes(allocator: std.mem.Allocator, kind: projector_format_mo
 
 test "initOwnedBytes detects termite projector and exposes compat store" {
     const allocator = std.testing.allocator;
-    const bytes = try projectorFixtureBytes(allocator, .termite_gemma3);
+    const bytes = try projectorFixtureBytes(allocator, .antfly_gemma3);
     defer allocator.free(bytes);
 
     const store = try ProjectorStore.initOwnedBytes(allocator, "fixture.mmproj.gguf", bytes);
     defer store.deinit();
 
-    try std.testing.expectEqual(projector_format_mod.Kind.termite_gemma3, store.kind);
+    try std.testing.expectEqual(projector_format_mod.Kind.antfly_gemma3, store.kind);
     try std.testing.expectEqualStrings("fixture.mmproj.gguf", store.name);
 
     var compat = store.asCompatGgufStore();
     try std.testing.expectEqualStrings("fixture.mmproj.gguf", compat.path.?);
-    try std.testing.expectEqual(projector_format_mod.Kind.termite_gemma3, projector_format_mod.detectFile(&compat.parsed));
+    try std.testing.expectEqual(projector_format_mod.Kind.antfly_gemma3, projector_format_mod.detectFile(&compat.parsed));
 }
 
 test "initOwnedBytes rejects unsupported projector metadata" {

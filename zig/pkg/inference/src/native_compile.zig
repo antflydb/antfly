@@ -325,7 +325,7 @@ fn parseEnvUsize(name: [:0]const u8, default_value: usize) usize {
 }
 
 fn pjrtMaxWholeModelExecutableExportHloBytes() usize {
-    return parseEnvUsize("TERMITE_PJRT_MAX_EXECUTABLE_EXPORT_HLO_BYTES", 256 * 1024 * 1024);
+    return parseEnvUsize("ANTFLY_INFERENCE_PJRT_MAX_EXECUTABLE_EXPORT_HLO_BYTES", 256 * 1024 * 1024);
 }
 
 fn artifactRole(attention_mode: []const u8) []const u8 {
@@ -334,7 +334,7 @@ fn artifactRole(attention_mode: []const u8) []const u8 {
 }
 
 fn onnxExportEstimateOnlyEnabled() bool {
-    return platform.env.getenv("TERMITE_ONNX_EXPORT_ESTIMATE_ONLY") != null;
+    return platform.env.getenv("ANTFLY_INFERENCE_ONNX_EXPORT_ESTIMATE_ONLY") != null;
 }
 
 fn shouldUseSemanticOnnxEntrypoint(
@@ -561,7 +561,7 @@ fn writeCompiledArtifact(
             ) catch |err| switch (err) {
                 error.ConstantPoolTooLarge => {
                     std.log.err(
-                        "ONNX full-model export requires external-data weight export for this graph shape; the termite graph constant pool exceeds 4 GiB",
+                        "ONNX full-model export requires external-data weight export for this graph shape; the Antfly inference graph constant pool exceeds 4 GiB",
                         .{},
                     );
                     return err;
@@ -1094,7 +1094,7 @@ fn guardPjrtExecutableExportBudgetWithMax(is_partial_artifact: bool, hlo_bytes_l
         .{ hlo_bytes_len, max_bytes },
     );
     std.log.info(
-        "PJRT executable export guidance: use --best-partition for a bounded proof, export HLO for validation, or raise TERMITE_PJRT_MAX_EXECUTABLE_EXPORT_HLO_BYTES explicitly",
+        "PJRT executable export guidance: use --best-partition for a bounded proof, export HLO for validation, or raise ANTFLY_INFERENCE_PJRT_MAX_EXECUTABLE_EXPORT_HLO_BYTES explicitly",
         .{},
     );
     return error.OutOfMemory;
@@ -2267,7 +2267,7 @@ pub fn printUsage() void {
         \\  onnx-weight-mode controls the default ONNX initializer export mode
         \\  onnx-weight-policy overrides export mode for matching parameter-name substrings; repeat as needed, or use default=MODE
         \\  onnx-reuse-initializers-from regenerates only the ONNX protobuf and points at an existing external-data blob
-        \\  onnx-import-from writes a Termite manifest for an existing semantic ONNX artifact, refreshes the package manifest, and requires explicit attention-mode, seq-len, and query-seq-len
+        \\  onnx-import-from writes an Antfly inference manifest for an existing semantic ONNX artifact, refreshes the package manifest, and requires explicit attention-mode, seq-len, and query-seq-len
         \\  artifact-role tags imported or compiled whole-model artifacts as prefill or decode
         \\  xla-artifact-kind selects serialized HLO or a plugin-native executable artifact
         \\  xla-parameter-mode=inputs emits model weights as PJRT inputs instead of embedding dense constants in HLO
@@ -2552,7 +2552,7 @@ test "wholeModelPjrtPackageManifestPath tracks resolved artifact kind" {
         .embedded,
     );
     defer std.testing.allocator.free(executable_path);
-    try std.testing.expect(std.mem.endsWith(u8, executable_path, "tmp/model-dir/xla/model-dir.xla.pjrt_executable.embedded.termite-package.json"));
+    try std.testing.expect(std.mem.endsWith(u8, executable_path, "tmp/model-dir/xla/model-dir.xla.pjrt_executable.embedded.antfly-inference-package.json"));
 
     const hlo_path = try wholeModelPjrtPackageManifestPath(
         std.testing.allocator,
@@ -2561,7 +2561,7 @@ test "wholeModelPjrtPackageManifestPath tracks resolved artifact kind" {
         .inputs,
     );
     defer std.testing.allocator.free(hlo_path);
-    try std.testing.expect(std.mem.endsWith(u8, hlo_path, "tmp/model-dir/xla/model-dir.xla.pjrt_hlo.inputs.termite-package.json"));
+    try std.testing.expect(std.mem.endsWith(u8, hlo_path, "tmp/model-dir/xla/model-dir.xla.pjrt_hlo.inputs.antfly-inference-package.json"));
 }
 
 test "defaultOutputPath matches backend extension" {

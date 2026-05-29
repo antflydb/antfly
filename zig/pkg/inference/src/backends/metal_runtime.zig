@@ -18030,7 +18030,7 @@ test "metal native real clip q4_k ffn linear matches reference" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
 
-    const model_path = std.c.getenv("TERMITE_TEST_CLIP_GGUF") orelse "/Users/ajroetker/.termite/models/antflydb/clipclap/clipclap-clip.Q4_K.gguf";
+    const model_path = std.c.getenv("ANTFLY_INFERENCE_TEST_CLIP_GGUF") orelse "/Users/ajroetker/.antfly/inference/models/antflydb/clipclap/clipclap-clip.Q4_K.gguf";
 
     const allocator = std.testing.allocator;
     const store_impl = tensor_store_mod.GgufStore.initAbsolute(allocator, std.mem.span(model_path)) catch return error.SkipZigTest;

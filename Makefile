@@ -8,13 +8,10 @@ SCRIPTS_PY ?= uv run --project scripts --locked python
 # Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
 GO := GOWORK=off GOEXPERIMENT=simd go
 ANTFLY_GO_MODULE := ./go/pkg/antfly
-GO_INFERENCE_RUNTIME_MODULE := ./go/pkg/termite
-
 # Go modules outside of the Antfly product module
 GO_SUBMODULES := \
 	./go/e2e \
 	./go/pkg/sdk \
-	$(GO_INFERENCE_RUNTIME_MODULE) \
 	./go/pkg/proxy \
 	./go/pkg/libaf \
 	./go/pkg/operator \

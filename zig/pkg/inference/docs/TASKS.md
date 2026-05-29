@@ -112,7 +112,7 @@ Inference should be conservative and loader-aware.
 Strong signals:
 
 - `model_manifest.json`
-- `termite_bundle.json`
+- `antfly_inference_bundle.json`
 - `config.json`
 - `tokenizer_config.json`
 - GGUF metadata

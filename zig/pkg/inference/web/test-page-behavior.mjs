@@ -55,7 +55,7 @@ if (!integratedState.imageEnabled || integratedState.audioEnabled) {
 }
 if (!integratedState.imageHint.includes('896x896')) fail('integrated image hint should mention resize dimensions');
 
-const gemma3State = computeMediaUiState({ task: 'generate', config: integratedConfig, projectorKind: 'termite_gemma3' });
+const gemma3State = computeMediaUiState({ task: 'generate', config: integratedConfig, projectorKind: 'antfly_gemma3' });
 if (!gemma3State.imageEnabled || gemma3State.audioEnabled) fail('Gemma3 projector state should enable image only');
 
 const gemma4ImageAudioState = computeMediaUiState({ task: 'generate', config: integratedConfig, projectorKind: 'clip_gemma4_image_audio' });

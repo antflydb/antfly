@@ -33,7 +33,7 @@ function detectMemoryModel(wasm) {
     // Give the caller a clearer error below.
   }
 
-  throw new Error('Unable to determine WASM host ABI for termite module');
+  throw new Error('Unable to determine WASM host ABI for Antfly inference module');
 }
 
 export function createWasmAbi(wasm) {

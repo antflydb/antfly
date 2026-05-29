@@ -26,7 +26,6 @@ go/pkg/
   memoryaf/          Memory-focused Antfly helpers
   operator/          Kubernetes operator
   proxy/             Antfly and Inference proxy packages
-  termite/           Deprecated Go inference runtime module
 ts/
   packages/sdk/      TypeScript SDK (@antfly/sdk)
   packages/components/  React component library (@antfly/components)
@@ -126,7 +125,6 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | evalaf antfly plugin | `go/pkg/evalaf/plugins/antfly/` |
 | Genkit plugin | `go/pkg/genkit/antfly/` |
 | Genkit OpenRouter | `go/pkg/genkit/openrouter/` |
-| Deprecated Go inference runtime | `go/pkg/termite/` |
 
 `make generate`, `make lint`, and `make update-deps` iterate over all submodules automatically.
 `make tidy` and `make tidy-check` do too.

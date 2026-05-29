@@ -16,7 +16,7 @@ import { createWasmAbi } from './runtime/wasm-abi.js';
 import { streamRegisterSafetensors } from './runtime/safetensors-stream.js';
 import { streamRegisterGguf } from './runtime/gguf-stream.js';
 
-// Inference Worker: runs Termite WASM module in a dedicated Web Worker.
+// Inference Worker: runs Antfly inference WASM module in a dedicated Web Worker.
 //
 // GPU operations are proxied to the main thread (which owns the WebGPU device)
 // via SharedArrayBuffer + Atomics. This enables synchronous GPU downloads from
@@ -478,7 +478,7 @@ async function instantiateFromWasmUrls(wasmUrls, importObject) {
       lastError = err;
     }
   }
-  throw lastError ?? new Error('Unable to instantiate termite WASM module in worker');
+  throw lastError ?? new Error('Unable to instantiate Antfly inference WASM module in worker');
 }
 
 self.onmessage = async (e) => {
@@ -667,7 +667,7 @@ self.onmessage = async (e) => {
           type: 'load-projector-done',
           id,
           handle,
-          kind: rawKind === 1 ? 'termite_gemma3'
+          kind: rawKind === 1 ? 'antfly_gemma3'
             : rawKind === 2 ? 'clip_gemma4_image'
             : rawKind === 3 ? 'clip_gemma4_audio'
             : rawKind === 4 ? 'clip_gemma4_image_audio'

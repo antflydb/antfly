@@ -1337,7 +1337,7 @@ test "isManifestPotentiallyLoadableInCurrentBuild hides incomplete colqwen bundl
     const allocator = std.testing.allocator;
     var colqwen = manifest_mod.ModelManifest{ .allocator = allocator };
     defer colqwen.deinit();
-    colqwen.termite_bundle_family = try allocator.dupe(u8, "colqwen2_gguf_bundle/v1");
+    colqwen.inference_bundle_family = try allocator.dupe(u8, "colqwen2_gguf_bundle/v1");
     colqwen.config_model_arch = try allocator.dupe(u8, "qwen2");
     colqwen.gguf_path = try allocator.dupe(u8, "model.gguf");
     colqwen.config_path = try allocator.dupe(u8, "config.json");
@@ -1371,7 +1371,7 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
         .data = "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"]}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "termite_bundle.json",
+        .sub_path = "antfly_inference_bundle.json",
         .data = "{\"family\":\"gliner2_split_bundle/v1\",\"wrapper\":\"gliner2\",\"encoder\":\"encoder.gguf\",\"head\":\"gliner_head.safetensors\"}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -1413,7 +1413,7 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     const model = try manager.loadFromDir(dir_path);
     try std.testing.expect(model.isGlinerModel());
     try std.testing.expect(model.supportsExtraction());
-    try std.testing.expectEqualStrings("gliner2_split_bundle/v1", model.manifest.termite_bundle_family);
+    try std.testing.expectEqualStrings("gliner2_split_bundle/v1", model.manifest.inference_bundle_family);
 
     var pipeline = model.glinerPipeline(allocator);
     try std.testing.expectEqualStrings("gliner2", pipeline.config.model_type);
@@ -1440,7 +1440,7 @@ test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipel
         .data = "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"]}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "termite_bundle.json",
+        .sub_path = "antfly_inference_bundle.json",
         .data = "{\"family\":\"gliner2_split_bundle/v1\",\"wrapper\":\"gliner2\",\"encoder\":\"encoder.gguf\",\"head\":\"gliner_head.gguf\"}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -1482,7 +1482,7 @@ test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipel
     const model = try manager.loadFromDir(dir_path);
     try std.testing.expect(model.isGlinerModel());
     try std.testing.expect(model.supportsExtraction());
-    try std.testing.expectEqualStrings("gliner2_split_bundle/v1", model.manifest.termite_bundle_family);
+    try std.testing.expectEqualStrings("gliner2_split_bundle/v1", model.manifest.inference_bundle_family);
 
     var pipeline = model.glinerPipeline(allocator);
     try std.testing.expectEqualStrings("gliner2", pipeline.config.model_type);
@@ -1692,7 +1692,7 @@ fn writeTinyHeadGgufForModelManagerTest(
     sub_path: []const u8,
 ) !void {
     const metadata = [_]gguf_format.MetadataEntry{
-        .{ .key = "general.architecture", .value = .{ .string = "termite-gliner-head" } },
+        .{ .key = "general.architecture", .value = .{ .string = "antfly-gliner-head" } },
         .{ .key = "general.alignment", .value = .{ .u32 = @intCast(gguf_format.default_alignment) } },
     };
     const dims = [_]u64{2};

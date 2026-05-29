@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 
 const Stats = struct {
     requests: u64 = 0,
@@ -81,7 +82,7 @@ pub const SharedPrefetchState = struct {
 
     fn lock(self: *SharedPrefetchState) void {
         while (!self.mutex.tryLock()) {
-            std.Thread.yield() catch {};
+            platform.time.yieldBriefly();
         }
     }
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Prometheus metrics for the Termite inference server.
+// Prometheus metrics for the Antfly inference server.
 //
 // Uses lib/prometheus for proper exposition format. Since httpx uses
 // fiber-based concurrency (single OS thread), the atomic operations in
@@ -43,23 +43,23 @@ pub const Metrics = struct {
     queue_depth: prometheus.Gauge(i64),
 
     pub const default: Metrics = .{
-        .requests_total = prometheus.Counter(u64).init("termite_requests_total", .{ .help = "Total number of requests" }, .{}),
-        .requests_active = prometheus.Gauge(i64).init("termite_requests_active", .{ .help = "Currently active requests" }, .{}),
-        .errors_total = prometheus.Counter(u64).init("termite_errors_total", .{ .help = "Total number of errors" }, .{}),
-        .embed_requests = prometheus.Counter(u64).init("termite_endpoint_requests_embed", .{ .help = "Embed endpoint requests" }, .{}),
-        .rerank_requests = prometheus.Counter(u64).init("termite_endpoint_requests_rerank", .{ .help = "Rerank endpoint requests" }, .{}),
-        .chunk_requests = prometheus.Counter(u64).init("termite_endpoint_requests_chunk", .{ .help = "Chunk endpoint requests" }, .{}),
-        .classify_requests = prometheus.Counter(u64).init("termite_endpoint_requests_classify", .{ .help = "Classify endpoint requests" }, .{}),
-        .recognize_requests = prometheus.Counter(u64).init("termite_endpoint_requests_recognize", .{ .help = "Recognize endpoint requests" }, .{}),
-        .extract_requests = prometheus.Counter(u64).init("termite_endpoint_requests_extract", .{ .help = "Extract endpoint requests" }, .{}),
-        .rewrite_requests = prometheus.Counter(u64).init("termite_endpoint_requests_rewrite", .{ .help = "Rewrite endpoint requests" }, .{}),
-        .generate_requests = prometheus.Counter(u64).init("termite_endpoint_requests_generate", .{ .help = "Generate endpoint requests" }, .{}),
-        .transcribe_requests = prometheus.Counter(u64).init("termite_endpoint_requests_transcribe", .{ .help = "Transcribe endpoint requests" }, .{}),
-        .read_requests = prometheus.Counter(u64).init("termite_endpoint_requests_read", .{ .help = "Read endpoint requests" }, .{}),
-        .models_loaded = prometheus.Gauge(u64).init("inference_models_loaded", .{ .help = "Number of loaded models" }, .{}),
-        .cache_hits = prometheus.Counter(u64).init("termite_cache_hits_total", .{ .help = "Cache hits" }, .{}),
-        .cache_misses = prometheus.Counter(u64).init("termite_cache_misses_total", .{ .help = "Cache misses" }, .{}),
-        .queue_depth = prometheus.Gauge(i64).init("termite_request_queue_depth", .{ .help = "Current request queue depth" }, .{}),
+        .requests_total = prometheus.Counter(u64).init("antfly_inference_requests_total", .{ .help = "Total number of requests" }, .{}),
+        .requests_active = prometheus.Gauge(i64).init("antfly_inference_requests_active", .{ .help = "Currently active requests" }, .{}),
+        .errors_total = prometheus.Counter(u64).init("antfly_inference_errors_total", .{ .help = "Total number of errors" }, .{}),
+        .embed_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_embed", .{ .help = "Embed endpoint requests" }, .{}),
+        .rerank_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_rerank", .{ .help = "Rerank endpoint requests" }, .{}),
+        .chunk_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_chunk", .{ .help = "Chunk endpoint requests" }, .{}),
+        .classify_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_classify", .{ .help = "Classify endpoint requests" }, .{}),
+        .recognize_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_recognize", .{ .help = "Recognize endpoint requests" }, .{}),
+        .extract_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_extract", .{ .help = "Extract endpoint requests" }, .{}),
+        .rewrite_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_rewrite", .{ .help = "Rewrite endpoint requests" }, .{}),
+        .generate_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_generate", .{ .help = "Generate endpoint requests" }, .{}),
+        .transcribe_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_transcribe", .{ .help = "Transcribe endpoint requests" }, .{}),
+        .read_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_read", .{ .help = "Read endpoint requests" }, .{}),
+        .models_loaded = prometheus.Gauge(u64).init("antfly_inference_models_loaded", .{ .help = "Number of loaded models" }, .{}),
+        .cache_hits = prometheus.Counter(u64).init("antfly_inference_cache_hits_total", .{ .help = "Cache hits" }, .{}),
+        .cache_misses = prometheus.Counter(u64).init("antfly_inference_cache_misses_total", .{ .help = "Cache misses" }, .{}),
+        .queue_depth = prometheus.Gauge(i64).init("antfly_inference_request_queue_depth", .{ .help = "Current request queue depth" }, .{}),
     };
 
     pub fn incRequest(self: *Metrics, endpoint: []const u8) void {
@@ -118,7 +118,7 @@ test "metrics render" {
     try m.render(&writer.writer);
     const output = writer.writer.buffered();
 
-    try std.testing.expect(std.mem.indexOf(u8, output, "termite_requests_total 3\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "termite_endpoint_requests_embed 2\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "termite_endpoint_requests_rerank 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_requests_total 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_endpoint_requests_embed 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_endpoint_requests_rerank 1\n") != null);
 }

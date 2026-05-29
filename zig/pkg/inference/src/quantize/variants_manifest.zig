@@ -204,7 +204,7 @@ pub fn writeClipclapVariantsManifest(allocator: Allocator, io: std.Io, model_dir
         \\
     );
 
-    const path = try std.fs.path.join(allocator, &.{ model_dir, "termite_variants.json" });
+    const path = try std.fs.path.join(allocator, &.{ model_dir, "antfly_inference_variants.json" });
     defer allocator.free(path);
     try compat.cwd().writeFile(io, .{ .sub_path = path, .data = text.written() });
 }
@@ -345,7 +345,7 @@ test "ClipClap variants manifest indexes complete GGUF and ONNX variants" {
 
     try writeClipclapVariantsManifest(allocator, compat.io(), dir_path);
 
-    const manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "termite_variants.json" });
+    const manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
     defer allocator.free(manifest_path);
     const raw = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(64 * 1024));
     defer allocator.free(raw);

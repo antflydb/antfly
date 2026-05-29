@@ -50,7 +50,7 @@ const PjrtBuffer = if (build_options.enable_pjrt) @import("pjrt").pjrt.Buffer el
 const print = std.debug.print;
 
 fn pjrtExecDebugEnabled() bool {
-    return platform.env.getenvBool("TERMITE_PJRT_EXEC_DEBUG");
+    return platform.env.getenvBool("ANTFLY_INFERENCE_PJRT_EXEC_DEBUG");
 }
 
 const Options = struct {
@@ -1519,7 +1519,7 @@ fn runOnnxArtifactFull(
     const debug_outputs_enabled = artifact.onnx_output_node_ids.len > 1;
     if (compare_host and debug_outputs_enabled and !allowFullOnnxDebugCompare()) {
         std.log.err(
-            "refusing full-graph ONNX debug compare because ORT can still materialize the full model and exceed memory limits; set TERMITE_ALLOW_FULL_ONNX_DEBUG_COMPARE=1 to override",
+            "refusing full-graph ONNX debug compare because ORT can still materialize the full model and exceed memory limits; set ANTFLY_INFERENCE_ALLOW_FULL_ONNX_DEBUG_COMPARE=1 to override",
             .{},
         );
         return error.UnsupportedArtifactOutput;
@@ -1637,7 +1637,7 @@ fn runOnnxArtifactFull(
 }
 
 fn allowFullOnnxDebugCompare() bool {
-    return platform.env.getenvBool("TERMITE_ALLOW_FULL_ONNX_DEBUG_COMPARE");
+    return platform.env.getenvBool("ANTFLY_INFERENCE_ALLOW_FULL_ONNX_DEBUG_COMPARE");
 }
 
 fn inferOnnxOutputLogitWidth(
@@ -2956,7 +2956,7 @@ pub fn printUsage() void {
         \\       antfly inference run-artifact <artifact-or-manifest> [--validate|--dry-run]
         \\
         \\<artifact-or-manifest> may be a raw artifact path, a .inference.json sidecar,
-        \\or a .termite-package.json package manifest.
+        \\or a .antfly-inference-package.json package manifest.
         \\Runs an offline artifact for its exact traced shape and prints the top-1
         \\next token without retracing or recompiling. Package manifests resolve the
         \\matching prefill entry for the prompt shape. Partition artifacts print
@@ -2996,7 +2996,7 @@ test "validateArtifact summarizes package manifests" {
     defer allocator.free(prefill_manifest_path);
     const decode_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "model.decode.s3.exec.inference.json" });
     defer allocator.free(decode_manifest_path);
-    const package_path = try std.fs.path.join(allocator, &.{ base_dir, "gpt2.xla.pjrt_executable.inputs.termite-package.json" });
+    const package_path = try std.fs.path.join(allocator, &.{ base_dir, "gpt2.xla.pjrt_executable.inputs.antfly-inference-package.json" });
     defer allocator.free(package_path);
 
     try compiled_artifact.writeManifest(allocator, io, prefill_manifest_path, .{
@@ -3096,7 +3096,7 @@ test "validateArtifact summarizes backend-owned PJRT package manifests" {
     defer allocator.free(prefill_manifest_path);
     const decode_manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "model.decode.s3.exec.inference.json" });
     defer allocator.free(decode_manifest_path);
-    const package_path = try std.fs.path.join(allocator, &.{ base_dir, "gpt2.xla.pjrt_executable.embedded.termite-package.json" });
+    const package_path = try std.fs.path.join(allocator, &.{ base_dir, "gpt2.xla.pjrt_executable.embedded.antfly-inference-package.json" });
     defer allocator.free(package_path);
 
     try compiled_artifact.writeManifest(allocator, io, prefill_manifest_path, .{

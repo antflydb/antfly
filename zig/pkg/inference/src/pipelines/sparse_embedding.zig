@@ -23,7 +23,7 @@
 //
 // Returns SparseVector per input text: sorted (index, value) pairs.
 //
-// Matches Go termite's lib/pipelines/sparse_embedding.go.
+// Matches Go inference's lib/pipelines/sparse_embedding.go.
 
 const std = @import("std");
 const backends = @import("../backends/backends.zig");

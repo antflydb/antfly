@@ -17,7 +17,7 @@ import { resolvePreferredMemoryModel } from './runtime/wasm-capabilities.js';
 import { streamRegisterSafetensors } from './runtime/safetensors-stream.js';
 import { streamRegisterGguf } from './runtime/gguf-stream.js';
 
-// Termite Web: browser-based ML inference via WASM SIMD.
+// Antfly Inference Web: browser-based ML inference via WASM SIMD.
 // Optionally accelerates heavy ops (matmul, attention) via WebGPU compute
 // shaders when the WASM module is built with -Dwebgpu=true.
 //
@@ -61,12 +61,12 @@ function normalizeInitArgs(wasmUrlOrOptions, options) {
 
 function defaultWasmCandidates(memoryModel, requestedMemoryModel) {
   if (requestedMemoryModel === 'auto' && memoryModel === 'wasm64') {
-    return ['termite-wasm64.wasm', 'termite-wasm32.wasm', 'termite.wasm'];
+    return ['antfly-inference-wasm64.wasm', 'antfly-inference-wasm32.wasm', 'antfly-inference.wasm'];
   }
   if (memoryModel === 'wasm64') {
-    return ['termite-wasm64.wasm', 'termite.wasm'];
+    return ['antfly-inference-wasm64.wasm', 'antfly-inference.wasm'];
   }
-  return ['termite-wasm32.wasm', 'termite.wasm'];
+  return ['antfly-inference-wasm32.wasm', 'antfly-inference.wasm'];
 }
 
 function toWasmCandidates(wasmUrl, requestedMemoryModel, resolvedMemoryModel) {
@@ -76,14 +76,14 @@ function toWasmCandidates(wasmUrl, requestedMemoryModel, resolvedMemoryModel) {
 
   const candidate = wasmUrl;
   const asText = typeof candidate === 'string' ? candidate : candidate.href;
-  if (asText.endsWith('/termite.wasm') || asText === 'termite.wasm') {
+  if (asText.endsWith('/antfly-inference.wasm') || asText === 'antfly-inference.wasm') {
     const profileNames = requestedMemoryModel === 'auto' && resolvedMemoryModel === 'wasm64'
-      ? ['termite-wasm64.wasm', 'termite-wasm32.wasm']
-      : [resolvedMemoryModel === 'wasm64' ? 'termite-wasm64.wasm' : 'termite-wasm32.wasm'];
+      ? ['antfly-inference-wasm64.wasm', 'antfly-inference-wasm32.wasm']
+      : [resolvedMemoryModel === 'wasm64' ? 'antfly-inference-wasm64.wasm' : 'antfly-inference-wasm32.wasm'];
     const profiled = profileNames.map((profileName) =>
       typeof candidate === 'string'
-        ? candidate.replace(/termite\.wasm$/, profileName)
-        : new URL(candidate.href.replace(/termite\.wasm$/, profileName)),
+        ? candidate.replace(/antfly-inference\.wasm$/, profileName)
+        : new URL(candidate.href.replace(/antfly-inference\.wasm$/, profileName)),
     );
     return [...profiled, candidate];
   }
@@ -121,7 +121,7 @@ async function instantiateWasmFromCandidates(candidates, importObject) {
       lastError = err;
     }
   }
-  throw lastError ?? new Error('Unable to instantiate termite WASM module');
+  throw lastError ?? new Error('Unable to instantiate Antfly inference WASM module');
 }
 
 function toStreamResponse(source) {
@@ -150,7 +150,7 @@ export class InferenceWeb {
 
   /**
    * Initialize the WASM module.
-   * @param {string|URL|object} [wasmUrl] - URL to the termite WASM artifact, or init options
+   * @param {string|URL|object} [wasmUrl] - URL to the Antfly inference WASM artifact, or init options
    * @param {object} [options]
    * @param {object} [options.gpu] - WebGPUOps instance (from webgpu-ops.js), already init'd
    * @param {boolean} [options.worker] - Run WASM in a Web Worker for sync GPU downloads
@@ -3753,7 +3753,7 @@ function _sample(logits, temperature, topK, topP) {
 
 function _projectorKindFromRaw(rawKind) {
   switch (rawKind) {
-    case 1: return 'termite_gemma3';
+    case 1: return 'antfly_gemma3';
     case 2: return 'clip_gemma4_image';
     case 3: return 'clip_gemma4_audio';
     case 4: return 'clip_gemma4_image_audio';

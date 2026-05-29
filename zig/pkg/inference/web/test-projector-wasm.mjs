@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Projector export smoke test for embedded Termite WASM.
+// Projector export smoke test for embedded Antfly inference WASM.
 //
 // Usage:
 //   zig build -Dwasm=true wasm
@@ -21,14 +21,14 @@
 
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { instantiateTermiteWasm } from './test-wasm-runtime.mjs';
+import { instantiateAntflyInferenceWasm } from './test-wasm-runtime.mjs';
 import { InferenceWeb } from './inference-web.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, '..');
 
-console.log('Loading Termite WASM...');
-const { wasm, memoryModel } = await instantiateTermiteWasm(root);
+console.log('Loading Antfly inference WASM...');
+const { wasm, memoryModel } = await instantiateAntflyInferenceWasm(root);
 console.log(`Loaded ${memoryModel} module`);
 
 console.log('\nTest 1: projector WASM exports exist');
@@ -74,16 +74,16 @@ for (const name of helperMethods) {
 console.log(`  All ${helperMethods.length} InferenceWeb helpers are present`);
 
 console.log('\nTest 3: worker-mode projector helpers dispatch correct RPCs');
-const termite = new InferenceWeb();
-termite._worker = { postMessage() {} };
-termite._readBinarySource = async (source) => {
+const inferenceRuntime = new InferenceWeb();
+inferenceRuntime._worker = { postMessage() {} };
+inferenceRuntime._readBinarySource = async (source) => {
   if (source instanceof Uint8Array) return source;
   if (source instanceof ArrayBuffer) return source;
   throw new Error(`unexpected source type: ${typeof source}`);
 };
 
 const workerCalls = [];
-termite._workerCall = async (type, extra = {}, transfer = []) => {
+inferenceRuntime._workerCall = async (type, extra = {}, transfer = []) => {
   workerCalls.push({ type, extra, transfer });
   switch (type) {
     case 'load-projector':
@@ -106,33 +106,33 @@ termite._workerCall = async (type, extra = {}, transfer = []) => {
 };
 
 const projectorBytes = new Uint8Array([1, 2, 3, 4]);
-const loadedProjector = await termite.loadProjectorGguf(projectorBytes);
+const loadedProjector = await inferenceRuntime.loadProjectorGguf(projectorBytes);
 if (loadedProjector.handle !== 17 || loadedProjector.kind !== 'clip_gemma4_image_audio') {
   console.error('  FAIL: loadProjectorGguf did not return worker response');
   process.exit(1);
 }
 
-await termite.unloadProjector(17);
+await inferenceRuntime.unloadProjector(17);
 
-const visionOutput = await termite.gptProjectorVisionEncode(10, 17, new Float32Array([0.1, 0.2, 0.3, 0.4]), 2);
+const visionOutput = await inferenceRuntime.gptProjectorVisionEncode(10, 17, new Float32Array([0.1, 0.2, 0.3, 0.4]), 2);
 if (!(visionOutput instanceof Float32Array) || visionOutput.length !== 4) {
   console.error('  FAIL: gptProjectorVisionEncode did not return worker output');
   process.exit(1);
 }
 
-const imageEncoded = await termite.gptProjectorImageEncode(17, new Uint8Array([9, 8, 7]));
+const imageEncoded = await inferenceRuntime.gptProjectorImageEncode(17, new Uint8Array([9, 8, 7]));
 if (!(imageEncoded.embeddings instanceof Float32Array) || imageEncoded.tokensPerImage[0] !== 77) {
   console.error('  FAIL: gptProjectorImageEncode did not preserve worker payload');
   process.exit(1);
 }
 
-const audioEncoded = await termite.gptProjectorAudioEncode(17, new Uint8Array([6, 5, 4]));
+const audioEncoded = await inferenceRuntime.gptProjectorAudioEncode(17, new Uint8Array([6, 5, 4]));
 if (!(audioEncoded.embeddings instanceof Float32Array) || audioEncoded.tokensPerAudio[0] !== 33) {
   console.error('  FAIL: gptProjectorAudioEncode did not preserve worker payload');
   process.exit(1);
 }
 
-const multimodalOutput = await termite.gptForwardMultimodalGemma4(
+const multimodalOutput = await inferenceRuntime.gptForwardMultimodalGemma4(
   10,
   11,
   [101, 102, 103],
@@ -148,7 +148,7 @@ if (!(multimodalOutput instanceof Float32Array) || multimodalOutput.length !== 3
   process.exit(1);
 }
 
-const cachedMultimodalOutput = await termite.gptForwardCachedMultimodalGemma4(
+const cachedMultimodalOutput = await inferenceRuntime.gptForwardCachedMultimodalGemma4(
   10,
   11,
   12,
@@ -204,14 +204,14 @@ if (!Array.isArray(workerCalls[6].extra.expandedIds) || workerCalls[6].extra.exp
 console.log(`  Executed ${workerCalls.length} projector worker RPCs with expected payloads`);
 
 console.log('\nTest 4: Gemma4 cached multimodal generation composes the new projector path correctly');
-const generateTermite = new InferenceWeb();
+const generateInferenceRuntime = new InferenceWeb();
 const generationCalls = [];
 let freedCache = null;
-generateTermite.gptCreateKvCache = (modelHandle, maxLen, options) => {
+generateInferenceRuntime.gptCreateKvCache = (modelHandle, maxLen, options) => {
   generationCalls.push({ type: 'create-cache', modelHandle, maxLen, options });
   return 44;
 };
-generateTermite.gptForwardCachedMultimodalGemma4 = (
+generateInferenceRuntime.gptForwardCachedMultimodalGemma4 = (
   modelHandle,
   tokenizerHandle,
   cacheHandle,
@@ -238,16 +238,16 @@ generateTermite.gptForwardCachedMultimodalGemma4 = (
   });
   return new Float32Array([0, 0, 10, 0]);
 };
-generateTermite.gptForwardCached = (modelHandle, cacheHandle, ids, batchSize, seqLen) => {
+generateInferenceRuntime.gptForwardCached = (modelHandle, cacheHandle, ids, batchSize, seqLen) => {
   generationCalls.push({ type: 'decode', modelHandle, cacheHandle, ids: [...ids], batchSize, seqLen });
   return new Float32Array([0, 9, 0, 0]);
 };
-generateTermite.gptFreeKvCache = (cacheHandle) => {
+generateInferenceRuntime.gptFreeKvCache = (cacheHandle) => {
   freedCache = cacheHandle;
 };
 
 const emittedTokens = [];
-const generated = await generateTermite.gptGenerateMultimodalGemma4(
+const generated = await generateInferenceRuntime.gptGenerateMultimodalGemma4(
   3,
   4,
   4,

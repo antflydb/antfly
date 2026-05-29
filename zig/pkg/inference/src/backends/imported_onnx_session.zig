@@ -1946,7 +1946,7 @@ fn defaultClipclapTextModelPath(allocator: std.mem.Allocator) ![]u8 {
 
 fn defaultClipclapModelPath(allocator: std.mem.Allocator, file_name: []const u8) ![]u8 {
     const home = std.c.getenv("HOME") orelse return error.SkipZigTest;
-    return std.fs.path.join(allocator, &.{ std.mem.span(home), ".termite", "models", "antflydb", "clipclap", file_name });
+    return std.fs.path.join(allocator, &.{ std.mem.span(home), ".antfly", "models", "antflydb", "clipclap", file_name });
 }
 
 test "imported onnx session executes clipclap text model natively with padded mask" {

@@ -1197,7 +1197,7 @@ test "open split gliner gguf bundle from manifest" {
     try appendLe(u64, allocator, &head_data, 1);
     try appendString(allocator, &head_data, "general.architecture");
     try appendLe(u32, allocator, &head_data, 8);
-    try appendString(allocator, &head_data, "termite-gliner-head");
+    try appendString(allocator, &head_data, "antfly-gliner-head");
     try appendString(allocator, &head_data, "span_rep.test");
     try appendLe(u32, allocator, &head_data, 1);
     try appendLe(u64, allocator, &head_data, 2);

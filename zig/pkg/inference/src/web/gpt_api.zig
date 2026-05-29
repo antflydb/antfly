@@ -510,7 +510,7 @@ pub fn projectorVisionEncode(
     batch: u32,
     out_ptr: [*]f32,
 ) !u32 {
-    if (projector.kind != .termite_gemma3) return error.UnsupportedProjector;
+    if (projector.kind != .antfly_gemma3) return error.UnsupportedProjector;
     const config = switch (model.config) {
         .gpt => |cfg| cfg,
         else => return error.UnsupportedModelType,

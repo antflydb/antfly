@@ -141,7 +141,7 @@ pub const ModelManifest = struct {
     special_tokens_map_path: ?[]const u8 = null,
     preprocessor_config_path: ?[]const u8 = null,
     processor_config_path: ?[]const u8 = null,
-    termite_bundle_family: []const u8 = "",
+    inference_bundle_family: []const u8 = "",
     tokenizer_type: ?TokenizerType = null,
 
     // Multimodal ONNX files (CLIP, CLAP, CLIPCLAP)
@@ -218,7 +218,7 @@ pub const ModelManifest = struct {
         if (self.special_tokens_map_path) |p| self.allocator.free(p);
         if (self.preprocessor_config_path) |p| self.allocator.free(p);
         if (self.processor_config_path) |p| self.allocator.free(p);
-        if (self.termite_bundle_family.len > 0) self.allocator.free(self.termite_bundle_family);
+        if (self.inference_bundle_family.len > 0) self.allocator.free(self.inference_bundle_family);
         if (self.visual_model_path) |p| self.allocator.free(p);
         if (self.audio_model_path) |p| self.allocator.free(p);
         if (self.text_projection_path) |p| self.allocator.free(p);
@@ -291,7 +291,7 @@ pub const ModelManifest = struct {
     }
 
     pub fn isColqwenBundle(self: *const ModelManifest) bool {
-        if (std.mem.eql(u8, self.termite_bundle_family, "colqwen2_gguf_bundle/v1")) return true;
+        if (std.mem.eql(u8, self.inference_bundle_family, "colqwen2_gguf_bundle/v1")) return true;
         if (!self.hasCapability("colqwen") and !self.hasCapability("multimodal_late_interaction")) return false;
         if (self.config_model_arch.len == 0) return false;
         return std.mem.eql(u8, self.config_model_arch, "qwen2") or std.mem.eql(u8, self.config_model_arch, "qwen2_vl");
@@ -309,7 +309,7 @@ pub const ModelManifest = struct {
     }
 
     pub fn isClipclapGgufBundle(self: *const ModelManifest) bool {
-        return std.mem.eql(u8, self.termite_bundle_family, "clipclap_gguf_bundle/v1");
+        return std.mem.eql(u8, self.inference_bundle_family, "clipclap_gguf_bundle/v1");
     }
 
     pub fn hasIncompleteClipclapGgufBundle(self: *const ModelManifest) bool {
@@ -422,14 +422,14 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
         parseModelManifestJson(&manifest, allocator, manifest_bytes) catch {};
     } else |_| {}
 
-    if (c_file.readFileFromDir(allocator, model_dir_path, "termite_bundle.json")) |bundle_bytes| {
+    if (c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_bundle.json")) |bundle_bytes| {
         defer allocator.free(bundle_bytes);
-        parseTermiteBundleJson(&manifest, allocator, model_dir_path, bundle_bytes) catch {};
+        parseInferenceBundleJson(&manifest, allocator, model_dir_path, bundle_bytes) catch {};
     } else |_| {}
     if (shouldParseClipclapGgufVariant(allocator, model_dir_path)) {
-        if (c_file.readFileFromDir(allocator, model_dir_path, "termite_variants.json")) |variants_bytes| {
+        if (c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_variants.json")) |variants_bytes| {
             defer allocator.free(variants_bytes);
-            parseTermiteVariantsJson(&manifest, allocator, model_dir_path, variants_bytes) catch {};
+            parseInferenceVariantsJson(&manifest, allocator, model_dir_path, variants_bytes) catch {};
         } else |_| {}
     }
 
@@ -547,13 +547,13 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         parseModelManifestJson(&manifest, allocator, manifest_bytes) catch {};
     } else |_| {}
 
-    if (c_file.readFileFromDir(allocator, model_dir_path, "termite_bundle.json")) |bundle_bytes| {
+    if (c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_bundle.json")) |bundle_bytes| {
         defer allocator.free(bundle_bytes);
-        parseTermiteBundleJson(&manifest, allocator, model_dir_path, bundle_bytes) catch {};
+        parseInferenceBundleJson(&manifest, allocator, model_dir_path, bundle_bytes) catch {};
     } else |_| {}
-    if (c_file.readFileFromDir(allocator, model_dir_path, "termite_variants.json")) |variants_bytes| {
+    if (c_file.readFileFromDir(allocator, model_dir_path, "antfly_inference_variants.json")) |variants_bytes| {
         defer allocator.free(variants_bytes);
-        parseTermiteVariantsJson(&manifest, allocator, model_dir_path, variants_bytes) catch {};
+        parseInferenceVariantsJson(&manifest, allocator, model_dir_path, variants_bytes) catch {};
     } else |_| {}
 
     if (c_file.readFileFromDir(allocator, model_dir_path, "gliner_config.json")) |gliner_bytes| {
@@ -1363,7 +1363,7 @@ fn parseGlinerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, jso
     }
 }
 
-fn parseTermiteBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8, json_bytes: []const u8) !void {
+fn parseInferenceBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8, json_bytes: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
@@ -1371,8 +1371,8 @@ fn parseTermiteBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     var family: ?[]const u8 = null;
     if (obj.get("family")) |v| {
         if (v == .string and v.string.len > 0) {
-            if (manifest.termite_bundle_family.len > 0) allocator.free(manifest.termite_bundle_family);
-            manifest.termite_bundle_family = allocator.dupe(u8, v.string) catch "";
+            if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
+            manifest.inference_bundle_family = allocator.dupe(u8, v.string) catch "";
             family = v.string;
         }
     }
@@ -1423,12 +1423,12 @@ fn shouldUseClipclapGgufVariant(allocator: std.mem.Allocator, model_dir_path: []
 fn shouldParseClipclapGgufVariant(allocator: std.mem.Allocator, model_dir_path: []const u8) bool {
     if (shouldUseClipclapGgufVariant(allocator, model_dir_path)) return true;
     if (build_options.enable_cuda and !build_options.enable_onnx) {
-        return c_file.fileExistsInDir(allocator, model_dir_path, "termite_variants.json");
+        return c_file.fileExistsInDir(allocator, model_dir_path, "antfly_inference_variants.json");
     }
     return false;
 }
 
-fn parseTermiteVariantsJson(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8, json_bytes: []const u8) !void {
+fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8, json_bytes: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
@@ -1466,8 +1466,8 @@ fn parseTermiteVariantsJson(manifest: *ModelManifest, allocator: std.mem.Allocat
     const arch = try allocator.dupe(u8, "clipclap");
     errdefer allocator.free(arch);
 
-    if (manifest.termite_bundle_family.len > 0) allocator.free(manifest.termite_bundle_family);
-    manifest.termite_bundle_family = family;
+    if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
+    manifest.inference_bundle_family = family;
     setOptionalPath(allocator, &manifest.gguf_path, pair.clip_path);
     pair.clip_path = "";
     setOptionalPath(allocator, &manifest.audio_model_path, pair.clap_path);
@@ -1891,7 +1891,7 @@ test "manifest detects incomplete colqwen bundle" {
         .data = "{\"type\":\"reranker\",\"capabilities\":[\"colqwen\",\"multimodal_late_interaction\"],\"inputs\":[\"text\",\"image\"]}",
     });
 
-    const bundle_path = try std.fs.path.join(allocator, &.{ dir_path, "termite_bundle.json" });
+    const bundle_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_bundle.json" });
     defer allocator.free(bundle_path);
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = bundle_path, .data = "{\"family\":\"colqwen2_gguf_bundle/v1\"}" });
 
@@ -1920,16 +1920,16 @@ test "manifest detects incomplete colqwen bundle" {
     try std.testing.expect(manifest.hasIncompleteColqwenBundle());
 }
 
-test "manifest parses termite bundle marker" {
+test "manifest parses Antfly inference bundle marker" {
     const allocator = std.testing.allocator;
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
 
-    try parseTermiteBundleJson(&manifest, allocator, ".",
+    try parseInferenceBundleJson(&manifest, allocator, ".",
         \\{"family":"gliner2_split_bundle/v1","wrapper":"gliner2"}
     );
 
-    try std.testing.expectEqualStrings("gliner2_split_bundle/v1", manifest.termite_bundle_family);
+    try std.testing.expectEqualStrings("gliner2_split_bundle/v1", manifest.inference_bundle_family);
     try std.testing.expectEqualStrings("gliner2", manifest.gliner_model_type);
 }
 
@@ -1938,7 +1938,7 @@ test "manifest parses clipclap gguf bundle marker" {
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
 
-    try parseTermiteBundleJson(&manifest, allocator, "/tmp/clipclap-q4_k",
+    try parseInferenceBundleJson(&manifest, allocator, "/tmp/clipclap-q4_k",
         \\{"family":"clipclap_gguf_bundle/v1","clip":"clip.gguf","clap":"clap.gguf","inputs":["text","image","audio"],"projections_embedded":true}
     );
 
@@ -2026,7 +2026,7 @@ test "manifest parses clipclap variants gguf pair" {
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
 
-    try parseTermiteVariantsJson(&manifest, allocator, dir_path,
+    try parseInferenceVariantsJson(&manifest, allocator, dir_path,
         \\{
         \\  "family": "clipclap_variants/v1",
         \\  "variants": [
@@ -2059,7 +2059,7 @@ test "manifest ignores stale clipclap variants with missing gguf files" {
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
 
-    try parseTermiteVariantsJson(&manifest, allocator, dir_path,
+    try parseInferenceVariantsJson(&manifest, allocator, dir_path,
         \\{
         \\  "family": "clipclap_variants/v1",
         \\  "variants": [
@@ -2096,7 +2096,7 @@ test "manifest falls back to first existing clipclap variant when preferred pair
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
 
-    try parseTermiteVariantsJson(&manifest, allocator, dir_path,
+    try parseInferenceVariantsJson(&manifest, allocator, dir_path,
         \\{
         \\  "family": "clipclap_variants/v1",
         \\  "variants": [
@@ -2245,7 +2245,7 @@ test "manifest detects layoutlmv3 token classification architecture as recognize
 }
 
 fn testScratchDir(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    const root = try std.fmt.allocPrint(allocator, "termite-model-tests-{d}", .{std.posix.system.getpid()});
+    const root = try std.fmt.allocPrint(allocator, "antfly-inference-model-tests-{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
     const dir_path = try std.fs.path.join(allocator, &.{ "/tmp", root, name });
     errdefer allocator.free(dir_path);

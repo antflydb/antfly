@@ -16,19 +16,19 @@ import fs from 'fs';
 import path from 'path';
 
 export function resolveWasmPath(root, options = {}) {
-  const memoryModel = options.memoryModel ?? process.env.TERMITE_WASM_MEMORY_MODEL ?? 'wasm32';
+  const memoryModel = options.memoryModel ?? process.env.ANTFLY_INFERENCE_WASM_MEMORY_MODEL ?? 'wasm32';
   const candidates = memoryModel === 'wasm64'
     ? [
-        path.join(root, 'zig-out', 'bin', 'termite-wasm64.wasm'),
-        path.join(root, 'web', 'termite-wasm64.wasm'),
-        path.join(root, 'zig-out', 'bin', 'termite.wasm'),
-        path.join(root, 'web', 'termite.wasm'),
+        path.join(root, 'zig-out', 'bin', 'antfly-inference-wasm64.wasm'),
+        path.join(root, 'web', 'antfly-inference-wasm64.wasm'),
+        path.join(root, 'zig-out', 'bin', 'antfly-inference.wasm'),
+        path.join(root, 'web', 'antfly-inference.wasm'),
       ]
     : [
-        path.join(root, 'zig-out', 'bin', 'termite-wasm32.wasm'),
-        path.join(root, 'web', 'termite-wasm32.wasm'),
-        path.join(root, 'zig-out', 'bin', 'termite.wasm'),
-        path.join(root, 'web', 'termite.wasm'),
+        path.join(root, 'zig-out', 'bin', 'antfly-inference-wasm32.wasm'),
+        path.join(root, 'web', 'antfly-inference-wasm32.wasm'),
+        path.join(root, 'zig-out', 'bin', 'antfly-inference.wasm'),
+        path.join(root, 'web', 'antfly-inference.wasm'),
       ];
 
   for (const wasmPath of candidates) {

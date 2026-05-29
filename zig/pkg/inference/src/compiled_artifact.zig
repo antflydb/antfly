@@ -211,12 +211,12 @@ pub fn packageManifestPath(
         defer allocator.free(mode_key);
         break :blk try std.fmt.allocPrint(
             allocator,
-            "{s}.{s}.{s}.{s}.termite-package.json",
+            "{s}.{s}.{s}.{s}.antfly-inference-package.json",
             .{ model_key, backend_key, kind_key, mode_key },
         );
     } else try std.fmt.allocPrint(
         allocator,
-        "{s}.{s}.{s}.termite-package.json",
+        "{s}.{s}.{s}.antfly-inference-package.json",
         .{ model_key, backend_key, kind_key },
     );
     defer allocator.free(filename);
@@ -228,7 +228,7 @@ pub fn artifactManifestPath(allocator: std.mem.Allocator, artifact_path: []const
 }
 
 pub fn isPackageManifestPath(path: []const u8) bool {
-    return std.mem.endsWith(u8, path, ".termite-package.json");
+    return std.mem.endsWith(u8, path, ".antfly-inference-package.json");
 }
 
 pub fn resolveManifestPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -436,7 +436,7 @@ fn findMatchingArtifactPathMode(
     return found;
 }
 
-test "artifactManifestPath appends termite sidecar suffix" {
+test "artifactManifestPath appends inference sidecar suffix" {
     const path = try artifactManifestPath(std.testing.allocator, "/tmp/model.mlpackage");
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/tmp/model.mlpackage.inference.json", path);
@@ -445,11 +445,11 @@ test "artifactManifestPath appends termite sidecar suffix" {
 test "packageManifestPath includes model, backend, kind, and parameter mode" {
     const path = try packageManifestPath(std.testing.allocator, "/tmp/artifacts", "xla", "/tmp/model/gpt2", "pjrt_executable", "inputs");
     defer std.testing.allocator.free(path);
-    try std.testing.expectEqualStrings("/tmp/artifacts/gpt2.xla.pjrt_executable.inputs.termite-package.json", path);
+    try std.testing.expectEqualStrings("/tmp/artifacts/gpt2.xla.pjrt_executable.inputs.antfly-inference-package.json", path);
 }
 
 test "modelArtifactNamespace keeps owner and model" {
-    const namespace = try modelArtifactNamespace(std.testing.allocator, "/Users/test/.termite/models/openai-community/gpt2");
+    const namespace = try modelArtifactNamespace(std.testing.allocator, "/Users/test/.antfly/inference/models/openai-community/gpt2");
     defer namespace.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("openai-community", namespace.owner);
     try std.testing.expectEqualStrings("gpt2", namespace.model);
@@ -473,7 +473,7 @@ test "resolveManifestPath accepts artifact or sidecar path" {
 }
 
 test "isPackageManifestPath detects package sidecars" {
-    try std.testing.expect(isPackageManifestPath("/tmp/model.xla.termite-package.json"));
+    try std.testing.expect(isPackageManifestPath("/tmp/model.xla.antfly-inference-package.json"));
     try std.testing.expect(!isPackageManifestPath("/tmp/model.onnx.inference.json"));
 }
 
@@ -612,7 +612,7 @@ test "writePackageManifest and readPackageManifest roundtrip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const manifest_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "artifact.termite-package.json" });
+    const manifest_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "artifact.antfly-inference-package.json" });
     defer allocator.free(manifest_path);
 
     const manifest: PackageManifest = .{
@@ -685,7 +685,7 @@ test "writePackageManifest and readPackageManifest support absolute paths" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const manifest_path = try std.fs.path.resolve(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "absolute-package.termite-package.json" });
+    const manifest_path = try std.fs.path.resolve(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "absolute-package.antfly-inference-package.json" });
     defer allocator.free(manifest_path);
 
     const manifest: PackageManifest = .{

@@ -20,7 +20,7 @@ import { homedir } from 'node:os';
 import { createStaticServer, pathIsInside } from './file_server.mjs';
 
 const webRoot = resolve(new URL('../web/', import.meta.url).pathname);
-const defaultModelsDir = resolve(join(homedir(), '.termite/models'));
+const defaultModelsDir = resolve(join(homedir(), '.antfly/inference/models'));
 
 let serverOrigin = null;
 let mainWindow = null;
@@ -41,7 +41,7 @@ function isInterestingModelFile(entryName) {
 }
 
 function toFileUrl(filePath) {
-  const url = new URL('/__termite__/file', serverOrigin);
+  const url = new URL('/__antfly_inference__/file', serverOrigin);
   url.searchParams.set('path', filePath);
   return url.href;
 }
@@ -111,9 +111,9 @@ async function createWindow() {
   await mainWindow.loadURL(`${serverOrigin}/index.html`);
 }
 
-ipcMain.handle('termite-electron:get-default-models-dir', async () => defaultModelsDir);
+ipcMain.handle('antfly-inference-electron:get-default-models-dir', async () => defaultModelsDir);
 
-ipcMain.handle('termite-electron:choose-models-dir', async () => {
+ipcMain.handle('antfly-inference-electron:choose-models-dir', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory'],
     defaultPath: defaultModelsDir,
@@ -124,7 +124,7 @@ ipcMain.handle('termite-electron:choose-models-dir', async () => {
   return chosen;
 });
 
-ipcMain.handle('termite-electron:scan-models-dir', async (_event, dirPath) => {
+ipcMain.handle('antfly-inference-electron:scan-models-dir', async (_event, dirPath) => {
   const resolved = resolve(dirPath || defaultModelsDir);
   if (!modelRootIsAllowed(resolved)) {
     throw new Error(`models directory ${resolved} has not been selected by the user`);

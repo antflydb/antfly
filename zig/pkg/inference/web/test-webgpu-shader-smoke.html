@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Termite WebGPU shader smoke</title>
+  <title>Antfly Inference WebGPU shader smoke</title>
   <style>
     body {
       font: 14px/1.5 system-ui, sans-serif;
@@ -20,7 +20,7 @@
   </style>
 </head>
 <body>
-  <h1>Termite WebGPU shader smoke</h1>
+  <h1>Antfly Inference WebGPU shader smoke</h1>
   <pre id="log">pending</pre>
 
   <script type="module">
@@ -355,7 +355,7 @@
       const softmaxId = gpu.createBuffer(len * Float32Array.BYTES_PER_ELEMENT);
       const outId = gpu.createBuffer(len * Float32Array.BYTES_PER_ELEMENT);
 
-      const downloadsBefore = globalThis.__termiteDownloadCount ?? 0;
+      const downloadsBefore = globalThis.__antflyInferenceDownloadCount ?? 0;
       imports.gpu_matmul_transb_q4_0(xId, qkvWeightId, qkvId, rows, hidden, hidden);
       imports.gpu_rms_norm(qkvId, normWeightId, normId, rows, hidden, f32Bits(1e-5));
       imports.gpu_gelu(normId, geluId, len);
@@ -363,7 +363,7 @@
       imports.gpu_add(projId, xId, residId, len);
       imports.gpu_softmax(residId, softmaxId, rows, hidden);
       imports.gpu_matmul_transb(softmaxId, outWeightId, outId, rows, hidden, hidden);
-      if ((globalThis.__termiteDownloadCount ?? 0) !== downloadsBefore) {
+      if ((globalThis.__antflyInferenceDownloadCount ?? 0) !== downloadsBefore) {
         throw new Error('resident transformer block downloaded before final output');
       }
 
@@ -392,9 +392,9 @@
 
         const imports = gpu.getImports(memory);
         const rawDownload = imports.gpu_download;
-        globalThis.__termiteDownloadCount = 0;
+        globalThis.__antflyInferenceDownloadCount = 0;
         imports.gpu_download = (...args) => {
-          globalThis.__termiteDownloadCount += 1;
+          globalThis.__antflyInferenceDownloadCount += 1;
           return rawDownload(...args);
         };
 

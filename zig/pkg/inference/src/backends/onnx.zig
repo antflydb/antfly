@@ -44,7 +44,7 @@ fn getApi() *const OrtApi {
 fn initEnv() !void {
     if (global_env != null) return;
     const api = getApi();
-    const status = api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "termite", &global_env);
+    const status = api.CreateEnv.?(c.ORT_LOGGING_LEVEL_WARNING, "antfly", &global_env);
     if (status) |s| {
         defer api.ReleaseStatus.?(s);
         return error.OrtEnvCreationFailed;

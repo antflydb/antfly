@@ -62,8 +62,8 @@ const always_files = [_][]const u8{
     "config_sentence_transformers.json",
     "1_SpladePooling/config.json",
     "model_manifest.json",
-    "termite_metadata.json",
-    "termite_variants.json",
+    "antfly_metadata.json",
+    "antfly_inference_variants.json",
 };
 
 /// ONNX model file candidates, tried in order.
@@ -640,9 +640,9 @@ fn appendMultiStageArtifacts(
     to_download: *std.ArrayListUnmanaged(HubFile),
     files: []const HubFile,
 ) !bool {
-    if (!hasFile(files, "termite_metadata.json")) return false;
+    if (!hasFile(files, "antfly_metadata.json")) return false;
 
-    _ = try appendMatchingFileIfMissing(allocator, to_download, files, "termite_metadata.json");
+    _ = try appendMatchingFileIfMissing(allocator, to_download, files, "antfly_metadata.json");
 
     var found_stage_payload = false;
     for (files) |file| {
@@ -670,7 +670,7 @@ fn appendPreexportedPaddleOCRArtifacts(
     to_download: *std.ArrayListUnmanaged(HubFile),
     files: []const HubFile,
 ) !SyntheticMetadataPlan {
-    if (hasFile(files, "termite_metadata.json")) return .none;
+    if (hasFile(files, "antfly_metadata.json")) return .none;
 
     const det = findPreferredFile(files, &.{ "/det.onnx", "det.onnx" }, &.{ "/v3/", "/v5/" }) orelse return .none;
     const rec = findPreferredFile(files, &.{ "/rec.onnx", "rec.onnx" }, &.{ "/english/", "/latin/" }) orelse return .none;
@@ -731,7 +731,7 @@ fn writeSyntheticMetadata(
                 , .{ payload.detection_model, payload.recognition_model, payload.char_dict_file });
             defer allocator.free(metadata);
 
-            const metadata_path = try std.fmt.allocPrint(allocator, "{s}/termite_metadata.json", .{dest_dir});
+            const metadata_path = try std.fmt.allocPrint(allocator, "{s}/antfly_metadata.json", .{dest_dir});
             defer allocator.free(metadata_path);
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
         },
@@ -1310,7 +1310,7 @@ test "appendMultiStageArtifacts selects multistage OCR payloads and sidecars" {
     const allocator = std.testing.allocator;
 
     const files = [_]HubFile{
-        .{ .name = "termite_metadata.json" },
+        .{ .name = "antfly_metadata.json" },
         .{ .name = "det.onnx" },
         .{ .name = "det.onnx.data" },
         .{ .name = "rec.onnx" },
@@ -1325,7 +1325,7 @@ test "appendMultiStageArtifacts selects multistage OCR payloads and sidecars" {
     try std.testing.expect(try appendMultiStageArtifacts(allocator, &to_download, &files));
 
     try std.testing.expectEqual(@as(usize, 6), to_download.items.len);
-    try std.testing.expect(std.mem.eql(u8, "termite_metadata.json", to_download.items[0].name));
+    try std.testing.expect(std.mem.eql(u8, "antfly_metadata.json", to_download.items[0].name));
     try std.testing.expect(std.mem.eql(u8, "det.onnx", to_download.items[1].name));
     try std.testing.expect(std.mem.eql(u8, "det.onnx.data", to_download.items[2].name));
     try std.testing.expect(std.mem.eql(u8, "rec.onnx", to_download.items[3].name));

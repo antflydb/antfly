@@ -170,7 +170,7 @@ const NativeQuantPhaseKind = enum {
     dequant_sgemm_compute,
 };
 
-const AtomicU64 = std.atomic.Value(u64);
+const AtomicU64 = platform.atomic.Value(u64);
 
 const AtomicNativeQuantDispatchStats = struct {
     dequant_sgemm: AtomicU64 = .init(0),
@@ -4099,7 +4099,7 @@ pub fn deinitPrefetchQueue(data: *WeightStore) void {
 
 pub fn deinitGlinerHeadDenseCache(data: *WeightStore) void {
     while (!data.gliner_head_dense_cache_lock.tryLock()) {
-        std.Thread.yield() catch {};
+        platform.time.yieldBriefly();
     }
     defer data.gliner_head_dense_cache_lock.unlock();
 
@@ -4116,7 +4116,7 @@ pub fn deinitGlinerHeadDenseCache(data: *WeightStore) void {
 
 pub fn quantDequantCacheStats(data: *WeightStore) QuantDequantCacheStats {
     while (!data.gliner_head_dense_cache_lock.tryLock()) {
-        std.Thread.yield() catch {};
+        platform.time.yieldBriefly();
     }
     defer data.gliner_head_dense_cache_lock.unlock();
 
@@ -4410,7 +4410,7 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     if (b.lazy_entry) |entry| {
         if (entry.guard) |guard| {
             while (!guard.tryLock()) {
-                std.Thread.yield() catch {};
+                platform.time.yieldBriefly();
             }
             defer guard.unlock();
             if (entry.pin_count > 0) entry.pin_count -= 1;
@@ -5344,7 +5344,7 @@ fn cachedQuantDequantDenseWeight(
     const max_bytes = quantDequantDenseCacheMaxBytes();
 
     while (!self.data.gliner_head_dense_cache_lock.tryLock()) {
-        std.Thread.yield() catch {};
+        platform.time.yieldBriefly();
     }
     defer self.data.gliner_head_dense_cache_lock.unlock();
 
@@ -8249,7 +8249,7 @@ fn ensurePreparedKBlock(self: *NativeCompute, storage: *QuantizedStorage) !void 
     if (known != .Q1_0 and known != .Q4_0 and known != .Q4_1 and known != .Q5_0 and known != .Q5_1 and known != .Q2_K and known != .Q3_K and known != .Q4_K and known != .Q5_K and known != .Q6_K and known != .Q8_0 and known != .Q8_1 and known != .Q8_K) return;
     if (nativePreparedStorageComplete(storage, known)) return;
     while (!self.data.quantized_prepare_lock.tryLock()) {
-        std.Thread.yield() catch {};
+        platform.time.yieldBriefly();
     }
     defer self.data.quantized_prepare_lock.unlock();
     if (nativePreparedStorageComplete(storage, known)) return;
@@ -9221,7 +9221,7 @@ fn ensureQ4Q5QKVPanel16Cache(
     if (preparedQKVPanel16GroupCacheMatches(storage_a_const, weight_buf_b.name, weight_buf_c.name, expected_bytes, row_blocks)) return;
 
     while (!self.data.quantized_prepare_lock.tryLock()) {
-        std.Thread.yield() catch {};
+        platform.time.yieldBriefly();
     }
     defer self.data.quantized_prepare_lock.unlock();
 

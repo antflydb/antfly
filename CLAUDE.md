@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Antfly is a distributed key-value store and vector search engine built on etcd's Raft consensus library. It provides hybrid search capabilities combining full-text search (BM25) with vector similarity search, supporting multimodal data (images, audio, video) and various embedding models.
 
-Multiple independent Go modules exist under `go/` (`go/pkg/antfly/`, `go/e2e/`, `go/pkg/sdk/`, `go/pkg/operator/`, `go/pkg/libaf/`, `go/pkg/termite/`, etc.) — each must be built from within its own directory. CLI subcommands (query, table, load, etc.) are registered directly on the root command.
+Multiple independent Go modules exist under `go/` (`go/pkg/antfly/`, `go/e2e/`, `go/pkg/sdk/`, `go/pkg/operator/`, `go/pkg/libaf/`, etc.) — each must be built from within its own directory. CLI subcommands (query, table, load, inference, etc.) are registered directly on the root command.
 
 ## Go Version
 
@@ -80,7 +80,7 @@ go test -race -v ./... > /tmp/test.log 2>&1
 cd go/pkg/antfly && go run ./cmd swarm        # Single-node dev
 ```
 
-**Termite**: ML service for embeddings/chunking/reranking, enabled by default in swarm mode. Models auto-discovered from `./models/`.
+**Antfly inference**: ML service for embeddings/chunking/reranking, enabled by default in swarm mode. Models auto-discovered from `~/.antfly/inference/models/`.
 
 **Model Registry**: Export HuggingFace models to ONNX via `scripts/export_model_to_registry.py`. Supports embedders, rerankers, chunkers, and multimodal (CLIP).
 
@@ -89,7 +89,7 @@ cd go/pkg/antfly && go run ./cmd swarm        # Single-node dev
 **Code generation**: OpenAPI specs use oapi-codegen with `cfg.yaml` configs. Look up the `cfg.yaml` next to any `openapi.yaml` or `api.yaml` for generation settings. Key setting: optional fields use `omitzero` instead of pointers (`prefer-skip-optional-pointer-with-omitzero: true`).
 
 **Adding endpoints**:
-1. Update the relevant spec under `specs/openapi/`, `go/pkg/antfly/`, or `go/pkg/termite/`
+1. Update the relevant spec under `specs/openapi/`
 2. Run `make generate`
 3. Implement handler
 
@@ -100,9 +100,7 @@ cd go/pkg/antfly && go run ./cmd swarm        # Single-node dev
 Tags follow Go module conventions and trigger CI:
 
 - `go/pkg/antfly/v*` — Antfly module release + container build
-- `go/pkg/operator/v*` — integrated Antfly/Termite operator container build
-- `go/pkg/termite/v*` — termite container build (both pure-Go and omni images)
-
+- `go/pkg/operator/v*` — integrated Antfly operator container build
 ## Secrets Management
 
 Never store credentials in config. Use `${secret:...}` keystore or env vars. See `docs/secrets.md`.

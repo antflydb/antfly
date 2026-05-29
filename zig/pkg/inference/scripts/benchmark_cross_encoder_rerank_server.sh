@@ -18,18 +18,18 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
-termite_bin="${TERMITE_BIN:-$repo_root/zig-out/bin/termite}"
-model_dir="${TERMITE_RERANK_MODEL_DIR:-/Users/tim/.cache/bge-reranker-base}"
-query="${TERMITE_RERANK_QUERY:-what is termite zig}"
-document="${TERMITE_RERANK_DOCUMENT:-termite is a zig inference server with native model runtimes}"
-repeat="${TERMITE_RERANK_SERVER_BENCH_REPEAT:-8}"
-world_size="${TERMITE_RERANK_TP_WORLD_SIZE:-2}"
-models_root="${TERMITE_MODELS_DIR:-$repo_root}"
-request_timeout="${TERMITE_RERANK_SERVER_REQUEST_TIMEOUT_SECS:-600}"
-startup_settle_ms="${TERMITE_RERANK_SERVER_STARTUP_SETTLE_MS:-1000}"
+antfly_bin="${ANTFLY_BIN:-$repo_root/zig-out/bin/antfly}"
+model_dir="${ANTFLY_INFERENCE_RERANK_MODEL_DIR:-/Users/tim/.cache/bge-reranker-base}"
+query="${ANTFLY_INFERENCE_RERANK_QUERY:-what is Antfly inference}"
+document="${ANTFLY_INFERENCE_RERANK_DOCUMENT:-Antfly inference is a Zig inference runtime with native model runtimes}"
+repeat="${ANTFLY_INFERENCE_RERANK_SERVER_BENCH_REPEAT:-8}"
+world_size="${ANTFLY_INFERENCE_RERANK_TP_WORLD_SIZE:-2}"
+models_root="${ANTFLY_INFERENCE_MODELS_DIR:-$repo_root}"
+request_timeout="${ANTFLY_INFERENCE_RERANK_SERVER_REQUEST_TIMEOUT_SECS:-600}"
+startup_settle_ms="${ANTFLY_INFERENCE_RERANK_SERVER_STARTUP_SETTLE_MS:-1000}"
 
-if [[ ! -x "$termite_bin" ]]; then
-  echo "missing termite binary at $termite_bin" >&2
+if [[ ! -x "$antfly_bin" ]]; then
+  echo "missing antfly binary at $antfly_bin" >&2
   echo "build it first, for example: zigup run master build" >&2
   exit 1
 fi
@@ -39,7 +39,7 @@ if [[ ! -f "$model_dir/model.safetensors" ]]; then
   exit 1
 fi
 
-python3 - "$termite_bin" "$models_root" "$model_dir" "$query" "$document" "$repeat" "$world_size" "$request_timeout" "$startup_settle_ms" <<'PY'
+python3 - "$antfly_bin" "$models_root" "$model_dir" "$query" "$document" "$repeat" "$world_size" "$request_timeout" "$startup_settle_ms" <<'PY'
 import atexit
 import json
 import os
@@ -52,7 +52,7 @@ import time
 
 import requests
 
-termite_bin, models_root, model_dir, query, document, repeat_s, world_size_s, request_timeout_s, startup_settle_ms_s = sys.argv[1:]
+antfly_bin, models_root, model_dir, query, document, repeat_s, world_size_s, request_timeout_s, startup_settle_ms_s = sys.argv[1:]
 repeat = int(repeat_s)
 world_size = int(world_size_s)
 request_timeout = float(request_timeout_s)
@@ -100,7 +100,7 @@ atexit.register(stop_all)
 def start_server(env: dict[str, str], port: int, log_path: str) -> str:
     with open(log_path, "wb") as log_file:
         proc = subprocess.Popen(
-            [termite_bin, "run", "--host", "127.0.0.1", "--port", str(port), "--models-dir", models_root],
+            [antfly_bin, "inference", "run", "--host", "127.0.0.1", "--port", str(port), "--models-dir", models_root],
             stdout=log_file,
             stderr=subprocess.STDOUT,
             env=env,

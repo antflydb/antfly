@@ -97,5 +97,5 @@ createServer((req, res) => {
   });
   createReadStream(filePath).pipe(res);
 }).listen(port, () => {
-  console.log(`Termite web dev server running at http://localhost:${port}/index.html`);
+  console.log(`Antfly inference web dev server running at http://localhost:${port}/index.html`);
 });

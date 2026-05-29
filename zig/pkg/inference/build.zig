@@ -23,7 +23,7 @@ fn resolveSharedLibRoot(b: *std.Build) []const u8 {
     return b.option(
         []const u8,
         "shared-lib-root",
-        "Path to the monorepo root that provides shared generic Zig libraries used by Termite (defaults to ../..)",
+        "Path to the monorepo root that provides shared generic Zig libraries used by Antfly inference (defaults to ../..)",
     ) orelse b.option(
         []const u8,
         "antfly-root",
@@ -177,7 +177,7 @@ pub fn build(b: *std.Build) void {
     // Backend options
     const enable_wasm = b.option(bool, "wasm", "Build WASM+SIMD module for browser inference") orelse false;
     const enable_webgpu = b.option(bool, "webgpu", "Enable WebGPU acceleration for WASM builds") orelse false;
-    const link_libc = b.option(bool, "link-libc", "Link Termite targets against libc") orelse !enable_wasm;
+    const link_libc = b.option(bool, "link-libc", "Link Antfly inference targets against libc") orelse !enable_wasm;
     const wasm_memory_model = b.option([]const u8, "wasm-memory-model", "WASM linear memory model for browser inference: wasm32 or wasm64") orelse "wasm32";
     if (!std.mem.eql(u8, wasm_memory_model, "wasm32") and !std.mem.eql(u8, wasm_memory_model, "wasm64")) {
         @panic("invalid -Dwasm-memory-model (expected wasm32 or wasm64)");
@@ -295,7 +295,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_exe.addArgs(args);
     }
-    const run_step = b.step("run", "Run the termite server");
+    const run_step = b.step("run", "Run the Antfly inference server");
     run_step.dependOn(&run_exe.step);
 
     const metal_gemma4_prefill_frame_test = b.addSystemCommand(&.{
@@ -321,7 +321,7 @@ pub fn build(b: *std.Build) void {
     metal_gemma4_prefill_block_parity_test_step.dependOn(&metal_gemma4_prefill_block_parity_test.step);
 
     const metal_prefill_bucket_bench_exe = b.addExecutable(.{
-        .name = "termite-metal-prefill-buckets-bench",
+        .name = "antfly-inference-metal-prefill-buckets-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/metal_prefill_buckets.zig"),
             .target = target,
@@ -345,11 +345,11 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_finetune.addArgs(args);
     }
-    const finetune_step = b.step("finetune", "Run termite finetune");
+    const finetune_step = b.step("finetune", "Run Antfly inference finetune");
     finetune_step.dependOn(&run_finetune.step);
 
     const bench_exe = b.addExecutable(.{
-        .name = "termite-paged-attention-bench",
+        .name = "antfly-inference-paged-attention-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/paged_attention_bench.zig"),
             .target = target,
@@ -373,7 +373,7 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&run_bench.step);
 
     const turboquant_distortion_bench_exe = b.addExecutable(.{
-        .name = "termite-turboquant-distortion-bench",
+        .name = "antfly-inference-turboquant-distortion-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/turboquant_distortion_bench.zig"),
             .target = target,
@@ -388,7 +388,7 @@ pub fn build(b: *std.Build) void {
     turboquant_distortion_bench_step.dependOn(&run_turboquant_distortion_bench.step);
 
     const training_bench_exe = b.addExecutable(.{
-        .name = "termite-training-bench",
+        .name = "antfly-inference-training-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/training_bench.zig"),
             .target = target,
@@ -396,7 +396,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const linalg_bench_exe = b.addExecutable(.{
-        .name = "termite-linalg-bench",
+        .name = "antfly-inference-linalg-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/linalg_bench.zig"),
             .target = target,
@@ -421,7 +421,7 @@ pub fn build(b: *std.Build) void {
     linalg_bench_step.dependOn(&run_linalg_bench.step);
 
     const clipclap_bench_exe = b.addExecutable(.{
-        .name = "termite-clipclap-kernels-bench",
+        .name = "antfly-inference-clipclap-kernels-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/clipclap_kernels_bench.zig"),
             .target = target,
@@ -443,7 +443,7 @@ pub fn build(b: *std.Build) void {
 
     // GLiNER2 end-to-end native bench: random weights, real eager forward.
     const gliner2_bench_exe = b.addExecutable(.{
-        .name = "termite-gliner2-native-bench",
+        .name = "antfly-inference-gliner2-native-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/gliner2_native.zig"),
             .target = target,
@@ -470,7 +470,7 @@ pub fn build(b: *std.Build) void {
     gliner2_bench_step.dependOn(&run_gliner2_bench.step);
 
     const gliner2_e2e_bench_exe = b.addExecutable(.{
-        .name = "termite-gliner2-e2e-bench",
+        .name = "antfly-inference-gliner2-e2e-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/gliner2_e2e.zig"),
             .target = target,
@@ -497,7 +497,7 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_step.dependOn(&run_gliner2_e2e_bench.step);
 
     const clipclap_native_bench_exe = b.addExecutable(.{
-        .name = "termite-clipclap-native-bench",
+        .name = "antfly-inference-clipclap-native-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/clipclap_native.zig"),
             .target = target,
@@ -524,7 +524,7 @@ pub fn build(b: *std.Build) void {
     clipclap_native_bench_step.dependOn(&run_clipclap_native_bench.step);
 
     const clipclap_e2e_bench_exe = b.addExecutable(.{
-        .name = "termite-clipclap-e2e-bench",
+        .name = "antfly-inference-clipclap-e2e-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/clipclap_e2e.zig"),
             .target = target,
@@ -551,7 +551,7 @@ pub fn build(b: *std.Build) void {
     clipclap_e2e_bench_step.dependOn(&run_clipclap_e2e_bench.step);
 
     const audio_bench_exe = b.addExecutable(.{
-        .name = "termite-audio-bench",
+        .name = "antfly-inference-audio-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/audio_bench.zig"),
             .target = target,
@@ -648,7 +648,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     const install_tests = b.addInstallArtifact(tests, .{
-        .dest_sub_path = "termite-tests",
+        .dest_sub_path = "antfly-inference-tests",
     });
     const test_bin_step = b.step("test-bin", "Build unit test binary without running");
     test_bin_step.dependOn(&install_tests.step);
@@ -822,13 +822,13 @@ pub fn build(b: *std.Build) void {
 
     const fetch_audio_xiph_corpora_e2e = b.addRunArtifact(audio_xiph_corpora_e2e);
     fetch_audio_xiph_corpora_e2e.addArg("fetch");
-    fetch_audio_xiph_corpora_e2e.addArg("/tmp/termite-audio-xiph-corpora");
+    fetch_audio_xiph_corpora_e2e.addArg("/tmp/antfly-inference-audio-xiph-corpora");
     const audio_xiph_corpora_e2e_fetch_step = b.step("audio-xiph-corpora-e2e-fetch", "Fetch or refresh the upstream lib/audio Xiph-family corpora checkouts");
     audio_xiph_corpora_e2e_fetch_step.dependOn(&fetch_audio_xiph_corpora_e2e.step);
 
     const run_audio_xiph_corpora_e2e = b.addRunArtifact(audio_xiph_corpora_e2e);
     run_audio_xiph_corpora_e2e.addArg("run");
-    run_audio_xiph_corpora_e2e.addArg("/tmp/termite-audio-xiph-corpora");
+    run_audio_xiph_corpora_e2e.addArg("/tmp/antfly-inference-audio-xiph-corpora");
     run_audio_xiph_corpora_e2e.addArg("--no-fetch");
     const audio_xiph_corpora_e2e_run_step = b.step("audio-xiph-corpora-e2e-run", "Run the lib/audio upstream Xiph-family corpora e2e runner");
     audio_xiph_corpora_e2e_run_step.dependOn(&run_audio_xiph_corpora_e2e.step);
@@ -848,13 +848,13 @@ pub fn build(b: *std.Build) void {
 
     const fetch_audio_misc_corpora_e2e = b.addRunArtifact(audio_misc_corpora_e2e);
     fetch_audio_misc_corpora_e2e.addArg("fetch");
-    fetch_audio_misc_corpora_e2e.addArg("/tmp/termite-audio-misc-corpora");
+    fetch_audio_misc_corpora_e2e.addArg("/tmp/antfly-inference-audio-misc-corpora");
     const audio_misc_corpora_e2e_fetch_step = b.step("audio-misc-corpora-e2e-fetch", "Fetch or refresh the external lib/audio MP3/AAC/MP4 corpora");
     audio_misc_corpora_e2e_fetch_step.dependOn(&fetch_audio_misc_corpora_e2e.step);
 
     const run_audio_misc_corpora_e2e = b.addRunArtifact(audio_misc_corpora_e2e);
     run_audio_misc_corpora_e2e.addArg("run");
-    run_audio_misc_corpora_e2e.addArg("/tmp/termite-audio-misc-corpora");
+    run_audio_misc_corpora_e2e.addArg("/tmp/antfly-inference-audio-misc-corpora");
     run_audio_misc_corpora_e2e.addArg("--no-fetch");
     const audio_misc_corpora_e2e_run_step = b.step("audio-misc-corpora-e2e-run", "Run the lib/audio external MP3/AAC/MP4 corpora e2e runner");
     audio_misc_corpora_e2e_run_step.dependOn(&run_audio_misc_corpora_e2e.step);
@@ -1202,14 +1202,14 @@ pub fn build(b: *std.Build) void {
             "src/wasm_entry_wasm64.zig"
         else
             "src/wasm_entry_wasm32.zig";
-        const wasm_install_name = if (is_wasm64) "termite-wasm64.wasm" else "termite-wasm32.wasm";
+        const wasm_install_name = if (is_wasm64) "antfly-inference-wasm64.wasm" else "antfly-inference-wasm32.wasm";
         const wasm_jinja_dep = b.dependency("jinja", .{
             .target = wasm_target,
             .optimize = .ReleaseSafe,
         });
 
         const wasm_lib = b.addExecutable(.{
-            .name = if (is_wasm64) "termite-wasm64" else "termite-wasm32",
+            .name = if (is_wasm64) "antfly-inference-wasm64" else "antfly-inference-wasm32",
             .root_module = b.createModule(.{
                 .root_source_file = b.path(wasm_root),
                 .target = wasm_target,
@@ -1293,7 +1293,7 @@ pub fn build(b: *std.Build) void {
         const wasm_step = b.step("wasm", "Build WASM module for browser inference");
         wasm_step.dependOn(&wasm_install.step);
         if (!is_wasm64) {
-            const wasm_compat_install = b.addInstallFile(wasm_lib.getEmittedBin(), "inference.wasm");
+            const wasm_compat_install = b.addInstallFile(wasm_lib.getEmittedBin(), "antfly-inference.wasm");
             wasm_step.dependOn(&wasm_compat_install.step);
         }
     }

@@ -22,13 +22,13 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { instantiateTermiteWasm } from './test-wasm-runtime.mjs';
+import { instantiateAntflyInferenceWasm } from './test-wasm-runtime.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, '..');
 
 // Load WASM module
-const { wasm, abi, alloc, free, bytesIn, write, read, size } = await instantiateTermiteWasm(root);
+const { wasm, abi, alloc, free, bytesIn, write, read, size } = await instantiateAntflyInferenceWasm(root);
 
 // Load model
 const modelPath = path.join(root, 'models', 'BAAI', 'bge-small-en-v1.5', 'model.safetensors');
@@ -36,7 +36,7 @@ const configPath = path.join(root, 'models', 'BAAI', 'bge-small-en-v1.5', 'confi
 const tokenizerPath = path.join(root, 'models', 'BAAI', 'bge-small-en-v1.5', 'tokenizer.json');
 
 if (!fs.existsSync(modelPath)) {
-  console.error('Model not found. Run: termite pull BAAI/bge-small-en-v1.5:native');
+  console.error('Model not found. Run: antfly inference pull BAAI/bge-small-en-v1.5:native');
   process.exit(1);
 }
 

@@ -14,8 +14,8 @@
 
 import { contextBridge, ipcRenderer } from 'electron';
 
-contextBridge.exposeInMainWorld('termiteElectron', {
-  getDefaultModelsDirectory: () => ipcRenderer.invoke('termite-electron:get-default-models-dir'),
-  chooseModelsDirectory: () => ipcRenderer.invoke('termite-electron:choose-models-dir'),
-  scanModelsDirectory: (dirPath) => ipcRenderer.invoke('termite-electron:scan-models-dir', dirPath),
+contextBridge.exposeInMainWorld('antflyInferenceElectron', {
+  getDefaultModelsDirectory: () => ipcRenderer.invoke('antfly-inference-electron:get-default-models-dir'),
+  chooseModelsDirectory: () => ipcRenderer.invoke('antfly-inference-electron:choose-models-dir'),
+  scanModelsDirectory: (dirPath) => ipcRenderer.invoke('antfly-inference-electron:scan-models-dir', dirPath),
 });

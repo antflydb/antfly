@@ -51,11 +51,11 @@ const LoadedF32 = struct {
 };
 
 pub fn isSupportedProjectorPath(allocator: std.mem.Allocator, projector_path: []const u8) !bool {
-    return try projector_format_mod.detectPath(allocator, projector_path) == .termite_gemma3;
+    return try projector_format_mod.detectPath(allocator, projector_path) == .antfly_gemma3;
 }
 
 pub fn isSupportedProjectorFile(file: *const gguf_format.File) bool {
-    return projector_format_mod.detectFile(file) == .termite_gemma3;
+    return projector_format_mod.detectFile(file) == .antfly_gemma3;
 }
 
 pub fn encodeProjectedImageTokens(
@@ -489,7 +489,7 @@ test "supports termite gemma3 projector metadata" {
     defer compat.cwd().deleteFile(compat.io(), path) catch {};
 
     const metadata = [_]gguf_mod.format.MetadataEntry{
-        .{ .key = "general.architecture", .value = .{ .string = "termite-projector" } },
+        .{ .key = "general.architecture", .value = .{ .string = "antfly-projector" } },
         .{ .key = "inference.projector.source_architecture", .value = .{ .string = "gemma3" } },
         .{ .key = "inference.projector.text_hidden_size", .value = .{ .u32 = 4 } },
         .{ .key = "inference.projector.vision_hidden_size", .value = .{ .u32 = 8 } },

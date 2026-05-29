@@ -78,7 +78,7 @@ export const webgpuStubs = {
   gpu_layer_norm: () => {},
 };
 
-export async function instantiateTermiteWasm(root, options = {}) {
+export async function instantiateAntflyInferenceWasm(root, options = {}) {
   const { wasmPath, memoryModel } = resolveWasmPath(root, options);
   if (!wasmPath) {
     throw new Error(`WASM module not found for ${memoryModel}. ${wasmBuildHint(memoryModel)}`);

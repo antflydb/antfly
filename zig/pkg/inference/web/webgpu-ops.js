@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// WebGPU compute shader dispatch for Termite WASM.
+// WebGPU compute shader dispatch for Antfly inference WASM.
 //
 // Provides implementations for the extern "webgpu" imports declared in
 // src/ops/wasm_extern.zig. Heavy ops (matmul, attention) are dispatched to GPU

@@ -14,7 +14,7 @@
 
 export function computeLoadAvailability({
   sourceMode,
-  termiteReady,
+  inferenceReady,
   hasDirectoryPicker,
   hasSingleFile,
   hasDiscoveredModel,
@@ -25,8 +25,8 @@ export function computeLoadAvailability({
 
   if (normalizedSourceMode === 'file') {
     const hasSelectedModel = Boolean(hasSingleFile || hasDiscoveredModel);
-    const loadDisabled = !termiteReady || !hasSelectedModel;
-    const loadDisabledReason = !termiteReady
+    const loadDisabled = !inferenceReady || !hasSelectedModel;
+    const loadDisabledReason = !inferenceReady
       ? 'Wait for the top status to say Initialized (...).'
       : !hasSelectedModel
         ? 'Choose a supported local model bundle or single GGUF file first.'
@@ -45,8 +45,8 @@ export function computeLoadAvailability({
   }
 
   const hasUrl = String(remoteUrl ?? '').trim().length > 0;
-  const loadDisabled = !termiteReady || !hasUrl;
-  const loadDisabledReason = !termiteReady
+  const loadDisabled = !inferenceReady || !hasUrl;
+  const loadDisabledReason = !inferenceReady
     ? 'Wait for the top status to say Initialized (...).'
     : !hasUrl
       ? 'Enter a remote GGUF URL first.'

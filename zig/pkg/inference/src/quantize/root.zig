@@ -64,7 +64,7 @@ fn printUsage(command_name: []const u8) void {
         \\  --quantize-include <csv-prefixes>
         \\  --quantize-exclude <csv-prefixes>
         \\  --projector-output <path>
-        \\  --projector-format auto|termite|clip
+        \\  --projector-format auto|antfly|clip
         \\  --dry-run
         \\
         \\Safetensors target options:

@@ -68,11 +68,11 @@ pub const WeightExportPolicy = struct {
 };
 
 fn onnxExportProfileEnabled() bool {
-    return platform.env.getenv("TERMITE_ONNX_EXPORT_PROFILE") != null;
+    return platform.env.getenv("ANTFLY_INFERENCE_ONNX_EXPORT_PROFILE") != null;
 }
 
 fn onnxExportEstimateOnlyEnabled() bool {
-    return platform.env.getenv("TERMITE_ONNX_EXPORT_ESTIMATE_ONLY") != null;
+    return platform.env.getenv("ANTFLY_INFERENCE_ONNX_EXPORT_ESTIMATE_ONLY") != null;
 }
 
 fn nowNs() u64 {
@@ -303,7 +303,7 @@ pub fn compilePartition(
     defer freeParameterInitializers(allocator, parameter_initializers);
 
     var export_opts: onnx_graph.ExportOptions = .{
-        .graph_name = "termite_partition",
+        .graph_name = "antfly_inference_partition",
         .lower_fused = false,
         .node_name_overrides = effective_node_name_overrides,
         .semantic_decoder_gqa_bindings = effective_semantic_gqa_bindings,
@@ -1209,10 +1209,10 @@ fn buildParameterInitializerFromExportSource(
 }
 
 fn onnxQ8ExportEnabledForName(name: []const u8) bool {
-    if (platform.env.getenv("TERMITE_ONNX_Q8_INCLUDE")) |include| {
+    if (platform.env.getenv("ANTFLY_INFERENCE_ONNX_Q8_INCLUDE")) |include| {
         if (include.len > 0 and !matchesCommaSeparatedSubstringList(include, name)) return false;
     }
-    if (platform.env.getenv("TERMITE_ONNX_Q8_EXCLUDE")) |exclude| {
+    if (platform.env.getenv("ANTFLY_INFERENCE_ONNX_Q8_EXCLUDE")) |exclude| {
         if (exclude.len > 0 and matchesCommaSeparatedSubstringList(exclude, name)) return false;
     }
     return true;

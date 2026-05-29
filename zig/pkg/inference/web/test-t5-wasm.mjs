@@ -22,13 +22,13 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { instantiateTermiteWasm } from './test-wasm-runtime.mjs';
+import { instantiateAntflyInferenceWasm } from './test-wasm-runtime.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(__dirname, '..');
 
 // Load WASM module
-const { wasm, alloc, free, bytesIn, write, read, size } = await instantiateTermiteWasm(root);
+const { wasm, alloc, free, bytesIn, write, read, size } = await instantiateAntflyInferenceWasm(root);
 
 // --- Load T5-small model ---
 

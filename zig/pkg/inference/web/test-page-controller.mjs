@@ -23,7 +23,7 @@ function fail(message) {
 console.log('Test 1: local model mode stays gated until runtime init and a selection exist');
 const waitingState = computeLoadAvailability({
   sourceMode: 'file',
-  termiteReady: false,
+  inferenceReady: false,
   hasDirectoryPicker: true,
   hasSingleFile: false,
   hasDiscoveredModel: false,
@@ -41,7 +41,7 @@ console.log('  pre-init local mode gating is correct');
 console.log('\nTest 2: local model mode enables load for either a single GGUF or a discovered bundle');
 const localBundleState = computeLoadAvailability({
   sourceMode: 'file',
-  termiteReady: true,
+  inferenceReady: true,
   hasDirectoryPicker: true,
   hasSingleFile: false,
   hasDiscoveredModel: true,
@@ -54,7 +54,7 @@ if (localBundleState.discoveredModelDisabled) fail('discovered model select shou
 
 const localFileState = computeLoadAvailability({
   sourceMode: 'file',
-  termiteReady: true,
+  inferenceReady: true,
   hasDirectoryPicker: false,
   hasSingleFile: true,
   hasDiscoveredModel: false,
@@ -68,7 +68,7 @@ console.log('  local single-file and discovered-bundle states are correct');
 console.log('\nTest 3: remote URL mode requires a URL and flips the enabled controls');
 const remoteEmptyState = computeLoadAvailability({
   sourceMode: 'url',
-  termiteReady: true,
+  inferenceReady: true,
   hasDirectoryPicker: true,
   hasSingleFile: true,
   hasDiscoveredModel: true,
@@ -86,7 +86,7 @@ if (remoteEmptyState.modelUrlDisabled || remoteEmptyState.streamLoadDisabled) {
 
 const remoteReadyState = computeLoadAvailability({
   sourceMode: 'url',
-  termiteReady: true,
+  inferenceReady: true,
   hasDirectoryPicker: true,
   hasSingleFile: false,
   hasDiscoveredModel: false,

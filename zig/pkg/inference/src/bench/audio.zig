@@ -162,7 +162,7 @@ fn parseBenchKind(arg: []const u8) !BenchKind {
 
 fn printUsage() !void {
     std.debug.print(
-        \\Usage: termite-audio-bench [options]
+        \\Usage: antfly-inference-audio-bench [options]
         \\  --bench all|mp3_decode|vorbis_decode|opus_decode|aac_adts_decode|aac_decode|mp3_synth
         \\  --warmup-iters N
         \\  --measure-iters N

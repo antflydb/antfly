@@ -85,7 +85,7 @@ This writes:
 ```text
 ~/.antfly/inference/models/antflydb/clipclap/clipclap-clip.Q4_K.gguf
 ~/.antfly/inference/models/antflydb/clipclap/clipclap-clap.Q4_K.gguf
-~/.antfly/inference/models/antflydb/clipclap/termite_variants.json
+~/.antfly/inference/models/antflydb/clipclap/antfly_inference_variants.json
 ```
 
 Use `--format none` to materialize the default F32 GGUF pair:
@@ -101,11 +101,11 @@ This writes:
 ```text
 clipclap-clip.gguf
 clipclap-clap.gguf
-termite_bundle.json
-termite_variants.json
+antfly_inference_bundle.json
+antfly_inference_variants.json
 ```
 
-`termite_bundle.json` is written only for the unsuffixed GGUF default. That
+`antfly_inference_bundle.json` is written only for the unsuffixed GGUF default. That
 keeps default model loading stable: generating `Q4_K` does not make `Q4_K` the
 default model.
 
@@ -134,12 +134,12 @@ variants have been generated there.
 
 ## Variant Index
 
-`termite_variants.json` is generated from files present in the repo directory.
+`antfly_inference_variants.json` is generated from files present in the repo directory.
 It records the default ONNX files and any complete ONNX or GGUF variants found.
 It is intentionally separate from `model_manifest.json`, which continues to
 describe the default model.
 
-The runtime loader can later use `termite_variants.json` for explicit variant
+The runtime loader can later use `antfly_inference_variants.json` for explicit variant
 selection without changing default loading behavior.
 
 ## Hugging Face Upload
@@ -260,7 +260,7 @@ implementations:
   requests onto the safetensors exporter.
 - `src/quantize/constants.zig` owns shared CLI defaults used by all targets.
 - `src/quantize/variants_manifest.zig` owns ClipClap variant file naming and
-  `termite_variants.json` generation.
+  `antfly_inference_variants.json` generation.
 - `src/native_export_gguf.zig` remains the GGUF-specific exporter and
   quantizer.
 - `src/native_export_safetensors.zig` is the safetensors-specific dense tensor
@@ -288,7 +288,7 @@ the dense model or fall back to dense based on policy.
 
 ## Near-Term Work
 
-1. Add runtime selection against `termite_variants.json`.
+1. Add runtime selection against `antfly_inference_variants.json`.
 2. Add graph/config/tokenizer sidecar bundling for safetensors exports.
 3. Add packed safetensors metadata if Antfly inference needs q4/q5 safetensors artifacts
    that avoid dense expansion.

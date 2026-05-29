@@ -1869,7 +1869,7 @@ Reduce Gemma4 partitioned Metal command volume by matching ggml’s execution mo
 - Update stats to distinguish `metadata_aliases`, `planned_descriptors`, and real command dispatches so reductions are visible and not hidden by counter semantics.
 
 ## Test Plan
-- Run `zig build termite-test -Dmetal=false --summary failures` after each stage.
+- Run `zig build test -Dmetal=false --summary failures` after each stage.
 - Run focused Metal validation smoke through `pkg/inference/scripts/debug_metal_command.sh command --api-validate -- ... --backend metal --mode compiled --compiled-target partitioned`.
 - Acceptance checks for Gemma4 smoke: token id remains `10979`, `interpreter_fallbacks=0`, `host_outputs=0`, no diagnostic reports, command count decreases from current `724`.
 - Add unit tests for alias ownership, concat descriptor reuse, attention-prep matcher rejection on extra uses, and scalar epilogue rejection on non-scalar/broadcast-unsafe inputs.

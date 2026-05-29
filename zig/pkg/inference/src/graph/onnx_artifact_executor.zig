@@ -27,7 +27,7 @@ pub const InputMaterialization = enum {
     /// Decoder-style ONNX ABI. The runtime owns host-side KV tensors and feeds
     /// them back into later ORT calls.
     runtime_owned_host_cache,
-    /// Decoder-style ONNX ABI using ORT IO binding. Termite keeps opaque
+    /// Decoder-style ONNX ABI using ORT IO binding. Antfly inference keeps opaque
     /// OrtValue handles for present KV tensors and feeds them back as past KV.
     backend_owned_kv,
 };

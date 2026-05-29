@@ -18,34 +18,34 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PKG_DIR="$ROOT_DIR/pkg/inference"
 
-TERMITE_BIN="${TERMITE_BIN:-$PKG_DIR/zig-out/bin/termite}"
-TARGET_MODEL_DIR="${TERMITE_GEMMA4_TARGET_MODEL:-$HOME/.termite/models/google/gemma-4-E2B-it}"
-DRAFT_MODEL_DIR="${TERMITE_GEMMA4_DRAFT_MODEL:-$HOME/.termite/models/google/gemma-4-E2B-it-assistant}"
-PROMPT="${TERMITE_GEMMA4_ASSISTANT_PROMPT:-hi}"
-MAX_TOKENS="${TERMITE_GEMMA4_ASSISTANT_MAX_TOKENS:-4}"
-SPECULATIVE_K="${TERMITE_GEMMA4_ASSISTANT_SPECULATIVE_K:-2}"
-EXPECTED_TOKEN_IDS="${TERMITE_GEMMA4_ASSISTANT_EXPECTED_TOKEN_IDS:-10979 236888 2088 740}"
-BACKEND="${TERMITE_GEMMA4_ASSISTANT_BACKEND:-auto}"
-HOST_BUDGET_MB="${TERMITE_GEMMA4_ASSISTANT_HOST_BUDGET_MB:-12288}"
-COMBINED_BUDGET_MB="${TERMITE_GEMMA4_ASSISTANT_COMBINED_BUDGET_MB:-17408}"
-OUT_DIR="${OUT_DIR:-/tmp/termite-metal-gemma4-assistant-speculative}"
+ANTFLY_BIN="${ANTFLY_BIN:-$PKG_DIR/zig-out/bin/antfly}"
+TARGET_MODEL_DIR="${ANTFLY_INFERENCE_GEMMA4_TARGET_MODEL:-$HOME/.antfly/inference/models/google/gemma-4-E2B-it}"
+DRAFT_MODEL_DIR="${ANTFLY_INFERENCE_GEMMA4_DRAFT_MODEL:-$HOME/.antfly/inference/models/google/gemma-4-E2B-it-assistant}"
+PROMPT="${ANTFLY_INFERENCE_GEMMA4_ASSISTANT_PROMPT:-hi}"
+MAX_TOKENS="${ANTFLY_INFERENCE_GEMMA4_ASSISTANT_MAX_TOKENS:-4}"
+SPECULATIVE_K="${ANTFLY_INFERENCE_GEMMA4_ASSISTANT_SPECULATIVE_K:-2}"
+EXPECTED_TOKEN_IDS="${ANTFLY_INFERENCE_GEMMA4_ASSISTANT_EXPECTED_TOKEN_IDS:-10979 236888 2088 740}"
+BACKEND="${ANTFLY_INFERENCE_GEMMA4_ASSISTANT_BACKEND:-auto}"
+HOST_BUDGET_MB="${ANTFLY_INFERENCE_GEMMA4_ASSISTANT_HOST_BUDGET_MB:-12288}"
+COMBINED_BUDGET_MB="${ANTFLY_INFERENCE_GEMMA4_ASSISTANT_COMBINED_BUDGET_MB:-17408}"
+OUT_DIR="${OUT_DIR:-/tmp/antfly-inference-metal-gemma4-assistant-speculative}"
 DEBUG_METAL_SCRIPT="$PKG_DIR/scripts/debug_metal_command.sh"
 
-if [[ ! -x "$TERMITE_BIN" ]]; then
-  echo "termite binary not executable: $TERMITE_BIN" >&2
+if [[ ! -x "$ANTFLY_BIN" ]]; then
+  echo "antfly binary not executable: $ANTFLY_BIN" >&2
   echo "build it first, for example: cd pkg/inference && zig build -Doptimize=ReleaseFast -Dmetal=true -Dmlx=false -Donnx=false -Dpjrt=false" >&2
   exit 2
 fi
 
 if [[ ! -d "$TARGET_MODEL_DIR" ]]; then
   echo "Gemma4 target model directory not found: $TARGET_MODEL_DIR" >&2
-  echo "set TERMITE_GEMMA4_TARGET_MODEL to the local target model directory" >&2
+  echo "set ANTFLY_INFERENCE_GEMMA4_TARGET_MODEL to the local target model directory" >&2
   exit 2
 fi
 
 if [[ ! -d "$DRAFT_MODEL_DIR" ]]; then
   echo "Gemma4 assistant model directory not found: $DRAFT_MODEL_DIR" >&2
-  echo "set TERMITE_GEMMA4_DRAFT_MODEL to the local assistant model directory" >&2
+  echo "set ANTFLY_INFERENCE_GEMMA4_DRAFT_MODEL to the local assistant model directory" >&2
   exit 2
 fi
 
@@ -58,10 +58,10 @@ TERMITE_DEBUG_METAL_TIMING=1 \
 bash "$DEBUG_METAL_SCRIPT" command \
   --label metal-gemma4-assistant-speculative \
   --out-dir "$debug_out" \
-  --timeout "${TERMITE_GEMMA4_ASSISTANT_TIMEOUT_SECS:-60}" \
+  --timeout "${ANTFLY_INFERENCE_GEMMA4_ASSISTANT_TIMEOUT_SECS:-60}" \
   --api-validate \
   --cwd "$ROOT_DIR" \
-  -- "$TERMITE_BIN" generate "$TARGET_MODEL_DIR" "$PROMPT" \
+  -- "$ANTFLY_BIN" inference generate "$TARGET_MODEL_DIR" "$PROMPT" \
   --backend "$BACKEND" \
   --draft-model "$DRAFT_MODEL_DIR" \
   --speculative-k "$SPECULATIVE_K" \

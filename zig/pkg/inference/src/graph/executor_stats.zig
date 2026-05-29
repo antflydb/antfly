@@ -15,6 +15,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const ml = @import("ml");
+const platform = @import("antfly_platform");
 
 const contracts = @import("backend_contracts.zig");
 const partition_mod = @import("partition.zig");
@@ -23,7 +24,7 @@ const Graph = ml.graph.Graph;
 const BackendKind = contracts.BackendKind;
 pub const ExecutionStats = partition_mod.PartitionExecutor.ExecutionStats;
 
-const AtomicU64 = std.atomic.Value(u64);
+const AtomicU64 = platform.atomic.Value(u64);
 
 var aggregate_partitions_executed: AtomicU64 = .init(0);
 var aggregate_cross_device_transfers: AtomicU64 = .init(0);

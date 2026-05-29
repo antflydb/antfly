@@ -118,7 +118,7 @@ async function freePort() {
 }
 
 function extraChromiumArgs() {
-  const raw = process.env.TERMITE_WEBGPU_CHROMIUM_ARGS;
+  const raw = process.env.ANTFLY_INFERENCE_WEBGPU_CHROMIUM_ARGS;
   if (!raw) return [];
   return raw.split(/\s+/).filter(Boolean);
 }
