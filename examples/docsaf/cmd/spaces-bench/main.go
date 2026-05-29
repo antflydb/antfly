@@ -53,39 +53,84 @@ type sampleSink struct {
 }
 
 type diagSnapshot struct {
-	Elapsed                      string         `json:"elapsed"`
-	GitCommit                    string         `json:"git_commit,omitempty"`
-	RunLabel                     string         `json:"run_label,omitempty"`
-	MetricsEnabled               bool           `json:"metrics_enabled"`
-	LoadElapsed                  string         `json:"load_elapsed,omitempty"`
-	CatchupElapsed               string         `json:"catchup_elapsed,omitempty"`
-	CatchupComplete              bool           `json:"catchup_complete,omitempty"`
-	Objects                      int64          `json:"objects,omitempty"`
-	ObjectBytes                  int64          `json:"object_bytes,omitempty"`
-	RecordsRead                  int64          `json:"records_read,omitempty"`
-	RecordsWritten               int64          `json:"records_written,omitempty"`
-	InvalidLines                 int64          `json:"invalid_lines,omitempty"`
-	BytesRead                    int64          `json:"bytes_read,omitempty"`
-	WritePayloadBytes            int64          `json:"write_payload_bytes,omitempty"`
-	BatchesSent                  int64          `json:"batches_sent,omitempty"`
-	RecordsPerSec                float64        `json:"records_per_sec,omitempty"`
-	MiBPerSec                    float64        `json:"mib_per_sec,omitempty"`
-	RSSBytes                     int64          `json:"rss_bytes,omitempty"`
-	HealthMetricsAvailable       bool           `json:"health_metrics_available"`
-	ProcessResidentBytes         int64          `json:"process_resident_bytes,omitempty"`
-	ProcessFootprintBytes        int64          `json:"process_footprint_bytes,omitempty"`
-	MallocAllocatedBytes         int64          `json:"malloc_allocated_bytes,omitempty"`
-	MallocZoneBytes              int64          `json:"malloc_zone_bytes,omitempty"`
-	FullTextPendingBytes         int64          `json:"full_text_pending_bytes,omitempty"`
-	DerivedBacklogBytes          int64          `json:"derived_backlog_bytes,omitempty"`
-	TextMergeBufferBytes         int64          `json:"text_merge_buffer_bytes,omitempty"`
-	SegmentFiles                 int64          `json:"segment_files,omitempty"`
-	SegmentBytes                 int64          `json:"segment_bytes,omitempty"`
-	VMMapPhysicalFootprintBytes  int64          `json:"vmmap_physical_footprint_bytes,omitempty"`
-	VMMapPhysicalPeakBytes       int64          `json:"vmmap_physical_peak_bytes,omitempty"`
-	VMMapMappedFileResidentBytes int64          `json:"vmmap_mapped_file_resident_bytes,omitempty"`
-	VMMapMallocAllocatedBytes    int64          `json:"vmmap_malloc_allocated_bytes,omitempty"`
-	Extra                        map[string]any `json:"extra,omitempty"`
+	Elapsed                              string         `json:"elapsed"`
+	GitCommit                            string         `json:"git_commit,omitempty"`
+	RunLabel                             string         `json:"run_label,omitempty"`
+	MetricsEnabled                       bool           `json:"metrics_enabled"`
+	LoadElapsed                          string         `json:"load_elapsed,omitempty"`
+	CatchupElapsed                       string         `json:"catchup_elapsed,omitempty"`
+	CatchupComplete                      bool           `json:"catchup_complete,omitempty"`
+	Objects                              int64          `json:"objects,omitempty"`
+	ObjectBytes                          int64          `json:"object_bytes,omitempty"`
+	RecordsRead                          int64          `json:"records_read,omitempty"`
+	RecordsWritten                       int64          `json:"records_written,omitempty"`
+	InvalidLines                         int64          `json:"invalid_lines,omitempty"`
+	BytesRead                            int64          `json:"bytes_read,omitempty"`
+	WritePayloadBytes                    int64          `json:"write_payload_bytes,omitempty"`
+	BatchesSent                          int64          `json:"batches_sent,omitempty"`
+	RecordsPerSec                        float64        `json:"records_per_sec,omitempty"`
+	MiBPerSec                            float64        `json:"mib_per_sec,omitempty"`
+	RSSBytes                             int64          `json:"rss_bytes,omitempty"`
+	HealthMetricsAvailable               bool           `json:"health_metrics_available"`
+	ProcessResidentBytes                 int64          `json:"process_resident_bytes,omitempty"`
+	ProcessFootprintBytes                int64          `json:"process_footprint_bytes,omitempty"`
+	MallocAllocatedBytes                 int64          `json:"malloc_allocated_bytes,omitempty"`
+	MallocZoneBytes                      int64          `json:"malloc_zone_bytes,omitempty"`
+	FullTextPendingBytes                 int64          `json:"full_text_pending_bytes,omitempty"`
+	DerivedBacklogBytes                  int64          `json:"derived_backlog_bytes,omitempty"`
+	TextMergeBufferBytes                 int64          `json:"text_merge_buffer_bytes,omitempty"`
+	FullTextIndexes                      int64          `json:"full_text_indexes,omitempty"`
+	FullTextSegments                     int64          `json:"full_text_segments,omitempty"`
+	FullTextSegmentBytes                 int64          `json:"full_text_segment_bytes,omitempty"`
+	FullTextMmapSegmentBytes             int64          `json:"full_text_mmap_segment_bytes,omitempty"`
+	FullTextHeapSegmentBytes             int64          `json:"full_text_heap_segment_bytes,omitempty"`
+	FullTextMaxSegmentBytes              int64          `json:"full_text_max_segment_bytes,omitempty"`
+	FullTextStoredFieldsBytes            int64          `json:"full_text_stored_fields_bytes,omitempty"`
+	FullTextInvertedBytes                int64          `json:"full_text_inverted_bytes,omitempty"`
+	FullTextInvertedHeaderBytes          int64          `json:"full_text_inverted_header_bytes,omitempty"`
+	FullTextInvertedFSTBytes             int64          `json:"full_text_inverted_fst_bytes,omitempty"`
+	FullTextInvertedBloomBytes           int64          `json:"full_text_inverted_bloom_bytes,omitempty"`
+	FullTextInvertedPostingsHeaderBytes  int64          `json:"full_text_inverted_postings_header_bytes,omitempty"`
+	FullTextInvertedBlockMaxBytes        int64          `json:"full_text_inverted_block_max_bytes,omitempty"`
+	FullTextInvertedChunkMetaBytes       int64          `json:"full_text_inverted_chunk_meta_bytes,omitempty"`
+	FullTextInvertedPostingsPayloadBytes int64          `json:"full_text_inverted_postings_payload_bytes,omitempty"`
+	FullTextInvertedPositionsBytes       int64          `json:"full_text_inverted_positions_bytes,omitempty"`
+	FullTextInvertedSkipBytes            int64          `json:"full_text_inverted_skip_bytes,omitempty"`
+	FullTextInvertedOneHitTerms          int64          `json:"full_text_inverted_one_hit_terms,omitempty"`
+	FullTextInvertedPostingsTerms        int64          `json:"full_text_inverted_postings_terms,omitempty"`
+	FullTextTypedDocValuesBytes          int64          `json:"full_text_typed_doc_values_bytes,omitempty"`
+	FullTextDocOrdinalsBytes             int64          `json:"full_text_doc_ordinals_bytes,omitempty"`
+	FullTextSectionIndexBytes            int64          `json:"full_text_section_index_bytes,omitempty"`
+	TextMergePendingIndexes              int64          `json:"text_merge_pending_indexes,omitempty"`
+	TextMergePendingSegments             int64          `json:"text_merge_pending_segments,omitempty"`
+	TextMergePendingBytes                int64          `json:"text_merge_pending_bytes,omitempty"`
+	TextMergeInFlightMerges              int64          `json:"text_merge_in_flight_merges,omitempty"`
+	TextMergeInFlightSegments            int64          `json:"text_merge_in_flight_segments,omitempty"`
+	TextMergeCompletedTotal              int64          `json:"text_merge_completed_total,omitempty"`
+	TextMergeSkippedStaleTotal           int64          `json:"text_merge_skipped_stale_total,omitempty"`
+	TextMergeFailedTotal                 int64          `json:"text_merge_failed_total,omitempty"`
+	TextMergeDeferredForPressureTotal    int64          `json:"text_merge_deferred_for_pressure_total,omitempty"`
+	TextMergeBackpressureEventsTotal     int64          `json:"text_merge_backpressure_events_total,omitempty"`
+	TextMergeBackpressureNsTotal         int64          `json:"text_merge_backpressure_ns_total,omitempty"`
+	TextMergeMaxPendingSegments          int64          `json:"text_merge_max_pending_segments,omitempty"`
+	TextMergeMaxPendingBytes             int64          `json:"text_merge_max_pending_bytes,omitempty"`
+	FullTextBuildUsedBytes               int64          `json:"full_text_build_used_bytes,omitempty"`
+	FullTextBuildPeakBytes               int64          `json:"full_text_build_peak_bytes,omitempty"`
+	FullTextPendingPeakBytes             int64          `json:"full_text_pending_peak_bytes,omitempty"`
+	TextMergeBufferPeakBytes             int64          `json:"text_merge_buffer_peak_bytes,omitempty"`
+	LSMCacheUsedBytes                    int64          `json:"lsm_cache_used_bytes,omitempty"`
+	LSMCachePeakBytes                    int64          `json:"lsm_cache_peak_bytes,omitempty"`
+	LSMCompactionUsedBytes               int64          `json:"lsm_compaction_used_bytes,omitempty"`
+	LSMCompactionPeakBytes               int64          `json:"lsm_compaction_peak_bytes,omitempty"`
+	LSMStateUsedBytes                    int64          `json:"lsm_state_used_bytes,omitempty"`
+	LSMStatePeakBytes                    int64          `json:"lsm_state_peak_bytes,omitempty"`
+	SegmentFiles                         int64          `json:"segment_files,omitempty"`
+	SegmentBytes                         int64          `json:"segment_bytes,omitempty"`
+	VMMapPhysicalFootprintBytes          int64          `json:"vmmap_physical_footprint_bytes,omitempty"`
+	VMMapPhysicalPeakBytes               int64          `json:"vmmap_physical_peak_bytes,omitempty"`
+	VMMapMappedFileResidentBytes         int64          `json:"vmmap_mapped_file_resident_bytes,omitempty"`
+	VMMapMallocAllocatedBytes            int64          `json:"vmmap_malloc_allocated_bytes,omitempty"`
+	Extra                                map[string]any `json:"extra,omitempty"`
 }
 
 type vmmapStats struct {
@@ -343,6 +388,32 @@ func main() {
 		finalDiag.SegmentFiles,
 		finalDiag.SegmentBytes,
 	)
+	fmt.Printf("full_text_layout segments=%d segment_bytes=%d mmap_segment_bytes=%d heap_segment_bytes=%d stored_fields_bytes=%d inverted_bytes=%d postings_payload_bytes=%d positions_bytes=%d term_dict_bytes=%d typed_doc_values_bytes=%d doc_ordinals_bytes=%d section_index_bytes=%d\n",
+		finalDiag.FullTextSegments,
+		finalDiag.FullTextSegmentBytes,
+		finalDiag.FullTextMmapSegmentBytes,
+		finalDiag.FullTextHeapSegmentBytes,
+		finalDiag.FullTextStoredFieldsBytes,
+		finalDiag.FullTextInvertedBytes,
+		finalDiag.FullTextInvertedPostingsPayloadBytes,
+		finalDiag.FullTextInvertedPositionsBytes,
+		finalDiag.FullTextInvertedFSTBytes,
+		finalDiag.FullTextTypedDocValuesBytes,
+		finalDiag.FullTextDocOrdinalsBytes,
+		finalDiag.FullTextSectionIndexBytes,
+	)
+	fmt.Printf("merge_and_resource_diagnostics text_merge_pending_segments=%d text_merge_pending_bytes=%d text_merge_completed_total=%d text_merge_failed_total=%d full_text_build_peak_bytes=%d full_text_pending_peak_bytes=%d text_merge_buffer_peak_bytes=%d lsm_cache_peak_bytes=%d lsm_compaction_peak_bytes=%d lsm_state_peak_bytes=%d\n",
+		finalDiag.TextMergePendingSegments,
+		finalDiag.TextMergePendingBytes,
+		finalDiag.TextMergeCompletedTotal,
+		finalDiag.TextMergeFailedTotal,
+		finalDiag.FullTextBuildPeakBytes,
+		finalDiag.FullTextPendingPeakBytes,
+		finalDiag.TextMergeBufferPeakBytes,
+		finalDiag.LSMCachePeakBytes,
+		finalDiag.LSMCompactionPeakBytes,
+		finalDiag.LSMStatePeakBytes,
+	)
 	if *vmmapOut != "" && *samplePID > 0 {
 		if vmmapStats, err := writeVMMapSummary(*samplePID, *vmmapOut); err != nil {
 			fmt.Printf("vmmap_error err=%v\n", err)
@@ -434,6 +505,51 @@ func collectDiagnostics(pid int, healthURL, dataDir string, elapsed time.Duratio
 			out.FullTextPendingBytes = int64(promValue(metrics, "antfly_resource_used_bytes", map[string]string{"slice": "full_text.pending_segments"}))
 			out.DerivedBacklogBytes = int64(promValue(metrics, "antfly_resource_used_bytes", map[string]string{"slice": "derived.backlog"}))
 			out.TextMergeBufferBytes = int64(promValue(metrics, "antfly_resource_used_bytes", map[string]string{"slice": "text_merge.buffers"}))
+			out.FullTextIndexes = int64(promValue(metrics, "antfly_full_text_indexes", nil))
+			out.FullTextSegments = int64(promValue(metrics, "antfly_full_text_segments", nil))
+			out.FullTextSegmentBytes = int64(promValue(metrics, "antfly_full_text_segment_bytes", nil))
+			out.FullTextMmapSegmentBytes = int64(promValue(metrics, "antfly_full_text_mmap_segment_bytes", nil))
+			out.FullTextHeapSegmentBytes = int64(promValue(metrics, "antfly_full_text_heap_segment_bytes", nil))
+			out.FullTextMaxSegmentBytes = int64(promValue(metrics, "antfly_full_text_max_segment_bytes", nil))
+			out.FullTextStoredFieldsBytes = int64(promValue(metrics, "antfly_full_text_stored_fields_bytes", nil))
+			out.FullTextInvertedBytes = int64(promValue(metrics, "antfly_full_text_inverted_bytes", nil))
+			out.FullTextInvertedHeaderBytes = int64(promValue(metrics, "antfly_full_text_inverted_header_bytes", nil))
+			out.FullTextInvertedFSTBytes = int64(promValue(metrics, "antfly_full_text_inverted_fst_bytes", nil))
+			out.FullTextInvertedBloomBytes = int64(promValue(metrics, "antfly_full_text_inverted_bloom_bytes", nil))
+			out.FullTextInvertedPostingsHeaderBytes = int64(promValue(metrics, "antfly_full_text_inverted_postings_header_bytes", nil))
+			out.FullTextInvertedBlockMaxBytes = int64(promValue(metrics, "antfly_full_text_inverted_block_max_bytes", nil))
+			out.FullTextInvertedChunkMetaBytes = int64(promValue(metrics, "antfly_full_text_inverted_chunk_meta_bytes", nil))
+			out.FullTextInvertedPostingsPayloadBytes = int64(promValue(metrics, "antfly_full_text_inverted_postings_payload_bytes", nil))
+			out.FullTextInvertedPositionsBytes = int64(promValue(metrics, "antfly_full_text_inverted_positions_bytes", nil))
+			out.FullTextInvertedSkipBytes = int64(promValue(metrics, "antfly_full_text_inverted_skip_bytes", nil))
+			out.FullTextInvertedOneHitTerms = int64(promValue(metrics, "antfly_full_text_inverted_one_hit_terms", nil))
+			out.FullTextInvertedPostingsTerms = int64(promValue(metrics, "antfly_full_text_inverted_postings_terms", nil))
+			out.FullTextTypedDocValuesBytes = int64(promValue(metrics, "antfly_full_text_typed_doc_values_bytes", nil))
+			out.FullTextDocOrdinalsBytes = int64(promValue(metrics, "antfly_full_text_doc_ordinals_bytes", nil))
+			out.FullTextSectionIndexBytes = int64(promValue(metrics, "antfly_full_text_section_index_bytes", nil))
+			out.TextMergePendingIndexes = int64(promValue(metrics, "antfly_text_merge_pending_indexes", nil))
+			out.TextMergePendingSegments = int64(promValue(metrics, "antfly_text_merge_pending_segments", nil))
+			out.TextMergePendingBytes = int64(promValue(metrics, "antfly_text_merge_pending_bytes", nil))
+			out.TextMergeInFlightMerges = int64(promValue(metrics, "antfly_text_merge_in_flight_merges", nil))
+			out.TextMergeInFlightSegments = int64(promValue(metrics, "antfly_text_merge_in_flight_segments", nil))
+			out.TextMergeCompletedTotal = int64(promValue(metrics, "antfly_text_merge_completed_total", nil))
+			out.TextMergeSkippedStaleTotal = int64(promValue(metrics, "antfly_text_merge_skipped_stale_total", nil))
+			out.TextMergeFailedTotal = int64(promValue(metrics, "antfly_text_merge_failed_total", nil))
+			out.TextMergeDeferredForPressureTotal = int64(promValue(metrics, "antfly_text_merge_deferred_for_pressure_total", nil))
+			out.TextMergeBackpressureEventsTotal = int64(promValue(metrics, "antfly_text_merge_backpressure_events_total", nil))
+			out.TextMergeBackpressureNsTotal = int64(promValue(metrics, "antfly_text_merge_backpressure_ns_total", nil))
+			out.TextMergeMaxPendingSegments = int64(promValue(metrics, "antfly_text_merge_max_pending_segments", nil))
+			out.TextMergeMaxPendingBytes = int64(promValue(metrics, "antfly_text_merge_max_pending_bytes", nil))
+			out.FullTextBuildUsedBytes = int64(promValue(metrics, "antfly_resource_used_bytes", map[string]string{"slice": "full_text.build_working_set"}))
+			out.FullTextBuildPeakBytes = int64(promValue(metrics, "antfly_resource_peak_bytes", map[string]string{"slice": "full_text.build_working_set"}))
+			out.FullTextPendingPeakBytes = int64(promValue(metrics, "antfly_resource_peak_bytes", map[string]string{"slice": "full_text.pending_segments"}))
+			out.TextMergeBufferPeakBytes = int64(promValue(metrics, "antfly_resource_peak_bytes", map[string]string{"slice": "text_merge.buffers"}))
+			out.LSMCacheUsedBytes = int64(promValue(metrics, "antfly_resource_used_bytes", map[string]string{"slice": "lsm.block_table_cache"}))
+			out.LSMCachePeakBytes = int64(promValue(metrics, "antfly_resource_peak_bytes", map[string]string{"slice": "lsm.block_table_cache"}))
+			out.LSMCompactionUsedBytes = int64(promValue(metrics, "antfly_resource_used_bytes", map[string]string{"slice": "lsm.compaction_work"}))
+			out.LSMCompactionPeakBytes = int64(promValue(metrics, "antfly_resource_peak_bytes", map[string]string{"slice": "lsm.compaction_work"}))
+			out.LSMStateUsedBytes = int64(promValue(metrics, "antfly_resource_used_bytes", map[string]string{"slice": "lsm.in_memory_state"}))
+			out.LSMStatePeakBytes = int64(promValue(metrics, "antfly_resource_peak_bytes", map[string]string{"slice": "lsm.in_memory_state"}))
 		}
 	}
 	if dataDir != "" {
