@@ -175,7 +175,7 @@ scripts/ci/zig-e2e-base-linux.sh
 ```
 
 Pass pytest selectors after the script name to run a focused Antfly E2E loop.
-Termite E2E is skipped for focused runs unless `RUN_TERMITE_E2E=1` is set:
+Inference E2E is skipped for focused runs unless `RUN_INFERENCE_E2E=1` is set:
 
 ```sh
 SKIP_BUILD=1 scripts/ci/zig-e2e-base-linux.sh \
@@ -208,8 +208,8 @@ docker run --rm --platform linux/amd64 \
 Useful script controls:
 
 - `SKIP_BUILD=1`: reuse existing `zig/zig-out/bin/antfly`.
-- `RUN_TERMITE_E2E=0`: skip Termite base E2E in the default run.
-- `ANTFLY_E2E_VENV` and `TERMITE_E2E_VENV`: override the script-managed
+- `RUN_INFERENCE_E2E=0`: skip inference base E2E in the default run.
+- `ANTFLY_E2E_VENV` and `ANTFLY_INFERENCE_E2E_VENV`: override the script-managed
   virtualenv paths, which default under `/tmp` so Docker runs do not rewrite
   project-local `.venv` directories.
 - `ANTFLY_CI_ZIG_TARGET`, `ANTFLY_CI_ZIG_CPU`, and `ANTFLY_CI_ZIG_OPTIMIZE`:
@@ -288,6 +288,14 @@ ANTFLY_INFERENCE_URL=https://inference.example.com ANTFLY_INFERENCE_TOKEN=... uv
 
 Common inference E2E environment variables:
 
+- `ANTFLY_BIN`: local Antfly binary to auto-start via `antfly inference run`.
+- `ANTFLY_INFERENCE_URL`: existing inference API endpoint.
+- `ANTFLY_INFERENCE_TOKEN`: bearer token for remote inference endpoints.
+- `ANTFLY_INFERENCE_MODELS_DIR`: model directory override.
+- `ANTFLY_INFERENCE_DOWNLOAD=1`: allow model downloads through `antfly
+  inference pull` when tests request unavailable models.
+- `RUN_LARGE_MODEL_TESTS=1`: opt into large-model tests.
+
 ## TypeScript Components
 
 Run the focused components checks through the same helper used for local CI
@@ -302,15 +310,6 @@ Pass Vitest selectors after the script name when narrowing a failure:
 ```sh
 scripts/ci/ts-components.sh src/Listener.test.tsx -t config
 ```
-
-Common inference E2E environment variables:
-
-- `ANTFLY_BIN`: local Antfly binary to auto-start via `antfly inference run`.
-- `ANTFLY_INFERENCE_URL`: existing inference API endpoint.
-- `ANTFLY_INFERENCE_TOKEN`: bearer token for remote inference endpoints.
-- `ANTFLY_INFERENCE_MODELS_DIR`: model directory override.
-- `ANTFLY_INFERENCE_DOWNLOAD=1`: allow model downloads through `antfly inference pull` when tests request unavailable models.
-- `RUN_LARGE_MODEL_TESTS=1`: opt into large-model tests.
 
 Many E2E tests skip cleanly when required binaries, services, local PostgreSQL,
 remote object stores, or model files are unavailable.

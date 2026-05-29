@@ -290,9 +290,9 @@ The model-facing producer types are separate from artifact kinds:
   roles.
 
 For Zig providers, `antfly` is the canonical local/remote provider name. A
-provider config with `provider: "antfly"` and no `url` uses the local Termite
-runtime when available. Supplying `url` routes to an Antfly/Termite-compatible
-HTTP service. `termite` remains an alias while older configs migrate.
+provider config with `provider: "antfly"` and no `url` uses the local Antfly
+inference runtime when available. Supplying `url` routes to an Antfly
+inference-compatible HTTP service.
 
 Vertex/Google auth uses provider-specific config. Explicit `bearer_token` or
 provider API key config wins. Otherwise Vertex providers resolve service-account

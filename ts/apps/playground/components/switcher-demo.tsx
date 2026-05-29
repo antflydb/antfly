@@ -35,7 +35,7 @@ const projects: Project[] = [
 const products = [
   { id: "antfarm", name: "Antfarm", description: "Database management dashboard" },
   { id: "searchaf", name: "SearchAF", description: "Managed search & answer engines" },
-  { id: "termite", name: "Termite", description: "Local ML inference service" },
+  { id: "inference", name: "Antfly Inference", description: "Local ML inference runtime" },
 ];
 
 export function SwitcherDemo() {

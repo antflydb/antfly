@@ -434,7 +434,6 @@ jobs:
     env:
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
-      TERMITE_HOME: /mnt/cache/antfly/zig/termite
       ANTFLY_CI_TRACE: "1"
     steps:
       - uses: actions/checkout@v6
@@ -452,11 +451,11 @@ jobs:
 
       - name: Prepare ARC cache dirs
         run: |
-          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$TERMITE_HOME"
-          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-termite
-          rm -rf ~/.cache ~/.termite
+          mkdir -p "$UV_CACHE_DIR" "$HF_HOME"
+          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-antfly
+          rm -rf ~/.cache ~/.antfly
           ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
-          ln -s /mnt/cache/antfly/zig/home-termite ~/.termite
+          ln -s /mnt/cache/antfly/zig/home-antfly ~/.antfly
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
@@ -477,7 +476,6 @@ jobs:
     env:
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
-      TERMITE_HOME: /mnt/cache/antfly/zig/termite
     steps:
       - uses: actions/checkout@v6
         with:
@@ -494,11 +492,11 @@ jobs:
 
       - name: Prepare ARC cache dirs
         run: |
-          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$TERMITE_HOME"
-          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-termite
-          rm -rf ~/.cache ~/.termite
+          mkdir -p "$UV_CACHE_DIR" "$HF_HOME"
+          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-antfly
+          rm -rf ~/.cache ~/.antfly
           ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
-          ln -s /mnt/cache/antfly/zig/home-termite ~/.termite
+          ln -s /mnt/cache/antfly/zig/home-antfly ~/.antfly
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
@@ -513,11 +511,11 @@ jobs:
           ANTFLY_LSM_OPEN_DEBUG: "1"
           ANTFLY_FS_PATH_DEBUG: "1"
         run: |
-          chmod +x ./zig-out/bin/antfly ./zig-out/bin/termite
+          chmod +x ./zig-out/bin/antfly
           uv run --project e2e/antfly pytest -q -x e2e/antfly
 
-      - name: Run Termite full E2E
+      - name: Run Antfly inference full E2E
         working-directory: zig
         env:
-          TERMITE_BIN: ./zig-out/bin/termite
-        run: uv run --project e2e/termite pytest -q -x e2e/termite
+          ANTFLY_BIN: ./zig-out/bin/antfly
+        run: uv run --project e2e/inference pytest -q -x e2e/inference
