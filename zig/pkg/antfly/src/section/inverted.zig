@@ -35,10 +35,12 @@ const bloom = @import("bloom");
 // ============================================================================
 //
 //   v7: FST + block-delta doc stream + StreamVByte freq/norm + positions + bloom
+//   v8: v7 plus sparse block-max metadata with a base chunk id per term
 //
-// This project is pre-release; readers only accept the current v7 format.
+// This project is pre-release; writers emit the current v8 format.
 
 const wire_version_v7: u8 = 7;
+const wire_version_v8: u8 = 8;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4; // 29 bytes
 const v7_chunk_meta_size: usize = 44;
 
@@ -66,6 +68,18 @@ fn writeV7Header(
     dst[17..21].* = @bitCast(std.mem.nativeToLittle(u32, chunk_size));
     dst[21..25].* = @bitCast(std.mem.nativeToLittle(u32, vellum_len));
     dst[25..29].* = @bitCast(std.mem.nativeToLittle(u32, bloom_len));
+}
+
+fn writeV8Header(
+    dst: []u8,
+    doc_count: u32,
+    total_field_len: u64,
+    chunk_size: u32,
+    vellum_len: u32,
+    bloom_len: u32,
+) void {
+    writeV7Header(dst, doc_count, total_field_len, chunk_size, vellum_len, bloom_len);
+    dst[4] = wire_version_v8;
 }
 
 // ============================================================================
@@ -245,19 +259,18 @@ pub const InvertedIndexBuilder = struct {
     ///   - General: postings offset within postings_data
     ///   - 1-hit: packed docNum + normBits (for single-doc, freq=1 terms)
     ///
-    /// Postings per term:
+    /// Postings per term, v8:
     ///   [doc_freq: u32 LE]
-    ///   [bitmap_len: u32 LE][bitmap_data]
-    ///   [freq_norm_len: u32 LE][freq_norm_data]  — chunked freqHasLocs+norm pairs
-    ///   [num_chunks: u32 LE]                      — block-max chunk count (v4+)
-    ///   per chunk: [max_freq: u16 LE][min_norm: u16 LE][max_norm: u16 LE]
-    ///   [positions_section_len: u32 LE]            — length of positions data (v5+)
-    ///   per doc (in posting order):
-    ///     v5: [num_positions: u16 LE][positions: num_positions * u32 LE]
-    ///     v6: [num_positions: varint][delta_0: varint][delta_1: varint]...
-    ///         (delta_0 is the absolute first position; delta_i = pos_i - pos_{i-1})
+    ///   [stored_chunks: u32 LE]
+    ///   [block_max_base_chunk: u32 LE]
+    ///   [block_max_chunks: u32 LE]
+    ///   [positions_section_len: u32 LE]
+    ///   [block_max_chunks × 6-byte block-max records]
+    ///   [stored_chunks × chunk metadata]
+    ///   [StreamVByte doc deltas + freqHasLocs/norm payloads]
+    ///   [positions: varint count + varint deltas per doc]
     ///
-    /// v7 stores postings first, then an optional per-segment term bloom filter,
+    /// v8 stores postings first, then an optional per-segment term bloom filter,
     /// then the FST. `bloom_len` in the header tells the reader how many bytes
     /// to skip past postings before the FST starts.
     pub fn build(self: *InvertedIndexBuilder) ![]u8 {
@@ -342,7 +355,7 @@ pub const InvertedIndexBuilder = struct {
                 try fst_builder.insert(term, fstValEncode1Hit(doc_num, norm_bits));
             } else {
                 const postings_offset: u64 = @intCast(output.items.len - v7_header_size);
-                try acc.serializeV7(output_alloc, &output, &serialize_scratch, self.config.chunk_size, self.doc_count);
+                try acc.serializeV8(output_alloc, &output, &serialize_scratch, self.config.chunk_size);
                 try fst_builder.insert(term, postings_offset);
             }
         }
@@ -370,7 +383,7 @@ pub const InvertedIndexBuilder = struct {
         }
         try output.appendSlice(output_alloc, fst_data);
 
-        writeV7Header(
+        writeV8Header(
             output.items[0..v7_header_size],
             self.doc_count,
             self.total_field_len,
@@ -528,19 +541,21 @@ const PostingAccumulator = struct {
         try self.all_positions.appendSlice(alloc, positions);
     }
 
-    fn serializeV7(
+    fn serializeV8(
         self: *const PostingAccumulator,
         alloc: Allocator,
         out: *std.ArrayListUnmanaged(u8),
         scratch: *PostingSerializeScratch,
         chunk_size: u32,
-        max_doc: u32,
     ) !void {
         scratch.reset();
         const doc_freq: u32 = @intCast(self.doc_ids.items.len);
-        const encoded_doc_limit = try self.encodedDocLimit(max_doc);
+        if (doc_freq == 0) return error.InvalidData;
 
-        const num_doc_chunks: u32 = if (encoded_doc_limit == 0) 0 else (encoded_doc_limit - 1) / chunk_size + 1;
+        const first_chunk_id = self.doc_ids.items[0] / chunk_size;
+        const last_doc_id = self.doc_ids.items[self.doc_ids.items.len - 1];
+        const last_chunk_id = last_doc_id / chunk_size;
+        const num_doc_chunks = std.math.add(u32, last_chunk_id - first_chunk_id, 1) catch return error.DocumentOutOfRange;
         try scratch.block_max.resize(alloc, @as(usize, num_doc_chunks) * 6);
         var chunk_idx: usize = 0;
         while (chunk_idx < num_doc_chunks) : (chunk_idx += 1) {
@@ -572,7 +587,7 @@ const PostingAccumulator = struct {
                 scratch.freq_norm_values.appendAssumeCapacity(meta.norm);
                 prev_doc = doc_id;
 
-                const bm_off = @as(usize, chunk_id) * 6;
+                const bm_off = @as(usize, chunk_id - first_chunk_id) * 6;
                 const freq_u16: u16 = if (meta.freq > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(meta.freq);
                 const norm_u16: u16 = if (meta.norm > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(meta.norm);
                 const cur_max_freq = std.mem.readInt(u16, scratch.block_max.items[bm_off..][0..2], .little);
@@ -616,15 +631,16 @@ const PostingAccumulator = struct {
         }
 
         const term_start = out.items.len;
-        const total_len = 16 + scratch.block_max.items.len + scratch.chunks.items.len * v7_chunk_meta_size + scratch.payload.items.len + scratch.positions.items.len;
+        const total_len = 20 + scratch.block_max.items.len + scratch.chunks.items.len * v7_chunk_meta_size + scratch.payload.items.len + scratch.positions.items.len;
         try out.ensureUnusedCapacity(alloc, total_len);
         out.items.len += total_len;
         const dst = out.items[term_start..][0..total_len];
         dst[0..4].* = @bitCast(std.mem.nativeToLittle(u32, doc_freq));
         dst[4..8].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(scratch.chunks.items.len))));
-        dst[8..12].* = @bitCast(std.mem.nativeToLittle(u32, num_doc_chunks));
-        dst[12..16].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(scratch.positions.items.len))));
-        var dst_pos: usize = 16;
+        dst[8..12].* = @bitCast(std.mem.nativeToLittle(u32, first_chunk_id));
+        dst[12..16].* = @bitCast(std.mem.nativeToLittle(u32, num_doc_chunks));
+        dst[16..20].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(scratch.positions.items.len))));
+        var dst_pos: usize = 20;
         @memcpy(dst[dst_pos..][0..scratch.block_max.items.len], scratch.block_max.items);
         dst_pos += scratch.block_max.items.len;
         for (scratch.chunks.items) |chunk| {
@@ -634,15 +650,6 @@ const PostingAccumulator = struct {
         @memcpy(dst[dst_pos..][0..scratch.payload.items.len], scratch.payload.items);
         dst_pos += scratch.payload.items.len;
         @memcpy(dst[dst_pos..][0..scratch.positions.items.len], scratch.positions.items);
-    }
-
-    fn encodedDocLimit(self: *const PostingAccumulator, max_doc: u32) !u32 {
-        var limit = max_doc;
-        for (self.doc_ids.items) |doc_id| {
-            const doc_limit = std.math.add(u32, doc_id, 1) catch return error.DocumentOutOfRange;
-            limit = @max(limit, doc_limit);
-        }
-        return limit;
     }
 };
 
@@ -668,7 +675,7 @@ pub const InvertedIndexReader = struct {
         if (data.len < v7_header_size) return error.InvalidData;
         if (!std.mem.eql(u8, data[0..4], "INVT")) return error.InvalidMagic;
         const version = data[4];
-        if (version != wire_version_v7) return error.UnsupportedVersion;
+        if (version != wire_version_v8 and version != wire_version_v7) return error.UnsupportedVersion;
 
         const doc_count = std.mem.readInt(u32, data[5..9], .little);
         const total_field_len = std.mem.readInt(u64, data[9..17], .little);
@@ -739,7 +746,7 @@ pub const InvertedIndexReader = struct {
                 .one_hit => stats.one_hit_terms +|= 1,
                 .postings => |postings| {
                     stats.postings_terms +|= 1;
-                    stats.postings_header_bytes +|= 16;
+                    stats.postings_header_bytes +|= if (self.version >= wire_version_v8) 20 else 16;
                     if (postings.block_max) |block_max_info| {
                         stats.block_max_bytes +|= @intCast(block_max_info.meta.len);
                     }
@@ -808,9 +815,20 @@ pub const InvertedIndexReader = struct {
         const base = self.postings_offset + offset;
         const doc_freq = std.mem.readInt(u32, self.data[base..][0..4], .little);
         const stored_chunks = std.mem.readInt(u32, self.data[base + 4 ..][0..4], .little);
-        const doc_chunks = std.mem.readInt(u32, self.data[base + 8 ..][0..4], .little);
-        const positions_len = std.mem.readInt(u32, self.data[base + 12 ..][0..4], .little);
-        const block_max_start = base + 16;
+        const block_max_base_chunk: u32 = if (self.version >= wire_version_v8)
+            std.mem.readInt(u32, self.data[base + 8 ..][0..4], .little)
+        else
+            0;
+        const doc_chunks = if (self.version >= wire_version_v8)
+            std.mem.readInt(u32, self.data[base + 12 ..][0..4], .little)
+        else
+            std.mem.readInt(u32, self.data[base + 8 ..][0..4], .little);
+        const positions_len = if (self.version >= wire_version_v8)
+            std.mem.readInt(u32, self.data[base + 16 ..][0..4], .little)
+        else
+            std.mem.readInt(u32, self.data[base + 12 ..][0..4], .little);
+        const postings_header_len: usize = if (self.version >= wire_version_v8) 20 else 16;
+        const block_max_start = base + postings_header_len;
         const block_max_len = @as(usize, doc_chunks) * 6;
         const chunk_meta_start = block_max_start + block_max_len;
         const chunk_meta_len = @as(usize, stored_chunks) * v7_chunk_meta_size;
@@ -833,6 +851,7 @@ pub const InvertedIndexReader = struct {
             .chunk_size = self.chunk_size,
             .version = self.version,
             .block_max = .{
+                .base_chunk = block_max_base_chunk,
                 .num_chunks = doc_chunks,
                 .meta = self.data[block_max_start..][0..block_max_len],
             },
@@ -913,6 +932,9 @@ pub const LookupResult = union(enum) {
 /// Per-chunk block-max metadata for WAND scoring acceleration.
 /// Each chunk stores (max_freq, min_norm, max_norm) packed as 6 bytes.
 pub const BlockMaxInfo = struct {
+    /// First global doc chunk covered by `meta`. v8 stores sparse block-max
+    /// windows per term instead of padding every term to segment max_doc.
+    base_chunk: u32 = 0,
     num_chunks: u32,
     /// Packed [max_freq:u16 LE][min_norm:u16 LE][max_norm:u16 LE] per chunk.
     meta: []const u8,
@@ -920,8 +942,10 @@ pub const BlockMaxInfo = struct {
     /// Compute the maximum possible BM25 impact for a chunk.
     /// Uses the most favorable values in the chunk: max_freq and min_norm (shortest doc).
     pub fn maxImpact(self: BlockMaxInfo, chunk_idx: u32, doc_count: u32, doc_freq: u32, avg_dl: f32, config: BM25Config) f32 {
-        if (chunk_idx >= self.num_chunks) return 0;
-        const offset = @as(usize, chunk_idx) * 6;
+        if (chunk_idx < self.base_chunk) return 0;
+        const local_chunk = chunk_idx - self.base_chunk;
+        if (local_chunk >= self.num_chunks) return 0;
+        const offset = @as(usize, local_chunk) * 6;
         const max_freq = std.mem.readInt(u16, self.meta[offset..][0..2], .little);
         const min_norm = std.mem.readInt(u16, self.meta[offset + 2 ..][0..2], .little);
         if (max_freq == 0) return 0;
@@ -976,7 +1000,7 @@ pub const PostingsIterator = struct {
     current_chunk_index: usize = std.math.maxInt(usize),
     next_chunk_index: usize = 0,
     chunk_doc_pos: usize = 0,
-    version: u8 = wire_version_v7,
+    version: u8 = wire_version_v8,
     positions_data: ?[]const u8 = null,
     positions_cursor: usize = 0,
     doc_values: std.ArrayListUnmanaged(u32) = .empty,
@@ -1723,7 +1747,8 @@ fn appendMergedTerm(
     }
 
     const postings_offset: u64 = @intCast(postings_data.items.len);
-    try acc.serializeV7(alloc, postings_data, serialize_scratch, config.chunk_size, merged_doc_count);
+    _ = merged_doc_count;
+    try acc.serializeV8(alloc, postings_data, serialize_scratch, config.chunk_size);
     try fst_builder.insert(term, postings_offset);
 }
 
@@ -1776,7 +1801,7 @@ fn assembleMergedSection(
 
     const total = v7_header_size + postings_data.len + bloom_bytes.len + fst_data.len;
     var output = try alloc.alloc(u8, total);
-    writeV7Header(
+    writeV8Header(
         output,
         doc_count,
         total_field_len,
@@ -2138,9 +2163,9 @@ test "1-hit optimization end-to-end" {
     const section = try builder.build();
     defer alloc.free(section);
 
-    // Builders emit v7 by default; the FST version-encoding (1-hit packing) is
+    // Builders emit v8 by default; the FST version-encoding (1-hit packing) is
     // unchanged from v3+, so the "unique" term still lands on the 1-hit path.
-    try std.testing.expectEqual(@as(u8, 7), section[4]);
+    try std.testing.expectEqual(@as(u8, wire_version_v8), section[4]);
 
     var reader = try InvertedIndexReader.init(alloc, section);
 
@@ -2231,7 +2256,7 @@ test "v4 block-max metadata round-trip" {
     defer alloc.free(section);
 
     var reader = try InvertedIndexReader.init(alloc, section);
-    try std.testing.expectEqual(@as(u8, 7), reader.version);
+    try std.testing.expectEqual(@as(u8, wire_version_v8), reader.version);
 
     const result = reader.lookup("term") orelse return error.TestExpectedEqual;
     switch (result) {
@@ -2257,6 +2282,37 @@ test "v4 block-max metadata round-trip" {
     }
 }
 
+test "v8 block-max metadata stores only term chunk window" {
+    const alloc = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
+    defer builder.deinit();
+
+    try builder.addDocument(0, &.{.{ .term = "pad0", .freq = 1, .norm = 10 }});
+    try builder.addDocument(1, &.{.{ .term = "pad1", .freq = 1, .norm = 10 }});
+    try builder.addDocument(2, &.{.{ .term = "late", .freq = 3, .norm = 9 }});
+    try builder.addDocument(3, &.{.{ .term = "late", .freq = 2, .norm = 11 }});
+    try builder.addDocument(4, &.{.{ .term = "pad4", .freq = 1, .norm = 10 }});
+    try builder.addDocument(5, &.{.{ .term = "pad5", .freq = 1, .norm = 10 }});
+
+    const section = try builder.build();
+    defer alloc.free(section);
+
+    var reader = try InvertedIndexReader.init(alloc, section);
+    const result = reader.lookup("late") orelse return error.TestExpectedEqual;
+    switch (result) {
+        .postings => |p| {
+            const bm = p.block_max orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(@as(u32, 1), bm.base_chunk);
+            try std.testing.expectEqual(@as(u32, 1), bm.num_chunks);
+            try std.testing.expectEqual(@as(usize, 6), bm.meta.len);
+            try std.testing.expectEqual(@as(f32, 0), bm.maxImpact(0, 6, 2, reader.avgDocLen(), .{}));
+            try std.testing.expect(bm.maxImpact(1, 6, 2, reader.avgDocLen(), .{}) > 0);
+            try std.testing.expectEqual(@as(f32, 0), bm.maxImpact(2, 6, 2, reader.avgDocLen(), .{}));
+        },
+        .one_hit => return error.TestExpectedEqual,
+    }
+}
+
 test "positions round-trip v6 delta+varint" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
@@ -2277,7 +2333,7 @@ test "positions round-trip v6 delta+varint" {
     defer alloc.free(section);
 
     var reader = try InvertedIndexReader.init(alloc, section);
-    try std.testing.expectEqual(@as(u8, 7), reader.version);
+    try std.testing.expectEqual(@as(u8, wire_version_v8), reader.version);
 
     // Check "hello" positions
     const hello = reader.lookup("hello") orelse return error.TestExpectedEqual;
@@ -2659,7 +2715,7 @@ test "v6 reads back positions across the varint multi-byte boundary" {
     defer alloc.free(section);
 
     var reader = try InvertedIndexReader.init(alloc, section);
-    try std.testing.expectEqual(@as(u8, 7), reader.version);
+    try std.testing.expectEqual(@as(u8, wire_version_v8), reader.version);
 
     const lookup = reader.lookup("term") orelse return error.TestExpectedEqual;
     var iter = try lookup.iterator(alloc);
