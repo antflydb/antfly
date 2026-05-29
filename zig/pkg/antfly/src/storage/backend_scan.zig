@@ -46,6 +46,31 @@ pub fn scan(
 
     var cur = try txn.openCursor();
     defer cur.close();
+    try scanCursor(&cur, lower, upper, options, callback);
+}
+
+pub fn scanCurrent(
+    store: *backend_erased.Store,
+    lower: []const u8,
+    upper: []const u8,
+    options: ScanOptions,
+    callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
+) !void {
+    var txn = try store.beginCurrentScan();
+    defer txn.abort();
+
+    var cur = try txn.openCursor();
+    defer cur.close();
+    try scanCursor(&cur, lower, upper, options, callback);
+}
+
+fn scanCursor(
+    cur: *backend_erased.Cursor,
+    lower: []const u8,
+    upper: []const u8,
+    options: ScanOptions,
+    callback: *const fn (key: []const u8, value: []const u8) anyerror!ScanAction,
+) !void {
     cur.setUpperBound(if (upper.len > 0) upper else null);
 
     const first = if (lower.len == 0)
@@ -69,6 +94,16 @@ pub fn scan(
     }
 }
 
+pub fn scanPrefixCurrent(alloc: std.mem.Allocator, store: *backend_erased.Store, prefix: []const u8) ![]OwnedKVPair {
+    var txn = try store.beginCurrentScan();
+    defer txn.abort();
+
+    var cur = try txn.openCursor();
+    defer cur.close();
+
+    return try scanPrefixCursor(alloc, &cur, prefix);
+}
+
 pub fn scanPrefix(alloc: std.mem.Allocator, store: *backend_erased.Store, prefix: []const u8) ![]OwnedKVPair {
     var txn = try store.beginRead();
     defer txn.abort();
@@ -76,6 +111,10 @@ pub fn scanPrefix(alloc: std.mem.Allocator, store: *backend_erased.Store, prefix
     var cur = try txn.openCursor();
     defer cur.close();
 
+    return try scanPrefixCursor(alloc, &cur, prefix);
+}
+
+fn scanPrefixCursor(alloc: std.mem.Allocator, cur: *backend_erased.Cursor, prefix: []const u8) ![]OwnedKVPair {
     var results = std.ArrayListUnmanaged(OwnedKVPair).empty;
     errdefer {
         for (results.items) |item| {
@@ -98,6 +137,21 @@ pub fn scanPrefix(alloc: std.mem.Allocator, store: *backend_erased.Store, prefix
     return try results.toOwnedSlice(alloc);
 }
 
+pub fn scanRangeCurrent(
+    alloc: std.mem.Allocator,
+    store: *backend_erased.Store,
+    lower: []const u8,
+    upper: []const u8,
+) ![]OwnedKVPair {
+    var txn = try store.beginCurrentScan();
+    defer txn.abort();
+
+    var cur = try txn.openCursor();
+    defer cur.close();
+
+    return try scanRangeCursor(alloc, &cur, lower, upper);
+}
+
 pub fn scanRange(
     alloc: std.mem.Allocator,
     store: *backend_erased.Store,
@@ -109,6 +163,16 @@ pub fn scanRange(
 
     var cur = try txn.openCursor();
     defer cur.close();
+
+    return try scanRangeCursor(alloc, &cur, lower, upper);
+}
+
+fn scanRangeCursor(
+    alloc: std.mem.Allocator,
+    cur: *backend_erased.Cursor,
+    lower: []const u8,
+    upper: []const u8,
+) ![]OwnedKVPair {
     cur.setUpperBound(if (upper.len > 0) upper else null);
 
     var results = std.ArrayListUnmanaged(OwnedKVPair).empty;

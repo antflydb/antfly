@@ -19,6 +19,7 @@ const Allocator = std.mem.Allocator;
 const bloom = @import("bloom");
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
+const backend_scan = @import("backend_scan.zig");
 const backend_types = @import("backend_types.zig");
 const lsm_manifest = @import("lsm/manifest.zig");
 const lsm_table_file = @import("lsm/table_file.zig");
@@ -6818,6 +6819,56 @@ test "lsm backend current scan does not rotate or clone mutable writer generatio
     }
 
     try std.testing.expect(saw_a);
+}
+
+test "lsm backend current scan helpers do not clone mutable writer generation" {
+    var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "A");
+        try write.put("doc:b", "B");
+        try write.commit();
+    }
+
+    const before = backend.snapshotMaintenanceStats();
+
+    const ScanState = struct {
+        count: usize = 0,
+
+        threadlocal var active: ?*@This() = null;
+
+        fn cb(key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
+            const self = active.?;
+            if (std.mem.startsWith(u8, key, "doc:")) {
+                try std.testing.expect(value.len > 0);
+                self.count += 1;
+            }
+            return .@"continue";
+        }
+    };
+
+    var state = ScanState{};
+    ScanState.active = &state;
+    defer ScanState.active = null;
+
+    try backend_scan.scanCurrent(&runtime, "doc:", "doc;", .{}, &ScanState.cb);
+    try std.testing.expectEqual(@as(usize, 2), state.count);
+
+    const prefix = try backend_scan.scanPrefixCurrent(std.testing.allocator, &runtime, "doc:");
+    defer backend_scan.freeResults(std.testing.allocator, prefix);
+    try std.testing.expectEqual(@as(usize, 2), prefix.len);
+
+    const range = try backend_scan.scanRangeCurrent(std.testing.allocator, &runtime, "doc:", "doc;");
+    defer backend_scan.freeResults(std.testing.allocator, range);
+    try std.testing.expectEqual(@as(usize, 2), range.len);
+
+    const after = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
 }
 
 test "lsm backend current scan survives mutable rotation after positioning active source" {

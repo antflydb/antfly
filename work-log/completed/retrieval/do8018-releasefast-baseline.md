@@ -5,6 +5,7 @@ Updated on 2026-05-29 from worktree commit `4ad4b59f5dd9` after the v15 prefix-r
 Updated on 2026-05-29 from worktree commit `14dfe7f28446` after the v16 per-section norms codec change. The initial v16 top-level health metric under-reported norms because shard aggregation omitted `inverted_norm_bytes`; direct segment parsing showed the norm artifacts were present on disk.
 Updated on 2026-05-29 from worktree commit `89a0e73e71d7` after byte-budgeted stored-field blocks.
 Updated on 2026-05-29 from worktree commit `d255fecf291d` after caching per-segment layout stats and adding merge/retire clean-page advice.
+Updated on 2026-05-29 after adding explicit current-scan helpers for maintenance paths so TTL/schema scans can avoid cloning the LSM mutable writer generation. This does not change the latest ReleaseFast baseline below; it is a working-set cleanup for the remaining mutable snapshot path.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -25,6 +26,19 @@ Latest stored-block-cap artifacts:
 Latest layout-cache/page-advice artifacts:
 
 `work-log/do8018/releasefast-baseline-20260529-123427/`
+
+## LSM Mutable Snapshot Cleanup
+
+- Added `backend_scan.scanCurrent`, `scanPrefixCurrent`, and `scanRangeCurrent` so maintenance callers can request a live ordered cursor without using snapshot read transactions.
+- Changed TTL candidate collection to use `scanCurrent`.
+- Changed schema copying to use a probe read for the active schema key and `scanPrefixCurrent` for versioned schema rows.
+- Added an LSM regression test proving current scan helpers do not increment `mutable_snapshot_clone_calls`.
+- Verification:
+  - `zig build lib-db-query-test --summary failures -- --test-filter "current scan helpers"`
+  - `zig build lib-db-query-test --summary failures -- --test-filter "current scan does not"`
+  - `zig build lib-db-query-test --summary failures -- --test-filter "ttl runtime"`
+  - `zig build lib-db-query-test --summary failures -- --test-filter "schema"`
+  - `zig build lib-db-query-test --summary failures`
 
 ## Latest Layout-Cache Metrics Off
 
