@@ -334,7 +334,7 @@ const RewritingPlaygroundPage: React.FC = () => {
           return part.toLowerCase() === answer.toLowerCase() ? (
             <span
               key={key}
-              className="bg-yellow-200 dark:bg-yellow-900/50 text-yellow-900 dark:text-yellow-100 px-1 rounded"
+              className="bg-amber-200 dark:bg-amber-900/50 text-amber-900 dark:text-amber-100 px-1 rounded-none"
             >
               {part}
             </span>
@@ -438,7 +438,7 @@ const RewritingPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -516,7 +516,7 @@ const RewritingPlaygroundPage: React.FC = () => {
                     textArray.map((question) => (
                       <div
                         key={`q-${question}`}
-                        className="p-4 bg-primary/5 border border-primary/20 rounded-lg"
+                        className="p-4 bg-primary/5 border border-primary/20 rounded-none"
                       >
                         <div className="flex items-start gap-3">
                           <MessageCircle className="h-5 w-5 text-primary mt-0.5 shrink-0" />
@@ -543,7 +543,7 @@ const RewritingPlaygroundPage: React.FC = () => {
                   <Label className="text-sm text-muted-foreground">
                     Context (answer highlighted)
                   </Label>
-                  <div className="p-3 bg-muted/50 rounded-lg border text-sm leading-relaxed">
+                  <div className="p-3 bg-muted/50 rounded-none border text-sm leading-relaxed">
                     {renderHighlightedContext()}
                   </div>
                 </div>
@@ -551,7 +551,7 @@ const RewritingPlaygroundPage: React.FC = () => {
                 {/* Answer */}
                 <div className="space-y-2">
                   <Label className="text-sm text-muted-foreground">Target Answer</Label>
-                  <div className="p-3 bg-yellow-100 dark:bg-yellow-900/30 rounded-lg border border-yellow-300 dark:border-yellow-700 text-sm font-medium">
+                  <div className="p-3 bg-amber-100 dark:bg-amber-900/30 rounded-none border border-amber-300 dark:border-amber-700 text-sm font-medium">
                     {answer}
                   </div>
                 </div>
@@ -587,7 +587,7 @@ const RewritingPlaygroundPage: React.FC = () => {
           </DialogHeader>
           <div className="space-y-4 py-4">
             {/* Show the Q+A pair */}
-            <div className="space-y-2 p-3 bg-muted/50 rounded-lg text-sm">
+            <div className="space-y-2 p-3 bg-muted/50 rounded-none text-sm">
               <div>
                 <span className="font-medium">Q:</span> {selectedQuestion}
               </div>

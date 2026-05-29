@@ -611,7 +611,10 @@ const ModelDetailSheet: React.FC<{
               <p className="text-xs text-muted-foreground">
                 {model.sourceUrl ? (
                   <>
-                    Use <code className="font-mono bg-muted px-1 py-0.5 rounded-none">termite pull</code>{" "}
+                    Use{" "}
+                    <code className="font-mono bg-muted px-1 py-0.5 rounded-none">
+                      termite pull
+                    </code>{" "}
                     CLI or the Termite operator to manage models in production deployments.
                   </>
                 ) : (

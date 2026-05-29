@@ -190,7 +190,7 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
         )}
 
         {result && proposedQuery && (
-          <div className="rounded-lg border p-3 space-y-3 bg-muted/30">
+          <div className="rounded-none border p-3 space-y-3 bg-muted/30">
             <div className="flex items-center justify-between">
               <span className="text-sm font-medium truncate flex-1 mr-2">"{intent}"</span>
               <div className="flex items-center gap-2">

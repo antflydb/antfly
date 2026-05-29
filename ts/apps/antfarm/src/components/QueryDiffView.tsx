@@ -29,7 +29,7 @@ export const QueryDiffView: React.FC<QueryDiffViewProps> = ({
     <div className={cn("grid grid-cols-2 gap-3", className)}>
       <div className="space-y-1.5">
         <span className="text-xs font-medium text-muted-foreground">Current Query</span>
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-none border overflow-hidden">
           <SyntaxHighlighter
             language="json"
             style={style}
@@ -42,7 +42,7 @@ export const QueryDiffView: React.FC<QueryDiffViewProps> = ({
       </div>
       <div className="space-y-1.5">
         <span className="text-xs font-medium text-muted-foreground">Proposed Query</span>
-        <div className="af-status-border-success rounded-md border overflow-hidden">
+        <div className="af-status-border-success rounded-none border overflow-hidden">
           <SyntaxHighlighter
             language="json"
             style={style}

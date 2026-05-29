@@ -965,7 +965,9 @@ const TranscribePlaygroundPage: React.FC = () => {
                           <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-destructive opacity-75" />
                           <span className="relative inline-flex rounded-full h-3 w-3 bg-destructive" />
                         </span>
-                        <span className="text-sm font-mono font-medium text-destructive">Recording</span>
+                        <span className="text-sm font-mono font-medium text-destructive">
+                          Recording
+                        </span>
                         <span className="text-sm font-mono text-muted-foreground">
                           {formatDuration(recordingDuration)}
                         </span>
