@@ -13,11 +13,11 @@ T = TypeVar("T", bound="TermiteTextContentPart")
 
 @_attrs_define
 class TermiteTextContentPart:
-    """Text content for embedding
+    """Text content part.
 
     Attributes:
         type_ (TermiteTextContentPartType):
-        text (str): Text content to embed
+        text (str): Text content.
     """
 
     type_: TermiteTextContentPartType

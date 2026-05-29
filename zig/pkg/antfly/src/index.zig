@@ -388,6 +388,11 @@ pub const IndexSnapshot = struct {
         return self.segments[resolved.seg_idx].reader.storedDoc(resolved.local_id);
     }
 
+    pub fn docOrdinal(self: *const IndexSnapshot, global_id: u32) !?u32 {
+        const resolved = self.resolveDocId(global_id) orelse return null;
+        return try self.segments[resolved.seg_idx].reader.docOrdinal(resolved.local_id);
+    }
+
     /// Get and decompress a stored document by global doc ID. Caller owns returned data.
     pub const DecompressedDoc = struct { id: []const u8, data: []u8 };
 
@@ -395,6 +400,61 @@ pub const IndexSnapshot = struct {
         const resolved = self.resolveDocId(global_id) orelse return null;
         const result = (try self.segments[resolved.seg_idx].reader.storedDocDecompressed(resolved.local_id)) orelse return null;
         return DecompressedDoc{ .id = result.id, .data = result.data };
+    }
+
+    pub fn docNumsForOrdinalsAlloc(self: *const IndexSnapshot, alloc: Allocator, ordinals: []const u32) ![]u32 {
+        if (ordinals.len == 0) return try alloc.alloc(u32, 0);
+        const sorted_ordinals = try alloc.dupe(u32, ordinals);
+        defer alloc.free(sorted_ordinals);
+        std.mem.sort(u32, sorted_ordinals, {}, u32LessThan);
+        const unique_ordinals = sorted_ordinals[0..uniqueSortedU32(sorted_ordinals)];
+
+        var out = std.ArrayListUnmanaged(u32).empty;
+        errdefer out.deinit(alloc);
+
+        var doc_offset: u32 = 0;
+        for (self.segments) |*seg| {
+            for (0..seg.reader.doc_count) |local_usize| {
+                const local_doc: u32 = @intCast(local_usize);
+                if (seg.deleted) |deleted| {
+                    if (deleted.contains(local_doc)) continue;
+                }
+                const ordinal = (try seg.reader.docOrdinal(local_doc)) orelse continue;
+                if (!containsSortedU32(unique_ordinals, ordinal)) continue;
+                const global_doc = doc_offset + local_doc;
+                try out.append(alloc, global_doc);
+            }
+            doc_offset += seg.reader.doc_count;
+        }
+
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn docOrdinalsForDocNumsAlloc(self: *const IndexSnapshot, alloc: Allocator, doc_nums: []const u32) !?[]u32 {
+        var out = std.ArrayListUnmanaged(u32).empty;
+        errdefer out.deinit(alloc);
+
+        for (doc_nums) |doc_num| {
+            const ordinal = (try self.docOrdinal(doc_num)) orelse return null;
+            try out.append(alloc, ordinal);
+        }
+
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn hasDocOrdinalCoverage(self: *const IndexSnapshot) bool {
+        for (self.segments) |*seg| {
+            if (seg.reader.doc_count == 0) continue;
+            if (seg.reader.getSection(segment_mod.doc_ordinals_field, .doc_ordinals) == null) return false;
+        }
+        return true;
+    }
+
+    pub fn hasInvertedField(self: *const IndexSnapshot, field: []const u8) !bool {
+        for (self.segments) |*seg| {
+            if (try seg.reader.invertedIndex(field) != null) return true;
+        }
+        return false;
     }
 
     pub fn termDocFreq(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, term: []const u8) !u32 {
@@ -460,6 +520,36 @@ pub const IndexSnapshot = struct {
         return @as(f32, @floatFromInt(total)) / @as(f32, @floatFromInt(self.global_doc_count));
     }
 };
+
+fn containsOrdinal(ordinals: []const u32, expected: u32) bool {
+    for (ordinals) |ordinal| {
+        if (ordinal == expected) return true;
+    }
+    return false;
+}
+
+fn u32LessThan(_: void, left: u32, right: u32) bool {
+    return left < right;
+}
+
+fn uniqueSortedU32(values: []u32) usize {
+    if (values.len == 0) return 0;
+    var out: usize = 1;
+    for (values[1..]) |value| {
+        if (value == values[out - 1]) continue;
+        values[out] = value;
+        out += 1;
+    }
+    return out;
+}
+
+fn containsSortedU32(values: []const u32, expected: u32) bool {
+    return std.sort.binarySearch(u32, values, expected, compareU32) != null;
+}
+
+fn compareU32(expected: u32, item: u32) std.math.Order {
+    return std.math.order(expected, item);
+}
 
 /// Coordinates writes and maintains the current snapshot.
 /// Reads are lock-free (atomic snapshot pointer).
@@ -601,6 +691,38 @@ pub const IndexWriter = struct {
         old.release();
     }
 
+    fn cloneGlobalFieldLens(alloc: Allocator, src: std.StringHashMapUnmanaged(u64)) !std.StringHashMapUnmanaged(u64) {
+        var cloned = std.StringHashMapUnmanaged(u64).empty;
+        errdefer cloned.deinit(alloc);
+
+        var it = src.iterator();
+        while (it.next()) |entry| {
+            const gop = try cloned.getOrPut(alloc, entry.key_ptr.*);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* = entry.value_ptr.*;
+        }
+
+        return cloned;
+    }
+
+    fn addSegmentFieldLens(
+        alloc: Allocator,
+        global_field_lens: *std.StringHashMapUnmanaged(u64),
+        reader: *const segment_mod.SegmentReader,
+    ) !void {
+        for (reader.fields) |*fi| {
+            if (std.mem.eql(u8, fi.name, segment_mod.doc_ordinals_field)) continue;
+            for (fi.sections) |*si| {
+                if (si.section_type != .inverted_text) continue;
+                const sec_data = reader.data[@intCast(si.offset)..][0..@intCast(si.length)];
+                const inv = inverted.InvertedIndexReader.init(alloc, sec_data) catch continue;
+                const gop = try global_field_lens.getOrPut(alloc, fi.name);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += inv.total_field_len;
+            }
+        }
+    }
+
     /// Like addSegment() but with an explicit segment ID (for recovery).
     pub fn addSegmentWithId(self: *IndexWriter, seg_id: u64, segment_bytes: []const u8) !void {
         const owned = try self.alloc.dupe(u8, segment_bytes);
@@ -635,7 +757,29 @@ pub const IndexWriter = struct {
 
         if (seg_id >= self.next_segment_id) self.next_segment_id = seg_id + 1;
 
-        try self.rebuildSnapshot(new_segments, &.{});
+        var global_field_lens = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
+        errdefer global_field_lens.deinit(self.alloc);
+        try addSegmentFieldLens(self.alloc, &global_field_lens, &reader);
+
+        const new_snap = try self.alloc.create(IndexSnapshot);
+        errdefer self.alloc.destroy(new_snap);
+        new_snap.* = .{
+            .alloc = self.alloc,
+            .ref_count = 1,
+            .epoch = self.next_epoch,
+            .segments = new_segments,
+            .global_doc_count = old.global_doc_count + new_segments[new_segments.len - 1].liveDocCount(),
+            .global_total_field_len = global_field_lens,
+            .term_doc_freq_cache_mu = .unlocked,
+            .term_doc_freq_cache = .empty,
+            .term_doc_freq_cache_hits = 0,
+            .term_doc_freq_cache_misses = 0,
+            .retired_segments = &.{},
+        };
+        self.next_epoch += 1;
+
+        @atomicStore(*IndexSnapshot, &self.current, new_snap, .release);
+        old.release();
         owned = null;
     }
 

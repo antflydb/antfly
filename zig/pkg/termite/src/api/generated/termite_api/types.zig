@@ -2,33 +2,22 @@
 // Package: termite_api
 
 const std = @import("std");
+const antfly_ai_messages_openapi = @import("antfly_ai_messages_openapi");
 
 pub const Error = struct {
     /// Error message
     @"error": []const u8,
 };
 
-/// Text content for embedding
-pub const TextContentPart = struct {
-    type: []const u8,
-    /// Text content to embed
-    text: []const u8,
-};
+pub const TextContentPart = antfly_ai_messages_openapi.TextContentPart;
 
-/// Image URL or data URI
-pub const ImageURL = struct {
-    /// URL or data URI (data:image/png;base64,...)
-    url: []const u8,
-};
+pub const ImageURL = antfly_ai_messages_openapi.ImageURL;
 
-/// Inline binary media content (audio, image, etc.)
-pub const MediaContentPart = struct {
-    type: []const u8,
-    /// Base64-encoded binary data
-    data: []const u8,
-    /// MIME type (audio/wav, image/gif, image/png, etc.)
-    mime_type: []const u8,
-};
+pub const ImageURLContentPart = antfly_ai_messages_openapi.ImageURLContentPart;
+
+pub const MediaContentPart = antfly_ai_messages_openapi.MediaContentPart;
+
+pub const ContentPart = antfly_ai_messages_openapi.ContentPart;
 
 /// A sparse vector with parallel index/value arrays, sorted by index ascending
 pub const SparseVector = struct {
@@ -252,48 +241,14 @@ pub const FunctionDefinition = struct {
     strict: ?bool = null,
 };
 
-/// The function called by the model
-pub const ToolCallFunction = struct {
-    /// The name of the function called
-    name: []const u8,
-    /// JSON string of the arguments to the function
-    arguments: []const u8,
-};
+pub const ToolCall = antfly_ai_messages_openapi.ToolCall;
+
+pub const ToolCallFunction = antfly_ai_messages_openapi.ToolCallFunction;
 
 /// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
 pub const ToolChoice = std.json.Value;
 
-/// The role of a message sender in a conversation
-pub const Role = enum {
-    system,
-    user,
-    assistant,
-    tool,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .system => "system",
-            .user => "user",
-            .assistant => "assistant",
-            .tool => "tool",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "system", .system },
-            .{ "user", .user },
-            .{ "assistant", .assistant },
-            .{ "tool", .tool },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
+pub const Role = antfly_ai_messages_openapi.ChatMessageRole;
 
 /// Reason why generation stopped
 pub const FinishReason = enum {
@@ -329,6 +284,10 @@ pub const FinishReason = enum {
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
+
+pub const ChatMessageContent = antfly_ai_messages_openapi.ChatMessageContent;
+
+pub const ChatMessage = antfly_ai_messages_openapi.ChatMessage;
 
 pub const GenerateJsonSchemaConfig = struct {
     /// Schema name
@@ -503,12 +462,6 @@ pub const EmbeddingUsage = struct {
     total_tokens: i64,
 };
 
-/// Image content for embedding (OpenAI-compatible format)
-pub const ImageURLContentPart = struct {
-    type: []const u8,
-    image_url: ImageURL,
-};
-
 /// Exactly one of `texts` or `images` must be provided. When using `images`, the server selects a compatible reader internally and processes the request as: read document text -> run structured extraction.
 pub const ExtractRequest = struct {
     /// Name of extractor model with 'extraction' capability
@@ -542,6 +495,22 @@ pub const ReadRequest = struct {
     prompt: ?[]const u8 = null,
     /// Maximum tokens to generate
     max_tokens: ?i64 = null,
+};
+
+/// OpenAI-compatible embedding request with Termite multimodal content-part extension
+pub const EmbedRequest = struct {
+    /// Model name to use for embedding generation
+    model: []const u8,
+    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
+    input: std.json.Value,
+    /// Encoding format for the embeddings (only "float" supported)
+    encoding_format: ?[]const u8 = null,
+    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
+    dimensions: ?i64 = null,
+    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+    task_type: ?[]const u8 = null,
+    /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
+    input_type: ?[]const u8 = null,
 };
 
 /// A single embedding result
@@ -663,13 +632,18 @@ pub const Tool = struct {
     function: FunctionDefinition,
 };
 
-/// A tool call made by the model
-pub const ToolCall = struct {
-    /// Unique identifier for this tool call
-    id: []const u8,
-    /// The type of tool call (currently only "function")
-    type: []const u8,
-    function: ToolCallFunction,
+pub const GenerateMessage = struct {
+    role: Role,
+    /// The generated message content (null when tool_calls is present)
+    content: ?[]const u8 = null,
+    /// Tool calls made by the model (only present when finish_reason is tool_calls)
+    tool_calls: ?[]const ToolCall = null,
+};
+
+pub const RerankMultimodalDocument = struct {
+    /// Optional caller-provided document identifier
+    id: ?[]const u8 = null,
+    content: ChatMessageContent,
 };
 
 pub const GenerateResponseFormat = struct {
@@ -776,62 +750,6 @@ pub const SchemasConfig = struct {
     style: ?Style = null,
 };
 
-/// A content part for multimodal input (text, image URL, or inline media)
-pub const ContentPart = union(enum) {
-    media_content_part: *MediaContentPart,
-    image_url_content_part: *ImageURLContentPart,
-    text_content_part: *TextContentPart,
-
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed.value;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "data",
-            "mime_type",
-        })) {
-            if (try parseStructuralVariant(MediaContentPart, allocator, source, options)) |parsed| return .{ .media_content_part = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "image_url",
-        })) {
-            if (try parseStructuralVariant(ImageURLContentPart, allocator, source, options)) |parsed| return .{ .image_url_content_part = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "text",
-        })) {
-            if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .media_content_part => |v| try jw.write(v.*),
-            .image_url_content_part => |v| try jw.write(v.*),
-            .text_content_part => |v| try jw.write(v.*),
-        }
-    }
-};
-
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
 pub const EmbedResponse = struct {
     /// Object type, always "list"
@@ -905,139 +823,6 @@ pub const ReadObject = struct {
     index: i64,
 };
 
-pub const GenerateMessage = struct {
-    role: Role,
-    /// The generated message content (null when tool_calls is present)
-    content: ?[]const u8 = null,
-    /// Tool calls made by the model (only present when finish_reason is tool_calls)
-    tool_calls: ?[]const ToolCall = null,
-};
-
-/// Delta content for streaming
-pub const GenerateDelta = struct {
-    role: ?Role = null,
-    /// Token content delta
-    content: ?[]const u8 = null,
-    /// Tool call deltas for streaming tool calls
-    tool_calls: ?[]const ToolCallDelta = null,
-};
-
-/// A chunk result object. Text chunks have mime_type text/plain.
-pub const ChunkObject = struct {
-    /// The chunk text content
-    text: ?[]const u8 = null,
-    /// Character position in original text where chunk starts
-    start_char: ?i64 = null,
-    /// Character position in original text where chunk ends (exclusive)
-    end_char: ?i64 = null,
-    /// Base64-encoded binary data (valid WAV, PNG, etc.)
-    data: ?[]const u8 = null,
-    /// Audio: window start time in milliseconds
-    start_time_ms: ?f32 = null,
-    /// Audio: window end time in milliseconds
-    end_time_ms: ?f32 = null,
-    /// Animation: frame number
-    frame_index: ?i64 = null,
-    /// Animation: display delay in milliseconds
-    frame_delay_ms: ?i64 = null,
-    /// Sequence number of the chunk (0, 1, 2, ...)
-    id: ?i64 = null,
-    /// MIME type: text/plain, audio/wav, image/png, etc.
-    mime_type: ?[]const u8 = null,
-    object: []const u8,
-    /// Position of this chunk object in the response data array.
-    index: i64,
-};
-
-pub const Config = struct {
-    /// URL of the Termite embedding/chunking service
-    api_url: []const u8,
-    /// Base directory containing model subdirectories. Termite auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/recognizers/` - Recognition models (ONNX) - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.termite/models (set via viper). If not set, only built-in fixed chunking is available.
-    models_dir: ?[]const u8 = null,
-    /// Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts.
-    content_security: ?ContentSecurityConfig = null,
-    /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
-    s3_credentials: ?Credentials = null,
-    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading). Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading where all models are loaded at startup and never unloaded.
-    keep_alive: ?[]const u8 = null,
-    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-    max_loaded_models: ?i64 = null,
-    /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
-    pool_size: ?i64 = null,
-    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Termite tries entries in order and uses the first available backend+device combination that supports the model. **Backends** (depend on build tags): - `go` - Pure Go inference (always available, CPU only, slowest) - `onnx` - ONNX Runtime (requires -tags="onnx,ORT", fastest) - `xla` - GoMLX XLA (requires -tags="xla,XLA", TPU/CUDA/CPU) **Devices**: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only **Examples**: - `["onnx", "xla", "go"]` - Try backends with auto device detection - `["onnx:cuda", "xla:tpu", "onnx:cpu", "go"]` - Prefer GPU, fall back to CPU - ` default: - onnx - xla - go
-    backend_priority: ?[]const []const u8 = null,
-    /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
-    max_concurrent_requests: ?i64 = null,
-    /// Maximum number of requests to queue when max_concurrent_requests is reached. When the queue is full, new requests receive 503 Service Unavailable with Retry-After header. Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
-    max_queue_size: ?i64 = null,
-    /// Maximum time to wait for a request to complete, including queue wait time. Use Go duration format: "30s", "1m", "0" (no timeout, default). Requests exceeding this timeout receive 504 Gateway Timeout.
-    request_timeout: ?[]const u8 = null,
-    /// List of model names to preload at startup (Ollama-compatible). These models are loaded immediately when Termite starts, avoiding first-request latency. Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5"). Only effective when keep_alive is non-zero (lazy loading mode).
-    preload: ?[]const []const u8 = null,
-    /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
-    max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup (as part of preload) - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
-    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
-    allow_downloads: ?bool = null,
-    log: ?SchemasConfig = null,
-};
-
-/// OpenAI-compatible embedding request with Termite multimodal content-part extension
-pub const EmbedRequest = struct {
-    /// Model name to use for embedding generation
-    model: []const u8,
-    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
-    input: std.json.Value,
-    /// Encoding format for the embeddings (only "float" supported)
-    encoding_format: ?[]const u8 = null,
-    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
-    dimensions: ?i64 = null,
-    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
-    task_type: ?[]const u8 = null,
-    /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
-    input_type: ?[]const u8 = null,
-};
-
-/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
-pub const ChatMessageContent = std.json.Value;
-
-pub const ChunkRequest = struct {
-    /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` (backward compatible) - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
-    input: ?std.json.Value = null,
-    /// DEPRECATED: Use 'input' instead. Text to chunk.
-    text: ?[]const u8 = null,
-    config: ?ChunkConfig = null,
-};
-
-pub const RecognizeResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Recognition result objects, one per input text.
-    data: []const RecognizeObject,
-    /// Name of model used for NER
-    model: []const u8,
-    usage: GenerateUsage,
-};
-
-pub const DocumentTokenClassificationResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    data: []const DocumentTokenClassificationObject,
-    model: []const u8,
-    usage: GenerateUsage,
-};
-
-pub const ReadResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Read result objects, one per input image.
-    data: []const ReadObject,
-    /// Name of model used for reading
-    model: []const u8,
-    usage: GenerateUsage,
-};
-
 pub const GenerateChoice = struct {
     /// Index of this choice in the list
     index: i64,
@@ -1045,63 +830,6 @@ pub const GenerateChoice = struct {
     finish_reason: FinishReason,
     /// Log probability information (not supported, always null)
     logprobs: ?std.json.Value = null,
-};
-
-pub const GenerateChunkChoice = struct {
-    index: i64,
-    delta: GenerateDelta,
-    finish_reason: ?FinishReason = null,
-};
-
-pub const ChunkResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Array of chunk objects
-    data: []const ChunkObject,
-    /// Chunking model actually used (may differ from requested if fallback occurred)
-    model: []const u8,
-    usage: GenerateUsage,
-    /// Whether result was served from cache
-    cache_hit: bool,
-};
-
-pub const RerankMultimodalDocument = struct {
-    /// Optional caller-provided document identifier
-    id: ?[]const u8 = null,
-    content: ChatMessageContent,
-};
-
-pub const ChatMessage = struct {
-    role: Role,
-    content: ?ChatMessageContent = null,
-    /// Tool calls made by the assistant (only for role=assistant)
-    tool_calls: ?[]const ToolCall = null,
-    /// ID of the tool call this message is responding to (only for role=tool)
-    tool_call_id: ?[]const u8 = null,
-};
-
-/// OpenAI-compatible chat completion response
-pub const GenerateResponse = struct {
-    /// A unique identifier for the chat completion
-    id: []const u8,
-    /// The object type, always "chat.completion"
-    object: []const u8,
-    /// Unix timestamp (seconds) when the completion was created
-    created: i64,
-    /// Model used for generation
-    model: []const u8,
-    /// List of completion choices (currently always 1)
-    choices: []const GenerateChoice,
-    usage: GenerateUsage,
-};
-
-/// Streaming generation chunk (SSE event data)
-pub const GenerateChunk = struct {
-    id: []const u8,
-    object: []const u8,
-    created: i64,
-    model: []const u8,
-    choices: []const GenerateChunkChoice,
 };
 
 pub const RerankMultimodalRequest = struct {
@@ -1158,4 +886,154 @@ pub const GenerateRequest = struct {
     compiled_target: ?[]const u8 = null,
     /// Controls how the model uses tools
     tool_choice: ?ToolChoice = null,
+};
+
+/// Delta content for streaming
+pub const GenerateDelta = struct {
+    role: ?Role = null,
+    /// Token content delta
+    content: ?[]const u8 = null,
+    /// Tool call deltas for streaming tool calls
+    tool_calls: ?[]const ToolCallDelta = null,
+};
+
+/// A chunk result object. Text chunks have mime_type text/plain.
+pub const ChunkObject = struct {
+    /// The chunk text content
+    text: ?[]const u8 = null,
+    /// Character position in original text where chunk starts
+    start_char: ?i64 = null,
+    /// Character position in original text where chunk ends (exclusive)
+    end_char: ?i64 = null,
+    /// Base64-encoded binary data (valid WAV, PNG, etc.)
+    data: ?[]const u8 = null,
+    /// Audio: window start time in milliseconds
+    start_time_ms: ?f32 = null,
+    /// Audio: window end time in milliseconds
+    end_time_ms: ?f32 = null,
+    /// Animation: frame number
+    frame_index: ?i64 = null,
+    /// Animation: display delay in milliseconds
+    frame_delay_ms: ?i64 = null,
+    /// Sequence number of the chunk (0, 1, 2, ...)
+    id: ?i64 = null,
+    /// MIME type: text/plain, audio/wav, image/png, etc.
+    mime_type: ?[]const u8 = null,
+    object: []const u8,
+    /// Position of this chunk object in the response data array.
+    index: i64,
+};
+
+pub const Config = struct {
+    /// URL of the Termite embedding/chunking service
+    api_url: []const u8,
+    /// API key used when calling an authenticated shared Termite API.
+    api_key: ?[]const u8 = null,
+    /// Base directory containing model subdirectories. Termite auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/recognizers/` - Recognition models (ONNX) - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.termite/models (set via viper). If not set, only built-in fixed chunking is available.
+    models_dir: ?[]const u8 = null,
+    /// Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts.
+    content_security: ?ContentSecurityConfig = null,
+    /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
+    s3_credentials: ?Credentials = null,
+    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading). Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading where all models are loaded at startup and never unloaded.
+    keep_alive: ?[]const u8 = null,
+    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
+    max_loaded_models: ?i64 = null,
+    /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
+    pool_size: ?i64 = null,
+    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Termite tries entries in order and uses the first available backend+device combination that supports the model. **Backends** (depend on build tags): - `go` - Pure Go inference (always available, CPU only, slowest) - `onnx` - ONNX Runtime (requires -tags="onnx,ORT", fastest) - `xla` - GoMLX XLA (requires -tags="xla,XLA", TPU/CUDA/CPU) **Devices**: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only **Examples**: - `["onnx", "xla", "go"]` - Try backends with auto device detection - `["onnx:cuda", "xla:tpu", "onnx:cpu", "go"]` - Prefer GPU, fall back to CPU - ` default: - onnx - xla - go
+    backend_priority: ?[]const []const u8 = null,
+    /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
+    max_concurrent_requests: ?i64 = null,
+    /// Maximum number of requests to queue when max_concurrent_requests is reached. When the queue is full, new requests receive 503 Service Unavailable with Retry-After header. Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+    max_queue_size: ?i64 = null,
+    /// Maximum time to wait for a request to complete, including queue wait time. Use Go duration format: "30s", "1m", "0" (no timeout, default). Requests exceeding this timeout receive 504 Gateway Timeout.
+    request_timeout: ?[]const u8 = null,
+    /// List of model names to preload at startup (Ollama-compatible). These models are loaded immediately when Termite starts, avoiding first-request latency. Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5"). Only effective when keep_alive is non-zero (lazy loading mode).
+    preload: ?[]const []const u8 = null,
+    /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
+    max_memory_mb: ?i64 = null,
+    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup (as part of preload) - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
+    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
+    allow_downloads: ?bool = null,
+    log: ?SchemasConfig = null,
+};
+
+pub const ChunkRequest = struct {
+    /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` (backward compatible) - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
+    input: ?std.json.Value = null,
+    /// DEPRECATED: Use 'input' instead. Text to chunk.
+    text: ?[]const u8 = null,
+    config: ?ChunkConfig = null,
+};
+
+pub const RecognizeResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Recognition result objects, one per input text.
+    data: []const RecognizeObject,
+    /// Name of model used for NER
+    model: []const u8,
+    usage: GenerateUsage,
+};
+
+pub const DocumentTokenClassificationResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    data: []const DocumentTokenClassificationObject,
+    model: []const u8,
+    usage: GenerateUsage,
+};
+
+pub const ReadResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Read result objects, one per input image.
+    data: []const ReadObject,
+    /// Name of model used for reading
+    model: []const u8,
+    usage: GenerateUsage,
+};
+
+/// OpenAI-compatible chat completion response
+pub const GenerateResponse = struct {
+    /// A unique identifier for the chat completion
+    id: []const u8,
+    /// The object type, always "chat.completion"
+    object: []const u8,
+    /// Unix timestamp (seconds) when the completion was created
+    created: i64,
+    /// Model used for generation
+    model: []const u8,
+    /// List of completion choices (currently always 1)
+    choices: []const GenerateChoice,
+    usage: GenerateUsage,
+};
+
+pub const GenerateChunkChoice = struct {
+    index: i64,
+    delta: GenerateDelta,
+    finish_reason: ?FinishReason = null,
+};
+
+pub const ChunkResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Array of chunk objects
+    data: []const ChunkObject,
+    /// Chunking model actually used (may differ from requested if fallback occurred)
+    model: []const u8,
+    usage: GenerateUsage,
+    /// Whether result was served from cache
+    cache_hit: bool,
+};
+
+/// Streaming generation chunk (SSE event data)
+pub const GenerateChunk = struct {
+    id: []const u8,
+    object: []const u8,
+    created: i64,
+    model: []const u8,
+    choices: []const GenerateChunkChoice,
 };

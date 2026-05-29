@@ -140,7 +140,7 @@ func TestNormalizeRetrievalAgentSessionRequest(t *testing.T) {
 		MaxInternalIterations: 3,
 		MaxUserClarifications: 2,
 		Decisions:             []AgentDecision{{QuestionId: "q1", Answer: "OAuth 2.0"}},
-		Messages:              []ai.ChatMessage{{Role: ai.ChatMessageRoleUser, Content: "prior"}},
+		Messages:              []ai.ChatMessage{{Role: ai.ChatMessageRoleUser, Content: ai.NewTextContent("prior")}},
 	}
 
 	normalizeRetrievalAgentSessionRequest(req)
@@ -148,7 +148,9 @@ func TestNormalizeRetrievalAgentSessionRequest(t *testing.T) {
 	assert.Equal(t, 3, req.MaxInternalIterations)
 	assert.NotEmpty(t, req.SessionId)
 	if assert.Len(t, req.Messages, 1) {
-		assert.Equal(t, "prior", req.Messages[0].Content)
+		content, err := req.Messages[0].Content.AsChatMessageContent0()
+		assert.NoError(t, err)
+		assert.Equal(t, "prior", content)
 	}
 }
 

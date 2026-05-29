@@ -2,7 +2,8 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@antfly/d
 import type { IndexConfig } from "@antfly/sdk";
 import type React from "react";
 import type { TableSchema } from "../api";
-import { api } from "../api";
+import { useApi } from "../hooks/use-api-config";
+import { useTable } from "../hooks/use-table";
 import TableSchemaForm from "./schema-builder/TableSchemaForm";
 
 interface CreateTableDialogProps {
@@ -18,6 +19,9 @@ const CreateTableDialog: React.FC<CreateTableDialogProps> = ({
   onTableCreated,
   theme,
 }) => {
+  const api = useApi();
+  const { refreshTables, setSelectedTable } = useTable();
+
   const handleCreateTable = async (data: {
     name: string;
     schema: Omit<TableSchema, "key">;
@@ -36,6 +40,8 @@ const CreateTableDialog: React.FC<CreateTableDialogProps> = ({
       for (const index of data.indexes) {
         await api.indexes.create(data.name, index);
       }
+      setSelectedTable(data.name);
+      await refreshTables();
       onTableCreated();
       onClose();
     } catch (error) {

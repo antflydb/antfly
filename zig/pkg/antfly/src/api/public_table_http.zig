@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
@@ -30,17 +31,20 @@ pub const TableApi = struct {
         MethodNotAllowed,
         Backpressured,
         Unavailable,
+        DocIdentityUnavailable,
         InternalFailure,
     };
 
     pub const ExecuteQueryError = error{
         InvalidQueryRequest,
         NotFound,
+        DocIdentityUnavailable,
         InternalFailure,
     };
 
     pub const ExecuteQueryViewError = error{
         NotFound,
+        DocIdentityUnavailable,
         InternalFailure,
     };
 
@@ -237,6 +241,12 @@ pub const TableApi = struct {
     }
 };
 
+pub const testing = if (builtin.is_test) struct {
+    pub fn hasInternalShardQueryFields(alloc: std.mem.Allocator, body: []const u8) !bool {
+        return bodyHasInternalShardQueryFields(alloc, body);
+    }
+} else struct {};
+
 pub const OwnedResponse = struct {
     status: u16,
     body: []u8,
@@ -265,6 +275,7 @@ pub fn handleTableBatch(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.Backpressured => return .{ .status = 429, .body = try alloc.dupe(u8, "table backpressured") },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
+        error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "batch failed") },
     };
 
@@ -281,6 +292,11 @@ pub fn handleTableQueryRequest(
     row_filter_json: ?[]const u8,
     api: TableApi,
 ) !OwnedResponse {
+    if (try bodyHasInternalShardQueryFields(alloc, body)) {
+        std.log.warn("public table query rejected internal fields table={s}", .{table_name});
+        return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
+    }
+
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
         switch (err) {
             error.InvalidQueryRequest => {
@@ -290,6 +306,10 @@ pub fn handleTableQueryRequest(
             error.NotFound => {
                 std.log.err("public table query missing table={s} err={}", .{ table_name, err });
                 return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
+            },
+            error.DocIdentityUnavailable => {
+                std.log.warn("public table query doc identity unavailable table={s} err={}", .{ table_name, err });
+                return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") };
             },
             error.InternalFailure => {
                 std.log.err("public table query failed table={s} err={}", .{ table_name, err });
@@ -303,6 +323,32 @@ pub fn handleTableQueryRequest(
     };
 }
 
+fn bodyHasInternalShardQueryFields(alloc: std.mem.Allocator, body: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    return objectHasInternalShardQueryField(parsed.value.object);
+}
+
+fn objectHasInternalShardQueryField(object: std.json.ObjectMap) bool {
+    const internal_fields = [_][]const u8{
+        "_distributed_text_stats",
+        "native_doc_id_constraints",
+        "_filter_query_json",
+        "_exclusion_query_json",
+        "_identity_read_generation",
+        "identity_read_generation",
+        "_filter_doc_ids",
+        "_filter_doc_ids_positive",
+        "_exclude_doc_ids",
+        "allow_doc_identity_reassignment",
+    };
+    inline for (internal_fields) |field| {
+        if (object.get(field) != null) return true;
+    }
+    return false;
+}
+
 pub fn handleTableQueryView(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -311,6 +357,7 @@ pub fn handleTableQueryView(
 ) !OwnedResponse {
     const response_body = api.executeTableQueryView(alloc, table_name, view) catch |err| switch (err) {
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "query failed") },
     };
     return .{
@@ -653,6 +700,83 @@ test "public table batch handler maps unavailable errors" {
     try std.testing.expectEqualStrings("maintenance routes unavailable on query-only runtime", resp.body);
 }
 
+test "public table batch handler maps doc identity unavailable errors" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) TableApi.ExecuteBatchError!void {
+            return error.DocIdentityUnavailable;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+}
+
+test "public table query handler maps doc identity unavailable errors" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            return error.DocIdentityUnavailable;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}}}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+}
+
 test "public table query handler returns json response" {
     const Backend = struct {
         called: bool = false,
@@ -703,6 +827,74 @@ test "public table query handler returns json response" {
     try std.testing.expectEqualStrings("{\"responses\":[]}", resp.body);
 }
 
+test "public table query handler rejects only top-level internal fields" {
+    const Backend = struct {
+        called: bool = false,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.called = true;
+            return alloc.dupe(u8, "{\"responses\":[]}") catch error.InternalFailure;
+        }
+    };
+
+    var rejected_backend = Backend{};
+    var rejected = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"_identity_read_generation":1}
+    , null, rejected_backend.iface());
+    defer rejected.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), rejected.status);
+    try std.testing.expect(!rejected_backend.called);
+
+    var rejected_plain_generation_backend = Backend{};
+    var rejected_plain_generation = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"with":{"visible":{"match_all":{}}},"identity_read_generation":1}
+    , null, rejected_plain_generation_backend.iface());
+    defer rejected_plain_generation.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), rejected_plain_generation.status);
+    try std.testing.expect(!rejected_plain_generation_backend.called);
+
+    var rejected_reassignment_backend = Backend{};
+    var rejected_reassignment = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"allow_doc_identity_reassignment":true}
+    , null, rejected_reassignment_backend.iface());
+    defer rejected_reassignment.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), rejected_reassignment.status);
+    try std.testing.expect(!rejected_reassignment_backend.called);
+
+    var accepted_backend = Backend{};
+    var accepted = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"full_text_search":{"query":"mentions \"_identity_read_generation\" and \"native_doc_id_constraints\""}}
+    , null, accepted_backend.iface());
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), accepted.status);
+    try std.testing.expect(accepted_backend.called);
+    try std.testing.expectEqualStrings("{\"responses\":[]}", accepted.body);
+}
+
 test "public table query handler maps backend errors" {
     const Backend = struct {
         fn iface() TableApi {
@@ -740,6 +932,42 @@ test "public table query handler maps backend errors" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("invalid query request", resp.body);
+}
+
+test "public table query view handler maps doc identity unavailable errors" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = executeTableQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryView(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: TableApi.TableQueryView,
+        ) TableApi.ExecuteQueryViewError![]u8 {
+            return error.DocIdentityUnavailable;
+        }
+    };
+
+    var resp = try handleTableQueryView(std.testing.allocator, "docs", .latest, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
 }
 
 test "public table query view handler returns json response" {

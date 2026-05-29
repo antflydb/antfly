@@ -2231,6 +2231,8 @@ fn publicGeneratorConfigToGenerated(cfg: generating_openapi.GeneratorConfig) gen
 
 fn generatorConfigFromGenerated(cfg: generating_openapi.GeneratorConfig) !generating.GeneratorConfig {
     const provider: generating.Provider = switch (cfg.provider) {
+        .gemini => .gemini,
+        .vertex => .vertex,
         .openai => .openai,
         .ollama => .ollama,
         .termite => .termite,
@@ -2241,6 +2243,7 @@ fn generatorConfigFromGenerated(cfg: generating_openapi.GeneratorConfig) !genera
     const url = switch (provider) {
         .termite => cfg.api_url orelse "",
         .antfly => "",
+        .gemini, .vertex => cfg.url orelse "",
         .openai, .ollama => cfg.url orelse return error.InvalidRetrievalAgentRequest,
         else => return error.UnsupportedRetrievalAgentRequest,
     };
@@ -2249,6 +2252,9 @@ fn generatorConfigFromGenerated(cfg: generating_openapi.GeneratorConfig) !genera
         .model = model,
         .url = url,
         .api_key = cfg.api_key,
+        .project_id = cfg.project_id,
+        .location = cfg.location,
+        .credentials_path = cfg.credentials_path,
     };
 }
 
@@ -2305,8 +2311,8 @@ fn buildGenerationMessages(
         );
 
     const messages = try alloc.alloc(generating.ChatMessage, 2);
-    messages[0] = .{ .role = .system, .content = system_prompt };
-    messages[1] = .{ .role = .user, .content = user_prompt };
+    messages[0] = .{ .role = .system, .content = .{ .text = system_prompt } };
+    messages[1] = .{ .role = .user, .content = .{ .text = user_prompt } };
     return messages;
 }
 

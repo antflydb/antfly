@@ -34,23 +34,23 @@ import (
 // This is a convenience helper for the common case of text-only messages.
 func NewChatMessage(role oapi.TermiteRole, content string) oapi.TermiteChatMessage {
 	msg := oapi.TermiteChatMessage{Role: role}
-	_ = msg.Content.FromTermiteChatMessageContent0(content)
+	_ = msg.Content.FromChatMessageContent0(content)
 	return msg
 }
 
 // NewUserMessage creates a user ChatMessage with string content.
 func NewUserMessage(content string) oapi.TermiteChatMessage {
-	return NewChatMessage(oapi.TermiteRoleUser, content)
+	return NewChatMessage(oapi.ChatMessageRoleUser, content)
 }
 
 // NewSystemMessage creates a system ChatMessage with string content.
 func NewSystemMessage(content string) oapi.TermiteChatMessage {
-	return NewChatMessage(oapi.TermiteRoleSystem, content)
+	return NewChatMessage(oapi.ChatMessageRoleSystem, content)
 }
 
 // NewAssistantMessage creates an assistant ChatMessage with string content.
 func NewAssistantMessage(content string) oapi.TermiteChatMessage {
-	return NewChatMessage(oapi.TermiteRoleAssistant, content)
+	return NewChatMessage(oapi.ChatMessageRoleAssistant, content)
 }
 
 // NewMultimodalUserMessage creates a user ChatMessage with text and image content.
@@ -61,8 +61,8 @@ func NewMultimodalUserMessage(text string, imageDataURIs ...string) (oapi.Termit
 	// Add text part if provided
 	if text != "" {
 		var textPart oapi.TermiteContentPart
-		if err := textPart.FromTermiteTextContentPart(oapi.TermiteTextContentPart{
-			Type: oapi.TermiteTextContentPartTypeText,
+		if err := textPart.FromTextContentPart(oapi.TermiteTextContentPart{
+			Type: oapi.TextContentPartTypeText,
 			Text: text,
 		}); err != nil {
 			return oapi.TermiteChatMessage{}, fmt.Errorf("creating text part: %w", err)
@@ -73,8 +73,8 @@ func NewMultimodalUserMessage(text string, imageDataURIs ...string) (oapi.Termit
 	// Add image parts
 	for _, dataURI := range imageDataURIs {
 		var imagePart oapi.TermiteContentPart
-		if err := imagePart.FromTermiteImageURLContentPart(oapi.TermiteImageURLContentPart{
-			Type: oapi.TermiteImageURLContentPartTypeImageUrl,
+		if err := imagePart.FromImageURLContentPart(oapi.TermiteImageURLContentPart{
+			Type: oapi.ImageURLContentPartTypeImageUrl,
 			ImageUrl: oapi.TermiteImageURL{
 				Url: dataURI,
 			},
@@ -84,8 +84,8 @@ func NewMultimodalUserMessage(text string, imageDataURIs ...string) (oapi.Termit
 		parts = append(parts, imagePart)
 	}
 
-	msg := oapi.TermiteChatMessage{Role: oapi.TermiteRoleUser}
-	if err := msg.Content.FromTermiteChatMessageContent1(parts); err != nil {
+	msg := oapi.TermiteChatMessage{Role: oapi.ChatMessageRoleUser}
+	if err := msg.Content.FromChatMessageContent1(parts); err != nil {
 		return oapi.TermiteChatMessage{}, fmt.Errorf("setting content parts: %w", err)
 	}
 	return msg, nil
@@ -328,8 +328,8 @@ type MediaChunkConfig struct {
 func (c *TermiteClient) ChunkMedia(ctx context.Context, data []byte, mimeType string, config MediaChunkConfig) ([]chunking.Chunk, error) {
 	// Build MediaContentPart
 	var part oapi.TermiteContentPart
-	if err := part.FromTermiteMediaContentPart(oapi.TermiteMediaContentPart{
-		Type:     oapi.TermiteMediaContentPartTypeMedia,
+	if err := part.FromMediaContentPart(oapi.TermiteMediaContentPart{
+		Type:     oapi.MediaContentPartTypeMedia,
 		Data:     data,
 		MimeType: mimeType,
 	}); err != nil {
@@ -435,128 +435,86 @@ func (c *TermiteClient) GetVersion(ctx context.Context) (*oapi.TermiteVersionRes
 	return resp.JSON200, nil
 }
 
-// Recognize extracts named entities from text using a recognizer model.
-// For GLiNER models, optional labels can be specified for zero-shot NER.
-func (c *TermiteClient) Recognize(ctx context.Context, model string, texts []string, labels []string) (*oapi.TermiteRecognizeResponse, error) {
-	req := oapi.TermiteRecognizeRequest{
+// Extract runs the canonical schema-driven extraction endpoint.
+func (c *TermiteClient) Extract(ctx context.Context, req oapi.ExtractionRequest) (*oapi.ExtractionResponse, error) {
+	resp, err := c.client.ExtractWithResponse(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("sending request: %w", err)
+	}
+	if resp.JSON400 != nil {
+		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
+	}
+	if resp.JSON404 != nil {
+		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
+	}
+	if resp.JSON500 != nil {
+		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
+	}
+	if resp.JSON503 != nil {
+		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
+	}
+	if resp.JSON200 == nil {
+		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
+	}
+	return resp.JSON200, nil
+}
+
+// Recognize extracts named entities through the canonical extraction endpoint.
+func (c *TermiteClient) Recognize(ctx context.Context, model string, texts []string, labels []string) (*oapi.ExtractionResponse, error) {
+	return c.Extract(ctx, oapi.ExtractionRequest{
+		Model:   model,
+		Inputs:  textExtractionInputs(texts),
+		Schema:  oapi.ExtractionSchema{Entities: labels},
+		Options: oapi.ExtractionOptions{IncludeConfidence: true, IncludeSpans: true},
+	})
+}
+
+// ExtractRelations extracts entities and relations through the canonical extraction endpoint.
+func (c *TermiteClient) ExtractRelations(ctx context.Context, model string, texts []string, entityLabels []string, relationLabels []string) (*oapi.ExtractionResponse, error) {
+	relations := make([]oapi.ExtractionRelationSchema, 0, len(relationLabels))
+	for _, label := range relationLabels {
+		relations = append(relations, oapi.ExtractionRelationSchema{Type: label})
+	}
+	return c.Extract(ctx, oapi.ExtractionRequest{
+		Model:   model,
+		Inputs:  textExtractionInputs(texts),
+		Schema:  oapi.ExtractionSchema{Entities: entityLabels, Relations: relations},
+		Options: oapi.ExtractionOptions{IncludeConfidence: true, IncludeSpans: true},
+	})
+}
+
+// Classify performs zero-shot classification through the canonical extraction endpoint.
+func (c *TermiteClient) Classify(ctx context.Context, model string, texts []string, labels []string) (*oapi.ExtractionResponse, error) {
+	return c.classify(ctx, model, texts, labels, false)
+}
+
+// ClassifyMultiLabel performs multi-label classification through the canonical extraction endpoint.
+func (c *TermiteClient) ClassifyMultiLabel(ctx context.Context, model string, texts []string, labels []string) (*oapi.ExtractionResponse, error) {
+	return c.classify(ctx, model, texts, labels, true)
+}
+
+func (c *TermiteClient) classify(ctx context.Context, model string, texts []string, labels []string, multiLabel bool) (*oapi.ExtractionResponse, error) {
+	return c.Extract(ctx, oapi.ExtractionRequest{
 		Model:  model,
-		Texts:  texts,
-		Labels: labels,
-	}
-
-	resp, err := c.client.RecognizeEntitiesWithResponse(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("sending request: %w", err)
-	}
-
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON200 == nil {
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
-	}
-
-	return resp.JSON200, nil
+		Inputs: textExtractionInputs(texts),
+		Schema: oapi.ExtractionSchema{
+			Classifications: []oapi.ExtractionClassificationSchema{{
+				Name:       "classification",
+				Labels:     labels,
+				MultiLabel: multiLabel,
+			}},
+		},
+	})
 }
 
-// ExtractRelations extracts entities and relations between them from text.
-// Uses models with the "relations" capability (e.g., REBEL, GLiNER multitask).
-// entityLabels specifies the entity types to extract (optional, uses model defaults if empty).
-// relationLabels specifies the relation types to extract (optional, uses model defaults if empty).
-func (c *TermiteClient) ExtractRelations(ctx context.Context, model string, texts []string, entityLabels []string, relationLabels []string) (*oapi.TermiteRecognizeResponse, error) {
-	req := oapi.TermiteRecognizeRequest{
-		Model:          model,
-		Texts:          texts,
-		Labels:         entityLabels,
-		RelationLabels: relationLabels,
+func textExtractionInputs(texts []string) []oapi.ExtractionInput {
+	inputs := make([]oapi.ExtractionInput, 0, len(texts))
+	for _, text := range texts {
+		var content oapi.ChatMessageContent
+		_ = content.FromChatMessageContent0(text)
+		inputs = append(inputs, oapi.ExtractionInput{Content: content})
 	}
-
-	resp, err := c.client.RecognizeEntitiesWithResponse(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("sending request: %w", err)
-	}
-
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON200 == nil {
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
-	}
-
-	return resp.JSON200, nil
-}
-
-// Classify performs zero-shot text classification.
-// Returns classification results with labels and scores for each input text.
-func (c *TermiteClient) Classify(ctx context.Context, model string, texts []string, labels []string) (*oapi.TermiteClassifyResponse, error) {
-	req := oapi.TermiteClassifyRequest{
-		Model:  model,
-		Texts:  texts,
-		Labels: labels,
-	}
-
-	resp, err := c.client.ClassifyTextWithResponse(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("sending request: %w", err)
-	}
-
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON200 == nil {
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
-	}
-
-	return resp.JSON200, nil
-}
-
-// ClassifyMultiLabel performs multi-label zero-shot text classification.
-// Unlike regular classification where scores sum to 1, multi-label allows independent label scores.
-func (c *TermiteClient) ClassifyMultiLabel(ctx context.Context, model string, texts []string, labels []string) (*oapi.TermiteClassifyResponse, error) {
-	req := oapi.TermiteClassifyRequest{
-		Model:      model,
-		Texts:      texts,
-		Labels:     labels,
-		MultiLabel: true,
-	}
-
-	resp, err := c.client.ClassifyTextWithResponse(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("sending request: %w", err)
-	}
-
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON200 == nil {
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
-	}
-
-	return resp.JSON200, nil
+	return inputs
 }
 
 // RewriteText rewrites input texts using a Seq2Seq rewriter model.
@@ -633,61 +591,37 @@ type ExtractJSONConfig struct {
 	IncludeSpans      bool
 }
 
-// ExtractJSON extracts structured JSON from text using a GLiNER2 model.
-// The schema maps structure names to field definitions (e.g., {"person": ["name::str", "age::str"]}).
-func (c *TermiteClient) ExtractJSON(ctx context.Context, model string, texts []string, schema map[string][]string, config *ExtractJSONConfig) (*oapi.TermiteExtractResponse, error) {
-	// Build request body manually instead of using the generated ExtractRequest type,
-	// because the generated type's omitzero tag on FlatNer (bool) silently drops false.
-	type extractReqBody struct {
-		Model             string              `json:"model"`
-		Texts             []string            `json:"texts"`
-		Schema            map[string][]string `json:"schema"`
-		Threshold         float32             `json:"threshold,omitempty"`
-		FlatNER           *bool               `json:"flat_ner,omitempty"`
-		IncludeConfidence bool                `json:"include_confidence,omitempty"`
-		IncludeSpans      bool                `json:"include_spans,omitempty"`
-	}
-
-	req := extractReqBody{
+// ExtractJSON extracts structured values through the canonical extraction endpoint.
+// The schema maps structure names to field definitions (for example, {"person": ["name::str", "age::str"]}).
+func (c *TermiteClient) ExtractJSON(ctx context.Context, model string, texts []string, schema map[string][]string, config *ExtractJSONConfig) (*oapi.ExtractionResponse, error) {
+	req := oapi.ExtractionRequest{
 		Model:  model,
-		Texts:  texts,
-		Schema: schema,
+		Inputs: textExtractionInputs(texts),
+		Schema: oapi.ExtractionSchema{Structures: extractionStructures(schema)},
 	}
-
 	if config != nil {
-		req.Threshold = config.Threshold
-		req.FlatNER = config.FlatNER
-		req.IncludeConfidence = config.IncludeConfidence
-		req.IncludeSpans = config.IncludeSpans
+		req.Options.Threshold = config.Threshold
+		if config.FlatNER != nil {
+			req.Options.FlatNer = *config.FlatNER
+		}
+		req.Options.IncludeConfidence = config.IncludeConfidence
+		req.Options.IncludeSpans = config.IncludeSpans
 	}
+	return c.Extract(ctx, req)
+}
 
-	buf, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshaling request: %w", err)
+func extractionStructures(schema map[string][]string) map[string]oapi.ExtractionStructureSchema {
+	structures := make(map[string]oapi.ExtractionStructureSchema, len(schema))
+	for name, fields := range schema {
+		fieldMap := make(map[string]oapi.ExtractionStructureField, len(fields))
+		for _, field := range fields {
+			var value oapi.ExtractionStructureField
+			_ = value.FromExtractionStructureField0(field)
+			fieldMap[field] = value
+		}
+		structures[name] = oapi.ExtractionStructureSchema{Fields: fieldMap}
 	}
-
-	resp, err := c.client.ExtractJSONWithBodyWithResponse(ctx, "application/json", bytes.NewReader(buf))
-	if err != nil {
-		return nil, fmt.Errorf("sending request: %w", err)
-	}
-
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
-	}
-	if resp.JSON200 == nil {
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
-	}
-
-	return resp.JSON200, nil
+	return structures
 }
 
 // GenerateConfig contains configuration for text generation.

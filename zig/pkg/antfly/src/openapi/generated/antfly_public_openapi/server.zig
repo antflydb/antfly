@@ -501,6 +501,7 @@ pub const Route = struct {
 
 pub const routes = [_]Route{
     .{ .method = "GET", .path = "/status", .operation_id = "getStatus" },
+    .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster" },
     .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets" },
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
@@ -570,6 +571,7 @@ pub const routes = [_]Route{
 // Handler interface. Implement these methods on your Impl struct:
 //
 //   fn getStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getCluster(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response

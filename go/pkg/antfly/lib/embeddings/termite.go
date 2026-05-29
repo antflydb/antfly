@@ -145,8 +145,8 @@ func convertSingleInput(parts []ai.ContentPart) (oapi.TermiteContentPart, error)
 		switch p := part.(type) {
 		case ai.BinaryContent:
 			dataURI := "data:" + p.MIMEType + ";base64," + base64.StdEncoding.EncodeToString(p.Data)
-			if err := out.FromTermiteImageURLContentPart(oapi.TermiteImageURLContentPart{
-				Type: oapi.TermiteImageURLContentPartTypeImageUrl,
+			if err := out.FromImageURLContentPart(oapi.TermiteImageURLContentPart{
+				Type: oapi.ImageURLContentPartTypeImageUrl,
 				ImageUrl: oapi.TermiteImageURL{
 					Url: dataURI,
 				},
@@ -156,8 +156,8 @@ func convertSingleInput(parts []ai.ContentPart) (oapi.TermiteContentPart, error)
 			return out, nil
 
 		case ai.ImageURLContent:
-			if err := out.FromTermiteImageURLContentPart(oapi.TermiteImageURLContentPart{
-				Type: oapi.TermiteImageURLContentPartTypeImageUrl,
+			if err := out.FromImageURLContentPart(oapi.TermiteImageURLContentPart{
+				Type: oapi.ImageURLContentPartTypeImageUrl,
 				ImageUrl: oapi.TermiteImageURL{
 					Url: p.URL,
 				},
@@ -168,8 +168,8 @@ func convertSingleInput(parts []ai.ContentPart) (oapi.TermiteContentPart, error)
 
 		case ai.TextContent:
 			// Continue looking for non-text parts; use text as fallback
-			if err := out.FromTermiteTextContentPart(oapi.TermiteTextContentPart{
-				Type: oapi.TermiteTextContentPartTypeText,
+			if err := out.FromTextContentPart(oapi.TermiteTextContentPart{
+				Type: oapi.TextContentPartTypeText,
 				Text: p.Text,
 			}); err != nil {
 				return out, fmt.Errorf("creating text content part: %w", err)

@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -91,19 +92,9 @@ func (t *TermiteAPI) GenerateContent(w http.ResponseWriter, r *http.Request) {
 	t.node.handleApiGenerate(w, r)
 }
 
-// RecognizeEntities implements ServerInterface
-func (t *TermiteAPI) RecognizeEntities(w http.ResponseWriter, r *http.Request) {
-	t.node.handleApiRecognize(w, r)
-}
-
 // RewriteText implements ServerInterface
 func (t *TermiteAPI) RewriteText(w http.ResponseWriter, r *http.Request) {
 	t.node.handleApiRewrite(w, r)
-}
-
-// ClassifyText implements ServerInterface
-func (t *TermiteAPI) ClassifyText(w http.ResponseWriter, r *http.Request) {
-	t.node.handleApiClassify(w, r)
 }
 
 // ReadImages implements ServerInterface
@@ -506,6 +497,17 @@ func parseEmbedInput(
 
 			// Try inline media content - check Type field
 			if mediaPart, err := part.AsMediaContentPart(); err == nil && mediaPart.Type == MediaContentPartTypeMedia {
+				if mediaPart.Url != "" {
+					mimeType, data, err := scraping.DownloadContent(ctx, mediaPart.Url, securityConfig, s3Creds)
+					if err != nil {
+						return nil, fmt.Errorf("downloading media at index %d: %w", i, err)
+					}
+					contents[i] = []ai.ContentPart{ai.BinaryContent{
+						MIMEType: mimeType,
+						Data:     data,
+					}}
+					continue
+				}
 				contents[i] = []ai.ContentPart{ai.BinaryContent{
 					MIMEType: mediaPart.MimeType,
 					Data:     mediaPart.Data,
@@ -668,7 +670,17 @@ func (ln *TermiteNode) handleApiChunk(w http.ResponseWriter, r *http.Request) {
 			if part, err := req.Input.AsContentPart(); err == nil {
 				// MediaContentPart — inline binary
 				if mediaPart, err := part.AsMediaContentPart(); err == nil && mediaPart.Type == MediaContentPartTypeMedia {
-					chunks, err = ln.chunkMedia(ctx, mediaPart.Data, mediaPart.MimeType, internalConfig.Model, mediaOpts)
+					data := mediaPart.Data
+					mimeType := mediaPart.MimeType
+					if mediaPart.Url != "" {
+						mimeType, data, err = scraping.DownloadContent(ctx, mediaPart.Url, ln.contentSecurityConfig, ln.s3Credentials)
+						if err != nil {
+							ln.logger.Error("media download failed", zap.Error(err))
+							http.Error(w, fmt.Sprintf("downloading media: %v", err), http.StatusBadRequest)
+							return
+						}
+					}
+					chunks, err = ln.chunkMedia(ctx, data, mimeType, internalConfig.Model, mediaOpts)
 					if err != nil {
 						ln.logger.Error("media chunking failed", zap.Error(err))
 						http.Error(w, fmt.Sprintf("chunking media: %v", err), http.StatusInternalServerError)
@@ -1349,7 +1361,7 @@ func convertChatMessage(msg ChatMessage) generation.Message {
 	if parts, err := msg.Content.AsChatMessageContent1(); err == nil {
 		for _, part := range parts {
 			// Try as text content part
-			if textPart, err := part.AsTextContentPart(); err == nil {
+			if textPart, err := part.AsTextContentPart(); err == nil && textPart.Type == TextContentPartTypeText {
 				result.Parts = append(result.Parts, generation.TextPart(textPart.Text))
 				// Also set Content for backward compatibility with text-only generators
 				if result.Content == "" {
@@ -1357,13 +1369,31 @@ func convertChatMessage(msg ChatMessage) generation.Message {
 				}
 			}
 			// Try as image content part
-			if imgPart, err := part.AsImageURLContentPart(); err == nil {
+			if imgPart, err := part.AsImageURLContentPart(); err == nil && imgPart.Type == ImageURLContentPartTypeImageUrl {
 				result.Parts = append(result.Parts, generation.ImagePart(imgPart.ImageUrl.Url))
+			}
+			if mediaPart, err := part.AsMediaContentPart(); err == nil && mediaPart.Type == MediaContentPartTypeMedia {
+				if imageURL := mediaPartImageURL(mediaPart); imageURL != "" {
+					result.Parts = append(result.Parts, generation.ImagePart(imageURL))
+				}
 			}
 		}
 	}
 
 	return result
+}
+
+func mediaPartImageURL(part MediaContentPart) string {
+	if part.Url != "" {
+		if part.MimeType == "" || strings.HasPrefix(part.MimeType, "image/") || strings.HasPrefix(part.Url, "data:image/") {
+			return part.Url
+		}
+		return ""
+	}
+	if len(part.Data) == 0 || !strings.HasPrefix(part.MimeType, "image/") {
+		return ""
+	}
+	return "data:" + part.MimeType + ";base64," + base64.StdEncoding.EncodeToString(part.Data)
 }
 
 // handleApiGenerate handles text generation requests using LLM models (OpenAI-compatible)

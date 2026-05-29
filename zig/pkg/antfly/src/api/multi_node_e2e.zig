@@ -1297,6 +1297,7 @@ const MetadataAdminSimSource = struct {
             .table_id = table.table_id,
             .donor_group_id = req.donor_group_id,
             .receiver_group_id = req.receiver_group_id,
+            .allow_doc_identity_reassignment = req.allow_doc_identity_reassignment,
         });
         try self.node.runRound();
     }

@@ -639,7 +639,10 @@ fn preflightQueryRequestAgainstContext(
     var runtime_preflight: ?db_mod.RuntimePreflightSummary = null;
     defer if (runtime_preflight) |*summary| summary.deinit(alloc);
     var contract_preflight = query_contract.preflightQueryRequestAlloc(alloc, query_request) catch |err| blk: {
-        const feedback = try std.fmt.allocPrint(alloc, "query_request failed contract preflight: {s}", .{@errorName(err)});
+        const feedback = if (query_request.graph_searches != null)
+            try std.fmt.allocPrint(alloc, "query_request.graph_searches failed executor preflight: {s}", .{@errorName(err)})
+        else
+            try std.fmt.allocPrint(alloc, "query_request failed contract preflight: {s}", .{@errorName(err)});
         defer alloc.free(feedback);
         try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "query_contract_preflight_failed", "query_request", feedback);
         break :blk null;
@@ -1309,6 +1312,7 @@ fn metadataValidateGraphSearchesAgainstContext(
             }
         }
     }
+    if (try metadataPreflightGraphSearchesAgainstExecutorParser(alloc, graph_searches)) |feedback| return feedback;
     return null;
 }
 
@@ -2467,7 +2471,7 @@ fn buildGraphQueryBuilderRepairMessages(
         base_prompt;
     const out = try alloc.alloc(generating.ChatMessage, messages.len + 1);
     @memcpy(out[0..messages.len], messages);
-    out[messages.len] = .{ .role = .user, .content = repair_prompt };
+    out[messages.len] = .{ .role = .user, .content = .{ .text = repair_prompt } };
     return out;
 }
 
@@ -2482,6 +2486,8 @@ fn buildQueryBuilderGenerationChain(
 
 fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generating.GeneratorConfig {
     const provider: generating.Provider = switch (cfg.provider) {
+        .gemini => .gemini,
+        .vertex => .vertex,
         .openai => .openai,
         .ollama => .ollama,
         .termite => .termite,
@@ -2492,6 +2498,7 @@ fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generatin
     const url = switch (provider) {
         .termite => cfg.api_url orelse "",
         .antfly => "",
+        .gemini, .vertex => cfg.url orelse "",
         .openai, .ollama => cfg.url orelse return error.InvalidQueryBuilderGeneration,
         else => return error.UnsupportedQueryBuilderGeneration,
     };
@@ -2500,6 +2507,9 @@ fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generatin
         .model = model,
         .url = url,
         .api_key = cfg.api_key,
+        .project_id = cfg.project_id,
+        .location = cfg.location,
+        .credentials_path = cfg.credentials_path,
     };
 }
 
@@ -2535,8 +2545,8 @@ fn buildSemanticQueryBuilderMessages(
         .{ intent, if (hybrid_mode) "hybrid" else "semantic", if (hybrid_mode) "{ ... native Bleve query ... }" else "null" },
     );
     return try alloc.dupe(generating.ChatMessage, &[_]generating.ChatMessage{
-        .{ .role = .system, .content = system },
-        .{ .role = .user, .content = user },
+        .{ .role = .system, .content = .{ .text = system } },
+        .{ .role = .user, .content = .{ .text = user } },
     });
 }
 
@@ -2571,7 +2581,7 @@ fn buildSemanticQueryBuilderRepairMessages(
         base_prompt;
     const out = try alloc.alloc(generating.ChatMessage, messages.len + 1);
     @memcpy(out[0..messages.len], messages);
-    out[messages.len] = .{ .role = .user, .content = repair_prompt };
+    out[messages.len] = .{ .role = .user, .content = .{ .text = repair_prompt } };
     return out;
 }
 
@@ -2705,8 +2715,8 @@ fn buildBleveQueryBuilderMessages(
         .{intent},
     );
     return try alloc.dupe(generating.ChatMessage, &[_]generating.ChatMessage{
-        .{ .role = .system, .content = system },
-        .{ .role = .user, .content = user },
+        .{ .role = .system, .content = .{ .text = system } },
+        .{ .role = .user, .content = .{ .text = user } },
     });
 }
 
@@ -2739,7 +2749,7 @@ fn buildBleveQueryBuilderRepairMessages(
         base_prompt;
     const out = try alloc.alloc(generating.ChatMessage, messages.len + 1);
     @memcpy(out[0..messages.len], messages);
-    out[messages.len] = .{ .role = .user, .content = repair_prompt };
+    out[messages.len] = .{ .role = .user, .content = .{ .text = repair_prompt } };
     return out;
 }
 
@@ -2843,8 +2853,8 @@ fn buildGraphQueryBuilderMessages(
         .{intent},
     );
     return try alloc.dupe(generating.ChatMessage, &[_]generating.ChatMessage{
-        .{ .role = .system, .content = system },
-        .{ .role = .user, .content = user },
+        .{ .role = .system, .content = .{ .text = system } },
+        .{ .role = .user, .content = .{ .text = user } },
     });
 }
 

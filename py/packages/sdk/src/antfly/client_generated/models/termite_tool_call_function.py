@@ -11,11 +11,11 @@ T = TypeVar("T", bound="TermiteToolCallFunction")
 
 @_attrs_define
 class TermiteToolCallFunction:
-    """The function called by the model
+    """The function called by a model tool call.
 
     Attributes:
-        name (str): The name of the function called Example: get_weather.
-        arguments (str): JSON string of the arguments to the function Example: {"location": "San Francisco, CA"}.
+        name (str): Function name.
+        arguments (str): JSON string of function arguments.
     """
 
     name: str

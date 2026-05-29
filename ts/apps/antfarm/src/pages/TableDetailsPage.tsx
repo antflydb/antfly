@@ -696,7 +696,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
 
                   <Accordion type="multiple" defaultValue={["semantic"]} className="space-y-2">
                     {/* Field Selection - Collapsible */}
-                    <AccordionItem value="fields" className="border rounded-lg bg-card/50 px-3">
+                    <AccordionItem value="fields" className="border rounded-none bg-card/50 px-3">
                       <AccordionTrigger className="py-2.5 hover:no-underline">
                         <div className="flex items-center gap-2">
                           <span className="font-medium text-sm">Field Selection</span>
@@ -744,7 +744,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
                     </AccordionItem>
 
                     {/* Semantic Search */}
-                    <AccordionItem value="semantic" className="border rounded-lg bg-card/50 px-3">
+                    <AccordionItem value="semantic" className="border rounded-none bg-card/50 px-3">
                       <AccordionTrigger className="py-2.5 hover:no-underline">
                         <span className="font-medium text-sm">Semantic Search</span>
                       </AccordionTrigger>
@@ -812,7 +812,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
                     </AccordionItem>
 
                     {/* Full-Text Search */}
-                    <AccordionItem value="filter" className="border rounded-lg bg-card/50 px-3">
+                    <AccordionItem value="filter" className="border rounded-none bg-card/50 px-3">
                       <AccordionTrigger className="py-2.5 hover:no-underline">
                         <span className="font-medium text-sm">Full-Text Search</span>
                       </AccordionTrigger>
@@ -898,7 +898,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
             )}
 
             {queryResult && (
-              <Card className="shadow-sm">
+              <Card>
                 <CardHeader>
                   <CardTitle>Query Results</CardTitle>
                 </CardHeader>

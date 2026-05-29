@@ -59,6 +59,7 @@ pub const SharedModules = struct {
     platform: ?*std.Build.Module = null,
     vellum: ?*std.Build.Module = null,
     scraping: ?*std.Build.Module = null,
+    google: ?*std.Build.Module = null,
     objectstore: ?*std.Build.Module = null,
     regex: ?*std.Build.Module = null,
     jsonschema: ?*std.Build.Module = null,
@@ -138,10 +139,17 @@ pub fn create(config: Config) Graph {
     };
     const platform_mod = shared.platform orelse createSharedModule(config, "lib/platform/src/root.zig");
     const vellum_mod = shared.vellum orelse createSharedModule(config, "lib/vellum/src/mod.zig");
+    const google_mod = shared.google orelse blk: {
+        const mod = createSharedModule(config, "lib/google/src/root.zig");
+        mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_platform", platform_mod);
+        break :blk mod;
+    };
     const objectstore_mod = shared.objectstore orelse blk: {
         const mod = createSharedModule(config, "lib/objectstore/src/root.zig");
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_platform", platform_mod);
+        mod.addImport("antfly_google", google_mod);
         break :blk mod;
     };
     const scraping_mod = shared.scraping orelse blk: {
@@ -470,7 +478,10 @@ fn addTermiteApiModule(
             .target = target,
             .optimize = optimize,
         });
+        const ai_messages_mod = addAiMessagesOpenApiModule(b, target, optimize, paths);
         mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_ai_messages_openapi", ai_messages_mod);
+        mod.addImport("antfly_extraction_openapi", addExtractionOpenApiModule(b, target, optimize, paths, ai_messages_mod));
         return mod;
     }
 
@@ -492,6 +503,9 @@ fn addTermiteApiModule(
     codegen.addFileArg(json_spec);
     codegen.addArgs(&.{ "--package", "termite_api" });
     codegen.addArgs(&.{ "--generate", "types,server,client" });
+    codegen.addArgs(&.{"--import-mapping"});
+    codegen.addArg(b.fmt("{s}={s}", .{ "../ai/messages.yaml", "antfly_ai_messages_openapi" }));
+    codegen.addArg(b.fmt("{s}={s}", .{ "../ai/extraction.yaml", "antfly_extraction_openapi" }));
     codegen.addArg("--output");
     const gen_dir = codegen.addOutputDirectoryArg("termite_api");
     const mod = addOrCreateModule(b, register_public_modules, "termite_api", .{
@@ -499,7 +513,39 @@ fn addTermiteApiModule(
         .target = target,
         .optimize = optimize,
     });
+    const ai_messages_mod = addAiMessagesOpenApiModule(b, target, optimize, paths);
     mod.addImport("httpx", httpx_mod);
+    mod.addImport("antfly_ai_messages_openapi", ai_messages_mod);
+    mod.addImport("antfly_extraction_openapi", addExtractionOpenApiModule(b, target, optimize, paths, ai_messages_mod));
+    return mod;
+}
+
+fn addAiMessagesOpenApiModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    paths: Paths,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_ai_messages_openapi/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+fn addExtractionOpenApiModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    paths: Paths,
+    ai_messages_mod: *std.Build.Module,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("antfly_ai_messages_openapi", ai_messages_mod);
     return mod;
 }
 
@@ -656,6 +702,8 @@ pub fn configureMetal(
     if (!enable_metal or target.result.os.tag != .macos) return;
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
+    module.linkFramework("MetalPerformanceShaders", .{});
+    module.linkFramework("MetalPerformanceShadersGraph", .{});
     module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.termite_root, "src/backends/metal_kernels.m")), .flags = &.{"-fobjc-arc"} });
 }
 

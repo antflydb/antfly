@@ -1005,7 +1005,6 @@ func (p *Proxy) Start(ctx context.Context) error {
 	apiMux.HandleFunc("/ml/v1/embeddings", p.handleEmbeddings)
 	apiMux.HandleFunc("/ml/v1/chunk", p.handleChunk)
 	apiMux.HandleFunc("/ml/v1/rerank", p.handleRerank)
-	apiMux.HandleFunc("/ml/v1/recognize", p.handleRecognize)
 	apiMux.HandleFunc("/ml/v1/extract", p.handleExtract)
 	apiMux.HandleFunc("/ml/v1/generate", p.handleGenerate)
 	apiMux.HandleFunc("/ml/v1/chat/completions", p.handleChatCompletions)
@@ -1071,10 +1070,6 @@ func (p *Proxy) handleChunk(w http.ResponseWriter, r *http.Request) {
 // handleRerank routes reranking requests
 func (p *Proxy) handleRerank(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "rerank")
-}
-
-func (p *Proxy) handleRecognize(w http.ResponseWriter, r *http.Request) {
-	p.proxyRequest(w, r, "recognize")
 }
 
 func (p *Proxy) handleExtract(w http.ResponseWriter, r *http.Request) {

@@ -36,6 +36,7 @@ from conftest import (
     find_free_port,
     lookup_key_path,
     maybe_preserve_tempdir,
+    raise_request_error_with_logs,
     resolve_binary_path,
     wait_for_server,
 )
@@ -104,19 +105,35 @@ class AuthApi:
 
     def get(self, path: str):
         with self._request_lock:
-            return self._check(self.s.get(f"{self.url}{path}", timeout=30))
+            try:
+                response = self.s.get(f"{self.url}{path}", timeout=30)
+            except requests.RequestException as err:
+                raise_request_error_with_logs(err, self._server)
+            return self._check(response)
 
     def post(self, path: str, payload: dict):
         with self._request_lock:
-            return self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=30))
+            try:
+                response = self.s.post(f"{self.url}{path}", json=payload, timeout=30)
+            except requests.RequestException as err:
+                raise_request_error_with_logs(err, self._server)
+            return self._check(response)
 
     def put(self, path: str, payload: dict):
         with self._request_lock:
-            return self._check(self.s.put(f"{self.url}{path}", json=payload, timeout=30))
+            try:
+                response = self.s.put(f"{self.url}{path}", json=payload, timeout=30)
+            except requests.RequestException as err:
+                raise_request_error_with_logs(err, self._server)
+            return self._check(response)
 
     def delete(self, path: str):
         with self._request_lock:
-            return self._check(self.s.delete(f"{self.url}{path}", timeout=30))
+            try:
+                response = self.s.delete(f"{self.url}{path}", timeout=30)
+            except requests.RequestException as err:
+                raise_request_error_with_logs(err, self._server)
+            return self._check(response)
 
     def create_table(self, table_name: str, payload: dict | None = None):
         body = payload or {"num_shards": 1}

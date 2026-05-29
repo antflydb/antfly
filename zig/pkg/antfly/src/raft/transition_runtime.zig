@@ -124,6 +124,7 @@ pub const MergeCoordinatorRuntime = struct {
             .ptr = self,
             .vtable = &.{
                 .observe_status = observeStatus,
+                .record_doc_identity_reassignment = recordDocIdentityReassignment,
                 .accept_receiver = acceptReceiver,
                 .catch_up_receiver = catchUpReceiver,
                 .finalize_merge = finalizeMerge,
@@ -135,6 +136,11 @@ pub const MergeCoordinatorRuntime = struct {
     fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.MergeTransitionStatus {
         const self: *MergeCoordinatorRuntime = @ptrCast(@alignCast(ptr));
         return try self.coordinator.status();
+    }
+
+    fn recordDocIdentityReassignment(ptr: *anyopaque, _: u64, _: u64) !void {
+        const self: *MergeCoordinatorRuntime = @ptrCast(@alignCast(ptr));
+        try self.coordinator.recordDocIdentityReassignmentOptIn();
     }
 
     fn acceptReceiver(ptr: *anyopaque, _: u64, _: u64) !void {
@@ -228,6 +234,7 @@ pub const MultiplexedTransitionRuntime = struct {
                 .ptr = self,
                 .vtable = &.{
                     .observe_status = multiplexObserveMerge,
+                    .record_doc_identity_reassignment = multiplexRecordDocIdentityReassignment,
                     .accept_receiver = multiplexAcceptMerge,
                     .catch_up_receiver = multiplexCatchUpMerge,
                     .finalize_merge = multiplexFinalizeMerge,
@@ -309,6 +316,12 @@ pub const MultiplexedTransitionRuntime = struct {
         return try merge_runtime.observeStatus(donor_group_id, receiver_group_id);
     }
 
+    fn multiplexRecordDocIdentityReassignment(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !void {
+        const self: *MultiplexedTransitionRuntime = @ptrCast(@alignCast(ptr));
+        const merge_runtime = try self.requireMerge(donor_group_id, receiver_group_id);
+        try merge_runtime.recordDocIdentityReassignment(donor_group_id, receiver_group_id);
+    }
+
     fn multiplexAcceptMerge(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !void {
         const self: *MultiplexedTransitionRuntime = @ptrCast(@alignCast(ptr));
         const merge_runtime = try self.requireMerge(donor_group_id, receiver_group_id);
@@ -383,6 +396,7 @@ pub const MergeRuntime = struct {
 
     pub const VTable = struct {
         observe_status: *const fn (ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) anyerror!data.MergeTransitionStatus,
+        record_doc_identity_reassignment: ?*const fn (ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) anyerror!void = null,
         accept_receiver: *const fn (ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) anyerror!void,
         catch_up_receiver: *const fn (ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) anyerror!usize,
         finalize_merge: *const fn (ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) anyerror!bool,
@@ -391,6 +405,11 @@ pub const MergeRuntime = struct {
 
     pub fn observeStatus(self: MergeRuntime, donor_group_id: u64, receiver_group_id: u64) !data.MergeTransitionStatus {
         return try self.vtable.observe_status(self.ptr, donor_group_id, receiver_group_id);
+    }
+
+    pub fn recordDocIdentityReassignment(self: MergeRuntime, donor_group_id: u64, receiver_group_id: u64) !void {
+        const callback = self.vtable.record_doc_identity_reassignment orelse return error.MissingDocIdentityReassignmentRuntime;
+        try callback(self.ptr, donor_group_id, receiver_group_id);
     }
 
     pub fn acceptReceiver(self: MergeRuntime, donor_group_id: u64, receiver_group_id: u64) !void {
@@ -488,14 +507,23 @@ pub const TransitionRuntime = struct {
             },
             .accept_merge_receiver => |op| {
                 const merge = self.merge orelse return error.MissingMergeRuntime;
+                if (op.allow_doc_identity_reassignment) {
+                    try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+                }
                 try merge.acceptReceiver(op.donor_group_id, op.receiver_group_id);
             },
             .catch_up_merge_receiver => |op| {
                 const merge = self.merge orelse return error.MissingMergeRuntime;
+                if (op.allow_doc_identity_reassignment) {
+                    try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+                }
                 _ = try merge.catchUpReceiver(op.donor_group_id, op.receiver_group_id);
             },
             .finalize_merge => |op| {
                 const merge = self.merge orelse return error.MissingMergeRuntime;
+                if (op.allow_doc_identity_reassignment) {
+                    try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+                }
                 _ = try merge.finalizeMerge(op.donor_group_id, op.receiver_group_id);
             },
             .rollback_merge => |op| {
@@ -664,6 +692,7 @@ test "transition runtime executes split and merge actions through local seams" {
                 .ptr = self,
                 .vtable = &.{
                     .observe_status = observeStatus,
+                    .record_doc_identity_reassignment = recordDocIdentityReassignment,
                     .accept_receiver = acceptReceiver,
                     .catch_up_receiver = catchUpReceiver,
                     .finalize_merge = finalizeMerge,
@@ -675,6 +704,11 @@ test "transition runtime executes split and merge actions through local seams" {
         fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.MergeTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
+        }
+
+        fn recordDocIdentityReassignment(ptr: *anyopaque, _: u64, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.calls.append(std.testing.allocator, "docid");
         }
 
         fn acceptReceiver(ptr: *anyopaque, _: u64, _: u64) !void {
@@ -756,15 +790,83 @@ test "transition runtime executes split and merge actions through local seams" {
     try runtime.execute(.{ .bootstrap_split_destination = .{ .transition_id = 1, .source_group_id = 41, .destination_group_id = 42 } });
     try runtime.execute(.{ .finalize_split_source = .{ .transition_id = 1, .source_group_id = 41, .destination_group_id = 42 } });
     try runtime.execute(.{ .accept_merge_receiver = .{ .transition_id = 2, .donor_group_id = 61, .receiver_group_id = 62 } });
-    try runtime.execute(.{ .finalize_merge = .{ .transition_id = 2, .donor_group_id = 61, .receiver_group_id = 62 } });
+    try runtime.execute(.{ .finalize_merge = .{
+        .transition_id = 2,
+        .donor_group_id = 61,
+        .receiver_group_id = 62,
+        .allow_doc_identity_reassignment = true,
+    } });
 
     try std.testing.expectEqual(@as(usize, 3), split.calls.items.len);
     try std.testing.expectEqualStrings("start", split.calls.items[0]);
     try std.testing.expectEqualStrings("bootstrap", split.calls.items[1]);
     try std.testing.expectEqualStrings("finalize", split.calls.items[2]);
-    try std.testing.expectEqual(@as(usize, 2), merge.calls.items.len);
+    try std.testing.expectEqual(@as(usize, 3), merge.calls.items.len);
     try std.testing.expectEqualStrings("accept", merge.calls.items[0]);
-    try std.testing.expectEqualStrings("finalize", merge.calls.items[1]);
+    try std.testing.expectEqualStrings("docid", merge.calls.items[1]);
+    try std.testing.expectEqualStrings("finalize", merge.calls.items[2]);
+}
+
+test "transition runtime fails closed when doc identity reassignment callback is missing" {
+    const FakeMerge = struct {
+        finalized: bool = false,
+
+        fn iface(self: *@This()) MergeRuntime {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .observe_status = observeStatus,
+                    .accept_receiver = acceptReceiver,
+                    .catch_up_receiver = catchUpReceiver,
+                    .finalize_merge = finalizeMerge,
+                    .rollback_merge = rollbackMerge,
+                },
+            };
+        }
+
+        fn observeStatus(_: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !data.MergeTransitionStatus {
+            return .{
+                .phase = .cutover_ready,
+                .donor_group_id = donor_group_id,
+                .receiver_group_id = receiver_group_id,
+                .receiver_accepts_donor_range = true,
+                .bootstrapped = true,
+                .replay_required = true,
+                .replay_caught_up = true,
+                .cutover_ready = true,
+                .receiver_ready_for_reads = true,
+                .donor_delta_sequence = 1,
+                .receiver_delta_sequence = 1,
+            };
+        }
+
+        fn acceptReceiver(_: *anyopaque, _: u64, _: u64) !void {}
+
+        fn catchUpReceiver(_: *anyopaque, _: u64, _: u64) !usize {
+            return 0;
+        }
+
+        fn finalizeMerge(ptr: *anyopaque, _: u64, _: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.finalized = true;
+            return true;
+        }
+
+        fn rollbackMerge(_: *anyopaque, _: u64, _: u64) !bool {
+            return true;
+        }
+    };
+
+    var merge = FakeMerge{};
+    const runtime = TransitionRuntime{ .merge = merge.iface() };
+
+    try std.testing.expectError(error.MissingDocIdentityReassignmentRuntime, runtime.execute(.{ .finalize_merge = .{
+        .transition_id = 2,
+        .donor_group_id = 61,
+        .receiver_group_id = 62,
+        .allow_doc_identity_reassignment = true,
+    } }));
+    try std.testing.expect(!merge.finalized);
 }
 
 test "multiplexed transition runtime dispatches by group ids" {
@@ -848,6 +950,7 @@ test "multiplexed transition runtime dispatches by group ids" {
                 .ptr = self,
                 .vtable = &.{
                     .observe_status = observeStatus,
+                    .record_doc_identity_reassignment = recordDocIdentityReassignment,
                     .accept_receiver = acceptReceiver,
                     .catch_up_receiver = catchUpReceiver,
                     .finalize_merge = finalizeMerge,
@@ -859,6 +962,11 @@ test "multiplexed transition runtime dispatches by group ids" {
         fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.MergeTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
+        }
+
+        fn recordDocIdentityReassignment(ptr: *anyopaque, _: u64, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.calls.append(std.testing.allocator, "docid");
         }
 
         fn acceptReceiver(ptr: *anyopaque, _: u64, _: u64) !void {
@@ -954,7 +1062,13 @@ test "multiplexed transition runtime dispatches by group ids" {
     try runtime.execute(.{ .start_split_source = .{ .transition_id = 10, .source_group_id = 1, .destination_group_id = 2 } });
     try runtime.execute(.{ .finalize_split_source = .{ .transition_id = 11, .source_group_id = 3, .destination_group_id = 4 } });
     try runtime.execute(.{ .accept_merge_receiver = .{ .transition_id = 12, .donor_group_id = 21, .receiver_group_id = 22 } });
-    try runtime.execute(.{ .rollback_merge = .{ .transition_id = 13, .donor_group_id = 31, .receiver_group_id = 32 } });
+    try runtime.execute(.{ .finalize_merge = .{
+        .transition_id = 13,
+        .donor_group_id = 31,
+        .receiver_group_id = 32,
+        .allow_doc_identity_reassignment = true,
+    } });
+    try runtime.execute(.{ .rollback_merge = .{ .transition_id = 14, .donor_group_id = 31, .receiver_group_id = 32 } });
 
     try std.testing.expectEqual(@as(usize, 1), split_a.calls.items.len);
     try std.testing.expectEqualStrings("start", split_a.calls.items[0]);
@@ -962,8 +1076,10 @@ test "multiplexed transition runtime dispatches by group ids" {
     try std.testing.expectEqualStrings("finalize", split_b.calls.items[0]);
     try std.testing.expectEqual(@as(usize, 1), merge_a.calls.items.len);
     try std.testing.expectEqualStrings("accept", merge_a.calls.items[0]);
-    try std.testing.expectEqual(@as(usize, 1), merge_b.calls.items.len);
-    try std.testing.expectEqualStrings("rollback", merge_b.calls.items[0]);
+    try std.testing.expectEqual(@as(usize, 3), merge_b.calls.items.len);
+    try std.testing.expectEqualStrings("docid", merge_b.calls.items[0]);
+    try std.testing.expectEqualStrings("finalize", merge_b.calls.items[1]);
+    try std.testing.expectEqualStrings("rollback", merge_b.calls.items[2]);
 }
 
 test "metadata transition controller drives split runtime deterministically" {

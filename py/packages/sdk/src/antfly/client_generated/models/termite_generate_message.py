@@ -20,7 +20,7 @@ T = TypeVar("T", bound="TermiteGenerateMessage")
 class TermiteGenerateMessage:
     """
     Attributes:
-        role (TermiteRole): The role of a message sender in a conversation
+        role (TermiteRole): The role of a chat message sender.
         content (None | str | Unset): The generated message content (null when tool_calls is present)
         tool_calls (list[TermiteToolCall] | Unset): Tool calls made by the model (only present when finish_reason is
             tool_calls)

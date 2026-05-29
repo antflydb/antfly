@@ -462,8 +462,10 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
 }
 
 pub fn deriveInitialRange(table: metadata_table_manager.TableRecord) metadata_table_manager.RangeRecord {
+    const group_id = deriveDataGroupId(table.name, 0x47525031);
     return .{
-        .group_id = deriveDataGroupId(table.name, 0x47525031),
+        .group_id = group_id,
+        .range_id = group_id,
         .table_id = table.table_id,
         .start_key = "",
         .end_key = null,
@@ -475,9 +477,11 @@ pub fn deriveInitialRanges(
     table: metadata_table_manager.TableRecord,
 ) ![]metadata_table_manager.RangeRecord {
     if (table.min_ranges <= 1) {
+        const initial_range = deriveInitialRange(table);
         const out = try alloc.alloc(metadata_table_manager.RangeRecord, 1);
         out[0] = .{
-            .group_id = deriveInitialRange(table).group_id,
+            .group_id = initial_range.group_id,
+            .range_id = initial_range.range_id,
             .table_id = table.table_id,
             .start_key = try alloc.dupe(u8, ""),
             .end_key = null,
@@ -509,8 +513,10 @@ pub fn deriveInitialRanges(
             try deriveShardBoundaryKey(alloc, i + 1, shard_count);
         errdefer if (end_key) |value| alloc.free(value);
 
+        const group_id = deriveShardGroupId(table.name, i);
         out[i] = .{
-            .group_id = deriveShardGroupId(table.name, i),
+            .group_id = group_id,
+            .range_id = group_id,
             .table_id = table.table_id,
             .start_key = start_key,
             .end_key = end_key,
@@ -1507,6 +1513,7 @@ fn antflyTypeName(value: runtime_schema_mod.AntflyType) []const u8 {
 
 fn queryNeedsPrimaryTextIndex(req: db_mod.types.SearchRequest) bool {
     if (req.full_text != null) return true;
+    if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) return true;
     if (req.full_text_queries.len > 0) return false;
 
     return switch (req.query) {
@@ -2250,6 +2257,37 @@ test "metadata.query routing preserves vector index and records read schema text
     defer if (req.index_name) |index_name| std.testing.allocator.free(index_name);
     defer if (req.primary_text_index_name) |index_name| std.testing.allocator.free(index_name);
     defer std.testing.allocator.free(req.filter_query_json);
+
+    try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
+    try std.testing.expectEqualStrings("dense_idx", req.index_name.?);
+    try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+}
+
+test "metadata.query routing selects read schema text index for vector-only structured filters" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":3}",
+        .read_schema_json = "{\"version\":0}",
+        .indexes_json = "{\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v3\":{\"type\":\"full_text\"}}",
+        .placement_role = "data",
+    };
+    var req: db_mod.types.SearchRequest = .{
+        .query = .{ .dense_knn = .{
+            .vector = try std.testing.allocator.dupe(f32, &.{ 1, 2, 3 }),
+            .k = 10,
+        } },
+        .index_name = try std.testing.allocator.dupe(u8, "dense_idx"),
+        .filter_query_json = try std.testing.allocator.dupe(u8, "{\"term\":{\"status\":\"active\"}}"),
+        .exclusion_query_json = try std.testing.allocator.dupe(u8, "{\"term\":{\"archived\":true}}"),
+    };
+    defer if (req.index_name) |index_name| std.testing.allocator.free(index_name);
+    defer if (req.primary_text_index_name) |index_name| std.testing.allocator.free(index_name);
+    defer {
+        std.testing.allocator.free(req.query.dense_knn.vector);
+        std.testing.allocator.free(req.filter_query_json);
+        std.testing.allocator.free(req.exclusion_query_json);
+    }
 
     try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
     try std.testing.expectEqualStrings("dense_idx", req.index_name.?);

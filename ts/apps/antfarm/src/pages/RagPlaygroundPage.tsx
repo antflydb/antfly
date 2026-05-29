@@ -101,7 +101,7 @@ function ErrorDisplay({ message }: { message: string }) {
     isLong && !expanded ? `${message.slice(0, ERROR_TRUNCATE_LENGTH)}...` : message;
 
   return (
-    <div className="mb-4 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+    <div className="mb-4 p-4 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
       {displayText}
       {isLong && (
         <button
@@ -439,7 +439,7 @@ const RagPlaygroundPage: React.FC = () => {
             </div>
           )}
           renderClassification={(data) => (
-            <div className="p-3 rounded-lg bg-muted/50 space-y-2">
+            <div className="p-3 rounded-none bg-muted/50 space-y-2">
               <div className="flex items-center gap-2 text-sm font-medium">
                 <Sparkles className="h-4 w-4" />
                 Classification
@@ -461,7 +461,7 @@ const RagPlaygroundPage: React.FC = () => {
                 </div>
               )}
               {data.reasoning && (
-                <div className="text-xs text-muted-foreground mt-2 p-2 bg-background rounded">
+                <div className="text-xs text-muted-foreground mt-2 p-2 bg-background rounded-none">
                   {data.reasoning}
                 </div>
               )}
@@ -519,7 +519,7 @@ const RagPlaygroundPage: React.FC = () => {
               </CollapsibleTrigger>
               <CollapsibleContent className="space-y-2 mt-2">
                 {hits.map((hit, i) => (
-                  <div key={hit._id || i} className="p-3 rounded-lg border text-xs space-y-1">
+                  <div key={hit._id || i} className="p-3 rounded-none border text-xs space-y-1">
                     <div className="flex items-center justify-between">
                       <span className="font-medium">{hit._id}</span>
                       <Badge variant="secondary" className="text-xs">
@@ -712,7 +712,7 @@ const RagPlaygroundPage: React.FC = () => {
                       <Label className="text-sm font-medium">Pipeline Steps</Label>
 
                       {/* Classification */}
-                      <div className="flex items-center justify-between p-3 rounded-lg border">
+                      <div className="flex items-center justify-between p-3 rounded-none border">
                         <div className="flex items-center gap-3">
                           <Sparkles className="h-4 w-4 text-muted-foreground" />
                           <div>
@@ -751,7 +751,7 @@ const RagPlaygroundPage: React.FC = () => {
                       </div>
 
                       {/* Follow-up */}
-                      <div className="flex items-center justify-between p-3 rounded-lg border">
+                      <div className="flex items-center justify-between p-3 rounded-none border">
                         <div className="flex items-center gap-3">
                           <HelpCircle className="h-4 w-4 text-muted-foreground" />
                           <div>
@@ -796,7 +796,7 @@ const RagPlaygroundPage: React.FC = () => {
                       </div>
 
                       {/* Confidence */}
-                      <div className="flex items-center justify-between p-3 rounded-lg border">
+                      <div className="flex items-center justify-between p-3 rounded-none border">
                         <div className="flex items-center gap-3">
                           <Target className="h-4 w-4 text-muted-foreground" />
                           <div>

@@ -114,11 +114,9 @@ components:
 
     MediaContentPart:
       type: object
-      description: Inline binary media content (audio, image, etc.)
+      description: Binary or URL media content for providers that support non-image media parts.
       required:
         - type
-        - data
-        - mime_type
       properties:
         type:
           type: string
@@ -126,10 +124,13 @@ components:
         data:
           type: string
           format: byte
-          description: "Base64-encoded binary data"
+          description: "Base64-encoded binary data. Use either data or url."
+        url:
+          type: string
+          description: "URL or data URI media reference. Use either url or data."
         mime_type:
           type: string
-          description: "MIME type (audio/wav, image/gif, image/png, etc.)"
+          description: "MIME type such as image/png, audio/wav, or application/pdf. Required with data and optional with url when the URL can resolve content type."
 
     ContentPart:
       description: A content part for multimodal input (text, image URL, or inline media)
@@ -1351,6 +1352,9 @@ components:
           format: uri
           description: "URL of the Termite embedding/chunking service"
           example: "http://localhost:8080"
+        api_key:
+          type: string
+          description: "API key used when calling an authenticated shared Termite API."
         models_dir:
           type: string
           description: |
@@ -1764,133 +1768,6 @@ paths:
                 $ref: "#/components/schemas/Error"
         "503":
           description: Generation service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "500":
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /recognize:
-    post:
-      summary: Recognize named entities
-      description: |
-        Recognizes named entities (persons, organizations, locations, etc.) from text using ONNX recognition models.
-
-        ## Entity Types
-
-        Standard CoNLL entity types:
-        - **PER**: Person names (e.g., "John Smith")
-        - **ORG**: Organizations (e.g., "Google", "Apple Inc.")
-        - **LOC**: Locations (e.g., "New York", "France")
-        - **MISC**: Miscellaneous entities
-
-        ## Models
-
-        - Models are auto-discovered from `models_dir/recognizers/`
-        - Supports quantized variants (model_i8.onnx)
-        - Compatible with HuggingFace BERT-based recognition models
-        - GLiNER models support custom entity labels via the `labels` parameter
-      operationId: recognizeEntities
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/RecognizeRequest"
-      responses:
-        "200":
-          description: Entities extracted successfully
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/RecognizeResponse"
-        "400":
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "404":
-          description: Model not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "503":
-          description: Recognition service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "500":
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /classify:
-    post:
-      summary: Zero-shot text classification
-      description: |
-        Classifies text into arbitrary categories using NLI-based zero-shot classification models.
-
-        ## How It Works
-
-        Zero-shot classification uses Natural Language Inference (NLI) to classify text
-        without requiring training data for the specific categories. The model determines
-        how well a text "entails" each candidate label.
-
-        ## Models
-
-        - Models are auto-discovered from `models_dir/classifiers/`
-        - Supports multilingual models like mDeBERTa-mnli-xnli
-        - Compatible with HuggingFace NLI/MNLI models exported to ONNX
-
-        ## Use Cases
-
-        - **Sentiment Analysis**: Classify as positive/negative/neutral
-        - **Topic Classification**: Categorize by topic without training
-        - **Intent Detection**: Identify user intents from text
-        - **Content Moderation**: Detect inappropriate content types
-
-        ## Multilingual Support
-
-        The mDeBERTa-mnli-xnli model supports 100+ languages. You can classify text
-        in any supported language using labels in that language.
-      operationId: classifyText
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ClassifyRequest"
-      responses:
-        "200":
-          description: Classification completed successfully
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ClassifyResponse"
-        "400":
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "404":
-          description: Model not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "503":
-          description: Classification service unavailable (no models configured)
           content:
             application/json:
               schema:

@@ -13,7 +13,6 @@ const getDefaultApiUrl = () => {
 const getDefaultTermiteApiUrl = () => {
   const configured = getAntfarmRuntimeConfig().termiteApiUrl;
   if (configured) return configured;
-
   // Termite is served same-origin at /ml/v1 in both the Antfly and Termite views.
   return "";
 };

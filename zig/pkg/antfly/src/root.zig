@@ -123,7 +123,10 @@ pub const generating_runtime = @import("generating/mod.zig");
 pub const reranking = @import("antfly_reranking");
 pub const reranking_runtime = @import("reranking/mod.zig");
 pub const transcribing = @import("antfly_transcribing");
+pub const readers = @import("antfly_readers");
+pub const extracting = @import("antfly_extracting");
 pub const synthesizing = @import("antfly_synthesizing");
+pub const asset_producer_runtime = @import("asset_producer_runtime.zig");
 
 // Storage backends
 pub const platform_clock = @import("platform/clock.zig");
@@ -241,6 +244,8 @@ test {
     // Public API
     _ = public_api;
     _ = public_api.http_server;
+    _ = public_api.http_internal_group_read_routes;
+    _ = public_api.http_internal_group_join_routes;
 
     // Raft integration
     _ = raft;
@@ -272,7 +277,9 @@ test {
     _ = reranking;
     _ = reranking_runtime;
     _ = transcribing;
+    _ = readers;
     _ = synthesizing;
+    _ = asset_producer_runtime;
 
     // Storage
     _ = lmdb;

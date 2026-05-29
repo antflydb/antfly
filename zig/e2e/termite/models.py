@@ -189,8 +189,6 @@ DEFAULT_MODEL_BY_PATH = {
     "/ml/v1/rerank": ("mixedbread-ai/mxbai-rerank-base-v1", "rerankers"),
     "/ml/v1/generate": (DEFAULT_GENERATOR_MODEL, "generators"),
     "/ml/v1/chat/completions": (DEFAULT_GENERATOR_MODEL, "generators"),
-    "/ml/v1/classify": ("cross-encoder/nli-distilroberta-base", "classifiers"),
-    "/ml/v1/recognize": ("fastino/gliner2-base-v1", "recognizers"),
     "/ml/v1/extract": ("fastino/gliner2-base-v1", "recognizers"),
     "/ml/v1/read": ("Xenova/trocr-base-printed", "readers"),
     "/ml/v1/transcribe": ("openai/whisper-tiny", "transcribers"),

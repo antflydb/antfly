@@ -1233,7 +1233,7 @@ func (t *TableApi) RunAgenticRetrieval(
 	if result.Generation != "" {
 		result.Messages = append(result.Messages, ai.ChatMessage{
 			Role:    ai.ChatMessageRoleAssistant,
-			Content: result.Generation,
+			Content: ai.NewTextContent(result.Generation),
 		})
 	}
 
@@ -1332,7 +1332,7 @@ func (t *TableApi) runAgenticWithTools(
 	result.Messages = append(result.Messages, messages...)
 	result.Messages = append(result.Messages, ai.ChatMessage{
 		Role:    ai.ChatMessageRoleUser,
-		Content: req.Query,
+		Content: ai.NewTextContent(req.Query),
 	})
 }
 

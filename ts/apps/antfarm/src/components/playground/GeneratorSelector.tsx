@@ -152,7 +152,7 @@ export function GeneratorSelector({
       <RadioGroup value={mode} onValueChange={handleModeChange} className="gap-2">
         <label
           htmlFor={defaultId}
-          className="flex items-start gap-3 rounded-lg border p-3 cursor-pointer hover:bg-muted/30"
+          className="flex items-start gap-3 rounded-none border p-3 cursor-pointer hover:bg-muted/30"
         >
           <RadioGroupItem value="default" id={defaultId} className="mt-0.5" />
           <div className="space-y-1">
@@ -164,7 +164,7 @@ export function GeneratorSelector({
         </label>
         <label
           htmlFor={customId}
-          className="flex items-start gap-3 rounded-lg border p-3 cursor-pointer hover:bg-muted/30"
+          className="flex items-start gap-3 rounded-none border p-3 cursor-pointer hover:bg-muted/30"
         >
           <RadioGroupItem value="custom" id={customId} className="mt-0.5" />
           <div className="space-y-1">

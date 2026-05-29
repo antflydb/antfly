@@ -32,12 +32,38 @@ Repo-local specs:
 - `../specs/openapi/antfly/metadata.yaml`: Antfly metadata/table API
 - `../specs/openapi/antfly/usermgr.yaml`: Antfly user-management API
 - `../specs/openapi/termite/api.yaml`: Termite public API
+- `../specs/openapi/ai/messages.yaml`: shared OpenAI-compatible chat/message schemas
 - `specs/openai-openapi.yaml`: vendored OpenAI API schema used for types
 
 Some shared provider/config schemas are still read from the sibling
 `../antfly` checkout when regenerating. The checked-in generated Zig means a
 normal build does not need that sibling checkout, but `make generate` currently
 does.
+
+## Shared AI Messages
+
+Antfly and Termite share the provider-neutral chat/message schema from
+`../specs/openapi/ai/messages.yaml`. That spec owns the OpenAI-compatible
+message primitives:
+
+- `ChatMessage`
+- `ChatMessageRole`
+- `ChatMessageContent`
+- `ContentPart`
+- `ToolCall`
+- `ToolCallFunction`
+
+Service specs should reference those schemas instead of redefining local chat
+message objects. The runtime can still use typed Zig structs/unions internally,
+but provider and public API boundaries should serialize to the shared
+OpenAI-compatible shape: `role`, optional string-or-content-parts `content`,
+assistant `tool_calls`, and tool-message `tool_call_id`.
+
+When adding a new shared AI primitive, update `specs/openapi/ai/messages.yaml`,
+then reference it from the owning service spec with an external `$ref`. If the
+reference is used by checked-in Zig generated code, add the matching
+`--import-mapping` in `zig/build.zig` and import the generated shared module
+into the dependent generated module.
 
 ## Generated Modules
 
@@ -51,6 +77,18 @@ The generated Termite API module lives under:
 
 ```text
 pkg/termite/src/api/generated/termite_api/
+```
+
+The shared AI message module is generated under:
+
+```text
+pkg/antfly/src/openapi/generated/antfly_ai_messages_openapi/
+```
+
+The shared AI extraction module is generated under:
+
+```text
+pkg/antfly/src/openapi/generated/antfly_extraction_openapi/
 ```
 
 Generated files start with:

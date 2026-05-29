@@ -99,6 +99,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         }
         var observation = ops.observeSplit(record) catch |err| switch (err) {
             error.UnknownGroup, error.UnknownSplitRuntime, error.MissingSplitRuntime => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             else => return err,
         };
         if (route.group_id == record.source_group_id) observation.source_local_leader = true;
@@ -116,6 +117,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         }
         var observation = ops.observeMerge(record) catch |err| switch (err) {
             error.UnknownGroup, error.UnknownMergeRuntime, error.MissingMergeRuntime => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             else => return err,
         };
         if (route.group_id == record.donor_group_id) observation.donor_local_leader = true;
@@ -136,6 +138,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
                 return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
             },
             error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             else => return err,
         };
@@ -156,6 +159,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
 
         _ = (writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             else => return err,
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         const result = batch_req.result();
@@ -183,6 +187,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         ) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request"),
             error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
             else => return err,
@@ -209,6 +214,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         ) catch |err| switch (err) {
             error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
             error.VersionConflict, error.IntentConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "transaction conflict"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
             else => return err,
@@ -229,6 +235,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             txn_req.commit_version,
         ) catch |err| switch (err) {
             error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
             else => return err,
@@ -246,6 +253,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             txn_route.table_name,
             txn_id,
         ) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
             else => return err,
@@ -274,6 +282,7 @@ const EncodedTransitionAction = struct {
     destination_group_id: ?u64 = null,
     donor_group_id: ?u64 = null,
     receiver_group_id: ?u64 = null,
+    allow_doc_identity_reassignment: bool = false,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
 };
@@ -301,6 +310,7 @@ fn parseMergeTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metad
         .receiver_group_id = parsed.value.receiver_group_id,
         .phase = parsed.value.phase,
         .rollback_reason = if (parsed.value.rollback_reason) |value| try alloc.dupe(u8, value) else null,
+        .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
     };
 }
 
@@ -357,6 +367,7 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
                 .transition_id = parsed.value.transition_id,
                 .donor_group_id = parsed.value.donor_group_id orelse return error.InvalidTransitionActionRequest,
                 .receiver_group_id = parsed.value.receiver_group_id orelse return error.InvalidTransitionActionRequest,
+                .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
             },
         },
         .catch_up_merge_receiver => .{
@@ -364,6 +375,7 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
                 .transition_id = parsed.value.transition_id,
                 .donor_group_id = parsed.value.donor_group_id orelse return error.InvalidTransitionActionRequest,
                 .receiver_group_id = parsed.value.receiver_group_id orelse return error.InvalidTransitionActionRequest,
+                .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
             },
         },
         .finalize_merge => .{
@@ -371,6 +383,7 @@ fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_m
                 .transition_id = parsed.value.transition_id,
                 .donor_group_id = parsed.value.donor_group_id orelse return error.InvalidTransitionActionRequest,
                 .receiver_group_id = parsed.value.receiver_group_id orelse return error.InvalidTransitionActionRequest,
+                .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
             },
         },
         .rollback_merge => .{
@@ -464,6 +477,125 @@ test "internal group write routes allow source-hosted split destination actions"
     try std.testing.expect(transitionActionMatchesRouteGroup(action, 7));
     try std.testing.expect(transitionActionMatchesRouteGroup(action, 8));
     try std.testing.expect(!transitionActionMatchesRouteGroup(action, 9));
+}
+
+test "internal group write routes parse merge doc identity reassignment action flag" {
+    const alloc = std.testing.allocator;
+    var action = try parseTransitionAction(alloc,
+        \\{"kind":"catch_up_merge_receiver","transition_id":4,"donor_group_id":10,"receiver_group_id":9,"allow_doc_identity_reassignment":true}
+    );
+    defer freeTransitionActionOwned(alloc, &action);
+
+    try std.testing.expect(action == .catch_up_merge_receiver);
+    try std.testing.expect(action.catch_up_merge_receiver.allow_doc_identity_reassignment);
+}
+
+test "internal group write routes map shard doc identity mismatch to conflict" {
+    const alloc = std.testing.allocator;
+    const ConflictShardOps = struct {
+        fn adapter() raft_mod.ShardOperationAdapter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .observe_split = observeSplit,
+                    .observe_merge = observeMerge,
+                    .prepare_split_source = prepareSplitSource,
+                    .start_split_source = startSplitSource,
+                    .bootstrap_split_destination = bootstrapSplitDestination,
+                    .catch_up_split_destination = catchUpSplitDestination,
+                    .finalize_split_source = finalizeSplitSource,
+                    .rollback_split = rollbackSplit,
+                    .accept_merge_receiver = acceptMergeReceiver,
+                    .catch_up_merge_receiver = catchUpMergeReceiver,
+                    .finalize_merge = finalizeMerge,
+                    .rollback_merge = rollbackMerge,
+                },
+            };
+        }
+
+        fn observeSplit(_: *anyopaque, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
+            return error.DocIdentityNamespaceMismatch;
+        }
+
+        fn observeMerge(_: *anyopaque, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
+            return error.DocIdentityNamespaceMismatch;
+        }
+
+        fn prepareSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
+            unreachable;
+        }
+
+        fn startSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
+            unreachable;
+        }
+
+        fn bootstrapSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
+            unreachable;
+        }
+
+        fn catchUpSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
+            unreachable;
+        }
+
+        fn finalizeSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
+            unreachable;
+        }
+
+        fn rollbackSplit(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
+            unreachable;
+        }
+
+        fn acceptMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
+            unreachable;
+        }
+
+        fn catchUpMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
+            unreachable;
+        }
+
+        fn finalizeMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
+            return error.DocIdentityNamespaceMismatch;
+        }
+
+        fn rollbackMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
+            unreachable;
+        }
+    };
+
+    const ctx: Context = .{
+        .alloc = alloc,
+        .shard_ops = ConflictShardOps.adapter(),
+        .writes = null,
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    };
+
+    var split_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/shard-ops/observe-split",
+        .body = "{\"transition_id\":1,\"source_group_id\":7,\"destination_group_id\":8,\"split_key\":\"doc:m\"}",
+    }, "/internal/v1/groups/7/shard-ops/observe-split")).?;
+    defer split_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), split_resp.status);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", split_resp.body);
+
+    var merge_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/shard-ops/observe-merge",
+        .body = "{\"transition_id\":2,\"donor_group_id\":8,\"receiver_group_id\":7}",
+    }, "/internal/v1/groups/7/shard-ops/observe-merge")).?;
+    defer merge_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), merge_resp.status);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", merge_resp.body);
+
+    var execute_resp = (try handle(ctx, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/shard-ops/execute",
+        .body = "{\"kind\":\"finalize_merge\",\"transition_id\":3,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true}",
+    }, "/internal/v1/groups/7/shard-ops/execute")).?;
+    defer execute_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), execute_resp.status);
+    try std.testing.expectEqualStrings("doc identity namespace mismatch", execute_resp.body);
 }
 
 const TestWriteSource = struct {

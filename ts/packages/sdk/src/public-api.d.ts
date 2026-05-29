@@ -13,9 +13,29 @@ export interface paths {
         };
         /**
          * Get cluster status
-         * @description Returns the current health and status of all stores and shards in the cluster
+         * @description Returns minimal cluster health and runtime status.
          */
         get: operations["getStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/cluster": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get cluster topology
+         * @description Returns cluster health plus data-node, range, replica, and group topology for dashboard views.
+         */
+        get: operations["getCluster"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1508,158 +1528,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ml/v1/recognize": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Recognize named entities
-         * @description Recognizes named entities (persons, organizations, locations, etc.) from text using ONNX recognition models.
-         *
-         *     ## Entity Types
-         *
-         *     Standard CoNLL entity types:
-         *     - **PER**: Person names (e.g., "John Smith")
-         *     - **ORG**: Organizations (e.g., "Google", "Apple Inc.")
-         *     - **LOC**: Locations (e.g., "New York", "France")
-         *     - **MISC**: Miscellaneous entities
-         *
-         *     ## Models
-         *
-         *     - Models are auto-discovered from `models_dir/recognizers/`
-         *     - Supports quantized variants (model_i8.onnx)
-         *     - Compatible with HuggingFace BERT-based recognition models
-         *     - GLiNER models support custom entity labels via the `labels` parameter
-         */
-        post: operations["recognizeEntities"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/ml/v1/classify": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Zero-shot text classification
-         * @description Classifies text into arbitrary categories using NLI-based zero-shot classification models.
-         *
-         *     ## How It Works
-         *
-         *     Zero-shot classification uses Natural Language Inference (NLI) to classify text
-         *     without requiring training data for the specific categories. The model determines
-         *     how well a text "entails" each candidate label.
-         *
-         *     ## Models
-         *
-         *     - Models are auto-discovered from `models_dir/classifiers/`
-         *     - Supports multilingual models like mDeBERTa-mnli-xnli
-         *     - Compatible with HuggingFace NLI/MNLI models exported to ONNX
-         *
-         *     ## Use Cases
-         *
-         *     - **Sentiment Analysis**: Classify as positive/negative/neutral
-         *     - **Topic Classification**: Categorize by topic without training
-         *     - **Intent Detection**: Identify user intents from text
-         *     - **Content Moderation**: Detect inappropriate content types
-         *
-         *     ## Multilingual Support
-         *
-         *     The mDeBERTa-mnli-xnli model supports 100+ languages. You can classify text
-         *     in any supported language using labels in that language.
-         */
-        post: operations["classifyText"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/ml/v1/classify/document": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Document classification
-         * @description Runs a native document classification head against a document image.
-         *
-         *     This endpoint serves `layoutdoc_sequence_head.safetensors` artifacts produced by
-         *     the Zig finetuning stack. It currently reconstructs the same compact visual/layout
-         *     feature vector used by the training code and applies the saved sequence head.
-         *
-         *     ## Current Scope
-         *
-         *     - Native `layoutdoc_sequence_head` checkpoints only
-         *     - Local image path input only
-         *     - Caller must supply labels in model output order
-         *     - Supports JPEG, PNG, and JPEG2000 image files
-         *
-         *     ## Not Yet Included
-         *
-         *     - Served `layoutdoc_token_head`
-         *     - OCR token / bbox request shapes
-         *     - Label vocab discovery from checkpoint artifacts
-         */
-        post: operations["classifyDocument"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/ml/v1/classify/document_tokens": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Document token classification
-         * @description Runs a native document token classification head against caller-provided OCR tokens and bounding boxes.
-         *
-         *     This endpoint serves `layoutdoc_token_head.safetensors` artifacts produced by the
-         *     Zig finetuning stack. It reconstructs the same compact 6-dimensional token feature
-         *     vector used by the training code for each OCR token.
-         *
-         *     ## Current Scope
-         *
-         *     - Native `layoutdoc_token_head` checkpoints only
-         *     - Caller-provided OCR token text and bboxes
-         *     - Caller must supply labels in model output order
-         *
-         *     ## Not Yet Included
-         *
-         *     - OCR extraction inside this endpoint
-         *     - Sequence-head image features
-         *     - Label vocab discovery from checkpoint artifacts
-         */
-        post: operations["classifyDocumentTokens"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/ml/v1/rewrite": {
         parameters: {
             query?: never;
@@ -1800,56 +1668,13 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Extract structured data from text
-         * @description Extracts structured data from text using GLiNER2 models.
-         *     Field names in the schema are treated as NER labels, and the model's
-         *     span extraction pipeline populates field values.
-         *
-         *     ## Schema Format
-         *
-         *     The schema maps structure names to arrays of field definitions:
-         *     ```json
-         *     {
-         *       "person": ["name::str", "age::str", "skills::list"]
-         *     }
-         *     ```
-         *
-         *     Field types:
-         *     - `::str` - Keep only the top-scoring span (default if no type specified)
-         *     - `::list` - Keep all extracted spans as an array
-         *     - `::[opt1|opt2]::str` - Choice field, classified against options
-         *
-         *     ## Example
-         *
-         *     ```json
-         *     {
-         *       "model": "fastino/gliner2-base-v1",
-         *       "texts": ["John Smith is 30 years old and works at Google."],
-         *       "schema": {
-         *         "person": ["name::str", "age::str", "company::str"]
-         *       }
-         *     }
-         *     ```
-         *
-         *     Response:
-         *     ```json
-         *     {
-         *       "model": "fastino/gliner2-base-v1",
-         *       "results": [
-         *         {
-         *           "person": [
-         *             {
-         *               "name": {"value": "John Smith"},
-         *               "age": {"value": "30"},
-         *               "company": {"value": "Google"}
-         *             }
-         *           ]
-         *         }
-         *       ]
-         *     }
-         *     ```
+         * Extract entities, relations, classifications, and structures
+         * @description Schema-driven extraction over shared AI content parts. This is the
+         *     canonical public API for named entity recognition, relation extraction,
+         *     text/document classification, token classification, and structured
+         *     document extraction.
          */
-        post: operations["extractJSON"];
+        post: operations["extract"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1999,6 +1824,112 @@ export interface components {
             secret_store?: components["schemas"]["SecretStoreStatus"];
         } & {
             [key: string]: unknown;
+        };
+        ClusterTopology: {
+            health: components["schemas"]["ClusterHealth"];
+            /** @description Optional message providing details about the health status */
+            message?: string;
+            /** @description Indicates whether authentication is enabled for the cluster */
+            auth_enabled?: boolean;
+            /** @description Indicates whether the cluster is running in single-node swarm mode */
+            swarm_mode?: boolean;
+            secret_store?: components["schemas"]["SecretStoreStatus"];
+            data: components["schemas"]["ClusterDataStatus"];
+        } & {
+            [key: string]: unknown;
+        };
+        /** @description Typed Zig status view for table data topology and range placement. */
+        ClusterDataStatus: {
+            nodes?: components["schemas"]["ClusterDataNodeStatus"][];
+            ranges?: components["schemas"]["ClusterDataRangeStatus"][];
+            replicas?: components["schemas"]["ClusterDataReplicaStatus"][];
+            groups?: components["schemas"]["ClusterDataGroupStatus"][];
+        };
+        ClusterDataNodeStatus: {
+            /** Format: uint64 */
+            data_id: number;
+            /** Format: uint64 */
+            node_id: number;
+            api_url?: string;
+            raft_url?: string;
+            role?: string;
+            state?: string;
+            health_class?: string;
+            failure_domain?: string;
+            live?: boolean;
+            drain_requested?: boolean;
+            /** Format: uint64 */
+            capacity_bytes?: number;
+            /** Format: uint64 */
+            available_bytes?: number;
+            /** Format: uint32 */
+            lease_pressure?: number;
+            /** Format: uint32 */
+            read_load?: number;
+            /** Format: uint32 */
+            write_load?: number;
+            /** Format: uint32 */
+            active_backfills?: number;
+        };
+        ClusterDataRangeStatus: {
+            /** Format: uint64 */
+            group_id: number;
+            /** Format: uint64 */
+            range_id: number;
+            /** Format: uint64 */
+            table_id: number;
+            table_name?: string;
+            start_key?: string;
+            end_key?: string | null;
+            /** Format: uint64 */
+            doc_identity_shard_id?: number;
+            /** Format: uint64 */
+            doc_identity_range_id?: number;
+            state?: string;
+            /** Format: uint64 */
+            leader_data_id?: number | null;
+            /** Format: uint32 */
+            voter_count?: number;
+            /** Format: uint64 */
+            doc_count?: number;
+            /** Format: uint64 */
+            disk_bytes?: number;
+            empty?: boolean;
+        };
+        ClusterDataReplicaStatus: {
+            /** Format: uint64 */
+            group_id: number;
+            /** Format: uint64 */
+            data_id: number;
+            /** Format: uint64 */
+            node_id: number;
+            /** Format: uint64 */
+            replica_id: number;
+            peer_node_ids?: number[];
+        };
+        ClusterDataGroupStatus: {
+            /** Format: uint64 */
+            group_id: number;
+            leader_known?: boolean;
+            /** Format: uint64 */
+            leader_data_id?: number | null;
+            voter_count_known?: boolean;
+            /** Format: uint32 */
+            voter_count?: number;
+            /** Format: uint32 */
+            healthy_voter_reports?: number;
+            joint_consensus?: boolean;
+            transition_pending?: boolean;
+            replay_required?: boolean;
+            replay_caught_up?: boolean;
+            cutover_ready?: boolean;
+            reads_ready_after_cutover?: boolean;
+            doc_identity_lifecycle?: string;
+            /** Format: uint64 */
+            doc_count?: number;
+            /** Format: uint64 */
+            disk_bytes?: number;
+            empty?: boolean;
         };
         /** @description Non-secret status for the local secrets file store, when one is available. */
         SecretStoreStatus: {
@@ -7434,41 +7365,67 @@ export interface components {
             options?: components["schemas"]["EvalOptions"];
         };
         /**
-         * @description Role of the message sender in the conversation
+         * @description The role of a chat message sender.
          * @enum {string}
          */
-        ChatMessageRole: "user" | "assistant" | "system" | "tool";
-        /** @description A tool call made by the assistant */
-        ChatToolCall: {
-            /** @description Unique identifier for this tool call */
-            id: string;
-            /** @description Name of the tool being called */
+        ChatMessageRole: "system" | "user" | "assistant" | "tool";
+        /** @description Text content part. */
+        TextContentPart: {
+            /** @enum {string} */
+            type: "text";
+            /** @description Text content. */
+            text: string;
+        };
+        /** @description Image URL or data URI. */
+        ImageURL: {
+            /** @description URL or data URI such as data:image/png;base64,... */
+            url: string;
+        };
+        /** @description Image content in the OpenAI-compatible content part format. */
+        ImageURLContentPart: {
+            /** @enum {string} */
+            type: "image_url";
+            image_url: components["schemas"]["ImageURL"];
+        };
+        /** @description Inline binary media content for providers that support non-image media parts. */
+        MediaContentPart: {
+            /** @enum {string} */
+            type: "media";
+            /**
+             * Format: byte
+             * @description Base64-encoded binary data.
+             */
+            data: string;
+            /** @description MIME type such as image/png, audio/wav, or application/pdf. */
+            mime_type: string;
+        };
+        /** @description A multimodal content part. */
+        ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"];
+        /** @description OpenAI-compatible message content: either text or an array of content parts. */
+        ChatMessageContent: string | components["schemas"]["ContentPart"][];
+        /** @description The function called by a model tool call. */
+        ToolCallFunction: {
+            /** @description Function name. */
             name: string;
-            /** @description Arguments passed to the tool as key-value pairs */
-            arguments: {
-                [key: string]: unknown;
-            };
+            /** @description JSON string of function arguments. */
+            arguments: string;
         };
-        /** @description Result from executing a tool call */
-        ChatToolResult: {
-            /** @description ID of the tool call this result corresponds to */
-            tool_call_id: string;
-            /** @description Result data from the tool execution */
-            result: {
-                [key: string]: unknown;
-            };
-            /** @description Error message if tool execution failed */
-            error?: string;
+        /** @description OpenAI-compatible assistant tool call. */
+        ToolCall: {
+            /** @description Tool call identifier. */
+            id: string;
+            /** @enum {string} */
+            type: "function";
+            function: components["schemas"]["ToolCallFunction"];
         };
-        /** @description A message in the conversation history */
+        /** @description OpenAI-compatible chat message. */
         ChatMessage: {
             role: components["schemas"]["ChatMessageRole"];
-            /** @description Text content of the message */
-            content: string;
-            /** @description Tool calls made by the assistant (only for assistant role) */
-            tool_calls?: components["schemas"]["ChatToolCall"][];
-            /** @description Results from tool executions (only for tool role) */
-            tool_results?: components["schemas"]["ChatToolResult"][];
+            content?: components["schemas"]["ChatMessageContent"];
+            /** @description Assistant tool calls. */
+            tool_calls?: components["schemas"]["ToolCall"][];
+            /** @description Tool call ID this tool message responds to. */
+            tool_call_id?: string;
         };
         /** @description A filter specification to apply to search queries */
         FilterSpec: {
@@ -7969,41 +7926,11 @@ export interface components {
             /** @description Error message */
             error: string;
         };
-        /** @description Text content for embedding */
-        TermiteTextContentPart: {
-            /** @enum {string} */
-            type: "text";
-            /** @description Text content to embed */
-            text: string;
-        };
-        /** @description Image URL or data URI */
-        TermiteImageURL: {
-            /**
-             * @description URL or data URI (data:image/png;base64,...)
-             * @example data:image/png;base64,iVBORw0KGgo...
-             */
-            url: string;
-        };
-        /** @description Image content for embedding (OpenAI-compatible format) */
-        TermiteImageURLContentPart: {
-            /** @enum {string} */
-            type: "image_url";
-            image_url: components["schemas"]["TermiteImageURL"];
-        };
-        /** @description Inline binary media content (audio, image, etc.) */
-        TermiteMediaContentPart: {
-            /** @enum {string} */
-            type: "media";
-            /**
-             * Format: byte
-             * @description Base64-encoded binary data
-             */
-            data: string;
-            /** @description MIME type (audio/wav, image/gif, image/png, etc.) */
-            mime_type: string;
-        };
-        /** @description A content part for multimodal input (text, image URL, or inline media) */
-        TermiteContentPart: components["schemas"]["TermiteTextContentPart"] | components["schemas"]["TermiteImageURLContentPart"] | components["schemas"]["TermiteMediaContentPart"];
+        TermiteTextContentPart: components["schemas"]["TextContentPart"];
+        TermiteImageURL: components["schemas"]["ImageURL"];
+        TermiteImageURLContentPart: components["schemas"]["ImageURLContentPart"];
+        TermiteMediaContentPart: components["schemas"]["MediaContentPart"];
+        TermiteContentPart: components["schemas"]["ContentPart"];
         /** @description OpenAI-compatible embedding request with Termite multimodal content-part extension */
         TermiteEmbedRequest: {
             /** @description Model name to use for embedding generation */
@@ -9010,33 +8937,8 @@ export interface components {
              */
             strict?: boolean;
         };
-        /** @description A tool call made by the model */
-        TermiteToolCall: {
-            /**
-             * @description Unique identifier for this tool call
-             * @example call_abc123
-             */
-            id: string;
-            /**
-             * @description The type of tool call (currently only "function")
-             * @enum {string}
-             */
-            type: "function";
-            function: components["schemas"]["TermiteToolCallFunction"];
-        };
-        /** @description The function called by the model */
-        TermiteToolCallFunction: {
-            /**
-             * @description The name of the function called
-             * @example get_weather
-             */
-            name: string;
-            /**
-             * @description JSON string of the arguments to the function
-             * @example {"location": "San Francisco, CA"}
-             */
-            arguments: string;
-        };
+        TermiteToolCall: components["schemas"]["ToolCall"];
+        TermiteToolCallFunction: components["schemas"]["ToolCallFunction"];
         /**
          * @description Controls how the model uses tools. Options:
          *     - "auto": Model decides whether to call a tool (default)
@@ -9052,30 +8954,14 @@ export interface components {
                 name: string;
             };
         };
-        /**
-         * @description The role of a message sender in a conversation
-         * @enum {string}
-         */
-        TermiteRole: "system" | "user" | "assistant" | "tool";
+        TermiteRole: components["schemas"]["ChatMessageRole"];
         /**
          * @description Reason why generation stopped
          * @enum {string}
          */
         TermiteFinishReason: "stop" | "length" | "tool_calls" | "content_filter" | "function_call";
-        /**
-         * @description Message content. Supports two formats:
-         *     - Simple string: "Hello, how are you?"
-         *     - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
-         */
-        TermiteChatMessageContent: string | components["schemas"]["TermiteContentPart"][];
-        TermiteChatMessage: {
-            role: components["schemas"]["TermiteRole"];
-            content?: components["schemas"]["TermiteChatMessageContent"];
-            /** @description Tool calls made by the assistant (only for role=assistant) */
-            tool_calls?: components["schemas"]["TermiteToolCall"][];
-            /** @description ID of the tool call this message is responding to (only for role=tool) */
-            tool_call_id?: string;
-        };
+        TermiteChatMessageContent: components["schemas"]["ChatMessageContent"];
+        TermiteChatMessage: components["schemas"]["ChatMessage"];
         TermiteGenerateRequest: {
             /**
              * @description Name of the generator model from models_dir/generators/
@@ -9315,6 +9201,8 @@ export interface components {
              * @example http://localhost:8080
              */
             api_url: string;
+            /** @description API key used when calling an authenticated shared Termite API. */
+            api_key?: string;
             /**
              * @description Base directory containing model subdirectories. Termite auto-discovers models from:
              *     - `{models_dir}/embedders/` - Embedding models (ONNX)
@@ -9672,6 +9560,124 @@ export interface components {
             /** @description Total tokens used */
             total_tokens: number;
         };
+        ExtractionToken: {
+            text: string;
+            box?: number[];
+        };
+        ExtractionInput: {
+            id?: string;
+            content: components["schemas"]["ChatMessageContent"];
+            tokens?: components["schemas"]["ExtractionToken"][];
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
+        ExtractionRelationSchema: {
+            type: string;
+            source?: string;
+            target?: string;
+        };
+        ExtractionClassificationSchema: {
+            name: string;
+            labels: string[];
+            /** @default false */
+            multi_label?: boolean;
+        };
+        ExtractionStructureField: string | {
+            [key: string]: unknown;
+        };
+        ExtractionStructureSchema: {
+            fields?: {
+                [key: string]: components["schemas"]["ExtractionStructureField"];
+            };
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionSchema: {
+            entities?: string[];
+            relations?: components["schemas"]["ExtractionRelationSchema"][];
+            classifications?: components["schemas"]["ExtractionClassificationSchema"][];
+            structures?: {
+                [key: string]: components["schemas"]["ExtractionStructureSchema"];
+            };
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionReaderOptions: {
+            provider?: string;
+            model?: string;
+            url?: string;
+            api_url?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionOptions: {
+            /** Format: float */
+            threshold?: number;
+            flat_ner?: boolean;
+            include_confidence?: boolean;
+            include_spans?: boolean;
+            reader?: components["schemas"]["ExtractionReaderOptions"];
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionRequest: {
+            model: string;
+            inputs: components["schemas"]["ExtractionInput"][];
+            schema: components["schemas"]["ExtractionSchema"];
+            options?: components["schemas"]["ExtractionOptions"];
+        };
+        ExtractionEntity: {
+            label: string;
+            text: string;
+            start?: number;
+            end?: number;
+            /** Format: float */
+            score?: number;
+        };
+        ExtractionRelationEndpoint: {
+            entity_index?: number;
+            id?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionRelation: {
+            type: string;
+            source?: components["schemas"]["ExtractionRelationEndpoint"];
+            target?: components["schemas"]["ExtractionRelationEndpoint"];
+            /** Format: float */
+            score?: number;
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionClassification: {
+            name: string;
+            label: string;
+            /** Format: float */
+            score?: number;
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionObject: {
+            id?: string;
+            entities?: components["schemas"]["ExtractionEntity"][];
+            relations?: components["schemas"]["ExtractionRelation"][];
+            classifications?: components["schemas"]["ExtractionClassification"][];
+            structures?: {
+                [key: string]: unknown;
+            };
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionResponse: {
+            /** @enum {string} */
+            object: "extraction";
+            model: string;
+            data: components["schemas"]["ExtractionObject"][];
+            usage?: {
+                [key: string]: unknown;
+            };
+        };
     };
     responses: {
         /** @description Bad request */
@@ -9760,6 +9766,36 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ClusterStatus"];
+                };
+            };
+            /** @description Unauthorized - authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getCluster: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cluster topology retrieved successfully */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClusterTopology"];
                 };
             };
             /** @description Unauthorized - authentication required */
@@ -12510,228 +12546,6 @@ export interface operations {
             };
         };
     };
-    recognizeEntities: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TermiteRecognizeRequest"];
-            };
-        };
-        responses: {
-            /** @description Entities extracted successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteRecognizeResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-            /** @description Recognition service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-        };
-    };
-    classifyText: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TermiteClassifyRequest"];
-            };
-        };
-        responses: {
-            /** @description Classification completed successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteClassifyResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-        };
-    };
-    classifyDocument: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TermiteDocumentClassificationRequest"];
-            };
-        };
-        responses: {
-            /** @description Document classification completed successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteDocumentClassificationResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-            /** @description Model or image not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-        };
-    };
-    classifyDocumentTokens: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TermiteDocumentTokenClassificationRequest"];
-            };
-        };
-        responses: {
-            /** @description Document token classification completed successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteDocumentTokenClassificationResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-            /** @description Classification service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TermiteError"];
-                };
-            };
-        };
-    };
     rewriteText: {
         parameters: {
             query?: never;
@@ -12912,7 +12726,7 @@ export interface operations {
             };
         };
     };
-    extractJSON: {
+    extract: {
         parameters: {
             query?: never;
             header?: never;
@@ -12921,7 +12735,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["TermiteExtractRequest"];
+                "application/json": components["schemas"]["ExtractionRequest"];
             };
         };
         responses: {
@@ -12931,7 +12745,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TermiteExtractResponse"];
+                    "application/json": components["schemas"]["ExtractionResponse"];
                 };
             };
             /** @description Invalid request */

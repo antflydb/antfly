@@ -202,6 +202,8 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
     for (batch.changed_artifact_keys) |key| {
         if (internal_keys.isGraphEdgeArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
+        } else if (internal_keys.isAssetArtifactKey(key)) {
+            try appendUniqueHintAlloc(alloc, &target_hints, .graph);
         } else if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
             try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);

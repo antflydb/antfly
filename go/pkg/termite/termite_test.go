@@ -74,7 +74,7 @@ func TestAPIHandlerServesRootOperationalRoutesOutsideMLPrefix(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
-		assert.True(t, w.Code == http.StatusOK || w.Code == http.StatusServiceUnavailable, "%s returned %d", path, w.Code)
+		assert.Equal(t, http.StatusOK, w.Code, path)
 	}
 
 	for _, path := range []string{"/ml/v1/healthz", "/ml/v1/readyz"} {
@@ -690,7 +690,6 @@ func TestTermiteNode_HandleApiNER_Success(t *testing.T) {
 		}, logger.Named("queue")),
 		nerCache: NewResultCache[[][]ner.Entity]("NER", 2*time.Minute, logger.Named("ner-cache")),
 	}
-	handler := NewTermiteAPI(logger, node)
 
 	// Create NER request
 	reqBody := struct {
@@ -706,11 +705,11 @@ func TestTermiteNode_HandleApiNER_Success(t *testing.T) {
 	body, err := json.Marshal(reqBody)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("POST", "/ml/v1/recognize", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/internal/recognize", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
+	node.handleApiRecognize(w, req)
 
 	// Should return 200 OK
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -744,7 +743,6 @@ func TestTermiteNode_HandleApiNER_NotAvailable(t *testing.T) {
 		logger:      logger,
 		nerRegistry: nil, // No NER configured
 	}
-	handler := NewTermiteAPI(logger, node)
 
 	// Create NER request
 	reqBody := struct {
@@ -757,11 +755,11 @@ func TestTermiteNode_HandleApiNER_NotAvailable(t *testing.T) {
 	body, err := json.Marshal(reqBody)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("POST", "/ml/v1/recognize", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/internal/recognize", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
+	node.handleApiRecognize(w, req)
 
 	// Should return 503 Service Unavailable
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
@@ -788,7 +786,6 @@ func TestTermiteNode_HandleApiNER_InvalidRequest(t *testing.T) {
 		}, logger.Named("queue")),
 		nerCache: NewResultCache[[][]ner.Entity]("NER", 2*time.Minute, logger.Named("ner-cache")),
 	}
-	handler := NewTermiteAPI(logger, node)
 
 	tests := []struct {
 		name       string
@@ -840,11 +837,11 @@ func TestTermiteNode_HandleApiNER_InvalidRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("POST", "/ml/v1/recognize", bytes.NewReader([]byte(tt.body)))
+			req := httptest.NewRequest("POST", "/internal/recognize", bytes.NewReader([]byte(tt.body)))
 			req.Header.Set("Content-Type", "application/json")
 
 			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, req)
+			node.handleApiRecognize(w, req)
 
 			assert.Equal(t, tt.wantStatus, w.Code)
 			if tt.wantError != "" {

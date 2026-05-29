@@ -9,9 +9,9 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.termite_image_url_content_part import TermiteImageURLContentPart
-    from ..models.termite_media_content_part import TermiteMediaContentPart
-    from ..models.termite_text_content_part import TermiteTextContentPart
+    from ..models.image_url_content_part import ImageURLContentPart
+    from ..models.media_content_part import MediaContentPart
+    from ..models.text_content_part import TextContentPart
 
 
 T = TypeVar("T", bound="TermiteRerankMultimodalDocument")
@@ -21,33 +21,29 @@ T = TypeVar("T", bound="TermiteRerankMultimodalDocument")
 class TermiteRerankMultimodalDocument:
     """
     Attributes:
-        content (list[TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart] | str): Message
-            content. Supports two formats:
-            - Simple string: "Hello, how are you?"
-            - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
+        content (list[ImageURLContentPart | MediaContentPart | TextContentPart] | str): OpenAI-compatible message
+            content: either text or an array of content parts.
         id (str | Unset): Optional caller-provided document identifier
     """
 
-    content: list[TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart] | str
+    content: list[ImageURLContentPart | MediaContentPart | TextContentPart] | str
     id: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.termite_image_url_content_part import TermiteImageURLContentPart
-        from ..models.termite_text_content_part import TermiteTextContentPart
+        from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.text_content_part import TextContentPart
 
         content: list[dict[str, Any]] | str
         if isinstance(self.content, list):
             content = []
             for componentsschemas_termite_chat_message_content_type_1_item_data in self.content:
                 componentsschemas_termite_chat_message_content_type_1_item: dict[str, Any]
-                if isinstance(componentsschemas_termite_chat_message_content_type_1_item_data, TermiteTextContentPart):
+                if isinstance(componentsschemas_termite_chat_message_content_type_1_item_data, TextContentPart):
                     componentsschemas_termite_chat_message_content_type_1_item = (
                         componentsschemas_termite_chat_message_content_type_1_item_data.to_dict()
                     )
-                elif isinstance(
-                    componentsschemas_termite_chat_message_content_type_1_item_data, TermiteImageURLContentPart
-                ):
+                elif isinstance(componentsschemas_termite_chat_message_content_type_1_item_data, ImageURLContentPart):
                     componentsschemas_termite_chat_message_content_type_1_item = (
                         componentsschemas_termite_chat_message_content_type_1_item_data.to_dict()
                     )
@@ -77,15 +73,13 @@ class TermiteRerankMultimodalDocument:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.termite_image_url_content_part import TermiteImageURLContentPart
-        from ..models.termite_media_content_part import TermiteMediaContentPart
-        from ..models.termite_text_content_part import TermiteTextContentPart
+        from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.media_content_part import MediaContentPart
+        from ..models.text_content_part import TextContentPart
 
         d = dict(src_dict)
 
-        def _parse_content(
-            data: object,
-        ) -> list[TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart] | str:
+        def _parse_content(data: object) -> list[ImageURLContentPart | MediaContentPart | TextContentPart] | str:
             try:
                 if not isinstance(data, list):
                     raise TypeError()
@@ -97,28 +91,28 @@ class TermiteRerankMultimodalDocument:
 
                     def _parse_componentsschemas_termite_chat_message_content_type_1_item(
                         data: object,
-                    ) -> TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart:
+                    ) -> ImageURLContentPart | MediaContentPart | TextContentPart:
                         try:
                             if not isinstance(data, dict):
                                 raise TypeError()
-                            componentsschemas_termite_content_part_type_0 = TermiteTextContentPart.from_dict(data)
+                            componentsschemas_content_part_type_0 = TextContentPart.from_dict(data)
 
-                            return componentsschemas_termite_content_part_type_0
+                            return componentsschemas_content_part_type_0
                         except (TypeError, ValueError, AttributeError, KeyError):
                             pass
                         try:
                             if not isinstance(data, dict):
                                 raise TypeError()
-                            componentsschemas_termite_content_part_type_1 = TermiteImageURLContentPart.from_dict(data)
+                            componentsschemas_content_part_type_1 = ImageURLContentPart.from_dict(data)
 
-                            return componentsschemas_termite_content_part_type_1
+                            return componentsschemas_content_part_type_1
                         except (TypeError, ValueError, AttributeError, KeyError):
                             pass
                         if not isinstance(data, dict):
                             raise TypeError()
-                        componentsschemas_termite_content_part_type_2 = TermiteMediaContentPart.from_dict(data)
+                        componentsschemas_content_part_type_2 = MediaContentPart.from_dict(data)
 
-                        return componentsschemas_termite_content_part_type_2
+                        return componentsschemas_content_part_type_2
 
                     componentsschemas_termite_chat_message_content_type_1_item = (
                         _parse_componentsschemas_termite_chat_message_content_type_1_item(
@@ -133,7 +127,7 @@ class TermiteRerankMultimodalDocument:
                 return componentsschemas_termite_chat_message_content_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(list[TermiteImageURLContentPart | TermiteMediaContentPart | TermiteTextContentPart] | str, data)
+            return cast(list[ImageURLContentPart | MediaContentPart | TextContentPart] | str, data)
 
         content = _parse_content(d.pop("content"))
 

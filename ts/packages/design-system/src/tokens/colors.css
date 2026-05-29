@@ -1,58 +1,72 @@
 /**
  * @antfly/design-system — color tokens
  *
- * Palette: cool-gray monochrome base, purple #9A94FF (oklch(0.7 0.15 285)) as accent.
- * Mirrors PR #184 aesthetic: raw-industrial, restrained — purple never carries
- * the whole surface, it anchors CTAs and single accent phrases.
+ * Visual language: a quiet, flat, precise, warm-monochrome instrument.
+ * Single hue (honey-amber) used STRICTLY as an accent, on neutral
+ * paper/ink. Purple retired. Borders carry hierarchy; shadows are flat
+ * (see shadows.css). Square corners (see radii.css).
  */
 
 :root {
-  /* Core semantic colors — cool gray */
-  --background: oklch(0.98 0.003 265);
-  --background-secondary: oklch(0.965 0.003 265);
-  --foreground: oklch(0.185 0.02 275);
+  /* honey-amber ramp — the single accent hue */
+  --amber-50:  #fdf6e3;
+  --amber-100: #f9e9bf;
+  --amber-200: #f3d488;
+  --amber-300: #ecbc4a;
+  --amber-400: #e3a112;  /* primary fill */
+  --amber-500: #c4850b;
+  --amber-600: #9c6907;
+  --amber-700: #6f4a05;
 
-  --card: oklch(0.995 0.001 265);
-  --card-foreground: oklch(0.185 0.02 275);
+  /* neutral paper + ink (light) */
+  --background:           #fafafa;
+  --background-secondary: #f2f2f1;
+  --foreground:           #1b1b1a;
 
-  --popover: oklch(0.995 0.001 265);
-  --popover-foreground: oklch(0.185 0.02 275);
+  --card:            #ffffff;
+  --card-foreground: #1b1b1a;
 
-  /* Purple accent — use sparingly */
-  --primary: oklch(0.7 0.15 285);
-  --primary-foreground: oklch(1 0 0);
+  --popover:            #ffffff;
+  --popover-foreground: #1b1b1a;
 
-  --secondary: oklch(0.955 0.003 265);
-  --secondary-foreground: oklch(0.185 0.02 275);
+  /* amber primary */
+  --primary:            var(--amber-400);
+  --primary-foreground: #221a06;   /* ink ON amber fills */
 
-  --muted: oklch(0.955 0.003 265);
-  --muted-foreground: oklch(0.55 0.01 265);
+  --secondary:            #f2f2f1;
+  --secondary-foreground: #1b1b1a;
 
-  --accent: oklch(0.955 0.003 265);
-  --accent-foreground: oklch(0.185 0.02 275);
+  --muted:            #f2f2f1;
+  --muted-foreground: #54534f;
 
-  --destructive: oklch(0.577 0.245 27.325);
-  --destructive-foreground: oklch(0.985 0 0);
+  --accent:            #f2f2f1;
+  --accent-foreground: #1b1b1a;
 
-  --success: oklch(0.7 0.17 150);
-  --success-foreground: oklch(0.985 0 0);
+  /* semantic — muted; express via border+icon+text, not loud fills.
+     warning is HOT-ORANGE (not brand amber) to avoid colliding with the brand. */
+  --destructive:            #b23c34;
+  --destructive-foreground: #ffffff;
 
-  --warning: oklch(0.78 0.16 75);
-  --warning-foreground: oklch(0.15 0.02 75);
+  --success:            #4d7a45;
+  --success-foreground: #ffffff;
 
-  --info: oklch(0.72 0.13 230);
-  --info-foreground: oklch(0.985 0 0);
+  --warning:            #d3641a;
+  --warning-foreground: #ffffff;
 
-  /* Compatibility scales for dashboards migrating from local token files */
+  --info:            #3f6c98;
+  --info-foreground: #ffffff;
+
+  /* Compatibility scales for dashboards migrating from local token files.
+     Re-rooted to neutral grays so legacy refs still render correctly. */
   --searchaf-1: #ffffff;
   --searchaf-2: #fafafa;
-  --searchaf-3: #f5f5f5;
-  --searchaf-4: #e5e5e5;
-  --searchaf-5: #d4d4d4;
-  --searchaf-6: #a3a3a3;
-  --searchaf-7: #737373;
-  --searchaf-8: #525252;
-  --searchaf-9: #1c2024;
+  --searchaf-3: #f4f4f4;
+  --searchaf-4: #e4e4e3;
+  --searchaf-5: #cbcac6;
+  --searchaf-6: #a3a29e;
+  --searchaf-7: #777572;
+  --searchaf-8: #555350;
+  --searchaf-9: #1f1e1c;
   --searchaf-10: #18181b;
   --searchaf-11: #09090b;
   --searchaf-12: #000000;
@@ -60,12 +74,12 @@
   --gray-1: #fcfcfc;
   --gray-2: #f9f9f9;
   --gray-3: #f0f0f0;
-  --gray-4: #e4e4e7;
-  --gray-5: #d4d4d8;
-  --gray-6: #a1a1aa;
-  --gray-7: #71717a;
-  --gray-8: #52525b;
-  --gray-9: #3f3f46;
+  --gray-4: #e4e4e3;
+  --gray-5: #cbcac6;
+  --gray-6: #a3a29e;
+  --gray-7: #777572;
+  --gray-8: #555350;
+  --gray-9: #3f3f3d;
   --gray-10: #27272a;
   --gray-11: #18181b;
   --gray-12: #09090b;
@@ -92,7 +106,7 @@
   --success-700: #15803d;
   --success-800: #166534;
   --success-900: #14532d;
-  --success-fg: #0a0a0b;
+  --success-fg: #ffffff;
 
   --info-50: #eff6ff;
   --info-100: #dbeafe;
@@ -116,102 +130,106 @@
   --warning-700: #b45309;
   --warning-800: #92400e;
   --warning-900: #78350f;
-  --warning-fg: #0a0a0b;
+  --warning-fg: #ffffff;
 
-  --border: oklch(0.91 0.005 265);
-  --input: oklch(0.91 0.005 265);
-  --ring: oklch(0.65 0.005 265);
+  --border:        #e4e3e0;   /* subtle separator — table rows, card-head divider */
+  --border-strong: #cbcac6;   /* chassis border — card outer, badge, button-outline */
+  --input:         #e4e3e0;
+  --ring:          #1b1b1a;   /* ink focus ring */
 
-  /* Chart palette — lead with primary + muted, then amber / green / coral */
+  /* Chart palette — amber leads, ink/neutral pair, then semantic family */
   --chart-1: var(--primary);
   --chart-2: var(--muted-foreground);
-  --chart-3: oklch(0.78 0.15 92);
-  --chart-4: oklch(0.58 0.12 145);
-  --chart-5: oklch(0.7 0.13 28);
-  --chart-6: oklch(0.64 0.13 225);
+  --chart-3: var(--amber-200);
+  --chart-4: var(--success);
+  --chart-5: var(--warning);
+  --chart-6: var(--info);
 
   /* Sidebar */
-  --sidebar: var(--background);
-  --sidebar-foreground: var(--foreground);
-  --sidebar-expanded: var(--background-secondary);
-  --sidebar-primary: var(--primary);
+  --sidebar:                    var(--background);
+  --sidebar-foreground:         var(--foreground);
+  --sidebar-expanded:           var(--background-secondary);
+  --sidebar-primary:            var(--primary);
   --sidebar-primary-foreground: var(--primary-foreground);
-  --sidebar-accent: var(--accent);
-  --sidebar-accent-foreground: var(--accent-foreground);
-  --sidebar-border: var(--border);
-  --sidebar-ring: var(--ring);
+  --sidebar-accent:             var(--accent);
+  --sidebar-accent-foreground:  var(--accent-foreground);
+  --sidebar-border:             var(--border);
+  --sidebar-ring:               var(--ring);
 
-  /* Graph paper background */
-  --grid-color: oklch(0.91 0.003 265 / 50%);
-  --grid-size: 24px;
+  /* Graph paper background — faint hex tessellation */
+  --grid-color: rgba(27, 27, 26, 0.05);
+  --grid-size:  24px;
 
   /* Mono label voice */
-  --label-color: oklch(0.55 0.01 265);
-  --label-size: 0.75rem;
+  --label-color: var(--muted-foreground);
+  --label-size:  0.75rem;
 
-  /* Anty character glow — soft pastel halo behind the brand character */
-  --anty-glow-inner: linear-gradient(90deg, #c5d4ff 0%, #e0c5ff 100%);
-  --anty-glow-outer: linear-gradient(90deg, #d5e2ff 0%, #eed5ff 100%);
+  /* Anty character glow — amber (purple retired). Hotter than ambient
+     UI amber so the mascot still reads as "alive" in a warm-monochrome system. */
+  --anty-glow-inner: radial-gradient(circle, #f2b022 0%, transparent 66%);
+  --anty-glow-outer: radial-gradient(circle, #ecbc4a 0%, transparent 72%);
 }
 
 .dark {
-  --background: oklch(0.135 0.005 275);
-  --background-secondary: oklch(0.11 0.005 275);
-  --foreground: oklch(0.91 0.005 265);
+  /* neutral near-black — modeled on the prototype's protobar palette */
+  --background:           #121212;
+  --background-secondary: #1a1a1a;
+  --foreground:           #ededec;
 
-  --card: oklch(0.185 0.005 275);
-  --card-foreground: oklch(0.91 0.005 265);
+  --card:            #1c1c1c;
+  --card-foreground: #ededec;
 
-  --popover: oklch(0.185 0.005 275);
-  --popover-foreground: oklch(0.91 0.005 265);
+  --popover:            #1c1c1c;
+  --popover-foreground: #ededec;
 
-  --primary: oklch(0.7 0.15 285);
-  --primary-foreground: oklch(0.135 0.005 275);
+  --amber-400: #ecb52e;   /* a touch brighter on dark */
+  --primary:            var(--amber-400);
+  --primary-foreground: #1c1407;
 
-  --secondary: oklch(0.22 0.005 275);
-  --secondary-foreground: oklch(0.91 0.005 265);
+  --secondary:            #1a1a1a;
+  --secondary-foreground: #ededec;
 
-  --muted: oklch(0.22 0.005 275);
-  --muted-foreground: oklch(0.65 0.005 265);
+  --muted:            #1a1a1a;
+  --muted-foreground: #b2b1ad;
 
-  --accent: oklch(0.22 0.005 275);
-  --accent-foreground: oklch(0.91 0.005 265);
+  --accent:            #1a1a1a;
+  --accent-foreground: #ededec;
 
-  --destructive: oklch(0.704 0.191 22.216);
-  --destructive-foreground: oklch(0.985 0 0);
+  --destructive:            #d96a61;
+  --destructive-foreground: #ffffff;
 
-  --success: oklch(0.72 0.17 150);
-  --success-foreground: oklch(0.135 0.005 275);
+  --success:            #6fa362;
+  --success-foreground: #121212;
 
-  --warning: oklch(0.82 0.16 75);
-  --warning-foreground: oklch(0.135 0.005 275);
+  --warning:            #e8854a;
+  --warning-foreground: #121212;
 
-  --info: oklch(0.72 0.13 230);
-  --info-foreground: oklch(0.135 0.005 275);
+  --info:            #6fa0cf;
+  --info-foreground: #121212;
 
   --searchaf-1: #0a0a0a;
   --searchaf-2: #0f0f0f;
   --searchaf-3: #131313;
-  --searchaf-4: #262626;
-  --searchaf-5: #3a3a3a;
-  --searchaf-6: #525252;
-  --searchaf-7: #737373;
-  --searchaf-8: #a1a1a1;
-  --searchaf-9: #e5e5e5;
-  --searchaf-10: #f5f5f5;
-  --searchaf-11: #fafafa;
+  --searchaf-4: #1c1c1c;
+  --searchaf-5: #2c2c2c;
+  --searchaf-6: #444443;
+  --searchaf-7: #7a7975;
+  --searchaf-8: #b2b1ad;
+  --searchaf-9: #d4d4d2;
+  --searchaf-10: #ededec;
+  --searchaf-11: #f5f5f5;
   --searchaf-12: #ffffff;
 
   --gray-1: #0a0a0a;
   --gray-2: #0f0f0f;
   --gray-3: #131313;
-  --gray-4: #262626;
-  --gray-5: #3a3a3a;
-  --gray-6: #525252;
-  --gray-7: #737373;
-  --gray-8: #a1a1a1;
-  --gray-9: #d4d4d4;
-  --gray-10: #e5e5e5;
+  --gray-4: #1c1c1c;
+  --gray-5: #2c2c2c;
+  --gray-6: #444443;
+  --gray-7: #7a7975;
+  --gray-8: #b2b1ad;
+  --gray-9: #d4d4d2;
+  --gray-10: #ededec;
   --gray-11: #f5f5f5;
   --gray-12: #ffffff;
 
@@ -261,33 +279,34 @@
   --warning-700: #fcd34d;
   --warning-800: #fde68a;
   --warning-900: #fef3c7;
-  --warning-fg: #0a0a0b;
+  --warning-fg: #ffffff;
 
-  --border: oklch(1 0 0 / 8%);
-  --input: oklch(1 0 0 / 12%);
-  --ring: oklch(0.5 0.005 265);
+  --border:        #2c2c2c;   /* subtle separator — table rows, card-head divider */
+  --border-strong: #444443;   /* chassis border — card outer, badge, button-outline */
+  --input:         #2c2c2c;
+  --ring:          #ededec;   /* ink focus ring (light ink on dark) */
 
   --chart-1: var(--primary);
   --chart-2: var(--muted-foreground);
-  --chart-3: #fadf5a;
-  --chart-4: #477f4f;
-  --chart-5: #f7978d;
-  --chart-6: oklch(0.64 0.13 225);
+  --chart-3: #f3d488;
+  --chart-4: var(--success);
+  --chart-5: var(--warning);
+  --chart-6: var(--info);
 
-  --sidebar: var(--background);
-  --sidebar-foreground: var(--foreground);
-  --sidebar-expanded: var(--background-secondary);
-  --sidebar-primary: var(--primary);
+  --sidebar:                    var(--background);
+  --sidebar-foreground:         var(--foreground);
+  --sidebar-expanded:           var(--background-secondary);
+  --sidebar-primary:            var(--primary);
   --sidebar-primary-foreground: var(--primary-foreground);
-  --sidebar-accent: var(--accent);
-  --sidebar-accent-foreground: var(--accent-foreground);
-  --sidebar-border: var(--border);
-  --sidebar-ring: var(--ring);
+  --sidebar-accent:             var(--accent);
+  --sidebar-accent-foreground:  var(--accent-foreground);
+  --sidebar-border:             var(--border);
+  --sidebar-ring:               var(--ring);
 
-  --grid-color: oklch(1 0 0 / 4%);
-  --label-color: oklch(0.55 0.005 265);
+  --grid-color: rgba(236, 235, 234, 0.045);
+  --label-color: var(--muted-foreground);
 
-  /* Dark-mode glow: saturated mid-purple, dimmer so it doesn't white-wash on dark bg */
-  --anty-glow-inner: linear-gradient(90deg, oklch(0.45 0.15 260) 0%, oklch(0.45 0.13 305) 100%);
-  --anty-glow-outer: linear-gradient(90deg, oklch(0.35 0.12 260) 0%, oklch(0.35 0.1 305) 100%);
+  /* Amber glow on dark — hotter still so it pops against near-black */
+  --anty-glow-inner: radial-gradient(circle, #ffc534 0%, transparent 64%);
+  --anty-glow-outer: radial-gradient(circle, #ecb52e 0%, transparent 70%);
 }

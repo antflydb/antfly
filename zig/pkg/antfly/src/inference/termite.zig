@@ -38,6 +38,7 @@ pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
     base_url: []const u8,
+    auth_header: ?[2][]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -48,7 +49,29 @@ pub const Provider = struct {
     }
 
     pub fn deinit(self: *Provider) void {
-        _ = self;
+        if (self.auth_header) |h| {
+            self.allocator.free(h[1]);
+            self.auth_header = null;
+        }
+    }
+
+    pub fn setApiKey(self: *Provider, api_key: []const u8) !void {
+        const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
+        defer self.allocator.free(auth_header);
+        try self.setAuthorizationHeader(auth_header);
+    }
+
+    pub fn setAuthorizationHeader(self: *Provider, auth_header: []const u8) !void {
+        if (self.auth_header) |h| {
+            if (std.mem.eql(u8, h[1], auth_header)) return;
+            self.allocator.free(h[1]);
+        }
+        self.auth_header = .{ "Authorization", try self.allocator.dupe(u8, auth_header) };
+    }
+
+    fn authHeaders(self: *const Provider) ?[]const [2][]const u8 {
+        if (self.auth_header) |*h| return @as(*const [1][2][]const u8, h);
+        return null;
     }
 
     pub fn embedder(self: *Provider) inference.Embedder {
@@ -83,7 +106,7 @@ pub const Provider = struct {
             .input = .{ .array = input_array },
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         defer resp.deinit();
 
         if (!resp.ok()) {
@@ -203,7 +226,7 @@ pub const Provider = struct {
             .input = input,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         defer resp.deinit();
 
         if (!resp.ok()) {
@@ -251,14 +274,6 @@ pub const Provider = struct {
     fn generateImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
-        const Message = struct {
-            role: []const u8,
-            content: []const u8,
-        };
-        const Request = struct {
-            model: []const u8,
-            messages: []const Message,
-        };
         const Response = struct {
             choices: []const struct {
                 message: struct {
@@ -267,28 +282,13 @@ pub const Provider = struct {
             },
         };
 
-        const api_messages = try alloc.alloc(Message, messages.len);
-        defer alloc.free(api_messages);
-        for (messages, 0..) |msg, i| {
-            api_messages[i] = .{
-                .role = switch (msg.role) {
-                    .system => "system",
-                    .user => "user",
-                    .assistant => "assistant",
-                },
-                .content = msg.content,
-            };
-        }
-
         const url = try std.fmt.allocPrint(self.allocator, "{s}/generate", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, Request{
-            .model = model,
-            .messages = api_messages,
-        });
+        const json_body = try inference.chatRequestJsonAlloc(self.allocator, model, messages, .termite_native);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
             .json = json_body,
+            .headers = self.authHeaders(),
             .timeout_ms = 300_000,
         });
         defer resp.deinit();
@@ -327,7 +327,7 @@ pub const Provider = struct {
             .prompts = documents,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         defer resp.deinit();
         if (!resp.ok()) return error.RerankRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
@@ -422,7 +422,7 @@ test "termite generate round trip" {
             defer provider.deinit();
 
             var gen = provider.generator();
-            var result = gen.generate(a, "test-model", &.{.{ .role = .user, .content = "Hello" }}) catch |e| {
+            var result = gen.generate(a, "test-model", &.{.{ .role = .user, .content = .{ .text = "Hello" } }}) catch |e| {
                 err_out.* = e;
                 return;
             };

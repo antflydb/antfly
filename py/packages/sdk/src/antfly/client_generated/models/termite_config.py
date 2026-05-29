@@ -23,6 +23,7 @@ class TermiteConfig:
     """
     Attributes:
         api_url (str): URL of the Termite embedding/chunking service Example: http://localhost:8080.
+        api_key (str | Unset): API key used when calling an authenticated shared Termite API.
         models_dir (str | Unset): Base directory containing model subdirectories. Termite auto-discovers models from:
             - `{models_dir}/embedders/` - Embedding models (ONNX)
             - `{models_dir}/chunkers/` - Chunking models (ONNX)
@@ -117,6 +118,7 @@ class TermiteConfig:
     """
 
     api_url: str
+    api_key: str | Unset = UNSET
     models_dir: str | Unset = UNSET
     content_security: TermiteContentSecurityConfig | Unset = UNSET
     s3_credentials: TermiteCredentials | Unset = UNSET
@@ -136,6 +138,8 @@ class TermiteConfig:
 
     def to_dict(self) -> dict[str, Any]:
         api_url = self.api_url
+
+        api_key = self.api_key
 
         models_dir = self.models_dir
 
@@ -186,6 +190,8 @@ class TermiteConfig:
                 "api_url": api_url,
             }
         )
+        if api_key is not UNSET:
+            field_dict["api_key"] = api_key
         if models_dir is not UNSET:
             field_dict["models_dir"] = models_dir
         if content_security is not UNSET:
@@ -228,6 +234,8 @@ class TermiteConfig:
 
         d = dict(src_dict)
         api_url = d.pop("api_url")
+
+        api_key = d.pop("api_key", UNSET)
 
         models_dir = d.pop("models_dir", UNSET)
 
@@ -281,6 +289,7 @@ class TermiteConfig:
 
         termite_config = cls(
             api_url=api_url,
+            api_key=api_key,
             models_dir=models_dir,
             content_security=content_security,
             s3_credentials=s3_credentials,

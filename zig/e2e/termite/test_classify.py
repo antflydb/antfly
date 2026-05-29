@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for /api/classify endpoint.
+"""Tests for canonical /api/extract classification extraction.
 
 Matches Go termite's classifier_test.go patterns.
 """

@@ -95,6 +95,8 @@ def walk_refs(value: object, rename_schema) -> object:
                 prefix = "#/components/schemas/"
                 if child.startswith(prefix):
                     out[key] = prefix + rename_schema(child[len(prefix) :])
+                elif child.startswith("../ai/"):
+                    out[key] = "specs/openapi/ai/" + child[len("../ai/") :]
                 else:
                     out[key] = child
                 continue
@@ -164,7 +166,7 @@ def join_specs() -> dict:
         seen_tags.add(name)
         tags.append(copy.deepcopy(item))
 
-    return {
+    joined = {
         "openapi": "3.0.3",
         "info": {
             "title": "Antfly Public API",
@@ -204,6 +206,8 @@ def join_specs() -> dict:
             },
         ],
     }
+    joiner = load_join_openapi().load_shared_joiner()
+    return joiner.bundle_joined_spec(joined)
 
 
 def dump_yaml(data: dict, output: Path) -> None:

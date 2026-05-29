@@ -363,6 +363,14 @@ test "embedded api round-trips batch lookup scan and search over memory-backed d
     defer alloc.free(query_json);
     try std.testing.expect(std.mem.indexOf(u8, query_json, "\"responses\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_json, "\"doc:a\"") != null);
+    try std.testing.expectError(error.InvalidQueryRequest, api.searchJson(
+        alloc,
+        "{\"query\":{\"match_all\":{}},\"native_doc_id_constraints\":{\"include_doc_ids\":[\"doc:a\"]}}",
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, api.searchJson(
+        alloc,
+        "{\"query\":{\"match_all\":{}},\"_identity_read_generation\":1}",
+    ));
 
     const pending_json = try api.pendingWorkStatsJson(alloc);
     defer alloc.free(pending_json);
