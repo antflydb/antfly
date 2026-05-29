@@ -116,9 +116,11 @@ pub const SegmentEntry = struct {
     id: u64,
     data: SegmentData,
     reader: segment_mod.SegmentReader,
+    layout_stats: segment_mod.SegmentLayoutStats = .{},
     deleted: ?roaring.RoaringBitmap,
 
     pub fn deinit(self: *SegmentEntry) void {
+        self.data.madviseDiscardCleanPages();
         self.reader.deinit();
         if (self.deleted) |*d| {
             var del = d.*;
@@ -134,6 +136,11 @@ pub const SegmentEntry = struct {
             return self.reader.doc_count -| del_count;
         }
         return self.reader.doc_count;
+    }
+
+    pub fn layoutStats(self: *const SegmentEntry, detailed_inverted: bool) segment_mod.SegmentLayoutStats {
+        if (!detailed_inverted) return self.layout_stats;
+        return self.reader.layoutStatsWithInvertedDetails(true);
     }
 };
 
@@ -690,6 +697,7 @@ pub const IndexWriter = struct {
             .id = seg_id,
             .data = data,
             .reader = reader,
+            .layout_stats = reader.layoutStats(),
             .deleted = null,
         };
 
@@ -717,6 +725,7 @@ pub const IndexWriter = struct {
             }
         }
         for (new_segments) |*seg| seg.data.madviseDiscardCleanPages();
+        for (retired) |*seg| seg.data.madviseDiscardCleanPages();
 
         const new_snap = try self.alloc.create(IndexSnapshot);
         new_snap.* = .{
@@ -810,6 +819,7 @@ pub const IndexWriter = struct {
             .id = seg_id,
             .data = owned.?,
             .reader = reader,
+            .layout_stats = reader.layoutStats(),
             .deleted = null,
         };
 
@@ -937,6 +947,7 @@ pub const IndexWriter = struct {
                 .id = replacement.id,
                 .data = replacement.data,
                 .reader = replacement_readers[i],
+                .layout_stats = replacement_readers[i].layoutStats(),
                 .deleted = null,
             };
             idx += 1;

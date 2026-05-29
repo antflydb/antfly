@@ -753,6 +753,13 @@ pub const IndexManager = struct {
             alloc.free(self.index_name);
             self.* = undefined;
         }
+
+        fn discardSourceCleanPages(self: *const TextMergeTask) void {
+            for (self.merge_indices) |seg_idx| {
+                if (seg_idx >= self.snapshot.segments.len) continue;
+                self.snapshot.segments[seg_idx].data.madviseDiscardCleanPages();
+            }
+        }
     };
 
     pub const TextMergeResult = struct {
@@ -1710,7 +1717,8 @@ pub const IndexManager = struct {
                     .mmap => stats.text_mmap_segment_bytes +|= bytes,
                     .heap => stats.text_heap_segment_bytes +|= bytes,
                 }
-                const layout = seg.reader.layoutStatsWithInvertedDetails(detailed_inverted_layout);
+                const layout = seg.layoutStats(detailed_inverted_layout);
+                if (detailed_inverted_layout) seg.data.madviseDiscardCleanPages();
                 stats.stored_fields_bytes +|= layout.stored_fields_bytes;
                 stats.inverted_text_bytes +|= layout.inverted_text_bytes;
                 stats.inverted_header_bytes +|= layout.inverted_header_bytes;
@@ -5711,6 +5719,7 @@ pub const IndexManager = struct {
     }
 
     pub fn executeTextMergeTask(alloc: Allocator, task: *const TextMergeTask) !TextMergeResult {
+        defer task.discardSourceCleanPages();
         if (task.persistent.prepareMergedSegmentToFile(task.snapshot, task.merge_indices)) |prepared| {
             return .{
                 .prepared_segments = prepared,
