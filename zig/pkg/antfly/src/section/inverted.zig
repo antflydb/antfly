@@ -33,23 +33,27 @@ const bloom = @import("bloom");
 // Wire format versions
 // ============================================================================
 //
-//   v9: FST + sparse block-max metadata + packed per-chunk doc/freq/norm columns
+//   v10: v9 + sparse skip data for long posting lists
 //
-// This project is pre-release; writers emit the current v9 format.
+// This project is pre-release; writers emit the current v10 format.
 
-const wire_version_v9: u8 = 9;
+const wire_version_current: u8 = 10;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4; // 29 bytes
 const v7_chunk_meta_size: usize = 44;
+const postings_header_size: usize = 24;
+const postings_skip_record_size: usize = 8;
+const postings_skip_stride_chunks: usize = 16;
+const postings_skip_min_chunks: usize = postings_skip_stride_chunks * 2;
 
 /// Skip building a per-segment bloom filter when there are fewer terms than this.
 /// FST traversal is already cheap for tiny term sets, and the filter would
 /// dominate the section size.
 const bloom_min_terms: usize = 64;
 
-/// Write the 29-byte v9 section header into `dst[0..v7_header_size]`. Shared
+/// Write the 29-byte current section header into `dst[0..v7_header_size]`. Shared
 /// between `InvertedIndexBuilder.build` and the merger's
 /// `assembleMergedSection` so the wire layout lives in exactly one place.
-fn writeV9Header(
+fn writeCurrentHeader(
     dst: []u8,
     doc_count: u32,
     total_field_len: u64,
@@ -59,7 +63,7 @@ fn writeV9Header(
 ) void {
     std.debug.assert(dst.len >= v7_header_size);
     @memcpy(dst[0..4], "INVT");
-    dst[4] = wire_version_v9;
+    dst[4] = wire_version_current;
     dst[5..9].* = @bitCast(std.mem.nativeToLittle(u32, doc_count));
     dst[9..17].* = @bitCast(std.mem.nativeToLittle(u64, total_field_len));
     dst[17..21].* = @bitCast(std.mem.nativeToLittle(u32, chunk_size));
@@ -115,6 +119,8 @@ fn termBloomHashes(term: []const u8) struct { h1: u64, h2: u64 } {
     h2 ^= h2 >> 31;
     return .{ .h1 = h1, .h2 = h2 };
 }
+
+const TermBloomHash = struct { h1: u64, h2: u64 };
 
 /// Decode a u32 LEB128 varint at `cursor`. Advances `cursor` past the decoded
 /// bytes. Returns `error.Truncated` if the buffer ends mid-varint.
@@ -244,7 +250,7 @@ pub const InvertedIndexBuilder = struct {
     ///   - General: postings offset within postings_data
     ///   - 1-hit: packed docNum + normBits (for single-doc, freq=1 terms)
     ///
-    /// Postings per term, v9:
+    /// Postings per term, v10:
     ///   [doc_freq: u32 LE]
     ///   [stored_chunks: u32 LE]
     ///   [block_max_base_chunk: u32 LE]
@@ -255,7 +261,7 @@ pub const InvertedIndexBuilder = struct {
     ///   [packed per-chunk doc-delta/freqHasLocs/norm payloads]
     ///   [positions: varint count + varint deltas per doc]
     ///
-    /// v9 stores postings first, then an optional per-segment term bloom filter,
+    /// v10 stores postings first, then an optional per-segment term bloom filter,
     /// then the FST. `bloom_len` in the header tells the reader how many bytes
     /// to skip past postings before the FST starts.
     pub fn build(self: *InvertedIndexBuilder) ![]u8 {
@@ -368,7 +374,7 @@ pub const InvertedIndexBuilder = struct {
         }
         try output.appendSlice(output_alloc, fst_data);
 
-        writeV9Header(
+        writeCurrentHeader(
             output.items[0..v7_header_size],
             self.doc_count,
             self.total_field_len,
@@ -410,6 +416,7 @@ const PostingSerializeScratch = struct {
     block_max: std.ArrayListUnmanaged(u8) = .empty,
     payload: std.ArrayListUnmanaged(u8) = .empty,
     positions: std.ArrayListUnmanaged(u8) = .empty,
+    skip: std.ArrayListUnmanaged(u8) = .empty,
     svb_control: std.ArrayListUnmanaged(u8) = .empty,
     svb_data: std.ArrayListUnmanaged(u8) = .empty,
 
@@ -421,6 +428,7 @@ const PostingSerializeScratch = struct {
         self.block_max.clearRetainingCapacity();
         self.payload.clearRetainingCapacity();
         self.positions.clearRetainingCapacity();
+        self.skip.clearRetainingCapacity();
         self.svb_control.clearRetainingCapacity();
         self.svb_data.clearRetainingCapacity();
     }
@@ -433,10 +441,23 @@ const PostingSerializeScratch = struct {
         self.block_max.deinit(alloc);
         self.payload.deinit(alloc);
         self.positions.deinit(alloc);
+        self.skip.deinit(alloc);
         self.svb_control.deinit(alloc);
         self.svb_data.deinit(alloc);
     }
 };
+
+fn appendPostingSkipData(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), chunks: []const V7ChunkMeta) !void {
+    out.clearRetainingCapacity();
+    if (chunks.len < postings_skip_min_chunks) return;
+
+    var chunk_index: usize = postings_skip_stride_chunks;
+    while (chunk_index < chunks.len) : (chunk_index += postings_skip_stride_chunks) {
+        const boundary = chunks[chunk_index - 1];
+        try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, boundary.max_doc))));
+        try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(chunk_index))))));
+    }
+}
 
 fn writeChunkMetaV7(dst: []u8, meta: V7ChunkMeta) void {
     std.debug.assert(dst.len >= v7_chunk_meta_size);
@@ -737,8 +758,10 @@ const PostingAccumulator = struct {
             doc_start = doc_end;
         }
 
+        try appendPostingSkipData(alloc, &scratch.skip, scratch.chunks.items);
+
         const term_start = out.items.len;
-        const total_len = 20 + scratch.block_max.items.len + scratch.chunks.items.len * v7_chunk_meta_size + scratch.payload.items.len + scratch.positions.items.len;
+        const total_len = postings_header_size + scratch.block_max.items.len + scratch.chunks.items.len * v7_chunk_meta_size + scratch.payload.items.len + scratch.positions.items.len + scratch.skip.items.len;
         try out.ensureUnusedCapacity(alloc, total_len);
         out.items.len += total_len;
         const dst = out.items[term_start..][0..total_len];
@@ -747,7 +770,8 @@ const PostingAccumulator = struct {
         dst[8..12].* = @bitCast(std.mem.nativeToLittle(u32, first_chunk_id));
         dst[12..16].* = @bitCast(std.mem.nativeToLittle(u32, num_doc_chunks));
         dst[16..20].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(scratch.positions.items.len))));
-        var dst_pos: usize = 20;
+        dst[20..24].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(scratch.skip.items.len))));
+        var dst_pos: usize = postings_header_size;
         @memcpy(dst[dst_pos..][0..scratch.block_max.items.len], scratch.block_max.items);
         dst_pos += scratch.block_max.items.len;
         for (scratch.chunks.items) |chunk| {
@@ -757,6 +781,8 @@ const PostingAccumulator = struct {
         @memcpy(dst[dst_pos..][0..scratch.payload.items.len], scratch.payload.items);
         dst_pos += scratch.payload.items.len;
         @memcpy(dst[dst_pos..][0..scratch.positions.items.len], scratch.positions.items);
+        dst_pos += scratch.positions.items.len;
+        @memcpy(dst[dst_pos..][0..scratch.skip.items.len], scratch.skip.items);
     }
 };
 
@@ -764,7 +790,7 @@ const PostingAccumulator = struct {
 // Index reader (query path)
 // ============================================================================
 
-/// Reads a serialized inverted index section (v9, with Vellum FST).
+/// Reads a serialized inverted index section (v10, with Vellum FST).
 pub const InvertedIndexReader = struct {
     alloc: Allocator,
     data: []const u8,
@@ -782,7 +808,7 @@ pub const InvertedIndexReader = struct {
         if (data.len < v7_header_size) return error.InvalidData;
         if (!std.mem.eql(u8, data[0..4], "INVT")) return error.InvalidMagic;
         const version = data[4];
-        if (version != wire_version_v9) return error.UnsupportedVersion;
+        if (version != wire_version_current) return error.UnsupportedVersion;
 
         const doc_count = std.mem.readInt(u32, data[5..9], .little);
         const total_field_len = std.mem.readInt(u64, data[9..17], .little);
@@ -829,6 +855,7 @@ pub const InvertedIndexReader = struct {
         chunk_meta_bytes: u64 = 0,
         postings_payload_bytes: u64 = 0,
         positions_bytes: u64 = 0,
+        skip_bytes: u64 = 0,
         one_hit_terms: u64 = 0,
         postings_terms: u64 = 0,
     };
@@ -853,7 +880,7 @@ pub const InvertedIndexReader = struct {
                 .one_hit => stats.one_hit_terms +|= 1,
                 .postings => |postings| {
                     stats.postings_terms +|= 1;
-                    stats.postings_header_bytes +|= 20;
+                    stats.postings_header_bytes +|= postings_header_size;
                     if (postings.block_max) |block_max_info| {
                         stats.block_max_bytes +|= @intCast(block_max_info.meta.len);
                     }
@@ -861,6 +888,9 @@ pub const InvertedIndexReader = struct {
                     stats.postings_payload_bytes +|= @intCast(postings.payload_data.len);
                     if (postings.positions_data) |positions_data| {
                         stats.positions_bytes +|= @intCast(positions_data.len);
+                    }
+                    if (postings.skip_data) |skip_data| {
+                        stats.skip_bytes +|= @intCast(skip_data.len);
                     }
                 },
             }
@@ -925,7 +955,8 @@ pub const InvertedIndexReader = struct {
         const block_max_base_chunk = std.mem.readInt(u32, self.data[base + 8 ..][0..4], .little);
         const doc_chunks = std.mem.readInt(u32, self.data[base + 12 ..][0..4], .little);
         const positions_len = std.mem.readInt(u32, self.data[base + 16 ..][0..4], .little);
-        const block_max_start = base + 20;
+        const skip_len = std.mem.readInt(u32, self.data[base + 20 ..][0..4], .little);
+        const block_max_start = base + postings_header_size;
         const block_max_len = @as(usize, doc_chunks) * 6;
         const chunk_meta_start = block_max_start + block_max_len;
         const chunk_meta_len = @as(usize, stored_chunks) * v7_chunk_meta_size;
@@ -940,7 +971,8 @@ pub const InvertedIndexReader = struct {
             payload_len = @max(payload_len, @as(usize, meta.freq_data_off) + meta.freq_data_len);
         }
         const positions_start = payload_start + payload_len;
-        const after_postings = positions_start + positions_len;
+        const skip_start = positions_start + positions_len;
+        const after_postings = skip_start + skip_len;
 
         return .{
             .doc_freq = doc_freq,
@@ -955,6 +987,7 @@ pub const InvertedIndexReader = struct {
             .chunk_meta_data = self.data[chunk_meta_start..][0..chunk_meta_len],
             .payload_data = self.data[payload_start..][0..payload_len],
             .positions_data = if (positions_len > 0) self.data[positions_start..][0..positions_len] else null,
+            .skip_data = if (skip_len > 0) self.data[skip_start..][0..skip_len] else null,
         };
     }
 };
@@ -1061,6 +1094,7 @@ pub const TermPostings = struct {
     chunk_meta_data: []const u8,
     payload_data: []const u8,
     positions_data: ?[]const u8 = null,
+    skip_data: ?[]const u8 = null,
 
     /// Decode document IDs into a roaring bitmap for callers that need set operations.
     pub fn docBitmap(self: *const TermPostings, alloc: Allocator) !roaring.RoaringBitmap {
@@ -1084,6 +1118,7 @@ pub const TermPostings = struct {
             .payload_data = self.payload_data,
             .version = self.version,
             .positions_data = self.positions_data,
+            .skip_data = self.skip_data,
         };
     }
 };
@@ -1097,8 +1132,9 @@ pub const PostingsIterator = struct {
     current_chunk_index: usize = std.math.maxInt(usize),
     next_chunk_index: usize = 0,
     chunk_doc_pos: usize = 0,
-    version: u8 = wire_version_v9,
+    version: u8 = wire_version_current,
     positions_data: ?[]const u8 = null,
+    skip_data: ?[]const u8 = null,
     positions_cursor: usize = 0,
     doc_values: std.ArrayListUnmanaged(u32) = .empty,
     freq_norm_values: std.ArrayListUnmanaged(u32) = .empty,
@@ -1142,9 +1178,57 @@ pub const PostingsIterator = struct {
         return readChunkMetaV7(self.chunk_meta_data[index * v7_chunk_meta_size ..][0..v7_chunk_meta_size]);
     }
 
+    fn skipRecordCount(self: *const PostingsIterator) usize {
+        const data = self.skip_data orelse return 0;
+        return data.len / postings_skip_record_size;
+    }
+
+    fn skipRecord(self: *const PostingsIterator, index: usize) struct { max_doc: u32, chunk_index: usize } {
+        const data = self.skip_data.?;
+        const base = index * postings_skip_record_size;
+        return .{
+            .max_doc = std.mem.readInt(u32, data[base..][0..4], .little),
+            .chunk_index = @intCast(std.mem.readInt(u32, data[base + 4 ..][0..4], .little)),
+        };
+    }
+
+    fn skipWindowForTarget(self: *const PostingsIterator, target: u32) struct { lo: usize, hi: usize } {
+        const count = self.skipRecordCount();
+        if (count == 0) return .{ .lo = self.next_chunk_index, .hi = self.chunkCount() };
+
+        var lo_record: usize = 0;
+        var hi_record: usize = count;
+        while (lo_record < hi_record) {
+            const mid = lo_record + (hi_record - lo_record) / 2;
+            const record = self.skipRecord(mid);
+            if (record.max_doc < target) {
+                lo_record = mid + 1;
+            } else {
+                hi_record = mid;
+            }
+        }
+
+        const start_record = if (lo_record == 0) null else lo_record - 1;
+        const start = if (start_record) |idx| self.skipRecord(idx).chunk_index else self.next_chunk_index;
+        const end = if (lo_record < count) self.skipRecord(lo_record).chunk_index else self.chunkCount();
+        return .{
+            .lo = @max(self.next_chunk_index, start),
+            .hi = @min(end, self.chunkCount()),
+        };
+    }
+
     fn nextChunkIndexForTarget(self: *const PostingsIterator, target: u32) usize {
-        var lo = self.next_chunk_index;
-        var hi = self.chunkCount();
+        const window = self.skipWindowForTarget(target);
+        var lo = window.lo;
+        var hi = window.hi;
+        if (lo >= hi) return lo;
+        if (self.skipRecordCount() > 0) {
+            while (lo < hi) : (lo += 1) {
+                const meta = self.chunkMeta(lo);
+                if (meta.max_doc >= target) return lo;
+            }
+            return hi;
+        }
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
             const meta = self.chunkMeta(mid);
@@ -1598,7 +1682,7 @@ pub const IndexConfig = struct {
     /// Documents per chunk for freq/norm encoding.
     chunk_size: u32 = 1024,
     /// Build a per-segment term bloom filter that lets readers reject absent
-    /// terms before walking the FST. Defaults on for new (v6) segments and is
+    /// terms before walking the FST. Defaults on for current segments and is
     /// auto-skipped when the term count falls below `bloom_min_terms`.
     enable_bloom: bool = true,
     /// Bloom filter sizing. 10 bits/key with 4 hashes → ~1% false-positive rate
@@ -1745,6 +1829,9 @@ pub fn mergeInvertedSectionSlotsWithDeletes(
     var total_field_len: u64 = 0;
     var serialize_scratch = PostingSerializeScratch{};
     defer serialize_scratch.deinit(alloc);
+    var bloom_hashes = std.ArrayListUnmanaged(TermBloomHash).empty;
+    defer bloom_hashes.deinit(alloc);
+    const collect_bloom_hashes = config.enable_bloom;
 
     while (true) {
         const min_term = findMinCurrentTerm(current_entries) orelse break;
@@ -1766,11 +1853,15 @@ pub fn mergeInvertedSectionSlotsWithDeletes(
             }
 
             if (acc.doc_ids.items.len == 0) continue;
+            if (collect_bloom_hashes) {
+                const h = termBloomHashes(merged_term);
+                try bloom_hashes.append(alloc, .{ .h1 = h.h1, .h2 = h.h2 });
+            }
             try appendMergedTerm(alloc, &fst_builder, &postings_data, &serialize_scratch, merged_term, &acc, config, running_offset);
         }
     }
 
-    return assembleMergedSection(alloc, running_offset, total_field_len, config.chunk_size, postings_data.items, try fst_builder.finish(), config);
+    return assembleMergedSection(alloc, running_offset, total_field_len, config.chunk_size, postings_data.items, try fst_builder.finish(), config, bloom_hashes.items);
 }
 
 fn nextTermIteratorEntry(term_iters: []TermIterator, idx: usize) !?TermIterator.Entry {
@@ -1888,48 +1979,28 @@ fn assembleMergedSection(
     postings_data: []const u8,
     fst_data: []u8,
     config: IndexConfig,
+    term_hashes: []const TermBloomHash,
 ) ![]u8 {
     defer alloc.free(fst_data);
 
-    // Re-derive the term set from the just-built FST so we can populate a
-    // bloom filter without threading hash collection through every merge
-    // helper. Single-pass: collect (h1, h2) pairs as we walk, then size and
-    // populate the bloom from the collected hashes. The transient hash
-    // buffer costs ~16 bytes/term — small even for million-term segments —
-    // and replaces the previous count + repeat-walk pattern.
     var bloom_bytes: []const u8 = &.{};
     defer if (bloom_bytes.len > 0) alloc.free(@constCast(bloom_bytes));
-    if (config.enable_bloom) {
-        var fst = try vellum.FST.load(fst_data);
-        var iter = try fst.iterator(alloc, null, null);
-        defer iter.deinit();
+    if (config.enable_bloom and term_hashes.len >= bloom_min_terms) {
+        var builder = try bloom.Builder.init(alloc, term_hashes.len, .{
+            .bits_per_key = config.bloom_bits_per_key,
+        });
+        errdefer builder.deinit();
 
-        const HashPair = struct { h1: u64, h2: u64 };
-        var hashes = std.ArrayListUnmanaged(HashPair).empty;
-        defer hashes.deinit(alloc);
+        for (term_hashes) |h| builder.addHashes(h.h1, h.h2);
 
-        while (try iter.nextEntry()) |entry| {
-            const h = termBloomHashes(entry.key);
-            try hashes.append(alloc, .{ .h1 = h.h1, .h2 = h.h2 });
-        }
-
-        if (hashes.items.len >= bloom_min_terms) {
-            var builder = try bloom.Builder.init(alloc, hashes.items.len, .{
-                .bits_per_key = config.bloom_bits_per_key,
-            });
-            errdefer builder.deinit();
-
-            for (hashes.items) |h| builder.addHashes(h.h1, h.h2);
-
-            var filter = builder.finish();
-            defer filter.deinit(alloc);
-            bloom_bytes = try filter.encodeAlloc(alloc);
-        }
+        var filter = builder.finish();
+        defer filter.deinit(alloc);
+        bloom_bytes = try filter.encodeAlloc(alloc);
     }
 
     const total = v7_header_size + postings_data.len + bloom_bytes.len + fst_data.len;
     var output = try alloc.alloc(u8, total);
-    writeV9Header(
+    writeCurrentHeader(
         output,
         doc_count,
         total_field_len,
@@ -2291,9 +2362,9 @@ test "1-hit optimization end-to-end" {
     const section = try builder.build();
     defer alloc.free(section);
 
-    // Builders emit v9 by default; the FST version-encoding (1-hit packing) is
+    // Builders emit the current version by default; the FST version-encoding (1-hit packing) is
     // unchanged from v3+, so the "unique" term still lands on the 1-hit path.
-    try std.testing.expectEqual(@as(u8, wire_version_v9), section[4]);
+    try std.testing.expectEqual(@as(u8, wire_version_current), section[4]);
 
     var reader = try InvertedIndexReader.init(alloc, section);
 
@@ -2384,7 +2455,7 @@ test "v4 block-max metadata round-trip" {
     defer alloc.free(section);
 
     var reader = try InvertedIndexReader.init(alloc, section);
-    try std.testing.expectEqual(@as(u8, wire_version_v9), reader.version);
+    try std.testing.expectEqual(@as(u8, wire_version_current), reader.version);
 
     const result = reader.lookup("term") orelse return error.TestExpectedEqual;
     switch (result) {
@@ -2410,7 +2481,7 @@ test "v4 block-max metadata round-trip" {
     }
 }
 
-test "v9 block-max metadata stores only term chunk window" {
+test "v10 block-max metadata stores only term chunk window" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
     defer builder.deinit();
@@ -2461,7 +2532,7 @@ test "positions round-trip v6 delta+varint" {
     defer alloc.free(section);
 
     var reader = try InvertedIndexReader.init(alloc, section);
-    try std.testing.expectEqual(@as(u8, wire_version_v9), reader.version);
+    try std.testing.expectEqual(@as(u8, wire_version_current), reader.version);
 
     // Check "hello" positions
     const hello = reader.lookup("hello") orelse return error.TestExpectedEqual;
@@ -2656,6 +2727,38 @@ test "PostingsIterator advanceTo skips through chunks correctly" {
     }
 }
 
+test "PostingsIterator advanceTo uses sparse skip data for long postings" {
+    const alloc = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 1 });
+    defer builder.deinit();
+
+    var doc: u32 = 0;
+    while (doc < 40) : (doc += 1) {
+        try builder.addDocument(doc, &.{
+            .{ .term = "term", .freq = doc + 1, .norm = 10 },
+        });
+    }
+
+    const section = try builder.build();
+    defer alloc.free(section);
+
+    var reader = try InvertedIndexReader.init(alloc, section);
+    const lookup = reader.lookup("term") orelse return error.TestExpectedEqual;
+    switch (lookup) {
+        .postings => |postings| {
+            try std.testing.expect(postings.skip_data != null);
+            try std.testing.expectEqual(@as(usize, 2 * postings_skip_record_size), postings.skip_data.?.len);
+        },
+        .one_hit => return error.TestUnexpectedResult,
+    }
+
+    var iter = try lookup.iterator(alloc);
+    defer iter.deinit();
+    const hit = (try iter.advanceTo(33)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 33), hit.doc_id);
+    try std.testing.expectEqual(@as(u32, 34), hit.freq);
+}
+
 test "PostingsIterator decode_positions=false skips position decode" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{});
@@ -2843,7 +2946,7 @@ test "v6 reads back positions across the varint multi-byte boundary" {
     defer alloc.free(section);
 
     var reader = try InvertedIndexReader.init(alloc, section);
-    try std.testing.expectEqual(@as(u8, wire_version_v9), reader.version);
+    try std.testing.expectEqual(@as(u8, wire_version_current), reader.version);
 
     const lookup = reader.lookup("term") orelse return error.TestExpectedEqual;
     var iter = try lookup.iterator(alloc);
@@ -2910,7 +3013,7 @@ test "v6 below bloom threshold skips bloom payload" {
     try std.testing.expect(reader.lookup("missing") == null);
 }
 
-test "legacy section versions are rejected by v9-only reader" {
+test "legacy section versions are rejected by current reader" {
     const alloc = std.testing.allocator;
 
     var fst_builder = try vellum.Builder.init(alloc, .{});

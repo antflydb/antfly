@@ -2533,7 +2533,7 @@ pub fn BoundProbeCursor(comptime BackendType: type) type {
 }
 
 pub fn BoundWriteTxn(comptime BackendType: type) type {
-    const LocalCursor = BoundCursor(State);
+    const LocalCursor = MergeCursor(BackendType, State);
     return struct {
         allocator: Allocator,
         metadata_allocator: Allocator,
@@ -2541,7 +2541,12 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         namespace: backend_types.Namespace,
         mutable: ActiveMemTable,
         bulk_appends: State = .{},
-        snapshot: ?State = null,
+        cursor_overlay: ?State = null,
+        cursor_base_mutable: ?State = null,
+        cursor_immutable_memtables: []const *const State = &.{},
+        cursor_runs: []Run = &.{},
+        cursor_l0_groups: []RunGroup = &.{},
+        cursor_levels: []RunLevel = &.{},
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
         batch_options: backend_types.BatchOptions = .{},
         closed: bool = false,
@@ -2572,7 +2577,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             const backend = self.backend;
             self.mutable.deinit(self.allocator);
             self.bulk_appends.deinit(self.allocator);
-            invalidateSnapshot(&self.snapshot, self.allocator);
+            self.invalidateCursorSnapshot();
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
@@ -2591,7 +2596,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.mutable = .{};
                 self.bulk_appends.deinit(self.allocator);
                 self.bulk_appends = .{};
-                invalidateSnapshot(&self.snapshot, self.allocator);
+                self.invalidateCursorSnapshot();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
                 self.backend.releaseReader();
@@ -2614,7 +2619,6 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
-                invalidateSnapshot(&self.snapshot, self.allocator);
                 if ((mutated or direct_ingested_bulk_appends) and @hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 try self.backend.maybeFlushMutable();
@@ -2626,6 +2630,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;
             self.closed = true;
+            self.invalidateCursorSnapshot();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
             self.backend.finalizeWriteReaderRelease() catch |err| {
@@ -2692,7 +2697,6 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (@hasDecl(BackendType, "recordBulkAppendSuccess")) self.backend.recordBulkAppendSuccess(entries, sort_ns);
             self.bulk_appends.deinit(self.allocator);
             self.bulk_appends = .{};
-            invalidateSnapshot(&self.snapshot, self.allocator);
             return true;
         }
 
@@ -2757,7 +2761,6 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             }
             self.mutable.deinit(self.allocator);
             self.mutable = .{};
-            invalidateSnapshot(&self.snapshot, self.allocator);
             if (@hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
             return true;
         }
@@ -2868,36 +2871,136 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
 
         pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
             try self.mutable.upsert(self.allocator, self.namespace, key, value, false);
-            invalidateSnapshot(&self.snapshot, self.allocator);
+            self.invalidateCursorSnapshot();
         }
 
         pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
             if (self.batch_options.mode == .bulk_ingest) {
                 const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
                 try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, self.namespace, key, value, false));
-                invalidateSnapshot(&self.snapshot, self.allocator);
+                self.invalidateCursorSnapshot();
                 return;
             }
             try self.mutable.appendUpsert(self.allocator, self.namespace, key, value, false);
-            invalidateSnapshot(&self.snapshot, self.allocator);
+            self.invalidateCursorSnapshot();
         }
 
         pub fn delete(self: *@This(), key: []const u8) !void {
             try self.mutable.upsert(self.allocator, self.namespace, key, "", true);
-            invalidateSnapshot(&self.snapshot, self.allocator);
+            self.invalidateCursorSnapshot();
         }
 
         pub fn openCursor(self: *@This()) !LocalCursor {
-            if (self.snapshot == null) {
-                const locked = lockBackend(BackendType, self.backend);
-                defer unlockBackend(BackendType, self.backend, locked);
-                self.snapshot = try self.backend.materializeVisibleStateWithOverlay(&self.backend.mutable, &self.mutable);
-                try state_mod.applyState(&self.snapshot.?, self.allocator, &self.bulk_appends);
-            }
+            try self.ensureCursorSnapshot();
+            const source_count = 1 + self.cursor_immutable_memtables.len + self.cursor_runs.len;
+            const cursor_alloc = runtimeScratchAllocator(self.allocator);
+            const positions = try cursor_alloc.alloc(?usize, source_count);
+            errdefer cursor_alloc.free(positions);
+            @memset(positions, null);
+            const source_entries = try cursor_alloc.alloc(?LocalCursor.SourceEntry, source_count);
+            errdefer cursor_alloc.free(source_entries);
+            @memset(source_entries, null);
+            const source_block_bytes = try cursor_alloc.alloc(?[]const u8, source_count);
+            errdefer cursor_alloc.free(source_block_bytes);
+            @memset(source_block_bytes, null);
+            const source_block_handles = try cursor_alloc.alloc(?cache_mod.Handle, source_count);
+            errdefer cursor_alloc.free(source_block_handles);
+            @memset(source_block_handles, null);
+            const source_block_indices = try cursor_alloc.alloc(?usize, source_count);
+            errdefer cursor_alloc.free(source_block_indices);
+            @memset(source_block_indices, null);
+            const advance_sources = try cursor_alloc.alloc(usize, source_count);
+            errdefer cursor_alloc.free(advance_sources);
+            const source_heap = try cursor_alloc.alloc(usize, source_count);
+            errdefer cursor_alloc.free(source_heap);
+            const source_heap_positions = try cursor_alloc.alloc(?usize, source_count);
+            errdefer cursor_alloc.free(source_heap_positions);
+            @memset(source_heap_positions, null);
             return .{
-                .state = &self.snapshot.?,
+                .allocator = cursor_alloc,
+                .backend = self.backend,
+                .mutable = &self.cursor_overlay.?,
+                .immutable_memtables = self.cursor_immutable_memtables,
+                .runs = self.cursor_runs,
+                .l0_groups = self.cursor_l0_groups,
+                .levels = self.cursor_levels,
                 .namespace = self.namespace,
+                .positions = positions,
+                .source_entries = source_entries,
+                .source_block_bytes = source_block_bytes,
+                .source_block_handles = source_block_handles,
+                .source_block_indices = source_block_indices,
+                .advance_sources = advance_sources,
+                .source_heap = source_heap,
+                .source_heap_positions = source_heap_positions,
             };
+        }
+
+        fn ensureCursorSnapshot(self: *@This()) !void {
+            if (self.cursor_overlay != null) return;
+            const locked = lockBackend(BackendType, self.backend);
+            defer unlockBackend(BackendType, self.backend, locked);
+
+            var overlay: State = .{};
+            errdefer overlay.deinit(self.allocator);
+            try state_mod.applyState(&overlay, self.allocator, &self.mutable);
+            try state_mod.applyState(&overlay, self.allocator, &self.bulk_appends);
+
+            var base_mutable: State = .{};
+            errdefer base_mutable.deinit(self.allocator);
+            try state_mod.applyState(&base_mutable, self.allocator, &self.backend.mutable);
+
+            const backend_immutable = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
+                try self.backend.snapshotImmutableMemtables()
+            else
+                &.{};
+            defer if (backend_immutable.len > 0) self.allocator.free(backend_immutable);
+
+            const immutable = try self.allocator.alloc(*const State, 1 + backend_immutable.len);
+            errdefer self.allocator.free(immutable);
+            for (backend_immutable, 0..) |state, i| immutable[i + 1] = state;
+
+            const runs = try borrowRunSnapshotList(self.metadata_allocator, self.backend.runs.items);
+            errdefer freeRunSnapshotList(self.metadata_allocator, runs);
+            const l0_groups = try buildL0RunGroupsWithStats(self.backend, self.metadata_allocator, runs);
+            errdefer deinitRunGroups(self.metadata_allocator, l0_groups);
+            const levels = try buildLowerLevels(self.metadata_allocator, runs);
+            errdefer self.metadata_allocator.free(levels);
+
+            self.cursor_overlay = overlay;
+            self.cursor_base_mutable = base_mutable;
+            immutable[0] = &self.cursor_base_mutable.?;
+            self.cursor_immutable_memtables = immutable;
+            self.cursor_runs = runs;
+            self.cursor_l0_groups = l0_groups;
+            self.cursor_levels = levels;
+        }
+
+        fn invalidateCursorSnapshot(self: *@This()) void {
+            if (self.cursor_overlay) |*state| {
+                state.deinit(self.allocator);
+                self.cursor_overlay = null;
+            }
+            if (self.cursor_base_mutable) |*state| {
+                state.deinit(self.allocator);
+                self.cursor_base_mutable = null;
+            }
+            if (self.cursor_immutable_memtables.len > 0) {
+                self.allocator.free(self.cursor_immutable_memtables);
+                self.cursor_immutable_memtables = &.{};
+            }
+            if (self.cursor_l0_groups.len > 0) {
+                deinitRunGroups(self.metadata_allocator, self.cursor_l0_groups);
+                self.cursor_l0_groups = &.{};
+            }
+            if (self.cursor_levels.len > 0) {
+                self.metadata_allocator.free(self.cursor_levels);
+                self.cursor_levels = &.{};
+            }
+            if (self.cursor_runs.len > 0) {
+                freeRunSnapshotList(self.metadata_allocator, self.cursor_runs);
+                self.cursor_runs = &.{};
+            }
         }
     };
 }
@@ -2910,13 +3013,13 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
         backend: *BackendType,
         mutable_snapshot: *const State,
         owns_mutable_snapshot: bool = false,
+        snapshot: ?State = null,
         immutable_memtables: []const *const State = &.{},
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
         levels: []RunLevel = &.{},
         last_l0_group_index: ?usize = null,
         read_hint: ?BorrowedReadHint = null,
-        snapshot: ?State = null,
         held_blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
 
@@ -4687,12 +4790,18 @@ fn mutableLastKey(state: anytype, namespace: backend_types.Namespace) ?[]const u
 }
 
 pub fn NamespaceWriteTxn(comptime BackendType: type) type {
-    const LocalCursor = BoundCursor(State);
+    const LocalCursor = MergeCursor(BackendType, State);
     return struct {
         allocator: Allocator,
+        metadata_allocator: Allocator,
         backend: *BackendType,
         mutable: ActiveMemTable,
-        snapshot: ?State = null,
+        cursor_overlay: ?State = null,
+        cursor_base_mutable: ?State = null,
+        cursor_immutable_memtables: []const *const State = &.{},
+        cursor_runs: []Run = &.{},
+        cursor_l0_groups: []RunGroup = &.{},
+        cursor_levels: []RunLevel = &.{},
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
         batch_options: backend_types.BatchOptions = .{},
         closed: bool = false,
@@ -4710,6 +4819,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             errdefer backend.finishBatchMode(options);
             return .{
                 .allocator = backend.allocator,
+                .metadata_allocator = runtimeScratchAllocator(backend.allocator),
                 .backend = backend,
                 .mutable = .{},
                 .batch_options = options,
@@ -4720,7 +4830,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             if (self.closed) return;
             const backend = self.backend;
             self.mutable.deinit(self.allocator);
-            invalidateSnapshot(&self.snapshot, self.allocator);
+            self.invalidateCursorSnapshot();
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
@@ -4737,7 +4847,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             errdefer if (release_on_error) {
                 self.mutable.deinit(self.allocator);
                 self.mutable = .{};
-                invalidateSnapshot(&self.snapshot, self.allocator);
+                self.invalidateCursorSnapshot();
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
                 self.backend.releaseReader();
@@ -4759,7 +4869,6 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
-                invalidateSnapshot(&self.snapshot, self.allocator);
                 if (mutated and @hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 try self.backend.maybeFlushMutable();
@@ -4771,6 +4880,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             try self.backend.finalizeExitedBatchMode(self.batch_options);
             release_on_error = false;
             self.closed = true;
+            self.invalidateCursorSnapshot();
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
             self.backend.finalizeWriteReaderRelease() catch |err| {
@@ -4830,7 +4940,6 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             }
             self.mutable.deinit(self.allocator);
             self.mutable = .{};
-            invalidateSnapshot(&self.snapshot, self.allocator);
             if (@hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
             return true;
         }
@@ -4852,29 +4961,128 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
         pub fn put(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
             try self.mutable.upsert(self.allocator, namespace, key, value, false);
-            invalidateSnapshot(&self.snapshot, self.allocator);
+            self.invalidateCursorSnapshot();
         }
 
         pub fn appendPut(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
             try self.mutable.appendUpsert(self.allocator, namespace, key, value, false);
-            invalidateSnapshot(&self.snapshot, self.allocator);
+            self.invalidateCursorSnapshot();
         }
 
         pub fn delete(self: *@This(), namespace: backend_types.Namespace, key: []const u8) !void {
             try self.mutable.upsert(self.allocator, namespace, key, "", true);
-            invalidateSnapshot(&self.snapshot, self.allocator);
+            self.invalidateCursorSnapshot();
         }
 
         pub fn openCursor(self: *@This(), namespace: backend_types.Namespace) !LocalCursor {
-            if (self.snapshot == null) {
-                const locked = lockBackend(BackendType, self.backend);
-                defer unlockBackend(BackendType, self.backend, locked);
-                self.snapshot = try self.backend.materializeVisibleStateWithOverlay(&self.backend.mutable, &self.mutable);
-            }
+            try self.ensureCursorSnapshot();
+            const source_count = 1 + self.cursor_immutable_memtables.len + self.cursor_runs.len;
+            const cursor_alloc = runtimeScratchAllocator(self.allocator);
+            const positions = try cursor_alloc.alloc(?usize, source_count);
+            errdefer cursor_alloc.free(positions);
+            @memset(positions, null);
+            const source_entries = try cursor_alloc.alloc(?LocalCursor.SourceEntry, source_count);
+            errdefer cursor_alloc.free(source_entries);
+            @memset(source_entries, null);
+            const source_block_bytes = try cursor_alloc.alloc(?[]const u8, source_count);
+            errdefer cursor_alloc.free(source_block_bytes);
+            @memset(source_block_bytes, null);
+            const source_block_handles = try cursor_alloc.alloc(?cache_mod.Handle, source_count);
+            errdefer cursor_alloc.free(source_block_handles);
+            @memset(source_block_handles, null);
+            const source_block_indices = try cursor_alloc.alloc(?usize, source_count);
+            errdefer cursor_alloc.free(source_block_indices);
+            @memset(source_block_indices, null);
+            const advance_sources = try cursor_alloc.alloc(usize, source_count);
+            errdefer cursor_alloc.free(advance_sources);
+            const source_heap = try cursor_alloc.alloc(usize, source_count);
+            errdefer cursor_alloc.free(source_heap);
+            const source_heap_positions = try cursor_alloc.alloc(?usize, source_count);
+            errdefer cursor_alloc.free(source_heap_positions);
+            @memset(source_heap_positions, null);
             return .{
-                .state = &self.snapshot.?,
+                .allocator = cursor_alloc,
+                .backend = self.backend,
+                .mutable = &self.cursor_overlay.?,
+                .immutable_memtables = self.cursor_immutable_memtables,
+                .runs = self.cursor_runs,
+                .l0_groups = self.cursor_l0_groups,
+                .levels = self.cursor_levels,
                 .namespace = namespace,
+                .positions = positions,
+                .source_entries = source_entries,
+                .source_block_bytes = source_block_bytes,
+                .source_block_handles = source_block_handles,
+                .source_block_indices = source_block_indices,
+                .advance_sources = advance_sources,
+                .source_heap = source_heap,
+                .source_heap_positions = source_heap_positions,
             };
+        }
+
+        fn ensureCursorSnapshot(self: *@This()) !void {
+            if (self.cursor_overlay != null) return;
+            const locked = lockBackend(BackendType, self.backend);
+            defer unlockBackend(BackendType, self.backend, locked);
+
+            var overlay = try self.mutable.clone(self.allocator);
+            errdefer overlay.deinit(self.allocator);
+
+            var base_mutable: State = .{};
+            errdefer base_mutable.deinit(self.allocator);
+            try state_mod.applyState(&base_mutable, self.allocator, &self.backend.mutable);
+
+            const backend_immutable = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
+                try self.backend.snapshotImmutableMemtables()
+            else
+                &.{};
+            defer if (backend_immutable.len > 0) self.allocator.free(backend_immutable);
+
+            const immutable = try self.allocator.alloc(*const State, 1 + backend_immutable.len);
+            errdefer self.allocator.free(immutable);
+            for (backend_immutable, 0..) |state, i| immutable[i + 1] = state;
+
+            const runs = try borrowRunSnapshotList(self.metadata_allocator, self.backend.runs.items);
+            errdefer freeRunSnapshotList(self.metadata_allocator, runs);
+            const l0_groups = try buildL0RunGroupsWithStats(self.backend, self.metadata_allocator, runs);
+            errdefer deinitRunGroups(self.metadata_allocator, l0_groups);
+            const levels = try buildLowerLevels(self.metadata_allocator, runs);
+            errdefer self.metadata_allocator.free(levels);
+
+            self.cursor_overlay = overlay;
+            self.cursor_base_mutable = base_mutable;
+            immutable[0] = &self.cursor_base_mutable.?;
+            self.cursor_immutable_memtables = immutable;
+            self.cursor_runs = runs;
+            self.cursor_l0_groups = l0_groups;
+            self.cursor_levels = levels;
+        }
+
+        fn invalidateCursorSnapshot(self: *@This()) void {
+            if (self.cursor_overlay) |*state| {
+                state.deinit(self.allocator);
+                self.cursor_overlay = null;
+            }
+            if (self.cursor_base_mutable) |*state| {
+                state.deinit(self.allocator);
+                self.cursor_base_mutable = null;
+            }
+            if (self.cursor_immutable_memtables.len > 0) {
+                self.allocator.free(self.cursor_immutable_memtables);
+                self.cursor_immutable_memtables = &.{};
+            }
+            if (self.cursor_l0_groups.len > 0) {
+                deinitRunGroups(self.metadata_allocator, self.cursor_l0_groups);
+                self.cursor_l0_groups = &.{};
+            }
+            if (self.cursor_levels.len > 0) {
+                self.metadata_allocator.free(self.cursor_levels);
+                self.cursor_levels = &.{};
+            }
+            if (self.cursor_runs.len > 0) {
+                freeRunSnapshotList(self.metadata_allocator, self.cursor_runs);
+                self.cursor_runs = &.{};
+            }
         }
     };
 }
@@ -4922,14 +5130,6 @@ test "lsm namespace write txn keeps merged mutable state when flush fails after 
         ) ![]const u8 {
             if (overlay.get(namespace, key)) |value| return value else |_| {}
             return backend_mutable.get(namespace, key);
-        }
-
-        fn materializeVisibleStateWithOverlay(
-            _: *@This(),
-            backend_mutable: *const State,
-            overlay: *const State,
-        ) !State {
-            return try state_mod.mergeStates(std.testing.allocator, backend_mutable, overlay);
         }
     };
 
