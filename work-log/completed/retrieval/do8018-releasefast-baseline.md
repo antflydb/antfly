@@ -7,6 +7,7 @@ Updated on 2026-05-29 from worktree commit `89a0e73e71d7` after byte-budgeted st
 Updated on 2026-05-29 from worktree commit `d255fecf291d` after caching per-segment layout stats and adding merge/retire clean-page advice.
 Updated on 2026-05-29 after adding explicit current-scan helpers for maintenance paths so TTL/schema scans can avoid cloning the LSM mutable writer generation. This does not change the latest ReleaseFast baseline below; it is a working-set cleanup for the remaining mutable snapshot path.
 Updated on 2026-05-29 after moving the segment container to v3 with a zero checksum sentinel. Segment publish/open no longer performs a full-file CRC pass by default, which avoids forcing newly-written mmap segment pages resident just to validate the footer.
+Updated on 2026-05-29 from worktree commit `cf09767718c1` with a post-v3 ReleaseFast baseline. Final mapped-file resident dropped from about 519-534 MiB to about 32-33 MiB while final segment bytes stayed about 528-532 MiB; final `ps` RSS dropped from about 1.17-1.19 GiB to about 684-700 MiB.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -27,6 +28,82 @@ Latest stored-block-cap artifacts:
 Latest layout-cache/page-advice artifacts:
 
 `work-log/do8018/releasefast-baseline-20260529-123427/`
+
+Latest segment-v3/no-eager-checksum artifacts:
+
+`work-log/do8018/releasefast-baseline-20260529-130221/`
+
+## Latest Segment-v3 Metrics Off
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Load time: 41.689561709s
+- Async catch-up time: 18.30403375s
+- Catch-up complete: true
+- Throughput: 1,693.59 records/sec, 5.17 MiB/sec
+- `ps` RSS: 684,179,456 bytes
+- Process footprint metric: 122,788,128 bytes
+- Live malloc metric: 99,002,224 bytes
+- Malloc zone metric: 149,815,296 bytes
+- vmmap footprint: 122,788,249 bytes
+- vmmap peak footprint: 865,494,630 bytes
+- vmmap mapped-file resident: 33,135,001 bytes
+- vmmap malloc allocated: 27,577,548 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 527,514,173
+- Stored fields bytes: 127,660,919
+- Inverted bytes: 395,751,664
+- Inverted norms bytes: 12,711,407
+- Inverted postings bytes: 270,698,041
+- Inverted term dictionary bytes: 106,504,141
+- Term block bytes: 100,981,932
+- Term index bytes: 2,778,761
+- Term FST bytes: 2,669,948
+- Typed doc values bytes: 3,446,943
+- Doc ordinal bytes: 282,460
+- Section index bytes: 371,867
+- Text merges completed: 148
+- Full-text build peak bytes: 173,817,800
+- Full-text pending peak bytes: 532,064,716
+- Text merge buffer peak bytes: 147,361,230
+- LSM compaction peak bytes: 67,448,112
+- LSM in-memory state peak bytes: 35,371,296
+
+## Latest Segment-v3 Metrics On
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Load time: 41.824538917s
+- Async catch-up time: 18.33002275s
+- Catch-up complete: true
+- Throughput: 1,688.12 records/sec, 5.15 MiB/sec
+- `ps` RSS: 699,514,880 bytes
+- Process footprint metric: 134,371,832 bytes
+- Live malloc metric: 91,245,552 bytes
+- Malloc zone metric: 143,196,160 bytes
+- vmmap footprint: 135,056,588 bytes
+- vmmap peak footprint: 798,490,624 bytes
+- vmmap mapped-file resident: 32,400,998 bytes
+- vmmap malloc allocated: 28,101,836 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 532,198,379
+- Stored fields bytes: 127,694,574
+- Inverted bytes: 400,394,698
+- Inverted norms bytes: 13,005,800
+- Inverted postings bytes: 269,654,389
+- Inverted term dictionary bytes: 111,359,228
+- Term block bytes: 105,623,533
+- Term index bytes: 2,885,593
+- Term FST bytes: 2,774,402
+- Typed doc values bytes: 3,444,316
+- Doc ordinal bytes: 282,460
+- Section index bytes: 382,011
+- Text merges completed: 132
+- Full-text build peak bytes: 170,753,841
+- Full-text pending peak bytes: 530,364,540
+- Text merge buffer peak bytes: 177,292,614
+- LSM compaction peak bytes: 67,851,816
+- LSM in-memory state peak bytes: 22,407,793
 
 ## LSM Mutable Snapshot Cleanup
 
