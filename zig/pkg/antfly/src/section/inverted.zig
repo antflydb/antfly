@@ -15,7 +15,7 @@
 //! Inverted text index section for full-text search.
 //!
 //! Builds and queries an inverted index using:
-//!   - Vellum FST term dictionary (term → postings offset)
+//!   - Blocked term dictionary indexed by a Vellum FST (prefix → block offset)
 //!   - Roaring bitmaps for posting lists (document ID sets)
 //!   - Chunked int encoder for term frequencies and field norms
 //!   - BM25 scoring
@@ -33,17 +33,20 @@ const bloom = @import("bloom");
 // Wire format versions
 // ============================================================================
 //
-//   v10: v9 + sparse skip data for long posting lists
+//   v11: v10 postings + BlockTree-style blocked term dictionary
 //
-// This project is pre-release; writers emit the current v10 format.
+// This project is pre-release; writers emit the current v11 format.
 
-const wire_version_current: u8 = 10;
+const wire_version_current: u8 = 11;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4; // 29 bytes
 const v7_chunk_meta_size: usize = 44;
 const postings_header_size: usize = 24;
 const postings_skip_record_size: usize = 8;
 const postings_skip_stride_chunks: usize = 16;
 const postings_skip_min_chunks: usize = postings_skip_stride_chunks * 2;
+const term_block_prefix_len: usize = 2;
+const term_dict_magic = "BTD1";
+const term_dict_header_size: usize = 16;
 
 /// Skip building a per-segment bloom filter when there are fewer terms than this.
 /// FST traversal is already cheap for tiny term sets, and the filter would
@@ -76,6 +79,14 @@ fn writeCurrentHeader(
 // ============================================================================
 
 fn writeVarintU32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
+    var v = value;
+    while (v >= 0x80) : (v >>= 7) {
+        try out.append(alloc, @as(u8, @truncate(v)) | 0x80);
+    }
+    try out.append(alloc, @truncate(v));
+}
+
+fn writeVarintU64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u64) !void {
     var v = value;
     while (v >= 0x80) : (v >>= 7) {
         try out.append(alloc, @as(u8, @truncate(v)) | 0x80);
@@ -122,6 +133,68 @@ fn termBloomHashes(term: []const u8) struct { h1: u64, h2: u64 } {
 
 const TermBloomHash = struct { h1: u64, h2: u64 };
 
+const TermDictEntry = struct {
+    term: []const u8,
+    value: u64,
+};
+
+fn termBlockKey(term: []const u8) []const u8 {
+    return term[0..@min(term.len, term_block_prefix_len)];
+}
+
+fn appendLeU32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, value))));
+}
+
+fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry) ![]u8 {
+    var block_data = std.ArrayListUnmanaged(u8).empty;
+    defer block_data.deinit(alloc);
+
+    const fst_registry_size: usize = std.math.clamp(entries.len, 64, 65_536);
+    var block_fst_builder = try vellum.Builder.init(alloc, .{
+        .registry_table_size = fst_registry_size,
+    });
+    defer block_fst_builder.deinit();
+
+    var i: usize = 0;
+    var block_count: u32 = 0;
+    while (i < entries.len) {
+        const prefix = termBlockKey(entries[i].term);
+        const block_offset: u64 = @intCast(block_data.items.len);
+        try block_fst_builder.insert(prefix, block_offset);
+
+        var end = i + 1;
+        while (end < entries.len and std.mem.eql(u8, termBlockKey(entries[end].term), prefix)) : (end += 1) {}
+
+        try block_data.append(alloc, @intCast(prefix.len));
+        try appendLeU32(alloc, &block_data, @intCast(end - i));
+        try block_data.appendSlice(alloc, prefix);
+
+        for (entries[i..end]) |entry| {
+            const suffix = entry.term[prefix.len..];
+            try writeVarintU32(alloc, &block_data, @intCast(suffix.len));
+            try block_data.appendSlice(alloc, suffix);
+            try writeVarintU64(alloc, &block_data, entry.value);
+        }
+
+        block_count += 1;
+        i = end;
+    }
+
+    const block_fst = try block_fst_builder.finish();
+    defer alloc.free(block_fst);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, term_dict_magic);
+    try appendLeU32(alloc, &out, block_count);
+    try appendLeU32(alloc, &out, @intCast(block_data.items.len));
+    try appendLeU32(alloc, &out, @intCast(block_fst.len));
+    try out.appendSlice(alloc, block_data.items);
+    try out.appendSlice(alloc, block_fst);
+    return try out.toOwnedSlice(alloc);
+}
+
 /// Decode a u32 LEB128 varint at `cursor`. Advances `cursor` past the decoded
 /// bytes. Returns `error.Truncated` if the buffer ends mid-varint.
 fn readVarintU32(data: []const u8, cursor: *usize) !u32 {
@@ -133,6 +206,20 @@ fn readVarintU32(data: []const u8, cursor: *usize) !u32 {
         result |= @as(u32, b & 0x7f) << shift;
         if (b & 0x80 == 0) return result;
         if (shift >= 28) return error.VarintOverflow;
+        shift += 7;
+    }
+    return error.Truncated;
+}
+
+fn readVarintU64(data: []const u8, cursor: *usize) !u64 {
+    var result: u64 = 0;
+    var shift: u6 = 0;
+    while (cursor.* < data.len) {
+        const b = data[cursor.*];
+        cursor.* += 1;
+        result |= @as(u64, b & 0x7f) << shift;
+        if (b & 0x80 == 0) return result;
+        if (shift >= 63) return error.VarintOverflow;
         shift += 7;
     }
     return error.Truncated;
@@ -291,22 +378,15 @@ pub const InvertedIndexBuilder = struct {
         }.lessThan);
 
         // Step 2: Serialize postings data directly into the final section and
-        // build the FST (term -> postings offset or 1-hit). The header is
+        // collect dictionary entries (term -> postings offset or 1-hit). The header is
         // backpatched after bloom/FST sizes are known, avoiding a second
         // field-sized postings buffer during segment construction.
         var output = std.ArrayListUnmanaged(u8).empty;
         errdefer output.deinit(output_alloc);
         try output.appendNTimes(output_alloc, 0, v7_header_size);
 
-        // Size the FST registry to roughly the term count: a 3-term segment
-        // has no use for the default 10K-cell dedup table, and an enormous
-        // segment shouldn't be capped to 10K either. The clamp keeps the
-        // allocation between one page and a few MB.
-        const fst_registry_size: usize = std.math.clamp(term_count, 64, 65_536);
-        var fst_builder = try vellum.Builder.init(scratch_alloc, .{
-            .registry_table_size = fst_registry_size,
-        });
-        defer fst_builder.deinit();
+        var dict_entries = try scratch_alloc.alloc(TermDictEntry, term_count);
+        defer scratch_alloc.free(dict_entries);
 
         // Optional per-segment term bloom filter. `null` when disabled (small
         // term sets) or when the caller opted out via `IndexConfig.enable_bloom`.
@@ -324,8 +404,9 @@ pub const InvertedIndexBuilder = struct {
         var serialize_scratch = PostingSerializeScratch{};
         defer serialize_scratch.deinit(scratch_alloc);
 
-        for (sorted_terms) |term| {
+        for (sorted_terms, 0..) |term, term_idx| {
             const acc = self.terms.getPtr(term).?;
+            var dict_value: u64 = 0;
 
             if (bloom_builder) |*b| {
                 // Single Wyhash + splitmix64 derivation; the read path mirrors
@@ -343,16 +424,20 @@ pub const InvertedIndexBuilder = struct {
             {
                 const doc_num: u64 = acc.doc_ids.items[0];
                 const norm_bits: u64 = acc.metas.items[0].norm;
-                try fst_builder.insert(term, fstValEncode1Hit(doc_num, norm_bits));
+                dict_value = fstValEncode1Hit(doc_num, norm_bits);
             } else {
                 const postings_offset: u64 = @intCast(output.items.len - v7_header_size);
                 try acc.serializeV9(output_alloc, &output, &serialize_scratch, self.config.chunk_size);
-                try fst_builder.insert(term, postings_offset);
+                dict_value = postings_offset;
             }
+            dict_entries[term_idx] = .{
+                .term = term,
+                .value = dict_value,
+            };
         }
 
-        const fst_data = try fst_builder.finish();
-        defer scratch_alloc.free(fst_data);
+        const term_dict_data = try encodeBlockedTermDictionary(scratch_alloc, dict_entries);
+        defer scratch_alloc.free(term_dict_data);
 
         // Encode bloom (if any) into a single buffer that we'll inline into
         // the section. The on-disk payload is the standard `lib/bloom` magic +
@@ -372,14 +457,14 @@ pub const InvertedIndexBuilder = struct {
         if (bloom_bytes.len > 0) {
             try output.appendSlice(output_alloc, bloom_bytes);
         }
-        try output.appendSlice(output_alloc, fst_data);
+        try output.appendSlice(output_alloc, term_dict_data);
 
         writeCurrentHeader(
             output.items[0..v7_header_size],
             self.doc_count,
             self.total_field_len,
             self.config.chunk_size,
-            @intCast(fst_data.len),
+            @intCast(term_dict_data.len),
             @intCast(bloom_bytes.len),
         );
 
@@ -790,7 +875,7 @@ const PostingAccumulator = struct {
 // Index reader (query path)
 // ============================================================================
 
-/// Reads a serialized inverted index section (v10, with Vellum FST).
+/// Reads a serialized inverted index section (v11, with blocked term dictionary).
 pub const InvertedIndexReader = struct {
     alloc: Allocator,
     data: []const u8,
@@ -799,7 +884,8 @@ pub const InvertedIndexReader = struct {
     chunk_size: u32,
     postings_offset: usize,
     version: u8,
-    fst: vellum.FST,
+    dict_blocks: []const u8,
+    dict_fst: vellum.FST,
     /// Optional per-segment term bloom filter. When present, callers can
     /// reject absent terms before walking the FST. Borrows into `data`.
     term_bloom: ?bloom.BorrowedFilter,
@@ -813,18 +899,25 @@ pub const InvertedIndexReader = struct {
         const doc_count = std.mem.readInt(u32, data[5..9], .little);
         const total_field_len = std.mem.readInt(u64, data[9..17], .little);
         const chunk_size = std.mem.readInt(u32, data[17..21], .little);
-        const vellum_len = std.mem.readInt(u32, data[21..25], .little);
+        const dict_len = std.mem.readInt(u32, data[21..25], .little);
         const bloom_len = std.mem.readInt(u32, data[25..29], .little);
         const postings_offset: usize = v7_header_size;
 
-        const fst_offset = data.len - vellum_len;
-        const fst_data = data[fst_offset..];
-        const fst = try vellum.FST.load(fst_data);
+        if (dict_len < term_dict_header_size or dict_len > data.len) return error.InvalidData;
+        const dict_offset = data.len - dict_len;
+        const dict_data = data[dict_offset..];
+        if (!std.mem.eql(u8, dict_data[0..4], term_dict_magic)) return error.InvalidData;
+        const block_data_len = std.mem.readInt(u32, dict_data[8..12], .little);
+        const block_fst_len = std.mem.readInt(u32, dict_data[12..16], .little);
+        if (term_dict_header_size + @as(usize, block_data_len) + @as(usize, block_fst_len) != dict_data.len) return error.InvalidData;
+        const block_data = dict_data[term_dict_header_size..][0..block_data_len];
+        const block_fst_data = dict_data[term_dict_header_size + @as(usize, block_data_len) ..];
+        const dict_fst = try vellum.FST.load(block_fst_data);
 
         var term_bloom: ?bloom.BorrowedFilter = null;
         if (bloom_len > 0) {
-            const bloom_offset = fst_offset - bloom_len;
-            term_bloom = bloom.BorrowedFilter.decode(data[bloom_offset..fst_offset]) catch null;
+            const bloom_offset = dict_offset - bloom_len;
+            term_bloom = bloom.BorrowedFilter.decode(data[bloom_offset..dict_offset]) catch null;
         }
 
         return .{
@@ -835,7 +928,8 @@ pub const InvertedIndexReader = struct {
             .chunk_size = chunk_size,
             .postings_offset = postings_offset,
             .version = version,
-            .fst = fst,
+            .dict_blocks = block_data,
+            .dict_fst = dict_fst,
             .term_bloom = term_bloom,
         };
     }
@@ -861,11 +955,11 @@ pub const InvertedIndexReader = struct {
     };
 
     pub fn layoutStats(self: *const InvertedIndexReader) LayoutStats {
-        const vellum_len = std.mem.readInt(u32, self.data[21..25], .little);
+        const dict_len = std.mem.readInt(u32, self.data[21..25], .little);
         const bloom_len = std.mem.readInt(u32, self.data[25..29], .little);
         return .{
             .header_bytes = v7_header_size,
-            .fst_bytes = vellum_len,
+            .fst_bytes = dict_len,
             .bloom_bytes = bloom_len,
         };
     }
@@ -898,7 +992,7 @@ pub const InvertedIndexReader = struct {
         return stats;
     }
 
-    /// Look up a term using the Vellum FST. Returns posting data, or null.
+    /// Look up a term using the blocked term dictionary. Returns posting data, or null.
     /// For 1-hit terms, returns a synthetic TermPostings with the single doc.
     /// Consults the per-segment term bloom filter before walking the FST
     /// when present, so absent-term lookups skip the FST traversal entirely.
@@ -907,26 +1001,28 @@ pub const InvertedIndexReader = struct {
             const h = termBloomHashes(term);
             if (!filter.maybeContainsHashes(h.h1, h.h2)) return null;
         }
-        const result = self.fst.get(term) catch return null;
+        const block_key = termBlockKey(term);
+        const result = self.dict_fst.get(block_key) catch return null;
         if (!result.found) return null;
+        const dict_value = self.lookupInTermBlock(@intCast(result.val), term) catch return null;
 
-        if (fstValIs1Hit(result.val)) {
-            const decoded = fstValDecode1Hit(result.val);
+        if (fstValIs1Hit(dict_value)) {
+            const decoded = fstValDecode1Hit(dict_value);
             return .{ .one_hit = .{
                 .doc_num = @intCast(decoded.doc_num),
                 .norm_bits = @intCast(decoded.norm_bits),
             } };
         }
 
-        return .{ .postings = self.readPostings(@intCast(result.val)) };
+        return .{ .postings = self.readPostings(@intCast(dict_value)) };
     }
 
-    /// Iterate all terms in the dictionary using the FST iterator.
+    /// Iterate all terms in the dictionary using the block-prefix FST iterator.
     pub fn termIterator(self: *const InvertedIndexReader) !TermIterator {
         return .{
             .alloc = self.alloc,
             .reader = self,
-            .fst_iter = try self.fst.iterator(self.alloc, null, null),
+            .block_iter = try self.dict_fst.iterator(self.alloc, null, null),
         };
     }
 
@@ -935,17 +1031,47 @@ pub const InvertedIndexReader = struct {
         return .{
             .alloc = self.alloc,
             .reader = self,
-            .fst_iter = try self.fst.iterator(self.alloc, start, end),
+            .block_iter = try self.dict_fst.iterator(self.alloc, if (start) |s| termBlockKey(s) else null, null),
+            .start = start,
+            .end = end,
         };
     }
 
-    /// Iterate terms matching an automaton using FST.search (prunes non-matching prefixes).
+    /// Iterate terms matching an automaton. Blocks are enumerated by prefix FST,
+    /// then the automaton is checked against full terms inside each block.
     pub fn fstSearchIterator(self: *const InvertedIndexReader, aut: vellum.Automaton) !TermIterator {
         return .{
             .alloc = self.alloc,
             .reader = self,
-            .fst_iter = try self.fst.search(self.alloc, aut, null, null),
+            .block_iter = try self.dict_fst.iterator(self.alloc, null, null),
+            .automaton = aut,
         };
+    }
+
+    fn lookupInTermBlock(self: *const InvertedIndexReader, block_offset: u32, term: []const u8) !u64 {
+        if (block_offset >= self.dict_blocks.len) return error.InvalidData;
+        var cursor: usize = block_offset;
+        const prefix_len = self.dict_blocks[cursor];
+        cursor += 1;
+        if (cursor + 4 > self.dict_blocks.len) return error.Truncated;
+        const entry_count = std.mem.readInt(u32, self.dict_blocks[cursor..][0..4], .little);
+        cursor += 4;
+        if (cursor + prefix_len > self.dict_blocks.len) return error.Truncated;
+        const prefix = self.dict_blocks[cursor..][0..prefix_len];
+        cursor += prefix_len;
+        if (!std.mem.startsWith(u8, term, prefix)) return error.NotFound;
+        const wanted_suffix = term[prefix.len..];
+
+        var i: u32 = 0;
+        while (i < entry_count) : (i += 1) {
+            const suffix_len = try readVarintU32(self.dict_blocks, &cursor);
+            if (cursor + suffix_len > self.dict_blocks.len) return error.Truncated;
+            const suffix = self.dict_blocks[cursor..][0..suffix_len];
+            cursor += suffix_len;
+            const value = try readVarintU64(self.dict_blocks, &cursor);
+            if (std.mem.eql(u8, suffix, wanted_suffix)) return value;
+        }
+        return error.NotFound;
     }
 
     fn readPostings(self: *const InvertedIndexReader, offset: u32) TermPostings {
@@ -995,42 +1121,89 @@ pub const InvertedIndexReader = struct {
 pub const TermIterator = struct {
     alloc: Allocator,
     reader: *const InvertedIndexReader,
-    fst_iter: vellum.FSTIterator,
-    // We must copy the key before advancing, because nextEntry() invalidates it
+    block_iter: vellum.FSTIterator,
+    current_block_prefix: []const u8 = &.{},
+    current_block_cursor: usize = 0,
+    current_block_remaining: u32 = 0,
+    start: ?[]const u8 = null,
+    end: ?[]const u8 = null,
+    automaton: ?vellum.Automaton = null,
+    // We must copy the key before advancing, because block parsing reuses section slices.
     current_key: std.ArrayListUnmanaged(u8) = .empty,
-    started: bool = false,
 
     pub const Entry = struct { term: []const u8, result: LookupResult };
 
     pub fn next(self: *TermIterator) !?Entry {
-        // Advance past previous entry (except on first call)
-        if (self.started) {
-            _ = try self.fst_iter.nextEntry();
+        while (true) {
+            if (self.current_block_remaining == 0) {
+                if (!try self.loadNextBlock()) return null;
+            }
+
+            const suffix_len = readVarintU32(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData;
+            if (self.current_block_cursor + suffix_len > self.reader.dict_blocks.len) return error.InvalidData;
+            const suffix = self.reader.dict_blocks[self.current_block_cursor..][0..suffix_len];
+            self.current_block_cursor += suffix_len;
+            const value = readVarintU64(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData;
+            self.current_block_remaining -= 1;
+
+            self.current_key.clearRetainingCapacity();
+            try self.current_key.appendSlice(self.alloc, self.current_block_prefix);
+            try self.current_key.appendSlice(self.alloc, suffix);
+
+            if (self.start) |start| {
+                if (std.mem.order(u8, self.current_key.items, start) == .lt) continue;
+            }
+            if (self.end) |end| {
+                if (std.mem.order(u8, self.current_key.items, end) != .lt) return null;
+            }
+            if (self.automaton) |aut| {
+                if (!termMatchesAutomaton(aut, self.current_key.items)) continue;
+            }
+
+            const result: LookupResult = if (fstValIs1Hit(value))
+                .{ .one_hit = .{
+                    .doc_num = @intCast(fstValDecode1Hit(value).doc_num),
+                    .norm_bits = @intCast(fstValDecode1Hit(value).norm_bits),
+                } }
+            else
+                .{ .postings = self.reader.readPostings(@intCast(value)) };
+
+            return .{ .term = self.current_key.items, .result = result };
         }
-        self.started = true;
+    }
 
-        const current = self.fst_iter.current() orelse return null;
-
-        const result: LookupResult = if (fstValIs1Hit(current.val))
-            .{ .one_hit = .{
-                .doc_num = @intCast(fstValDecode1Hit(current.val).doc_num),
-                .norm_bits = @intCast(fstValDecode1Hit(current.val).norm_bits),
-            } }
-        else
-            .{ .postings = self.reader.readPostings(@intCast(current.val)) };
-
-        // Copy key so it survives across calls
-        self.current_key.clearRetainingCapacity();
-        try self.current_key.appendSlice(self.alloc, current.key);
-
-        return .{ .term = self.current_key.items, .result = result };
+    fn loadNextBlock(self: *TermIterator) !bool {
+        const current = self.block_iter.current() orelse return false;
+        _ = try self.block_iter.nextEntry();
+        const block_offset: usize = @intCast(current.val);
+        if (block_offset >= self.reader.dict_blocks.len) return error.InvalidData;
+        var cursor = block_offset;
+        const prefix_len = self.reader.dict_blocks[cursor];
+        cursor += 1;
+        if (cursor + 4 > self.reader.dict_blocks.len) return error.InvalidData;
+        self.current_block_remaining = std.mem.readInt(u32, self.reader.dict_blocks[cursor..][0..4], .little);
+        cursor += 4;
+        if (cursor + prefix_len > self.reader.dict_blocks.len) return error.InvalidData;
+        self.current_block_prefix = self.reader.dict_blocks[cursor..][0..prefix_len];
+        cursor += prefix_len;
+        self.current_block_cursor = cursor;
+        return true;
     }
 
     pub fn deinit(self: *TermIterator) void {
         self.current_key.deinit(self.alloc);
-        self.fst_iter.deinit();
+        self.block_iter.deinit();
     }
 };
+
+fn termMatchesAutomaton(aut: vellum.Automaton, term: []const u8) bool {
+    var state = aut.start();
+    for (term) |b| {
+        if (!aut.canMatch(state)) return false;
+        state = aut.accept(state, b);
+    }
+    return aut.isMatch(state);
+}
 
 /// Result of looking up a term. Either a full postings list or a 1-hit value.
 pub const LookupResult = union(enum) {
@@ -1823,22 +1996,24 @@ pub fn mergeInvertedSectionSlotsWithDeletes(
     var postings_data = std.ArrayListUnmanaged(u8).empty;
     defer postings_data.deinit(alloc);
 
-    var fst_builder = try vellum.Builder.init(alloc, .{});
-    defer fst_builder.deinit();
-
     var total_field_len: u64 = 0;
     var serialize_scratch = PostingSerializeScratch{};
     defer serialize_scratch.deinit(alloc);
     var bloom_hashes = std.ArrayListUnmanaged(TermBloomHash).empty;
     defer bloom_hashes.deinit(alloc);
     const collect_bloom_hashes = config.enable_bloom;
+    var dict_entries = std.ArrayListUnmanaged(TermDictEntry).empty;
+    defer {
+        for (dict_entries.items) |entry| alloc.free(entry.term);
+        dict_entries.deinit(alloc);
+    }
 
     while (true) {
         const min_term = findMinCurrentTerm(current_entries) orelse break;
 
         {
             const merged_term = try alloc.dupe(u8, min_term);
-            defer alloc.free(merged_term);
+            errdefer alloc.free(merged_term);
 
             var acc = PostingAccumulator.init();
             defer acc.deinit(alloc);
@@ -1857,11 +2032,17 @@ pub fn mergeInvertedSectionSlotsWithDeletes(
                 const h = termBloomHashes(merged_term);
                 try bloom_hashes.append(alloc, .{ .h1 = h.h1, .h2 = h.h2 });
             }
-            try appendMergedTerm(alloc, &fst_builder, &postings_data, &serialize_scratch, merged_term, &acc, config, running_offset);
+            const dict_value = try appendMergedTerm(alloc, &postings_data, &serialize_scratch, &acc, config, running_offset);
+            try dict_entries.append(alloc, .{
+                .term = merged_term,
+                .value = dict_value,
+            });
         }
     }
 
-    return assembleMergedSection(alloc, running_offset, total_field_len, config.chunk_size, postings_data.items, try fst_builder.finish(), config, bloom_hashes.items);
+    const term_dict_data = try encodeBlockedTermDictionary(alloc, dict_entries.items);
+    defer alloc.free(term_dict_data);
+    return assembleMergedSection(alloc, running_offset, total_field_len, config.chunk_size, postings_data.items, term_dict_data, config, bloom_hashes.items);
 }
 
 fn nextTermIteratorEntry(term_iters: []TermIterator, idx: usize) !?TermIterator.Entry {
@@ -1946,14 +2127,12 @@ fn appendLookupResultToAccumulator(
 
 fn appendMergedTerm(
     alloc: Allocator,
-    fst_builder: *vellum.Builder,
     postings_data: *std.ArrayListUnmanaged(u8),
     serialize_scratch: *PostingSerializeScratch,
-    term: []const u8,
     acc: *const PostingAccumulator,
     config: IndexConfig,
     merged_doc_count: u32,
-) !void {
+) !u64 {
     if (acc.doc_ids.items.len == 1 and
         acc.metas.items[0].freq == 1 and
         acc.metas.items[0].position_count == 0 and
@@ -1961,14 +2140,13 @@ fn appendMergedTerm(
     {
         const doc_num: u64 = acc.doc_ids.items[0];
         const norm_bits: u64 = acc.metas.items[0].norm;
-        try fst_builder.insert(term, fstValEncode1Hit(doc_num, norm_bits));
-        return;
+        return fstValEncode1Hit(doc_num, norm_bits);
     }
 
     const postings_offset: u64 = @intCast(postings_data.items.len);
     _ = merged_doc_count;
     try acc.serializeV9(alloc, postings_data, serialize_scratch, config.chunk_size);
-    try fst_builder.insert(term, postings_offset);
+    return postings_offset;
 }
 
 fn assembleMergedSection(
@@ -1977,12 +2155,10 @@ fn assembleMergedSection(
     total_field_len: u64,
     chunk_size: u32,
     postings_data: []const u8,
-    fst_data: []u8,
+    term_dict_data: []const u8,
     config: IndexConfig,
     term_hashes: []const TermBloomHash,
 ) ![]u8 {
-    defer alloc.free(fst_data);
-
     var bloom_bytes: []const u8 = &.{};
     defer if (bloom_bytes.len > 0) alloc.free(@constCast(bloom_bytes));
     if (config.enable_bloom and term_hashes.len >= bloom_min_terms) {
@@ -1998,14 +2174,14 @@ fn assembleMergedSection(
         bloom_bytes = try filter.encodeAlloc(alloc);
     }
 
-    const total = v7_header_size + postings_data.len + bloom_bytes.len + fst_data.len;
+    const total = v7_header_size + postings_data.len + bloom_bytes.len + term_dict_data.len;
     var output = try alloc.alloc(u8, total);
     writeCurrentHeader(
         output,
         doc_count,
         total_field_len,
         chunk_size,
-        @intCast(fst_data.len),
+        @intCast(term_dict_data.len),
         @intCast(bloom_bytes.len),
     );
     var pos: usize = v7_header_size;
@@ -2016,7 +2192,7 @@ fn assembleMergedSection(
         @memcpy(output[pos..][0..bloom_bytes.len], bloom_bytes);
         pos += bloom_bytes.len;
     }
-    @memcpy(output[pos..][0..fst_data.len], fst_data);
+    @memcpy(output[pos..][0..term_dict_data.len], term_dict_data);
 
     return output;
 }
@@ -2127,6 +2303,33 @@ test "term iterator enumerates all terms" {
     const t2 = try iter.next() orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("charlie", t2.term);
     try std.testing.expect(try iter.next() == null);
+}
+
+test "v11 term dictionary stores prefix blocks indexed by fst" {
+    const alloc = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(alloc, .{});
+    defer builder.deinit();
+
+    try builder.addDocument(0, &.{
+        .{ .term = "aa0", .freq = 1 },
+        .{ .term = "aa1", .freq = 1 },
+        .{ .term = "ab0", .freq = 1 },
+    });
+
+    const section = try builder.build();
+    defer alloc.free(section);
+
+    try std.testing.expectEqual(@as(u8, wire_version_current), section[4]);
+    const dict_len = std.mem.readInt(u32, section[21..25], .little);
+    const dict = section[section.len - dict_len ..];
+    try std.testing.expectEqualStrings(term_dict_magic, dict[0..4]);
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, dict[4..8], .little));
+
+    var reader = try InvertedIndexReader.init(alloc, section);
+    try std.testing.expect(reader.lookup("aa0") != null);
+    try std.testing.expect(reader.lookup("aa1") != null);
+    try std.testing.expect(reader.lookup("ab0") != null);
+    try std.testing.expect(reader.lookup("aa2") == null);
 }
 
 test "BM25 scoring" {

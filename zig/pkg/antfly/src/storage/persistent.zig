@@ -327,6 +327,47 @@ const SegmentFileStore = struct {
     }
 };
 
+const RetiredSegmentFileDeleter = struct {
+    allocator: Allocator,
+    root_dir: []u8,
+    storage: storage_io.Storage,
+
+    fn init(allocator: Allocator, store: *const SegmentFileStore) !*RetiredSegmentFileDeleter {
+        const deleter = try allocator.create(RetiredSegmentFileDeleter);
+        errdefer allocator.destroy(deleter);
+        deleter.* = .{
+            .allocator = allocator,
+            .root_dir = try allocator.dupe(u8, store.root_dir),
+            .storage = store.storage,
+        };
+        return deleter;
+    }
+
+    fn deinit(self: *RetiredSegmentFileDeleter) void {
+        const allocator = self.allocator;
+        allocator.free(self.root_dir);
+        allocator.destroy(self);
+    }
+
+    fn cleanup(self: *RetiredSegmentFileDeleter) index_mod.RetiredSegmentCleanup {
+        return .{
+            .ptr = self,
+            .delete = delete,
+        };
+    }
+
+    fn pathAlloc(self: *const RetiredSegmentFileDeleter, seg_id: u64) ![]u8 {
+        return try std.fmt.allocPrint(self.allocator, "{s}/{d}.seg", .{ self.root_dir, seg_id });
+    }
+
+    fn delete(ptr: *anyopaque, seg_id: u64) void {
+        const self: *RetiredSegmentFileDeleter = @ptrCast(@alignCast(ptr));
+        const path = self.pathAlloc(seg_id) catch return;
+        defer self.allocator.free(path);
+        self.storage.deleteFileAbsolute(path) catch {};
+    }
+};
+
 const AtomicSegmentSink = struct {
     writer: *storage_io.AtomicWriteSink,
 
@@ -582,6 +623,7 @@ pub const PersistentIndex = struct {
     main_store: backend_erased.NamespaceStore,
     main_store_owner: MainStoreOwner,
     segment_files: ?SegmentFileStore,
+    retired_segment_file_deleter: ?*RetiredSegmentFileDeleter = null,
     wal: wal_mod.WAL,
     committed_lsn: u64,
     main_backend: MainBackend,
@@ -965,6 +1007,11 @@ pub const PersistentIndex = struct {
             try pi.pruneActiveSegmentsMissingRangesOrDataLocked(path_span);
         }
 
+        if (pi.segment_files) |*store| {
+            pi.retired_segment_file_deleter = try RetiredSegmentFileDeleter.init(alloc, store);
+            pi.writer.setRetiredSegmentCleanup(pi.retired_segment_file_deleter.?.cleanup());
+        }
+
         return pi;
     }
 
@@ -984,6 +1031,7 @@ pub const PersistentIndex = struct {
         self.wal.close();
         self.main_store.deinit();
         self.main_store_owner.close(self.alloc);
+        if (self.retired_segment_file_deleter) |deleter| deleter.deinit();
         if (self.segment_files) |*store| store.close();
         self.unlockStorage();
         self.* = undefined;
@@ -1733,7 +1781,6 @@ pub const PersistentIndex = struct {
         }
         try self.writer.replaceSegmentsManyData(old_seg_ids, replacements);
         published_to_writer = true;
-        for (old_seg_ids) |old_id| self.deleteSegmentFile(old_id);
         return true;
     }
 
@@ -1920,7 +1967,6 @@ pub const PersistentIndex = struct {
 
         try self.writer.replaceSegmentsData(old_seg_ids, new_seg_id, segment_data.?);
         segment_data = null;
-        for (old_seg_ids) |old_id| self.deleteSegmentFile(old_id);
         return true;
     }
 
@@ -2048,7 +2094,6 @@ pub const PersistentIndex = struct {
 
         try self.writer.replaceSegmentsManyData(old_seg_ids, replacements);
         published_to_writer = true;
-        for (old_seg_ids) |old_id| self.deleteSegmentFile(old_id);
         return true;
     }
 
@@ -2081,7 +2126,6 @@ pub const PersistentIndex = struct {
 
         try txn.commit();
         try self.writer.removeSegments(old_seg_ids);
-        for (old_seg_ids) |old_id| self.deleteSegmentFile(old_id);
     }
 
     fn persistSegment(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64) !void {
@@ -2994,6 +3038,55 @@ test "persistent index snapshots use mapped segment files when native storage is
     try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
     try std.testing.expect(snap.segments[0].data.isFileBacked());
     try std.testing.expectEqualStrings("doc:a", snap.storedDoc(0).?.id);
+}
+
+test "persistent index deletes replaced segment files only after retained snapshot release" {
+    if (!supports_main_lmdb) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    var idx = try PersistentIndex.open(alloc, .{
+        .path = path,
+        .main_backend = .lsm,
+    });
+    defer idx.close();
+
+    const seg_a = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(seg_a);
+    try idx.indexSegment(seg_a);
+
+    const seg_b = try buildSimpleSegment(alloc, "doc:z", "omega");
+    defer alloc.free(seg_b);
+    try idx.indexSegment(seg_b);
+
+    const retained = idx.acquireSnapshot();
+    try std.testing.expectEqual(@as(usize, 2), retained.segments.len);
+
+    const store = &idx.segment_files.?;
+    const path_1 = try store.pathAlloc(1);
+    defer alloc.free(path_1);
+    const path_2 = try store.pathAlloc(2);
+    defer alloc.free(path_2);
+
+    _ = try store.storage.fileSize(path_1);
+    _ = try store.storage.fileSize(path_2);
+
+    const merged = try buildMultiDocSegment(alloc, &.{
+        .{ .doc_id = "doc:a", .term = "alpha" },
+        .{ .doc_id = "doc:z", .term = "omega" },
+    });
+    defer alloc.free(merged);
+    try idx.replaceSegments(&.{ 1, 2 }, merged);
+
+    _ = try store.storage.fileSize(path_1);
+    _ = try store.storage.fileSize(path_2);
+
+    retained.release();
+    try std.testing.expectError(error.FileNotFound, store.storage.fileSize(path_1));
+    try std.testing.expectError(error.FileNotFound, store.storage.fileSize(path_2));
 }
 
 const PersistentSimAction = persistent_sim_fixture.Action;

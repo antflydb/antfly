@@ -142,6 +142,15 @@ pub const ReplacementSegmentData = struct {
     data: SegmentData,
 };
 
+pub const RetiredSegmentCleanup = struct {
+    ptr: *anyopaque,
+    delete: *const fn (ptr: *anyopaque, seg_id: u64) void,
+
+    fn run(self: RetiredSegmentCleanup, seg_id: u64) void {
+        self.delete(self.ptr, seg_id);
+    }
+};
+
 const LiveDocCollector = struct {
     base: *scorer_mod.TopKCollector,
     deleted: ?*const roaring.RoaringBitmap = null,
@@ -249,6 +258,7 @@ pub const IndexSnapshot = struct {
     /// Segments whose readers should be deinit'd when this snapshot is released.
     /// Set by replaceSegments for the segments being merged away.
     retired_segments: []SegmentEntry,
+    retired_segment_cleanup: ?RetiredSegmentCleanup = null,
 
     /// Increment reference count. Returns self for chaining.
     pub fn retain(self: *IndexSnapshot) *IndexSnapshot {
@@ -263,7 +273,9 @@ pub const IndexSnapshot = struct {
             // Deinit retired segments (replaced during merge)
             for (self.retired_segments) |*seg| {
                 var s = seg.*;
+                const seg_id = s.id;
                 s.deinit();
+                if (self.retired_segment_cleanup) |cleanup| cleanup.run(seg_id);
             }
             if (self.retired_segments.len > 0) alloc.free(self.retired_segments);
             alloc.free(self.segments);
@@ -287,7 +299,9 @@ pub const IndexSnapshot = struct {
         for (self.segments) |*seg| seg.deinit();
         for (self.retired_segments) |*seg| {
             var s = seg.*;
+            const seg_id = s.id;
             s.deinit();
+            if (self.retired_segment_cleanup) |cleanup| cleanup.run(seg_id);
         }
         if (self.retired_segments.len > 0) self.alloc.free(self.retired_segments);
         self.alloc.free(self.segments);
@@ -592,6 +606,7 @@ pub const IndexWriter = struct {
     mu: std.atomic.Mutex,
     next_segment_id: u64,
     next_epoch: u64,
+    retired_segment_cleanup: ?RetiredSegmentCleanup = null,
 
     pub fn lockMutex(self: *IndexWriter) void {
         while (!self.mu.tryLock()) {
@@ -613,6 +628,7 @@ pub const IndexWriter = struct {
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
             .retired_segments = &.{},
+            .retired_segment_cleanup = null,
         };
         return .{
             .alloc = alloc,
@@ -620,7 +636,14 @@ pub const IndexWriter = struct {
             .mu = .unlocked,
             .next_segment_id = 1,
             .next_epoch = 1,
+            .retired_segment_cleanup = null,
         };
+    }
+
+    pub fn setRetiredSegmentCleanup(self: *IndexWriter, cleanup: ?RetiredSegmentCleanup) void {
+        self.retired_segment_cleanup = cleanup;
+        const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        snap.retired_segment_cleanup = cleanup;
     }
 
     pub fn deinit(self: *IndexWriter) void {
@@ -708,6 +731,7 @@ pub const IndexWriter = struct {
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
             .retired_segments = &.{},
+            .retired_segment_cleanup = self.retired_segment_cleanup,
         };
         self.next_epoch += 1;
 
@@ -716,6 +740,7 @@ pub const IndexWriter = struct {
         // Attach retired segments to the old snapshot so they get cleaned up
         // when all readers release it.
         old.retired_segments = retired;
+        old.retired_segment_cleanup = self.retired_segment_cleanup;
 
         // Atomic swap so concurrent readers see a consistent pointer.
         @atomicStore(*IndexSnapshot, &self.current, new_snap, .release);
@@ -809,6 +834,7 @@ pub const IndexWriter = struct {
             .term_doc_freq_cache_hits = 0,
             .term_doc_freq_cache_misses = 0,
             .retired_segments = &.{},
+            .retired_segment_cleanup = self.retired_segment_cleanup,
         };
         self.next_epoch += 1;
 
