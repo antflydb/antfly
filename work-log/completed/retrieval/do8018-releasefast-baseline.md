@@ -6,6 +6,7 @@ Updated on 2026-05-29 from worktree commit `14dfe7f28446` after the v16 per-sect
 Updated on 2026-05-29 from worktree commit `89a0e73e71d7` after byte-budgeted stored-field blocks.
 Updated on 2026-05-29 from worktree commit `d255fecf291d` after caching per-segment layout stats and adding merge/retire clean-page advice.
 Updated on 2026-05-29 after adding explicit current-scan helpers for maintenance paths so TTL/schema scans can avoid cloning the LSM mutable writer generation. This does not change the latest ReleaseFast baseline below; it is a working-set cleanup for the remaining mutable snapshot path.
+Updated on 2026-05-29 after moving the segment container to v3 with a zero checksum sentinel. Segment publish/open no longer performs a full-file CRC pass by default, which avoids forcing newly-written mmap segment pages resident just to validate the footer.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -38,6 +39,18 @@ Latest layout-cache/page-advice artifacts:
   - `zig build lib-db-query-test --summary failures -- --test-filter "current scan does not"`
   - `zig build lib-db-query-test --summary failures -- --test-filter "ttl runtime"`
   - `zig build lib-db-query-test --summary failures -- --test-filter "schema"`
+  - `zig build lib-db-query-test --summary failures`
+
+## Segment Container v3
+
+- Segment writers now emit v3 footers with checksum `0` as a sentinel for "not materialized".
+- Segment readers still honor non-zero checksums, but normal v3 opens skip the full-segment CRC pass.
+- File-backed segment publish and merge paths no longer read the entire just-written segment back through `crc32Prefix`, reducing page-cache/RSS pressure.
+- Fixed a leaked merged-term allocation in the inverted-section merge loop that the file-backed merge test exposed.
+- Verification:
+  - `zig build lib-db-query-test --summary failures -- --test-filter "text segment"`
+  - `zig build persistent-test --summary failures -- --test-filter "persistent index"`
+  - `zig build index-manager-test --summary failures -- --test-filter "text merge"`
   - `zig build lib-db-query-test --summary failures`
 
 ## Latest Layout-Cache Metrics Off

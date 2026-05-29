@@ -2303,7 +2303,8 @@ pub fn mergeInvertedSectionSlotsWithDeletes(
 
         {
             const merged_term = try alloc.dupe(u8, min_term);
-            errdefer alloc.free(merged_term);
+            var keep_merged_term = false;
+            defer if (!keep_merged_term) alloc.free(merged_term);
 
             var acc = PostingAccumulator.init();
             defer acc.deinit(alloc);
@@ -2327,6 +2328,7 @@ pub fn mergeInvertedSectionSlotsWithDeletes(
                 .term = merged_term,
                 .value = dict_value,
             });
+            keep_merged_term = true;
         }
     }
 

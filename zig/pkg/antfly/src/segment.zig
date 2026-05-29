@@ -43,7 +43,7 @@ const roaring = @import("encoding/roaring.zig");
 // ============================================================================
 
 const magic: [4]u8 = "AFSM".*; // AntFly SegMent
-const segment_version: u32 = 2; // v2: big-endian footer + CRC32 + Snappy stored fields
+const segment_version: u32 = 3; // v3: footer checksum is optional to avoid eager full-file scans
 const stored_fields_version_compressed_per_doc: u8 = 2;
 const stored_fields_version_uncompressed_offsets: u8 = 3;
 const stored_fields_version_block_compressed: u8 = 4;
@@ -57,7 +57,7 @@ const stored_fields_v4_doc_entry_size: usize = 24;
 ///   [sectionsIndexOffset: u64 BE] 8
 ///   [chunkMode: u32 BE]         4
 ///   [version: u32 BE]           4
-///   [CRC32: u32 BE]             4
+///   [CRC32: u32 BE]             4  (0 means not materialized)
 ///   [magic: 4 bytes]            4
 const footer_size: usize = 8 + 8 + 8 + 4 + 4 + 4 + 4; // 40 bytes
 
@@ -254,14 +254,12 @@ pub const SegmentWriter = struct {
         const sections_index_offset: u64 = @intCast(sink.len());
         try self.writeSectionIndexToSink(sink);
 
-        const footer_start = sink.len();
         try sinkAppendU64BE(sink, @intCast(self.doc_count));
         try sinkAppendU64BE(sink, stored_offset);
         try sinkAppendU64BE(sink, sections_index_offset);
         try sinkAppendU32BE(sink, 0);
         try sinkAppendU32BE(sink, segment_version);
-        const crc = try sink.crc32Prefix(footer_start + 32);
-        try sinkAppendU32BE(sink, crc);
+        try sinkAppendU32BE(sink, 0);
         try sink.appendSlice(&magic);
     }
 
@@ -553,10 +551,14 @@ pub const SegmentReader = struct {
         const stored_offset = std.mem.readInt(u64, data[end - 32 ..][0..8], .big);
         const doc_count: u32 = @intCast(std.mem.readInt(u64, data[end - 40 ..][0..8], .big));
 
-        // Verify CRC32 (over everything up to but not including CRC + magic)
-        const footer_data_end = end - 8; // exclude CRC + magic
-        const expected_crc = std.hash.Crc32.hash(data[0..footer_data_end]);
-        if (stored_crc != expected_crc) return error.CrcMismatch;
+        // v3 writers use a zero checksum sentinel so normal mmap opens do not
+        // force the whole segment resident. Non-zero legacy/diagnostic
+        // checksums are still honored.
+        if (stored_crc != 0) {
+            const footer_data_end = end - 8; // exclude CRC + magic
+            const expected_crc = std.hash.Crc32.hash(data[0..footer_data_end]);
+            if (stored_crc != expected_crc) return error.CrcMismatch;
+        }
 
         // Parse sections index (big-endian)
         var pos: usize = @intCast(sections_index_offset);
@@ -1082,14 +1084,12 @@ pub fn writeMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []
     const sections_index_offset: u64 = @intCast(sink.len());
     try writeMergedSectionIndex(alloc, sink, built_fields.items);
 
-    const footer_start = sink.len();
     try sinkAppendU64BE(sink, doc_count);
     try sinkAppendU64BE(sink, stored_offset);
     try sinkAppendU64BE(sink, sections_index_offset);
     try sinkAppendU32BE(sink, 0);
     try sinkAppendU32BE(sink, segment_version);
-    const crc = try sink.crc32Prefix(footer_start + 32);
-    try sinkAppendU32BE(sink, crc);
+    try sinkAppendU32BE(sink, 0);
     try sink.appendSlice(&magic);
 }
 
