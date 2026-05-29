@@ -381,6 +381,12 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     pub fn clear(self: *ProvisionedTableWriteCache) void {
+        var leased_retirements: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.active_leases > 0) leased_retirements += 1;
+        }
+        self.retired_entries.ensureUnusedCapacity(self.alloc, leased_retirements) catch return;
+
         for (self.entries.items) |entry| self.retireEntryLocked(entry);
         self.entries.clearRetainingCapacity();
         for (self.table_metadata.items) |*metadata| metadata.deinit(self.alloc);
@@ -507,7 +513,7 @@ pub const ProvisionedTableWriteCache = struct {
 
         const metadata = try self.getOrLoadMetadataLocked(catalog, table_name);
         const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
-        self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
+        try self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
         if (mode == .status_only) {
             const opened = try openDbForMode(
                 self.alloc,
@@ -608,7 +614,7 @@ pub const ProvisionedTableWriteCache = struct {
         lsm_root_generation: u64,
         table_name: []const u8,
     ) !GetOrPrepareOpen {
-        self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
+        try self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
                 _ = self.hit_count.fetchAdd(1, .monotonic);
@@ -691,7 +697,7 @@ pub const ProvisionedTableWriteCache = struct {
         mode: ManagedDbOpenMode,
         prepared: *PreparedOpen,
     ) !CachedDb {
-        self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
+        try self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
                 if (opened.*) |*db| db.close();
@@ -757,7 +763,7 @@ pub const ProvisionedTableWriteCache = struct {
         indexes_json: []const u8,
         schema_json: []const u8,
     ) !void {
-        self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
+        try self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id) continue;
             if (entry.lsm_root_generation != lsm_root_generation) continue;
@@ -840,7 +846,15 @@ pub const ProvisionedTableWriteCache = struct {
         group_id: u64,
         lsm_root_generation: u64,
         table_name: []const u8,
-    ) void {
+    ) !void {
+        var leased_retirements: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.lsm_root_generation == lsm_root_generation) continue;
+            if (entry.active_leases > 0) leased_retirements += 1;
+        }
+        try self.retired_entries.ensureUnusedCapacity(self.alloc, leased_retirements);
+
         var i: usize = 0;
         while (i < self.entries.items.len) {
             const entry = self.entries.items[i];
@@ -876,6 +890,13 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     fn removeDbEntriesForTable(self: *ProvisionedTableWriteCache, table_name: []const u8) void {
+        var leased_retirements: usize = 0;
+        for (self.entries.items) |entry| {
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.active_leases > 0) leased_retirements += 1;
+        }
+        self.retired_entries.ensureUnusedCapacity(self.alloc, leased_retirements) catch return;
+
         var i: usize = 0;
         while (i < self.entries.items.len) {
             if (!std.mem.eql(u8, self.entries.items[i].table_name, table_name)) {
@@ -1261,7 +1282,7 @@ pub const ProvisionedTableWriteCache = struct {
             }
 
             const dest_generation = if (generation_source) |source| source.generationForGroup(entry.group_id) else 0;
-            dest.pruneStaleEntriesForGroupTableLocked(entry.group_id, dest_generation, table_name);
+            try dest.pruneStaleEntriesForGroupTableLocked(entry.group_id, dest_generation, table_name);
             var existing_index: ?usize = null;
             for (dest.entries.items, 0..) |dest_entry, dest_i| {
                 if (dest_entry.group_id != entry.group_id) continue;
@@ -1270,6 +1291,9 @@ pub const ProvisionedTableWriteCache = struct {
                 break;
             }
             if (existing_index) |dest_i| {
+                if (dest.entries.items[dest_i].active_leases > 0) {
+                    try dest.retired_entries.ensureUnusedCapacity(dest.alloc, 1);
+                }
                 const removed = dest.entries.orderedRemove(dest_i);
                 dest.retireEntryLocked(removed);
             }
@@ -3050,6 +3074,14 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn pruneStaleWriteCacheLocked(self: *ProvisionedTableWriteSource) void {
         const pruneCache = struct {
             fn run(write_source: *ProvisionedTableWriteSource, cache: *ProvisionedTableWriteCache) void {
+                var leased_retirements: usize = 0;
+                for (cache.entries.items) |entry| {
+                    const current_generation = write_source.lsmRootGeneration(entry.group_id);
+                    if (entry.lsm_root_generation == current_generation) continue;
+                    if (entry.active_leases > 0) leased_retirements += 1;
+                }
+                cache.retired_entries.ensureUnusedCapacity(cache.alloc, leased_retirements) catch return;
+
                 var i: usize = 0;
                 while (i < cache.entries.items.len) {
                     const entry = cache.entries.items[i];
@@ -5248,6 +5280,14 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.isWriteCacheDirtyForTable(table_name)) {
             _ = try cache.finishExpiredAutoBulkIngestLocked(platform_time.monotonicNs());
         }
+
+        var leased_retirements: usize = 0;
+        for (cache.entries.items) |entry| {
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.lsm_root_generation == self.lsmRootGeneration(entry.group_id)) continue;
+            if (entry.active_leases > 0) leased_retirements += 1;
+        }
+        try cache.retired_entries.ensureUnusedCapacity(cache.alloc, leased_retirements);
 
         var i: usize = 0;
         while (i < cache.entries.items.len) {
@@ -16629,6 +16669,69 @@ test "write cache invalidation retires leased entry until release" {
     try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
 
     cached.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+}
+
+test "write cache reserves retirement slots when pruning multiple leased generations" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-retire-multiple-stale", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var gen0 = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    var gen1 = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 1, "docs");
+    var gen2 = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 2, "docs");
+
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), write_cache.retired_entries.items.len);
+
+    gen0.deinit(alloc);
+    gen1.deinit(alloc);
+    gen2.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 

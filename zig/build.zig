@@ -3426,6 +3426,7 @@ pub fn build(b: *std.Build) void {
             "bound table write source backs up and restores a local table",
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned restore repair open rejects stale doc identity namespace",
+            "write cache reserves retirement slots when pruning multiple leased generations",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
