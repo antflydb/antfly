@@ -5347,7 +5347,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                 if (session_barriers_suppressed) {
                     cb.decoderRuntimePopPlannedComputeBarrierSuppression() catch |err| {
                         if (glinerTraceMetalStages()) std.debug.print("gliner_session_trace: stage=session_frame_pop_barrier_suppression err={s} action=ignored\n", .{@errorName(err)});
-                        if (err != error.SubmissionFailed) return err;
+                        if (err != error.PlannedBarrierSuppressionNotActive) return err;
                     };
                     session_barriers_suppressed = false;
                 }

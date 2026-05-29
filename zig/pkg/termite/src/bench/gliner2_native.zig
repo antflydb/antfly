@@ -104,6 +104,10 @@ fn glinerSuppressPlannedComputeBarriers() bool {
     return !platform.env.getenvBool("TERMITE_METAL_GLINER_KEEP_PLANNED_COMPUTE_BARRIERS");
 }
 
+fn glinerTraceMetalStages() bool {
+    return platform.env.getenvBool("TERMITE_METAL_TRACE_GLINER_STAGES");
+}
+
 fn parseArgs(init: std.process.Init) !BenchConfig {
     var cfg = BenchConfig{};
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);
@@ -893,7 +897,10 @@ fn runForwardTimed(
 
     if (session_frame_active) {
         if (session_barriers_suppressed) {
-            try cb.decoderRuntimePopPlannedComputeBarrierSuppression();
+            cb.decoderRuntimePopPlannedComputeBarrierSuppression() catch |err| {
+                if (glinerTraceMetalStages()) std.debug.print("bench gliner2: session frame pop barrier suppression failed: {s}; ignoring\n", .{@errorName(err)});
+                if (err != error.PlannedBarrierSuppressionNotActive) return err;
+            };
             session_barriers_suppressed = false;
         }
         try cb.decoderRuntimeSubmitAndWaitFrame();

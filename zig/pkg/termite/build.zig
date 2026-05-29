@@ -467,6 +467,7 @@ pub fn build(b: *std.Build) void {
     gliner2_bench_exe.root_module.addImport("termite_audio", termite_audio_mod);
     gliner2_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     gliner2_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    gliner2_bench_exe.root_module.addImport("antfly_platform", platform_mod);
     gliner2_bench_exe.root_module.addImport("termite_internal", termite_internal_mod);
     configureNativeTool(b, gliner2_bench_exe, target, enable_system_blas, blas_root, enable_mlx, effective_mlx_root, enable_metal);
     configureOnnxRuntime(b, gliner2_bench_exe.root_module, enable_onnx, effective_onnx_root);

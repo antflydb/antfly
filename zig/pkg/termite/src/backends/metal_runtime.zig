@@ -5847,6 +5847,7 @@ pub const FrameError = error{
     FrameNotActive,
     PlannedScopeActive,
     PlannedScopeNotActive,
+    PlannedBarrierSuppressionNotActive,
     SubmissionFailed,
     CommandBufferFailed,
 };
@@ -5955,6 +5956,7 @@ pub fn popPlannedComputeBarrierSuppression(runtime: ?*RawMetalDecodeRuntime) Fra
     return switch (termite_metal_decode_runtime_pop_planned_compute_barrier_suppression(runtime)) {
         0 => {},
         -1 => FrameError.RuntimeUnavailable,
+        -2 => FrameError.PlannedBarrierSuppressionNotActive,
         else => FrameError.SubmissionFailed,
     };
 }
