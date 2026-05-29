@@ -425,9 +425,13 @@ const AntflyRootImports = struct {
     common_openapi: *std.Build.Module,
     generating_openapi: *std.Build.Module,
     reranking_openapi: *std.Build.Module,
+    extraction_openapi: *std.Build.Module,
     transcribing: *std.Build.Module,
+    readers: *std.Build.Module,
+    extracting: *std.Build.Module,
     synthesizing: *std.Build.Module,
     httpx: *std.Build.Module,
+    google: *std.Build.Module,
     objectstore: *std.Build.Module,
     bloom: *std.Build.Module,
     vector: *std.Build.Module,
@@ -482,9 +486,13 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_common_openapi", .field = "common_openapi" },
         .{ .name = "antfly_generating_openapi", .field = "generating_openapi" },
         .{ .name = "antfly_reranking_openapi", .field = "reranking_openapi" },
+        .{ .name = "antfly_extraction_openapi", .field = "extraction_openapi" },
         .{ .name = "antfly_transcribing", .field = "transcribing" },
+        .{ .name = "antfly_readers", .field = "readers" },
+        .{ .name = "antfly_extracting", .field = "extracting" },
         .{ .name = "antfly_synthesizing", .field = "synthesizing" },
         .{ .name = "httpx", .field = "httpx" },
+        .{ .name = "antfly_google", .field = "google" },
         .{ .name = "objectstore", .field = "objectstore" },
         .{ .name = "bloom", .field = "bloom" },
         .{ .name = "antfly_vector", .field = "vector" },
@@ -726,12 +734,18 @@ fn addYamlOpenApiModule(
 
 fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
     const check = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{"--compare"});
+    check.addFileInput(b.path("../scripts/openapi_joiner.py"));
+    check.addFileInput(b.path("../specs/openapi/antfly/metadata.yaml"));
+    check.addFileInput(b.path("../specs/openapi/antfly/usermgr.yaml"));
     check.addFileArg(b.path("../openapi.yaml"));
     return check;
 }
 
 fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--joined-only"});
+    join.addFileInput(b.path("../scripts/openapi_joiner.py"));
+    join.addFileInput(b.path("../specs/openapi/antfly/metadata.yaml"));
+    join.addFileInput(b.path("../specs/openapi/antfly/usermgr.yaml"));
     return join.addOutputFileArg("openapi.public.joined.yaml");
 }
 
@@ -992,11 +1006,19 @@ fn addOpenApiRegenStep(
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/generating/openapi.yaml"), "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/reranking/openapi.yaml"), "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/ai/messages.yaml"), "antfly_ai_messages_openapi", antfly_generated_root ++ "/antfly_ai_messages_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/ai/extraction.yaml"), "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi", "types", &.{
+            .{ "../ai/messages.yaml", "antfly_ai_messages_openapi" },
+        }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/ai/openapi.yaml"), "antfly_ai_openapi", antfly_generated_root ++ "/antfly_ai_openapi", "types", &.{
             .{ "../../../generating/openapi.yaml", "antfly_generating_openapi" },
             .{ "../websearch/openapi.yaml", "antfly_websearch_openapi" },
+            .{ "../../../../../specs/openapi/ai/messages.yaml", "antfly_ai_messages_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/termite/api.yaml"), "termite_api", termite_generated_root ++ "/termite_api", "types,server", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/termite/api.yaml"), "termite_api", termite_generated_root ++ "/termite_api", "types,server", &.{
+            .{ "../ai/messages.yaml", "antfly_ai_messages_openapi" },
+            .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
+        }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
     };
 
@@ -1143,7 +1165,10 @@ pub fn build(b: *std.Build) void {
     const common_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi");
     const generating_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi");
     const reranking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi");
+    const ai_messages_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_ai_messages_openapi", antfly_generated_root ++ "/antfly_ai_messages_openapi");
+    const extraction_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi");
     const ai_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_ai_openapi", antfly_generated_root ++ "/antfly_ai_openapi");
+    extraction_openapi_mod.addImport("antfly_ai_messages_openapi", ai_messages_openapi_mod);
     indexes_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     indexes_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     indexes_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
@@ -1151,6 +1176,7 @@ pub fn build(b: *std.Build) void {
     eval_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     ai_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     ai_openapi_mod.addImport("antfly_websearch_openapi", websearch_openapi_mod);
+    ai_openapi_mod.addImport("antfly_ai_messages_openapi", ai_messages_openapi_mod);
     public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     public_openapi_mod.addImport("antfly_ai_openapi", ai_openapi_mod);
@@ -1212,15 +1238,31 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const google_mod = b.createModule(.{
+        .root_source_file = b.path("lib/google/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    google_mod.addImport("httpx", httpx_mod);
+    google_mod.addImport("antfly_platform", platform_mod);
     objectstore_mod.addImport("httpx", httpx_mod);
     objectstore_mod.addImport("antfly_platform", platform_mod);
+    objectstore_mod.addImport("antfly_google", google_mod);
     const wasm_objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
+    const wasm_google_mod = b.createModule(.{
+        .root_source_file = b.path("lib/google/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_google_mod.addImport("httpx", httpx_mod);
+    wasm_google_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_objectstore_mod.addImport("httpx", httpx_mod);
     wasm_objectstore_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_objectstore_mod.addImport("antfly_google", wasm_google_mod);
     const bloom_mod = b.createModule(.{
         .root_source_file = b.path("lib/bloom/src/mod.zig"),
         .target = target,
@@ -1274,6 +1316,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    usermgr_mod.link_libc = link_libc;
     usermgr_mod.addImport("antfly_casbin", casbin_mod);
     usermgr_mod.addImport("usermgr_storage", storage_mod);
     const wasm_bloom_mod = b.createModule(.{
@@ -1355,6 +1398,13 @@ pub fn build(b: *std.Build) void {
     });
     reranking_mod.addImport("antfly-json", json_mod);
     reranking_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
+    const extracting_mod = b.createModule(.{
+        .root_source_file = b.path("lib/extracting/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    extracting_mod.addImport("httpx", httpx_mod);
+    extracting_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
 
     // Inference dependencies
     const openai_api_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "openai_api", antfly_generated_root ++ "/openai_api", httpx_mod);
@@ -1467,6 +1517,7 @@ pub fn build(b: *std.Build) void {
             .platform = platform_mod,
             .vellum = vellum_mod,
             .scraping = scraping_mod,
+            .google = google_mod,
             .objectstore = objectstore_mod,
             .regex = regex_mod,
             .jsonschema = jsonschema_mod,
@@ -1483,6 +1534,8 @@ pub fn build(b: *std.Build) void {
     });
     const termite_build_options_mod = termite_graph.build_options_mod;
     const termite_api_mod = termite_graph.termite_api_mod;
+    termite_api_mod.addImport("antfly_ai_messages_openapi", ai_messages_openapi_mod);
+    termite_api_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     const termite_hf_tokenizer_mod = termite_graph.termite_hf_tokenizer_mod;
     const termite_fixed_tokenizer_data_mod = termite_graph.termite_fixed_tokenizer_data_mod;
     const termite_chunker_mod = termite_graph.termite_chunker_mod;
@@ -1497,6 +1550,18 @@ pub fn build(b: *std.Build) void {
     transcribing_mod.addImport("httpx", httpx_mod);
     transcribing_mod.addImport("termite_api", termite_api_mod);
     transcribing_mod.addImport("antfly_scraping", scraping_mod);
+    transcribing_mod.addImport("antfly_google", google_mod);
+    const readers_mod = b.createModule(.{
+        .root_source_file = b.path("lib/readers/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    readers_mod.addImport("httpx", httpx_mod);
+    readers_mod.addImport("termite_api", termite_api_mod);
+    readers_mod.addImport("antfly_google", google_mod);
+    termite_server_mod.addImport("antfly_readers", readers_mod);
+    termite_server_mod.addImport("antfly_transcribing", transcribing_mod);
+    termite_server_mod.addImport("antfly_extracting", extracting_mod);
     const synthesizing_mod = b.createModule(.{
         .root_source_file = b.path("lib/synthesizing/src/mod.zig"),
         .target = target,
@@ -1533,9 +1598,13 @@ pub fn build(b: *std.Build) void {
         .common_openapi = common_openapi_mod,
         .generating_openapi = generating_openapi_mod,
         .reranking_openapi = reranking_openapi_mod,
+        .extraction_openapi = extraction_openapi_mod,
         .transcribing = transcribing_mod,
+        .readers = readers_mod,
+        .extracting = extracting_mod,
         .synthesizing = synthesizing_mod,
         .httpx = httpx_mod,
+        .google = google_mod,
         .objectstore = objectstore_mod,
         .bloom = bloom_mod,
         .vector = vector_mod,
@@ -2116,6 +2185,20 @@ pub fn build(b: *std.Build) void {
     const lib_chunking_test_step = b.step("lib-chunking-test", "Run standalone lib/chunking tests");
     lib_chunking_test_step.dependOn(&run_lib_chunking_tests.step);
 
+    const lib_readers_tests = b.addTest(.{
+        .root_module = readers_mod,
+    });
+    const run_lib_readers_tests = b.addRunArtifact(lib_readers_tests);
+    const lib_readers_test_step = b.step("lib-readers-test", "Run standalone lib/readers tests");
+    lib_readers_test_step.dependOn(&run_lib_readers_tests.step);
+
+    const lib_extracting_tests = b.addTest(.{
+        .root_module = extracting_mod,
+    });
+    const run_lib_extracting_tests = b.addRunArtifact(lib_extracting_tests);
+    const lib_extracting_test_step = b.step("lib-extracting-test", "Run standalone lib/extracting tests");
+    lib_extracting_test_step.dependOn(&run_lib_extracting_tests.step);
+
     const image_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/image_test_root.zig"),
         .target = target,
@@ -2374,7 +2457,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"generating backend factory executes fallback chain across providers"},
+        .filters = &.{ "generating backend factory executes fallback chain across providers", "asset producer runtime" },
     });
     const run_lib_generating_runtime_tests = b.addRunArtifact(lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
@@ -2632,6 +2715,7 @@ pub fn build(b: *std.Build) void {
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime status refresh budget reuses cached group status instead of opening db",
         "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
+        "data runtime keeps status refresh dirty for non-startup async index work",
         "data runtime runRound does not refresh provisioned replica root inline while worker is active",
         "data runtime data changes mark provisioned startup catch-up dirty",
         "data runtime structural changes preserve writer-published runtime status",
@@ -3342,6 +3426,7 @@ pub fn build(b: *std.Build) void {
             "bound table write source backs up and restores a local table",
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned restore repair open rejects stale doc identity namespace",
+            "write cache reserves retirement slots when pruning multiple leased generations",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3661,8 +3746,13 @@ pub fn build(b: *std.Build) void {
         .root_module = audio_test_mod,
     });
     const run_lib_audio_tests = b.addRunArtifact(lib_audio_tests);
+    const lib_transcribing_tests = b.addTest(.{
+        .root_module = transcribing_mod,
+    });
+    const run_lib_transcribing_tests = b.addRunArtifact(lib_transcribing_tests);
     const lib_audio_test_step = b.step("lib-audio-test", "Run audio transcribing and synthesizing runtime tests");
     lib_audio_test_step.dependOn(&run_lib_audio_tests.step);
+    lib_audio_test_step.dependOn(&run_lib_transcribing_tests.step);
 
     const lib_audio_xiph_conformance = b.addExecutable(.{
         .name = "lib-audio-xiph-conformance",

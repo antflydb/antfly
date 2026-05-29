@@ -15,11 +15,7 @@
         "total_hits": 1,
         "hits": [
           {
-            "id": "paper:2",
-            "stored_data": {
-              "title": "advanced",
-              "body": "graph retrieval"
-            }
+            "id": "paper:2"
           }
         ]
       }

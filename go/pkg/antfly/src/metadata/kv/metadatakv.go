@@ -281,9 +281,10 @@ func (s *metadataKV) getPebbleOpts() (*pebble.Options, error) {
 	pebbleOpts := &pebble.Options{
 		Logger: &logger.NoopLoggerAndTracer{},
 		// Metadata KV is small control-plane state. It does not benefit materially
-		// from Pebble's async table-stats collector, and disabling it avoids
-		// shutdown races in short-lived/restarted test nodes.
-		DisableTableStats: true,
+		// from Pebble's async table-stats collector or automatic compaction, and
+		// disabling both avoids shutdown races in short-lived/restarted test nodes.
+		DisableTableStats:           true,
+		DisableAutomaticCompactions: true,
 	}
 	s.cache.Apply(pebbleOpts, 64<<20) // 64MB fallback
 	if s.antflyConfig.GetMetadataStorageType() == "s3" {

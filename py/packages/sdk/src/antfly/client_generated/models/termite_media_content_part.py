@@ -7,29 +7,35 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.termite_media_content_part_type import TermiteMediaContentPartType
+from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="TermiteMediaContentPart")
 
 
 @_attrs_define
 class TermiteMediaContentPart:
-    """Inline binary media content (audio, image, etc.)
+    """Binary or URL media content for providers that support non-image media parts.
 
     Attributes:
         type_ (TermiteMediaContentPartType):
-        data (str): Base64-encoded binary data
-        mime_type (str): MIME type (audio/wav, image/gif, image/png, etc.)
+        data (str | Unset): Base64-encoded binary data. Use either data or url.
+        url (str | Unset): URL or data URI media reference. Use either url or data.
+        mime_type (str | Unset): MIME type such as image/png, audio/wav, or application/pdf. Required with data and
+            optional with url when the URL can resolve content type.
     """
 
     type_: TermiteMediaContentPartType
-    data: str
-    mime_type: str
+    data: str | Unset = UNSET
+    url: str | Unset = UNSET
+    mime_type: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         type_ = self.type_.value
 
         data = self.data
+
+        url = self.url
 
         mime_type = self.mime_type
 
@@ -38,10 +44,14 @@ class TermiteMediaContentPart:
         field_dict.update(
             {
                 "type": type_,
-                "data": data,
-                "mime_type": mime_type,
             }
         )
+        if data is not UNSET:
+            field_dict["data"] = data
+        if url is not UNSET:
+            field_dict["url"] = url
+        if mime_type is not UNSET:
+            field_dict["mime_type"] = mime_type
 
         return field_dict
 
@@ -50,13 +60,16 @@ class TermiteMediaContentPart:
         d = dict(src_dict)
         type_ = TermiteMediaContentPartType(d.pop("type"))
 
-        data = d.pop("data")
+        data = d.pop("data", UNSET)
 
-        mime_type = d.pop("mime_type")
+        url = d.pop("url", UNSET)
+
+        mime_type = d.pop("mime_type", UNSET)
 
         termite_media_content_part = cls(
             type_=type_,
             data=data,
+            url=url,
             mime_type=mime_type,
         )
 

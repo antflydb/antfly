@@ -11,10 +11,10 @@ T = TypeVar("T", bound="TermiteImageURL")
 
 @_attrs_define
 class TermiteImageURL:
-    """Image URL or data URI
+    """Image URL or data URI.
 
     Attributes:
-        url (str): URL or data URI (data:image/png;base64,...) Example: data:image/png;base64,iVBORw0KGgo....
+        url (str): URL or data URI such as data:image/png;base64,...
     """
 
     url: str

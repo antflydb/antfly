@@ -1,0 +1,135 @@
+openapi: 3.0.3
+info:
+  title: Antfly AI Message Schemas
+  version: "1.0.0"
+  description: Shared OpenAI-compatible chat/message schemas used by Antfly and Termite.
+paths: {}
+components:
+  schemas:
+    TextContentPart:
+      type: object
+      description: Text content part.
+      required:
+        - type
+        - text
+      properties:
+        type:
+          type: string
+          enum:
+            - text
+        text:
+          type: string
+          description: Text content.
+    ImageURL:
+      type: object
+      description: Image URL or data URI.
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          description: URL or data URI such as data:image/png;base64,...
+    ImageURLContentPart:
+      type: object
+      description: Image content in the OpenAI-compatible content part format.
+      required:
+        - type
+        - image_url
+      properties:
+        type:
+          type: string
+          enum:
+            - image_url
+        image_url:
+          $ref: "#/components/schemas/ImageURL"
+    MediaContentPart:
+      type: object
+      description: Binary or URL media content for providers that support non-image media parts.
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - media
+        data:
+          type: string
+          format: byte
+          description: Base64-encoded binary data. Use either data or url.
+        url:
+          type: string
+          description: URL or data URI media reference. Use either url or data.
+        mime_type:
+          type: string
+          description: MIME type such as image/png, audio/wav, or application/pdf. Required with data and optional with url when the URL can resolve content type.
+    ContentPart:
+      description: A multimodal content part.
+      oneOf:
+        - $ref: "#/components/schemas/TextContentPart"
+        - $ref: "#/components/schemas/ImageURLContentPart"
+        - $ref: "#/components/schemas/MediaContentPart"
+    ChatMessageContent:
+      description: "OpenAI-compatible message content: either text or an array of content parts."
+      oneOf:
+        - type: string
+          description: Text content.
+        - type: array
+          description: Multimodal content parts.
+          items:
+            $ref: "#/components/schemas/ContentPart"
+    ChatMessageRole:
+      type: string
+      enum:
+        - system
+        - user
+        - assistant
+        - tool
+      description: The role of a chat message sender.
+    ToolCallFunction:
+      type: object
+      description: The function called by a model tool call.
+      required:
+        - name
+        - arguments
+      properties:
+        name:
+          type: string
+          description: Function name.
+        arguments:
+          type: string
+          description: JSON string of function arguments.
+    ToolCall:
+      type: object
+      description: OpenAI-compatible assistant tool call.
+      required:
+        - id
+        - type
+        - function
+      properties:
+        id:
+          type: string
+          description: Tool call identifier.
+        type:
+          type: string
+          enum:
+            - function
+        function:
+          $ref: "#/components/schemas/ToolCallFunction"
+    ChatMessage:
+      type: object
+      description: OpenAI-compatible chat message.
+      required:
+        - role
+      properties:
+        role:
+          $ref: "#/components/schemas/ChatMessageRole"
+        content:
+          $ref: "#/components/schemas/ChatMessageContent"
+        tool_calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/ToolCall"
+          description: Assistant tool calls.
+        tool_call_id:
+          type: string
+          description: Tool call ID this tool message responds to.

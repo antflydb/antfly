@@ -2471,7 +2471,7 @@ fn buildGraphQueryBuilderRepairMessages(
         base_prompt;
     const out = try alloc.alloc(generating.ChatMessage, messages.len + 1);
     @memcpy(out[0..messages.len], messages);
-    out[messages.len] = .{ .role = .user, .content = repair_prompt };
+    out[messages.len] = .{ .role = .user, .content = .{ .text = repair_prompt } };
     return out;
 }
 
@@ -2486,6 +2486,8 @@ fn buildQueryBuilderGenerationChain(
 
 fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generating.GeneratorConfig {
     const provider: generating.Provider = switch (cfg.provider) {
+        .gemini => .gemini,
+        .vertex => .vertex,
         .openai => .openai,
         .ollama => .ollama,
         .termite => .termite,
@@ -2496,6 +2498,7 @@ fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generatin
     const url = switch (provider) {
         .termite => cfg.api_url orelse "",
         .antfly => "",
+        .gemini, .vertex => cfg.url orelse "",
         .openai, .ollama => cfg.url orelse return error.InvalidQueryBuilderGeneration,
         else => return error.UnsupportedQueryBuilderGeneration,
     };
@@ -2504,6 +2507,9 @@ fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generatin
         .model = model,
         .url = url,
         .api_key = cfg.api_key,
+        .project_id = cfg.project_id,
+        .location = cfg.location,
+        .credentials_path = cfg.credentials_path,
     };
 }
 
@@ -2539,8 +2545,8 @@ fn buildSemanticQueryBuilderMessages(
         .{ intent, if (hybrid_mode) "hybrid" else "semantic", if (hybrid_mode) "{ ... native Bleve query ... }" else "null" },
     );
     return try alloc.dupe(generating.ChatMessage, &[_]generating.ChatMessage{
-        .{ .role = .system, .content = system },
-        .{ .role = .user, .content = user },
+        .{ .role = .system, .content = .{ .text = system } },
+        .{ .role = .user, .content = .{ .text = user } },
     });
 }
 
@@ -2575,7 +2581,7 @@ fn buildSemanticQueryBuilderRepairMessages(
         base_prompt;
     const out = try alloc.alloc(generating.ChatMessage, messages.len + 1);
     @memcpy(out[0..messages.len], messages);
-    out[messages.len] = .{ .role = .user, .content = repair_prompt };
+    out[messages.len] = .{ .role = .user, .content = .{ .text = repair_prompt } };
     return out;
 }
 
@@ -2709,8 +2715,8 @@ fn buildBleveQueryBuilderMessages(
         .{intent},
     );
     return try alloc.dupe(generating.ChatMessage, &[_]generating.ChatMessage{
-        .{ .role = .system, .content = system },
-        .{ .role = .user, .content = user },
+        .{ .role = .system, .content = .{ .text = system } },
+        .{ .role = .user, .content = .{ .text = user } },
     });
 }
 
@@ -2743,7 +2749,7 @@ fn buildBleveQueryBuilderRepairMessages(
         base_prompt;
     const out = try alloc.alloc(generating.ChatMessage, messages.len + 1);
     @memcpy(out[0..messages.len], messages);
-    out[messages.len] = .{ .role = .user, .content = repair_prompt };
+    out[messages.len] = .{ .role = .user, .content = .{ .text = repair_prompt } };
     return out;
 }
 
@@ -2847,8 +2853,8 @@ fn buildGraphQueryBuilderMessages(
         .{intent},
     );
     return try alloc.dupe(generating.ChatMessage, &[_]generating.ChatMessage{
-        .{ .role = .system, .content = system },
-        .{ .role = .user, .content = user },
+        .{ .role = .system, .content = .{ .text = system } },
+        .{ .role = .user, .content = .{ .text = user } },
     });
 }
 

@@ -102,10 +102,38 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Install Playwright Browsers
+      - name: Cache Playwright Browsers
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('ts/pnpm-lock.yaml') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Install Playwright OS Dependencies
         working-directory: ts/apps/antfarm
         timeout-minutes: 10
-        run: DEBUG=pw:install,pw:download pnpm exec playwright install --with-deps chromium
+        run: |
+          set -euxo pipefail
+          time pnpm exec playwright install-deps chromium firefox
+
+      - name: Install Playwright Chromium
+        working-directory: ts/apps/antfarm
+        timeout-minutes: 10
+        run: |
+          set -euxo pipefail
+          time pnpm exec playwright install chromium
+        env:
+          DEBUG: pw:install
+
+      - name: Install Playwright Firefox
+        working-directory: ts/apps/antfarm
+        timeout-minutes: 10
+        run: |
+          set -euxo pipefail
+          time pnpm exec playwright install firefox
+        env:
+          DEBUG: pw:install
 
       - name: Preview server
         working-directory: ts/apps/antfarm
@@ -117,7 +145,7 @@ jobs:
 
       - name: Run Playwright tests
         working-directory: ts/apps/antfarm
-        run: pnpm exec playwright test
+        run: pnpm exec playwright test --project=chromium --project=firefox --reporter=list
         env:
           BASE_URL: http://localhost:4173
 

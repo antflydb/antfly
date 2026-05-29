@@ -16,11 +16,13 @@ package ai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
 
+	aimessages "github.com/antflydb/antfly/go/pkg/antfly/lib/ai/messages"
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
 	"go.uber.org/zap"
@@ -39,6 +41,15 @@ const (
 	ToolNameFullTextSearch = ChatToolNameFullTextSearch
 	ToolNameTreeSearch     = ChatToolNameTreeSearch
 	ToolNameGraphSearch    = ChatToolNameGraphSearch
+)
+
+const (
+	ChatMessageRoleAssistant = aimessages.ChatMessageRoleAssistant
+	ChatMessageRoleSystem    = aimessages.ChatMessageRoleSystem
+	ChatMessageRoleTool      = aimessages.ChatMessageRoleTool
+	ChatMessageRoleUser      = aimessages.ChatMessageRoleUser
+
+	ToolCallTypeFunction = aimessages.ToolCallTypeFunction
 )
 
 // Static tool schemas for native tools (those that don't depend on runtime index names).
@@ -402,30 +413,26 @@ func ChatMessagesToGenKit(messages []ChatMessage) []*ai.Message {
 
 		var parts []*ai.Part
 
-		// Add text content
-		if msg.Content != "" {
-			parts = append(parts, ai.NewTextPart(msg.Content))
-		}
+		parts = append(parts, chatContentToGenKitParts(msg.Content)...)
 
 		// Add tool call parts for assistant messages
 		if msg.ToolCalls != nil {
 			for _, tc := range *msg.ToolCalls {
+				input := parseToolCallArguments(tc.Function.Arguments)
 				parts = append(parts, ai.NewToolRequestPart(&ai.ToolRequest{
-					Name:  tc.Name,
-					Input: any(tc.Arguments),
+					Name:  tc.Function.Name,
+					Input: input,
 					Ref:   tc.Id,
 				}))
 			}
 		}
 
-		// Add tool result parts for tool messages
-		if msg.ToolResults != nil {
-			for _, tr := range *msg.ToolResults {
-				parts = append(parts, ai.NewToolResponsePart(&ai.ToolResponse{
-					Output: any(tr.Result),
-					Ref:    tr.ToolCallId,
-				}))
-			}
+		if msg.Role == ChatMessageRoleTool && msg.ToolCallId != nil {
+			output := chatContentOutput(msg.Content)
+			parts = append(parts, ai.NewToolResponsePart(&ai.ToolResponse{
+				Output: output,
+				Ref:    *msg.ToolCallId,
+			}))
 		}
 
 		if len(parts) > 0 {
@@ -437,6 +444,161 @@ func ChatMessagesToGenKit(messages []ChatMessage) []*ai.Message {
 	}
 
 	return result
+}
+
+func chatContentToGenKitParts(content *ChatMessageContent) []*ai.Part {
+	if content == nil {
+		return nil
+	}
+	if text, err := content.AsChatMessageContent0(); err == nil {
+		if text == "" {
+			return nil
+		}
+		return []*ai.Part{ai.NewTextPart(text)}
+	}
+	contentParts, err := content.AsChatMessageContent1()
+	if err != nil {
+		return nil
+	}
+	parts := make([]*ai.Part, 0, len(contentParts))
+	for _, contentPart := range contentParts {
+		if textPart, err := contentPart.AsTextContentPart(); err == nil && textPart.Type == aimessages.TextContentPartTypeText && textPart.Text != "" {
+			parts = append(parts, ai.NewTextPart(textPart.Text))
+			continue
+		}
+		if imagePart, err := contentPart.AsImageURLContentPart(); err == nil && imagePart.Type == aimessages.ImageURLContentPartTypeImageUrl && imagePart.ImageUrl.Url != "" {
+			parts = append(parts, ai.NewMediaPart(contentTypeFromMediaURL(imagePart.ImageUrl.Url), imagePart.ImageUrl.Url))
+			continue
+		}
+		if mediaPart, err := contentPart.AsMediaContentPart(); err == nil && mediaPart.Type == aimessages.MediaContentPartTypeMedia {
+			if part := mediaContentPartToGenKit(mediaPart); part != nil {
+				parts = append(parts, part)
+			}
+		}
+	}
+	return parts
+}
+
+func mediaContentPartToGenKit(part aimessages.MediaContentPart) *ai.Part {
+	mimeType := ""
+	if part.MimeType != nil {
+		mimeType = *part.MimeType
+	}
+	if part.Url != nil && *part.Url != "" {
+		if mimeType == "" {
+			mimeType = contentTypeFromMediaURL(*part.Url)
+		}
+		return ai.NewMediaPart(mimeType, *part.Url)
+	}
+	if part.Data != nil && len(*part.Data) > 0 {
+		data := base64.StdEncoding.EncodeToString(*part.Data)
+		if mimeType != "" {
+			data = "data:" + mimeType + ";base64," + data
+		}
+		return ai.NewMediaPart(mimeType, data)
+	}
+	return nil
+}
+
+func contentTypeFromMediaURL(value string) string {
+	if !strings.HasPrefix(value, "data:") {
+		return ""
+	}
+	rest := strings.TrimPrefix(value, "data:")
+	if semi := strings.IndexByte(rest, ';'); semi >= 0 {
+		return rest[:semi]
+	}
+	if comma := strings.IndexByte(rest, ','); comma >= 0 {
+		return rest[:comma]
+	}
+	return ""
+}
+
+func chatContentOutput(content *ChatMessageContent) any {
+	if content == nil {
+		return map[string]any{}
+	}
+	if text, err := content.AsChatMessageContent0(); err == nil {
+		var decoded any
+		if json.Unmarshal([]byte(text), &decoded) == nil {
+			return decoded
+		}
+		return text
+	}
+	return chatContentToText(content)
+}
+
+func chatContentToText(content *ChatMessageContent) string {
+	if content == nil {
+		return ""
+	}
+	if text, err := content.AsChatMessageContent0(); err == nil {
+		return text
+	}
+	contentParts, err := content.AsChatMessageContent1()
+	if err != nil {
+		return ""
+	}
+	var builder strings.Builder
+	for _, contentPart := range contentParts {
+		if textPart, err := contentPart.AsTextContentPart(); err == nil && textPart.Type == aimessages.TextContentPartTypeText {
+			builder.WriteString(textPart.Text)
+		}
+	}
+	return builder.String()
+}
+
+func parseToolCallArguments(arguments string) any {
+	if arguments == "" {
+		return map[string]any{}
+	}
+	var decoded any
+	if json.Unmarshal([]byte(arguments), &decoded) == nil {
+		return decoded
+	}
+	return arguments
+}
+
+func newTextContent(text string) *ChatMessageContent {
+	return NewTextContent(text)
+}
+
+func NewTextContent(text string) *ChatMessageContent {
+	content := ChatMessageContent{}
+	if err := content.FromChatMessageContent0(text); err != nil {
+		return nil
+	}
+	return &content
+}
+
+func newToolOutputContent(output any) *ChatMessageContent {
+	switch value := output.(type) {
+	case nil:
+		return nil
+	case string:
+		return newTextContent(value)
+	default:
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return newTextContent(fmt.Sprint(value))
+		}
+		return newTextContent(string(encoded))
+	}
+}
+
+func toolCallArguments(input any) string {
+	switch value := input.(type) {
+	case nil:
+		return "{}"
+	case string:
+		return value
+	default:
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return "{}"
+		}
+		return string(encoded)
+	}
 }
 
 // GenKitToChatMessages converts GenKit ai.Message types back to Antfly ChatMessage types.
@@ -466,44 +628,37 @@ func GenKitToChatMessages(messages []*ai.Message) []ChatMessage {
 			Role: role,
 		}
 
-		// Extract text content and tool parts
+		var text strings.Builder
 		var toolCalls []ChatToolCall
-		var toolResults []ChatToolResult
 
 		for _, part := range msg.Content {
 			if part.Text != "" {
-				cm.Content += part.Text
+				text.WriteString(part.Text)
 			}
 			if part.IsToolRequest() {
 				tr := part.ToolRequest
-				args := make(map[string]any)
-				if input, ok := tr.Input.(map[string]any); ok {
-					args = input
-				}
 				toolCalls = append(toolCalls, ChatToolCall{
-					Id:        tr.Ref,
-					Name:      tr.Name,
-					Arguments: args,
+					Id: tr.Ref,
+					Function: aimessages.ToolCallFunction{
+						Name:      tr.Name,
+						Arguments: toolCallArguments(tr.Input),
+					},
+					Type: ToolCallTypeFunction,
 				})
 			}
 			if part.IsToolResponse() {
 				tr := part.ToolResponse
-				resultMap := make(map[string]any)
-				if output, ok := tr.Output.(map[string]any); ok {
-					resultMap = output
-				}
-				toolResults = append(toolResults, ChatToolResult{
-					ToolCallId: tr.Ref,
-					Result:     resultMap,
-				})
+				ref := tr.Ref
+				cm.ToolCallId = &ref
+				cm.Content = newToolOutputContent(tr.Output)
 			}
 		}
 
+		if text.Len() > 0 {
+			cm.Content = newTextContent(text.String())
+		}
 		if len(toolCalls) > 0 {
 			cm.ToolCalls = &toolCalls
-		}
-		if len(toolResults) > 0 {
-			cm.ToolResults = &toolResults
 		}
 
 		result = append(result, cm)

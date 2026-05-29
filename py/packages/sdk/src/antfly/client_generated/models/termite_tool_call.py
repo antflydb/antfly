@@ -9,7 +9,7 @@ from attrs import field as _attrs_field
 from ..models.termite_tool_call_type import TermiteToolCallType
 
 if TYPE_CHECKING:
-    from ..models.termite_tool_call_function import TermiteToolCallFunction
+    from ..models.tool_call_function import ToolCallFunction
 
 
 T = TypeVar("T", bound="TermiteToolCall")
@@ -17,17 +17,17 @@ T = TypeVar("T", bound="TermiteToolCall")
 
 @_attrs_define
 class TermiteToolCall:
-    """A tool call made by the model
+    """OpenAI-compatible assistant tool call.
 
     Attributes:
-        id (str): Unique identifier for this tool call Example: call_abc123.
-        type_ (TermiteToolCallType): The type of tool call (currently only "function")
-        function (TermiteToolCallFunction): The function called by the model
+        id (str): Tool call identifier.
+        type_ (TermiteToolCallType):
+        function (ToolCallFunction): The function called by a model tool call.
     """
 
     id: str
     type_: TermiteToolCallType
-    function: TermiteToolCallFunction
+    function: ToolCallFunction
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -51,14 +51,14 @@ class TermiteToolCall:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.termite_tool_call_function import TermiteToolCallFunction
+        from ..models.tool_call_function import ToolCallFunction
 
         d = dict(src_dict)
         id = d.pop("id")
 
         type_ = TermiteToolCallType(d.pop("type"))
 
-        function = TermiteToolCallFunction.from_dict(d.pop("function"))
+        function = ToolCallFunction.from_dict(d.pop("function"))
 
         termite_tool_call = cls(
             id=id,

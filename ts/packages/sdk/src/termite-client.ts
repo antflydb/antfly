@@ -249,12 +249,14 @@ export class TermiteClient {
     texts: string[],
     options?: { labels?: string[]; relationLabels?: string[] }
   ): Promise<RecognizeResponse> {
-    const { data, error } = await this.client.POST("/ml/v1/recognize", {
+    const { data, error } = await this.client.POST("/ml/v1/extract", {
       body: {
         model,
-        texts,
-        labels: options?.labels,
-        relation_labels: options?.relationLabels,
+        inputs: texts.map((content, index) => ({ id: String(index), content })),
+        schema: {
+          entities: options?.labels,
+          relations: options?.relationLabels?.map((type) => ({ type })),
+        },
       },
     });
     if (error) throw new Error(`Recognize failed: ${error.error}`);
@@ -294,12 +296,14 @@ export class TermiteClient {
     const { data, error } = await this.client.POST("/ml/v1/extract", {
       body: {
         model,
-        texts,
-        schema,
-        threshold: options?.threshold,
-        flat_ner: options?.flatNer,
-        include_confidence: options?.includeConfidence,
-        include_spans: options?.includeSpans,
+        inputs: texts.map((content, index) => ({ id: String(index), content })),
+        schema: { structures: structureSchema(schema) },
+        options: {
+          threshold: options?.threshold,
+          flat_ner: options?.flatNer,
+          include_confidence: options?.includeConfidence,
+          include_spans: options?.includeSpans,
+        },
       },
     });
     if (error) throw new Error(`Extract failed: ${error.error}`);
@@ -418,6 +422,25 @@ export class TermiteClient {
   getRawClient() {
     return this.client;
   }
+}
+
+function structureSchema(schema: Record<string, string[]>) {
+  return Object.fromEntries(
+    Object.entries(schema).map(([name, fields]) => [
+      name,
+      {
+        fields: Object.fromEntries(fields.map((field) => parseStructureField(field))),
+      },
+    ])
+  );
+}
+
+function parseStructureField(field: string): [string, string] {
+  const parts = field.split("::");
+  const name = parts[0]?.trim();
+  if (!name) throw new Error(`Invalid extraction field: ${field}`);
+  const kind = parts[1]?.trim();
+  return [name, kind === "list" ? "list" : "str"];
 }
 
 function normalizeBaseUrl(baseUrl: string): string {

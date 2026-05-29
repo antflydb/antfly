@@ -107,6 +107,11 @@ jobs:
             go/pkg/sdk/query/query.gen.go)"
           if [ -n "$status" ]; then
             echo "$status"
+            git diff -- \
+              openapi.yaml \
+              go/pkg/sdk/oapi/client.gen.go \
+              go/pkg/sdk/oapi/validate.go \
+              go/pkg/sdk/query/query.gen.go
             exit 1
           fi
 
@@ -236,8 +241,10 @@ jobs:
         run: cd go/pkg/termite && GOWORK=off go test -v -tags="onnx,ORT,xla,XLA" ./...
 
   sim-validate:
-    # Temporarily disabled while heavy runners are constrained.
-    if: vars.ENABLE_GO_SIM_VALIDATE == 'true'
+    # Temporarily disabled while simulator coverage is migrated/stabilized.
+    # Keep the job definition here so it can be re-enabled without rebuilding
+    # the runner setup from scratch. Set either opt-in variable to true to run it.
+    if: ${{ vars.ENABLE_GO_SIM_CI == 'true' || vars.ENABLE_GO_SIM_VALIDATE == 'true' }}
     runs-on: arc-antfly-heavy
     # sim-validate runs `go test ./go/pkg/antfly/src/sim` under a wrapper; on the 4-cpu
     # standard runner with no /mnt/cache, it tipped past the 10Gi ephemeral

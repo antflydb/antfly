@@ -17,13 +17,13 @@ export type Chunk = components["schemas"]["TermiteChunk"];
 export type RerankRequest = components["schemas"]["TermiteRerankRequest"];
 export type RerankResponse = components["schemas"]["TermiteRerankResponse"];
 
-export type RecognizeRequest = components["schemas"]["TermiteRecognizeRequest"];
-export type RecognizeResponse = components["schemas"]["TermiteRecognizeResponse"];
-export type RecognizeEntity = components["schemas"]["TermiteRecognizeEntity"];
+export type RecognizeRequest = components["schemas"]["ExtractionRequest"];
+export type RecognizeResponse = components["schemas"]["ExtractionResponse"];
+export type RecognizeEntity = components["schemas"]["ExtractionEntity"];
 
-export type ExtractRequest = components["schemas"]["TermiteExtractRequest"];
-export type ExtractResponse = components["schemas"]["TermiteExtractResponse"];
-export type ExtractFieldValue = components["schemas"]["TermiteExtractFieldValue"];
+export type ExtractRequest = components["schemas"]["ExtractionRequest"];
+export type ExtractResponse = components["schemas"]["ExtractionResponse"];
+export type ExtractFieldValue = unknown;
 
 export type RewriteRequest = components["schemas"]["TermiteRewriteRequest"];
 export type RewriteResponse = components["schemas"]["TermiteRewriteResponse"];

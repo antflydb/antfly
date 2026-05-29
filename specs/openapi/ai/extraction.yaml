@@ -1,0 +1,264 @@
+openapi: 3.0.3
+info:
+  title: Antfly AI Extraction Schemas
+  version: "1.0.0"
+  description: Shared schema-driven extraction request and response types.
+paths: {}
+components:
+  schemas:
+    ExtractionProvider:
+      type: string
+      enum:
+        - antfly
+        - termite
+        - pioneer
+        - openai
+        - mock
+    ExtractionConfig:
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          $ref: "#/components/schemas/ExtractionProvider"
+        model:
+          type: string
+        url:
+          type: string
+        api_url:
+          type: string
+        api_key:
+          type: string
+        bearer_token:
+          type: string
+        schema:
+          $ref: "#/components/schemas/ExtractionSchema"
+        options:
+          $ref: "#/components/schemas/ExtractionOptions"
+    ExtractionInput:
+      type: object
+      required:
+        - content
+      properties:
+        id:
+          type: string
+        content:
+          $ref: "../ai/messages.yaml#/components/schemas/ChatMessageContent"
+        tokens:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractionToken"
+        metadata:
+          type: object
+          additionalProperties: true
+    ExtractionToken:
+      type: object
+      required:
+        - text
+      properties:
+        text:
+          type: string
+        box:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: integer
+    ExtractionRelationSchema:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+        source:
+          type: string
+        target:
+          type: string
+    ExtractionClassificationSchema:
+      type: object
+      required:
+        - name
+        - labels
+      properties:
+        name:
+          type: string
+        labels:
+          type: array
+          items:
+            type: string
+        multi_label:
+          type: boolean
+          default: false
+    ExtractionStructureField:
+      oneOf:
+        - type: string
+        - type: object
+          additionalProperties: true
+    ExtractionStructureSchema:
+      type: object
+      properties:
+        fields:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/ExtractionStructureField"
+      additionalProperties: true
+    ExtractionSchema:
+      type: object
+      properties:
+        entities:
+          type: array
+          items:
+            type: string
+        relations:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractionRelationSchema"
+        classifications:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractionClassificationSchema"
+        structures:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/ExtractionStructureSchema"
+      additionalProperties: true
+    ExtractionReaderOptions:
+      type: object
+      properties:
+        provider:
+          type: string
+        model:
+          type: string
+        url:
+          type: string
+        api_url:
+          type: string
+      additionalProperties: true
+    ExtractionOptions:
+      type: object
+      properties:
+        threshold:
+          type: number
+          format: float
+        flat_ner:
+          type: boolean
+        include_confidence:
+          type: boolean
+        include_spans:
+          type: boolean
+        reader:
+          $ref: "#/components/schemas/ExtractionReaderOptions"
+      additionalProperties: true
+    ExtractionRequest:
+      type: object
+      required:
+        - model
+        - inputs
+        - schema
+      properties:
+        model:
+          type: string
+        inputs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractionInput"
+        schema:
+          $ref: "#/components/schemas/ExtractionSchema"
+        options:
+          $ref: "#/components/schemas/ExtractionOptions"
+    ExtractionEntity:
+      type: object
+      required:
+        - label
+        - text
+      properties:
+        label:
+          type: string
+        text:
+          type: string
+        start:
+          type: integer
+        end:
+          type: integer
+        score:
+          type: number
+          format: float
+    ExtractionRelationEndpoint:
+      type: object
+      properties:
+        entity_index:
+          type: integer
+        id:
+          type: string
+      additionalProperties: true
+    ExtractionRelation:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+        source:
+          $ref: "#/components/schemas/ExtractionRelationEndpoint"
+        target:
+          $ref: "#/components/schemas/ExtractionRelationEndpoint"
+        score:
+          type: number
+          format: float
+      additionalProperties: true
+    ExtractionClassification:
+      type: object
+      required:
+        - name
+        - label
+      properties:
+        name:
+          type: string
+        label:
+          type: string
+        score:
+          type: number
+          format: float
+      additionalProperties: true
+    ExtractionObject:
+      type: object
+      properties:
+        id:
+          type: string
+        entities:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractionEntity"
+        relations:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractionRelation"
+        classifications:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractionClassification"
+        structures:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+    ExtractionResponse:
+      type: object
+      required:
+        - object
+        - model
+        - data
+      properties:
+        object:
+          type: string
+          enum:
+            - extraction
+        model:
+          type: string
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtractionObject"
+        usage:
+          type: object
+          additionalProperties: true

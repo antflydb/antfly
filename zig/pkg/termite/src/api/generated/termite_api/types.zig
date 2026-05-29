@@ -2,33 +2,22 @@
 // Package: termite_api
 
 const std = @import("std");
+const antfly_ai_messages_openapi = @import("antfly_ai_messages_openapi");
 
 pub const Error = struct {
     /// Error message
     @"error": []const u8,
 };
 
-/// Text content for embedding
-pub const TextContentPart = struct {
-    type: []const u8,
-    /// Text content to embed
-    text: []const u8,
-};
+pub const TextContentPart = antfly_ai_messages_openapi.TextContentPart;
 
-/// Image URL or data URI
-pub const ImageURL = struct {
-    /// URL or data URI (data:image/png;base64,...)
-    url: []const u8,
-};
+pub const ImageURL = antfly_ai_messages_openapi.ImageURL;
 
-/// Inline binary media content (audio, image, etc.)
-pub const MediaContentPart = struct {
-    type: []const u8,
-    /// Base64-encoded binary data
-    data: []const u8,
-    /// MIME type (audio/wav, image/gif, image/png, etc.)
-    mime_type: []const u8,
-};
+pub const ImageURLContentPart = antfly_ai_messages_openapi.ImageURLContentPart;
+
+pub const MediaContentPart = antfly_ai_messages_openapi.MediaContentPart;
+
+pub const ContentPart = antfly_ai_messages_openapi.ContentPart;
 
 /// A sparse vector with parallel index/value arrays, sorted by index ascending
 pub const SparseVector = struct {
@@ -252,48 +241,14 @@ pub const FunctionDefinition = struct {
     strict: ?bool = null,
 };
 
-/// The function called by the model
-pub const ToolCallFunction = struct {
-    /// The name of the function called
-    name: []const u8,
-    /// JSON string of the arguments to the function
-    arguments: []const u8,
-};
+pub const ToolCall = antfly_ai_messages_openapi.ToolCall;
+
+pub const ToolCallFunction = antfly_ai_messages_openapi.ToolCallFunction;
 
 /// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
 pub const ToolChoice = std.json.Value;
 
-/// The role of a message sender in a conversation
-pub const Role = enum {
-    system,
-    user,
-    assistant,
-    tool,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .system => "system",
-            .user => "user",
-            .assistant => "assistant",
-            .tool => "tool",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "system", .system },
-            .{ "user", .user },
-            .{ "assistant", .assistant },
-            .{ "tool", .tool },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
+pub const Role = antfly_ai_messages_openapi.ChatMessageRole;
 
 /// Reason why generation stopped
 pub const FinishReason = enum {
@@ -329,6 +284,10 @@ pub const FinishReason = enum {
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
+
+pub const ChatMessageContent = antfly_ai_messages_openapi.ChatMessageContent;
+
+pub const ChatMessage = antfly_ai_messages_openapi.ChatMessage;
 
 pub const GenerateJsonSchemaConfig = struct {
     /// Schema name
@@ -503,12 +462,6 @@ pub const EmbeddingUsage = struct {
     total_tokens: i64,
 };
 
-/// Image content for embedding (OpenAI-compatible format)
-pub const ImageURLContentPart = struct {
-    type: []const u8,
-    image_url: ImageURL,
-};
-
 /// Exactly one of `texts` or `images` must be provided. When using `images`, the server selects a compatible reader internally and processes the request as: read document text -> run structured extraction.
 pub const ExtractRequest = struct {
     /// Name of extractor model with 'extraction' capability
@@ -542,6 +495,22 @@ pub const ReadRequest = struct {
     prompt: ?[]const u8 = null,
     /// Maximum tokens to generate
     max_tokens: ?i64 = null,
+};
+
+/// OpenAI-compatible embedding request with Termite multimodal content-part extension
+pub const EmbedRequest = struct {
+    /// Model name to use for embedding generation
+    model: []const u8,
+    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
+    input: std.json.Value,
+    /// Encoding format for the embeddings (only "float" supported)
+    encoding_format: ?[]const u8 = null,
+    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
+    dimensions: ?i64 = null,
+    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+    task_type: ?[]const u8 = null,
+    /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
+    input_type: ?[]const u8 = null,
 };
 
 /// A single embedding result
@@ -663,13 +632,18 @@ pub const Tool = struct {
     function: FunctionDefinition,
 };
 
-/// A tool call made by the model
-pub const ToolCall = struct {
-    /// Unique identifier for this tool call
-    id: []const u8,
-    /// The type of tool call (currently only "function")
-    type: []const u8,
-    function: ToolCallFunction,
+pub const GenerateMessage = struct {
+    role: Role,
+    /// The generated message content (null when tool_calls is present)
+    content: ?[]const u8 = null,
+    /// Tool calls made by the model (only present when finish_reason is tool_calls)
+    tool_calls: ?[]const ToolCall = null,
+};
+
+pub const RerankMultimodalDocument = struct {
+    /// Optional caller-provided document identifier
+    id: ?[]const u8 = null,
+    content: ChatMessageContent,
 };
 
 pub const GenerateResponseFormat = struct {
@@ -776,62 +750,6 @@ pub const SchemasConfig = struct {
     style: ?Style = null,
 };
 
-/// A content part for multimodal input (text, image URL, or inline media)
-pub const ContentPart = union(enum) {
-    media_content_part: *MediaContentPart,
-    image_url_content_part: *ImageURLContentPart,
-    text_content_part: *TextContentPart,
-
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed.value;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "data",
-            "mime_type",
-        })) {
-            if (try parseStructuralVariant(MediaContentPart, allocator, source, options)) |parsed| return .{ .media_content_part = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "image_url",
-        })) {
-            if (try parseStructuralVariant(ImageURLContentPart, allocator, source, options)) |parsed| return .{ .image_url_content_part = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "text",
-        })) {
-            if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .media_content_part => |v| try jw.write(v.*),
-            .image_url_content_part => |v| try jw.write(v.*),
-            .text_content_part => |v| try jw.write(v.*),
-        }
-    }
-};
-
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
 pub const EmbedResponse = struct {
     /// Object type, always "list"
@@ -905,12 +823,69 @@ pub const ReadObject = struct {
     index: i64,
 };
 
-pub const GenerateMessage = struct {
-    role: Role,
-    /// The generated message content (null when tool_calls is present)
-    content: ?[]const u8 = null,
-    /// Tool calls made by the model (only present when finish_reason is tool_calls)
-    tool_calls: ?[]const ToolCall = null,
+pub const GenerateChoice = struct {
+    /// Index of this choice in the list
+    index: i64,
+    message: GenerateMessage,
+    finish_reason: FinishReason,
+    /// Log probability information (not supported, always null)
+    logprobs: ?std.json.Value = null,
+};
+
+pub const RerankMultimodalRequest = struct {
+    /// Name of multimodal reranking model from models_dir/rerankers/
+    model: []const u8,
+    /// Text query for relevance scoring
+    query: []const u8,
+    /// Documents expressed as text and image content parts
+    documents: []const RerankMultimodalDocument,
+};
+
+pub const GenerateRequest = struct {
+    /// Name of the generator model from models_dir/generators/
+    model: []const u8,
+    /// Conversation messages (OpenAI-compatible format)
+    messages: []const ChatMessage,
+    /// Maximum tokens to generate
+    max_tokens: ?i64 = null,
+    /// Sampling temperature (0.0 = deterministic, higher = more random)
+    temperature: ?f32 = null,
+    /// Nucleus sampling probability
+    top_p: ?f32 = null,
+    /// Top-k sampling (Termite extension, not in OpenAI API)
+    top_k: ?i64 = null,
+    /// If true, partial message deltas will be sent as SSE events
+    stream: ?bool = null,
+    /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
+    tools: ?[]const Tool = null,
+    /// Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to top_p.
+    min_p: ?f32 = null,
+    /// Repetition penalty factor applied to previously generated tokens (1.0 = disabled, >1.0 penalizes, <1.0 encourages)
+    repetition_penalty: ?f32 = null,
+    /// Additive penalty based on token frequency in context (logit -= frequency_penalty * count)
+    frequency_penalty: ?f32 = null,
+    /// Additive penalty for tokens that appeared at all in context (logit -= presence_penalty if count > 0)
+    presence_penalty: ?f32 = null,
+    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+    response_format: ?GenerateResponseFormat = null,
+    /// Termite-native grammar override. When set, this takes precedence over `response_format`. Grammar-constrained decoding is currently native-backend only.
+    grammar: ?[]const u8 = null,
+    /// Termite-native speculative decoding extension. Path or model identifier for a smaller draft model.
+    draft_model: ?[]const u8 = null,
+    /// Termite-native speculative decoding extension. Number of draft tokens proposed per verification round.
+    speculative_k: ?i64 = null,
+    /// Termite-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
+    cache_dtype: ?[]const u8 = null,
+    /// Termite-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+    cache_compaction_ratio: ?f32 = null,
+    /// Optional backend override for this request. `auto` keeps the node default behavior. `onnx` forces ONNX generation when the model/package supports it. `native`, `metal`, and `mlx` force the native host backend choice. `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and requires a PJRT plugin path via `TERMITE_XLA_PLUGIN`, `TERMITE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` to request WebGPU graph partition execution.
+    backend: ?[]const u8 = null,
+    /// Termite-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs Termite graph planning, partitioning, and backend executor attachment.
+    mode: ?[]const u8 = null,
+    /// Termite-native compiled graph target. `partitioned` attaches compiled executors to eligible graph partitions. `whole-model` requests a compiled backend only when it can own the full traced graph shape.
+    compiled_target: ?[]const u8 = null,
+    /// Controls how the model uses tools
+    tool_choice: ?ToolChoice = null,
 };
 
 /// Delta content for streaming
@@ -985,25 +960,6 @@ pub const Config = struct {
     log: ?SchemasConfig = null,
 };
 
-/// OpenAI-compatible embedding request with Termite multimodal content-part extension
-pub const EmbedRequest = struct {
-    /// Model name to use for embedding generation
-    model: []const u8,
-    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
-    input: std.json.Value,
-    /// Encoding format for the embeddings (only "float" supported)
-    encoding_format: ?[]const u8 = null,
-    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
-    dimensions: ?i64 = null,
-    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
-    task_type: ?[]const u8 = null,
-    /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
-    input_type: ?[]const u8 = null,
-};
-
-/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
-pub const ChatMessageContent = std.json.Value;
-
 pub const ChunkRequest = struct {
     /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` (backward compatible) - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
     input: ?std.json.Value = null,
@@ -1040,13 +996,19 @@ pub const ReadResponse = struct {
     usage: GenerateUsage,
 };
 
-pub const GenerateChoice = struct {
-    /// Index of this choice in the list
-    index: i64,
-    message: GenerateMessage,
-    finish_reason: FinishReason,
-    /// Log probability information (not supported, always null)
-    logprobs: ?std.json.Value = null,
+/// OpenAI-compatible chat completion response
+pub const GenerateResponse = struct {
+    /// A unique identifier for the chat completion
+    id: []const u8,
+    /// The object type, always "chat.completion"
+    object: []const u8,
+    /// Unix timestamp (seconds) when the completion was created
+    created: i64,
+    /// Model used for generation
+    model: []const u8,
+    /// List of completion choices (currently always 1)
+    choices: []const GenerateChoice,
+    usage: GenerateUsage,
 };
 
 pub const GenerateChunkChoice = struct {
@@ -1067,36 +1029,6 @@ pub const ChunkResponse = struct {
     cache_hit: bool,
 };
 
-pub const RerankMultimodalDocument = struct {
-    /// Optional caller-provided document identifier
-    id: ?[]const u8 = null,
-    content: ChatMessageContent,
-};
-
-pub const ChatMessage = struct {
-    role: Role,
-    content: ?ChatMessageContent = null,
-    /// Tool calls made by the assistant (only for role=assistant)
-    tool_calls: ?[]const ToolCall = null,
-    /// ID of the tool call this message is responding to (only for role=tool)
-    tool_call_id: ?[]const u8 = null,
-};
-
-/// OpenAI-compatible chat completion response
-pub const GenerateResponse = struct {
-    /// A unique identifier for the chat completion
-    id: []const u8,
-    /// The object type, always "chat.completion"
-    object: []const u8,
-    /// Unix timestamp (seconds) when the completion was created
-    created: i64,
-    /// Model used for generation
-    model: []const u8,
-    /// List of completion choices (currently always 1)
-    choices: []const GenerateChoice,
-    usage: GenerateUsage,
-};
-
 /// Streaming generation chunk (SSE event data)
 pub const GenerateChunk = struct {
     id: []const u8,
@@ -1104,60 +1036,4 @@ pub const GenerateChunk = struct {
     created: i64,
     model: []const u8,
     choices: []const GenerateChunkChoice,
-};
-
-pub const RerankMultimodalRequest = struct {
-    /// Name of multimodal reranking model from models_dir/rerankers/
-    model: []const u8,
-    /// Text query for relevance scoring
-    query: []const u8,
-    /// Documents expressed as text and image content parts
-    documents: []const RerankMultimodalDocument,
-};
-
-pub const GenerateRequest = struct {
-    /// Name of the generator model from models_dir/generators/
-    model: []const u8,
-    /// Conversation messages (OpenAI-compatible format)
-    messages: []const ChatMessage,
-    /// Maximum tokens to generate
-    max_tokens: ?i64 = null,
-    /// Sampling temperature (0.0 = deterministic, higher = more random)
-    temperature: ?f32 = null,
-    /// Nucleus sampling probability
-    top_p: ?f32 = null,
-    /// Top-k sampling (Termite extension, not in OpenAI API)
-    top_k: ?i64 = null,
-    /// If true, partial message deltas will be sent as SSE events
-    stream: ?bool = null,
-    /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
-    tools: ?[]const Tool = null,
-    /// Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to top_p.
-    min_p: ?f32 = null,
-    /// Repetition penalty factor applied to previously generated tokens (1.0 = disabled, >1.0 penalizes, <1.0 encourages)
-    repetition_penalty: ?f32 = null,
-    /// Additive penalty based on token frequency in context (logit -= frequency_penalty * count)
-    frequency_penalty: ?f32 = null,
-    /// Additive penalty for tokens that appeared at all in context (logit -= presence_penalty if count > 0)
-    presence_penalty: ?f32 = null,
-    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
-    response_format: ?GenerateResponseFormat = null,
-    /// Termite-native grammar override. When set, this takes precedence over `response_format`. Grammar-constrained decoding is currently native-backend only.
-    grammar: ?[]const u8 = null,
-    /// Termite-native speculative decoding extension. Path or model identifier for a smaller draft model.
-    draft_model: ?[]const u8 = null,
-    /// Termite-native speculative decoding extension. Number of draft tokens proposed per verification round.
-    speculative_k: ?i64 = null,
-    /// Termite-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
-    cache_dtype: ?[]const u8 = null,
-    /// Termite-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
-    cache_compaction_ratio: ?f32 = null,
-    /// Optional backend override for this request. `auto` keeps the node default behavior. `onnx` forces ONNX generation when the model/package supports it. `native`, `metal`, and `mlx` force the native host backend choice. `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and requires a PJRT plugin path via `TERMITE_XLA_PLUGIN`, `TERMITE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` to request WebGPU graph partition execution.
-    backend: ?[]const u8 = null,
-    /// Termite-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs Termite graph planning, partitioning, and backend executor attachment.
-    mode: ?[]const u8 = null,
-    /// Termite-native compiled graph target. `partitioned` attaches compiled executors to eligible graph partitions. `whole-model` requests a compiled backend only when it can own the full traced graph shape.
-    compiled_target: ?[]const u8 = null,
-    /// Controls how the model uses tools
-    tool_choice: ?ToolChoice = null,
 };

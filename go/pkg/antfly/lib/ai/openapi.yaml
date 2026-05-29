@@ -278,69 +278,16 @@ components:
     # Chat Agent Types - Conversational RAG with tool calling
 
     ChatMessageRole:
-      type: string
-      enum: ["user", "assistant", "system", "tool"]
-      description: "Role of the message sender in the conversation"
+      $ref: "../../../../../specs/openapi/ai/messages.yaml#/components/schemas/ChatMessageRole"
 
     ChatToolCall:
-      type: object
-      description: "A tool call made by the assistant"
-      required:
-        - id
-        - name
-        - arguments
-      properties:
-        id:
-          type: string
-          description: "Unique identifier for this tool call"
-        name:
-          type: string
-          description: "Name of the tool being called"
-        arguments:
-          type: object
-          additionalProperties: true
-          description: "Arguments passed to the tool as key-value pairs"
+      $ref: "../../../../../specs/openapi/ai/messages.yaml#/components/schemas/ToolCall"
 
-    ChatToolResult:
-      type: object
-      description: "Result from executing a tool call"
-      required:
-        - tool_call_id
-        - result
-      properties:
-        tool_call_id:
-          type: string
-          description: "ID of the tool call this result corresponds to"
-        result:
-          type: object
-          additionalProperties: true
-          description: "Result data from the tool execution"
-        error:
-          type: string
-          description: "Error message if tool execution failed"
+    ChatMessageContent:
+      $ref: "../../../../../specs/openapi/ai/messages.yaml#/components/schemas/ChatMessageContent"
 
     ChatMessage:
-      type: object
-      description: "A message in the conversation history"
-      required:
-        - role
-        - content
-      properties:
-        role:
-          $ref: "#/components/schemas/ChatMessageRole"
-        content:
-          type: string
-          description: "Text content of the message"
-        tool_calls:
-          type: array
-          items:
-            $ref: "#/components/schemas/ChatToolCall"
-          description: "Tool calls made by the assistant (only for assistant role)"
-        tool_results:
-          type: array
-          items:
-            $ref: "#/components/schemas/ChatToolResult"
-          description: "Results from tool executions (only for tool role)"
+      $ref: "../../../../../specs/openapi/ai/messages.yaml#/components/schemas/ChatMessage"
 
     ChatToolName:
       type: string

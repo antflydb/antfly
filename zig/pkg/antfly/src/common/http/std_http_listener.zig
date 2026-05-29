@@ -17,6 +17,7 @@ const std = @import("std");
 const common = @import("http_common.zig");
 
 pub const default_max_request_bytes: usize = 32 * 1024 * 1024;
+pub const default_request_stack_size: usize = 8 * 1024 * 1024;
 
 fn sleepMs(ms: u64) void {
     var req = std.posix.timespec{
@@ -38,9 +39,9 @@ pub const StdHttpListenerConfig = struct {
     recv_buffer_bytes: usize = 8 * 1024,
     send_buffer_bytes: usize = 8 * 1024,
     max_request_bytes: usize = default_max_request_bytes,
-    thread_stack_size: usize = 1 * 1024 * 1024,
+    thread_stack_size: usize = default_request_stack_size,
     serve_in_connection_threads: bool = false,
-    connection_thread_stack_size: usize = 256 * 1024,
+    connection_thread_stack_size: usize = default_request_stack_size,
     max_connection_threads: u32 = 0,
 };
 
@@ -67,7 +68,7 @@ pub const StdHttpListener = struct {
         app: common.RequestExecutor,
     ) StdHttpListener {
         const io_impl = alloc.create(std.Io.Threaded) catch @panic("OOM");
-        io_impl.* = std.Io.Threaded.init(alloc, .{});
+        io_impl.* = std.Io.Threaded.init(alloc, .{ .stack_size = cfg.connection_thread_stack_size });
         return .{
             .alloc = alloc,
             .cfg = cfg,

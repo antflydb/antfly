@@ -131,8 +131,12 @@ func TestExtractConversationHistory(t *testing.T) {
 	if messages[0].Role != ai.ChatMessageRoleUser {
 		t.Errorf("expected user role, got %s", messages[0].Role)
 	}
-	if messages[0].Content != "What is OAuth?" {
-		t.Errorf("unexpected content: %s", messages[0].Content)
+	content, err := messages[0].Content.AsChatMessageContent0()
+	if err != nil {
+		t.Fatalf("expected text content: %v", err)
+	}
+	if content != "What is OAuth?" {
+		t.Errorf("unexpected content: %s", content)
 	}
 
 	if messages[1].Role != ai.ChatMessageRoleAssistant {

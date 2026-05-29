@@ -6,69 +6,68 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
+from ..models.tool_call_type import ToolCallType
 
 if TYPE_CHECKING:
-    from ..models.chat_tool_result_result import ChatToolResultResult
+    from ..models.tool_call_function import ToolCallFunction
 
 
-T = TypeVar("T", bound="ChatToolResult")
+T = TypeVar("T", bound="ToolCall")
 
 
 @_attrs_define
-class ChatToolResult:
-    """Result from executing a tool call
+class ToolCall:
+    """OpenAI-compatible assistant tool call.
 
     Attributes:
-        tool_call_id (str): ID of the tool call this result corresponds to
-        result (ChatToolResultResult): Result data from the tool execution
-        error (str | Unset): Error message if tool execution failed
+        id (str): Tool call identifier.
+        type_ (ToolCallType):
+        function (ToolCallFunction): The function called by a model tool call.
     """
 
-    tool_call_id: str
-    result: ChatToolResultResult
-    error: str | Unset = UNSET
+    id: str
+    type_: ToolCallType
+    function: ToolCallFunction
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        tool_call_id = self.tool_call_id
+        id = self.id
 
-        result = self.result.to_dict()
+        type_ = self.type_.value
 
-        error = self.error
+        function = self.function.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "tool_call_id": tool_call_id,
-                "result": result,
+                "id": id,
+                "type": type_,
+                "function": function,
             }
         )
-        if error is not UNSET:
-            field_dict["error"] = error
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.chat_tool_result_result import ChatToolResultResult
+        from ..models.tool_call_function import ToolCallFunction
 
         d = dict(src_dict)
-        tool_call_id = d.pop("tool_call_id")
+        id = d.pop("id")
 
-        result = ChatToolResultResult.from_dict(d.pop("result"))
+        type_ = ToolCallType(d.pop("type"))
 
-        error = d.pop("error", UNSET)
+        function = ToolCallFunction.from_dict(d.pop("function"))
 
-        chat_tool_result = cls(
-            tool_call_id=tool_call_id,
-            result=result,
-            error=error,
+        tool_call = cls(
+            id=id,
+            type_=type_,
+            function=function,
         )
 
-        chat_tool_result.additional_properties = d
-        return chat_tool_result
+        tool_call.additional_properties = d
+        return tool_call
 
     @property
     def additional_keys(self) -> list[str]:

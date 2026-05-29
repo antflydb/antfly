@@ -974,6 +974,7 @@ pub const IndexManager = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         edge_type_configs: []graph_mod.EdgeTypeConfig,
+        artifact_source: ?GraphArtifactSource = null,
         rebuild_root_path: []u8,
         index: graph_mod.GraphIndex,
     };
@@ -1317,6 +1318,7 @@ pub const IndexManager = struct {
             if (cfg.field_name) |field_name| self.alloc.free(field_name);
         }
         self.alloc.free(entry.edge_type_configs);
+        if (entry.artifact_source) |*source| source.deinit(self.alloc);
         self.alloc.free(entry.rebuild_root_path);
         entry.config.deinit(self.alloc);
     }
@@ -2163,6 +2165,12 @@ pub const IndexManager = struct {
                 return true;
             }
         }
+        for (self.enrichments.items) |entry| {
+            if (excluded_enrichment) |skip| {
+                if (entry.kind == skip.kind and std.mem.eql(u8, entry.name, skip.name)) continue;
+            }
+            if (entry.kind == .asset) return true;
+        }
         return false;
     }
 
@@ -2403,7 +2411,7 @@ pub const IndexManager = struct {
                 defer generator.deinit(alloc);
                 const chunk_cfg = resolveChunkGenerator(self, generator);
                 const embedding_name = entry.embedding_name orelse entry.config.name;
-                if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.artifact_name)) {
+                if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name)) {
                     try requests.append(alloc, .{
                         .kind = .chunk_text,
                         .index_name = try alloc.dupe(u8, entry.config.name),
@@ -2416,7 +2424,7 @@ pub const IndexManager = struct {
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                     });
                 }
-                if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.artifact_name, embedding_name)) {
+                if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name, embedding_name)) {
                     try requests.append(alloc, .{
                         .kind = .dense_embedding,
                         .index_name = try alloc.dupe(u8, entry.config.name),
@@ -2436,7 +2444,7 @@ pub const IndexManager = struct {
                 if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                 if (embedding_cfg.source_artifact_name.len > 0) {
                     const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                    if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.name)) {
+                    if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
                         try requests.append(alloc, .{
                             .kind = .chunk_text,
                             .index_name = try alloc.dupe(u8, entry.config.name),
@@ -2449,7 +2457,7 @@ pub const IndexManager = struct {
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                         });
                     }
-                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, chunk_cfg.name, embedding_name)) {
+                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                         try requests.append(alloc, .{
                             .kind = .dense_embedding,
                             .index_name = try alloc.dupe(u8, entry.config.name),
@@ -2465,7 +2473,7 @@ pub const IndexManager = struct {
                         });
                     }
                 } else {
-                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, "", embedding_name)) {
+                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
                         try requests.append(alloc, .{
                             .kind = .dense_embedding,
                             .index_name = try alloc.dupe(u8, entry.config.name),
@@ -2492,7 +2500,7 @@ pub const IndexManager = struct {
             if (try parseSparseGeneratorConfig(alloc, entry.config.config_json)) |generator| {
                 defer generator.deinit(alloc);
                 const chunk_cfg = resolveChunkGenerator(self, generator);
-                if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.artifact_name)) {
+                if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name)) {
                     try requests.append(alloc, .{
                         .kind = .chunk_text,
                         .index_name = try alloc.dupe(u8, entry.config.name),
@@ -2518,6 +2526,20 @@ pub const IndexManager = struct {
                     .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                 });
             }
+        }
+
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset) continue;
+            try requests.append(alloc, .{
+                .kind = .asset,
+                .index_name = try alloc.dupe(u8, entry.name),
+                .artifact_name = try alloc.dupe(u8, entry.name),
+                .doc_key = try alloc.dupe(u8, doc_key),
+                .source_field = try alloc.dupe(u8, entry.source_field),
+                .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
+                .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
+                .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
+            });
         }
 
         return try requests.toOwnedSlice(alloc);
@@ -3044,10 +3066,12 @@ pub const IndexManager = struct {
     const ArtifactRefs = struct {
         chunk_name: ?[]u8 = null,
         embedding_name: ?[]u8 = null,
+        asset_name: ?[]u8 = null,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.chunk_name) |value| alloc.free(value);
             if (self.embedding_name) |value| alloc.free(value);
+            if (self.asset_name) |value| alloc.free(value);
             self.* = undefined;
         }
     };
@@ -3099,7 +3123,14 @@ pub const IndexManager = struct {
                         try self.alloc.dupe(u8, cfg.name),
                 };
             },
-            .graph, .algebraic => return .{},
+            .graph => {
+                var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
+                defer graph_cfg.deinit(self.alloc);
+                return .{
+                    .asset_name = if (graph_cfg.artifact_source) |source| try self.alloc.dupe(u8, source.artifact_name) else null,
+                };
+            },
+            .algebraic => return .{},
         }
     }
 
@@ -3683,6 +3714,19 @@ pub const IndexManager = struct {
         }
         if (self.graph_indexes.items.len == 1) return &self.graph_indexes.items[0];
         return null;
+    }
+
+    pub fn graphArtifactSource(self: *const IndexManager, name: []const u8) ?GraphArtifactSource {
+        for (self.graph_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            return entry.artifact_source;
+        }
+        return null;
+    }
+
+    pub fn graphIndexConsumesAssetArtifact(self: *const IndexManager, index_name: []const u8, artifact_name: []const u8) bool {
+        const source = self.graphArtifactSource(index_name) orelse return false;
+        return std.mem.eql(u8, source.artifact_name, artifact_name);
     }
 
     pub fn graphTraversalAccessPath(self: *IndexManager, name: ?[]const u8) ?algebraic_mod.ir.PhysicalAccessPath {
@@ -5031,8 +5075,16 @@ pub const IndexManager = struct {
             .graph => {
                 const started_ns = nowNs();
                 var backfill_ns: u64 = 0;
-                const graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
-                errdefer graph_cfg.deinit(self.alloc);
+                var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
+                var graph_cfg_moved = false;
+                errdefer if (!graph_cfg_moved) graph_cfg.deinit(self.alloc);
+                if (graph_cfg.artifact_source) |source| {
+                    if (self.getEnrichment(.asset, source.artifact_name) == null) return error.InvalidIndexConfig;
+                }
+                if (graph_cfg.shorthand_asset) |*asset| {
+                    asset.deinit(self.alloc);
+                    graph_cfg.shorthand_asset = null;
+                }
 
                 const path = try self.indexPath(cfg.name);
                 defer self.alloc.free(path);
@@ -5082,12 +5134,14 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = cloned_cfg,
                     .edge_type_configs = graph_cfg.edge_type_configs,
+                    .artifact_source = graph_cfg.artifact_source,
                     .rebuild_root_path = try self.alloc.dupe(u8, path),
                     .index = index,
                 };
                 apply_mutex_owned = false;
                 cloned_cfg_moved = true;
                 index_moved = true;
+                graph_cfg_moved = true;
                 errdefer self.freeGraphIndexEntry(&entry);
 
                 const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
@@ -5236,6 +5290,19 @@ pub const IndexManager = struct {
                     }
                 }
             },
+            .graph => {
+                var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
+                defer graph_cfg.deinit(self.alloc);
+                if (graph_cfg.shorthand_asset) |asset| {
+                    changed = (try self.ensureAssetEnrichment(asset)) or changed;
+                }
+                if (graph_cfg.artifact_source) |source| {
+                    if (graph_cfg.shorthand_asset) |asset| {
+                        if (!std.mem.eql(u8, asset.name, source.artifact_name)) return error.InvalidIndexConfig;
+                    }
+                    if (self.getEnrichment(.asset, source.artifact_name) == null) return error.InvalidIndexConfig;
+                }
+            },
             else => {},
         }
         return changed;
@@ -5243,7 +5310,12 @@ pub const IndexManager = struct {
 
     fn ensureChunkEnrichment(self: *IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !bool {
         if (self.getEnrichment(.chunk, cfg.name)) |existing| {
-            if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or existing.chunk_size != cfg.chunk_size or existing.chunk_overlap != cfg.chunk_overlap or !std.mem.eql(u8, existing.chunker_json, cfg.chunker_json)) {
+            if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
+                !std.mem.eql(u8, existing.source_template, cfg.source_template) or
+                existing.chunk_size != cfg.chunk_size or
+                existing.chunk_overlap != cfg.chunk_overlap or
+                !std.mem.eql(u8, existing.chunker_json, cfg.chunker_json))
+            {
                 return error.ConflictingEnrichmentConfig;
             }
             return false;
@@ -5256,6 +5328,7 @@ pub const IndexManager = struct {
     fn ensureEmbeddingEnrichment(self: *IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !bool {
         if (self.getEnrichment(.embedding, cfg.name)) |existing| {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
+                !std.mem.eql(u8, existing.source_template, cfg.source_template) or
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.expected_dims != cfg.expected_dims)
             {
@@ -5268,8 +5341,24 @@ pub const IndexManager = struct {
         return true;
     }
 
+    fn ensureAssetEnrichment(self: *IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !bool {
+        if (self.getEnrichment(.asset, cfg.name)) |existing| {
+            if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
+                !std.mem.eql(u8, existing.source_template, cfg.source_template) or
+                !std.mem.eql(u8, existing.content_type, cfg.content_type) or
+                !std.mem.eql(u8, existing.producer_json, cfg.producer_json))
+            {
+                return error.ConflictingEnrichmentConfig;
+            }
+            return false;
+        }
+
+        try self.enrichments.append(self.alloc, try enrichment_catalog.EnrichmentConfig.clone(self.alloc, cfg));
+        return true;
+    }
+
     fn validateEnrichmentConfig(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
-        if (cfg.name.len == 0 or cfg.source_field.len == 0) return error.InvalidEnrichmentConfig;
+        if (cfg.name.len == 0 or (cfg.source_field.len == 0 and cfg.source_template.len == 0)) return error.InvalidEnrichmentConfig;
         switch (cfg.kind) {
             .chunk => {
                 if (cfg.chunk_size == 0 and cfg.chunker_json.len == 0) return error.InvalidEnrichmentConfig;
@@ -5280,7 +5369,7 @@ pub const IndexManager = struct {
                     return error.InvalidEnrichmentConfig;
                 }
             },
-            .summary => {},
+            .asset => {},
         }
     }
 
@@ -5316,7 +5405,13 @@ pub const IndexManager = struct {
                     }
                 }
             },
-            .summary => {},
+            .asset => {
+                for (self.graph_indexes.items) |entry| {
+                    if (entry.artifact_source) |source| {
+                        if (std.mem.eql(u8, source.artifact_name, name)) return true;
+                    }
+                }
+            },
         }
         return false;
     }
@@ -9813,23 +9908,106 @@ const SparseConfig = struct {
     }
 };
 
+pub const GraphArtifactFormat = enum {
+    extraction_relation,
+    extraction_graph,
+};
+
+pub const GraphNodeModel = enum {
+    document,
+    external,
+};
+
+pub const GraphArtifactMapping = struct {
+    node_model: GraphNodeModel = .document,
+    source_template: []u8 = "",
+    target_template: []u8 = "",
+    edge_type_template: []u8 = "",
+    weight_template: []u8 = "",
+    metadata_template_json: []u8 = "",
+    context_doc_fields: []const []u8 = &.{},
+
+    pub fn clone(alloc: Allocator, mapping: GraphArtifactMapping) !GraphArtifactMapping {
+        const context_doc_fields = if (mapping.context_doc_fields.len > 0)
+            try alloc.alloc([]u8, mapping.context_doc_fields.len)
+        else
+            &.{};
+        var initialized: usize = 0;
+        errdefer {
+            for (context_doc_fields[0..initialized]) |field| alloc.free(field);
+            if (context_doc_fields.len > 0) alloc.free(context_doc_fields);
+        }
+        for (mapping.context_doc_fields, 0..) |field, i| {
+            context_doc_fields[i] = try alloc.dupe(u8, field);
+            initialized += 1;
+        }
+        return .{
+            .node_model = mapping.node_model,
+            .source_template = if (mapping.source_template.len > 0) try alloc.dupe(u8, mapping.source_template) else "",
+            .target_template = if (mapping.target_template.len > 0) try alloc.dupe(u8, mapping.target_template) else "",
+            .edge_type_template = if (mapping.edge_type_template.len > 0) try alloc.dupe(u8, mapping.edge_type_template) else "",
+            .weight_template = if (mapping.weight_template.len > 0) try alloc.dupe(u8, mapping.weight_template) else "",
+            .metadata_template_json = if (mapping.metadata_template_json.len > 0) try alloc.dupe(u8, mapping.metadata_template_json) else "",
+            .context_doc_fields = context_doc_fields,
+        };
+    }
+
+    pub fn deinit(self: *GraphArtifactMapping, alloc: Allocator) void {
+        if (self.source_template.len > 0) alloc.free(self.source_template);
+        if (self.target_template.len > 0) alloc.free(self.target_template);
+        if (self.edge_type_template.len > 0) alloc.free(self.edge_type_template);
+        if (self.weight_template.len > 0) alloc.free(self.weight_template);
+        if (self.metadata_template_json.len > 0) alloc.free(self.metadata_template_json);
+        for (self.context_doc_fields) |field| alloc.free(field);
+        if (self.context_doc_fields.len > 0) alloc.free(self.context_doc_fields);
+        self.* = undefined;
+    }
+};
+
+pub const GraphArtifactSource = struct {
+    artifact_name: []u8,
+    path: []u8 = "",
+    format: GraphArtifactFormat = .extraction_relation,
+    mapping: GraphArtifactMapping = .{},
+
+    pub fn clone(alloc: Allocator, source: GraphArtifactSource) !GraphArtifactSource {
+        return .{
+            .artifact_name = try alloc.dupe(u8, source.artifact_name),
+            .path = if (source.path.len > 0) try alloc.dupe(u8, source.path) else "",
+            .format = source.format,
+            .mapping = try GraphArtifactMapping.clone(alloc, source.mapping),
+        };
+    }
+
+    pub fn deinit(self: *GraphArtifactSource, alloc: Allocator) void {
+        alloc.free(self.artifact_name);
+        if (self.path.len > 0) alloc.free(self.path);
+        self.mapping.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 const GraphConfig = struct {
     edge_type_configs: []graph_mod.EdgeTypeConfig,
+    artifact_source: ?GraphArtifactSource = null,
+    shorthand_asset: ?enrichment_catalog.EnrichmentConfig = null,
     algebraic_semiring_traversal: bool = false,
 
-    fn deinit(self: *const GraphConfig, alloc: Allocator) void {
+    fn deinit(self: *GraphConfig, alloc: Allocator) void {
         for (self.edge_type_configs) |cfg| {
             alloc.free(cfg.name);
             if (cfg.field_name) |field_name| alloc.free(field_name);
         }
         alloc.free(self.edge_type_configs);
+        if (self.artifact_source) |*source| source.deinit(alloc);
+        if (self.shorthand_asset) |*asset| asset.deinit(alloc);
     }
 };
 
 fn publicEnrichmentKindToInternal(kind: types.EnrichmentKind) enrichment_catalog.EnrichmentType {
     return switch (kind) {
         .chunk => .chunk,
-        .summary => .summary,
+        .asset => .asset,
         .embedding => .embedding,
     };
 }
@@ -9838,36 +10016,41 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
     return .{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = publicEnrichmentKindToInternal(cfg.kind),
-        .source_field = try alloc.dupe(u8, cfg.source_field),
-        .source_template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
+        .source_field = if (cfg.field.len > 0) try alloc.dupe(u8, cfg.field) else "",
+        .source_template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
         .expected_dims = cfg.expected_dims,
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
+        .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
+        .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
     };
 }
 
 fn internalEnrichmentKindToPublic(kind: enrichment_catalog.EnrichmentType) types.EnrichmentKind {
     return switch (kind) {
         .chunk => .chunk,
-        .summary => .summary,
+        .asset => .asset,
         .embedding => .embedding,
     };
 }
 
 fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig) !types.EnrichmentConfig {
-    return .{
+    const out = types.EnrichmentConfig{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = internalEnrichmentKindToPublic(cfg.kind),
-        .source_field = try alloc.dupe(u8, cfg.source_field),
-        .source_template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
+        .field = if (cfg.source_field.len > 0) try alloc.dupe(u8, cfg.source_field) else "",
+        .template = if (cfg.source_template.len > 0) try alloc.dupe(u8, cfg.source_template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
         .expected_dims = cfg.expected_dims,
         .chunk_size = cfg.chunk_size,
         .chunk_overlap = cfg.chunk_overlap,
         .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
+        .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
+        .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
     };
+    return out;
 }
 
 fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
@@ -10016,22 +10199,25 @@ fn openTextPersistentIndexWithRetry(
     opts: persistent_mod.PersistentIndexOptions,
 ) !persistent_mod.PersistentIndex {
     const max_attempts: usize = 6;
+    const debug_open = std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        std.log.info(
-            "full_text persistent open begin attempt={d} path={s} main_backend={s} wal_backend={s} main_lsm_storage={any} wal_storage={any} read_only={any} main_read_only={any} wal_read_only={any}",
-            .{
-                attempt + 1,
-                std.mem.span(opts.path),
-                @tagName(opts.main_backend),
-                @tagName(opts.resolvedWalBackend()),
-                opts.main_lsm_storage != null,
-                opts.wal_storage != null,
-                opts.read_only,
-                opts.main_lsm_options.backend.read_only,
-                opts.wal_lsm_options.backend.read_only,
-            },
-        );
+        if (debug_open) {
+            std.log.info(
+                "full_text persistent open begin attempt={d} path={s} main_backend={s} wal_backend={s} main_lsm_storage={any} wal_storage={any} read_only={any} main_read_only={any} wal_read_only={any}",
+                .{
+                    attempt + 1,
+                    std.mem.span(opts.path),
+                    @tagName(opts.main_backend),
+                    @tagName(opts.resolvedWalBackend()),
+                    opts.main_lsm_storage != null,
+                    opts.wal_storage != null,
+                    opts.read_only,
+                    opts.main_lsm_options.backend.read_only,
+                    opts.wal_lsm_options.backend.read_only,
+                },
+            );
+        }
         return persistent_mod.PersistentIndex.open(alloc, opts) catch |err| {
             std.log.warn("full_text persistent open attempt failed attempt={d} path={s} err={s}", .{
                 attempt + 1,
@@ -10386,12 +10572,14 @@ fn hasGeneratedChunkRequest(
     requests: []const enrichment_types.GeneratedEnrichmentRequest,
     doc_key: []const u8,
     source_field: []const u8,
+    source_template: []const u8,
     artifact_name: []const u8,
 ) bool {
     for (requests) |request| {
         if (request.kind != .chunk_text) continue;
         if (!std.mem.eql(u8, request.doc_key, doc_key)) continue;
         if (!std.mem.eql(u8, request.source_field, source_field)) continue;
+        if (!std.mem.eql(u8, request.source_template, source_template)) continue;
         if (!std.mem.eql(u8, request.artifact_name, artifact_name)) continue;
         return true;
     }
@@ -10402,6 +10590,7 @@ fn hasGeneratedDenseEmbeddingRequest(
     requests: []const enrichment_types.GeneratedEnrichmentRequest,
     doc_key: []const u8,
     source_field: []const u8,
+    source_template: []const u8,
     artifact_name: []const u8,
     embedding_name: []const u8,
 ) bool {
@@ -10409,6 +10598,7 @@ fn hasGeneratedDenseEmbeddingRequest(
         if (request.kind != .dense_embedding) continue;
         if (!std.mem.eql(u8, request.doc_key, doc_key)) continue;
         if (!std.mem.eql(u8, request.source_field, source_field)) continue;
+        if (!std.mem.eql(u8, request.source_template, source_template)) continue;
         if (!std.mem.eql(u8, request.artifact_name, artifact_name)) continue;
         if (!std.mem.eql(u8, request.embedding_name, embedding_name)) continue;
         return true;
@@ -10448,10 +10638,20 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
+    var artifact_source = try parseGraphArtifactSource(alloc, root);
+    errdefer if (artifact_source) |*source| {
+        source.deinit(alloc);
+    };
+    var shorthand_asset = try parseGraphShorthandAsset(alloc, root);
+    errdefer if (shorthand_asset) |*asset| {
+        asset.deinit(alloc);
+    };
 
     const edge_types = root.object.get("edge_types") orelse {
         return .{
             .edge_type_configs = try alloc.alloc(graph_mod.EdgeTypeConfig, 0),
+            .artifact_source = artifact_source,
+            .shorthand_asset = shorthand_asset,
             .algebraic_semiring_traversal = algebraic_semiring_traversal,
         };
     };
@@ -10480,6 +10680,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
         } else graph_mod.TopologyMode.graph;
 
         const field_name = if (item.object.get("field")) |value| blk: {
+            if (artifact_source != null) return error.InvalidIndexConfig;
             if (value != .string) return error.InvalidIndexConfig;
             break :blk try alloc.dupe(u8, value.string);
         } else null;
@@ -10494,7 +10695,203 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
 
     return .{
         .edge_type_configs = configs,
+        .artifact_source = artifact_source,
+        .shorthand_asset = shorthand_asset,
         .algebraic_semiring_traversal = algebraic_semiring_traversal,
+    };
+}
+
+fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtifactSource {
+    const source = root.object.get("source") orelse return null;
+    if (source != .object) return error.InvalidIndexConfig;
+    const kind = source.object.get("kind") orelse return error.InvalidIndexConfig;
+    if (kind != .string) return error.InvalidIndexConfig;
+    if (std.mem.eql(u8, kind.string, "document_field")) {
+        const field = source.object.get("field") orelse return error.InvalidIndexConfig;
+        if (field != .string or field.string.len == 0) return error.InvalidIndexConfig;
+        if (!std.mem.eql(u8, field.string, "_edges")) return error.InvalidIndexConfig;
+        return null;
+    }
+    if (!std.mem.eql(u8, kind.string, "artifact")) return error.InvalidIndexConfig;
+
+    const artifact = source.object.get("artifact") orelse return error.InvalidIndexConfig;
+    if (artifact != .string or artifact.string.len == 0) return error.InvalidIndexConfig;
+    const path = if (source.object.get("path")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        try validateGraphArtifactPath(value.string);
+        break :blk value.string;
+    } else "";
+    const format = if (source.object.get("format")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        if (std.mem.eql(u8, value.string, "extraction_relation")) break :blk GraphArtifactFormat.extraction_relation;
+        if (std.mem.eql(u8, value.string, "extraction_graph")) break :blk GraphArtifactFormat.extraction_graph;
+        return error.InvalidIndexConfig;
+    } else GraphArtifactFormat.extraction_relation;
+
+    var out = GraphArtifactSource{
+        .artifact_name = try alloc.dupe(u8, artifact.string),
+        .path = if (path.len > 0) try alloc.dupe(u8, path) else "",
+        .format = format,
+    };
+    errdefer out.deinit(alloc);
+    out.mapping = try parseGraphArtifactMapping(alloc, root);
+    return out;
+}
+
+fn validateGraphArtifactPath(path: []const u8) !void {
+    if (path.len == 0 or std.mem.eql(u8, path, "$")) return;
+    if (!std.mem.startsWith(u8, path, "$.")) return error.InvalidIndexConfig;
+    var trimmed = path[2..];
+    if (std.mem.endsWith(u8, trimmed, "[*]")) trimmed = trimmed[0 .. trimmed.len - 3];
+    if (trimmed.len == 0) return error.InvalidIndexConfig;
+    var parts = std.mem.splitScalar(u8, trimmed, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0) return error.InvalidIndexConfig;
+        for (part) |ch| {
+            if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return error.InvalidIndexConfig;
+        }
+    }
+}
+
+fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtifactMapping {
+    var mapping = GraphArtifactMapping{};
+    errdefer mapping.deinit(alloc);
+
+    if (root.object.get("nodes")) |nodes| {
+        if (nodes != .object) return error.InvalidIndexConfig;
+        if (nodes.object.get("model")) |model| {
+            if (model != .string) return error.InvalidIndexConfig;
+            if (std.mem.eql(u8, model.string, "document")) {
+                mapping.node_model = .document;
+            } else if (std.mem.eql(u8, model.string, "external")) {
+                mapping.node_model = .external;
+            } else {
+                return error.InvalidIndexConfig;
+            }
+        }
+        mapping.source_template = try parseOptionalGraphTemplate(alloc, nodes, "source");
+        mapping.target_template = try parseOptionalGraphTemplate(alloc, nodes, "target");
+    }
+
+    if (root.object.get("edge")) |edge| {
+        if (edge != .object) return error.InvalidIndexConfig;
+        mapping.edge_type_template = try parseOptionalGraphTemplate(alloc, edge, "type");
+        mapping.weight_template = try parseOptionalGraphTemplate(alloc, edge, "weight");
+        if (edge.object.get("metadata")) |metadata| {
+            mapping.metadata_template_json = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
+        }
+    }
+
+    if (root.object.get("context")) |context| {
+        if (context != .object) return error.InvalidIndexConfig;
+        mapping.context_doc_fields = try parseGraphContextDocFields(alloc, context);
+    }
+
+    try validateGraphMappingTemplates(mapping);
+    return mapping;
+}
+
+fn parseOptionalGraphTemplate(alloc: Allocator, parent: std.json.Value, name: []const u8) ![]u8 {
+    const value = parent.object.get(name) orelse return "";
+    return switch (value) {
+        .string => |text| if (text.len > 0) try alloc.dupe(u8, text) else "",
+        .integer, .float, .number_string => try std.json.Stringify.valueAlloc(alloc, value, .{}),
+        else => error.InvalidIndexConfig,
+    };
+}
+
+fn parseGraphContextDocFields(alloc: Allocator, context: std.json.Value) ![]const []u8 {
+    const value = context.object.get("doc_fields") orelse return &.{};
+    if (value != .array) return error.InvalidIndexConfig;
+    const fields = try alloc.alloc([]u8, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |field| alloc.free(field);
+        alloc.free(fields);
+    }
+    for (value.array.items, 0..) |item, i| {
+        if (item != .string or item.string.len == 0) return error.InvalidIndexConfig;
+        fields[i] = try alloc.dupe(u8, item.string);
+        initialized += 1;
+    }
+    return fields;
+}
+
+fn validateGraphMappingTemplates(mapping: GraphArtifactMapping) !void {
+    try validateGraphMaterializedSourceTemplate(mapping.source_template);
+    try validateGraphTemplateDocFields(mapping.source_template, mapping.context_doc_fields);
+    try validateGraphTemplateDocFields(mapping.target_template, mapping.context_doc_fields);
+    try validateGraphTemplateDocFields(mapping.edge_type_template, mapping.context_doc_fields);
+    try validateGraphTemplateDocFields(mapping.weight_template, mapping.context_doc_fields);
+    try validateGraphTemplateDocFields(mapping.metadata_template_json, mapping.context_doc_fields);
+}
+
+fn validateGraphMaterializedSourceTemplate(template_source: []const u8) !void {
+    const trimmed = std.mem.trim(u8, template_source, &std.ascii.whitespace);
+    if (trimmed.len == 0) return;
+    if (!std.mem.startsWith(u8, trimmed, "{{") or !std.mem.endsWith(u8, trimmed, "}}")) return error.InvalidIndexConfig;
+    const expr = std.mem.trim(u8, trimmed[2 .. trimmed.len - 2], &std.ascii.whitespace);
+    if (!std.mem.eql(u8, expr, "_doc.key")) return error.InvalidIndexConfig;
+}
+
+fn validateGraphTemplateDocFields(template_source: []const u8, declared_fields: []const []u8) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, template_source, pos, "_doc.value.")) |start| {
+        const field_start = start + "_doc.value.".len;
+        var field_end = field_start;
+        while (field_end < template_source.len) : (field_end += 1) {
+            const ch = template_source[field_end];
+            if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) break;
+        }
+        if (field_end == field_start) return error.InvalidIndexConfig;
+        const field = template_source[field_start..field_end];
+        if (!graphContextFieldDeclared(field, declared_fields)) return error.InvalidIndexConfig;
+        pos = field_end;
+    }
+}
+
+fn graphContextFieldDeclared(field: []const u8, declared_fields: []const []u8) bool {
+    for (declared_fields) |declared| {
+        if (std.mem.eql(u8, declared, field)) return true;
+    }
+    return false;
+}
+
+fn parseGraphShorthandAsset(alloc: Allocator, root: std.json.Value) !?enrichment_catalog.EnrichmentConfig {
+    const artifact = root.object.get("artifact") orelse return null;
+    if (artifact != .object) return error.InvalidIndexConfig;
+
+    const name = artifact.object.get("name") orelse return error.InvalidIndexConfig;
+    if (name != .string or name.string.len == 0) return error.InvalidIndexConfig;
+    const kind = artifact.object.get("kind") orelse return error.InvalidIndexConfig;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "asset")) return error.InvalidIndexConfig;
+
+    const field = if (artifact.object.get("field")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        break :blk value.string;
+    } else "";
+    const template = if (artifact.object.get("template")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        break :blk value.string;
+    } else "";
+    if (field.len == 0 and template.len == 0) return error.InvalidIndexConfig;
+    const content_type = if (artifact.object.get("content_type")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        break :blk value.string;
+    } else "";
+    const producer_json = if (artifact.object.get("producer_json")) |value|
+        try std.json.Stringify.valueAlloc(alloc, value, .{})
+    else
+        "";
+    errdefer if (producer_json.len > 0) alloc.free(producer_json);
+
+    return .{
+        .name = try alloc.dupe(u8, name.string),
+        .kind = .asset,
+        .source_field = if (field.len > 0) try alloc.dupe(u8, field) else "",
+        .source_template = if (template.len > 0) try alloc.dupe(u8, template) else "",
+        .content_type = if (content_type.len > 0) try alloc.dupe(u8, content_type) else "",
+        .producer_json = producer_json,
     };
 }
 
@@ -10529,6 +10926,87 @@ test "graph config declares algebraic provenance semiring traversal law" {
 
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"algebraic_planning":{"bounded_traversal":{"law":"min_plus_semiring"}}}
+    ));
+}
+
+test "graph config parses artifact source and shorthand asset enrichment" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly"}}}
+        \\}
+    );
+    defer cfg.deinit(alloc);
+
+    try std.testing.expect(cfg.artifact_source != null);
+    try std.testing.expectEqualStrings("relations_v1", cfg.artifact_source.?.artifact_name);
+    try std.testing.expectEqualStrings("$.relations[*]", cfg.artifact_source.?.path);
+    try std.testing.expectEqual(GraphArtifactFormat.extraction_relation, cfg.artifact_source.?.format);
+    try std.testing.expect(cfg.shorthand_asset != null);
+    try std.testing.expectEqualStrings("relations_v1", cfg.shorthand_asset.?.name);
+    try std.testing.expectEqual(enrichment_catalog.EnrichmentType.asset, cfg.shorthand_asset.?.kind);
+    try std.testing.expectEqualStrings("body", cfg.shorthand_asset.?.source_field);
+    try std.testing.expectEqualStrings("application/json", cfg.shorthand_asset.?.content_type);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.producer_json, "\"type\":\"extractor\"") != null);
+}
+
+test "graph config parses artifact mapping templates and context fields" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.items[*]","format":"extraction_relation"},
+        \\  "nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.to }}"},
+        \\  "edge":{"type":"{{ _item.rel }}","weight":"{{ default _item.score 1.0 }}","metadata":{"evidence":"{{ _item.evidence }}","tenant":"{{ _doc.value.tenant_id }}"}},
+        \\  "context":{"doc_fields":["tenant_id"]}
+        \\}
+    );
+    defer cfg.deinit(alloc);
+
+    const mapping = cfg.artifact_source.?.mapping;
+    try std.testing.expectEqual(GraphNodeModel.document, mapping.node_model);
+    try std.testing.expectEqualStrings("{{ _doc.key }}", mapping.source_template);
+    try std.testing.expectEqualStrings("{{ _item.to }}", mapping.target_template);
+    try std.testing.expectEqualStrings("{{ _item.rel }}", mapping.edge_type_template);
+    try std.testing.expectEqualStrings("{{ default _item.score 1.0 }}", mapping.weight_template);
+    try std.testing.expectEqual(@as(usize, 1), mapping.context_doc_fields.len);
+    try std.testing.expectEqualStrings("tenant_id", mapping.context_doc_fields[0]);
+    try std.testing.expect(std.mem.indexOf(u8, mapping.metadata_template_json, "_item.evidence") != null);
+}
+
+test "graph config rejects undeclared doc value template fields and unsupported paths" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"edge":{"type":"{{ _doc.value.tenant_id }}"}}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"nodes":{"source":"{{ _item.source.document_id }}"}}
+    ));
+}
+
+test "graph config rejects artifact source combined with document field edge types" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"edge_types":[{"name":"mentions","field":"edges"}]}
+    ));
+}
+
+test "graph config validates document field source shape" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{"source":{"kind":"document_field","field":"_edges"}}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expect(cfg.artifact_source == null);
+
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"document_field"}}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"document_field","field":"links"}}
     ));
 }
 
@@ -12314,6 +12792,90 @@ test "parseSparseGeneratorConfig parses source_template" {
     try std.testing.expectEqualStrings("body", generator.source_field);
     try std.testing.expectEqualStrings("{{title}} {{body}}", generator.source_template);
     try std.testing.expectEqualStrings("body_chunks", generator.artifact_name);
+}
+
+test "shorthand chunk and embedding enrichment compatibility includes source_template" {
+    const alloc = std.testing.allocator;
+
+    var manager = try IndexManager.init(alloc, ".");
+    defer manager.deinit();
+
+    try std.testing.expect(try manager.ensureChunkEnrichment(.{
+        .name = "body_chunks",
+        .kind = .chunk,
+        .source_field = "body",
+        .source_template = "{{title}} {{body}}",
+        .chunk_size = 256,
+    }));
+    try std.testing.expect(!try manager.ensureChunkEnrichment(.{
+        .name = "body_chunks",
+        .kind = .chunk,
+        .source_field = "body",
+        .source_template = "{{title}} {{body}}",
+        .chunk_size = 256,
+    }));
+    try std.testing.expectError(error.ConflictingEnrichmentConfig, manager.ensureChunkEnrichment(.{
+        .name = "body_chunks",
+        .kind = .chunk,
+        .source_field = "body",
+        .source_template = "{{body}}",
+        .chunk_size = 256,
+    }));
+
+    try std.testing.expect(try manager.ensureEmbeddingEnrichment(.{
+        .name = "body_embedding",
+        .kind = .embedding,
+        .source_field = "body",
+        .source_template = "{{title}} {{body}}",
+        .source_artifact_name = "body_chunks",
+        .expected_dims = 384,
+    }));
+    try std.testing.expect(!try manager.ensureEmbeddingEnrichment(.{
+        .name = "body_embedding",
+        .kind = .embedding,
+        .source_field = "body",
+        .source_template = "{{title}} {{body}}",
+        .source_artifact_name = "body_chunks",
+        .expected_dims = 384,
+    }));
+    try std.testing.expectError(error.ConflictingEnrichmentConfig, manager.ensureEmbeddingEnrichment(.{
+        .name = "body_embedding",
+        .kind = .embedding,
+        .source_field = "body",
+        .source_template = "{{body}}",
+        .source_artifact_name = "body_chunks",
+        .expected_dims = 384,
+    }));
+}
+
+test "generated enrichment request identity includes source_template" {
+    const requests = [_]enrichment_types.GeneratedEnrichmentRequest{
+        .{
+            .kind = .chunk_text,
+            .index_name = "semantic",
+            .artifact_name = "body_chunks",
+            .doc_key = "doc:1",
+            .source_field = "body",
+            .source_template = "{{title}} {{body}}",
+            .chunk_size = 256,
+        },
+        .{
+            .kind = .dense_embedding,
+            .index_name = "semantic",
+            .artifact_name = "body_chunks",
+            .embedding_name = "body_embedding",
+            .doc_key = "doc:1",
+            .source_field = "body",
+            .source_template = "{{title}} {{body}}",
+            .expected_dims = 384,
+        },
+    };
+
+    try std.testing.expect(hasGeneratedChunkRequest(requests[0..], "doc:1", "body", "{{title}} {{body}}", "body_chunks"));
+    try std.testing.expect(!hasGeneratedChunkRequest(requests[0..], "doc:1", "body", "{{body}}", "body_chunks"));
+
+    try std.testing.expect(hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{title}} {{body}}", "body_chunks", "body_embedding"));
+    try std.testing.expect(!hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{body}}", "body_chunks", "body_embedding"));
 }
 
 test "parseTextConfig prefers source artifact name and accepts legacy chunk name" {

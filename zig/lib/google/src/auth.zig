@@ -294,19 +294,20 @@ pub fn tokenSourceFromEnvAlloc(alloc: Allocator, scope: []const u8) !*CachedToke
 }
 
 pub fn configFromEnvAlloc(alloc: Allocator, scope: []const u8) !Config {
-    const service_account = if (try envOwned(alloc, "GOOGLE_SERVICE_ACCOUNT_JSON")) |json| blk: {
+    var service_account = if (try envOwned(alloc, "GOOGLE_SERVICE_ACCOUNT_JSON")) |json| blk: {
         defer alloc.free(json);
         break :blk try parseServiceAccountJsonAlloc(alloc, json);
     } else if (try envOwned(alloc, "GOOGLE_APPLICATION_CREDENTIALS")) |path| blk: {
         defer alloc.free(path);
         break :blk try serviceAccountFromFileAlloc(alloc, path);
     } else return error.MissingServiceAccount;
+    errdefer service_account.deinit(alloc);
 
     return try configFromServiceAccountAlloc(alloc, service_account, scope);
 }
 
 pub fn serviceAccountEnvProjectIdAlloc(alloc: Allocator) !?[]u8 {
-    const service_account = configFromEnvAlloc(alloc, default_scope) catch return null;
+    var service_account = configFromEnvAlloc(alloc, default_scope) catch return null;
     defer service_account.deinit(alloc);
     return if (service_account.service_account.project_id) |value| try alloc.dupe(u8, value) else null;
 }
