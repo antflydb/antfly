@@ -1986,7 +1986,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             const levels = try buildLowerLevels(metadata_allocator, runs);
             errdefer metadata_allocator.free(levels);
             backend.retainReader();
-            errdefer backend.releaseReader();
+            errdefer releaseReadReader(BackendType, backend);
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
@@ -2028,7 +2028,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            backend.releaseReader();
+            releaseReadReader(BackendType, backend);
             self.* = undefined;
         }
 
@@ -2107,6 +2107,14 @@ const MutableReadSnapshot = struct {
     owned: bool,
 };
 
+fn releaseReadReader(comptime BackendType: type, backend: *BackendType) void {
+    if (@hasDecl(BackendType, "finalizeReadReaderRelease")) {
+        backend.finalizeReadReaderRelease();
+    } else {
+        backend.releaseReader();
+    }
+}
+
 fn snapshotReadMutable(comptime BackendType: type, backend: *BackendType) !MutableReadSnapshot {
     if (@hasDecl(BackendType, "snapshotMutableState")) {
         return .{ .state = try backend.snapshotMutableState(), .owned = false };
@@ -2138,7 +2146,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             backend.retainReader();
-            errdefer backend.releaseReader();
+            errdefer releaseReadReader(BackendType, backend);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             const stable_point_view = backend.mutable.entries.items.len == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
             return .{
@@ -2161,7 +2169,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            backend.releaseReader();
+            releaseReadReader(BackendType, backend);
             self.* = undefined;
         }
 
@@ -2301,7 +2309,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             const levels = try buildLowerLevels(metadata_allocator, runs);
             errdefer metadata_allocator.free(levels);
             backend.retainReader();
-            errdefer backend.releaseReader();
+            errdefer releaseReadReader(BackendType, backend);
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
@@ -2328,7 +2336,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             if (self.immutable_memtables.len > 0) self.allocator.free(self.immutable_memtables);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            backend.releaseReader();
+            releaseReadReader(BackendType, backend);
             self.* = undefined;
         }
 
@@ -3036,7 +3044,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             const levels = try buildLowerLevels(metadata_allocator, runs);
             errdefer metadata_allocator.free(levels);
             backend.retainReader();
-            errdefer backend.releaseReader();
+            errdefer releaseReadReader(BackendType, backend);
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
@@ -3078,7 +3086,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            backend.releaseReader();
+            releaseReadReader(BackendType, backend);
             self.* = undefined;
         }
 

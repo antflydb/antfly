@@ -2407,6 +2407,16 @@ pub const Backend = struct {
         try self.persistManifest();
     }
 
+    pub fn finalizeReadReaderRelease(self: *Backend) void {
+        self.releaseReader();
+        if ((!self.manifest_dirty and !self.obsolete_manifest_dirty) or
+            self.active_readers != 0 or
+            self.bulkIngestActive() or
+            self.root_dir == null or
+            self.options.backend.read_only) return;
+        self.persistManifest() catch {};
+    }
+
     pub fn beginBatchMode(self: *Backend, options: backend_types.BatchOptions) void {
         if (options.mode != .bulk_ingest) return;
         self.active_bulk_ingest_batches += 1;
@@ -7801,6 +7811,79 @@ test "lsm backend reclaims obsolete run files after retention on a later writer 
         ));
         try std.testing.expectEqual(@as(usize, 0), obsolete_paths.items.len);
     }
+}
+
+test "lsm backend reclaims obsolete run files when last reader releases" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-reader-release-obsolete-gc";
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 1);
+    defer alloc.free(obsolete_path);
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1,
+        .foreground_soft_compaction = true,
+        .obsolete_retention_ns = 0,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    var read_txn = try runtime.beginRead();
+    try std.testing.expectEqualStrings("A", try read_txn.get("doc:a"));
+
+    {
+        var txn = try runtime.beginWrite();
+        try txn.delete("doc:a");
+        try txn.put("doc:b", "B");
+        try txn.commit();
+    }
+
+    try std.testing.expect(backend.obsolete_paths.items.len > 0);
+    {
+        const bytes = try backing.storage().readFileAlloc(alloc, obsolete_path, 1024);
+        defer alloc.free(bytes);
+        try std.testing.expect(bytes.len > 0);
+    }
+
+    read_txn.abort();
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+
+    var manifest_backing: ?[]u8 = null;
+    defer if (manifest_backing) |raw| alloc.free(raw);
+    var next_run_id: u64 = 0;
+    var runs = std.ArrayListUnmanaged(repository_mod.Run).empty;
+    var obsolete_paths = std.ArrayListUnmanaged(repository_mod.ObsoletePath).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+        for (obsolete_paths.items) |*obsolete| obsolete.deinit(alloc);
+        obsolete_paths.deinit(alloc);
+    }
+
+    try std.testing.expect(try repository_mod.loadManifestIfPresentWithStorage(
+        backing.storage(),
+        alloc,
+        root_dir,
+        &manifest_backing,
+        &next_run_id,
+        &runs,
+        &obsolete_paths,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), obsolete_paths.items.len);
 }
 
 test "lsm backend reloads persisted manifest and run files" {
