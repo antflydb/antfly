@@ -36,12 +36,13 @@ const bloom = @import("bloom");
 //   v11: v10 postings + fixed-prefix blocked term dictionary
 //   v12: v11 + bit-packed position deltas
 //   v13: v12 + variable BlockTree-style prefix-compressed term blocks
+//   v14: v13 + compact postings chunk metadata
 //
-// This project is pre-release; writers emit only the current v13 format.
+// This project is pre-release; writers emit only the current v14 format.
 
-const wire_version_current: u8 = 13;
+const wire_version_current: u8 = 14;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4; // 29 bytes
-const v7_chunk_meta_size: usize = 44;
+const v7_chunk_meta_size: usize = 20;
 const postings_header_size: usize = 24;
 const postings_skip_record_size: usize = 8;
 const postings_skip_stride_chunks: usize = 16;
@@ -389,7 +390,7 @@ pub const InvertedIndexBuilder = struct {
     ///   [block_max_chunks: u32 LE]
     ///   [positions_section_len: u32 LE]
     ///   [block_max_chunks × 6-byte block-max records]
-    ///   [stored_chunks × chunk metadata]
+    ///   [stored_chunks × compact chunk metadata]
     ///   [packed per-chunk doc-delta/freqHasLocs/norm payloads]
     ///   [positions: varint count + varint deltas per doc]
     ///
@@ -596,12 +597,6 @@ fn writeChunkMetaV7(dst: []u8, meta: V7ChunkMeta) void {
     dst[8..12].* = @bitCast(std.mem.nativeToLittle(u32, meta.doc_count));
     dst[12..16].* = @bitCast(std.mem.nativeToLittle(u32, meta.doc_ctrl_off));
     dst[16..20].* = @bitCast(std.mem.nativeToLittle(u32, meta.doc_ctrl_len));
-    dst[20..24].* = @bitCast(std.mem.nativeToLittle(u32, meta.doc_data_off));
-    dst[24..28].* = @bitCast(std.mem.nativeToLittle(u32, meta.doc_data_len));
-    dst[28..32].* = @bitCast(std.mem.nativeToLittle(u32, meta.freq_ctrl_off));
-    dst[32..36].* = @bitCast(std.mem.nativeToLittle(u32, meta.freq_ctrl_len));
-    dst[36..40].* = @bitCast(std.mem.nativeToLittle(u32, meta.freq_data_off));
-    dst[40..44].* = @bitCast(std.mem.nativeToLittle(u32, meta.freq_data_len));
 }
 
 fn readChunkMetaV7(src: []const u8) V7ChunkMeta {
@@ -612,12 +607,12 @@ fn readChunkMetaV7(src: []const u8) V7ChunkMeta {
         .doc_count = std.mem.readInt(u32, src[8..12], .little),
         .doc_ctrl_off = std.mem.readInt(u32, src[12..16], .little),
         .doc_ctrl_len = std.mem.readInt(u32, src[16..20], .little),
-        .doc_data_off = std.mem.readInt(u32, src[20..24], .little),
-        .doc_data_len = std.mem.readInt(u32, src[24..28], .little),
-        .freq_ctrl_off = std.mem.readInt(u32, src[28..32], .little),
-        .freq_ctrl_len = std.mem.readInt(u32, src[32..36], .little),
-        .freq_data_off = std.mem.readInt(u32, src[36..40], .little),
-        .freq_data_len = std.mem.readInt(u32, src[40..44], .little),
+        .doc_data_off = 0,
+        .doc_data_len = 0,
+        .freq_ctrl_off = 0,
+        .freq_ctrl_len = 0,
+        .freq_data_off = 0,
+        .freq_data_len = 0,
     };
 }
 
@@ -946,7 +941,7 @@ const PostingAccumulator = struct {
 // Index reader (query path)
 // ============================================================================
 
-/// Reads a serialized inverted index section (v13, with variable blocked term dictionary).
+/// Reads a serialized inverted index section (v14, with compact postings metadata).
 pub const InvertedIndexReader = struct {
     alloc: Allocator,
     data: []const u8,
@@ -2440,7 +2435,7 @@ test "term iterator enumerates all terms" {
     try std.testing.expect(try iter.next() == null);
 }
 
-test "v13 term dictionary stores variable prefix blocks indexed by block ceiling" {
+test "v14 term dictionary stores variable prefix blocks indexed by block ceiling" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{});
     defer builder.deinit();
@@ -2872,6 +2867,41 @@ test "v10 block-max metadata stores only term chunk window" {
             try std.testing.expectEqual(@as(f32, 0), bm.maxImpact(0, 6, 2, reader.avgDocLen(), .{}));
             try std.testing.expect(bm.maxImpact(1, 6, 2, reader.avgDocLen(), .{}) > 0);
             try std.testing.expectEqual(@as(f32, 0), bm.maxImpact(2, 6, 2, reader.avgDocLen(), .{}));
+        },
+        .one_hit => return error.TestExpectedEqual,
+    }
+}
+
+test "v14 postings use compact chunk metadata" {
+    const alloc = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
+    defer builder.deinit();
+
+    try builder.addDocument(0, &.{.{ .term = "term", .freq = 3, .norm = 10 }});
+    try builder.addDocument(1, &.{.{ .term = "term", .freq = 1, .norm = 20 }});
+    try builder.addDocument(2, &.{.{ .term = "term", .freq = 5, .norm = 30 }});
+    try builder.addDocument(3, &.{.{ .term = "term", .freq = 2, .norm = 15 }});
+
+    const section = try builder.build();
+    defer alloc.free(section);
+
+    var reader = try InvertedIndexReader.init(alloc, section);
+    const result = reader.lookup("term") orelse return error.TestExpectedEqual;
+    switch (result) {
+        .postings => |p| {
+            try std.testing.expectEqual(@as(u8, 14), p.version);
+            try std.testing.expectEqual(@as(usize, 2 * 20), p.chunk_meta_data.len);
+            var iter = try p.iterator(alloc);
+            defer iter.deinit();
+
+            const h0 = try iter.next() orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(@as(u32, 0), h0.doc_id);
+            try std.testing.expectEqual(@as(u32, 3), h0.freq);
+            try std.testing.expectEqual(@as(u32, 10), h0.norm);
+            const h3 = try iter.advanceTo(3) orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(@as(u32, 3), h3.doc_id);
+            try std.testing.expectEqual(@as(u32, 2), h3.freq);
+            try std.testing.expectEqual(@as(u32, 15), h3.norm);
         },
         .one_hit => return error.TestExpectedEqual,
     }
