@@ -41,17 +41,17 @@ func NewChatMessage(role oapi.InferenceRole, content string) oapi.InferenceChatM
 
 // NewUserMessage creates a user ChatMessage with string content.
 func NewUserMessage(content string) oapi.InferenceChatMessage {
-	return NewChatMessage(oapi.InferenceRoleUser, content)
+	return NewChatMessage(oapi.ChatMessageRoleUser, content)
 }
 
 // NewSystemMessage creates a system ChatMessage with string content.
 func NewSystemMessage(content string) oapi.InferenceChatMessage {
-	return NewChatMessage(oapi.InferenceRoleSystem, content)
+	return NewChatMessage(oapi.ChatMessageRoleSystem, content)
 }
 
 // NewAssistantMessage creates an assistant ChatMessage with string content.
 func NewAssistantMessage(content string) oapi.InferenceChatMessage {
-	return NewChatMessage(oapi.InferenceRoleAssistant, content)
+	return NewChatMessage(oapi.ChatMessageRoleAssistant, content)
 }
 
 // NewMultimodalUserMessage creates a user ChatMessage with text and image content.
@@ -85,7 +85,7 @@ func NewMultimodalUserMessage(text string, imageDataURIs ...string) (oapi.Infere
 		parts = append(parts, imagePart)
 	}
 
-	msg := oapi.InferenceChatMessage{Role: oapi.InferenceRoleUser}
+	msg := oapi.InferenceChatMessage{Role: oapi.ChatMessageRoleUser}
 	raw, err := json.Marshal(parts)
 	if err != nil {
 		return oapi.InferenceChatMessage{}, fmt.Errorf("setting content parts: %w", err)
@@ -424,16 +424,10 @@ func (c *InferenceClient) ListModels(ctx context.Context) (*oapi.InferenceModels
 	return resp.JSON200, nil
 }
 
-// Recognize extracts named entities from text using a recognizer model.
-// For GLiNER models, optional labels can be specified for zero-shot NER.
-func (c *InferenceClient) Recognize(ctx context.Context, model string, texts []string, labels []string) (*oapi.InferenceRecognizeResponse, error) {
-	req := oapi.InferenceRecognizeRequest{
-		Model:  model,
-		Texts:  texts,
-		Labels: labels,
-	}
-
-	resp, err := c.client.RecognizeEntitiesWithResponse(ctx, req)
+// Extract runs schema-driven extraction through the canonical Antfly inference
+// extraction endpoint.
+func (c *InferenceClient) Extract(ctx context.Context, req oapi.ExtractionRequest) (*oapi.ExtractionResponse, error) {
+	resp, err := c.client.ExtractWithResponse(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
@@ -447,99 +441,8 @@ func (c *InferenceClient) Recognize(ctx context.Context, model string, texts []s
 	if resp.JSON500 != nil {
 		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
 	}
-	if resp.JSON200 == nil {
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
-	}
-
-	return resp.JSON200, nil
-}
-
-// ExtractRelations extracts entities and relations between them from text.
-// Uses models with the "relations" capability (e.g., REBEL, GLiNER multitask).
-// entityLabels specifies the entity types to extract (optional, uses model defaults if empty).
-// relationLabels specifies the relation types to extract (optional, uses model defaults if empty).
-func (c *InferenceClient) ExtractRelations(ctx context.Context, model string, texts []string, entityLabels []string, relationLabels []string) (*oapi.InferenceRecognizeResponse, error) {
-	req := oapi.InferenceRecognizeRequest{
-		Model:          model,
-		Texts:          texts,
-		Labels:         entityLabels,
-		RelationLabels: relationLabels,
-	}
-
-	resp, err := c.client.RecognizeEntitiesWithResponse(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("sending request: %w", err)
-	}
-
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON200 == nil {
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
-	}
-
-	return resp.JSON200, nil
-}
-
-// Classify performs zero-shot text classification.
-// Returns classification results with labels and scores for each input text.
-func (c *InferenceClient) Classify(ctx context.Context, model string, texts []string, labels []string) (*oapi.InferenceClassifyResponse, error) {
-	req := oapi.InferenceClassifyRequest{
-		Model:  model,
-		Texts:  texts,
-		Labels: labels,
-	}
-
-	resp, err := c.client.ClassifyTextWithResponse(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("sending request: %w", err)
-	}
-
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON200 == nil {
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
-	}
-
-	return resp.JSON200, nil
-}
-
-// ClassifyMultiLabel performs multi-label zero-shot text classification.
-// Unlike regular classification where scores sum to 1, multi-label allows independent label scores.
-func (c *InferenceClient) ClassifyMultiLabel(ctx context.Context, model string, texts []string, labels []string) (*oapi.InferenceClassifyResponse, error) {
-	req := oapi.InferenceClassifyRequest{
-		Model:      model,
-		Texts:      texts,
-		Labels:     labels,
-		MultiLabel: true,
-	}
-
-	resp, err := c.client.ClassifyTextWithResponse(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("sending request: %w", err)
-	}
-
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
+	if resp.JSON503 != nil {
+		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
@@ -591,71 +494,6 @@ func (c *InferenceClient) Transcribe(ctx context.Context, model string, audio []
 	}
 
 	resp, err := c.client.TranscribeAudioWithResponse(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("sending request: %w", err)
-	}
-
-	if resp.JSON400 != nil {
-		return nil, fmt.Errorf("bad request: %s", resp.JSON400.Error)
-	}
-	if resp.JSON404 != nil {
-		return nil, fmt.Errorf("model not found: %s", resp.JSON404.Error)
-	}
-	if resp.JSON500 != nil {
-		return nil, fmt.Errorf("server error: %s", resp.JSON500.Error)
-	}
-	if resp.JSON503 != nil {
-		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
-	}
-	if resp.JSON200 == nil {
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
-	}
-
-	return resp.JSON200, nil
-}
-
-// ExtractJSONConfig contains configuration for JSON extraction.
-type ExtractJSONConfig struct {
-	Threshold         float32
-	FlatNER           *bool // Pointer so explicit false can be sent (server defaults to true)
-	IncludeConfidence bool
-	IncludeSpans      bool
-}
-
-// ExtractJSON extracts structured JSON from text using a GLiNER2 model.
-// The schema maps structure names to field definitions (e.g., {"person": ["name::str", "age::str"]}).
-func (c *InferenceClient) ExtractJSON(ctx context.Context, model string, texts []string, schema map[string][]string, config *ExtractJSONConfig) (*oapi.InferenceExtractResponse, error) {
-	// Build request body manually instead of using the generated ExtractRequest type,
-	// because the generated type's omitzero tag on FlatNer (bool) silently drops false.
-	type extractReqBody struct {
-		Model             string              `json:"model"`
-		Texts             []string            `json:"texts"`
-		Schema            map[string][]string `json:"schema"`
-		Threshold         float32             `json:"threshold,omitempty"`
-		FlatNER           *bool               `json:"flat_ner,omitempty"`
-		IncludeConfidence bool                `json:"include_confidence,omitempty"`
-		IncludeSpans      bool                `json:"include_spans,omitempty"`
-	}
-
-	req := extractReqBody{
-		Model:  model,
-		Texts:  texts,
-		Schema: schema,
-	}
-
-	if config != nil {
-		req.Threshold = config.Threshold
-		req.FlatNER = config.FlatNER
-		req.IncludeConfidence = config.IncludeConfidence
-		req.IncludeSpans = config.IncludeSpans
-	}
-
-	buf, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshaling request: %w", err)
-	}
-
-	resp, err := c.client.ExtractJSONWithBodyWithResponse(ctx, "application/json", bytes.NewReader(buf))
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}

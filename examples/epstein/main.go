@@ -3535,15 +3535,23 @@ func recognizeEntityWindowBatch(
 		texts[i] = window.content
 	}
 
-	var (
-		resp *inferenceoapi.InferenceRecognizeResponse
-		err  error
-	)
-	if len(relationLabels) > 0 {
-		resp, err = client.ExtractRelations(ctx, model, texts, labels, relationLabels)
-	} else {
-		resp, err = client.Recognize(ctx, model, texts, labels)
+	inputs, err := inferenceExtractionInputs(texts)
+	if err != nil {
+		log.Printf("Warning: entity recognition request build failed: %v", err)
+		return "", 0, len(windows)
 	}
+	relations := make([]inferenceoapi.ExtractionRelationSchema, 0, len(relationLabels))
+	for _, label := range relationLabels {
+		relations = append(relations, inferenceoapi.ExtractionRelationSchema{Type: label})
+	}
+	resp, err := client.Extract(ctx, inferenceoapi.ExtractionRequest{
+		Model:  model,
+		Inputs: inputs,
+		Schema: inferenceoapi.ExtractionSchema{
+			Entities:  labels,
+			Relations: relations,
+		},
+	})
 	if err != nil {
 		if len(windows) > 1 {
 			mid := len(windows) / 2
@@ -3571,12 +3579,9 @@ func recognizeEntityWindowBatch(
 
 	resultsByIndex := make(map[int]inferenceoapi.InferenceRecognizeObject, len(resp.Data))
 	for resultIdx, result := range resp.Data {
-		idx := result.Index
-		if idx < 0 || idx >= len(windows) {
-			idx = resultIdx
-		}
+		idx := resultIdx
 		if idx >= 0 && idx < len(windows) {
-			resultsByIndex[idx] = result
+			resultsByIndex[idx] = inferenceRecognizeObjectFromExtraction(result)
 		}
 	}
 
@@ -3596,6 +3601,59 @@ func recognizeEntityWindowBatch(
 	}
 
 	return usedModel, len(windows), 0
+}
+
+func inferenceExtractionInputs(texts []string) ([]inferenceoapi.ExtractionInput, error) {
+	inputs := make([]inferenceoapi.ExtractionInput, len(texts))
+	for i, text := range texts {
+		content, err := json.Marshal(text)
+		if err != nil {
+			return nil, err
+		}
+		inputs[i] = inferenceoapi.ExtractionInput{Content: inferenceoapi.ChatMessageContent(content)}
+	}
+	return inputs, nil
+}
+
+func inferenceRecognizeObjectFromExtraction(item inferenceoapi.ExtractionObject) inferenceoapi.InferenceRecognizeObject {
+	entities := make([]inferenceoapi.InferenceRecognizeEntity, len(item.Entities))
+	for i, entity := range item.Entities {
+		entities[i] = inferenceoapi.InferenceRecognizeEntity{
+			Text:  entity.Text,
+			Label: entity.Label,
+			Score: entity.Score,
+			Start: entity.Start,
+			End:   entity.End,
+		}
+	}
+	relations := make([]inferenceoapi.InferenceRelation, 0, len(item.Relations))
+	for _, relation := range item.Relations {
+		relations = append(relations, inferenceoapi.InferenceRelation{
+			Head:  inferenceRelationEndpointEntity(relation.Source, entities),
+			Label: relation.Type,
+			Score: relation.Score,
+			Tail:  inferenceRelationEndpointEntity(relation.Target, entities),
+		})
+	}
+	return inferenceoapi.InferenceRecognizeObject{
+		Entities:  entities,
+		Object:    inferenceoapi.InferenceRecognizeObjectObjectRecognition,
+		Relations: relations,
+	}
+}
+
+func inferenceRelationEndpointEntity(endpoint inferenceoapi.ExtractionRelationEndpoint, entities []inferenceoapi.InferenceRecognizeEntity) inferenceoapi.InferenceRecognizeEntity {
+	if endpoint.EntityIndex >= 0 && endpoint.EntityIndex < len(entities) {
+		return entities[endpoint.EntityIndex]
+	}
+	if endpoint.Id != "" {
+		for _, entity := range entities {
+			if entity.Text == endpoint.Id {
+				return entity
+			}
+		}
+	}
+	return inferenceoapi.InferenceRecognizeEntity{}
 }
 
 func offsetEntities(entities []inferenceoapi.InferenceRecognizeEntity, base int) []inferenceoapi.InferenceRecognizeEntity {

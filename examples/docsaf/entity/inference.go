@@ -42,13 +42,26 @@ type inferenceRecognizerExtractor struct {
 }
 
 func (r *inferenceRecognizerExtractor) Extract(ctx context.Context, texts []string, opts docsafentity.ExtractOptions) ([]docsafentity.Extraction, error) {
-	resp, err := r.client.Recognize(ctx, r.model, texts, opts.EntityLabels)
+	inputs, err := inferenceExtractionInputs(texts)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := r.client.Extract(ctx, oapi.ExtractionRequest{
+		Model:  r.model,
+		Inputs: inputs,
+		Schema: oapi.ExtractionSchema{
+			Entities: opts.EntityLabels,
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	results := make([]docsafentity.Extraction, len(resp.Data))
+	results := make([]docsafentity.Extraction, len(texts))
 	for i, item := range resp.Data {
+		if i >= len(results) {
+			continue
+		}
 		results[i].Entities = make([]docsafentity.Entity, len(item.Entities))
 		for j, entity := range item.Entities {
 			results[i].Entities[j] = docsafentity.Entity{
@@ -69,13 +82,31 @@ type inferenceRelationExtractor struct {
 }
 
 func (r *inferenceRelationExtractor) Extract(ctx context.Context, texts []string, opts docsafentity.ExtractOptions) ([]docsafentity.Extraction, error) {
-	resp, err := r.client.ExtractRelations(ctx, r.model, texts, opts.EntityLabels, opts.RelationLabels)
+	inputs, err := inferenceExtractionInputs(texts)
+	if err != nil {
+		return nil, err
+	}
+	relations := make([]oapi.ExtractionRelationSchema, 0, len(opts.RelationLabels))
+	for _, label := range opts.RelationLabels {
+		relations = append(relations, oapi.ExtractionRelationSchema{Type: label})
+	}
+	resp, err := r.client.Extract(ctx, oapi.ExtractionRequest{
+		Model:  r.model,
+		Inputs: inputs,
+		Schema: oapi.ExtractionSchema{
+			Entities:  opts.EntityLabels,
+			Relations: relations,
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	results := make([]docsafentity.Extraction, len(resp.Data))
+	results := make([]docsafentity.Extraction, len(texts))
 	for i, item := range resp.Data {
+		if i >= len(results) {
+			continue
+		}
 		results[i].Entities = make([]docsafentity.Entity, len(item.Entities))
 		for j, entity := range item.Entities {
 			results[i].Entities[j] = docsafentity.Entity{
@@ -89,28 +120,44 @@ func (r *inferenceRelationExtractor) Extract(ctx context.Context, texts []string
 		if len(item.Relations) > 0 {
 			results[i].Relations = make([]docsafentity.Relation, len(item.Relations))
 			for j, relation := range item.Relations {
+				head := docsafEntityForEndpoint(relation.Source, results[i].Entities)
+				tail := docsafEntityForEndpoint(relation.Target, results[i].Entities)
 				results[i].Relations[j] = docsafentity.Relation{
-					Head: docsafentity.Entity{
-						Text:  relation.Head.Text,
-						Label: relation.Head.Label,
-						Score: relation.Head.Score,
-						Start: relation.Head.Start,
-						End:   relation.Head.End,
-					},
-					Label: relation.Label,
+					Head:  head,
+					Label: relation.Type,
 					Score: relation.Score,
-					Tail: docsafentity.Entity{
-						Text:  relation.Tail.Text,
-						Label: relation.Tail.Label,
-						Score: relation.Tail.Score,
-						Start: relation.Tail.Start,
-						End:   relation.Tail.End,
-					},
+					Tail:  tail,
 				}
 			}
 		}
 	}
 	return results, nil
+}
+
+func inferenceExtractionInputs(texts []string) ([]oapi.ExtractionInput, error) {
+	inputs := make([]oapi.ExtractionInput, len(texts))
+	for i, text := range texts {
+		content, err := json.Marshal(text)
+		if err != nil {
+			return nil, err
+		}
+		inputs[i] = oapi.ExtractionInput{Content: oapi.ChatMessageContent(content)}
+	}
+	return inputs, nil
+}
+
+func docsafEntityForEndpoint(endpoint oapi.ExtractionRelationEndpoint, entities []docsafentity.Entity) docsafentity.Entity {
+	if endpoint.EntityIndex >= 0 && endpoint.EntityIndex < len(entities) {
+		return entities[endpoint.EntityIndex]
+	}
+	if endpoint.Id != "" {
+		for _, entity := range entities {
+			if entity.Text == endpoint.Id {
+				return entity
+			}
+		}
+	}
+	return docsafentity.Entity{}
 }
 
 type inferenceGeneratorExtractor struct {

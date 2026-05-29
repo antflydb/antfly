@@ -2,12 +2,14 @@ package memoryaf
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"sync"
 	"time"
 
 	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/inference"
 	inferenceclient "github.com/antflydb/antfly/go/pkg/sdk"
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"go.uber.org/zap"
 )
 
@@ -99,7 +101,17 @@ func (c *NERClient) Extract(ctx context.Context, texts []string, opts ExtractOpt
 		labels = c.nerLabels
 	}
 
-	resp, err := c.client.Recognize(ctx, c.nerModel, texts, labels)
+	inputs, err := extractionInputs(texts)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.client.Extract(ctx, oapi.ExtractionRequest{
+		Model:  c.nerModel,
+		Inputs: inputs,
+		Schema: oapi.ExtractionSchema{
+			Entities: labels,
+		},
+	})
 	if err != nil {
 		c.logger.Warn("Antfly inference NER request failed", zap.Error(err))
 		out := make([]Extraction, len(texts))
@@ -107,9 +119,8 @@ func (c *NERClient) Extract(ctx context.Context, texts []string, opts ExtractOpt
 	}
 
 	results := make([]Extraction, len(texts))
-	for _, item := range resp.Data {
-		i := item.Index
-		if i >= len(texts) {
+	for i, item := range resp.Data {
+		if i >= len(results) {
 			continue
 		}
 		entities := make([]ExtractedEntity, 0, len(item.Entities))
@@ -123,4 +134,16 @@ func (c *NERClient) Extract(ctx context.Context, texts []string, opts ExtractOpt
 		results[i] = Extraction{Entities: entities}
 	}
 	return results, nil
+}
+
+func extractionInputs(texts []string) ([]oapi.ExtractionInput, error) {
+	inputs := make([]oapi.ExtractionInput, len(texts))
+	for i, text := range texts {
+		content, err := json.Marshal(text)
+		if err != nil {
+			return nil, err
+		}
+		inputs[i] = oapi.ExtractionInput{Content: oapi.ChatMessageContent(content)}
+	}
+	return inputs, nil
 }
