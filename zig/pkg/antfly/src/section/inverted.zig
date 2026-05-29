@@ -15,7 +15,7 @@
 //! Inverted text index section for full-text search.
 //!
 //! Builds and queries an inverted index using:
-//!   - Blocked term dictionary indexed by a Vellum FST (prefix → block offset)
+//!   - Blocked term dictionary indexed by a Vellum FST (block ceiling → block offset)
 //!   - Roaring bitmaps for posting lists (document ID sets)
 //!   - Chunked int encoder for term frequencies and field norms
 //!   - BM25 scoring
@@ -33,21 +33,24 @@ const bloom = @import("bloom");
 // Wire format versions
 // ============================================================================
 //
-//   v11: v10 postings + BlockTree-style blocked term dictionary
+//   v11: v10 postings + fixed-prefix blocked term dictionary
 //   v12: v11 + bit-packed position deltas
+//   v13: v12 + variable BlockTree-style prefix-compressed term blocks
 //
-// This project is pre-release; writers emit the current v12 format.
+// This project is pre-release; writers emit only the current v13 format.
 
-const wire_version_current: u8 = 12;
+const wire_version_current: u8 = 13;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4; // 29 bytes
 const v7_chunk_meta_size: usize = 44;
 const postings_header_size: usize = 24;
 const postings_skip_record_size: usize = 8;
 const postings_skip_stride_chunks: usize = 16;
 const postings_skip_min_chunks: usize = postings_skip_stride_chunks * 2;
-const term_block_prefix_len: usize = 2;
-const term_dict_magic = "BTD1";
-const term_dict_header_size: usize = 16;
+const term_dict_block_min_entries: usize = 25;
+const term_dict_block_max_entries: usize = 48;
+const term_dict_index_record_size: usize = 8;
+const term_dict_magic = "BTD2";
+const term_dict_header_size: usize = 20;
 
 /// Skip building a per-segment bloom filter when there are fewer terms than this.
 /// FST traversal is already cheap for tiny term sets, and the filter would
@@ -139,17 +142,49 @@ const TermDictEntry = struct {
     value: u64,
 };
 
-fn termBlockKey(term: []const u8) []const u8 {
-    return term[0..@min(term.len, term_block_prefix_len)];
-}
-
 fn appendLeU32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
     try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, value))));
+}
+
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    const limit = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < limit and a[i] == b[i]) : (i += 1) {}
+    return i;
+}
+
+fn chooseTermBlockEnd(entries_len: usize, start: usize) usize {
+    const remaining = entries_len - start;
+    if (remaining <= term_dict_block_max_entries) return entries_len;
+
+    var block_len = term_dict_block_max_entries;
+    const tail = remaining - block_len;
+    if (tail > 0 and tail < term_dict_block_min_entries) {
+        const borrow = term_dict_block_min_entries - tail;
+        if (block_len > term_dict_block_min_entries + borrow) {
+            block_len -= borrow;
+        }
+    }
+    return start + block_len;
+}
+
+fn appendTermDictIndexRecord(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    block_offset: u32,
+    ceiling_term_offset: u32,
+) !void {
+    try appendLeU32(alloc, out, block_offset);
+    try appendLeU32(alloc, out, ceiling_term_offset);
 }
 
 fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry) ![]u8 {
     var block_data = std.ArrayListUnmanaged(u8).empty;
     defer block_data.deinit(alloc);
+    var index_records = std.ArrayListUnmanaged(u8).empty;
+    defer index_records.deinit(alloc);
+    var index_terms = std.ArrayListUnmanaged(u8).empty;
+    defer index_terms.deinit(alloc);
 
     const fst_registry_size: usize = std.math.clamp(entries.len, 64, 65_536);
     var block_fst_builder = try vellum.Builder.init(alloc, .{
@@ -160,15 +195,21 @@ fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry)
     var i: usize = 0;
     var block_count: u32 = 0;
     while (i < entries.len) {
-        const prefix = termBlockKey(entries[i].term);
+        const end = chooseTermBlockEnd(entries.len, i);
+        const first_term = entries[i].term;
+        const ceiling_term = entries[end - 1].term;
+        const prefix_len = commonPrefixLen(first_term, ceiling_term);
+        const prefix = first_term[0..prefix_len];
         const block_offset: u64 = @intCast(block_data.items.len);
-        try block_fst_builder.insert(prefix, block_offset);
+        try block_fst_builder.insert(ceiling_term, block_offset);
 
-        var end = i + 1;
-        while (end < entries.len and std.mem.eql(u8, termBlockKey(entries[end].term), prefix)) : (end += 1) {}
+        const ceiling_term_offset: u32 = @intCast(index_terms.items.len);
+        try writeVarintU32(alloc, &index_terms, @intCast(ceiling_term.len));
+        try index_terms.appendSlice(alloc, ceiling_term);
+        try appendTermDictIndexRecord(alloc, &index_records, @intCast(block_offset), ceiling_term_offset);
 
-        try block_data.append(alloc, @intCast(prefix.len));
-        try appendLeU32(alloc, &block_data, @intCast(end - i));
+        try writeVarintU32(alloc, &block_data, @intCast(prefix.len));
+        try writeVarintU32(alloc, &block_data, @intCast(end - i));
         try block_data.appendSlice(alloc, prefix);
 
         for (entries[i..end]) |entry| {
@@ -190,8 +231,11 @@ fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry)
     try out.appendSlice(alloc, term_dict_magic);
     try appendLeU32(alloc, &out, block_count);
     try appendLeU32(alloc, &out, @intCast(block_data.items.len));
+    try appendLeU32(alloc, &out, @intCast(index_records.items.len + index_terms.items.len));
     try appendLeU32(alloc, &out, @intCast(block_fst.len));
     try out.appendSlice(alloc, block_data.items);
+    try out.appendSlice(alloc, index_records.items);
+    try out.appendSlice(alloc, index_terms.items);
     try out.appendSlice(alloc, block_fst);
     return try out.toOwnedSlice(alloc);
 }
@@ -902,7 +946,7 @@ const PostingAccumulator = struct {
 // Index reader (query path)
 // ============================================================================
 
-/// Reads a serialized inverted index section (v11, with blocked term dictionary).
+/// Reads a serialized inverted index section (v13, with variable blocked term dictionary).
 pub const InvertedIndexReader = struct {
     alloc: Allocator,
     data: []const u8,
@@ -911,7 +955,9 @@ pub const InvertedIndexReader = struct {
     chunk_size: u32,
     postings_offset: usize,
     version: u8,
+    dict_block_count: u32,
     dict_blocks: []const u8,
+    dict_index: []const u8,
     dict_fst: vellum.FST,
     /// Optional per-segment term bloom filter. When present, callers can
     /// reject absent terms before walking the FST. Borrows into `data`.
@@ -934,11 +980,16 @@ pub const InvertedIndexReader = struct {
         const dict_offset = data.len - dict_len;
         const dict_data = data[dict_offset..];
         if (!std.mem.eql(u8, dict_data[0..4], term_dict_magic)) return error.InvalidData;
+        const block_count = std.mem.readInt(u32, dict_data[4..8], .little);
         const block_data_len = std.mem.readInt(u32, dict_data[8..12], .little);
-        const block_fst_len = std.mem.readInt(u32, dict_data[12..16], .little);
-        if (term_dict_header_size + @as(usize, block_data_len) + @as(usize, block_fst_len) != dict_data.len) return error.InvalidData;
+        const block_index_len = std.mem.readInt(u32, dict_data[12..16], .little);
+        const block_fst_len = std.mem.readInt(u32, dict_data[16..20], .little);
+        const index_records_len = @as(usize, block_count) * term_dict_index_record_size;
+        if (block_index_len < index_records_len) return error.InvalidData;
+        if (term_dict_header_size + @as(usize, block_data_len) + @as(usize, block_index_len) + @as(usize, block_fst_len) != dict_data.len) return error.InvalidData;
         const block_data = dict_data[term_dict_header_size..][0..block_data_len];
-        const block_fst_data = dict_data[term_dict_header_size + @as(usize, block_data_len) ..];
+        const block_index_data = dict_data[term_dict_header_size + @as(usize, block_data_len) ..][0..block_index_len];
+        const block_fst_data = dict_data[term_dict_header_size + @as(usize, block_data_len) + @as(usize, block_index_len) ..];
         const dict_fst = try vellum.FST.load(block_fst_data);
 
         var term_bloom: ?bloom.BorrowedFilter = null;
@@ -955,7 +1006,9 @@ pub const InvertedIndexReader = struct {
             .chunk_size = chunk_size,
             .postings_offset = postings_offset,
             .version = version,
+            .dict_block_count = block_count,
             .dict_blocks = block_data,
+            .dict_index = block_index_data,
             .dict_fst = dict_fst,
             .term_bloom = term_bloom,
         };
@@ -1028,10 +1081,8 @@ pub const InvertedIndexReader = struct {
             const h = termBloomHashes(term);
             if (!filter.maybeContainsHashes(h.h1, h.h2)) return null;
         }
-        const block_key = termBlockKey(term);
-        const result = self.dict_fst.get(block_key) catch return null;
-        if (!result.found) return null;
-        const dict_value = self.lookupInTermBlock(@intCast(result.val), term) catch return null;
+        const block_offset = self.findTermBlockOffset(term) catch return null;
+        const dict_value = self.lookupInTermBlock(block_offset, term) catch return null;
 
         if (fstValIs1Hit(dict_value)) {
             const decoded = fstValDecode1Hit(dict_value);
@@ -1044,7 +1095,7 @@ pub const InvertedIndexReader = struct {
         return .{ .postings = self.readPostings(@intCast(dict_value)) };
     }
 
-    /// Iterate all terms in the dictionary using the block-prefix FST iterator.
+    /// Iterate all terms in the dictionary using the block-ceiling FST iterator.
     pub fn termIterator(self: *const InvertedIndexReader) !TermIterator {
         return .{
             .alloc = self.alloc,
@@ -1058,7 +1109,7 @@ pub const InvertedIndexReader = struct {
         return .{
             .alloc = self.alloc,
             .reader = self,
-            .block_iter = try self.dict_fst.iterator(self.alloc, if (start) |s| termBlockKey(s) else null, null),
+            .block_iter = try self.dict_fst.iterator(self.alloc, start, null),
             .start = start,
             .end = end,
         };
@@ -1075,14 +1126,43 @@ pub const InvertedIndexReader = struct {
         };
     }
 
+    fn findTermBlockOffset(self: *const InvertedIndexReader, term: []const u8) !u32 {
+        var lo: usize = 0;
+        var hi: usize = self.dict_block_count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const ceiling = try self.termBlockCeiling(mid);
+            if (std.mem.order(u8, ceiling, term) == .lt) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo >= self.dict_block_count) return error.NotFound;
+        return self.termBlockOffset(lo);
+    }
+
+    fn termBlockOffset(self: *const InvertedIndexReader, block_idx: usize) u32 {
+        const off = block_idx * term_dict_index_record_size;
+        return std.mem.readInt(u32, self.dict_index[off..][0..4], .little);
+    }
+
+    fn termBlockCeiling(self: *const InvertedIndexReader, block_idx: usize) ![]const u8 {
+        const records_len = @as(usize, self.dict_block_count) * term_dict_index_record_size;
+        const record_off = block_idx * term_dict_index_record_size;
+        const term_offset = std.mem.readInt(u32, self.dict_index[record_off + 4 ..][0..4], .little);
+        if (term_offset >= self.dict_index.len - records_len) return error.InvalidData;
+        var cursor = records_len + @as(usize, term_offset);
+        const term_len = try readVarintU32(self.dict_index, &cursor);
+        if (cursor + term_len > self.dict_index.len) return error.InvalidData;
+        return self.dict_index[cursor..][0..term_len];
+    }
+
     fn lookupInTermBlock(self: *const InvertedIndexReader, block_offset: u32, term: []const u8) !u64 {
         if (block_offset >= self.dict_blocks.len) return error.InvalidData;
         var cursor: usize = block_offset;
-        const prefix_len = self.dict_blocks[cursor];
-        cursor += 1;
-        if (cursor + 4 > self.dict_blocks.len) return error.Truncated;
-        const entry_count = std.mem.readInt(u32, self.dict_blocks[cursor..][0..4], .little);
-        cursor += 4;
+        const prefix_len = try readVarintU32(self.dict_blocks, &cursor);
+        const entry_count = try readVarintU32(self.dict_blocks, &cursor);
         if (cursor + prefix_len > self.dict_blocks.len) return error.Truncated;
         const prefix = self.dict_blocks[cursor..][0..prefix_len];
         cursor += prefix_len;
@@ -1205,11 +1285,8 @@ pub const TermIterator = struct {
         const block_offset: usize = @intCast(current.val);
         if (block_offset >= self.reader.dict_blocks.len) return error.InvalidData;
         var cursor = block_offset;
-        const prefix_len = self.reader.dict_blocks[cursor];
-        cursor += 1;
-        if (cursor + 4 > self.reader.dict_blocks.len) return error.InvalidData;
-        self.current_block_remaining = std.mem.readInt(u32, self.reader.dict_blocks[cursor..][0..4], .little);
-        cursor += 4;
+        const prefix_len = readVarintU32(self.reader.dict_blocks, &cursor) catch return error.InvalidData;
+        self.current_block_remaining = readVarintU32(self.reader.dict_blocks, &cursor) catch return error.InvalidData;
         if (cursor + prefix_len > self.reader.dict_blocks.len) return error.InvalidData;
         self.current_block_prefix = self.reader.dict_blocks[cursor..][0..prefix_len];
         cursor += prefix_len;
@@ -2340,16 +2417,24 @@ test "term iterator enumerates all terms" {
     try std.testing.expect(try iter.next() == null);
 }
 
-test "v12 term dictionary stores prefix blocks indexed by fst" {
+test "v13 term dictionary stores variable prefix blocks indexed by block ceiling" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{});
     defer builder.deinit();
 
-    try builder.addDocument(0, &.{
-        .{ .term = "aa0", .freq = 1 },
-        .{ .term = "aa1", .freq = 1 },
-        .{ .term = "ab0", .freq = 1 },
-    });
+    var hits = std.ArrayListUnmanaged(InvertedIndexBuilder.TermHit).empty;
+    defer {
+        for (hits.items) |hit| alloc.free(@constCast(hit.term));
+        hits.deinit(alloc);
+    }
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        const term = try std.fmt.allocPrint(alloc, "aa{d:0>3}", .{i});
+        errdefer alloc.free(term);
+        try hits.append(alloc, .{ .term = term, .freq = 1 });
+    }
+
+    try builder.addDocument(0, hits.items);
 
     const section = try builder.build();
     defer alloc.free(section);
@@ -2359,12 +2444,31 @@ test "v12 term dictionary stores prefix blocks indexed by fst" {
     const dict = section[section.len - dict_len ..];
     try std.testing.expectEqualStrings(term_dict_magic, dict[0..4]);
     try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, dict[4..8], .little));
+    const block_data_len = std.mem.readInt(u32, dict[8..12], .little);
+    const index_data_len = std.mem.readInt(u32, dict[12..16], .little);
+    try std.testing.expect(block_data_len > 0);
+    try std.testing.expect(index_data_len > 2 * term_dict_index_record_size);
+
+    var block_cursor: usize = term_dict_header_size;
+    const first_prefix_len = try readVarintU32(dict, &block_cursor);
+    try std.testing.expect(first_prefix_len > 2);
 
     var reader = try InvertedIndexReader.init(alloc, section);
-    try std.testing.expect(reader.lookup("aa0") != null);
-    try std.testing.expect(reader.lookup("aa1") != null);
-    try std.testing.expect(reader.lookup("ab0") != null);
-    try std.testing.expect(reader.lookup("aa2") == null);
+    try std.testing.expect(reader.lookup("aa000") != null);
+    try std.testing.expect(reader.lookup("aa034") != null);
+    try std.testing.expect(reader.lookup("aa035") != null);
+    try std.testing.expect(reader.lookup("aa059") != null);
+    try std.testing.expect(reader.lookup("aa060") == null);
+
+    var range_iter = try reader.rangeTermIterator("aa034", "aa037");
+    defer range_iter.deinit();
+    const r0 = try range_iter.next() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("aa034", r0.term);
+    const r1 = try range_iter.next() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("aa035", r1.term);
+    const r2 = try range_iter.next() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("aa036", r2.term);
+    try std.testing.expect(try range_iter.next() == null);
 }
 
 test "BM25 scoring" {

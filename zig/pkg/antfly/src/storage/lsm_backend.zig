@@ -825,7 +825,7 @@ pub const Backend = struct {
 
         score +|= level_overflow_runs * 500;
         score +|= level_overflow_bytes / (64 * 1024);
-        if (self.manifest_dirty or self.obsolete_manifest_dirty) score +|= 1;
+        if (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()) score +|= 1;
         return score;
     }
 
@@ -908,7 +908,7 @@ pub const Backend = struct {
             }
         }
         try self.enforceWritePressure();
-        if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty)) {
+        if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
             try self.persistManifest();
         }
 
@@ -2399,7 +2399,8 @@ pub const Backend = struct {
 
     pub fn finalizeWriteReaderRelease(self: *Backend) !void {
         self.releaseReader();
-        if ((!self.manifest_dirty and !self.obsolete_manifest_dirty) or
+        const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
+        if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
             self.active_readers != 0 or
             self.bulkIngestActive() or
             self.root_dir == null or
@@ -2409,7 +2410,8 @@ pub const Backend = struct {
 
     pub fn finalizeReadReaderRelease(self: *Backend) void {
         self.releaseReader();
-        if ((!self.manifest_dirty and !self.obsolete_manifest_dirty) or
+        const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
+        if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
             self.active_readers != 0 or
             self.bulkIngestActive() or
             self.root_dir == null or
@@ -2534,7 +2536,7 @@ pub const Backend = struct {
         try self.runForegroundCompactionBudget(options);
         if (options.compact) {
             try self.finalizeDeferredRunWork(.{ .force_soft_compaction = true });
-        } else if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty)) {
+        } else if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
             try self.persistManifest();
         } else {
             _ = self.refreshCachedMaintenanceHintLocked();
@@ -2552,7 +2554,7 @@ pub const Backend = struct {
                 }
             }
             try self.runForegroundCompactionBudget(options);
-            if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty)) {
+            if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
                 try self.persistManifest();
             } else {
                 _ = self.refreshCachedMaintenanceHintLocked();
@@ -2616,7 +2618,7 @@ pub const Backend = struct {
         if (!self.bulkIngestActive() and (options.force_soft_compaction or self.options.foreground_soft_compaction)) {
             try self.maybeCompactRuns();
         }
-        if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty)) {
+        if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
             try self.persistManifest();
         }
     }
@@ -2685,6 +2687,16 @@ pub const Backend = struct {
             removed.deinit(self.allocator);
         }
         return needs_follow_up;
+    }
+
+    fn hasReclaimableObsoletePathsLocked(self: *Backend) bool {
+        if (self.active_readers != 0 or self.obsolete_paths.items.len == 0) return false;
+        if (self.root_dir == null or self.storage == null or self.options.backend.read_only) return false;
+        const now_ns = self.nowNs();
+        for (self.obsolete_paths.items) |obsolete| {
+            if (obsolete.delete_after_ns <= now_ns) return true;
+        }
+        return false;
     }
 
     fn nowNs(self: *Backend) u64 {
@@ -7884,6 +7896,41 @@ test "lsm backend reclaims obsolete run files when last reader releases" {
         &obsolete_paths,
     ));
     try std.testing.expectEqual(@as(usize, 0), obsolete_paths.items.len);
+}
+
+test "lsm backend reader release reclaims expired clean obsolete paths" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-reader-release-clean-obsolete-gc";
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 999);
+    defer alloc.free(obsolete_path);
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .obsolete_retention_ns = 0,
+    });
+    defer backend.close();
+
+    try repository_mod.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
+    try backend.obsolete_paths.append(alloc, .{
+        .path = try alloc.dupe(u8, obsolete_path),
+        .delete_after_ns = 0,
+    });
+    backend.manifest_dirty = false;
+    backend.obsolete_manifest_dirty = false;
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var read_txn = try runtime.beginRead();
+    try std.testing.expectEqual(@as(usize, 1), backend.active_readers);
+    read_txn.abort();
+
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
 }
 
 test "lsm backend reloads persisted manifest and run files" {
