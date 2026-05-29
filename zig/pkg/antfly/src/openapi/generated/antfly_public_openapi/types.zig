@@ -4,7 +4,7 @@
 const std = @import("std");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
-const antfly_ai_openapi = @import("antfly_ai_openapi");
+const antfly_generating_api_openapi = @import("antfly_generating_api_openapi");
 const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
@@ -960,15 +960,15 @@ pub const PruneStats = struct {
 /// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
 pub const RetrievalAgentSteps = struct {
     /// Tool configuration for the retrieval agent. Controls which tools are available and their settings. If not specified, tools are automatically determined from the table's available indexes.
-    tools: ?antfly_ai_openapi.ChatToolsConfig = null,
+    tools: ?antfly_generating_api_openapi.ChatToolsConfig = null,
     /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
-    classification: ?antfly_ai_openapi.ClassificationStepConfig = null,
+    classification: ?antfly_generating_api_openapi.ClassificationStepConfig = null,
     /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
-    generation: ?antfly_ai_openapi.GenerationStepConfig = null,
+    generation: ?antfly_generating_api_openapi.GenerationStepConfig = null,
     /// Configuration for generating follow-up questions. Requires steps.generation to be set.
-    followup: ?antfly_ai_openapi.FollowupStepConfig = null,
+    followup: ?antfly_generating_api_openapi.FollowupStepConfig = null,
     /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
-    confidence: ?antfly_ai_openapi.ConfidenceStepConfig = null,
+    confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
     /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
     eval: ?antfly_eval_openapi.EvalConfig = null,
 };
@@ -976,13 +976,13 @@ pub const RetrievalAgentSteps = struct {
 /// DEPRECATED: Use RetrievalAgentSteps instead. Configuration for the answer agent's pipeline steps.
 pub const AnswerAgentSteps = struct {
     /// Configuration for query classification and transformation.
-    classification: ?antfly_ai_openapi.ClassificationStepConfig = null,
+    classification: ?antfly_generating_api_openapi.ClassificationStepConfig = null,
     /// DEPRECATED: Use steps.generation on RetrievalAgentRequest instead. Configuration for answer generation from retrieved documents.
-    answer: ?antfly_ai_openapi.GenerationStepConfig = null,
+    answer: ?antfly_generating_api_openapi.GenerationStepConfig = null,
     /// Configuration for generating follow-up questions.
-    followup: ?antfly_ai_openapi.FollowupStepConfig = null,
+    followup: ?antfly_generating_api_openapi.FollowupStepConfig = null,
     /// Configuration for confidence assessment.
-    confidence: ?antfly_ai_openapi.ConfidenceStepConfig = null,
+    confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
 };
 
 pub const Embedding = std.json.Value;
@@ -1816,13 +1816,13 @@ pub const RetrievalAgentResult = struct {
     /// Clarification questions exposed in the shared bounded-agent envelope.
     questions: ?[]const AgentQuestion = null,
     /// Filters that were applied during retrieval
-    applied_filters: ?[]const antfly_ai_openapi.FilterSpec = null,
+    applied_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
     /// Total number of tool calls made during retrieval
     tool_calls_made: ?i64 = null,
     /// Optional conversational context including tool calls and responses. Decisions remain the authoritative continuation input for bounded agent interactions.
     messages: ?[]const antfly_generating_openapi.ChatMessage = null,
     /// Query classification and transformation result. Present when steps.classification was configured. Includes strategy, semantic_query, sub_questions (decompose), step_back_query, and reasoning.
-    classification: ?antfly_ai_openapi.ClassificationTransformationResult = null,
+    classification: ?antfly_generating_api_openapi.ClassificationTransformationResult = null,
     /// Generated response in markdown format. Present when steps.generation was configured.
     generation: ?[]const u8 = null,
     /// Confidence in the generated response (requires steps.confidence)
@@ -2224,7 +2224,7 @@ pub const RetrievalAgentRequest = struct {
     /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
     agent_knowledge: ?[]const u8 = null,
     /// Pre-applied filters from prior interactions. These are applied to all search tool invocations.
-    accumulated_filters: ?[]const antfly_ai_openapi.FilterSpec = null,
+    accumulated_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
     /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
     session_id: ?[]const u8 = null,
     /// Structured answers provided by the user as part of client-carried continuation.
@@ -2308,7 +2308,7 @@ pub const AnswerAgentResult = struct {
     /// Relevance of retrieved documents to the query
     context_relevance: ?f32 = null,
     /// DEPRECATED: Use classification on RetrievalAgentResult instead. Query classification and transformation result.
-    classification_transformation: ?antfly_ai_openapi.ClassificationTransformationResult = null,
+    classification_transformation: ?antfly_generating_api_openapi.ClassificationTransformationResult = null,
     /// DEPRECATED: Use hits on RetrievalAgentResult instead. Query results grouped by table.
     query_results: ?[]const QueryResult = null,
     /// Suggested follow-up questions

@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const structlog = @import("structlog");
 const inference_cli = @import("inference_cli");
 const platform = @import("antfly_platform");
@@ -41,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "version")) {
-        inference_cli.printVersion();
+        printVersion();
         return;
     }
 
@@ -65,6 +66,10 @@ fn printUsage() void {
         \\Run `antfly inference help` for inference commands.
         \\
     , .{});
+}
+
+fn printVersion() void {
+    std.debug.print("antfly {s} (zig runtime)\n", .{build_options.antfly_version});
 }
 
 test "inference main compiles" {

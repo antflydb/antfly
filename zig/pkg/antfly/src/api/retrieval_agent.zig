@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const ai_openapi = @import("antfly_ai_openapi");
+const generating_api_openapi = @import("antfly_generating_api_openapi");
 const eval_openapi = @import("antfly_eval_openapi");
 const generating_openapi = @import("antfly_generating_openapi");
 const indexes_openapi = @import("antfly_indexes_openapi");
@@ -233,7 +233,7 @@ const LiveEmitter = struct {
         }
     }
 
-    fn emitClassification(self: *LiveEmitter, classification: ai_openapi.ClassificationTransformationResult) !void {
+    fn emitClassification(self: *LiveEmitter, classification: generating_api_openapi.ClassificationTransformationResult) !void {
         try self.emitValue("classification", classification);
         if (classification.reasoning) |reasoning| try self.emitTextChunks("reasoning", reasoning);
         if (classification.sub_questions) |sub_questions| {
@@ -474,7 +474,7 @@ fn executeInternal(
     const clarification_state = try parseClarificationState(request);
     var steps_list = std.ArrayListUnmanaged(AgentStep).empty;
     defer steps_list.deinit(arena);
-    const classification_result: ?ai_openapi.ClassificationTransformationResult = if (classification_cfg) |cfg|
+    const classification_result: ?generating_api_openapi.ClassificationTransformationResult = if (classification_cfg) |cfg|
         try buildClassificationResult(arena, request.query, cfg)
     else if (agentic_mode)
         try buildClassificationResult(arena, request.query, .{
@@ -1365,8 +1365,8 @@ const ParsedGenerationConfig = struct {
 };
 
 const ParsedClassificationConfig = struct {
-    force_strategy: ?ai_openapi.QueryStrategy,
-    force_semantic_mode: ?ai_openapi.SemanticQueryMode,
+    force_strategy: ?generating_api_openapi.QueryStrategy,
+    force_semantic_mode: ?generating_api_openapi.SemanticQueryMode,
     with_reasoning: bool,
 };
 
@@ -1556,7 +1556,7 @@ fn buildTreeExpansionStepDetails(
 
 fn buildSelectStrategyAction(
     alloc: std.mem.Allocator,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_queries: []const RetrievalQueryRequest,
     selected_query_indices: []const usize,
 ) ![]const u8 {
@@ -1576,7 +1576,7 @@ fn buildSelectStrategyStepDetails(
     alloc: std.mem.Allocator,
     retrieval_queries: []const RetrievalQueryRequest,
     selected_query_indices: []const usize,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     source: AgenticSelectionSource,
     candidate_scores: []const AgenticCandidateScore,
     broadened_from_decision: bool,
@@ -1654,7 +1654,7 @@ fn buildEvaluationRefineQueryStepDetails(
     alloc: std.mem.Allocator,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
-    classification: ai_openapi.ClassificationTransformationResult,
+    classification: generating_api_openapi.ClassificationTransformationResult,
     refined_query: []const u8,
 ) !std.json.Value {
     var obj = std.json.ObjectMap.empty;
@@ -1968,7 +1968,7 @@ fn buildInitialRefineQueryStepDetails(
     alloc: std.mem.Allocator,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
-    classification: ai_openapi.ClassificationTransformationResult,
+    classification: generating_api_openapi.ClassificationTransformationResult,
     refined_query: []const u8,
 ) !std.json.Value {
     var obj = std.json.ObjectMap.empty;
@@ -2170,7 +2170,7 @@ fn parseConfidenceEnabled(request: RetrievalAgentRequest, has_generation: bool) 
 fn buildGenerationChain(
     alloc: std.mem.Allocator,
     request: RetrievalAgentRequest,
-    generation: ai_openapi.GenerationStepConfig,
+    generation: generating_api_openapi.GenerationStepConfig,
 ) ![]const generating.ChainLink {
     var links = std.ArrayListUnmanaged(generating.ChainLink).empty;
     errdefer links.deinit(alloc);
@@ -2188,7 +2188,7 @@ fn buildGenerationChain(
     return try links.toOwnedSlice(alloc);
 }
 
-fn generationStepFromPublic(generation: ai_openapi.GenerationStepConfig) ai_openapi.GenerationStepConfig {
+fn generationStepFromPublic(generation: generating_api_openapi.GenerationStepConfig) generating_api_openapi.GenerationStepConfig {
     return .{
         .enabled = generation.enabled,
         .generator = if (generation.generator) |cfg| publicGeneratorConfigToGenerated(cfg) else null,
@@ -3200,8 +3200,8 @@ fn buildClassificationResult(
     alloc: std.mem.Allocator,
     query: []const u8,
     cfg: ParsedClassificationConfig,
-) !ai_openapi.ClassificationTransformationResult {
-    const route_type: ai_openapi.RouteType = if (isQuestionLike(query)) .question else .search;
+) !generating_api_openapi.ClassificationTransformationResult {
+    const route_type: generating_api_openapi.RouteType = if (isQuestionLike(query)) .question else .search;
     const strategy = cfg.force_strategy orelse inferClassificationStrategy(query);
     const semantic_mode = cfg.force_semantic_mode orelse inferSemanticMode(strategy);
     const improved_query = try buildImprovedQuery(alloc, query, route_type, strategy);
@@ -3231,14 +3231,14 @@ fn buildClassificationResult(
     };
 }
 
-fn inferClassificationStrategy(query: []const u8) ai_openapi.QueryStrategy {
+fn inferClassificationStrategy(query: []const u8) generating_api_openapi.QueryStrategy {
     if (containsAnyIgnoreCase(query, &.{ " and ", "compare", "versus", " vs ", "difference between" })) return .decompose;
     if (containsAnyIgnoreCase(query, &.{ "how does", "why does", "architecture", "workflow", "background" })) return .step_back;
     if (containsAnyIgnoreCase(query, &.{ "overview", "benefits", "tradeoffs", "concept", "summarize" })) return .hyde;
     return .simple;
 }
 
-fn inferSemanticMode(strategy: ai_openapi.QueryStrategy) ai_openapi.SemanticQueryMode {
+fn inferSemanticMode(strategy: generating_api_openapi.QueryStrategy) generating_api_openapi.SemanticQueryMode {
     return switch (strategy) {
         .hyde => .hypothetical,
         .simple, .decompose, .step_back => .rewrite,
@@ -3248,8 +3248,8 @@ fn inferSemanticMode(strategy: ai_openapi.QueryStrategy) ai_openapi.SemanticQuer
 fn buildImprovedQuery(
     alloc: std.mem.Allocator,
     query: []const u8,
-    route_type: ai_openapi.RouteType,
-    strategy: ai_openapi.QueryStrategy,
+    route_type: generating_api_openapi.RouteType,
+    strategy: generating_api_openapi.QueryStrategy,
 ) ![]const u8 {
     const route_hint = switch (route_type) {
         .question => "Question",
@@ -3265,8 +3265,8 @@ fn buildImprovedQuery(
 fn buildSemanticQuery(
     alloc: std.mem.Allocator,
     query: []const u8,
-    strategy: ai_openapi.QueryStrategy,
-    semantic_mode: ai_openapi.SemanticQueryMode,
+    strategy: generating_api_openapi.QueryStrategy,
+    semantic_mode: generating_api_openapi.SemanticQueryMode,
 ) ![]const u8 {
     return switch (semantic_mode) {
         .rewrite => switch (strategy) {
@@ -3309,7 +3309,7 @@ fn buildSubQuestions(alloc: std.mem.Allocator, query: []const u8) ![]const []con
 fn buildMultiPhrases(
     alloc: std.mem.Allocator,
     query: []const u8,
-    route_type: ai_openapi.RouteType,
+    route_type: generating_api_openapi.RouteType,
 ) ![]const []const u8 {
     const phrases = try alloc.alloc([]const u8, 3);
     phrases[0] = try alloc.dupe(u8, query);
@@ -3321,7 +3321,7 @@ fn buildMultiPhrases(
     return phrases;
 }
 
-fn classificationConfidence(strategy: ai_openapi.QueryStrategy, route_type: ai_openapi.RouteType) f32 {
+fn classificationConfidence(strategy: generating_api_openapi.QueryStrategy, route_type: generating_api_openapi.RouteType) f32 {
     const base: f32 = switch (strategy) {
         .simple => 0.86,
         .decompose => 0.74,
@@ -3745,7 +3745,7 @@ fn maybeProbeAgenticSelection(
     runner: QueryRunner,
     raw_queries: []const std.json.Value,
     retrieval_queries: []const RetrievalQueryRequest,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     selection: AgenticSelection,
 ) !?AgenticSelection {
     const existing_scores = selection.candidate_scores orelse return selection;
@@ -3825,7 +3825,7 @@ fn maybeProbeAgenticSelection(
 
 fn detectAgenticEvaluationTrigger(
     query: []const u8,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     attempted_strategy: RetrievalStrategy,
     attempt_summary: AttemptEvaluationSummary,
     candidate_scores: []const AgenticCandidateScore,
@@ -3877,7 +3877,7 @@ fn planNextAgenticFallback(
     runner: QueryRunner,
     raw_queries: []const std.json.Value,
     retrieval_queries: []const RetrievalQueryRequest,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     candidate_scores: []const AgenticCandidateScore,
     attempted_query_indices: []const bool,
 ) !?AgenticFallbackPlan {
@@ -3905,7 +3905,7 @@ fn probeAgenticFallbackCandidates(
     runner: QueryRunner,
     raw_queries: []const std.json.Value,
     retrieval_queries: []const RetrievalQueryRequest,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     candidate_scores: []const AgenticCandidateScore,
     attempted_query_indices: []const bool,
 ) ![]const AgenticCandidateScore {
@@ -4469,7 +4469,7 @@ fn compareProbeCandidate(lhs: AgenticCandidateScore, rhs: AgenticCandidateScore)
 }
 
 fn queryTextForProbe(
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
 ) []const u8 {
     if (classification_result) |classification| {
@@ -4500,7 +4500,7 @@ fn extractQueryString(value: std.json.Value) ?[]const u8 {
     };
 }
 
-fn preferredAgenticQueryStrategy(request: RetrievalAgentRequest) ai_openapi.QueryStrategy {
+fn preferredAgenticQueryStrategy(request: RetrievalAgentRequest) generating_api_openapi.QueryStrategy {
     if (request.steps) |steps| {
         if (steps.classification) |classification| {
             if (classification.force_strategy) |strategy| return strategy;
@@ -4545,7 +4545,7 @@ fn buildAgenticCandidateScores(
     alloc: std.mem.Allocator,
     query: []const u8,
     retrieval_queries: []const RetrievalQueryRequest,
-    preferred_strategy: ai_openapi.QueryStrategy,
+    preferred_strategy: generating_api_openapi.QueryStrategy,
 ) ![]const AgenticCandidateScore {
     const out = try alloc.alloc(AgenticCandidateScore, retrieval_queries.len);
     for (retrieval_queries, out, 0..) |retrieval_query, *slot, i| {
@@ -4688,7 +4688,7 @@ fn collectRemainingCandidateIndices(
 fn scoreAgenticQueryCandidate(
     query: []const u8,
     retrieval_query: RetrievalQueryRequest,
-    preferred_strategy: ai_openapi.QueryStrategy,
+    preferred_strategy: generating_api_openapi.QueryStrategy,
 ) i32 {
     const strategy = detectStrategy(retrieval_query);
     var score: i32 = switch (strategy) {
@@ -5100,7 +5100,7 @@ fn encodeQueryValueForRetrievalQuery(
     value: std.json.Value,
     retrieval_query: RetrievalQueryRequest,
     previous_query_hits: []const QueryHit,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query_index: usize,
     refinement_pass: QueryRefinementPass,
 ) ![]u8 {
@@ -5136,7 +5136,7 @@ fn encodeQueryValueForRetrievalQuery(
 
 fn applyClassificationRefinement(
     query_request: *QueryRequest,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query_index: usize,
     refinement_pass: QueryRefinementPass,
 ) void {
@@ -5158,7 +5158,7 @@ fn applyClassificationRefinement(
 }
 
 fn selectRefinedQueryText(
-    classification: ai_openapi.ClassificationTransformationResult,
+    classification: generating_api_openapi.ClassificationTransformationResult,
     retrieval_query_index: usize,
     refinement_pass: QueryRefinementPass,
 ) ?[]const u8 {
@@ -5189,7 +5189,7 @@ fn selectRefinedQueryText(
 }
 
 fn selectEvaluationQueryText(
-    classification: ai_openapi.ClassificationTransformationResult,
+    classification: generating_api_openapi.ClassificationTransformationResult,
     current_refined: []const u8,
 ) ?[]const u8 {
     if (classification.multi_phrases) |multi_phrases| {
@@ -5203,7 +5203,7 @@ fn selectEvaluationQueryText(
 }
 
 fn initialRefinedQueryText(
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
 ) ?[]const u8 {
@@ -5238,7 +5238,7 @@ fn containsUsedQueryText(
 }
 
 fn nextEvaluationRefinedQueryText(
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
     used_queries: []const []const u8,
@@ -5272,7 +5272,7 @@ fn shouldRunStepBackFollowup(
     agentic_mode: bool,
     max_internal_iterations: i64,
     tool_calls_made: i64,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
 ) bool {
     if (!agentic_mode) return false;
@@ -6485,7 +6485,7 @@ test "attempt evaluation summary includes top tree branch quality" {
 }
 
 test "retrieval agent can select multiple evaluation refinement phrases" {
-    const classification = ai_openapi.ClassificationTransformationResult{
+    const classification = generating_api_openapi.ClassificationTransformationResult{
         .route_type = .question,
         .strategy = .simple,
         .improved_query = "improved architecture query",
@@ -7583,7 +7583,7 @@ test "retrieval agent agentic mode uses multiple tools for decompose queries" {
     try std.testing.expectEqual(@as(usize, 2), runner.call_count);
     try std.testing.expectEqual(@as(i64, 2), parsed.value.tool_calls_made.?);
     try std.testing.expectEqual(RetrievalStrategy.hybrid, parsed.value.strategy_used.?);
-    try std.testing.expectEqual(ai_openapi.QueryStrategy.decompose, parsed.value.classification.?.strategy);
+    try std.testing.expectEqual(generating_api_openapi.QueryStrategy.decompose, parsed.value.classification.?.strategy);
 }
 
 test "retrieval agent refines decompose queries before execution" {
@@ -7992,8 +7992,8 @@ test "retrieval agent supports classification confidence and followup" {
     var parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.classification != null);
-    try std.testing.expectEqual(ai_openapi.RouteType.question, parsed.value.classification.?.route_type);
-    try std.testing.expectEqual(ai_openapi.QueryStrategy.step_back, parsed.value.classification.?.strategy);
+    try std.testing.expectEqual(generating_api_openapi.RouteType.question, parsed.value.classification.?.route_type);
+    try std.testing.expectEqual(generating_api_openapi.QueryStrategy.step_back, parsed.value.classification.?.strategy);
     try std.testing.expect(parsed.value.classification.?.step_back_query != null);
     try std.testing.expect(parsed.value.classification.?.multi_phrases != null);
     try std.testing.expect(parsed.value.classification.?.reasoning != null);
@@ -8073,7 +8073,7 @@ test "retrieval agent classification can decompose multi-part queries" {
     var parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.classification != null);
-    try std.testing.expectEqual(ai_openapi.QueryStrategy.decompose, parsed.value.classification.?.strategy);
+    try std.testing.expectEqual(generating_api_openapi.QueryStrategy.decompose, parsed.value.classification.?.strategy);
     try std.testing.expect(parsed.value.classification.?.sub_questions != null);
     try std.testing.expect(parsed.value.classification.?.sub_questions.?.len >= 2);
 }

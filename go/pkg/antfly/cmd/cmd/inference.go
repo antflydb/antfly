@@ -202,6 +202,7 @@ func runInferencePull(cmd *cobra.Command, args []string) error {
 	modelTypeStr, _ := cmd.Flags().GetString("type")
 	hfToken, _ := cmd.Flags().GetString("hf-token")
 	variant, _ := cmd.Flags().GetString("variant")
+	effectiveModelsDir := resolveInferenceModelsDir(cmd)
 
 	for _, modelRef := range args {
 		fmt.Printf("\n=== Pulling %s ===\n", modelRef)
@@ -209,7 +210,7 @@ func runInferencePull(cmd *cobra.Command, args []string) error {
 		// Check for hf: prefix to route to HuggingFace
 		if repoID, isHF := modelregistry.ParseHuggingFaceRef(modelRef); isHF {
 			if err := cli.PullFromHuggingFace(repoID, cli.HuggingFaceOptions{
-				ModelsDir: modelsDir,
+				ModelsDir: effectiveModelsDir,
 				ModelType: modelTypeStr,
 				HFToken:   hfToken,
 				Variant:   variant,
@@ -222,7 +223,7 @@ func runInferencePull(cmd *cobra.Command, args []string) error {
 		// Standard registry pull
 		if err := cli.PullFromRegistry(modelRef, cli.PullOptions{
 			RegistryURL: registryURL,
-			ModelsDir:   modelsDir,
+			ModelsDir:   effectiveModelsDir,
 			Variants:    inferenceVariants,
 		}); err != nil {
 			return fmt.Errorf("failed to pull %s: %w", modelRef, err)
@@ -238,7 +239,7 @@ func runInferenceList(cmd *cobra.Command, args []string) error {
 
 	opts := cli.ListOptions{
 		RegistryURL: registryURL,
-		ModelsDir:   modelsDir,
+		ModelsDir:   resolveInferenceModelsDir(cmd),
 		TypeFilter:  typeFilter,
 		BinaryName:  "antfly inference",
 	}
@@ -247,4 +248,14 @@ func runInferenceList(cmd *cobra.Command, args []string) error {
 		return cli.ListRemoteModels(opts)
 	}
 	return cli.ListLocalModels(opts)
+}
+
+func resolveInferenceModelsDir(cmd *cobra.Command) string {
+	if flag := cmd.Flag("models-dir"); flag != nil && flag.Changed {
+		return modelsDir
+	}
+	if value := viper.GetString("inference.models_dir"); value != "" {
+		return value
+	}
+	return modelsDir
 }

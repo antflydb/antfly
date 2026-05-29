@@ -38,7 +38,7 @@ pub const BackendOptions = struct {
     ffmpeg_paths: ?FfmpegPaths = null,
     link_libc: bool = true,
     skip_openapi: bool = false,
-    inference_version: []const u8 = "0.1.0",
+    inference_version: []const u8 = "dev",
     enable_native_quant_dispatch_stats: bool = false,
 };
 

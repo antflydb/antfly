@@ -230,7 +230,7 @@ pub fn build(b: *std.Build) void {
         null
     else
         blas_root_opt;
-    const inference_version = b.option([]const u8, "inference-version", "Version string reported by CLI version output") orelse "0.1.0";
+    const antfly_version = b.option([]const u8, "antfly-version", "Antfly version string") orelse "dev";
     const enable_native_quant_dispatch_stats = b.option(bool, "enable-native-quant-dispatch-stats", "Enable native quant dispatch counters for benchmark diagnostics") orelse false;
 
     const runtime_graph = runtime_build.create(.{
@@ -259,7 +259,7 @@ pub fn build(b: *std.Build) void {
             .wasm_memory_model = wasm_memory_model,
             .link_libc = link_libc,
             .skip_openapi = skip_openapi,
-            .inference_version = inference_version,
+            .inference_version = antfly_version,
             .enable_native_quant_dispatch_stats = enable_native_quant_dispatch_stats,
         },
     });

@@ -167,7 +167,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         }
     }
 
-    print("antfly-inference v{s}\n", .{build_options.inference_version});
+    print("antfly inference v{s}\n", .{build_options.inference_version});
     print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
@@ -264,7 +264,7 @@ fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, a
 }
 
 pub fn printVersion() void {
-    print("antfly-inference v{s}\n", .{build_options.inference_version});
+    print("antfly inference v{s}\n", .{build_options.inference_version});
     print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
