@@ -719,6 +719,10 @@ fn writeProcessMemoryMetrics(writer: *std.Io.Writer, stats: process_memory_mod.S
     try health_metrics.appendPromMetric(writer, "antfly_process_footprint_bytes", "gauge", "Process physical footprint bytes reported by the operating system", stats.footprint_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_wired_bytes", "gauge", "Process wired bytes reported by the operating system", stats.wired_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_pageins_total", "counter", "Process page-ins reported by the operating system", stats.pageins);
+    try health_metrics.appendPromMetric(writer, "antfly_process_malloc_available", "gauge", "Whether process malloc zone metrics are available on this platform", if (stats.malloc_available) 1 else 0);
+    if (!stats.malloc_available) return;
+    try health_metrics.appendPromMetric(writer, "antfly_process_malloc_allocated_bytes", "gauge", "Live bytes allocated across process malloc zones", stats.malloc_allocated_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_process_malloc_zone_bytes", "gauge", "Bytes reserved by process malloc zones", stats.malloc_zone_bytes);
 }
 
 const LsmCacheMetricField = enum {
@@ -11992,11 +11996,15 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .footprint_bytes = 13,
         .wired_bytes = 19,
         .pageins = 23,
+        .malloc_available = true,
+        .malloc_allocated_bytes = 29,
+        .malloc_zone_bytes = 31,
     });
     const process_memory_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_memory_available 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_footprint_bytes 13") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_pageins_total 23") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_malloc_allocated_bytes 29") != null);
 
     writer = .fixed(&writer_buf);
     try writeLsmMaintenanceMetrics(&writer, .{

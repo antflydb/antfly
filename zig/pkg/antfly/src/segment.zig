@@ -74,6 +74,16 @@ pub const doc_ordinals_field = "\x00__antfly_doc_ordinals";
 pub const SegmentLayoutStats = struct {
     stored_fields_bytes: u64 = 0,
     inverted_text_bytes: u64 = 0,
+    inverted_header_bytes: u64 = 0,
+    inverted_fst_bytes: u64 = 0,
+    inverted_bloom_bytes: u64 = 0,
+    inverted_postings_header_bytes: u64 = 0,
+    inverted_block_max_bytes: u64 = 0,
+    inverted_chunk_meta_bytes: u64 = 0,
+    inverted_postings_payload_bytes: u64 = 0,
+    inverted_positions_bytes: u64 = 0,
+    inverted_one_hit_terms: u64 = 0,
+    inverted_postings_terms: u64 = 0,
     typed_doc_values_bytes: u64 = 0,
     doc_ordinals_bytes: u64 = 0,
     other_section_bytes: u64 = 0,
@@ -576,6 +586,10 @@ pub const SegmentReader = struct {
     }
 
     pub fn layoutStats(self: *const SegmentReader) SegmentLayoutStats {
+        return self.layoutStatsWithInvertedDetails(false);
+    }
+
+    pub fn layoutStatsWithInvertedDetails(self: *const SegmentReader, detailed_inverted: bool) SegmentLayoutStats {
         var stats = SegmentLayoutStats{};
         var stored_end: usize = @intCast(self.index_offset);
         for (self.fields) |*field| {
@@ -584,7 +598,28 @@ pub const SegmentReader = struct {
                 const length: u64 = section.length;
                 if (offset >= self.stored_offset and offset < stored_end) stored_end = offset;
                 switch (section.section_type) {
-                    .inverted_text => stats.inverted_text_bytes +|= length,
+                    .inverted_text => {
+                        stats.inverted_text_bytes +|= length;
+                        const section_data = self.data[offset..][0..@intCast(length)];
+                        if (inverted.InvertedIndexReader.init(self.alloc, section_data)) |reader| {
+                            const inverted_layout = if (detailed_inverted)
+                                reader.detailedLayoutStats() catch reader.layoutStats()
+                            else
+                                reader.layoutStats();
+                            {
+                                stats.inverted_header_bytes +|= inverted_layout.header_bytes;
+                                stats.inverted_fst_bytes +|= inverted_layout.fst_bytes;
+                                stats.inverted_bloom_bytes +|= inverted_layout.bloom_bytes;
+                                stats.inverted_postings_header_bytes +|= inverted_layout.postings_header_bytes;
+                                stats.inverted_block_max_bytes +|= inverted_layout.block_max_bytes;
+                                stats.inverted_chunk_meta_bytes +|= inverted_layout.chunk_meta_bytes;
+                                stats.inverted_postings_payload_bytes +|= inverted_layout.postings_payload_bytes;
+                                stats.inverted_positions_bytes +|= inverted_layout.positions_bytes;
+                                stats.inverted_one_hit_terms +|= inverted_layout.one_hit_terms;
+                                stats.inverted_postings_terms +|= inverted_layout.postings_terms;
+                            }
+                        } else |_| {}
+                    },
                     .typed_doc_values => stats.typed_doc_values_bytes +|= length,
                     .doc_ordinals => stats.doc_ordinals_bytes +|= length,
                     else => stats.other_section_bytes +|= length,

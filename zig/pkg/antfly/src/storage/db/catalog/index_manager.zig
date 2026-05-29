@@ -83,6 +83,7 @@ var bench_hbc_metrics_cache: std.atomic.Value(u8) = .init(0);
 var bench_text_metrics_cache: std.atomic.Value(u8) = .init(0);
 var bench_text_profile_cache: std.atomic.Value(u8) = .init(0);
 var bench_memory_attribution_cache: std.atomic.Value(u8) = .init(0);
+var bench_memory_layout_detail_cache: std.atomic.Value(u8) = .init(0);
 var text_build_memory_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_doc_scratch_retained_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_segment_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
@@ -90,7 +91,7 @@ var text_projection_source_build_target_bytes_cache: std.atomic.Value(usize) = .
 var sparse_replay_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
 const default_merge_policy = merger_mod.MergePolicy{
     .max_segments_per_tier = 10,
-    .max_segment_size = 64 * 1024 * 1024,
+    .max_segment_size = 256 * 1024 * 1024,
     .floor_segment_size = 16 * 1024,
 };
 const default_text_segment_build_target_bytes: usize = 16 * 1024 * 1024;
@@ -225,6 +226,16 @@ const TextMemoryAttributionStats = struct {
     text_max_segment_bytes: u64 = 0,
     stored_fields_bytes: u64 = 0,
     inverted_text_bytes: u64 = 0,
+    inverted_header_bytes: u64 = 0,
+    inverted_fst_bytes: u64 = 0,
+    inverted_bloom_bytes: u64 = 0,
+    inverted_postings_header_bytes: u64 = 0,
+    inverted_block_max_bytes: u64 = 0,
+    inverted_chunk_meta_bytes: u64 = 0,
+    inverted_postings_payload_bytes: u64 = 0,
+    inverted_positions_bytes: u64 = 0,
+    inverted_one_hit_terms: u64 = 0,
+    inverted_postings_terms: u64 = 0,
     typed_doc_values_bytes: u64 = 0,
     doc_ordinals_bytes: u64 = 0,
     section_index_bytes: u64 = 0,
@@ -723,17 +734,12 @@ pub const IndexManager = struct {
         index_name: []u8,
         source: []TextMergeSourceSegment,
         merge_indices: []usize,
-        segments: []index_mod.SegmentEntry,
+        snapshot: *index_mod.IndexSnapshot,
         buffer_reservation: ?resource_manager_mod.Reservation = null,
 
         pub fn deinit(self: *TextMergeTask, alloc: Allocator) void {
             if (self.buffer_reservation) |*reservation| reservation.release();
-            for (self.segments) |*seg| {
-                seg.reader.deinit();
-                if (seg.deleted) |*deleted| deleted.deinit();
-                seg.data.deinit(alloc);
-            }
-            alloc.free(self.segments);
+            self.snapshot.release();
             alloc.free(self.merge_indices);
             for (self.source) |*source| source.deinit(alloc);
             alloc.free(self.source);
@@ -1667,6 +1673,7 @@ pub const IndexManager = struct {
 
     fn snapshotTextMemoryAttribution(self: *IndexManager) TextMemoryAttributionStats {
         var stats = TextMemoryAttributionStats{};
+        const detailed_inverted_layout = memoryLayoutDetailEnabled();
         stats.text_indexes = @intCast(self.text_indexes.items.len);
         for (self.text_indexes.items) |*entry| {
             const persistent_memory = entry.persistent.memoryStatsSnapshot();
@@ -1684,9 +1691,19 @@ pub const IndexManager = struct {
                     .mmap => stats.text_mmap_segment_bytes +|= bytes,
                     .heap => stats.text_heap_segment_bytes +|= bytes,
                 }
-                const layout = seg.reader.layoutStats();
+                const layout = seg.reader.layoutStatsWithInvertedDetails(detailed_inverted_layout);
                 stats.stored_fields_bytes +|= layout.stored_fields_bytes;
                 stats.inverted_text_bytes +|= layout.inverted_text_bytes;
+                stats.inverted_header_bytes +|= layout.inverted_header_bytes;
+                stats.inverted_fst_bytes +|= layout.inverted_fst_bytes;
+                stats.inverted_bloom_bytes +|= layout.inverted_bloom_bytes;
+                stats.inverted_postings_header_bytes +|= layout.inverted_postings_header_bytes;
+                stats.inverted_block_max_bytes +|= layout.inverted_block_max_bytes;
+                stats.inverted_chunk_meta_bytes +|= layout.inverted_chunk_meta_bytes;
+                stats.inverted_postings_payload_bytes +|= layout.inverted_postings_payload_bytes;
+                stats.inverted_positions_bytes +|= layout.inverted_positions_bytes;
+                stats.inverted_one_hit_terms +|= layout.inverted_one_hit_terms;
+                stats.inverted_postings_terms +|= layout.inverted_postings_terms;
                 stats.typed_doc_values_bytes +|= layout.typed_doc_values_bytes;
                 stats.doc_ordinals_bytes +|= layout.doc_ordinals_bytes;
                 stats.section_index_bytes +|= layout.section_index_bytes;
@@ -1706,12 +1723,15 @@ pub const IndexManager = struct {
 
         const memory = process_memory.snapshot();
         const text_stats = self.snapshotTextMemoryAttribution();
+        const text_merge_stats = self.textMergeStatsSnapshot();
         const lsm_stats = self.snapshotLsmMaintenanceStats();
         const lsm_cache_stats: lsm_backend_mod.cache.Stats = if (self.lsm_cache) |cache| cache.snapshotStats() else .{};
         var ft_pending_used: u64 = 0;
         var ft_pending_peak: u64 = 0;
         var ft_build_used: u64 = 0;
         var ft_build_peak: u64 = 0;
+        var text_merge_used: u64 = 0;
+        var text_merge_peak: u64 = 0;
         var lsm_cache_used: u64 = 0;
         var lsm_cache_peak: u64 = 0;
         var lsm_compaction_used: u64 = 0;
@@ -1722,6 +1742,7 @@ pub const IndexManager = struct {
             const resource_stats = manager.snapshot();
             const ft_pending = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)];
             const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
+            const text_merge = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)];
             const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
             const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
             const lsm_state = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)];
@@ -1729,6 +1750,8 @@ pub const IndexManager = struct {
             ft_pending_peak = ft_pending.peak_bytes;
             ft_build_used = ft_build.used_bytes;
             ft_build_peak = ft_build.peak_bytes;
+            text_merge_used = text_merge.used_bytes;
+            text_merge_peak = text_merge.peak_bytes;
             lsm_cache_used = lsm_cache.used_bytes;
             lsm_cache_peak = lsm_cache.peak_bytes;
             lsm_compaction_used = lsm_compaction.used_bytes;
@@ -1738,7 +1761,7 @@ pub const IndexManager = struct {
         }
 
         std.log.info(
-            "antfly_bench_memory_attribution label={s} source_docs={d} projection_docs={d} batch_segments={d} rss_bytes={d} footprint_bytes={d} text_indexes={d} text_segments={d} text_segment_bytes={d} text_mmap_segment_bytes={d} text_heap_segment_bytes={d} text_max_segment_bytes={d} configured_lmdb_main_map_bytes={d} configured_lmdb_wal_map_bytes={d}",
+            "antfly_bench_memory_attribution label={s} source_docs={d} projection_docs={d} batch_segments={d} rss_bytes={d} footprint_bytes={d} malloc_available={any} malloc_allocated_bytes={d} malloc_zone_bytes={d} text_indexes={d} text_segments={d} text_segment_bytes={d} mapped_segment_bytes={d} text_mmap_segment_bytes={d} text_heap_segment_bytes={d} text_max_segment_bytes={d} configured_lmdb_main_map_bytes={d} configured_lmdb_wal_map_bytes={d}",
             .{
                 label,
                 source_docs,
@@ -1746,9 +1769,13 @@ pub const IndexManager = struct {
                 batch_segments,
                 memory.resident_bytes,
                 memory.footprint_bytes,
+                memory.malloc_available,
+                memory.malloc_allocated_bytes,
+                memory.malloc_zone_bytes,
                 text_stats.text_indexes,
                 text_stats.text_segments,
                 text_stats.text_segment_bytes,
+                text_stats.text_mmap_segment_bytes,
                 text_stats.text_mmap_segment_bytes,
                 text_stats.text_heap_segment_bytes,
                 text_stats.text_max_segment_bytes,
@@ -1757,24 +1784,36 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_memory_segment_layout label={s} stored_fields_bytes={d} inverted_text_bytes={d} typed_doc_values_bytes={d} doc_ordinals_bytes={d} section_index_bytes={d}",
+            "antfly_bench_memory_segment_layout label={s} stored_fields_bytes={d} inverted_text_bytes={d} inverted_header_bytes={d} inverted_fst_bytes={d} inverted_bloom_bytes={d} inverted_postings_header_bytes={d} inverted_block_max_bytes={d} inverted_chunk_meta_bytes={d} inverted_postings_payload_bytes={d} inverted_positions_bytes={d} inverted_one_hit_terms={d} inverted_postings_terms={d} typed_doc_values_bytes={d} doc_ordinals_bytes={d} section_index_bytes={d}",
             .{
                 label,
                 text_stats.stored_fields_bytes,
                 text_stats.inverted_text_bytes,
+                text_stats.inverted_header_bytes,
+                text_stats.inverted_fst_bytes,
+                text_stats.inverted_bloom_bytes,
+                text_stats.inverted_postings_header_bytes,
+                text_stats.inverted_block_max_bytes,
+                text_stats.inverted_chunk_meta_bytes,
+                text_stats.inverted_postings_payload_bytes,
+                text_stats.inverted_positions_bytes,
+                text_stats.inverted_one_hit_terms,
+                text_stats.inverted_postings_terms,
                 text_stats.typed_doc_values_bytes,
                 text_stats.doc_ordinals_bytes,
                 text_stats.section_index_bytes,
             },
         );
         std.log.info(
-            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d}",
+            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d}",
             .{
                 label,
                 ft_pending_used,
                 ft_pending_peak,
                 ft_build_used,
                 ft_build_peak,
+                text_merge_used,
+                text_merge_peak,
                 lsm_cache_used,
                 lsm_cache_peak,
                 lsm_compaction_used,
@@ -1791,6 +1830,25 @@ pub const IndexManager = struct {
                 lsm_cache_stats.run_table_raw.used_bytes,
                 lsm_cache_stats.run_table_index.used_bytes,
                 lsm_cache_stats.run_table_block.used_bytes,
+            },
+        );
+        std.log.info(
+            "antfly_bench_memory_text_merge label={s} pending_indexes={d} pending_segments={d} pending_bytes={d} in_flight_merges={d} in_flight_segments={d} completed_merges={d} skipped_stale_merges={d} failed_merges={d} quarantined_merges={d} quarantined_segments={d} deferred_for_pressure={d} backpressure_events={d} backpressure_ns={d}",
+            .{
+                label,
+                text_merge_stats.pending_indexes,
+                text_merge_stats.pending_segments,
+                text_merge_stats.pending_bytes,
+                text_merge_stats.in_flight_merges,
+                text_merge_stats.in_flight_segments,
+                text_merge_stats.completed_merges,
+                text_merge_stats.skipped_stale_merges,
+                text_merge_stats.failed_merges,
+                text_merge_stats.quarantined_merges,
+                text_merge_stats.quarantined_segments,
+                text_merge_stats.deferred_for_pressure,
+                text_merge_stats.backpressure_events,
+                text_merge_stats.backpressure_ns,
             },
         );
     }
@@ -5622,21 +5680,7 @@ pub const IndexManager = struct {
     }
 
     pub fn executeTextMergeTask(alloc: Allocator, task: *const TextMergeTask) !TextMergeResult {
-        var synthetic = index_mod.IndexSnapshot{
-            .alloc = alloc,
-            .ref_count = 1,
-            .epoch = 0,
-            .segments = task.segments,
-            .global_doc_count = 0,
-            .global_total_field_len = .empty,
-            .term_doc_freq_cache_mu = .unlocked,
-            .term_doc_freq_cache = .empty,
-            .term_doc_freq_cache_hits = 0,
-            .term_doc_freq_cache_misses = 0,
-            .retired_segments = &.{},
-        };
-
-        const merged = merger_mod.mergeSegmentsBounded(alloc, &synthetic, task.merge_indices, .{
+        const merged = merger_mod.mergeSegmentsBounded(alloc, task.snapshot, task.merge_indices, .{
             .target_segment_bytes = @intCast(default_merge_policy.max_segment_size),
         }) catch |err| {
             if (builtin.os.tag != .freestanding) {
@@ -5727,7 +5771,7 @@ pub const IndexManager = struct {
         return task;
     }
 
-    fn copyTextMergeTask(self: *IndexManager, index_name: []const u8, snap: *const index_mod.IndexSnapshot, planned: []const usize) !TextMergeTask {
+    fn copyTextMergeTask(self: *IndexManager, index_name: []const u8, snap: *index_mod.IndexSnapshot, planned: []const usize) !TextMergeTask {
         const owned_index_name = try self.alloc.dupe(u8, index_name);
         errdefer self.alloc.free(owned_index_name);
 
@@ -5744,51 +5788,21 @@ pub const IndexManager = struct {
         const merge_indices = try self.alloc.alloc(usize, planned.len);
         errdefer self.alloc.free(merge_indices);
 
-        const segments = try self.alloc.alloc(index_mod.SegmentEntry, planned.len);
-        var segments_initialized: usize = 0;
-        errdefer {
-            for (segments[0..segments_initialized]) |*seg| {
-                seg.reader.deinit();
-                if (seg.deleted) |*deleted| deleted.deinit();
-                seg.data.deinit(self.alloc);
-            }
-            self.alloc.free(segments);
-        }
-
         for (planned, 0..) |seg_idx, i| {
             const source_seg = &snap.segments[seg_idx];
-            const data_copy = try self.alloc.dupe(u8, source_seg.data.bytes());
-            errdefer self.alloc.free(data_copy);
-
-            var reader = try segment_mod.SegmentReader.init(self.alloc, data_copy);
-            errdefer reader.deinit();
-
-            var deletion_clone = if (source_seg.deleted) |*deleted|
-                try deleted.clone(self.alloc)
-            else
-                null;
-            errdefer if (deletion_clone) |*deleted| deleted.deinit();
-
             source[i] = .{
                 .id = source_seg.id,
                 .deleted = if (source_seg.deleted) |*deleted| try deleted.clone(self.alloc) else null,
             };
             source_initialized += 1;
-            merge_indices[i] = i;
-            segments[i] = .{
-                .id = source_seg.id,
-                .data = index_mod.SegmentData.fromOwnedHeap(data_copy),
-                .reader = reader,
-                .deleted = deletion_clone,
-            };
-            segments_initialized += 1;
+            merge_indices[i] = seg_idx;
         }
 
         return .{
             .index_name = owned_index_name,
             .source = source,
             .merge_indices = merge_indices,
-            .segments = segments,
+            .snapshot = snap.retain(),
             .buffer_reservation = buffer_reservation,
         };
     }
@@ -5802,16 +5816,13 @@ pub const IndexManager = struct {
             source_bytes = std.math.add(u64, source_bytes, @as(u64, @intCast(seg.data.bytes().len))) catch return error.ResourceBudgetExceeded;
         }
 
-        const merged_output_bytes = source_bytes;
         const segment_overhead = std.math.mul(u64, @as(u64, @intCast(planned.len)), 1024) catch return error.ResourceBudgetExceeded;
-        const source_and_output = std.math.add(u64, source_bytes, merged_output_bytes) catch return error.ResourceBudgetExceeded;
-        const reservation_bytes = std.math.add(u64, source_and_output, segment_overhead) catch return error.ResourceBudgetExceeded;
+        const reservation_bytes = std.math.add(u64, source_bytes, segment_overhead) catch return error.ResourceBudgetExceeded;
         return try manager.reserve(.text_merge_buffers, reservation_bytes);
     }
 
     fn shouldDeferTextMergeForResourcePressure(self: *IndexManager) bool {
         const manager = self.resource_manager orelse return false;
-        if (sliceDefersBackgroundWork(manager.sliceStats(.full_text_pending_segments))) return true;
         if (sliceDefersBackgroundWork(manager.sliceStats(.full_text_build_working_set))) return true;
         return sliceDefersBackgroundWork(manager.sliceStats(.text_merge_buffers));
     }
@@ -7088,7 +7099,7 @@ pub const IndexManager = struct {
         stats: TextBatchMutationStats,
     ) !void {
         if (!stats.touched()) return;
-        const compaction_due = stats.deleted_any or textCompactionDue(&entry.persistent, opts);
+        const compaction_due = stats.deleted_any or textCompactionDue(&entry.persistent, opts) or opts.defer_text_compaction;
         if (!compaction_due) return;
         if (opts.defer_text_compaction and entry.compaction_pending) return;
         if (!try self.textIndexNeedsMerge(&entry.persistent, default_merge_policy)) {
@@ -8493,6 +8504,25 @@ pub const IndexManager = struct {
             std.ascii.eqlIgnoreCase(raw, "false") or
             std.ascii.eqlIgnoreCase(raw, "no"));
         bench_memory_attribution_cache.store(if (enabled) 2 else 1, .monotonic);
+        return enabled;
+    }
+
+    fn memoryLayoutDetailEnabled() bool {
+        const cached = bench_memory_layout_detail_cache.load(.monotonic);
+        if (cached != 0) return cached == 2;
+        if (comptime builtin.os.tag == .freestanding) {
+            bench_memory_layout_detail_cache.store(1, .monotonic);
+            return false;
+        }
+        const raw_z = getenv("ANTFLY_BENCH_MEMORY_LAYOUT_DETAIL") orelse {
+            bench_memory_layout_detail_cache.store(1, .monotonic);
+            return false;
+        };
+        const raw = std.mem.span(raw_z);
+        const enabled = !(std.mem.eql(u8, raw, "0") or
+            std.ascii.eqlIgnoreCase(raw, "false") or
+            std.ascii.eqlIgnoreCase(raw, "no"));
+        bench_memory_layout_detail_cache.store(if (enabled) 2 else 1, .monotonic);
         return enabled;
     }
 
@@ -15446,7 +15476,8 @@ test "text merge task skips stale source after concurrent delete" {
     try std.testing.expect(parallel_stats.in_flight_segments > in_flight_stats.in_flight_segments);
     manager.cancelTextMergeTask(&second_task);
 
-    const stale_doc = task.segments[0].reader.storedDoc(0) orelse return error.TestUnexpectedResult;
+    const stale_segment = &task.snapshot.segments[task.merge_indices[0]];
+    const stale_doc = stale_segment.reader.storedDoc(0) orelse return error.TestUnexpectedResult;
     try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{stale_doc.id}, opts);
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
@@ -15654,6 +15685,10 @@ test "text merge resource pressure defers background merges" {
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
+    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 1024 * 1024,
+    };
     var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -15698,6 +15733,18 @@ test "text merge resource pressure defers background merges" {
     try std.testing.expect(pending_stats.pending_bytes > 1);
 
     var maybe_task = try manager.beginTextMergeTask();
+    if (maybe_task) |*task| {
+        manager.cancelTextMergeTask(task);
+        task.deinit(alloc);
+    } else {
+        return error.TestUnexpectedResult;
+    }
+
+    var tracked_merge_usage: u64 = 0;
+    resource_manager.observeUsage(.text_merge_buffers, &tracked_merge_usage, 2);
+    defer resource_manager.observeUsage(.text_merge_buffers, &tracked_merge_usage, 0);
+
+    maybe_task = try manager.beginTextMergeTask();
     if (maybe_task) |*task| {
         task.deinit(alloc);
         return error.TestUnexpectedResult;

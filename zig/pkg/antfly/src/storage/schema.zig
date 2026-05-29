@@ -546,7 +546,7 @@ pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !void {
 pub fn loadSchema(store: anytype, alloc: Allocator) !?TableSchema {
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginRead();
+    var txn = try runtime.store.beginProbe();
     defer txn.abort();
     const raw = txn.get(schema_key) catch |err| switch (err) {
         error.NotFound => return null,
@@ -562,7 +562,7 @@ pub fn loadSchemaVersion(store: anytype, alloc: Allocator, version: u32) !?Table
     defer alloc.free(versioned_key);
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginRead();
+    var txn = try runtime.store.beginProbe();
     defer txn.abort();
     const raw = txn.get(versioned_key) catch |err| switch (err) {
         error.NotFound => return null,

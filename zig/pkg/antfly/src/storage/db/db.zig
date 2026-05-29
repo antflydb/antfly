@@ -1504,8 +1504,6 @@ fn logSparseWriteProfileDelta(index_name: []const u8, delta: sparse_mod.WritePro
 
 var temp_path_nonce: u64 = 0;
 var split_replay_artifact_nonce: u64 = 0;
-const small_derived_text_compact_segment_threshold: usize = 6;
-const derived_text_compact_segment_threshold: usize = 128;
 
 fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
     if (builtin.os.tag == .freestanding) return;
@@ -14203,17 +14201,6 @@ fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_type
     try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null);
 }
 
-fn derivedTextCompactSegmentThreshold(batch: derived_types.DerivedBatch) usize {
-    const work_items = batch.documents.len + batch.deleted_keys.len + batch.overwritten_doc_keys.len;
-    // Preserve low-latency small-write/full_index behavior without making
-    // large replay or ingest windows compact tiny text segments every few
-    // batches.
-    return if (work_items <= 2)
-        small_derived_text_compact_segment_threshold
-    else
-        derived_text_compact_segment_threshold;
-}
-
 fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, profile: ?*BatchProfile) !void {
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
@@ -14222,7 +14209,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             const apply_start_ns = monotonicTimeNs();
             const text_replay_options: index_manager_mod.IndexBatchOptions = .{
                 .compact_text = false,
-                .compact_text_segment_threshold = derivedTextCompactSegmentThreshold(batch),
+                .compact_text_segment_threshold = null,
                 .defer_text_compaction = true,
             };
             const delete_keys = if (batch.deleted_keys.len == 0)

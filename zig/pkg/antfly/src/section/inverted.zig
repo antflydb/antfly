@@ -706,6 +706,54 @@ pub const InvertedIndexReader = struct {
         return @as(f32, @floatFromInt(self.total_field_len)) / @as(f32, @floatFromInt(self.doc_count));
     }
 
+    pub const LayoutStats = struct {
+        header_bytes: u64 = 0,
+        fst_bytes: u64 = 0,
+        bloom_bytes: u64 = 0,
+        postings_header_bytes: u64 = 0,
+        block_max_bytes: u64 = 0,
+        chunk_meta_bytes: u64 = 0,
+        postings_payload_bytes: u64 = 0,
+        positions_bytes: u64 = 0,
+        one_hit_terms: u64 = 0,
+        postings_terms: u64 = 0,
+    };
+
+    pub fn layoutStats(self: *const InvertedIndexReader) LayoutStats {
+        const vellum_len = std.mem.readInt(u32, self.data[21..25], .little);
+        const bloom_len = std.mem.readInt(u32, self.data[25..29], .little);
+        return .{
+            .header_bytes = v7_header_size,
+            .fst_bytes = vellum_len,
+            .bloom_bytes = bloom_len,
+        };
+    }
+
+    pub fn detailedLayoutStats(self: *const InvertedIndexReader) !LayoutStats {
+        var stats = self.layoutStats();
+
+        var it = try self.termIterator();
+        defer it.deinit();
+        while (try it.next()) |entry| {
+            switch (entry.result) {
+                .one_hit => stats.one_hit_terms +|= 1,
+                .postings => |postings| {
+                    stats.postings_terms +|= 1;
+                    stats.postings_header_bytes +|= 16;
+                    if (postings.block_max) |block_max_info| {
+                        stats.block_max_bytes +|= @intCast(block_max_info.meta.len);
+                    }
+                    stats.chunk_meta_bytes +|= @intCast(postings.chunk_meta_data.len);
+                    stats.postings_payload_bytes +|= @intCast(postings.payload_data.len);
+                    if (postings.positions_data) |positions_data| {
+                        stats.positions_bytes +|= @intCast(positions_data.len);
+                    }
+                },
+            }
+        }
+        return stats;
+    }
+
     /// Look up a term using the Vellum FST. Returns posting data, or null.
     /// For 1-hit terms, returns a synthetic TermPostings with the single doc.
     /// Consults the per-segment term bloom filter before walking the FST
