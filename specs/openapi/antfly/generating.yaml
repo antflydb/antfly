@@ -283,11 +283,11 @@ components:
     ChatMessageContent:
       $ref: "../shared/generating.yaml#/components/schemas/ChatMessageContent"
 
-    ChatToolCall:
-      $ref: "../shared/generating.yaml#/components/schemas/ChatToolCall"
+    ToolCall:
+      $ref: "../shared/generating.yaml#/components/schemas/ToolCall"
 
-    ChatToolResult:
-      $ref: "../shared/generating.yaml#/components/schemas/ChatToolResult"
+    ToolCallFunction:
+      $ref: "../shared/generating.yaml#/components/schemas/ToolCallFunction"
 
     ChatMessage:
       $ref: "../shared/generating.yaml#/components/schemas/ChatMessage"

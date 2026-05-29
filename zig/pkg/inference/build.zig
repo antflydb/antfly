@@ -285,6 +285,7 @@ pub fn build(b: *std.Build) void {
     const inference_fixed_tokenizer_data_mod = runtime_graph.inference_fixed_tokenizer_data_mod;
     const inference_audio_mod = runtime_graph.inference_audio_mod;
     const inference_chunker_mod = runtime_graph.inference_chunker_mod;
+    const generating_openapi_mod = runtime_graph.generating_openapi_mod;
     const client_mod = runtime_graph.inference_client_mod;
     const inference_internal_mod = runtime_graph.inference_internal_mod;
 
@@ -587,6 +588,7 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("build_options", build_options_mod);
     tests.root_module.addImport("httpx", httpx_mod);
     tests.root_module.addImport("inference_api", inference_api_mod);
+    tests.root_module.addImport("antfly_generating_openapi", generating_openapi_mod);
     tests.root_module.addImport("inference_audio", inference_audio_mod);
     tests.root_module.addImport("inference_chunker", inference_chunker_mod);
     tests.root_module.addImport("jinja", jinja_mod);

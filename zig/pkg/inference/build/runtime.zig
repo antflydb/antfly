@@ -113,6 +113,7 @@ pub const Graph = struct {
     inference_fixed_tokenizer_data_mod: *std.Build.Module,
     inference_audio_mod: *std.Build.Module,
     inference_chunker_mod: *std.Build.Module,
+    generating_openapi_mod: *std.Build.Module,
     inference_mod: *std.Build.Module,
     inference_internal_mod: *std.Build.Module,
 };
@@ -193,7 +194,14 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     }).module("pjrt");
 
-    const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared);
+    const generating_openapi_mod = shared.generating_openapi orelse addOrCreateModule(b, config.register_public_modules, "antfly_generating_openapi", .{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_generating_openapi/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+    var shared_with_generating = shared;
+    shared_with_generating.generating_openapi = generating_openapi_mod;
+    const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
             .root_source_file = b.path(pathJoin(b, paths.inference_root, "../inference-client/src/root.zig")),
@@ -276,6 +284,7 @@ pub fn create(config: Config) Graph {
         .protobuf_mod = protobuf_mod,
         .inference_client_mod = inference_client_mod,
     });
+    inference_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     configureRuntimeLinks(b, inference_mod, target, backend, paths);
     inference_mod.link_libc = backend.link_libc;
 
@@ -329,6 +338,7 @@ pub fn create(config: Config) Graph {
         .inference_fixed_tokenizer_data_mod = inference_fixed_tokenizer_data_mod,
         .inference_audio_mod = inference_audio_mod,
         .inference_chunker_mod = inference_chunker_mod,
+        .generating_openapi_mod = generating_openapi_mod,
         .inference_mod = inference_mod,
         .inference_internal_mod = inference_internal_mod,
     };

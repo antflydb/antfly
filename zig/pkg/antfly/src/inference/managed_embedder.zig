@@ -27,7 +27,7 @@ const bedrock_provider = @import("bedrock.zig");
 const openai_provider = @import("openai.zig");
 const antfly_provider_mod = @import("local.zig");
 const chunking_types = @import("../chunking/types.zig");
-const termite_chunker = @import("termite_chunker");
+const inference_chunker = @import("inference_chunker");
 const transcribing = @import("antfly_transcribing");
 const readers = @import("antfly_readers");
 const extracting = @import("antfly_extracting");
@@ -93,9 +93,9 @@ pub const AntflyProvider = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         model: []const u8,
-        input: termite_chunker.Input,
+        input: inference_chunker.Input,
         config: chunking_types.Config,
-    ) anyerror![]termite_chunker.Chunk = null,
+    ) anyerror![]inference_chunker.Chunk = null,
     transcribe_audio: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,

@@ -129,9 +129,9 @@ pub const ChatMessageRole = antfly_generating_openapi.ChatMessageRole;
 
 pub const ChatMessageContent = antfly_generating_openapi.ChatMessageContent;
 
-pub const ChatToolCall = antfly_generating_openapi.ChatToolCall;
+pub const ToolCall = antfly_generating_openapi.ToolCall;
 
-pub const ChatToolResult = antfly_generating_openapi.ChatToolResult;
+pub const ToolCallFunction = antfly_generating_openapi.ToolCallFunction;
 
 pub const ChatMessage = antfly_generating_openapi.ChatMessage;
 

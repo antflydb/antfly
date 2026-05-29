@@ -7346,36 +7346,31 @@ export interface components {
          *     - Array of content parts: [{"type": "text", "text": "Hello"}]
          */
         ChatMessageContent: string | components["schemas"]["ContentPart"][];
-        /** @description A tool call made by the assistant */
-        ChatToolCall: {
-            /** @description Unique identifier for this tool call */
-            id: string;
-            /** @description Name of the tool being called */
+        /** @description The function called by a model tool call. */
+        ToolCallFunction: {
+            /** @description Function name. */
             name: string;
-            /** @description Arguments passed to the tool as key-value pairs */
-            arguments: {
-                [key: string]: unknown;
-            };
+            /** @description JSON string of function arguments. */
+            arguments: string;
         };
-        /** @description Result from executing a tool call */
-        ChatToolResult: {
-            /** @description ID of the tool call this result corresponds to */
-            tool_call_id: string;
-            /** @description Result data from the tool execution */
-            result: {
-                [key: string]: unknown;
-            };
-            /** @description Error message if tool execution failed */
-            error?: string;
+        /** @description OpenAI-compatible assistant tool call. */
+        ToolCall: {
+            /** @description Tool call identifier. */
+            id: string;
+            /** @enum {string} */
+            type: "function";
+            function: components["schemas"]["ToolCallFunction"];
         };
-        /** @description A message in a generation/chat conversation */
+        /** @description OpenAI-compatible message in a generation/chat conversation. */
         ChatMessage: {
             role: components["schemas"]["ChatMessageRole"];
-            content: components["schemas"]["ChatMessageContent"];
-            /** @description Tool calls made by the assistant (only for assistant role) */
-            tool_calls?: components["schemas"]["ChatToolCall"][];
-            /** @description Results from tool executions (only for tool role) */
-            tool_results?: components["schemas"]["ChatToolResult"][];
+            content?: components["schemas"]["ChatMessageContent"];
+            /** @description Tool calls made by the assistant (only for role=assistant). */
+            tool_calls?: components["schemas"]["ToolCall"][];
+            /** @description ID of the tool call this message responds to (only for role=tool). */
+            tool_call_id?: string;
+            /** @description Optional tool name for tool messages when model templates need it. */
+            name?: string;
         };
         /** @description A filter specification to apply to search queries */
         FilterSpec: {
@@ -8892,21 +8887,6 @@ export interface components {
              */
             strict?: boolean;
         };
-        /** @description OpenAI-compatible assistant tool call. */
-        InferenceToolCall: {
-            /** @description Tool call identifier. */
-            id: string;
-            /** @enum {string} */
-            type: "function";
-            function: components["schemas"]["InferenceToolCallFunction"];
-        };
-        /** @description The function called by a model tool call. */
-        InferenceToolCallFunction: {
-            /** @description Function name. */
-            name: string;
-            /** @description JSON string of function arguments. */
-            arguments: string;
-        };
         /**
          * @description Controls how the model uses tools. Options:
          *     - "auto": Model decides whether to call a tool (default)
@@ -8938,7 +8918,7 @@ export interface components {
             role: components["schemas"]["InferenceRole"];
             content?: components["schemas"]["ChatMessageContent"];
             /** @description Tool calls made by the assistant (only for role=assistant) */
-            tool_calls?: components["schemas"]["InferenceToolCall"][];
+            tool_calls?: components["schemas"]["ToolCall"][];
             /** @description ID of the tool call this message is responding to (only for role=tool) */
             tool_call_id?: string;
         };
@@ -9122,7 +9102,7 @@ export interface components {
             /** @description The generated message content (null when tool_calls is present) */
             content?: string | null;
             /** @description Tool calls made by the model (only present when finish_reason is tool_calls) */
-            tool_calls?: components["schemas"]["InferenceToolCall"][];
+            tool_calls?: components["schemas"]["ToolCall"][];
         };
         InferenceGenerateUsage: {
             /** @description Number of tokens in the prompt */

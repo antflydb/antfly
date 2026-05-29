@@ -1006,6 +1006,7 @@ fn addOpenApiRegenStep(
             .{ "../shared/scraping.yaml", "antfly_scraping_openapi" },
             .{ "../shared/s3.yaml", "antfly_s3_openapi" },
             .{ "../shared/logging.yaml", "antfly_logging_openapi" },
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/chunking.yaml"), "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/chunking.yaml"), "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi", "types", &.{
@@ -1222,6 +1223,7 @@ pub fn build(b: *std.Build) void {
     inference_config_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
+    inference_config_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     common_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
     common_openapi_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     common_openapi_mod.addImport("antfly_middleware_openapi", middleware_openapi_mod);

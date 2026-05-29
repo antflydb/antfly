@@ -222,7 +222,7 @@ fn coerceMessage(
         if (tc_value != .array) return error.InvalidToolCalls;
         tool_calls = try allocator.alloc(ToolCall, tc_value.array.items.len);
         for (tc_value.array.items, 0..) |call_value, idx| {
-            tool_calls[idx] = try coerceToolCall(allocator, call_value);
+            tool_calls[idx] = try coerceToolCall(call_value);
         }
     }
 
@@ -235,22 +235,21 @@ fn coerceMessage(
     };
 }
 
-fn coerceToolCall(allocator: std.mem.Allocator, value: std.json.Value) !ToolCall {
+fn coerceToolCall(value: std.json.Value) !ToolCall {
     const obj = if (value == .object) value.object else return error.InvalidToolCall;
     const id = firstNonEmptyString(obj, &.{"id"}) orelse return error.InvalidToolCall;
-    const name = firstNonEmptyString(obj, &.{ "name", "tool_name" }) orelse return error.InvalidToolCall;
-    const arguments_json = blk: {
-        if (obj.get("arguments_json")) |arg| {
-            if (arg == .string) break :blk arg.string;
-        }
-        if (obj.get("arguments")) |arg| {
-            var buf: std.Io.Writer.Allocating = .init(allocator);
-            defer buf.deinit();
-            try std.json.Stringify.value(arg, .{}, &buf.writer);
-            break :blk try allocator.dupe(u8, buf.written());
-        }
-        break :blk "{}";
-    };
+    if (firstNonEmptyString(obj, &.{"type"})) |tool_type| {
+        if (!std.mem.eql(u8, tool_type, "function")) return error.InvalidToolCall;
+    } else return error.InvalidToolCall;
+    const function = if (obj.get("function")) |function_value| blk: {
+        if (function_value != .object) return error.InvalidToolCall;
+        break :blk function_value.object;
+    } else return error.InvalidToolCall;
+    const name = firstNonEmptyString(function, &.{"name"}) orelse return error.InvalidToolCall;
+    const arguments_json = if (function.get("arguments")) |arg| blk: {
+        if (arg != .string) return error.InvalidToolCall;
+        break :blk arg.string;
+    } else return error.InvalidToolCall;
     return .{ .id = id, .name = name, .arguments_json = arguments_json };
 }
 
@@ -424,7 +423,7 @@ test "load tool chat example" {
     defer tmp.cleanup();
 
     const jsonl =
-        \\{"schema":"gemma_chat/v1","messages":[{"role":"user","content":"list"},{"role":"assistant","content":"Checking","tool_calls":[{"id":"call_1","name":"shell","arguments":{"cmd":"ls"}}]},{"role":"tool","tool_call_id":"call_1","name":"shell","content":"file.txt"},{"role":"assistant","content":"Found file.txt"}],"metadata":{"policy_version":"v1"}}
+        \\{"schema":"gemma_chat/v1","messages":[{"role":"user","content":"list"},{"role":"assistant","content":"Checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"cmd\":\"ls\"}"}}]},{"role":"tool","tool_call_id":"call_1","name":"shell","content":"file.txt"},{"role":"assistant","content":"Found file.txt"}],"metadata":{"policy_version":"v1"}}
         \\
     ;
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "train.jsonl", .data = jsonl });

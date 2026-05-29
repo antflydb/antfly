@@ -1117,7 +1117,7 @@ usage: prepare-gemma4-lora-inputs <model_dir> <dataset_path> <split|-> <out_summ
 - `num_supervised_tokens`
 - `turn_count`
 - `has_tool_calls`
-- `has_tool_results`
+- `has_tool_messages`
 - optional `policy_version`
 
 The summary also records aggregate metadata:
@@ -1126,7 +1126,7 @@ The summary also records aggregate metadata:
 - `max_input_tokens`
 - `max_supervised_tokens`
 - `examples_with_tool_calls`
-- `examples_with_tool_results`
+- `examples_with_tool_messages`
 - `examples_with_multiturn`
 
 The loader only accepts these supported prepared schemas and rejects unknown versions at load time.

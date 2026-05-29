@@ -1076,41 +1076,6 @@ components:
           description: Whether to enforce strict parameter validation
           default: false
 
-    ToolCall:
-      type: object
-      description: A tool call made by the model
-      required:
-        - id
-        - type
-        - function
-      properties:
-        id:
-          type: string
-          description: Unique identifier for this tool call
-          example: "call_abc123"
-        type:
-          type: string
-          enum: [function]
-          description: The type of tool call (currently only "function")
-        function:
-          $ref: "#/components/schemas/ToolCallFunction"
-
-    ToolCallFunction:
-      type: object
-      description: The function called by the model
-      required:
-        - name
-        - arguments
-      properties:
-        name:
-          type: string
-          description: The name of the function called
-          example: "get_weather"
-        arguments:
-          type: string
-          description: JSON string of the arguments to the function
-          example: '{"location": "San Francisco, CA"}'
-
     ToolChoice:
       description: |
         Controls how the model uses tools. Options:
@@ -1177,7 +1142,7 @@ components:
         tool_calls:
           type: array
           items:
-            $ref: "#/components/schemas/ToolCall"
+            $ref: "../shared/generating.yaml#/components/schemas/ToolCall"
           description: Tool calls made by the assistant (only for role=assistant)
         tool_call_id:
           type: string
@@ -1300,7 +1265,7 @@ components:
         tool_calls:
           type: array
           items:
-            $ref: "#/components/schemas/ToolCall"
+            $ref: "../shared/generating.yaml#/components/schemas/ToolCall"
           description: Tool calls made by the model (only present when finish_reason is tool_calls)
 
     GenerateUsage:

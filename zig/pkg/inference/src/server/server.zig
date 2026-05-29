@@ -21,6 +21,7 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const httpx = @import("httpx");
 const api = @import("inference_api");
+const generating_api = @import("antfly_generating_openapi");
 const scraping = @import("antfly_scraping");
 const jsonschema = @import("antfly_jsonschema");
 const antfly_readers = @import("antfly_readers");
@@ -2834,7 +2835,7 @@ pub const Node = struct {
             if (calls.len == 0) {
                 message.content = response_text;
             } else {
-                const api_calls = try alloc.alloc(api.ToolCall, calls.len);
+                const api_calls = try alloc.alloc(generating_api.ToolCall, calls.len);
                 for (calls, 0..) |call, i| {
                     api_calls[i] = .{
                         .id = call.id,

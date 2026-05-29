@@ -2225,36 +2225,6 @@ components:
           type: boolean
           description: Whether to enforce strict parameter validation
           default: false
-    ToolCall:
-      type: object
-      description: OpenAI-compatible assistant tool call.
-      required:
-        - id
-        - type
-        - function
-      properties:
-        id:
-          type: string
-          description: Tool call identifier.
-        type:
-          type: string
-          enum:
-            - function
-        function:
-          $ref: '#/components/schemas/ToolCallFunction'
-    ToolCallFunction:
-      type: object
-      description: The function called by a model tool call.
-      required:
-        - name
-        - arguments
-      properties:
-        name:
-          type: string
-          description: Function name.
-        arguments:
-          type: string
-          description: JSON string of function arguments.
     ToolChoice:
       description: |
         Controls how the model uses tools. Options:
@@ -2321,7 +2291,7 @@ components:
         tool_calls:
           type: array
           items:
-            $ref: '#/components/schemas/ToolCall'
+            $ref: '../shared/generating.yaml#/components/schemas/ToolCall'
           description: Tool calls made by the assistant (only for role=assistant)
         tool_call_id:
           type: string
@@ -2565,7 +2535,7 @@ components:
         tool_calls:
           type: array
           items:
-            $ref: '#/components/schemas/ToolCall'
+            $ref: '../shared/generating.yaml#/components/schemas/ToolCall'
           description: Tool calls made by the model (only present when finish_reason is tool_calls)
     GenerateUsage:
       type: object

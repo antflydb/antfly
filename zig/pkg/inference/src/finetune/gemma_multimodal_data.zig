@@ -368,7 +368,7 @@ test "load multimodal gemma chat v1 with image parts and tool call" {
     defer tmp.cleanup();
 
     const jsonl =
-        \\{"schema":"gemma_chat/v1","messages":[{"role":"user","content":[{"type":"text","text":"What is shown?"},{"type":"image","image_path":"img.png"}]},{"role":"assistant","content":"Checking","tool_calls":[{"id":"call_1","name":"ocr","arguments":{"region":"full"}}]},{"role":"tool","tool_call_id":"call_1","name":"ocr","content":"Quarterly revenue chart"},{"role":"assistant","content":"A revenue chart."}]}
+        \\{"schema":"gemma_chat/v1","messages":[{"role":"user","content":[{"type":"text","text":"What is shown?"},{"type":"image","image_path":"img.png"}]},{"role":"assistant","content":"Checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"ocr","arguments":"{\"region\":\"full\"}"}}]},{"role":"tool","tool_call_id":"call_1","name":"ocr","content":"Quarterly revenue chart"},{"role":"assistant","content":"A revenue chart."}]}
         \\
     ;
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "train.jsonl", .data = jsonl });

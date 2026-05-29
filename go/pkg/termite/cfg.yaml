@@ -14,6 +14,7 @@ output-options:
   prefer-skip-optional-pointer-with-omitzero: true
 import-mapping:
   ../shared/chunking.yaml: github.com/antflydb/antfly/go/pkg/libaf/chunking
+  ../shared/generating.yaml: github.com/antflydb/antfly/go/pkg/generating
   ../shared/logging.yaml: github.com/antflydb/antfly/go/pkg/libaf/logging
   ../shared/s3.yaml: github.com/antflydb/antfly/go/pkg/libaf/s3
   ../shared/scraping.yaml: github.com/antflydb/antfly/go/pkg/libaf/scraping

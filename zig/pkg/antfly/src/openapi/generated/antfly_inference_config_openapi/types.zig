@@ -6,6 +6,7 @@ const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
 const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 const antfly_s3_openapi = @import("antfly_s3_openapi");
 const antfly_logging_openapi = @import("antfly_logging_openapi");
+const antfly_generating_openapi = @import("antfly_generating_openapi");
 
 pub const Error = struct {
     /// Error message
@@ -237,14 +238,6 @@ pub const FunctionDefinition = struct {
     parameters: ?std.json.Value = null,
     /// Whether to enforce strict parameter validation
     strict: ?bool = null,
-};
-
-/// The function called by the model
-pub const ToolCallFunction = struct {
-    /// The name of the function called
-    name: []const u8,
-    /// JSON string of the arguments to the function
-    arguments: []const u8,
 };
 
 /// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
@@ -490,13 +483,12 @@ pub const Tool = struct {
     function: FunctionDefinition,
 };
 
-/// A tool call made by the model
-pub const ToolCall = struct {
-    /// Unique identifier for this tool call
-    id: []const u8,
-    /// The type of tool call (currently only "function")
-    type: []const u8,
-    function: ToolCallFunction,
+pub const GenerateMessage = struct {
+    role: Role,
+    /// The generated message content (null when tool_calls is present)
+    content: ?[]const u8 = null,
+    /// Tool calls made by the model (only present when finish_reason is tool_calls)
+    tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
 };
 
 /// Incremental tool call data for streaming
@@ -595,12 +587,13 @@ pub const ReadResponse = struct {
     results: []const ReadResult,
 };
 
-pub const GenerateMessage = struct {
-    role: Role,
-    /// The generated message content (null when tool_calls is present)
-    content: ?[]const u8 = null,
-    /// Tool calls made by the model (only present when finish_reason is tool_calls)
-    tool_calls: ?[]const ToolCall = null,
+pub const GenerateChoice = struct {
+    /// Index of this choice in the list
+    index: i64,
+    message: GenerateMessage,
+    finish_reason: FinishReason,
+    /// Log probability information (not supported, always null)
+    logprobs: ?std.json.Value = null,
 };
 
 /// Delta content for streaming
@@ -636,30 +629,6 @@ pub const ChunkRequest = struct {
     config: ?ChunkConfig = null,
 };
 
-pub const GenerateChoice = struct {
-    /// Index of this choice in the list
-    index: i64,
-    message: GenerateMessage,
-    finish_reason: FinishReason,
-    /// Log probability information (not supported, always null)
-    logprobs: ?std.json.Value = null,
-};
-
-pub const GenerateChunkChoice = struct {
-    index: i64,
-    delta: GenerateDelta,
-    finish_reason: ?FinishReason = null,
-};
-
-pub const ChatMessage = struct {
-    role: Role,
-    content: ?ChatMessageContent = null,
-    /// Tool calls made by the assistant (only for role=assistant)
-    tool_calls: ?[]const ToolCall = null,
-    /// ID of the tool call this message is responding to (only for role=tool)
-    tool_call_id: ?[]const u8 = null,
-};
-
 /// OpenAI-compatible chat completion response
 pub const GenerateResponse = struct {
     /// A unique identifier for the chat completion
@@ -673,6 +642,21 @@ pub const GenerateResponse = struct {
     /// List of completion choices (currently always 1)
     choices: []const GenerateChoice,
     usage: GenerateUsage,
+};
+
+pub const GenerateChunkChoice = struct {
+    index: i64,
+    delta: GenerateDelta,
+    finish_reason: ?FinishReason = null,
+};
+
+pub const ChatMessage = struct {
+    role: Role,
+    content: ?ChatMessageContent = null,
+    /// Tool calls made by the assistant (only for role=assistant)
+    tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
+    /// ID of the tool call this message is responding to (only for role=tool)
+    tool_call_id: ?[]const u8 = null,
 };
 
 /// Streaming generation chunk (SSE event data)

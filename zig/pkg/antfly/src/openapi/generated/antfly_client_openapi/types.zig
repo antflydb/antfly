@@ -2518,24 +2518,12 @@ pub const MediaContentPart = struct {
     mime_type: []const u8,
 };
 
-/// A tool call made by the assistant
-pub const ChatToolCall = struct {
-    /// Unique identifier for this tool call
-    id: []const u8,
-    /// Name of the tool being called
+/// The function called by a model tool call.
+pub const ToolCallFunction = struct {
+    /// Function name.
     name: []const u8,
-    /// Arguments passed to the tool as key-value pairs
-    arguments: std.json.Value,
-};
-
-/// Result from executing a tool call
-pub const ChatToolResult = struct {
-    /// ID of the tool call this result corresponds to
-    tool_call_id: []const u8,
-    /// Result data from the tool execution
-    result: std.json.Value,
-    /// Error message if tool execution failed
-    @"error": ?[]const u8 = null,
+    /// JSON string of function arguments.
+    arguments: []const u8,
 };
 
 /// A filter specification to apply to search queries
@@ -3010,14 +2998,6 @@ pub const InferenceFunctionDefinition = struct {
     parameters: ?std.json.Value = null,
     /// Whether to enforce strict parameter validation
     strict: ?bool = null,
-};
-
-/// The function called by a model tool call.
-pub const InferenceToolCallFunction = struct {
-    /// Function name.
-    name: []const u8,
-    /// JSON string of function arguments.
-    arguments: []const u8,
 };
 
 /// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
@@ -4010,6 +3990,14 @@ pub const InferenceImageURL = ImageURL;
 
 pub const InferenceMediaContentPart = MediaContentPart;
 
+/// OpenAI-compatible assistant tool call.
+pub const ToolCall = struct {
+    /// Tool call identifier.
+    id: []const u8,
+    type: []const u8,
+    function: ToolCallFunction,
+};
+
 /// Query classification and transformation result combining all query enhancements including strategy selection and semantic optimization
 pub const ClassificationTransformationResult = struct {
     route_type: RouteType,
@@ -4219,14 +4207,6 @@ pub const InferenceTool = struct {
     /// The type of tool (currently only "function" is supported)
     type: []const u8,
     function: InferenceFunctionDefinition,
-};
-
-/// OpenAI-compatible assistant tool call.
-pub const InferenceToolCall = struct {
-    /// Tool call identifier.
-    id: []const u8,
-    type: []const u8,
-    function: InferenceToolCallFunction,
 };
 
 pub const InferenceGenerateResponseFormat = struct {
@@ -4840,6 +4820,14 @@ pub const InferenceReadRequest = struct {
     max_tokens: ?i64 = null,
 };
 
+pub const InferenceGenerateMessage = struct {
+    role: InferenceRole,
+    /// The generated message content (null when tool_calls is present)
+    content: ?[]const u8 = null,
+    /// Tool calls made by the model (only present when finish_reason is tool_calls)
+    tool_calls: ?[]const ToolCall = null,
+};
+
 /// Complete evaluation result
 pub const EvalResult = struct {
     /// Scores organized by category
@@ -4933,14 +4921,6 @@ pub const InferenceReadObject = struct {
     object: []const u8,
     /// Original input image index.
     index: i64,
-};
-
-pub const InferenceGenerateMessage = struct {
-    role: InferenceRole,
-    /// The generated message content (null when tool_calls is present)
-    content: ?[]const u8 = null,
-    /// Tool calls made by the model (only present when finish_reason is tool_calls)
-    tool_calls: ?[]const InferenceToolCall = null,
 };
 
 /// Delta content for streaming
@@ -5220,6 +5200,15 @@ pub const InferenceEmbedRequest = struct {
 /// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
 pub const InferenceChatMessageContent = std.json.Value;
 
+pub const InferenceGenerateChoice = struct {
+    /// Index of this choice in the list
+    index: i64,
+    message: InferenceGenerateMessage,
+    finish_reason: InferenceFinishReason,
+    /// Log probability information (not supported, always null)
+    logprobs: ?std.json.Value = null,
+};
+
 pub const InferenceChunkRequest = struct {
     /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` (backward compatible) - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
     input: ?std.json.Value = null,
@@ -5254,15 +5243,6 @@ pub const InferenceReadResponse = struct {
     /// Name of model used for reading
     model: []const u8,
     usage: InferenceGenerateUsage,
-};
-
-pub const InferenceGenerateChoice = struct {
-    /// Index of this choice in the list
-    index: i64,
-    message: InferenceGenerateMessage,
-    finish_reason: InferenceFinishReason,
-    /// Log probability information (not supported, always null)
-    logprobs: ?std.json.Value = null,
 };
 
 pub const InferenceGenerateChunkChoice = struct {
@@ -5369,14 +5349,16 @@ pub const TableMigration = struct {
     read_schema: TableSchema,
 };
 
-/// A message in a generation/chat conversation
+/// OpenAI-compatible message in a generation/chat conversation.
 pub const ChatMessage = struct {
     role: ChatMessageRole,
-    content: ChatMessageContent,
-    /// Tool calls made by the assistant (only for assistant role)
-    tool_calls: ?[]const ChatToolCall = null,
-    /// Results from tool executions (only for tool role)
-    tool_results: ?[]const ChatToolResult = null,
+    content: ?ChatMessageContent = null,
+    /// Tool calls made by the assistant (only for role=assistant).
+    tool_calls: ?[]const ToolCall = null,
+    /// ID of the tool call this message responds to (only for role=tool).
+    tool_call_id: ?[]const u8 = null,
+    /// Optional tool name for tool messages when model templates need it.
+    name: ?[]const u8 = null,
 };
 
 pub const InferenceRerankMultimodalDocument = struct {
@@ -5389,7 +5371,7 @@ pub const InferenceChatMessage = struct {
     role: InferenceRole,
     content: ?ChatMessageContent = null,
     /// Tool calls made by the assistant (only for role=assistant)
-    tool_calls: ?[]const InferenceToolCall = null,
+    tool_calls: ?[]const ToolCall = null,
     /// ID of the tool call this message is responding to (only for role=tool)
     tool_call_id: ?[]const u8 = null,
 };

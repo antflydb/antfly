@@ -141,7 +141,8 @@ type (
 	ImageURL            = oapi.ImageURL
 	ImageURLContentPart = oapi.ImageURLContentPart
 	MediaContentPart    = oapi.MediaContentPart
-	ChatToolCall        = oapi.ChatToolCall
+	ToolCall            = oapi.ToolCall
+	ToolCallFunction    = oapi.ToolCallFunction
 	ChatToolName        = oapi.ChatToolName
 	ChatToolsConfig     = oapi.ChatToolsConfig
 	FetchConfig         = oapi.FetchConfig

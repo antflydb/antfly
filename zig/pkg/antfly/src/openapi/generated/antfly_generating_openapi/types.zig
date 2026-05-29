@@ -151,24 +151,12 @@ pub const MediaContentPart = struct {
     mime_type: []const u8,
 };
 
-/// A tool call made by the assistant
-pub const ChatToolCall = struct {
-    /// Unique identifier for this tool call
-    id: []const u8,
-    /// Name of the tool being called
+/// The function called by a model tool call.
+pub const ToolCallFunction = struct {
+    /// Function name.
     name: []const u8,
-    /// Arguments passed to the tool as key-value pairs
-    arguments: std.json.Value,
-};
-
-/// Result from executing a tool call
-pub const ChatToolResult = struct {
-    /// ID of the tool call this result corresponds to
-    tool_call_id: []const u8,
-    /// Result data from the tool execution
-    result: std.json.Value,
-    /// Error message if tool execution failed
-    @"error": ?[]const u8 = null,
+    /// JSON string of function arguments.
+    arguments: []const u8,
 };
 
 /// Configuration for the Google generative AI provider (Gemini).
@@ -349,6 +337,14 @@ pub const ImageURLContentPart = struct {
     image_url: ImageURL,
 };
 
+/// OpenAI-compatible assistant tool call.
+pub const ToolCall = struct {
+    /// Tool call identifier.
+    id: []const u8,
+    type: []const u8,
+    function: ToolCallFunction,
+};
+
 /// A unified configuration for a generative AI provider.
 pub const GeneratorConfig = struct {
     /// The Google Cloud project ID.
@@ -454,12 +450,14 @@ pub const ChainLink = struct {
 /// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts: [{"type": "text", "text": "Hello"}]
 pub const ChatMessageContent = std.json.Value;
 
-/// A message in a generation/chat conversation
+/// OpenAI-compatible message in a generation/chat conversation.
 pub const ChatMessage = struct {
     role: ChatMessageRole,
-    content: ChatMessageContent,
-    /// Tool calls made by the assistant (only for assistant role)
-    tool_calls: ?[]const ChatToolCall = null,
-    /// Results from tool executions (only for tool role)
-    tool_results: ?[]const ChatToolResult = null,
+    content: ?ChatMessageContent = null,
+    /// Tool calls made by the assistant (only for role=assistant).
+    tool_calls: ?[]const ToolCall = null,
+    /// ID of the tool call this message responds to (only for role=tool).
+    tool_call_id: ?[]const u8 = null,
+    /// Optional tool name for tool messages when model templates need it.
+    name: ?[]const u8 = null,
 };

@@ -97,7 +97,7 @@ pub const PreparedExampleInput = struct {
     num_supervised_tokens: usize = 0,
     turn_count: usize = 0,
     has_tool_calls: bool = false,
-    has_tool_results: bool = false,
+    has_tool_messages: bool = false,
     image_paths: []const []const u8 = &.{},
     audio_paths: []const []const u8 = &.{},
     image_token_counts: []const usize = &.{},
@@ -127,7 +127,7 @@ pub const PreparedInputsSummary = struct {
     max_input_tokens: usize = 0,
     max_supervised_tokens: usize = 0,
     examples_with_tool_calls: usize = 0,
-    examples_with_tool_results: usize = 0,
+    examples_with_tool_messages: usize = 0,
     examples_with_multiturn: usize = 0,
     examples_with_images: usize = 0,
     examples_with_audio: usize = 0,
@@ -1485,7 +1485,7 @@ pub fn prepareInputsFromChatData(
         summary.max_input_tokens = @max(summary.max_input_tokens, item.num_input_tokens);
         summary.max_supervised_tokens = @max(summary.max_supervised_tokens, item.num_supervised_tokens);
         if (item.has_tool_calls) summary.examples_with_tool_calls += 1;
-        if (item.has_tool_results) summary.examples_with_tool_results += 1;
+        if (item.has_tool_messages) summary.examples_with_tool_messages += 1;
         if (item.turn_count > 2) summary.examples_with_multiturn += 1;
         if (item.image_paths.len > 0) summary.examples_with_images += 1;
         if (item.audio_paths.len > 0) summary.examples_with_audio += 1;
@@ -1569,7 +1569,7 @@ pub fn prepareMultimodalInputsFromChatData(
         summary.max_input_tokens = @max(summary.max_input_tokens, item.num_input_tokens);
         summary.max_supervised_tokens = @max(summary.max_supervised_tokens, item.num_supervised_tokens);
         if (item.has_tool_calls) summary.examples_with_tool_calls += 1;
-        if (item.has_tool_results) summary.examples_with_tool_results += 1;
+        if (item.has_tool_messages) summary.examples_with_tool_messages += 1;
         if (item.turn_count > 2) summary.examples_with_multiturn += 1;
         if (item.image_paths.len > 0) summary.examples_with_images += 1;
         if (item.audio_paths.len > 0) summary.examples_with_audio += 1;
@@ -2076,13 +2076,13 @@ fn tokenizeChatExample(
     }
 
     var has_tool_calls = false;
-    var has_tool_results = false;
+    var has_tool_messages = false;
     for (selected.messages, 0..) |msg, idx| {
         if (msg.tool_calls.len > 0) {
             has_tool_calls = true;
             tool_call_json_bufs[idx] = try stringifyToolCalls(allocator, msg.tool_calls);
         }
-        if (msg.role == .tool) has_tool_results = true;
+        if (msg.role == .tool) has_tool_messages = true;
         render_messages[idx] = .{
             .role = switch (msg.role) {
                 .system => .system,
@@ -2167,7 +2167,7 @@ fn tokenizeChatExample(
         .num_supervised_tokens = response_count,
         .turn_count = selected.messages.len,
         .has_tool_calls = has_tool_calls,
-        .has_tool_results = has_tool_results,
+        .has_tool_messages = has_tool_messages,
         .image_paths = try cloneStringSlice(allocator, example.image_paths),
         .audio_paths = try cloneStringSlice(allocator, example.audio_paths),
         .was_truncated = selected.turns_dropped_from_left > 0 or encoded.ids.len == max_seq_len and selected.messages.len < example.messages.len,
@@ -2432,7 +2432,18 @@ fn cloneF32Slice(allocator: std.mem.Allocator, items: []const f32) ![]f32 {
 fn stringifyToolCalls(allocator: std.mem.Allocator, tool_calls: []const gemma_chat_data.ToolCall) ![]u8 {
     var buf: std.Io.Writer.Allocating = .init(allocator);
     defer buf.deinit();
-    try std.json.Stringify.value(tool_calls, .{}, &buf.writer);
+    try buf.writer.writeByte('[');
+    for (tool_calls, 0..) |tool_call, idx| {
+        if (idx != 0) try buf.writer.writeByte(',');
+        try buf.writer.writeAll("{\"id\":");
+        try std.json.Stringify.value(tool_call.id, .{}, &buf.writer);
+        try buf.writer.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
+        try std.json.Stringify.value(tool_call.name, .{}, &buf.writer);
+        try buf.writer.writeAll(",\"arguments\":");
+        try std.json.Stringify.value(tool_call.arguments_json, .{}, &buf.writer);
+        try buf.writer.writeAll("}}");
+    }
+    try buf.writer.writeByte(']');
     return try allocator.dupe(u8, buf.written());
 }
 
@@ -2513,7 +2524,7 @@ fn clonePreparedInputsSummary(allocator: std.mem.Allocator, source: *const Prepa
             .num_supervised_tokens = item.num_supervised_tokens,
             .turn_count = item.turn_count,
             .has_tool_calls = item.has_tool_calls,
-            .has_tool_results = item.has_tool_results,
+            .has_tool_messages = item.has_tool_messages,
             .image_paths = try cloneStringSlice(allocator, item.image_paths),
             .audio_paths = try cloneStringSlice(allocator, item.audio_paths),
             .image_token_counts = try cloneUsizeSlice(allocator, item.image_token_counts),
@@ -2545,7 +2556,7 @@ fn clonePreparedInputsSummary(allocator: std.mem.Allocator, source: *const Prepa
         .max_input_tokens = source.max_input_tokens,
         .max_supervised_tokens = source.max_supervised_tokens,
         .examples_with_tool_calls = source.examples_with_tool_calls,
-        .examples_with_tool_results = source.examples_with_tool_results,
+        .examples_with_tool_messages = source.examples_with_tool_messages,
         .examples_with_multiturn = source.examples_with_multiturn,
         .examples_with_images = source.examples_with_images,
         .examples_with_audio = source.examples_with_audio,

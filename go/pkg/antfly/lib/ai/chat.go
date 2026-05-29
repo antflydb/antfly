@@ -393,23 +393,35 @@ func NewTextChatMessageContent(text string) ChatMessageContent {
 	return ChatMessageContent(content)
 }
 
+func NewTextChatMessageContentPtr(text string) *ChatMessageContent {
+	content := NewTextChatMessageContent(text)
+	return &content
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
 func NewTextChatMessage(role ChatMessageRole, text string) ChatMessage {
 	return ChatMessage{
 		Role:    role,
-		Content: NewTextChatMessageContent(text),
+		Content: NewTextChatMessageContentPtr(text),
 	}
 }
 
-func ChatMessageContentAsText(content ChatMessageContent) string {
-	if len(content) == 0 {
+func ChatMessageContentAsText(content *ChatMessageContent) string {
+	if content == nil || len(*content) == 0 {
 		return ""
 	}
 	var text string
-	if err := json.Unmarshal(content, &text); err == nil {
+	if err := json.Unmarshal(*content, &text); err == nil {
 		return text
 	}
 	var parts []generatingtypes.ContentPart
-	if err := json.Unmarshal(content, &parts); err == nil {
+	if err := json.Unmarshal(*content, &parts); err == nil {
 		var b strings.Builder
 		for _, part := range parts {
 			textPart, err := part.AsTextContentPart()
@@ -419,22 +431,22 @@ func ChatMessageContentAsText(content ChatMessageContent) string {
 		}
 		return b.String()
 	}
-	return string(content)
+	return string(*content)
 }
 
-func chatMessageContentToGenKitParts(content ChatMessageContent) []*ai.Part {
-	if len(content) == 0 {
+func chatMessageContentToGenKitParts(content *ChatMessageContent) []*ai.Part {
+	if content == nil || len(*content) == 0 {
 		return nil
 	}
 	var text string
-	if err := json.Unmarshal(content, &text); err == nil {
+	if err := json.Unmarshal(*content, &text); err == nil {
 		if text == "" {
 			return nil
 		}
 		return []*ai.Part{ai.NewTextPart(text)}
 	}
 	var contentParts []generatingtypes.ContentPart
-	if err := json.Unmarshal(content, &contentParts); err == nil {
+	if err := json.Unmarshal(*content, &contentParts); err == nil {
 		parts := make([]*ai.Part, 0, len(contentParts))
 		for _, part := range contentParts {
 			textPart, err := part.AsTextContentPart()
@@ -444,7 +456,51 @@ func chatMessageContentToGenKitParts(content ChatMessageContent) []*ai.Part {
 		}
 		return parts
 	}
-	return []*ai.Part{ai.NewTextPart(string(content))}
+	return []*ai.Part{ai.NewTextPart(string(*content))}
+}
+
+func parseToolArguments(arguments string) any {
+	if arguments == "" {
+		return map[string]any{}
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(arguments), &parsed); err == nil {
+		return parsed
+	}
+	return arguments
+}
+
+func stringifyToolArguments(input any) string {
+	if input == nil {
+		return "{}"
+	}
+	if text, ok := input.(string); ok && json.Valid([]byte(text)) {
+		return text
+	}
+	data, err := json.Marshal(input)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+func toolResponseContent(output any) *ChatMessageContent {
+	if output == nil {
+		return NewTextChatMessageContentPtr("")
+	}
+	if text, ok := output.(string); ok {
+		return NewTextChatMessageContentPtr(text)
+	}
+	if obj, ok := output.(map[string]any); ok && len(obj) == 1 {
+		if text, ok := obj["content"].(string); ok {
+			return NewTextChatMessageContentPtr(text)
+		}
+	}
+	data, err := json.Marshal(output)
+	if err != nil {
+		return NewTextChatMessageContentPtr(fmt.Sprint(output))
+	}
+	return NewTextChatMessageContentPtr(string(data))
 }
 
 func ChatMessagesToGenKit(messages []ChatMessage) []*ai.Message {
@@ -476,21 +532,20 @@ func ChatMessagesToGenKit(messages []ChatMessage) []*ai.Message {
 		if msg.ToolCalls != nil {
 			for _, tc := range *msg.ToolCalls {
 				parts = append(parts, ai.NewToolRequestPart(&ai.ToolRequest{
-					Name:  tc.Name,
-					Input: any(tc.Arguments),
+					Name:  tc.Function.Name,
+					Input: parseToolArguments(tc.Function.Arguments),
 					Ref:   tc.Id,
 				}))
 			}
 		}
 
-		// Add tool result parts for tool messages
-		if msg.ToolResults != nil {
-			for _, tr := range *msg.ToolResults {
-				parts = append(parts, ai.NewToolResponsePart(&ai.ToolResponse{
-					Output: any(tr.Result),
-					Ref:    tr.ToolCallId,
-				}))
-			}
+		// Add OpenAI-style tool response parts for tool messages.
+		if msg.Role == ChatMessageRoleTool && msg.ToolCallId != nil {
+			parts = append(parts, ai.NewToolResponsePart(&ai.ToolResponse{
+				Name:   derefString(msg.Name),
+				Output: map[string]any{"content": ChatMessageContentAsText(msg.Content)},
+				Ref:    *msg.ToolCallId,
+			}))
 		}
 
 		if len(parts) > 0 {
@@ -530,9 +585,8 @@ func GenKitToChatMessages(messages []*ai.Message) []ChatMessage {
 		cm := ChatMessage{Role: role}
 		var text strings.Builder
 
-		// Extract text content and tool parts
-		var toolCalls []ChatToolCall
-		var toolResults []ChatToolResult
+		// Extract text content and tool call parts.
+		var toolCalls []ToolCall
 
 		for _, part := range msg.Content {
 			if part.Text != "" {
@@ -540,25 +594,24 @@ func GenKitToChatMessages(messages []*ai.Message) []ChatMessage {
 			}
 			if part.IsToolRequest() {
 				tr := part.ToolRequest
-				args := make(map[string]any)
-				if input, ok := tr.Input.(map[string]any); ok {
-					args = input
-				}
-				toolCalls = append(toolCalls, ChatToolCall{
-					Id:        tr.Ref,
-					Name:      tr.Name,
-					Arguments: args,
+				toolCalls = append(toolCalls, ToolCall{
+					Id:   tr.Ref,
+					Type: generatingtypes.ToolCallTypeFunction,
+					Function: ToolCallFunction{
+						Name:      tr.Name,
+						Arguments: stringifyToolArguments(tr.Input),
+					},
 				})
 			}
 			if part.IsToolResponse() {
 				tr := part.ToolResponse
-				resultMap := make(map[string]any)
-				if output, ok := tr.Output.(map[string]any); ok {
-					resultMap = output
-				}
-				toolResults = append(toolResults, ChatToolResult{
-					ToolCallId: tr.Ref,
-					Result:     resultMap,
+				toolCallID := tr.Ref
+				name := tr.Name
+				result = append(result, ChatMessage{
+					Role:       ChatMessageRoleTool,
+					ToolCallId: &toolCallID,
+					Name:       &name,
+					Content:    toolResponseContent(tr.Output),
 				})
 			}
 		}
@@ -566,14 +619,13 @@ func GenKitToChatMessages(messages []*ai.Message) []ChatMessage {
 		if len(toolCalls) > 0 {
 			cm.ToolCalls = &toolCalls
 		}
-		if len(toolResults) > 0 {
-			cm.ToolResults = &toolResults
-		}
 		if text.Len() > 0 {
-			cm.Content = NewTextChatMessageContent(text.String())
+			cm.Content = NewTextChatMessageContentPtr(text.String())
 		}
 
-		result = append(result, cm)
+		if cm.Content != nil || cm.ToolCalls != nil {
+			result = append(result, cm)
+		}
 	}
 
 	return result

@@ -34,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	generatingtypes "github.com/antflydb/antfly/go/pkg/generating"
 	"github.com/antflydb/antfly/go/pkg/libaf/ai"
 	"github.com/antflydb/antfly/go/pkg/libaf/chunking"
 	"github.com/antflydb/antfly/go/pkg/libaf/embeddings"
@@ -1397,7 +1398,13 @@ func convertChatMessage(msg ChatMessage) generation.Message {
 }
 
 func mediaPartImageURL(part MediaContentPart) string {
-	if len(part.Data) == 0 || !strings.HasPrefix(part.MimeType, "image/") {
+	if !strings.HasPrefix(part.MimeType, "image/") {
+		return ""
+	}
+	if part.Url != "" {
+		return part.Url
+	}
+	if len(part.Data) == 0 {
 		return ""
 	}
 	return "data:" + part.MimeType + ";base64," + base64.StdEncoding.EncodeToString(part.Data)
@@ -1645,12 +1652,12 @@ func (ln *TermiteNode) handleApiGenerate(w http.ResponseWriter, r *http.Request)
 			respMessage.Content = responseText
 		}
 		// Convert internal tool calls to API format
-		apiToolCalls := make([]ToolCall, len(toolCalls))
+		apiToolCalls := make([]generatingtypes.ToolCall, len(toolCalls))
 		for i, tc := range toolCalls {
-			apiToolCalls[i] = ToolCall{
+			apiToolCalls[i] = generatingtypes.ToolCall{
 				Id:   tc.ID,
-				Type: ToolCallType(tc.Type),
-				Function: ToolCallFunction{
+				Type: generatingtypes.ToolCallType(tc.Type),
+				Function: generatingtypes.ToolCallFunction{
 					Name:      tc.Function.Name,
 					Arguments: tc.Function.Arguments,
 				},

@@ -187,49 +187,43 @@ components:
           items:
             $ref: "#/components/schemas/ContentPart"
 
-    ChatToolCall:
+    ToolCall:
       type: object
-      description: "A tool call made by the assistant"
+      description: "OpenAI-compatible assistant tool call."
       required:
         - id
-        - name
-        - arguments
+        - type
+        - function
       properties:
         id:
           type: string
-          description: "Unique identifier for this tool call"
+          description: "Tool call identifier."
+        type:
+          type: string
+          enum:
+            - function
+        function:
+          $ref: "#/components/schemas/ToolCallFunction"
+
+    ToolCallFunction:
+      type: object
+      description: "The function called by a model tool call."
+      required:
+        - name
+        - arguments
+      properties:
         name:
           type: string
-          description: "Name of the tool being called"
+          description: "Function name."
         arguments:
-          type: object
-          additionalProperties: true
-          description: "Arguments passed to the tool as key-value pairs"
-
-    ChatToolResult:
-      type: object
-      description: "Result from executing a tool call"
-      required:
-        - tool_call_id
-        - result
-      properties:
-        tool_call_id:
           type: string
-          description: "ID of the tool call this result corresponds to"
-        result:
-          type: object
-          additionalProperties: true
-          description: "Result data from the tool execution"
-        error:
-          type: string
-          description: "Error message if tool execution failed"
+          description: "JSON string of function arguments."
 
     ChatMessage:
       type: object
-      description: "A message in a generation/chat conversation"
+      description: "OpenAI-compatible message in a generation/chat conversation."
       required:
         - role
-        - content
       properties:
         role:
           $ref: "#/components/schemas/ChatMessageRole"
@@ -238,13 +232,14 @@ components:
         tool_calls:
           type: array
           items:
-            $ref: "#/components/schemas/ChatToolCall"
-          description: "Tool calls made by the assistant (only for assistant role)"
-        tool_results:
-          type: array
-          items:
-            $ref: "#/components/schemas/ChatToolResult"
-          description: "Results from tool executions (only for tool role)"
+            $ref: "#/components/schemas/ToolCall"
+          description: "Tool calls made by the assistant (only for role=assistant)."
+        tool_call_id:
+          type: string
+          description: "ID of the tool call this message responds to (only for role=tool)."
+        name:
+          type: string
+          description: "Optional tool name for tool messages when model templates need it."
 
     GoogleGeneratorConfig:
       type: object
