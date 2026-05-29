@@ -3207,7 +3207,7 @@ pub const DataServer = struct {
                     if (self.shouldSkipActiveStartupGroupStatusOpen(table.name, group_id, active_target)) {
                         continue;
                     }
-                    if (self.write_source.hasReadBlockingActivityBestEffort(table.name, group_id)) {
+                    if (self.hasReadBlockingActivityBestEffort(table.name, group_id)) {
                         if (try self.snapshotCachedLocalGroupStatusReport(alloc, group_id, generation, fingerprint, true)) |cached| {
                             try reports.append(alloc, cached);
                             continue;
@@ -3215,7 +3215,7 @@ pub const DataServer = struct {
                         continue;
                     }
 
-                    switch (self.write_source.probeManagedWriterGroupBestEffort(table.name, group_id)) {
+                    switch (self.probeManagedWriterGroupBestEffort(table.name, group_id)) {
                         .leased => {
                             if (try self.snapshotCachedLocalGroupStatusReport(alloc, group_id, generation, fingerprint, true)) |cached| {
                                 try reports.append(alloc, cached);
@@ -3658,6 +3658,73 @@ pub const DataServer = struct {
         }
 
         return try reports.toOwnedSlice(alloc);
+    }
+
+    fn liveRuntimeWriteSource(self: *DataServer) *antfly.public_api.ProvisionedTableWriteSource {
+        if (self.data_raft_apply) |apply_sm| return &apply_sm.write_source;
+        return &self.write_source;
+    }
+
+    fn snapshotManagedWriterGroupStatusBestEffort(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+    ) !?runtime_status.LocalTableRuntimeStatus {
+        if (try self.liveRuntimeWriteSource().snapshotManagedWriterGroupStatusBestEffort(alloc, table_name, group_id)) |status| {
+            return status;
+        }
+        if (self.data_raft_apply != null) {
+            return try self.write_source.snapshotManagedWriterGroupStatusBestEffort(alloc, table_name, group_id);
+        }
+        return null;
+    }
+
+    fn overlayManagedWriterGroupStatusBestEffort(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+        status: *runtime_status.LocalTableRuntimeStatus,
+    ) void {
+        if (self.data_raft_apply) |apply_sm| {
+            switch (apply_sm.write_source.probeManagedWriterGroupBestEffort(table_name, group_id)) {
+                .leased => |cached| {
+                    var lease = cached;
+                    const release_alloc = if (lease.cache) |cache| cache.alloc else std.heap.page_allocator;
+                    defer lease.deinit(release_alloc);
+                    apply_sm.write_source.overlayManagedWriterGroupStatusBestEffort(alloc, table_name, group_id, status);
+                    return;
+                },
+                .unknown => return,
+                .absent => {},
+            }
+        }
+        self.write_source.overlayManagedWriterGroupStatusBestEffort(alloc, table_name, group_id, status);
+    }
+
+    fn hasReadBlockingActivityBestEffort(
+        self: *DataServer,
+        table_name: []const u8,
+        group_id: u64,
+    ) bool {
+        if (self.liveRuntimeWriteSource().hasReadBlockingActivityBestEffort(table_name, group_id)) return true;
+        if (self.data_raft_apply != null and self.write_source.hasReadBlockingActivityBestEffort(table_name, group_id)) return true;
+        return false;
+    }
+
+    fn probeManagedWriterGroupBestEffort(
+        self: *DataServer,
+        table_name: []const u8,
+        group_id: u64,
+    ) antfly.public_api.ProvisionedTableWriteSource.ManagedWriterGroupProbe {
+        const live_probe = self.liveRuntimeWriteSource().probeManagedWriterGroupBestEffort(table_name, group_id);
+        switch (live_probe) {
+            .leased, .unknown => return live_probe,
+            .absent => {},
+        }
+        if (self.data_raft_apply != null) return self.write_source.probeManagedWriterGroupBestEffort(table_name, group_id);
+        return live_probe;
     }
 
     fn applyRuntimeStatusStorageFactsBestEffort(
@@ -4375,7 +4442,8 @@ pub const DataServer = struct {
         _ = self.runtime_status_refresh_started.fetchAdd(1, .monotonic);
         var stats: RuntimeStatusRefreshStats = .{};
         var budget: RuntimeStatusRefreshBudget = .{ .max_db_opens = max_db_opens };
-        var replay_debt_present = false;
+        var pending_runtime_work = false;
+        var startup_catch_up_debt_present = false;
         defer self.runtime_status_refresh_last_table_count.store(stats.table_count, .monotonic);
         defer self.runtime_status_refresh_last_group_count.store(stats.group_count, .monotonic);
         defer self.runtime_status_refresh_last_db_opens.store(stats.db_opens, .monotonic);
@@ -4411,7 +4479,8 @@ pub const DataServer = struct {
         stats.table_count = @intCast(snapshots.len);
         for (snapshots) |entry| {
             stats.group_count += @intCast(entry.statuses.items.len);
-            if (replayDebtPresent(entry.statuses.items)) replay_debt_present = true;
+            if (runtimeStatusWorkPending(entry.statuses.items)) pending_runtime_work = true;
+            if (runtimeStatusStartupCatchUpDebtPresent(entry.statuses.items)) startup_catch_up_debt_present = true;
         }
         if (active_target_owned) |target| {
             self.provisioned_storage.runtime_status_cache.replaceOwnedPreservingGroupStatus(snapshots, target.table_name, target.group_id) catch |err| {
@@ -4422,18 +4491,25 @@ pub const DataServer = struct {
         } else {
             self.provisioned_storage.runtime_status_cache.replaceOwned(snapshots);
         }
-        self.provisioned_startup_catch_up_dirty.store(replay_debt_present, .release);
+        self.provisioned_startup_catch_up_dirty.store(startup_catch_up_debt_present, .release);
         self.runtime_status_last_refresh_at_ms.store(
             @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)),
             .monotonic,
         );
-        self.runtime_status_dirty.store(false, .release);
+        self.runtime_status_dirty.store(pending_runtime_work, .release);
         self.store_status_dirty = true;
         _ = self.runtime_status_refresh_completed.fetchAdd(1, .monotonic);
         return stats;
     }
 
-    fn replayDebtPresent(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
+    fn runtimeStatusWorkPending(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
+        for (statuses) |status| {
+            if (runtimeStatusHasActiveBackgroundWork(status)) return true;
+        }
+        return false;
+    }
+
+    fn runtimeStatusStartupCatchUpDebtPresent(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
         for (statuses) |status| {
             for (status.stats.indexes) |index| {
                 if (index.replay_catch_up_required or index.backfill_active) return true;
@@ -4544,30 +4620,30 @@ pub const DataServer = struct {
             if (self.shouldSkipActiveStartupGroupStatusOpen(table.name, group_id, active_target)) {
                 continue;
             }
-            if (try self.write_source.snapshotManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id)) |live_status| {
+            if (try self.snapshotManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id)) |live_status| {
                 var status = live_status;
                 status.metadata = status.metadata.withDefaults(.live_writer_publish, platform_time.monotonicNs());
                 self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
                 try items.append(self.alloc, status);
                 continue;
             }
-            if (self.write_source.hasReadBlockingActivityBestEffort(table.name, group_id)) {
+            if (self.hasReadBlockingActivityBestEffort(table.name, group_id)) {
                 if (try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(self.alloc, table.name, group_id)) |cached| {
                     var status = cached;
-                    self.write_source.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
+                    self.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
                     self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
                     try items.append(self.alloc, status);
                     continue;
                 }
                 if (try syntheticConfiguredRuntimeStatus(self.alloc, table, group_id)) |synthetic| {
                     var status = synthetic;
-                    self.write_source.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
+                    self.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
                     self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
                     try items.append(self.alloc, status);
                 }
                 continue;
             }
-            switch (self.write_source.probeManagedWriterGroupBestEffort(table.name, group_id)) {
+            switch (self.probeManagedWriterGroupBestEffort(table.name, group_id)) {
                 .leased => |cached| {
                     var lease = cached;
                     const release_alloc = if (lease.cache) |cache| cache.alloc else std.heap.page_allocator;
@@ -4582,7 +4658,7 @@ pub const DataServer = struct {
                         .stats = try lease.db.stats(self.alloc),
                     };
                     errdefer status.deinit(self.alloc);
-                    self.write_source.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
+                    self.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
                     self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, lease.db);
                     try items.append(self.alloc, status);
                     continue;
@@ -4590,7 +4666,7 @@ pub const DataServer = struct {
                 .unknown => {
                     if (try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(self.alloc, table.name, group_id)) |cached| {
                         var status = cached;
-                        self.write_source.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
+                        self.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
                         self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
                         try items.append(self.alloc, status);
                         continue;
@@ -4632,8 +4708,10 @@ pub const DataServer = struct {
         if (status.stats.enrichment.target_sequence > status.stats.enrichment.applied_sequence) return true;
         if (status.stats.async_indexing.startup.active) return true;
         if (status.stats.async_indexing.dense_catch_up.active) return true;
+        if (status.stats.async_indexing.bulk_coalescing.active_session) return true;
         for (status.stats.indexes) |index| {
             if (index.backfill_active) return true;
+            if (index.catch_up_active) return true;
             if (index.replay_catch_up_required) return true;
             if (index.replay_target_sequence > index.replay_applied_sequence) return true;
         }
@@ -10947,6 +11025,32 @@ test "data runtime startup catch-up stays dirty when metadata snapshot is unavai
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_completed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_last_group_count.load(.monotonic));
+}
+
+test "data runtime keeps status refresh dirty for non-startup async index work" {
+    var catch_up_indexes = [_]antfly.db.types.DBIndexStats{.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .catch_up_active = true,
+    }};
+    const catch_up_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .stats = .{
+            .indexes = catch_up_indexes[0..],
+            .index_count = 1,
+        },
+    }};
+    try std.testing.expect(DataServer.runtimeStatusWorkPending(catch_up_statuses[0..]));
+    try std.testing.expect(!DataServer.runtimeStatusStartupCatchUpDebtPresent(catch_up_statuses[0..]));
+
+    const bulk_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .stats = .{
+            .async_indexing = .{
+                .bulk_coalescing = .{ .active_session = true },
+            },
+        },
+    }};
+    try std.testing.expect(DataServer.runtimeStatusWorkPending(bulk_statuses[0..]));
+    try std.testing.expect(!DataServer.runtimeStatusStartupCatchUpDebtPresent(bulk_statuses[0..]));
 }
 
 test "data runtime defers replica-root reconcile only for unresolved startup debt on known metadata" {

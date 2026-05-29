@@ -2715,6 +2715,7 @@ pub fn build(b: *std.Build) void {
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime status refresh budget reuses cached group status instead of opening db",
         "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
+        "data runtime keeps status refresh dirty for non-startup async index work",
         "data runtime runRound does not refresh provisioned replica root inline while worker is active",
         "data runtime data changes mark provisioned startup catch-up dirty",
         "data runtime structural changes preserve writer-published runtime status",
