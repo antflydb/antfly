@@ -723,7 +723,7 @@ pub const SegmentReader = struct {
         return ver == stored_fields_version_compressed_per_doc or ver == stored_fields_version_block_compressed;
     }
 
-    const V4StoredDocLocation = struct {
+    pub const V4StoredDocLocation = struct {
         id: []const u8,
         block_start: usize,
         block_end: usize,
@@ -1094,10 +1094,24 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
     var chunk = std.ArrayListUnmanaged(u8).empty;
     defer chunk.deinit(alloc);
     for (inputs) |input| {
-        for (0..input.reader.doc_count) |doc_id_usize| {
+        var doc_id_usize: usize = 0;
+        while (doc_id_usize < input.reader.doc_count) {
             const doc_id: u32 = @intCast(doc_id_usize);
-            if (input.isDeleted(doc_id)) continue;
-            if (out_doc_id > 0 and out_doc_id % stored_fields_block_doc_target == 0) {
+            if (input.isDeleted(doc_id)) {
+                doc_id_usize += 1;
+                continue;
+            }
+
+            if (chunk.items.len == 0 and out_doc_id % stored_fields_block_doc_target == 0) {
+                if (try copyMergedStoredBlockIfPossible(sink, input, doc_id, out_doc_id, block_idx, doc_table_start, block_offsets_start, data_start)) |copied_docs| {
+                    out_doc_id += copied_docs;
+                    doc_id_usize += copied_docs;
+                    block_idx += 1;
+                    continue;
+                }
+            }
+
+            if (chunk.items.len > 0 and out_doc_id > 0 and out_doc_id % stored_fields_block_doc_target == 0) {
                 const compressed = try snappy.encode(alloc, chunk.items);
                 defer alloc.free(compressed);
                 try sink.appendSlice(compressed);
@@ -1117,6 +1131,7 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
             try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, doc_offset))));
             try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(stored.data.len))))));
             out_doc_id += 1;
+            doc_id_usize += 1;
         }
     }
     if (doc_count > 0) {
@@ -1126,6 +1141,54 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
         const block_end_offset: u64 = @intCast(sink.len() - data_start);
         try sink.writeAt(block_offsets_start + @as(usize, block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
     }
+}
+
+fn copyMergedStoredBlockIfPossible(
+    sink: *SegmentSink,
+    input: MergeInput,
+    start_doc_id: u32,
+    out_doc_id: u32,
+    out_block_idx: u32,
+    doc_table_start: usize,
+    block_offsets_start: usize,
+    data_start: usize,
+) !?u32 {
+    if (input.deleted != null) return null;
+    const reader = input.reader;
+    if (reader.data[@intCast(reader.stored_offset)] != stored_fields_version_block_compressed) return null;
+    if (start_doc_id % stored_fields_block_doc_target != 0) return null;
+    if (out_doc_id % stored_fields_block_doc_target != 0) return null;
+    if (start_doc_id + stored_fields_block_doc_target > reader.doc_count) return null;
+
+    var first_loc: ?SegmentReader.V4StoredDocLocation = null;
+    var i: u32 = 0;
+    while (i < stored_fields_block_doc_target) : (i += 1) {
+        const loc = reader.v4StoredDocLocation(@intCast(reader.stored_offset + 1 + 4), start_doc_id + i) orelse return null;
+        if (first_loc == null) {
+            if (loc.doc_offset != 0) return null;
+            first_loc = loc;
+        } else if (loc.block_start != first_loc.?.block_start or loc.block_end != first_loc.?.block_end) {
+            return null;
+        }
+    }
+
+    const first = first_loc.?;
+    if (first.block_start > first.block_end or first.block_end > reader.data.len) return null;
+
+    try sink.appendSlice(reader.data[first.block_start..first.block_end]);
+    const block_end_offset: u64 = @intCast(sink.len() - data_start);
+    try sink.writeAt(block_offsets_start + @as(usize, out_block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
+
+    i = 0;
+    while (i < stored_fields_block_doc_target) : (i += 1) {
+        const loc = reader.v4StoredDocLocation(@intCast(reader.stored_offset + 1 + 4), start_doc_id + i) orelse return null;
+        const entry_pos = doc_table_start + @as(usize, out_doc_id + i) * stored_fields_v4_doc_entry_size;
+        try sink.writeAt(entry_pos + 12, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, out_block_idx))));
+        try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(loc.doc_offset))))));
+        try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, loc.raw_len))));
+    }
+
+    return @intCast(stored_fields_block_doc_target);
 }
 
 fn appendBuiltSection(
@@ -1481,6 +1544,50 @@ test "segment block-compressed stored fields cross block boundary" {
     defer alloc.free(last.data);
     try std.testing.expectEqualStrings("doc-134", last.id);
     try std.testing.expect(std.mem.indexOf(u8, last.data, "\"ordinal\":134") != null);
+}
+
+test "merge copies aligned stored field blocks without recompressing" {
+    const alloc = std.testing.allocator;
+
+    var sw1 = SegmentWriter.init(alloc);
+    defer sw1.deinit();
+    var id_buf: [32]u8 = undefined;
+    var data_buf: [128]u8 = undefined;
+    for (0..stored_fields_block_doc_target) |i| {
+        const id = try std.fmt.bufPrint(&id_buf, "a-{d}", .{i});
+        const data = try std.fmt.bufPrint(&data_buf, "{{\"segment\":\"a\",\"ordinal\":{d},\"body\":\"copy aligned stored block\"}}", .{i});
+        try sw1.addStoredDoc(id, data);
+    }
+    const seg1 = try sw1.build();
+    defer alloc.free(seg1);
+
+    var sw2 = SegmentWriter.init(alloc);
+    defer sw2.deinit();
+    try sw2.addStoredDoc("b-0", "{\"segment\":\"b\",\"ordinal\":0}");
+    const seg2 = try sw2.build();
+    defer alloc.free(seg2);
+
+    var r1 = try SegmentReader.init(alloc, seg1);
+    defer r1.deinit();
+    const src_loc = r1.v4StoredDocLocation(@intCast(r1.stored_offset + 1 + 4), 0) orelse return error.TestExpectedEqual;
+    const src_block = r1.data[src_loc.block_start..src_loc.block_end];
+
+    const merged = try mergeSegments(alloc, &.{ seg1, seg2 });
+    defer alloc.free(merged);
+
+    var merged_reader = try SegmentReader.init(alloc, merged);
+    defer merged_reader.deinit();
+    const merged_loc = merged_reader.v4StoredDocLocation(@intCast(merged_reader.stored_offset + 1 + 4), 0) orelse return error.TestExpectedEqual;
+    const merged_block = merged_reader.data[merged_loc.block_start..merged_loc.block_end];
+    try std.testing.expectEqualSlices(u8, src_block, merged_block);
+
+    const last_copied = (try merged_reader.storedDocDecompressed(@intCast(stored_fields_block_doc_target - 1))) orelse return error.TestExpectedEqual;
+    defer alloc.free(last_copied.data);
+    try std.testing.expectEqualStrings("a-127", last_copied.id);
+
+    const tail = (try merged_reader.storedDocDecompressed(@intCast(stored_fields_block_doc_target))) orelse return error.TestExpectedEqual;
+    defer alloc.free(tail.data);
+    try std.testing.expectEqualStrings("b-0", tail.id);
 }
 
 test "segment doc ordinal sidecar roundtrip and merge preserve live order" {
