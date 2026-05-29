@@ -392,13 +392,15 @@ fn CloudReaderState(comptime provider: Provider) type {
                 .location = try dupOpt(alloc, cfg.location),
             };
             errdefer state.deinitState();
+            if (provider == .vertex) {
+                if (state.project_id == null) {
+                    state.project_id = try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path);
+                }
+            }
             if (cfg.bearer_token orelse cfg.api_key) |token| {
                 try state.setBearer(token);
             } else if (provider == .vertex) {
                 state.token_source = try initVertexTokenSource(alloc, cfg.credentials_path);
-                if (state.project_id == null) {
-                    state.project_id = try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path);
-                }
             }
             if (provider == .vertex and state.project_id == null) return error.InvalidReaderConfig;
             if (provider == .vertex and state.location == null) state.location = try alloc.dupe(u8, "us-central1");
@@ -799,6 +801,67 @@ test "vertex reader exchanges service account credentials and sends bearer auth"
     try std.testing.expectEqualStrings("read from vertex", results.?[0].text);
 }
 
+test "vertex reader explicit bearer still defaults project id from credentials" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/projects/proj-from-json/locations/us-central1/publishers/google/models/gemini-test:generateContent", .assert_request = expectExplicitVertexBearer, .respond = .{
+            .body = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"read with explicit auth\"}]}}]}",
+        } },
+    });
+    defer server.deinit();
+
+    const credentials_json = try fakeVertexCredentialsJsonAlloc(alloc, "http://127.0.0.1/token-not-used");
+    defer alloc.free(credentials_json);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "credentials.json", .data = credentials_json });
+    const credentials_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "credentials.json" });
+    defer alloc.free(credentials_path);
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const reader = try initReader(alloc, &client, .{
+        .provider = .vertex,
+        .base_url = server.baseUrl(),
+        .model = "gemini-test",
+        .credentials_path = credentials_path,
+        .bearer_token = "explicit-token",
+    });
+    defer reader.deinit();
+
+    var results: ?[]Result = null;
+    defer if (results) |items| {
+        for (items) |*item| deinitResult(alloc, item);
+        alloc.free(items);
+    };
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+
+    const Fiber = struct {
+        fn run(a: Allocator, r: Reader, out: *?[]Result, err_out: *?anyerror) std.Io.Cancelable!void {
+            const images = [_][]const u8{"data:image/png;base64,ZmFrZQ=="};
+            out.* = r.read(a, .{ .images = &images }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    group.concurrent(io, Fiber.run, .{ alloc, reader, &results, &run_err }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+
+    try std.testing.expectEqual(@as(usize, 1), results.?.len);
+    try std.testing.expectEqualStrings("read with explicit auth", results.?[0].text);
+}
+
 const fake_vertex_private_key_json =
     "-----BEGIN PRIVATE KEY-----\\n" ++
     "MIICeAIBADANBgkqhkiG9w0BAQEFAASCAmIwggJeAgEAAoGBAOXaLd9jk03zcJ95\\n" ++
@@ -835,6 +898,11 @@ fn fakeVertexCredentialsJsonAlloc(alloc: Allocator, token_uri: []const u8) ![]u8
 fn expectVertexBearer(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqual(httpx.Method.POST, req.method);
     try std.testing.expectEqualStrings("Bearer vertex-token", req.header("Authorization") orelse return error.MissingHeader);
+}
+
+fn expectExplicitVertexBearer(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqual(httpx.Method.POST, req.method);
+    try std.testing.expectEqualStrings("Bearer explicit-token", req.header("Authorization") orelse return error.MissingHeader);
 }
 
 fn expectAntflyReaderBearer(req: httpx.testing_mod.RequestInfo) !void {

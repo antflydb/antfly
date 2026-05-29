@@ -2486,6 +2486,8 @@ fn buildQueryBuilderGenerationChain(
 
 fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generating.GeneratorConfig {
     const provider: generating.Provider = switch (cfg.provider) {
+        .gemini => .gemini,
+        .vertex => .vertex,
         .openai => .openai,
         .ollama => .ollama,
         .termite => .termite,
@@ -2496,6 +2498,7 @@ fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generatin
     const url = switch (provider) {
         .termite => cfg.api_url orelse "",
         .antfly => "",
+        .gemini, .vertex => cfg.url orelse "",
         .openai, .ollama => cfg.url orelse return error.InvalidQueryBuilderGeneration,
         else => return error.UnsupportedQueryBuilderGeneration,
     };
@@ -2504,6 +2507,9 @@ fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generatin
         .model = model,
         .url = url,
         .api_key = cfg.api_key,
+        .project_id = cfg.project_id,
+        .location = cfg.location,
+        .credentials_path = cfg.credentials_path,
     };
 }
 

@@ -92,19 +92,9 @@ func (t *TermiteAPI) GenerateContent(w http.ResponseWriter, r *http.Request) {
 	t.node.handleApiGenerate(w, r)
 }
 
-// RecognizeEntities implements ServerInterface
-func (t *TermiteAPI) RecognizeEntities(w http.ResponseWriter, r *http.Request) {
-	t.node.handleApiRecognize(w, r)
-}
-
 // RewriteText implements ServerInterface
 func (t *TermiteAPI) RewriteText(w http.ResponseWriter, r *http.Request) {
 	t.node.handleApiRewrite(w, r)
-}
-
-// ClassifyText implements ServerInterface
-func (t *TermiteAPI) ClassifyText(w http.ResponseWriter, r *http.Request) {
-	t.node.handleApiClassify(w, r)
 }
 
 // ReadImages implements ServerInterface

@@ -23,6 +23,7 @@ pub const types = @import("types.zig");
 pub const bedrock = @import("bedrock.zig");
 pub const termite = @import("termite.zig");
 pub const openai = @import("openai.zig");
+pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
 
 pub const Embedder = types.Embedder;
@@ -41,6 +42,7 @@ test "inference module compiles" {
     _ = bedrock;
     _ = termite;
     _ = openai;
+    _ = vertex;
     _ = managed_embedder;
 }
 

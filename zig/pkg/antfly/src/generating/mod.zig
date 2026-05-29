@@ -19,6 +19,7 @@ const inference = @import("../inference/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const openai_provider = @import("../inference/openai.zig");
 const termite_provider = @import("../inference/termite.zig");
+const vertex_provider = @import("../inference/vertex.zig");
 const common_secrets = @import("../common/secrets.zig");
 
 pub const Role = lib.Role;
@@ -98,6 +99,8 @@ const BackendState = struct {
     provider: union(enum) {
         openai: openai_provider.Provider,
         termite: termite_provider.Provider,
+        vertex: vertex_provider.Provider,
+        gemini: vertex_provider.GeminiProvider,
         local_termite: managed_embedder.LocalTermiteProvider,
     },
 
@@ -116,6 +119,7 @@ const BackendState = struct {
         state.cfg = cfg;
         state.api_key = switch (cfg.provider) {
             .termite, .antfly => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key orelse termite_api_key, "ANTFLY_TERMITE_API_KEY"),
+            .gemini => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, "GEMINI_API_KEY"),
             else => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
         };
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
@@ -125,6 +129,26 @@ const BackendState = struct {
             .openai, .ollama => blk: {
                 const provider = openai_provider.Provider.init(alloc, http, cfg.url);
                 break :blk .{ .openai = provider };
+            },
+            .gemini => blk: {
+                const api_key_ref = state.api_key orelse return error.MissingGeneratorCredentials;
+                const api_key = (try api_key_ref.resolveOwned(alloc, secret_store)) orelse return error.MissingGeneratorCredentials;
+                defer alloc.free(api_key);
+                break :blk .{ .gemini = try vertex_provider.GeminiProvider.init(alloc, http, .{
+                    .base_url = if (cfg.url.len > 0) cfg.url else "https://generativelanguage.googleapis.com/v1beta",
+                    .api_key = api_key,
+                }) };
+            },
+            .vertex => blk: {
+                const bearer_token = if (state.api_key) |*api_key_ref| try api_key_ref.resolveOwned(alloc, secret_store) else null;
+                defer if (bearer_token) |value| alloc.free(value);
+                break :blk .{ .vertex = try vertex_provider.Provider.init(alloc, http, .{
+                    .base_url = if (cfg.url.len > 0) cfg.url else "https://aiplatform.googleapis.com/v1",
+                    .project_id = cfg.project_id,
+                    .location = cfg.location orelse "us-central1",
+                    .credentials_path = cfg.credentials_path,
+                    .bearer_token = bearer_token,
+                }) };
             },
             .antfly => if (cfg.url.len == 0)
                 .{ .local_termite = local_termite_provider orelse return error.UnsupportedGeneratorProvider }
@@ -151,6 +175,8 @@ const BackendState = struct {
         switch (self.provider) {
             .openai => |*provider| provider.deinit(),
             .termite => |*provider| provider.deinit(),
+            .vertex => |*provider| provider.deinit(),
+            .gemini => |*provider| provider.deinit(),
             .local_termite => {},
         }
         self.auth_header_cache.deinit(self.alloc);
@@ -179,6 +205,8 @@ const BackendState = struct {
                 }
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
+            .vertex => |*provider| try provider.generator().generate(alloc, model, messages),
+            .gemini => |*provider| try provider.generator().generate(alloc, model, messages),
             .local_termite => |local| blk: {
                 if (local.generate_messages) |generate_messages| {
                     const content = try generate_messages(local.ptr, alloc, model, messages);
