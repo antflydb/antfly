@@ -48,6 +48,7 @@ const stored_fields_version_compressed_per_doc: u8 = 2;
 const stored_fields_version_uncompressed_offsets: u8 = 3;
 const stored_fields_version_block_compressed: u8 = 4;
 const stored_fields_block_doc_target: usize = 128;
+const stored_fields_block_raw_target: usize = 512 * 1024;
 const stored_fields_v4_doc_entry_size: usize = 24;
 
 /// Fixed footer size (big-endian, at end of segment):
@@ -348,7 +349,9 @@ pub const SegmentWriter = struct {
         self.last_stored_raw_bytes = 0;
         self.last_stored_compressed_bytes = 0;
         try sinkAppendU32LE(sink, num_docs);
-        const num_blocks: u32 = if (num_docs == 0) 0 else @intCast((@as(usize, num_docs) - 1) / stored_fields_block_doc_target + 1);
+        const blocks = try planStoredFieldBlocks(self.alloc, self.stored_fields.items);
+        defer self.alloc.free(blocks);
+        const num_blocks: u32 = @intCast(blocks.len);
         try sinkAppendU32LE(sink, num_blocks);
         try sinkAppendU32LE(sink, stored_fields_block_doc_target);
         const id_bytes_len_pos = sink.len();
@@ -371,14 +374,13 @@ pub const SegmentWriter = struct {
         try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, id_bytes_len))));
 
         const data_start = sink.len();
-        var doc_index: usize = 0;
-        for (0..num_blocks) |block_idx| {
-            var chunk = std.ArrayListUnmanaged(u8).empty;
-            defer chunk.deinit(self.alloc);
+        var chunk = std.ArrayListUnmanaged(u8).empty;
+        defer chunk.deinit(self.alloc);
+        for (blocks, 0..) |block, block_idx| {
             chunk.clearRetainingCapacity();
 
-            const block_end = @min(doc_index + stored_fields_block_doc_target, self.stored_fields.items.len);
-            while (doc_index < block_end) : (doc_index += 1) {
+            var doc_index = block.start;
+            while (doc_index < block.end) : (doc_index += 1) {
                 const doc = &self.stored_fields.items[doc_index];
                 const doc_offset: u32 = @intCast(chunk.items.len);
                 var decoded: ?[]u8 = null;
@@ -456,6 +458,37 @@ pub const SegmentWriter = struct {
         is_compressed: bool,
         owns_data: bool,
     };
+
+    const StoredFieldBlockPlan = struct {
+        start: usize,
+        end: usize,
+    };
+
+    fn storedDocRawLen(doc: *const StoredDoc) !usize {
+        return if (doc.is_compressed) try snappy.decodedLen(doc.data) else doc.data.len;
+    }
+
+    fn planStoredFieldBlocks(alloc: Allocator, docs: []const StoredDoc) ![]StoredFieldBlockPlan {
+        if (docs.len == 0) return try alloc.alloc(StoredFieldBlockPlan, 0);
+        var blocks = std.ArrayListUnmanaged(StoredFieldBlockPlan).empty;
+        errdefer blocks.deinit(alloc);
+
+        var start: usize = 0;
+        while (start < docs.len) {
+            var end = start;
+            var raw_bytes: usize = 0;
+            while (end < docs.len) {
+                const doc_raw_bytes = (try storedDocRawLen(&docs[end])) +| 4;
+                if (end > start and (end - start >= stored_fields_block_doc_target or raw_bytes +| doc_raw_bytes > stored_fields_block_raw_target)) break;
+                raw_bytes +|= doc_raw_bytes;
+                end += 1;
+            }
+            try blocks.append(alloc, .{ .start = start, .end = end });
+            start = end;
+        }
+
+        return try blocks.toOwnedSlice(alloc);
+    }
 
     const SectionData = struct {
         section_type: SectionType,
@@ -737,6 +770,7 @@ pub const SegmentReader = struct {
 
     pub const V4StoredDocLocation = struct {
         id: []const u8,
+        block_idx: u32,
         block_start: usize,
         block_end: usize,
         doc_offset: usize,
@@ -773,6 +807,7 @@ pub const SegmentReader = struct {
         if (block_start > self.data.len or block_end > self.data.len or block_start > block_end) return null;
         return .{
             .id = self.data[id_start..][0..id_len],
+            .block_idx = block_idx,
             .block_start = block_start,
             .block_end = block_end,
             .doc_offset = @intCast(doc_offset),
@@ -1071,7 +1106,7 @@ fn countLiveDocs(inputs: []const MergeInput) u32 {
 fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_count: u32) !void {
     try sink.appendByte(stored_fields_version_block_compressed);
     try sinkAppendU32LE(sink, doc_count);
-    const num_blocks: u32 = if (doc_count == 0) 0 else @intCast((@as(usize, doc_count) - 1) / stored_fields_block_doc_target + 1);
+    const num_blocks = try countMergedStoredBlocks(alloc, inputs);
     try sinkAppendU32LE(sink, num_blocks);
     try sinkAppendU32LE(sink, stored_fields_block_doc_target);
     const id_bytes_len_pos = sink.len();
@@ -1103,6 +1138,7 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
     const data_start = sink.len();
     out_doc_id = 0;
     var block_idx: u32 = 0;
+    var docs_in_block: u32 = 0;
     var chunk = std.ArrayListUnmanaged(u8).empty;
     defer chunk.deinit(alloc);
     for (inputs) |input| {
@@ -1114,27 +1150,27 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
                 continue;
             }
 
-            if (chunk.items.len == 0 and out_doc_id % stored_fields_block_doc_target == 0) {
+            if (chunk.items.len == 0) {
                 if (try copyMergedStoredBlockIfPossible(sink, input, doc_id, out_doc_id, block_idx, doc_table_start, block_offsets_start, data_start)) |copied_docs| {
                     out_doc_id += copied_docs;
                     doc_id_usize += copied_docs;
                     block_idx += 1;
+                    docs_in_block = 0;
                     continue;
                 }
             }
 
-            if (chunk.items.len > 0 and out_doc_id > 0 and out_doc_id % stored_fields_block_doc_target == 0) {
-                const compressed = try snappy.encode(alloc, chunk.items);
-                defer alloc.free(compressed);
-                try sink.appendSlice(compressed);
-                const block_end_offset: u64 = @intCast(sink.len() - data_start);
-                try sink.writeAt(block_offsets_start + @as(usize, block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
+            const stored = (try input.reader.storedDocDecompressed(doc_id)) orelse {
+                doc_id_usize += 1;
+                continue;
+            };
+            defer alloc.free(stored.data);
+            if (chunk.items.len > 0 and (docs_in_block >= stored_fields_block_doc_target or chunk.items.len +| 4 +| stored.data.len > stored_fields_block_raw_target)) {
+                try flushMergedStoredBlock(alloc, sink, &chunk, block_offsets_start, data_start, block_idx);
                 block_idx += 1;
-                chunk.clearRetainingCapacity();
+                docs_in_block = 0;
             }
 
-            const stored = (try input.reader.storedDocDecompressed(doc_id)) orelse continue;
-            defer alloc.free(stored.data);
             const doc_offset: u32 = @intCast(chunk.items.len);
             try appendU32LE(alloc, &chunk, @intCast(stored.data.len));
             try chunk.appendSlice(alloc, stored.data);
@@ -1143,16 +1179,72 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
             try sink.writeAt(entry_pos + 16, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, doc_offset))));
             try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(stored.data.len))))));
             out_doc_id += 1;
+            docs_in_block += 1;
             doc_id_usize += 1;
         }
     }
-    if (doc_count > 0) {
-        const compressed = try snappy.encode(alloc, chunk.items);
-        defer alloc.free(compressed);
-        try sink.appendSlice(compressed);
-        const block_end_offset: u64 = @intCast(sink.len() - data_start);
-        try sink.writeAt(block_offsets_start + @as(usize, block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
+    if (chunk.items.len > 0) {
+        try flushMergedStoredBlock(alloc, sink, &chunk, block_offsets_start, data_start, block_idx);
     }
+}
+
+fn countMergedStoredBlocks(alloc: Allocator, inputs: []const MergeInput) !u32 {
+    var blocks: u32 = 0;
+    var docs_in_block: u32 = 0;
+    var raw_bytes: usize = 0;
+    for (inputs) |input| {
+        var doc_id_usize: usize = 0;
+        while (doc_id_usize < input.reader.doc_count) {
+            const doc_id: u32 = @intCast(doc_id_usize);
+            if (input.isDeleted(doc_id)) {
+                doc_id_usize += 1;
+                continue;
+            }
+
+            if (raw_bytes == 0) {
+                if (copyableStoredBlockDocs(input, doc_id)) |copied_docs| {
+                    blocks += 1;
+                    doc_id_usize += copied_docs;
+                    docs_in_block = 0;
+                    raw_bytes = 0;
+                    continue;
+                }
+            }
+
+            const stored = (try input.reader.storedDocDecompressed(doc_id)) orelse {
+                doc_id_usize += 1;
+                continue;
+            };
+            const doc_raw_bytes = 4 +| stored.data.len;
+            alloc.free(stored.data);
+            if (raw_bytes > 0 and (docs_in_block >= stored_fields_block_doc_target or raw_bytes +| doc_raw_bytes > stored_fields_block_raw_target)) {
+                blocks += 1;
+                docs_in_block = 0;
+                raw_bytes = 0;
+            }
+            docs_in_block += 1;
+            raw_bytes +|= doc_raw_bytes;
+            doc_id_usize += 1;
+        }
+    }
+    if (raw_bytes > 0) blocks += 1;
+    return blocks;
+}
+
+fn flushMergedStoredBlock(
+    alloc: Allocator,
+    sink: *SegmentSink,
+    chunk: *std.ArrayListUnmanaged(u8),
+    block_offsets_start: usize,
+    data_start: usize,
+    block_idx: u32,
+) !void {
+    const compressed = try snappy.encode(alloc, chunk.items);
+    defer alloc.free(compressed);
+    try sink.appendSlice(compressed);
+    const block_end_offset: u64 = @intCast(sink.len() - data_start);
+    try sink.writeAt(block_offsets_start + @as(usize, block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
+    chunk.clearRetainingCapacity();
 }
 
 fn copyMergedStoredBlockIfPossible(
@@ -1165,34 +1257,18 @@ fn copyMergedStoredBlockIfPossible(
     block_offsets_start: usize,
     data_start: usize,
 ) !?u32 {
-    if (input.deleted != null) return null;
+    const copied_docs = copyableStoredBlockDocs(input, start_doc_id) orelse return null;
     const reader = input.reader;
-    if (reader.data[@intCast(reader.stored_offset)] != stored_fields_version_block_compressed) return null;
-    if (start_doc_id % stored_fields_block_doc_target != 0) return null;
-    if (out_doc_id % stored_fields_block_doc_target != 0) return null;
-    if (start_doc_id + stored_fields_block_doc_target > reader.doc_count) return null;
+    const first = reader.v4StoredDocLocation(@intCast(reader.stored_offset + 1 + 4), start_doc_id) orelse return null;
 
-    var first_loc: ?SegmentReader.V4StoredDocLocation = null;
-    var i: u32 = 0;
-    while (i < stored_fields_block_doc_target) : (i += 1) {
-        const loc = reader.v4StoredDocLocation(@intCast(reader.stored_offset + 1 + 4), start_doc_id + i) orelse return null;
-        if (first_loc == null) {
-            if (loc.doc_offset != 0) return null;
-            first_loc = loc;
-        } else if (loc.block_start != first_loc.?.block_start or loc.block_end != first_loc.?.block_end) {
-            return null;
-        }
-    }
-
-    const first = first_loc.?;
     if (first.block_start > first.block_end or first.block_end > reader.data.len) return null;
 
     try sink.appendSlice(reader.data[first.block_start..first.block_end]);
     const block_end_offset: u64 = @intCast(sink.len() - data_start);
     try sink.writeAt(block_offsets_start + @as(usize, out_block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
 
-    i = 0;
-    while (i < stored_fields_block_doc_target) : (i += 1) {
+    var i: u32 = 0;
+    while (i < copied_docs) : (i += 1) {
         const loc = reader.v4StoredDocLocation(@intCast(reader.stored_offset + 1 + 4), start_doc_id + i) orelse return null;
         const entry_pos = doc_table_start + @as(usize, out_doc_id + i) * stored_fields_v4_doc_entry_size;
         try sink.writeAt(entry_pos + 12, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, out_block_idx))));
@@ -1200,7 +1276,30 @@ fn copyMergedStoredBlockIfPossible(
         try sink.writeAt(entry_pos + 20, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, loc.raw_len))));
     }
 
-    return @intCast(stored_fields_block_doc_target);
+    return copied_docs;
+}
+
+fn copyableStoredBlockDocs(input: MergeInput, start_doc_id: u32) ?u32 {
+    if (input.deleted != null) return null;
+    const reader = input.reader;
+    if (reader.data[@intCast(reader.stored_offset)] != stored_fields_version_block_compressed) return null;
+    const first = reader.v4StoredDocLocation(@intCast(reader.stored_offset + 1 + 4), start_doc_id) orelse return null;
+    if (first.doc_offset != 0) return null;
+
+    var count: u32 = 0;
+    var raw_bytes: usize = 0;
+    var doc_id = start_doc_id;
+    while (doc_id < reader.doc_count) : (doc_id += 1) {
+        const loc = reader.v4StoredDocLocation(@intCast(reader.stored_offset + 1 + 4), doc_id) orelse return null;
+        if (loc.block_idx != first.block_idx) break;
+        if (loc.block_start != first.block_start or loc.block_end != first.block_end) return null;
+        count += 1;
+        raw_bytes +|= 4 +| @as(usize, loc.raw_len);
+    }
+    if (count == 0) return null;
+    if (count > stored_fields_block_doc_target) return null;
+    if (count > 1 and raw_bytes > stored_fields_block_raw_target) return null;
+    return count;
 }
 
 fn appendBuiltSection(
@@ -1556,6 +1655,37 @@ test "segment block-compressed stored fields cross block boundary" {
     defer alloc.free(last.data);
     try std.testing.expectEqualStrings("doc-134", last.id);
     try std.testing.expect(std.mem.indexOf(u8, last.data, "\"ordinal\":134") != null);
+}
+
+test "segment stored fields split large blocks by raw byte budget" {
+    const alloc = std.testing.allocator;
+
+    var writer = SegmentWriter.init(alloc);
+    defer writer.deinit();
+
+    const large = try alloc.alloc(u8, stored_fields_block_raw_target / 3);
+    defer alloc.free(large);
+    @memset(large, 'x');
+
+    try writer.addStoredDoc("doc-0", large);
+    try writer.addStoredDoc("doc-1", large);
+    try writer.addStoredDoc("doc-2", large);
+
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+
+    var reader = try SegmentReader.init(alloc, bytes);
+    defer reader.deinit();
+
+    const loc0 = reader.v4StoredDocLocation(@intCast(reader.stored_offset + 1 + 4), 0) orelse return error.TestExpectedEqual;
+    const loc1 = reader.v4StoredDocLocation(@intCast(reader.stored_offset + 1 + 4), 1) orelse return error.TestExpectedEqual;
+    const loc2 = reader.v4StoredDocLocation(@intCast(reader.stored_offset + 1 + 4), 2) orelse return error.TestExpectedEqual;
+
+    try std.testing.expectEqual(@as(u32, 0), loc0.block_idx);
+    try std.testing.expectEqual(@as(u32, 0), loc1.block_idx);
+    try std.testing.expectEqual(@as(u32, 1), loc2.block_idx);
+    try std.testing.expect(loc0.block_end - loc0.block_start < stored_fields_block_raw_target);
+    try std.testing.expect(loc2.block_end > loc2.block_start);
 }
 
 test "merge copies aligned stored field blocks without recompressing" {

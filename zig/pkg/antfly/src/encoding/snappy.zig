@@ -115,6 +115,14 @@ pub fn decode(alloc: Allocator, src: []const u8) ![]u8 {
     return dst;
 }
 
+/// Return the decoded length stored in the Snappy block preamble without
+/// materializing the decoded bytes.
+pub fn decodedLen(src: []const u8) !usize {
+    if (src.len == 0) return 0;
+    var pos: usize = 0;
+    return try readVarint(src, &pos);
+}
+
 /// Encode data using Snappy block compression.
 /// Returns compressed bytes owned by caller.
 pub fn encode(alloc: Allocator, src: []const u8) ![]u8 {
