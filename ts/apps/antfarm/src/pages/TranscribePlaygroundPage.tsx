@@ -641,7 +641,7 @@ const TranscribePlaygroundPage: React.FC = () => {
 
               <div className="space-y-2">
                 <Label>Input Source</Label>
-                <div className="flex rounded-md border overflow-hidden h-9">
+                <div className="flex rounded-none border overflow-hidden h-9">
                   <button
                     type="button"
                     className={`flex-1 flex items-center justify-center gap-1.5 text-sm transition-colors ${
@@ -873,7 +873,7 @@ const TranscribePlaygroundPage: React.FC = () => {
 
         {/* Error */}
         {error && (
-          <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+          <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
             {error}
           </div>
         )}
@@ -918,7 +918,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                 <>
                   {/* Drop zone */}
                   <div
-                    className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors ${
+                    className={`border-2 border-dashed rounded-none p-8 text-center cursor-pointer transition-colors ${
                       isDraggingAudio
                         ? "border-primary bg-primary/5"
                         : "border-muted-foreground/25 hover:border-primary/50"
@@ -957,15 +957,17 @@ const TranscribePlaygroundPage: React.FC = () => {
                 </>
               ) : (
                 /* Mic recording */
-                <div className="border-2 border-dashed rounded-lg p-8 text-center transition-colors border-muted-foreground/25">
+                <div className="border-2 border-dashed rounded-none p-8 text-center transition-colors border-muted-foreground/25">
                   {isRecording ? (
                     <div className="space-y-4">
                       <div className="flex items-center justify-center gap-2">
                         <span className="relative flex h-3 w-3">
-                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" />
-                          <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500" />
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-destructive opacity-75" />
+                          <span className="relative inline-flex rounded-full h-3 w-3 bg-destructive" />
                         </span>
-                        <span className="text-sm font-medium text-red-600">Recording</span>
+                        <span className="text-sm font-mono font-medium text-destructive">
+                          Recording
+                        </span>
                         <span className="text-sm font-mono text-muted-foreground">
                           {formatDuration(recordingDuration)}
                         </span>
@@ -992,7 +994,7 @@ const TranscribePlaygroundPage: React.FC = () => {
 
               {/* Audio file info & player */}
               {audioFile && !isRecording && (
-                <div className="p-4 bg-muted/30 rounded-lg border space-y-3">
+                <div className="p-4 bg-muted/30 rounded-none border space-y-3">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2 min-w-0">
                       <Mic className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -1065,7 +1067,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                   {segments.map((seg, i) => (
                     <div
                       key={`seg-${seg.startMs}-${seg.endMs}`}
-                      className="p-3 bg-muted/30 rounded-lg border space-y-2"
+                      className="p-3 bg-muted/30 rounded-none border space-y-2"
                     >
                       {/* Timestamp + copy */}
                       <div className="flex items-center justify-between">

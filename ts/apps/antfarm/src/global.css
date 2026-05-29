@@ -62,7 +62,7 @@ select::placeholder {
 /* @antfly/components SDK styles — autosuggest, querybox, pagination, results, facets */
 
 .react-af-autosuggest {
-  @apply bg-popover border border-border rounded-md shadow-md mt-1 max-h-64 overflow-y-auto max-w-md;
+  @apply bg-popover border border-border mt-1 max-h-64 overflow-y-auto max-w-md;
 }
 
 .react-af-autosuggest-item {
@@ -82,7 +82,7 @@ select::placeholder {
 }
 
 .react-af-querybox input {
-  @apply w-full px-3 py-2 bg-background text-foreground border border-border rounded-md focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent placeholder:text-muted-foreground;
+  @apply w-full px-3 py-2 bg-background text-foreground border border-border focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent placeholder:text-muted-foreground;
 }
 
 .react-af-querybox form {
@@ -94,7 +94,7 @@ select::placeholder {
 }
 
 .react-af-querybox-submit {
-  @apply px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors;
+  @apply px-4 py-2 bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors;
 }
 
 .react-af-pagination {
@@ -106,7 +106,7 @@ select::placeholder {
 }
 
 .react-af-pagination li button {
-  @apply px-3 py-1.5 min-w-10 text-sm font-medium rounded-md bg-background text-foreground border border-border hover:bg-accent hover:text-accent-foreground transition-colors cursor-pointer;
+  @apply px-3 py-1.5 min-w-10 text-sm font-medium bg-background text-foreground border border-border hover:bg-accent hover:text-accent-foreground transition-colors cursor-pointer;
 }
 
 .react-af-pagination li.react-af-pagination-active-page button {
@@ -122,23 +122,23 @@ select::placeholder {
 }
 
 .react-af-facet {
-  @apply flex flex-col gap-2 p-3 bg-card border border-border rounded-md;
+  @apply flex flex-col gap-2 p-3 bg-card border border-border;
 }
 
 .react-af-facet input[type="text"] {
-  @apply w-full px-3 py-1.5 text-sm bg-background text-foreground border border-border rounded-md mb-2 focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent placeholder:text-muted-foreground;
+  @apply w-full px-3 py-1.5 text-sm bg-background text-foreground border border-border mb-2 focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent placeholder:text-muted-foreground;
 }
 
 .react-af-facet label {
-  @apply flex items-center gap-2 px-2 py-1.5 text-sm cursor-pointer hover:bg-accent rounded transition-colors;
+  @apply flex items-center gap-2 px-2 py-1.5 text-sm cursor-pointer hover:bg-accent transition-colors;
 }
 
 .react-af-facet input[type="checkbox"] {
-  @apply w-4 h-4 rounded border-border cursor-pointer text-primary focus:ring-2 focus:ring-ring focus:ring-offset-0;
+  @apply w-4 h-4 border-border cursor-pointer text-primary focus:ring-2 focus:ring-ring focus:ring-offset-0;
 }
 
 .react-af-facet button:not([type="checkbox"]) {
-  @apply mt-2 px-3 py-1.5 text-sm font-medium text-primary hover:text-primary-foreground hover:bg-primary border border-border rounded-md transition-colors;
+  @apply mt-2 px-3 py-1.5 text-sm font-medium text-primary hover:text-primary-foreground hover:bg-primary border border-border transition-colors;
 }
 
 /* Antfarm-local visual utilities */

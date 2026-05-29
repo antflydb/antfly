@@ -105,15 +105,17 @@ interface ResolverConfig {
 const DEFAULT_ENTITY_LABELS = ["person", "organization", "location", "date"];
 const DEFAULT_RELATION_LABELS = ["founded", "works_at", "located_in", "ceo_of", "acquired"];
 
-// Entity type colors
+// Entity type colors — routed through the design-system categorical chart
+// palette so node types stay distinguishable without inventing new hues
+// (color is the only channel available in the SVG graph).
 const ENTITY_TYPE_COLORS: Record<string, string> = {
-  person: "#3b82f6", // blue
-  organization: "#22c55e", // green
-  location: "#a855f7", // purple
-  date: "#f59e0b", // amber
-  product: "#ec4899", // pink
-  event: "#06b6d4", // cyan
-  default: "#6b7280", // gray
+  person: "var(--chart-series-1)",
+  organization: "var(--chart-series-2)",
+  location: "var(--chart-series-3)",
+  date: "var(--chart-series-4)",
+  product: "var(--chart-series-5)",
+  event: "var(--chart-series-6)",
+  default: "var(--muted-foreground)",
 };
 
 const STORAGE_KEY = "antfarm-playground-knowledge-graph";
@@ -521,7 +523,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     });
 
     return (
-      <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-80 bg-muted/30 rounded-lg">
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-80 bg-muted/30 rounded-none">
         <title>Knowledge graph visualization</title>
         <defs>
           <marker
@@ -532,7 +534,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
             refY="3.5"
             orient="auto"
           >
-            <polygon points="0 0, 10 3.5, 0 7" fill="#888" />
+            <polygon points="0 0, 10 3.5, 0 7" fill="var(--muted-foreground)" />
           </marker>
         </defs>
 
@@ -576,7 +578,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 y1={y1}
                 x2={x2}
                 y2={y2}
-                stroke={isSelected ? "#3b82f6" : "#888"}
+                stroke={isSelected ? "var(--primary)" : "var(--muted-foreground)"}
                 strokeWidth={isSelected ? 2 : 1}
                 markerEnd="url(#arrowhead)"
               />
@@ -888,7 +890,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -959,7 +961,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 <TabsContent value="visual" className="mt-0">
                   {graphVisualization}
                   {(selectedNode || selectedEdge) && (
-                    <div className="mt-4 p-3 bg-muted/50 rounded-lg border text-sm">
+                    <div className="mt-4 p-3 bg-muted/50 rounded-none border text-sm">
                       {selectedNode && (
                         <div>
                           <div className="font-medium">{selectedNode.canonical_name}</div>
@@ -989,7 +991,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 </TabsContent>
 
                 <TabsContent value="nodes" className="mt-0 h-80 overflow-y-auto">
-                  <div className="rounded-lg border overflow-hidden">
+                  <div className="rounded-none border overflow-hidden">
                     <table className="w-full text-sm">
                       <thead className="bg-muted/50 sticky top-0">
                         <tr>
@@ -1026,7 +1028,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 </TabsContent>
 
                 <TabsContent value="edges" className="mt-0 h-80 overflow-y-auto">
-                  <div className="rounded-lg border overflow-hidden">
+                  <div className="rounded-none border overflow-hidden">
                     <table className="w-full text-sm">
                       <thead className="bg-muted/50 sticky top-0">
                         <tr>

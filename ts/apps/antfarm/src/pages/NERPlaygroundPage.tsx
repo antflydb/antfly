@@ -719,7 +719,7 @@ const RecognizePlaygroundPage: React.FC = () => {
       elements.push(
         <span
           key={`entity-${entity.label}-${entity.start}-${entity.end}`}
-          className={`${colors.bg} ${colors.border} rounded px-1 py-0.5 border cursor-help`}
+          className={`${colors.bg} ${colors.border} rounded-none px-1 py-0.5 border cursor-help`}
           title={`${entity.label}: ${(entity.score * 100).toFixed(1)}% confidence`}
         >
           {entity.text}
@@ -789,7 +789,7 @@ const RecognizePlaygroundPage: React.FC = () => {
                 {(instances as Record<string, unknown>[]).map((instance) => (
                   <div
                     key={`${structName}-${Object.keys(instance).join("-")}`}
-                    className="p-3 bg-muted/50 rounded-lg border text-sm space-y-1"
+                    className="p-3 bg-muted/50 rounded-none border text-sm space-y-1"
                   >
                     {Object.entries(instance).map(([fieldName, fieldValue]) => {
                       // Handle both single ExtractFieldValue and arrays
@@ -1052,7 +1052,7 @@ const RecognizePlaygroundPage: React.FC = () => {
               {schema.map((structure, si) => (
                 <div
                   key={`structure-${structure.name || `unnamed-${structure.fields.length}`}`}
-                  className="p-3 bg-muted/30 rounded-lg border space-y-2"
+                  className="p-3 bg-muted/30 rounded-none border space-y-2"
                 >
                   <div className="flex items-center gap-2">
                     <Input
@@ -1157,7 +1157,7 @@ const RecognizePlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -1265,7 +1265,7 @@ const RecognizePlaygroundPage: React.FC = () => {
                   )}
 
                   {/* Highlighted text view */}
-                  <div className="p-3 bg-muted/50 rounded-lg border max-h-37.5 overflow-y-auto">
+                  <div className="p-3 bg-muted/50 rounded-none border max-h-37.5 overflow-y-auto">
                     {renderHighlightedText()}
                   </div>
 
@@ -1274,7 +1274,7 @@ const RecognizePlaygroundPage: React.FC = () => {
                   {/* Entity list */}
                   <div className="space-y-2">
                     {getFilteredEntities().length > 0 ? (
-                      <div className="rounded-lg border overflow-hidden">
+                      <div className="rounded-none border overflow-hidden">
                         <table className="w-full text-sm">
                           <thead className="bg-muted/50">
                             <tr>
@@ -1326,7 +1326,9 @@ const RecognizePlaygroundPage: React.FC = () => {
                     <Tag className="h-12 w-12 mx-auto mb-3 opacity-20" />
                     <p className="mb-3">
                       Enter text and press{" "}
-                      <kbd className="px-1.5 py-0.5 text-xs border rounded bg-muted">Cmd+Enter</kbd>{" "}
+                      <kbd className="px-1.5 py-0.5 text-xs border rounded-none bg-muted">
+                        Cmd+Enter
+                      </kbd>{" "}
                       to extract entities
                     </p>
                     <Button

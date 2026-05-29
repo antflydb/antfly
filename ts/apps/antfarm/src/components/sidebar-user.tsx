@@ -43,7 +43,7 @@ export function SidebarUser(): React.JSX.Element | null {
       <SidebarMenu>
         <SidebarMenuItem>
           <div className="flex items-center gap-2 p-2">
-            <Skeleton className="h-8 w-8 rounded-lg" />
+            <Skeleton className="h-8 w-8 rounded-none" />
             <div className="flex-1 space-y-2">
               <Skeleton className="h-4 w-24" />
               <Skeleton className="h-3 w-32" />
@@ -82,9 +82,9 @@ export function SidebarUser(): React.JSX.Element | null {
                   "group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-0! relative z-50 pointer-events-auto"
               )}
             >
-              <Avatar className="h-8 w-8 rounded-lg">
+              <Avatar className="h-8 w-8 rounded-none">
                 <AvatarImage src={undefined} alt={displayName} />
-                <AvatarFallback className="rounded-lg bg-primary text-primary-foreground text-xs font-bold">
+                <AvatarFallback className="rounded-none bg-primary text-primary-foreground text-xs font-bold">
                   {initials}
                 </AvatarFallback>
               </Avatar>
@@ -98,7 +98,7 @@ export function SidebarUser(): React.JSX.Element | null {
             </SidebarMenuButton>
           </DropdownMenuTrigger>
           <DropdownMenuContent
-            className="w-(--radix-dropdown-menu-trigger-width) min-w-56 rounded-lg"
+            className="w-(--radix-dropdown-menu-trigger-width) min-w-56 rounded-none"
             side={isMobile ? "bottom" : "right"}
             align="end"
             sideOffset={4}
@@ -106,9 +106,9 @@ export function SidebarUser(): React.JSX.Element | null {
             {/* Menu header with user info */}
             <DropdownMenuLabel className="p-0 font-normal">
               <div className="flex items-center gap-2 px-1 py-1.5 text-left text-sm">
-                <Avatar className="h-8 w-8 rounded-lg">
+                <Avatar className="h-8 w-8 rounded-none">
                   <AvatarImage src={undefined} alt={displayName} />
-                  <AvatarFallback className="rounded-lg bg-primary text-primary-foreground text-xs font-bold">
+                  <AvatarFallback className="rounded-none bg-primary text-primary-foreground text-xs font-bold">
                     {initials}
                   </AvatarFallback>
                 </Avatar>

@@ -313,7 +313,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
       elements.push(
         <span
           key={`chunk-${chunk.id}`}
-          className={`${CHUNK_COLORS[colorIndex]} rounded px-0.5 border`}
+          className={`${CHUNK_COLORS[colorIndex]} rounded-none px-0.5 border`}
           title={`Chunk ${chunk.id}`}
         >
           {inputText.slice(chunk.start_char, chunk.end_char)}
@@ -533,7 +533,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -603,7 +603,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
             ) : result ? (
               <div className="h-100 overflow-y-auto space-y-4">
                 {/* Highlighted text view */}
-                <div className="p-3 bg-muted/50 rounded-lg border max-h-37.5 overflow-y-auto">
+                <div className="p-3 bg-muted/50 rounded-none border max-h-37.5 overflow-y-auto">
                   {renderHighlightedText()}
                 </div>
 
@@ -616,7 +616,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
                     return (
                       <div
                         key={chunk.id}
-                        className={`p-3 rounded-lg border ${CHUNK_COLORS[colorIndex]}`}
+                        className={`p-3 rounded-none border ${CHUNK_COLORS[colorIndex]}`}
                       >
                         <div className="flex items-center justify-between mb-2">
                           <span

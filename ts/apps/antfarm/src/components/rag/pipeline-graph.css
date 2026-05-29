@@ -7,21 +7,21 @@
   }
 }
 
-/* Running node: pulsing glow */
+/* Running node: pulsing amber ring (the single accent) */
 @keyframes pipeline-node-glow {
   0%,
   100% {
-    box-shadow: 0 0 0px var(--color-blue-300, #93c5fd);
+    box-shadow: 0 0 0px var(--primary);
   }
   50% {
-    box-shadow: 0 0 8px var(--color-blue-300, #93c5fd);
+    box-shadow: 0 0 8px var(--primary);
   }
 }
 
-/* Complete node: brief green flash */
+/* Complete node: brief success-tinted flash */
 @keyframes pipeline-node-complete {
   from {
-    background-color: var(--color-green-100, #dcfce7);
+    background-color: color-mix(in oklch, var(--success-100, var(--muted)) 70%, transparent);
   }
   to {
     background-color: transparent;

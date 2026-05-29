@@ -438,7 +438,7 @@ const RerankingPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -516,7 +516,7 @@ const RerankingPlaygroundPage: React.FC = () => {
                   const barWidth = maxScore > 0 ? Math.max(2, (doc.score / maxScore) * 100) : 0;
 
                   return (
-                    <div key={doc.index} className="p-3 bg-muted/30 rounded-lg border space-y-2">
+                    <div key={doc.index} className="p-3 bg-muted/30 rounded-none border space-y-2">
                       <div className="flex items-center gap-2">
                         <span className="flex items-center justify-center w-6 h-6 rounded-full bg-primary/10 text-primary text-xs font-bold shrink-0">
                           {doc.rank}

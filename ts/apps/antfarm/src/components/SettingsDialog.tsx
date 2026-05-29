@@ -84,11 +84,15 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
                   <Input placeholder="http://localhost:8082/api/v1" {...field} />
                 </FormControl>
                 <FormDescription>
-                  Current: <code className="text-xs bg-muted px-1 py-0.5 rounded">{apiUrl}</code>
+                  Current:{" "}
+                  <code className="text-xs bg-muted px-1 py-0.5 rounded-none">{apiUrl}</code>
                 </FormDescription>
                 <FormDescription className="text-xs">
-                  Examples: <code className="bg-muted px-1 py-0.5 rounded">/api/v1</code> (default),{" "}
-                  <code className="bg-muted px-1 py-0.5 rounded">http://server:8082/api/v1</code>
+                  Examples: <code className="bg-muted px-1 py-0.5 rounded-none">/api/v1</code>{" "}
+                  (default),{" "}
+                  <code className="bg-muted px-1 py-0.5 rounded-none">
+                    http://server:8082/api/v1
+                  </code>
                 </FormDescription>
               </FormItem>
             )}
@@ -105,13 +109,15 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
                 </FormControl>
                 <FormDescription>
                   Current:{" "}
-                  <code className="text-xs bg-muted px-1 py-0.5 rounded">{termiteApiUrl}</code>
+                  <code className="text-xs bg-muted px-1 py-0.5 rounded-none">{termiteApiUrl}</code>
                 </FormDescription>
                 <FormDescription className="text-xs">
                   Examples:{" "}
-                  <code className="bg-muted px-1 py-0.5 rounded">http://localhost:11433</code>{" "}
+                  <code className="bg-muted px-1 py-0.5 rounded-none">http://localhost:11433</code>{" "}
                   (default),{" "}
-                  <code className="bg-muted px-1 py-0.5 rounded">https://termite.company.com</code>
+                  <code className="bg-muted px-1 py-0.5 rounded-none">
+                    https://termite.company.com
+                  </code>
                 </FormDescription>
               </FormItem>
             )}
