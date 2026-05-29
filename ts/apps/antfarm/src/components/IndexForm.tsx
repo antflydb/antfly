@@ -61,7 +61,7 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
   const { inferenceApiUrl } = useApiConfig();
   const prefix = fieldPrefix ? `${fieldPrefix}.` : "";
 
-  // Inference model detection
+  // Antfly inference model detection
   const [inferenceEmbedders, setInferenceEmbedders] = useState<string[]>([]);
   const [inferenceModelsLoading, setInferenceModelsLoading] = useState(false);
 
@@ -75,8 +75,8 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
           setInferenceEmbedders(Object.keys(data.embedders || {}));
         }
       } catch {
-        // Inference might not be running - this is fine
-        console.debug("Inference not available for model detection");
+        // Antfly inference might not be running - this is fine.
+        console.debug("Antfly inference not available for model detection");
       } finally {
         setInferenceModelsLoading(false);
       }
@@ -235,13 +235,15 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
               />
             </FormControl>
             {provider === "antfly" && inferenceModelsLoading && (
-              <p className="text-xs text-muted-foreground">Loading models from Inference...</p>
+              <p className="text-xs text-muted-foreground">
+                Loading models from Antfly inference...
+              </p>
             )}
             {provider === "antfly" && !inferenceModelsLoading && (
               <p className="text-xs text-muted-foreground">
                 {inferenceEmbedders.length > 0
-                  ? "Select a model or enter a custom name for Inference to pull."
-                  : "Enter a model name (e.g., sentence-transformers/all-MiniLM-L6-v2) for Inference to pull."}
+                  ? "Select a model or enter a custom name for Antfly inference to pull."
+                  : "Enter a model name (e.g., sentence-transformers/all-MiniLM-L6-v2) for Antfly inference to pull."}
               </p>
             )}
             <FormMessage />

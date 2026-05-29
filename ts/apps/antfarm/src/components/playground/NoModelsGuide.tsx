@@ -117,7 +117,7 @@ export function NoModelsGuide({
 
           <div className="mt-3">
             <Button variant="link" size="sm" className="h-auto p-0 text-xs" asChild>
-              <Link to="/models">
+              <Link to="/inference/models">
                 Browse all models
                 <ExternalLink className="h-3 w-3 ml-1" />
               </Link>

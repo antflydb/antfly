@@ -1,6 +1,6 @@
 /**
  * Semantic search for the command palette.
- * Uses pre-computed embeddings and Inference's /api/embed for query embedding.
+ * Uses pre-computed embeddings and Antfly inference's /ai/v1/embed for query embedding.
  */
 
 import type { InferenceClient } from "@antfly/sdk";
@@ -69,7 +69,7 @@ function cosineSimilarity(a: number[], b: number[]): number {
 
 /**
  * Performs semantic search against the command palette items.
- * Uses Inference's /api/embed endpoint to embed the query, then
+ * Uses Antfly inference's /ai/v1/embed endpoint to embed the query, then
  * computes cosine similarity against pre-embedded command vectors.
  *
  * @param query - The user's search query
@@ -83,7 +83,7 @@ export async function semanticSearch(
   limit = 3
 ): Promise<SemanticResult[]> {
   try {
-    // Get query embedding from Inference
+    // Get query embedding from Antfly inference.
     // Use the same model as the pre-computed embeddings
     const response = await inferenceClient.embed(index.model, query);
     const queryVec = response.data[0]?.embedding;
@@ -108,7 +108,7 @@ export async function semanticSearch(
     // Return top-k results sorted by score (highest first)
     return scored.sort((a, b) => b.score - a.score).slice(0, limit);
   } catch (e) {
-    // Graceful degradation - Inference unavailable or model not loaded
+    // Graceful degradation - Antfly inference unavailable or model not loaded.
     console.error("Semantic search failed:", e);
     return [];
   }

@@ -111,7 +111,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     const commands = [
       { icon: Table, label: "Tables", href: "/" },
       { icon: Plus, label: "Create Table", href: "/create" },
-      { icon: Library, label: "Models", href: "/models" },
+      { icon: Library, label: "Models & Runtime", href: "/inference/models" },
     ];
     if (showLocalAdminRoutes) {
       commands.push({ icon: Users, label: "Users", href: "/users" });
@@ -121,12 +121,17 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
 
   const playgroundCommands = React.useMemo(
     () => [
-      { icon: Scissors, label: "Chunking Playground", href: "/playground/chunking" },
-      { icon: Tag, label: "Recognize Playground", href: "/playground/recognize" },
-      { icon: Repeat2, label: "Rewriting Playground", href: "/playground/rewrite" },
-      { icon: ArrowUpDown, label: "Reranking Playground", href: "/playground/rerank" },
-      { icon: Network, label: "Knowledge Graph", href: "/playground/kg" },
-      { icon: ClipboardCheck, label: "Evals", href: "/playground/evals" },
+      { icon: Scissors, label: "Data Chunking Playground", href: "/data/playground/chunk" },
+      { icon: ClipboardCheck, label: "Data Evals", href: "/data/playground/evals" },
+      {
+        icon: Scissors,
+        label: "Antfly Inference Chunking Playground",
+        href: "/inference/playground/chunk",
+      },
+      { icon: Tag, label: "Extraction Playground", href: "/inference/playground/extract" },
+      { icon: Repeat2, label: "Rewriting Playground", href: "/inference/playground/rewrite" },
+      { icon: ArrowUpDown, label: "Reranking Playground", href: "/inference/playground/rerank" },
+      { icon: Network, label: "Knowledge Graph", href: "/inference/playground/kg" },
     ],
     []
   );

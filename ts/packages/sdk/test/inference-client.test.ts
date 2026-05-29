@@ -29,7 +29,6 @@ describe("InferenceClient", () => {
     expect(typeof client.embedBinary).toBe("function");
     expect(typeof client.chunk).toBe("function");
     expect(typeof client.rerank).toBe("function");
-    expect(typeof client.recognize).toBe("function");
     expect(typeof client.extract).toBe("function");
     expect(typeof client.rewrite).toBe("function");
     expect(typeof client.transcribe).toBe("function");
@@ -268,90 +267,23 @@ describe("InferenceClient with mock fetch", () => {
     });
   });
 
-  describe("recognize", () => {
-    it("should recognize entities in text", async () => {
-      const mockResponse = {
-        model: "gliner-multi-v2.1",
-        entities: [
-          [
-            { text: "John Smith", label: "person", start: 0, end: 10, score: 0.95 },
-            { text: "Google", label: "organization", start: 20, end: 26, score: 0.92 },
-          ],
-        ],
-      };
-
-      vi.mocked(fetch).mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: () => Promise.resolve(mockResponse),
-        text: () => Promise.resolve(JSON.stringify(mockResponse)),
-        headers: new Headers({ "Content-Type": "application/json" }),
-      } as Response);
-
-      const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      const result = await client.recognize("gliner-multi-v2.1", ["John Smith works at Google."], {
-        labels: ["person", "organization"],
-      });
-
-      expect(result.model).toBe("gliner-multi-v2.1");
-      expect(result.entities).toHaveLength(1);
-      expect(result.entities[0]).toHaveLength(2);
-      expect(result.entities[0][0].text).toBe("John Smith");
-      expect(result.entities[0][0].label).toBe("person");
-      expect(result.entities[0][1].text).toBe("Google");
-      expect(fetch).toHaveBeenCalled();
-    });
-
-    it("should handle recognize errors", async () => {
-      vi.mocked(fetch).mockResolvedValueOnce({
-        ok: false,
-        status: 400,
-        json: () => Promise.resolve({ error: "Invalid model" }),
-        text: () => Promise.resolve(JSON.stringify({ error: "Invalid model" })),
-        headers: new Headers({ "Content-Type": "application/json" }),
-      } as Response);
-
-      const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      await expect(
-        client.recognize("invalid-model", ["test"], { labels: ["person"] })
-      ).rejects.toThrow("Recognize failed");
-    });
-
-    it("should work without optional labels", async () => {
-      const mockResponse = {
-        model: "bert-base-NER",
-        entities: [[{ text: "Paris", label: "LOC", start: 0, end: 5, score: 0.98 }]],
-      };
-
-      vi.mocked(fetch).mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: () => Promise.resolve(mockResponse),
-        text: () => Promise.resolve(JSON.stringify(mockResponse)),
-        headers: new Headers({ "Content-Type": "application/json" }),
-      } as Response);
-
-      const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      const result = await client.recognize("bert-base-NER", ["Visit Paris."]);
-
-      expect(result.model).toBe("bert-base-NER");
-      expect(result.entities[0][0].label).toBe("LOC");
-    });
-  });
-
   describe("extract", () => {
     it("should extract structured data from text", async () => {
       const mockResponse = {
+        object: "extraction",
         model: "gliner2-base-v1",
-        results: [
+        data: [
           {
-            person: [
-              {
-                name: { value: "John Smith", score: 0.95 },
-                age: { value: "30", score: 0.88 },
-                company: { value: "Google", score: 0.91 },
-              },
-            ],
+            id: "0",
+            structures: {
+              person: [
+                {
+                  name: { value: "John Smith", score: 0.95 },
+                  age: { value: "30", score: 0.88 },
+                  company: { value: "Google", score: 0.91 },
+                },
+              ],
+            },
           },
         ],
       };
@@ -373,8 +305,8 @@ describe("InferenceClient with mock fetch", () => {
       );
 
       expect(result.model).toBe("gliner2-base-v1");
-      expect(result.results).toHaveLength(1);
-      expect(result.results[0].person).toHaveLength(1);
+      expect(result.data).toHaveLength(1);
+      expect(result.data[0].structures?.person).toHaveLength(1);
       expect(fetch).toHaveBeenCalled();
     });
 
@@ -394,7 +326,7 @@ describe("InferenceClient with mock fetch", () => {
     });
 
     it("should accept all optional parameters without error", async () => {
-      const mockResponse = { model: "gliner2-base-v1", results: [{}] };
+      const mockResponse = { object: "extraction", model: "gliner2-base-v1", data: [{}] };
 
       vi.mocked(fetch).mockResolvedValueOnce({
         ok: true,

@@ -13,7 +13,7 @@ const getDefaultApiUrl = () => {
 const getDefaultInferenceApiUrl = () => {
   const configured = getAntfarmRuntimeConfig().inferenceApiUrl;
   if (configured) return configured;
-  // Inference is served same-origin at /ai/v1 in both the Antfly and Inference views.
+  // Antfly inference is served same-origin at /ai/v1 in both dashboard workspaces.
   return "";
 };
 

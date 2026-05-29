@@ -86,7 +86,7 @@ export function BackendInfoBar() {
       <div className="flex items-center justify-between mb-4 p-3 rounded-none border border-destructive/30 bg-destructive/5">
         <div className="flex items-center gap-2 text-sm text-destructive">
           <WifiOff className="h-4 w-4" />
-          <span>Inference disconnected</span>
+          <span>Antfly inference disconnected</span>
           <code className="text-xs bg-muted px-1.5 py-0.5 rounded-none">{inferenceApiUrl}</code>
         </div>
         <div className="flex items-center gap-2">

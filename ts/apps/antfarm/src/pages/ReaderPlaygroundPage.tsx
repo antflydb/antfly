@@ -300,7 +300,9 @@ const ReaderPlaygroundPage: React.FC = () => {
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
       setError(
-        err instanceof Error ? err.message : `Failed to connect to Inference at ${inferenceApiUrl}`
+        err instanceof Error
+          ? err.message
+          : `Failed to connect to Antfly inference at ${inferenceApiUrl}`
       );
     } finally {
       setIsLoading(false);

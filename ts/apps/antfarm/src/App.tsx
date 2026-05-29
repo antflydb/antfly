@@ -29,10 +29,10 @@ import ClusterPage from "./pages/ClusterPage";
 import CreateTablePage from "./pages/CreateTablePage";
 import EmbeddingPlaygroundPage from "./pages/EmbeddingPlaygroundPage";
 import EvalsPlaygroundPage from "./pages/EvalsPlaygroundPage";
+import ExtractionPlaygroundPage from "./pages/ExtractionPlaygroundPage";
 import KnowledgeGraphPlaygroundPage from "./pages/KnowledgeGraphPlaygroundPage";
 import { LoginPage } from "./pages/LoginPage";
 import ModelsPage from "./pages/ModelsPage";
-import RecognizePlaygroundPage from "./pages/NERPlaygroundPage";
 import RewritingPlaygroundPage from "./pages/QuestionPlaygroundPage";
 import RagPlaygroundPage from "./pages/RagPlaygroundPage";
 import ReaderPlaygroundPage from "./pages/ReaderPlaygroundPage";
@@ -91,19 +91,19 @@ function AppContent() {
                           <Route path="/secrets" element={<SecretsPage />} />
                         )}
                         <Route path="/cluster" element={<ClusterPage />} />
-                        <Route path="/playground/evals" element={<EvalsPlaygroundPage />} />
-                        <Route path="/playground/rag" element={<RagPlaygroundPage />} />
-                        <Route path="/playground/chat" element={<ChatPlaygroundPage />} />
+                        <Route path="/data/playground/evals" element={<EvalsPlaygroundPage />} />
+                        <Route path="/data/playground/rag" element={<RagPlaygroundPage />} />
+                        <Route path="/data/playground/chat" element={<ChatPlaygroundPage />} />
                         <Route
-                          path="/playground/embedding"
+                          path="/data/playground/embed"
                           element={<AntflyEmbeddingPlaygroundPage />}
                         />
                         <Route
-                          path="/playground/reranking"
+                          path="/data/playground/rerank"
                           element={<AntflyRerankingPlaygroundPage />}
                         />
                         <Route
-                          path="/playground/chunking"
+                          path="/data/playground/chunk"
                           element={<AntflyChunkingPlaygroundPage />}
                         />
                       </>
@@ -112,16 +112,37 @@ function AppContent() {
                     {/* Inference routes */}
                     {isProductEnabled("inference") && (
                       <>
-                        <Route path="/models" element={<ModelsPage />} />
-                        <Route path="/playground/chunk" element={<ChunkingPlaygroundPage />} />
-                        <Route path="/playground/recognize" element={<RecognizePlaygroundPage />} />
-                        <Route path="/playground/rewrite" element={<RewritingPlaygroundPage />} />
-                        <Route path="/playground/rerank" element={<RerankingPlaygroundPage />} />
-                        <Route path="/playground/kg" element={<KnowledgeGraphPlaygroundPage />} />
-                        <Route path="/playground/embed" element={<EmbeddingPlaygroundPage />} />
-                        <Route path="/playground/read" element={<ReaderPlaygroundPage />} />
+                        <Route path="/inference/models" element={<ModelsPage />} />
                         <Route
-                          path="/playground/transcribe"
+                          path="/inference/playground/chunk"
+                          element={<ChunkingPlaygroundPage />}
+                        />
+                        <Route
+                          path="/inference/playground/extract"
+                          element={<ExtractionPlaygroundPage />}
+                        />
+                        <Route
+                          path="/inference/playground/rewrite"
+                          element={<RewritingPlaygroundPage />}
+                        />
+                        <Route
+                          path="/inference/playground/rerank"
+                          element={<RerankingPlaygroundPage />}
+                        />
+                        <Route
+                          path="/inference/playground/kg"
+                          element={<KnowledgeGraphPlaygroundPage />}
+                        />
+                        <Route
+                          path="/inference/playground/embed"
+                          element={<EmbeddingPlaygroundPage />}
+                        />
+                        <Route
+                          path="/inference/playground/read"
+                          element={<ReaderPlaygroundPage />}
+                        />
+                        <Route
+                          path="/inference/playground/transcribe"
                           element={<TranscribePlaygroundPage />}
                         />
                       </>

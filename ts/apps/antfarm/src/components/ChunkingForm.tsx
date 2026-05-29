@@ -177,12 +177,12 @@ const ChunkingForm: React.FC<ChunkingFormProps> = ({ fieldPrefix = "" }) => {
               name={`${prefix}api_url`}
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Inference API URL</FormLabel>
+                  <FormLabel>Antfly Inference API URL</FormLabel>
                   <FormControl>
                     <Input type="text" {...field} placeholder="http://localhost:11433" />
                   </FormControl>
                   <p className="text-sm text-muted-foreground">
-                    Override the default Inference service URL (leave empty to use cluster default)
+                    Override the default Antfly inference URL (leave empty to use cluster default)
                   </p>
                   <FormMessage />
                 </FormItem>

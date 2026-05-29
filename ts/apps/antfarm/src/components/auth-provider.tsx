@@ -59,7 +59,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       return false;
     }
 
-    // Inference has no auth - skip the check when Antfly is not enabled
+    // Antfly inference has no auth - skip the check when Antfly data is not enabled.
     if (!isProductEnabled("antfly")) {
       return false;
     }

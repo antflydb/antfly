@@ -13,7 +13,6 @@ import type {
   EmbedResponse,
   ExtractResponse,
   ModelsResponse,
-  RecognizeResponse,
   RequestOptions,
   RerankResponse,
   RewriteResponse,
@@ -220,46 +219,6 @@ export class InferenceClient {
     });
     if (error) throw new Error(`Rerank failed: ${error.error}`);
     if (!data) throw new Error("Rerank failed: unexpected empty response");
-    return data;
-  }
-
-  /**
-   * Recognize named entities in text
-   *
-   * @param model - Name of the recognizer model (e.g., "gliner-multi-v2.1")
-   * @param texts - Array of texts to extract entities from
-   * @param options - Optional parameters
-   * @param options.labels - Custom entity labels (GLiNER models only)
-   * @param options.relationLabels - Relation types to extract (for models with relations capability)
-   * @returns RecognizeResponse with entities per input text
-   *
-   * @example
-   * ```typescript
-   * const result = await client.recognize(
-   *   "gliner-multi-v2.1",
-   *   ["John Smith works at Google in London."],
-   *   { labels: ["person", "organization", "location"] }
-   * );
-   * // result.entities[0] contains entities for the first text
-   * ```
-   */
-  async recognize(
-    model: string,
-    texts: string[],
-    options?: { labels?: string[]; relationLabels?: string[] }
-  ): Promise<RecognizeResponse> {
-    const { data, error } = await this.client.POST("/ai/v1/recognize", {
-      body: {
-        model,
-        inputs: texts.map((content, index) => ({ id: String(index), content })),
-        schema: {
-          entities: options?.labels,
-          relations: options?.relationLabels?.map((type) => ({ type })),
-        },
-      },
-    });
-    if (error) throw new Error(`Recognize failed: ${error.error}`);
-    if (!data) throw new Error("Recognize failed: unexpected empty response");
     return data;
   }
 

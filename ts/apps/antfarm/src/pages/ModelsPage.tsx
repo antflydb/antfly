@@ -615,10 +615,10 @@ const ModelDetailSheet: React.FC<{
                     <code className="font-mono bg-muted px-1 py-0.5 rounded-none">
                       antfly inference pull
                     </code>{" "}
-                    CLI or the Inference operator to manage models in production deployments.
+                    CLI or the Antfly inference operator to manage models in production deployments.
                   </>
                 ) : (
-                  "This model is provided by the running Inference runtime and does not need a download command."
+                  "This model is provided by the running Antfly inference runtime and does not need a download command."
                 )}
               </p>
             </div>
@@ -1040,7 +1040,7 @@ const ModelsPage: React.FC = () => {
     return (
       <DashboardPage className="min-h-full items-center justify-center">
         <ErrorState
-          message="Could not load models from Inference. Check the runtime connection and try again."
+          message="Could not load models from Antfly inference. Check the runtime connection and try again."
           onRetry={retry}
         />
       </DashboardPage>
@@ -1051,10 +1051,10 @@ const ModelsPage: React.FC = () => {
     <DashboardPage>
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Model Directory</DashboardPageTitle>
+          <DashboardPageTitle className="font-aeonik">Models & Runtime</DashboardPageTitle>
           <DashboardPageDescription>
-            Browse {models.length} models reported by Inference. Models run locally through the Zig
-            runtime.
+            Browse {models.length} models reported by Antfly inference. Models run locally through
+            the Zig runtime.
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>

@@ -1,5 +1,5 @@
-// Inference Model Type Definitions
-// Types and helper functions for working with Inference model directory entries
+// Antfly Inference Model Type Definitions
+// Types and helper functions for working with Antfly inference model directory entries
 
 export type ModelType =
   | "embedder"
@@ -242,11 +242,13 @@ export function getDownloadCommand(model: InferenceModel, quantization?: Quantiz
 
 // Map model types to their playground routes
 export const MODEL_TYPE_PLAYGROUND: Partial<Record<ModelType, string>> = {
-  chunker: "/playground/chunking",
-  recognizer: "/playground/recognize",
-  rewriter: "/playground/rewrite",
-  reranker: "/playground/rerank",
-  transcriber: "/playground/transcribe",
+  embedder: "/inference/playground/embed",
+  chunker: "/inference/playground/chunk",
+  recognizer: "/inference/playground/extract",
+  rewriter: "/inference/playground/rewrite",
+  reranker: "/inference/playground/rerank",
+  reader: "/inference/playground/read",
+  transcriber: "/inference/playground/transcribe",
 };
 
 // Detailed model type information for educational banners
@@ -333,7 +335,7 @@ export const MODEL_TYPE_DETAILS: Record<ModelType, ModelTypeDetail> = {
     type: "generator",
     tagline: "Generate text responses using language models",
     description:
-      "Generator models produce natural language output for tasks like answering questions, summarization, and content generation. In Inference, generators power the answer synthesis step in RAG pipelines.",
+      "Generator models produce natural language output for tasks like answering questions, summarization, and content generation. In Antfly inference, generators power the answer synthesis step in RAG pipelines.",
     useCases: [
       "Answering questions based on retrieved context (RAG)",
       "Summarizing search results into concise answers",

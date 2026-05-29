@@ -87,6 +87,16 @@ func (t *TermiteAPI) RerankPrompts(w http.ResponseWriter, r *http.Request) {
 	t.node.handleApiRerank(w, r)
 }
 
+// ClassifyText implements ServerInterface
+func (t *TermiteAPI) ClassifyText(w http.ResponseWriter, r *http.Request) {
+	t.node.handleApiClassify(w, r)
+}
+
+// RecognizeEntities implements ServerInterface
+func (t *TermiteAPI) RecognizeEntities(w http.ResponseWriter, r *http.Request) {
+	t.node.handleApiRecognize(w, r)
+}
+
 // GenerateContent implements ServerInterface
 func (t *TermiteAPI) GenerateContent(w http.ResponseWriter, r *http.Request) {
 	t.node.handleApiGenerate(w, r)
@@ -519,17 +529,6 @@ func parseEmbedInput(
 
 			// Try inline media content - check Type field
 			if mediaPart, err := part.AsMediaContentPart(); err == nil && mediaPart.Type == MediaContentPartTypeMedia {
-				if mediaPart.Url != "" {
-					mimeType, data, err := scraping.DownloadContent(ctx, mediaPart.Url, securityConfig, s3Creds)
-					if err != nil {
-						return nil, fmt.Errorf("downloading media at index %d: %w", i, err)
-					}
-					contents[i] = []ai.ContentPart{ai.BinaryContent{
-						MIMEType: mimeType,
-						Data:     data,
-					}}
-					continue
-				}
 				contents[i] = []ai.ContentPart{ai.BinaryContent{
 					MIMEType: mediaPart.MimeType,
 					Data:     mediaPart.Data,
@@ -694,14 +693,6 @@ func (ln *TermiteNode) handleApiChunk(w http.ResponseWriter, r *http.Request) {
 				if mediaPart, err := part.AsMediaContentPart(); err == nil && mediaPart.Type == MediaContentPartTypeMedia {
 					data := mediaPart.Data
 					mimeType := mediaPart.MimeType
-					if mediaPart.Url != "" {
-						mimeType, data, err = scraping.DownloadContent(ctx, mediaPart.Url, ln.contentSecurityConfig, ln.s3Credentials)
-						if err != nil {
-							ln.logger.Error("media download failed", zap.Error(err))
-							http.Error(w, fmt.Sprintf("downloading media: %v", err), http.StatusBadRequest)
-							return
-						}
-					}
 					chunks, err = ln.chunkMedia(ctx, data, mimeType, internalConfig.Model, mediaOpts)
 					if err != nil {
 						ln.logger.Error("media chunking failed", zap.Error(err))
@@ -1406,12 +1397,6 @@ func convertChatMessage(msg ChatMessage) generation.Message {
 }
 
 func mediaPartImageURL(part MediaContentPart) string {
-	if part.Url != "" {
-		if part.MimeType == "" || strings.HasPrefix(part.MimeType, "image/") || strings.HasPrefix(part.Url, "data:image/") {
-			return part.Url
-		}
-		return ""
-	}
 	if len(part.Data) == 0 || !strings.HasPrefix(part.MimeType, "image/") {
 		return ""
 	}

@@ -101,10 +101,10 @@ function modelDescription(type: ModelType, name: string, inputs: string[]): stri
   }
 
   const inputText = inputs.length > 0 ? ` for ${inputs.join(", ")} input` : "";
-  return `Installed ${MODEL_TYPE_NAMES[type]} model reported by Inference${inputText}.`;
+  return `Installed ${MODEL_TYPE_NAMES[type]} model reported by Antfly inference${inputText}.`;
 }
 
-// Static model type metadata (not provided by Inference's model list)
+// Static model type metadata (not provided by Antfly inference's model list)
 const MODEL_TYPES: ModelTypeInfo[] = [
   {
     type: "embedder",
@@ -158,7 +158,7 @@ const MODEL_TYPES: ModelTypeInfo[] = [
   },
 ];
 
-// Static quantization options (not provided by Inference's model list)
+// Static quantization options (not provided by Antfly inference's model list)
 const QUANTIZATION_OPTIONS: QuantizationOption[] = [
   {
     type: "f32",
@@ -204,7 +204,7 @@ export interface InferenceRegistryState {
   retry: () => void;
 }
 
-// Transform Inference's live /ai/v1/models response into the UI model card format.
+// Transform Antfly inference's live /ai/v1/models response into the UI model card format.
 function transformModel(
   task: InferenceTaskKey,
   name: string,
@@ -250,7 +250,7 @@ function transformModels(data: InferenceModelsResponse): InferenceModel[] {
   return models;
 }
 
-// Cache model data while keeping each configured Inference endpoint isolated.
+// Cache model data while keeping each configured Antfly inference endpoint isolated.
 let modelCache: {
   key: string;
   models: InferenceModel[];
@@ -289,7 +289,7 @@ export function useInferenceRegistry(): InferenceRegistryState {
         });
 
         if (!response.ok) {
-          throw new Error(`Failed to fetch Inference models: ${response.status}`);
+          throw new Error(`Failed to fetch Antfly inference models: ${response.status}`);
         }
 
         const data: unknown = await response.json();
@@ -297,7 +297,7 @@ export function useInferenceRegistry(): InferenceRegistryState {
         if (!isMountedRef.current) return;
 
         if (!isInferenceModelsResponse(data)) {
-          throw new Error("Inference model response is missing model groups");
+          throw new Error("Antfly inference model response is missing model groups");
         }
 
         const transformedModels = transformModels(data);
@@ -317,7 +317,7 @@ export function useInferenceRegistry(): InferenceRegistryState {
         if (signal?.aborted) return;
         if (!isMountedRef.current) return;
 
-        const message = err instanceof Error ? err.message : "Failed to fetch Inference models";
+        const message = err instanceof Error ? err.message : "Failed to fetch Antfly inference models";
         setError(message);
         setLoading(false);
       } finally {
@@ -336,7 +336,7 @@ export function useInferenceRegistry(): InferenceRegistryState {
   useEffect(() => {
     isMountedRef.current = true;
 
-    // Skip fetch if we have cached data for this Inference endpoint.
+    // Skip fetch if we have cached data for this Antfly inference endpoint.
     if (modelCache?.key === cacheKey) {
       setModels(modelCache.models);
       setTypes(modelCache.types);

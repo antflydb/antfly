@@ -46,7 +46,7 @@ import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { fetchWithRetry } from "@/lib/utils";
 
-// NER response types matching Inference API
+// Entity extraction response types matching the Antfly inference API.
 interface NEREntity {
   text: string;
   label: string;
@@ -237,7 +237,7 @@ const EXTRACT_SAMPLES = {
   },
 };
 
-const RecognizePlaygroundPage: React.FC = () => {
+const ExtractionPlaygroundPage: React.FC = () => {
   const { inferenceApiUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -549,7 +549,7 @@ const RecognizePlaygroundPage: React.FC = () => {
       setError(
         err instanceof Error
           ? err.message
-          : "Failed to connect to Inference. Make sure Inference is running."
+          : "Failed to connect to Antfly inference. Make sure the runtime is running."
       );
     } finally {
       setIsLoading(false);
@@ -843,7 +843,7 @@ const RecognizePlaygroundPage: React.FC = () => {
     <DashboardPage className="h-full">
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle>Recognize Playground</DashboardPageTitle>
+          <DashboardPageTitle>Extraction Playground</DashboardPageTitle>
           <DashboardPageDescription>
             Extract entities and structured data from text using GLiNER models
           </DashboardPageDescription>
@@ -860,7 +860,7 @@ const RecognizePlaygroundPage: React.FC = () => {
       <BackendInfoBar />
 
       {modelsLoaded && availableModels.length === 0 && (
-        <NoModelsGuide modelType="recognizer" typeName="NER recognizer" />
+        <NoModelsGuide modelType="recognizer" typeName="extraction model" />
       )}
 
       {/* Configuration Panel */}
@@ -877,7 +877,7 @@ const RecognizePlaygroundPage: React.FC = () => {
               onClick={() => setMode("recognize")}
             >
               <Tag className="h-4 w-4 mr-1" />
-              Recognize
+              Entities
             </Button>
             <Button
               variant={mode === "extract" ? "default" : "outline"}
@@ -1381,4 +1381,4 @@ const RecognizePlaygroundPage: React.FC = () => {
   );
 };
 
-export default RecognizePlaygroundPage;
+export default ExtractionPlaygroundPage;

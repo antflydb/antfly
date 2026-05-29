@@ -17,13 +17,11 @@ export type Chunk = components["schemas"]["InferenceChunk"];
 export type RerankRequest = components["schemas"]["InferenceRerankRequest"];
 export type RerankResponse = components["schemas"]["InferenceRerankResponse"];
 
-export type RecognizeRequest = components["schemas"]["InferenceRecognizeRequest"];
-export type RecognizeResponse = components["schemas"]["InferenceRecognizeResponse"];
-export type RecognizeEntity = components["schemas"]["InferenceRecognizeEntity"];
-
-export type ExtractRequest = components["schemas"]["InferenceExtractRequest"];
-export type ExtractResponse = components["schemas"]["InferenceExtractResponse"];
-export type ExtractFieldValue = components["schemas"]["InferenceExtractFieldValue"];
+export type ExtractRequest = components["schemas"]["ExtractionRequest"];
+export type ExtractResponse = components["schemas"]["ExtractionResponse"];
+export type ExtractEntity = components["schemas"]["ExtractionEntity"];
+export type ExtractRelation = components["schemas"]["ExtractionRelation"];
+export type ExtractClassification = components["schemas"]["ExtractionClassification"];
 
 export type RewriteRequest = components["schemas"]["InferenceRewriteRequest"];
 export type RewriteResponse = components["schemas"]["InferenceRewriteResponse"];

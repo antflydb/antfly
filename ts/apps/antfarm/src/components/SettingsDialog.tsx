@@ -34,6 +34,7 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
   const { apiUrl, setApiUrl, resetToDefault, inferenceApiUrl, setInferenceApiUrl, resetInferenceApiUrl } =
     useApiConfig();
   const [isOpen, setIsOpen] = useState(false);
+  const effectiveInferenceApiUrl = inferenceApiUrl || "same origin (/ai/v1)";
 
   const form = useForm<SettingsFormValues>({
     defaultValues: { apiUrl, inferenceUrl: inferenceApiUrl },
@@ -69,8 +70,8 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
         <DialogHeader>
           <DialogTitle>API Settings</DialogTitle>
           <DialogDescription>
-            Configure the Antfly and Inference servers to connect to. This is useful when accessing
-            the dashboard remotely or connecting to different servers.
+            Configure the Antfly data and inference APIs. This is useful when accessing the
+            dashboard remotely or connecting to separate Antfly deployments.
           </DialogDescription>
         </DialogHeader>
         <Form form={form} onSubmit={form.handleSubmit(handleSave)} className="gap-6 py-4">
@@ -79,7 +80,7 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
             name="apiUrl"
             render={({ field }) => (
               <FormItem>
-                <FormLabel>Antfly API URL</FormLabel>
+                <FormLabel>Antfly Data API URL</FormLabel>
                 <FormControl>
                   <Input placeholder="http://localhost:8082/db/v1" {...field} />
                 </FormControl>
@@ -103,22 +104,21 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
             name="inferenceUrl"
             render={({ field }) => (
               <FormItem>
-                <FormLabel>Inference API URL</FormLabel>
+                <FormLabel>Antfly Inference API URL</FormLabel>
                 <FormControl>
-                  <Input placeholder="http://localhost:11433" {...field} />
+                  <Input placeholder="/ai/v1" {...field} />
                 </FormControl>
                 <FormDescription>
                   Current:{" "}
                   <code className="text-xs bg-muted px-1 py-0.5 rounded-none">
-                    {inferenceApiUrl}
+                    {effectiveInferenceApiUrl}
                   </code>
                 </FormDescription>
                 <FormDescription className="text-xs">
-                  Examples:{" "}
-                  <code className="bg-muted px-1 py-0.5 rounded-none">http://localhost:11433</code>{" "}
+                  Examples: <code className="bg-muted px-1 py-0.5 rounded-none">/ai/v1</code>{" "}
                   (default),{" "}
                   <code className="bg-muted px-1 py-0.5 rounded-none">
-                    https://inference.company.com
+                    https://antfly.company.com/ai/v1
                   </code>
                 </FormDescription>
               </FormItem>

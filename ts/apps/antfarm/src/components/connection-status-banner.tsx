@@ -17,9 +17,9 @@ const SERVER_INFO: Record<string, ServerInfo> = {
     hint: "Make sure the Antfly server is running on localhost:8080",
   },
   inference: {
-    name: "Inference",
+    name: "Antfly inference",
     port: 11433,
-    hint: "Make sure the Inference server is running (check Settings for URL)",
+    hint: "Make sure the Antfly inference runtime is running (check Settings for URL)",
   },
 };
 

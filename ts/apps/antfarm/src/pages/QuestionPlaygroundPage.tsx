@@ -42,7 +42,7 @@ import { useApiConfig } from "@/hooks/use-api-config";
 import { useEvalSets } from "@/hooks/use-eval-sets";
 import { fetchWithRetry } from "@/lib/utils";
 
-// Rewrite response types matching Inference API
+// Rewrite response types matching the Antfly inference API.
 interface RewriteResponse {
   model: string;
   texts: string[][];
@@ -249,7 +249,7 @@ const RewritingPlaygroundPage: React.FC = () => {
       setError(
         err instanceof Error
           ? err.message
-          : "Failed to connect to Inference. Make sure Inference is running."
+          : "Failed to connect to Antfly inference. Make sure the runtime is running."
       );
     } finally {
       setIsLoading(false);

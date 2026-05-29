@@ -67,7 +67,7 @@ export function ProductSwitcher({ currentProduct, onProductChange }: ProductSwit
         }
         label={current.name}
       />
-      <SidebarSwitcherContent label="Products">
+      <SidebarSwitcherContent label="Workspaces">
         {enabledProducts.map((productId) => {
           const product = PRODUCTS[productId];
           return (

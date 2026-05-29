@@ -39,7 +39,7 @@ import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { fetchWithRetry } from "@/lib/utils";
 
-// RecognizeResponse types matching Inference /api/recognize
+// Recognition response types matching the Antfly inference extraction API.
 interface RecognizeEntity {
   text: string;
   label: string;
@@ -420,7 +420,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       setError(
         err instanceof Error
           ? err.message
-          : "Failed to connect to Inference. Make sure Inference is running."
+          : "Failed to connect to Antfly inference. Make sure the runtime is running."
       );
     } finally {
       setIsLoading(false);

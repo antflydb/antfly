@@ -1,9 +1,9 @@
 // Product configuration for conditional builds
 // Set VITE_PRODUCTS environment variable to control which products are enabled
 // Examples:
-//   VITE_PRODUCTS=inference          - Inference-only build
-//   VITE_PRODUCTS=antfly           - Antfly-only build
-//   VITE_PRODUCTS=antfly,inference   - Full antfarm (default)
+//   VITE_PRODUCTS=inference        - Antfly inference-only build
+//   VITE_PRODUCTS=antfly           - Antfly data-only build
+//   VITE_PRODUCTS=antfly,inference - Full antfarm (default)
 
 export type ProductId = "antfly" | "inference";
 
@@ -22,7 +22,7 @@ export const PRODUCTS: Record<ProductId, Product> = {
   antfly: {
     id: "antfly",
     name: "Antfly",
-    description: "Vector database management",
+    description: "Data and vector search",
     defaultRoute: "/",
     routes: [
       "/",
@@ -31,29 +31,29 @@ export const PRODUCTS: Record<ProductId, Product> = {
       "/users",
       "/secrets",
       "/cluster",
-      "/playground/evals",
-      "/playground/rag",
-      "/playground/chat",
-      "/playground/embedding",
-      "/playground/reranking",
-      "/playground/chunking",
+      "/data/playground/evals",
+      "/data/playground/rag",
+      "/data/playground/chat",
+      "/data/playground/embed",
+      "/data/playground/rerank",
+      "/data/playground/chunk",
     ],
   },
   inference: {
     id: "inference",
-    name: "Inference",
-    description: "ML inference playgrounds",
-    defaultRoute: "/playground/chunk",
+    name: "Antfly Inference",
+    description: "Model runtimes and playgrounds",
+    defaultRoute: "/inference/models",
     routes: [
-      "/models",
-      "/playground/chunk",
-      "/playground/recognize",
-      "/playground/rewrite",
-      "/playground/rerank",
-      "/playground/kg",
-      "/playground/embed",
-      "/playground/read",
-      "/playground/transcribe",
+      "/inference/models",
+      "/inference/playground/chunk",
+      "/inference/playground/extract",
+      "/inference/playground/rewrite",
+      "/inference/playground/rerank",
+      "/inference/playground/kg",
+      "/inference/playground/embed",
+      "/inference/playground/read",
+      "/inference/playground/transcribe",
     ],
   },
 };
@@ -91,7 +91,7 @@ export const getDefaultRoute = (): string => {
 };
 
 // Determine which product owns a given pathname by checking each product's
-// routes list. Longer prefixes are checked first so "/playground/chunking"
+// routes list. Longer prefixes are checked first so "/data/playground/chunk"
 // matches inference before a hypothetical "/" catch-all matches antfly.
 export function productForPath(pathname: string): ProductId | undefined {
   let best: { product: ProductId; len: number } | undefined;
