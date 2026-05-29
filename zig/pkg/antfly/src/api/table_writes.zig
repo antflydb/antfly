@@ -87,6 +87,33 @@ var test_before_restore_work_hook: ?TestExecutionHook = null;
 
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
 
+fn accumulateTextMemoryAttributionStats(dst: *db_mod.TextMemoryAttributionStats, src: db_mod.TextMemoryAttributionStats) void {
+    dst.text_indexes +|= src.text_indexes;
+    dst.text_segments +|= src.text_segments;
+    dst.text_segment_bytes +|= src.text_segment_bytes;
+    dst.text_mmap_segment_bytes +|= src.text_mmap_segment_bytes;
+    dst.text_heap_segment_bytes +|= src.text_heap_segment_bytes;
+    dst.text_max_segment_bytes = @max(dst.text_max_segment_bytes, src.text_max_segment_bytes);
+    dst.stored_fields_bytes +|= src.stored_fields_bytes;
+    dst.inverted_text_bytes +|= src.inverted_text_bytes;
+    dst.inverted_header_bytes +|= src.inverted_header_bytes;
+    dst.inverted_fst_bytes +|= src.inverted_fst_bytes;
+    dst.inverted_bloom_bytes +|= src.inverted_bloom_bytes;
+    dst.inverted_postings_header_bytes +|= src.inverted_postings_header_bytes;
+    dst.inverted_block_max_bytes +|= src.inverted_block_max_bytes;
+    dst.inverted_chunk_meta_bytes +|= src.inverted_chunk_meta_bytes;
+    dst.inverted_postings_payload_bytes +|= src.inverted_postings_payload_bytes;
+    dst.inverted_positions_bytes +|= src.inverted_positions_bytes;
+    dst.inverted_skip_bytes +|= src.inverted_skip_bytes;
+    dst.inverted_one_hit_terms +|= src.inverted_one_hit_terms;
+    dst.inverted_postings_terms +|= src.inverted_postings_terms;
+    dst.typed_doc_values_bytes +|= src.typed_doc_values_bytes;
+    dst.doc_ordinals_bytes +|= src.doc_ordinals_bytes;
+    dst.section_index_bytes +|= src.section_index_bytes;
+    dst.configured_lmdb_main_map_bytes +|= src.configured_lmdb_main_map_bytes;
+    dst.configured_lmdb_wal_map_bytes +|= src.configured_lmdb_wal_map_bytes;
+}
+
 fn runTestBeforeBatchExecutionHook() void {
     if (comptime builtin.is_test) {
         if (test_before_batch_execution_hook) |hook| hook.run(hook.ptr);
@@ -3692,6 +3719,30 @@ pub const ProvisionedTableWriteSource = struct {
         var stats = db_mod.types.AsyncIndexingStats{};
         for (cache.entries.items) |entry| {
             db_mod.types.accumulateAsyncIndexingStats(&stats, entry.db.snapshotAsyncIndexingStats());
+        }
+        return stats;
+    }
+
+    pub fn textMemoryAttributionStatsBestEffort(self: *ProvisionedTableWriteSource) db_mod.TextMemoryAttributionStats {
+        if (!self.local_db_mutex.tryLock()) return .{};
+        defer self.local_db_mutex.unlock();
+        const cache = self.write_cache orelse return .{};
+        var stats = db_mod.TextMemoryAttributionStats{};
+        for (cache.entries.items) |entry| {
+            const entry_stats = entry.db.trySnapshotTextMemoryAttributionStats() orelse continue;
+            accumulateTextMemoryAttributionStats(&stats, entry_stats);
+        }
+        return stats;
+    }
+
+    pub fn textMergeStatsBestEffort(self: *ProvisionedTableWriteSource) db_mod.types.TextMergeStats {
+        if (!self.local_db_mutex.tryLock()) return .{};
+        defer self.local_db_mutex.unlock();
+        const cache = self.write_cache orelse return .{};
+        var stats = db_mod.types.TextMergeStats{};
+        for (cache.entries.items) |entry| {
+            const entry_stats = entry.db.trySnapshotTextMergeStats() orelse continue;
+            db_mod.types.accumulateTextMergeStats(&stats, entry_stats);
         }
         return stats;
     }

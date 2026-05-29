@@ -3051,6 +3051,30 @@ pub const DB = struct {
         return maintenance_stats;
     }
 
+    pub fn snapshotTextMemoryAttributionStats(self: *DB) index_manager_mod.TextMemoryAttributionStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.snapshotTextMemoryAttribution();
+    }
+
+    pub fn trySnapshotTextMemoryAttributionStats(self: *DB) ?index_manager_mod.TextMemoryAttributionStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.snapshotTextMemoryAttribution();
+    }
+
+    pub fn snapshotTextMergeStats(self: *DB) types.TextMergeStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.textMergeStatsSnapshot();
+    }
+
+    pub fn trySnapshotTextMergeStats(self: *DB) ?types.TextMergeStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.textMergeStatsSnapshot();
+    }
+
     pub fn snapshotPrimaryLsmWriteStatsForTest(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();

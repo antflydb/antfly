@@ -93,6 +93,7 @@ pub const Options = struct {
     wal_segment_bytes: u64 = 64 * 1024 * 1024,
     root_generation: u64 = 0,
     obsolete_retention_ns: u64 = 5 * std.time.ns_per_min,
+    read_snapshot_rotate_mutable_bytes: u64 = 1 * 1024 * 1024,
 };
 
 pub const IoRuntime = storage_io.RuntimeKind;
@@ -548,6 +549,7 @@ pub const Backend = struct {
     active_bulk_ingest_batches: usize = 0,
     mutable: ActiveMemTable = .{},
     mutable_wal_range: WalSegmentRange = .{},
+    empty_mutable_snapshot: State = .{},
     mutable_read_snapshot: ?*State = null,
     immutable_memtables: std.ArrayListUnmanaged(*State) = .empty,
     immutable_wal_ranges: std.ArrayListUnmanaged(WalSegmentRange) = .empty,
@@ -935,8 +937,21 @@ pub const Backend = struct {
         return snapshot;
     }
 
+    pub fn prepareReadSnapshot(self: *Backend) !void {
+        if (self.mutable_read_snapshot != null) return;
+        if (self.options.read_snapshot_rotate_mutable_bytes == 0) return;
+        if (self.mutable.entries.items.len == 0) return;
+        const mutable_bytes = estimateStateBytes(&self.mutable);
+        if (mutable_bytes < self.options.read_snapshot_rotate_mutable_bytes) return;
+
+        try self.rotateMutableToImmutable();
+        if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
+        self.notePotentialMaintenanceDebt();
+    }
+
     pub fn snapshotMutableState(self: *Backend) !*const State {
         if (self.mutable_read_snapshot) |snapshot| return snapshot;
+        if (self.mutable.entries.items.len == 0) return &self.empty_mutable_snapshot;
         const snapshot = try self.allocator.create(State);
         errdefer self.allocator.destroy(snapshot);
         snapshot.* = try self.mutable.clone(self.allocator);
@@ -7109,6 +7124,30 @@ test "lsm backend reuses mutable read snapshot until writes invalidate it" {
     try std.testing.expectEqualStrings("B", try read_c.get(.{ .name = "docs" }, "doc:b"));
     try std.testing.expect(backend.mutable_read_snapshot != null);
     try std.testing.expect(first_snapshot != backend.mutable_read_snapshot.?);
+}
+
+test "lsm backend rotates large mutable state for read snapshots instead of cloning" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .read_snapshot_rotate_mutable_bytes = 1,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+    }
+
+    try std.testing.expect(backend.mutable.entries.items.len > 0);
+    try std.testing.expectEqual(@as(u64, 0), backend.mutable_snapshot_clone_calls);
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("A", try read.get(.{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(?*State, null), backend.mutable_read_snapshot);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(u64, 0), backend.mutable_snapshot_clone_calls);
 }
 
 test "lsm backend write txns retain reader guards until completion" {

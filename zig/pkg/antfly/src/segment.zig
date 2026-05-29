@@ -82,6 +82,7 @@ pub const SegmentLayoutStats = struct {
     inverted_chunk_meta_bytes: u64 = 0,
     inverted_postings_payload_bytes: u64 = 0,
     inverted_positions_bytes: u64 = 0,
+    inverted_skip_bytes: u64 = 0,
     inverted_one_hit_terms: u64 = 0,
     inverted_postings_terms: u64 = 0,
     typed_doc_values_bytes: u64 = 0,
@@ -615,6 +616,7 @@ pub const SegmentReader = struct {
                                 stats.inverted_chunk_meta_bytes +|= inverted_layout.chunk_meta_bytes;
                                 stats.inverted_postings_payload_bytes +|= inverted_layout.postings_payload_bytes;
                                 stats.inverted_positions_bytes +|= inverted_layout.positions_bytes;
+                                stats.inverted_skip_bytes +|= inverted_layout.skip_bytes;
                                 stats.inverted_one_hit_terms +|= inverted_layout.one_hit_terms;
                                 stats.inverted_postings_terms +|= inverted_layout.postings_terms;
                             }

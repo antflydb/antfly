@@ -79,6 +79,29 @@ pub fn applyPlannedMerge(
     merge_error_prefix: []const u8,
     apply_error_prefix: []const u8,
 ) !void {
+    const old_ids = try alloc.alloc(u64, planned.len);
+    defer alloc.free(old_ids);
+    for (planned, 0..) |seg_idx, i| {
+        old_ids[i] = snap.segments[seg_idx].id;
+    }
+
+    if (index.prepareMergedSegmentToFile(snap, planned)) |prepared| {
+        _ = index.replaceSegmentsIfActiveManyPrepared(old_ids, prepared) catch |err| switch (err) {
+            error.EmptySegment => try index.removeSegmentsIfActive(old_ids),
+            else => {
+                logErr(apply_error_prefix, err);
+                return err;
+            },
+        };
+        return;
+    } else |err| switch (err) {
+        error.Unsupported => {},
+        else => {
+            logErr(merge_error_prefix, err);
+            return err;
+        },
+    }
+
     var merged = merger_mod.mergeSegmentsBounded(alloc, snap, planned, .{
         .target_segment_bytes = @intCast(target_segment_bytes),
     }) catch |err| {
@@ -90,11 +113,6 @@ pub fn applyPlannedMerge(
     merger_mod.applyPersistentMergeManyOwned(index, planned, merged) catch |err| {
         merged = &.{};
         if (err == error.EmptySegment) {
-            const old_ids = try alloc.alloc(u64, planned.len);
-            defer alloc.free(old_ids);
-            for (planned, 0..) |seg_idx, i| {
-                old_ids[i] = snap.segments[seg_idx].id;
-            }
             try index.removeSegments(old_ids);
             return;
         }

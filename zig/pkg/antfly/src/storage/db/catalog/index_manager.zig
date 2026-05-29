@@ -217,7 +217,7 @@ const PhaseTrackingAllocator = struct {
     }
 };
 
-const TextMemoryAttributionStats = struct {
+pub const TextMemoryAttributionStats = struct {
     text_indexes: u64 = 0,
     text_segments: u64 = 0,
     text_segment_bytes: u64 = 0,
@@ -234,6 +234,7 @@ const TextMemoryAttributionStats = struct {
     inverted_chunk_meta_bytes: u64 = 0,
     inverted_postings_payload_bytes: u64 = 0,
     inverted_positions_bytes: u64 = 0,
+    inverted_skip_bytes: u64 = 0,
     inverted_one_hit_terms: u64 = 0,
     inverted_postings_terms: u64 = 0,
     typed_doc_values_bytes: u64 = 0,
@@ -1684,7 +1685,7 @@ pub const IndexManager = struct {
         return stats;
     }
 
-    fn snapshotTextMemoryAttribution(self: *IndexManager) TextMemoryAttributionStats {
+    pub fn snapshotTextMemoryAttribution(self: *IndexManager) TextMemoryAttributionStats {
         var stats = TextMemoryAttributionStats{};
         const detailed_inverted_layout = memoryLayoutDetailEnabled();
         stats.text_indexes = @intCast(self.text_indexes.items.len);
@@ -1715,6 +1716,7 @@ pub const IndexManager = struct {
                 stats.inverted_chunk_meta_bytes +|= layout.inverted_chunk_meta_bytes;
                 stats.inverted_postings_payload_bytes +|= layout.inverted_postings_payload_bytes;
                 stats.inverted_positions_bytes +|= layout.inverted_positions_bytes;
+                stats.inverted_skip_bytes +|= layout.inverted_skip_bytes;
                 stats.inverted_one_hit_terms +|= layout.inverted_one_hit_terms;
                 stats.inverted_postings_terms +|= layout.inverted_postings_terms;
                 stats.typed_doc_values_bytes +|= layout.typed_doc_values_bytes;
@@ -1797,7 +1799,7 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_memory_segment_layout label={s} stored_fields_bytes={d} inverted_text_bytes={d} inverted_header_bytes={d} inverted_fst_bytes={d} inverted_bloom_bytes={d} inverted_postings_header_bytes={d} inverted_block_max_bytes={d} inverted_chunk_meta_bytes={d} inverted_postings_payload_bytes={d} inverted_positions_bytes={d} inverted_one_hit_terms={d} inverted_postings_terms={d} typed_doc_values_bytes={d} doc_ordinals_bytes={d} section_index_bytes={d}",
+            "antfly_bench_memory_segment_layout label={s} stored_fields_bytes={d} inverted_text_bytes={d} inverted_header_bytes={d} inverted_fst_bytes={d} inverted_bloom_bytes={d} inverted_postings_header_bytes={d} inverted_block_max_bytes={d} inverted_chunk_meta_bytes={d} inverted_postings_payload_bytes={d} inverted_positions_bytes={d} inverted_skip_bytes={d} inverted_one_hit_terms={d} inverted_postings_terms={d} typed_doc_values_bytes={d} doc_ordinals_bytes={d} section_index_bytes={d}",
             .{
                 label,
                 text_stats.stored_fields_bytes,
@@ -1810,6 +1812,7 @@ pub const IndexManager = struct {
                 text_stats.inverted_chunk_meta_bytes,
                 text_stats.inverted_postings_payload_bytes,
                 text_stats.inverted_positions_bytes,
+                text_stats.inverted_skip_bytes,
                 text_stats.inverted_one_hit_terms,
                 text_stats.inverted_postings_terms,
                 text_stats.typed_doc_values_bytes,

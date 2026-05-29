@@ -1987,6 +1987,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             errdefer metadata_allocator.free(levels);
             backend.retainReader();
             errdefer backend.releaseReader();
+            if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else
@@ -2301,6 +2302,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             errdefer metadata_allocator.free(levels);
             backend.retainReader();
             errdefer backend.releaseReader();
+            if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else
@@ -3035,6 +3037,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             errdefer metadata_allocator.free(levels);
             backend.retainReader();
             errdefer backend.releaseReader();
+            if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else

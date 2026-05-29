@@ -1254,6 +1254,27 @@ pub const TextMergeStats = struct {
     max_pending_bytes: u64 = 0,
 };
 
+pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void {
+    dst.enabled = dst.enabled or src.enabled;
+    dst.pending_indexes +|= src.pending_indexes;
+    dst.pending_segments +|= src.pending_segments;
+    dst.pending_bytes +|= src.pending_bytes;
+    dst.in_flight_merges +|= src.in_flight_merges;
+    dst.in_flight_segments +|= src.in_flight_segments;
+    dst.completed_merges +|= src.completed_merges;
+    dst.skipped_stale_merges +|= src.skipped_stale_merges;
+    dst.failed_merges +|= src.failed_merges;
+    dst.quarantined_merges +|= src.quarantined_merges;
+    dst.quarantined_segments +|= src.quarantined_segments;
+    if (src.last_merge_error.len != 0) dst.last_merge_error = src.last_merge_error;
+    dst.retry_after_ns = @max(dst.retry_after_ns, src.retry_after_ns);
+    dst.deferred_for_pressure +|= src.deferred_for_pressure;
+    dst.backpressure_events +|= src.backpressure_events;
+    dst.backpressure_ns +|= src.backpressure_ns;
+    dst.max_pending_segments = @max(dst.max_pending_segments, src.max_pending_segments);
+    dst.max_pending_bytes = @max(dst.max_pending_bytes, src.max_pending_bytes);
+}
+
 pub const DocIdentityStats = struct {
     namespace_table_id: u64 = 0,
     namespace_shard_id: u64 = 0,
