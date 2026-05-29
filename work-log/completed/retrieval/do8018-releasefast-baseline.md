@@ -2,7 +2,7 @@
 
 Captured on 2026-05-29 from worktree commit `7d13cfc14c60` with `WAIT_CATCHUP=300s`.
 Updated on 2026-05-29 from worktree commit `4ad4b59f5dd9` after the v15 prefix-run term dictionary and compact postings metadata codec changes.
-Updated on 2026-05-29 from worktree commit `14dfe7f28446` after the v16 per-section norms codec change.
+Updated on 2026-05-29 from worktree commit `14dfe7f28446` after the v16 per-section norms codec change. The initial v16 top-level health metric under-reported norms because shard aggregation omitted `inverted_norm_bytes`; direct segment parsing showed the norm artifacts were present on disk.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -36,7 +36,7 @@ Latest v16 artifacts:
 - Final full-text segment bytes: 523,396,046
 - Stored fields bytes: 127,469,017
 - Inverted bytes: 391,836,582
-- Inverted norms bytes: 0
+- Inverted norms bytes: 14,048,785 (direct segment parse; top-level health metric was missing aggregation)
 - Inverted postings bytes: 265,156,118
 - Inverted term dictionary bytes: 106,529,640
 - Term block bytes: 101,047,551
@@ -72,7 +72,7 @@ Latest v16 artifacts:
 - Final full-text segment bytes: 527,350,293
 - Stored fields bytes: 127,555,983
 - Inverted bytes: 395,700,555
-- Inverted norms bytes: 0
+- Inverted norms bytes: 13,759,899 (direct segment parse; top-level health metric was missing aggregation)
 - Inverted postings bytes: 266,689,426
 - Inverted term dictionary bytes: 109,138,919
 - Term block bytes: 103,576,237
@@ -236,4 +236,4 @@ The remaining segment size is now attributable without expensive per-term diagno
 
 After the v15 codec changes, final segment bytes fell to ~518-525 MiB and postings fell to ~282-285 MiB. The term dictionary remains ~99-104 MiB, with term blocks still ~94-98 MiB and the FST still only ~2.5 MiB. RSS also fell, but it still tracks mapped segment residency plus allocator/library resident pages much more closely than live heap.
 
-After the v16 codec change, postings fell again to ~265-267 MiB, but segment bytes stayed around ~523-527 MiB because the term dictionary varied upward on this run. The new norms attribution currently reports zero in the DO8018 run and should be treated as a follow-up correctness check before using that counter to quantify savings. Final RSS remains ~1.18-1.19 GiB while live malloc is only ~79-90 MiB and vmmap malloc allocated is ~28 MiB. The actionable RSS target is therefore mapped segment residency plus allocator retention, not a large live heap.
+After the v16 codec change, postings fell again to ~265-267 MiB, with norms stored separately at ~13.8-14.0 MiB. Segment bytes stayed around ~523-527 MiB because the term dictionary varied upward on this run. Final RSS remains ~1.18-1.19 GiB while live malloc is only ~79-90 MiB and vmmap malloc allocated is ~28 MiB. The actionable RSS target is therefore mapped segment residency plus allocator retention, not a large live heap.

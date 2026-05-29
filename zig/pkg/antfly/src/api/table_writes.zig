@@ -97,6 +97,7 @@ fn accumulateTextMemoryAttributionStats(dst: *db_mod.TextMemoryAttributionStats,
     dst.stored_fields_bytes +|= src.stored_fields_bytes;
     dst.inverted_text_bytes +|= src.inverted_text_bytes;
     dst.inverted_header_bytes +|= src.inverted_header_bytes;
+    dst.inverted_norm_bytes +|= src.inverted_norm_bytes;
     dst.inverted_term_dict_bytes +|= src.inverted_term_dict_bytes;
     dst.inverted_term_block_bytes +|= src.inverted_term_block_bytes;
     dst.inverted_term_index_bytes +|= src.inverted_term_index_bytes;
@@ -116,6 +117,23 @@ fn accumulateTextMemoryAttributionStats(dst: *db_mod.TextMemoryAttributionStats,
     dst.section_index_bytes +|= src.section_index_bytes;
     dst.configured_lmdb_main_map_bytes +|= src.configured_lmdb_main_map_bytes;
     dst.configured_lmdb_wal_map_bytes +|= src.configured_lmdb_wal_map_bytes;
+}
+
+test "full text memory attribution aggregation includes norm bytes" {
+    var dst = db_mod.TextMemoryAttributionStats{
+        .inverted_header_bytes = 3,
+        .inverted_norm_bytes = 5,
+        .inverted_term_dict_bytes = 7,
+    };
+    accumulateTextMemoryAttributionStats(&dst, .{
+        .inverted_header_bytes = 11,
+        .inverted_norm_bytes = 13,
+        .inverted_term_dict_bytes = 17,
+    });
+
+    try std.testing.expectEqual(@as(u64, 14), dst.inverted_header_bytes);
+    try std.testing.expectEqual(@as(u64, 18), dst.inverted_norm_bytes);
+    try std.testing.expectEqual(@as(u64, 24), dst.inverted_term_dict_bytes);
 }
 
 fn runTestBeforeBatchExecutionHook() void {
