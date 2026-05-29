@@ -81,7 +81,7 @@ run_one() {
       --local-dir "${data_source}" \
       --contains "/codex/" \
       --table "${table}" \
-      --antfly-url "http://127.0.0.1:${port}/api/v1" \
+      --antfly-url "http://127.0.0.1:${port}/db/v1" \
       --batch-size "${batch_size}" \
       --batch-workers "${batch_workers}" \
       --object-workers "${object_workers}" \
