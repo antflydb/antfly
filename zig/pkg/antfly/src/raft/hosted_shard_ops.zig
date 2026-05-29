@@ -233,18 +233,81 @@ pub const HostedShardDbAdapter = struct {
 
     fn fetchMedianKey(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !?[]u8 {
         const self: *HostedShardDbAdapter = @ptrCast(@alignCast(ptr));
-        var route = (try api_table_router.resolveGroupRoute(self.alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
+        var tried_node_ids = std.ArrayListUnmanaged(u64).empty;
+        defer tried_node_ids.deinit(self.alloc);
+
+        if (try self.fetchMedianKeyFromResolvedRoute(alloc, group_id, .prefer_leader, &tried_node_ids)) |median_key| {
+            return median_key;
+        }
+
+        const maybe_node_ids = try self.router.groupNodeIds(self.alloc, group_id);
+        const node_ids = maybe_node_ids orelse blk: {
+            var snapshot = try self.catalog.adminSnapshot();
+            defer self.catalog.freeAdminSnapshot(&snapshot);
+            const placements = try metadata_mod.admin.listGroupPlacement(self.alloc, &snapshot, group_id);
+            defer metadata_mod.admin.freePlacementRefs(self.alloc, placements);
+            var nodes = try std.ArrayListUnmanaged(u64).initCapacity(self.alloc, placements.len);
+            errdefer nodes.deinit(self.alloc);
+            for (placements) |intent| {
+                try nodes.append(self.alloc, intent.record.local_node_id);
+            }
+            break :blk try nodes.toOwnedSlice(self.alloc);
+        };
+        defer self.alloc.free(node_ids);
+
+        const local_node_id = self.router.localNodeId();
+        if (self.router.localStatus(group_id) == .active and !containsNodeId(tried_node_ids.items, local_node_id)) {
+            try tried_node_ids.append(self.alloc, local_node_id);
+            if (self.local_db) |local_db| {
+                if (try local_db.fetchMedianKey(alloc, group_id)) |median_key| return median_key;
+            }
+        }
+
+        var saw_candidate = tried_node_ids.items.len > 0;
+        for (node_ids) |node_id| {
+            if (containsNodeId(tried_node_ids.items, node_id)) continue;
+            if (node_id == local_node_id) continue;
+            if (self.router.nodeStatus(node_id, group_id)) |status| {
+                if (status != .active) continue;
+            }
+            const base_uri = (try self.router.nodeBaseUriForGroup(self.alloc, group_id, node_id)) orelse continue;
+            defer self.alloc.free(base_uri);
+            saw_candidate = true;
+            var client = api_http_client.ApiHttpClient.init(alloc, self.executor);
+            if (try client.fetchGroupDbMedianKey(base_uri, group_id)) |median_key| return median_key;
+        }
+
+        return if (saw_candidate) null else error.UnknownGroup;
+    }
+
+    fn fetchMedianKeyFromResolvedRoute(
+        self: *HostedShardDbAdapter,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        policy: api_table_router.RoutePolicy,
+        tried_node_ids: *std.ArrayListUnmanaged(u64),
+    ) !?[]u8 {
+        var route = (try api_table_router.resolveGroupRoute(self.alloc, self.catalog, self.router, group_id, policy)) orelse return null;
         defer route.deinit(self.alloc);
         return switch (route) {
             .local => {
-                const local_db = self.local_db orelse return error.UnsupportedOperation;
+                try tried_node_ids.append(self.alloc, self.router.localNodeId());
+                const local_db = self.local_db orelse return null;
                 return try local_db.fetchMedianKey(alloc, group_id);
             },
             .remote => |remote| {
+                try tried_node_ids.append(self.alloc, remote.node_id);
                 var client = api_http_client.ApiHttpClient.init(alloc, self.executor);
                 return try client.fetchGroupDbMedianKey(remote.base_uri, group_id);
             },
         };
+    }
+
+    fn containsNodeId(items: []const u64, node_id: u64) bool {
+        for (items) |item| {
+            if (item == node_id) return true;
+        }
+        return false;
     }
 
     fn schemaIndexReady(

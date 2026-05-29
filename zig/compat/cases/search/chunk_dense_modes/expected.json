@@ -1,9 +1,9 @@
 {
   "chunk_mode": {
-    "total_hits": 3,
+    "total_hits": 1,
     "hits": [
       {
-        "id": "doc:a:e:chunk:body_chunks_v1:0"
+        "id": "af1:chunk:ZG9jOmE:Ym9keV9jaHVua3NfdjE:0"
       }
     ]
   },
@@ -14,7 +14,7 @@
         "id": "doc:a",
         "chunk_hits": [
           {
-            "id": "doc:a:e:chunk:body_chunks_v1:0"
+            "id": "af1:chunk:ZG9jOmE:Ym9keV9jaHVua3NfdjE:0"
           }
         ]
       }

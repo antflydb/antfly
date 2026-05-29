@@ -128,9 +128,7 @@ export type {
   ChatMessage,
   ChatMessageRole,
   ChatStreamCallbacks,
-  ChatToolCall,
   ChatToolName,
-  ChatToolResult,
   ChatToolsConfig,
   // Chat types (used by retrieval agent)
   // Retrieval Agent result types
@@ -220,6 +218,8 @@ export type {
   TableMigration,
   TableSchema,
   TableStatus,
+  ToolCall,
+  ToolCallFunction,
   TraversalResult,
   TraversalRules,
   UpdatePasswordRequest,

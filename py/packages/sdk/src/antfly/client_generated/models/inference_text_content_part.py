@@ -13,11 +13,11 @@ T = TypeVar("T", bound="InferenceTextContentPart")
 
 @_attrs_define
 class InferenceTextContentPart:
-    """Text content for embedding
+    """Text content for multimodal input.
 
     Attributes:
         type_ (InferenceTextContentPartType):
-        text (str): Text content to embed
+        text (str): Text content.
     """
 
     type_: InferenceTextContentPartType

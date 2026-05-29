@@ -20,7 +20,7 @@ T = TypeVar("T", bound="InferenceGenerateMessage")
 class InferenceGenerateMessage:
     """
     Attributes:
-        role (InferenceRole): The role of a message sender in a conversation
+        role (InferenceRole): Role of the message sender in a generation/chat conversation
         content (None | str | Unset): The generated message content (null when tool_calls is present)
         tool_calls (list[InferenceToolCall] | Unset): Tool calls made by the model (only present when finish_reason is
             tool_calls)

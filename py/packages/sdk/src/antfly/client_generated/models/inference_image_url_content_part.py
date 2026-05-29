@@ -9,7 +9,7 @@ from attrs import field as _attrs_field
 from ..models.inference_image_url_content_part_type import InferenceImageURLContentPartType
 
 if TYPE_CHECKING:
-    from ..models.inference_image_url import InferenceImageURL
+    from ..models.image_url import ImageURL
 
 
 T = TypeVar("T", bound="InferenceImageURLContentPart")
@@ -17,15 +17,15 @@ T = TypeVar("T", bound="InferenceImageURLContentPart")
 
 @_attrs_define
 class InferenceImageURLContentPart:
-    """Image content for embedding (OpenAI-compatible format)
+    """Image content in OpenAI-compatible format.
 
     Attributes:
         type_ (InferenceImageURLContentPartType):
-        image_url (InferenceImageURL): Image URL or data URI
+        image_url (ImageURL): Image URL or data URI.
     """
 
     type_: InferenceImageURLContentPartType
-    image_url: InferenceImageURL
+    image_url: ImageURL
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -46,12 +46,12 @@ class InferenceImageURLContentPart:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inference_image_url import InferenceImageURL
+        from ..models.image_url import ImageURL
 
         d = dict(src_dict)
         type_ = InferenceImageURLContentPartType(d.pop("type"))
 
-        image_url = InferenceImageURL.from_dict(d.pop("image_url"))
+        image_url = ImageURL.from_dict(d.pop("image_url"))
 
         inference_image_url_content_part = cls(
             type_=type_,

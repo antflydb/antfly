@@ -25,7 +25,7 @@ pub const Kind = enum(u8) {
     chunk_json = 1,
     dense_embedding = 2,
     sparse_embedding = 3,
-    summary_text = 4,
+    asset = 4,
     graph_edge = 5,
 };
 
@@ -321,7 +321,7 @@ pub fn decodeHeader(data: []const u8) !Header {
         @intFromEnum(Kind.chunk_json) => .chunk_json,
         @intFromEnum(Kind.dense_embedding) => .dense_embedding,
         @intFromEnum(Kind.sparse_embedding) => .sparse_embedding,
-        @intFromEnum(Kind.summary_text) => .summary_text,
+        @intFromEnum(Kind.asset) => .asset,
         @intFromEnum(Kind.graph_edge) => .graph_edge,
         else => return error.InvalidArtifactKind,
     };

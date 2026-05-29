@@ -9,27 +9,15 @@ pub const Error = struct {
     @"error": []const u8,
 };
 
-/// Text content for embedding
-pub const TextContentPart = struct {
-    type: []const u8,
-    /// Text content to embed
-    text: []const u8,
-};
+pub const TextContentPart = antfly_generating_openapi.TextContentPart;
 
-/// Image URL or data URI
-pub const ImageURL = struct {
-    /// URL or data URI (data:image/png;base64,...)
-    url: []const u8,
-};
+pub const ImageURL = antfly_generating_openapi.ImageURL;
 
-/// Inline binary media content (audio, image, etc.)
-pub const MediaContentPart = struct {
-    type: []const u8,
-    /// Base64-encoded binary data
-    data: []const u8,
-    /// MIME type (audio/wav, image/gif, image/png, etc.)
-    mime_type: []const u8,
-};
+pub const ImageURLContentPart = antfly_generating_openapi.ImageURLContentPart;
+
+pub const MediaContentPart = antfly_generating_openapi.MediaContentPart;
+
+pub const ContentPart = antfly_generating_openapi.ContentPart;
 
 /// OpenAI-compatible embedding request with inference multimodal content-part extension
 pub const EmbedRequest = struct {
@@ -275,48 +263,18 @@ pub const FunctionDefinition = struct {
     strict: ?bool = null,
 };
 
-/// The function called by the model
+/// The function called by a model tool call.
 pub const ToolCallFunction = struct {
-    /// The name of the function called
+    /// Function name.
     name: []const u8,
-    /// JSON string of the arguments to the function
+    /// JSON string of function arguments.
     arguments: []const u8,
 };
 
 /// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
 pub const ToolChoice = std.json.Value;
 
-/// The role of a message sender in a conversation
-pub const Role = enum {
-    system,
-    user,
-    assistant,
-    tool,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .system => "system",
-            .user => "user",
-            .assistant => "assistant",
-            .tool => "tool",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "system", .system },
-            .{ "user", .user },
-            .{ "assistant", .assistant },
-            .{ "tool", .tool },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
+pub const Role = antfly_generating_openapi.ChatMessageRole;
 
 /// Reason why generation stopped
 pub const FinishReason = enum {
@@ -536,12 +494,6 @@ pub const EmbeddingUsage = struct {
     total_tokens: i64,
 };
 
-/// Image content for embedding (OpenAI-compatible format)
-pub const ImageURLContentPart = struct {
-    type: []const u8,
-    image_url: ImageURL,
-};
-
 /// Exactly one of `texts` or `images` must be provided. When using `images`, the server selects a compatible reader internally and processes the request as: read document text -> run structured extraction.
 pub const ExtractRequest = struct {
     /// Name of extractor model with 'extraction' capability
@@ -682,11 +634,10 @@ pub const Tool = struct {
     function: FunctionDefinition,
 };
 
-/// A tool call made by the model
+/// OpenAI-compatible assistant tool call.
 pub const ToolCall = struct {
-    /// Unique identifier for this tool call
+    /// Tool call identifier.
     id: []const u8,
-    /// The type of tool call (currently only "function")
     type: []const u8,
     function: ToolCallFunction,
 };
@@ -807,62 +758,6 @@ pub const Chunk = struct {
 pub const SchemasConfig = struct {
     level: ?Level = null,
     style: ?Style = null,
-};
-
-/// A content part for multimodal input (text, image URL, or inline media)
-pub const ContentPart = union(enum) {
-    media_content_part: *MediaContentPart,
-    image_url_content_part: *ImageURLContentPart,
-    text_content_part: *TextContentPart,
-
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed.value;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "data",
-            "mime_type",
-        })) {
-            if (try parseStructuralVariant(MediaContentPart, allocator, source, options)) |parsed| return .{ .media_content_part = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "image_url",
-        })) {
-            if (try parseStructuralVariant(ImageURLContentPart, allocator, source, options)) |parsed| return .{ .image_url_content_part = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "text",
-        })) {
-            if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .media_content_part => |v| try jw.write(v.*),
-            .image_url_content_part => |v| try jw.write(v.*),
-            .text_content_part => |v| try jw.write(v.*),
-        }
-    }
 };
 
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors

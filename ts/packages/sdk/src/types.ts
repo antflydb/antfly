@@ -185,8 +185,8 @@ export type QueryBuilderResult = components["schemas"]["QueryBuilderResult"];
 // Chat/Retrieval types (used by retrieval agent's tool-calling mode)
 export type ChatMessage = components["schemas"]["ChatMessage"];
 export type ChatMessageRole = components["schemas"]["ChatMessageRole"];
-export type ChatToolCall = components["schemas"]["ChatToolCall"];
-export type ChatToolResult = components["schemas"]["ChatToolResult"];
+export type ToolCall = components["schemas"]["ToolCall"];
+export type ToolCallFunction = components["schemas"]["ToolCallFunction"];
 export type ChatToolName = components["schemas"]["ChatToolName"];
 export type ChatToolsConfig = components["schemas"]["ChatToolsConfig"];
 export type FilterSpec = components["schemas"]["FilterSpec"];

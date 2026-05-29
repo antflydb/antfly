@@ -364,7 +364,7 @@ const ReplayChunkBuilder = struct {
             .graph => {
                 for (record.deleted_doc_keys) |key| try self.appendUniqueKey(&self.deleted_doc_keys, &self.seen_deleted_docs, key);
                 for (record.changed_artifact_keys) |key| {
-                    if (!internal_keys.isGraphEdgeArtifactKey(key)) continue;
+                    if (!internal_keys.isGraphEdgeArtifactKey(key) and !internal_keys.isAssetArtifactKey(key)) continue;
                     try self.appendUniqueKey(&self.changed_artifact_keys, &self.seen_changed_artifacts, key);
                 }
             },
@@ -512,7 +512,7 @@ fn countEmbeddingArtifactKeys(keys: []const []const u8) usize {
 fn countGraphArtifactKeys(keys: []const []const u8) usize {
     var count: usize = 0;
     for (keys) |key| {
-        if (internal_keys.isGraphEdgeArtifactKey(key)) count += 1;
+        if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key)) count += 1;
     }
     return count;
 }

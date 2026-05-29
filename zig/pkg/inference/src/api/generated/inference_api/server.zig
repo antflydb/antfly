@@ -4,6 +4,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const types = @import("types.zig");
+const antfly_extraction_openapi = @import("antfly_extraction_openapi");
 
 /// --- Extractors (framework-agnostic) ---
 /// Parse the JSON request body for generateEmbeddings.
@@ -36,26 +37,6 @@ pub fn parseChatCompletionsBody(allocator: std.mem.Allocator, body: []const u8) 
     return std.json.parseFromSlice(types.GenerateRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Parse the JSON request body for recognizeEntities.
-pub fn parseRecognizeEntitiesBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RecognizeRequest) {
-    return std.json.parseFromSlice(types.RecognizeRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for classifyText.
-pub fn parseClassifyTextBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ClassifyRequest) {
-    return std.json.parseFromSlice(types.ClassifyRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for classifyDocument.
-pub fn parseClassifyDocumentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DocumentClassificationRequest) {
-    return std.json.parseFromSlice(types.DocumentClassificationRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for classifyDocumentTokens.
-pub fn parseClassifyDocumentTokensBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DocumentTokenClassificationRequest) {
-    return std.json.parseFromSlice(types.DocumentTokenClassificationRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
 /// Parse the JSON request body for rewriteText.
 pub fn parseRewriteTextBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RewriteRequest) {
     return std.json.parseFromSlice(types.RewriteRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -71,9 +52,9 @@ pub fn parseTranscribeAudioBody(allocator: std.mem.Allocator, body: []const u8) 
     return std.json.parseFromSlice(types.TranscribeRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Parse the JSON request body for extractJSON.
-pub fn parseExtractJSONBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ExtractRequest) {
-    return std.json.parseFromSlice(types.ExtractRequest, allocator, body, .{ .ignore_unknown_fields = true });
+/// Parse the JSON request body for extract.
+pub fn parseExtractBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_extraction_openapi.ExtractionRequest) {
+    return std.json.parseFromSlice(antfly_extraction_openapi.ExtractionRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for createEmbedding.
@@ -95,14 +76,10 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/rerank", .operation_id = "rerankPrompts" },
     .{ .method = "POST", .path = "/generate", .operation_id = "generateContent" },
     .{ .method = "POST", .path = "/chat/completions", .operation_id = "chatCompletions" },
-    .{ .method = "POST", .path = "/recognize", .operation_id = "recognizeEntities" },
-    .{ .method = "POST", .path = "/classify", .operation_id = "classifyText" },
-    .{ .method = "POST", .path = "/classify/document", .operation_id = "classifyDocument" },
-    .{ .method = "POST", .path = "/classify/document_tokens", .operation_id = "classifyDocumentTokens" },
     .{ .method = "POST", .path = "/rewrite", .operation_id = "rewriteText" },
     .{ .method = "POST", .path = "/read", .operation_id = "readImages" },
     .{ .method = "POST", .path = "/transcribe", .operation_id = "transcribeAudio" },
-    .{ .method = "POST", .path = "/extract", .operation_id = "extractJSON" },
+    .{ .method = "POST", .path = "/extract", .operation_id = "extract" },
     .{ .method = "GET", .path = "/models", .operation_id = "listModels" },
     .{ .method = "POST", .path = "/embeddings", .operation_id = "createEmbedding" },
 };
@@ -124,14 +101,10 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "rerankPrompts")) @compileError("ServerRouter: Impl missing required method 'rerankPrompts'");
         if (!@hasDecl(Impl, "generateContent")) @compileError("ServerRouter: Impl missing required method 'generateContent'");
         if (!@hasDecl(Impl, "chatCompletions")) @compileError("ServerRouter: Impl missing required method 'chatCompletions'");
-        if (!@hasDecl(Impl, "recognizeEntities")) @compileError("ServerRouter: Impl missing required method 'recognizeEntities'");
-        if (!@hasDecl(Impl, "classifyText")) @compileError("ServerRouter: Impl missing required method 'classifyText'");
-        if (!@hasDecl(Impl, "classifyDocument")) @compileError("ServerRouter: Impl missing required method 'classifyDocument'");
-        if (!@hasDecl(Impl, "classifyDocumentTokens")) @compileError("ServerRouter: Impl missing required method 'classifyDocumentTokens'");
         if (!@hasDecl(Impl, "rewriteText")) @compileError("ServerRouter: Impl missing required method 'rewriteText'");
         if (!@hasDecl(Impl, "readImages")) @compileError("ServerRouter: Impl missing required method 'readImages'");
         if (!@hasDecl(Impl, "transcribeAudio")) @compileError("ServerRouter: Impl missing required method 'transcribeAudio'");
-        if (!@hasDecl(Impl, "extractJSON")) @compileError("ServerRouter: Impl missing required method 'extractJSON'");
+        if (!@hasDecl(Impl, "extract")) @compileError("ServerRouter: Impl missing required method 'extract'");
         if (!@hasDecl(Impl, "listModels")) @compileError("ServerRouter: Impl missing required method 'listModels'");
         if (!@hasDecl(Impl, "createEmbedding")) @compileError("ServerRouter: Impl missing required method 'createEmbedding'");
     }
@@ -154,14 +127,10 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/rerank", rerankPrompts);
             try server.post("/generate", generateContent);
             try server.post("/chat/completions", chatCompletions);
-            try server.post("/recognize", recognizeEntities);
-            try server.post("/classify", classifyText);
-            try server.post("/classify/document", classifyDocument);
-            try server.post("/classify/document_tokens", classifyDocumentTokens);
             try server.post("/rewrite", rewriteText);
             try server.post("/read", readImages);
             try server.post("/transcribe", transcribeAudio);
-            try server.post("/extract", extractJSON);
+            try server.post("/extract", extract);
             try server.get("/models", listModels);
             try server.post("/embeddings", createEmbedding);
         }
@@ -208,34 +177,6 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.chatCompletions(ctx);
         }
 
-        /// Recognize named entities
-        /// POST /recognize
-        fn recognizeEntities(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.recognizeEntities(ctx);
-        }
-
-        /// Zero-shot text classification
-        /// POST /classify
-        fn classifyText(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.classifyText(ctx);
-        }
-
-        /// Document classification
-        /// POST /classify/document
-        fn classifyDocument(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.classifyDocument(ctx);
-        }
-
-        /// Document token classification
-        /// POST /classify/document_tokens
-        fn classifyDocumentTokens(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.classifyDocumentTokens(ctx);
-        }
-
         /// Rewrite text using Seq2Seq models
         /// POST /rewrite
         fn rewriteText(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -257,11 +198,11 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.transcribeAudio(ctx);
         }
 
-        /// Extract structured data from text
+        /// Extract entities, relations, classifications, and structures
         /// POST /extract
-        fn extractJSON(ctx: *httpx.Context) anyerror!httpx.Response {
+        fn extract(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.extractJSON(ctx);
+            return impl.extract(ctx);
         }
 
         /// List available models
@@ -288,13 +229,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn rerankPrompts(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn generateContent(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn chatCompletions(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn recognizeEntities(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn classifyText(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn classifyDocument(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn classifyDocumentTokens(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn rewriteText(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn readImages(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn transcribeAudio(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn extractJSON(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn extract(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listModels(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createEmbedding(self: *Impl, ctx: *httpx.Context) !httpx.Response

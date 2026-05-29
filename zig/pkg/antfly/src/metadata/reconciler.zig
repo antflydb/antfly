@@ -595,6 +595,7 @@ pub const Reconciler = struct {
                 if (!groupStatusReadyForAutomaticPlanning(status)) continue;
                 if (!docIdentityNamespaceReadyForAutomaticSplit(status)) continue;
                 if (status.disk_bytes <= self.config.max_shard_size_bytes) continue;
+                if (status.doc_count < 2) continue;
                 const lookup = self.config.median_key_lookup orelse continue;
                 const owned_split_key = (lookup.fetchMedianKey(self.alloc, range.group_id) catch continue) orelse continue;
                 var split_key_consumed = false;

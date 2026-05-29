@@ -935,7 +935,7 @@ const JsonWritePair = struct {
 fn artifactKindLabel(kind: db_mod.types.ArtifactKind) []const u8 {
     return switch (kind) {
         .chunk => "chunk",
-        .summary => "summary",
+        .asset => "asset",
         .embedding => "embedding",
     };
 }
@@ -1044,25 +1044,6 @@ const JsonSparseEnrichmentWrite = struct {
     }
 };
 
-const JsonSummaryEnrichmentWrite = struct {
-    index_name: []const u8,
-    doc_key_b64: []u8,
-    text: []const u8,
-
-    fn init(alloc: Allocator, write: db_mod.types.EnrichmentSummaryWrite) !JsonSummaryEnrichmentWrite {
-        return .{
-            .index_name = write.index_name,
-            .doc_key_b64 = try dupBase64(alloc, write.doc_key),
-            .text = write.text,
-        };
-    }
-
-    fn deinit(self: *JsonSummaryEnrichmentWrite, alloc: Allocator) void {
-        alloc.free(self.doc_key_b64);
-        self.* = undefined;
-    }
-};
-
 const JsonGraphWrite = struct {
     index_name: []const u8,
     source_b64: []u8,
@@ -1120,7 +1101,6 @@ const JsonDocumentEnrichmentWrite = struct {
 const JsonExtractEnrichmentsResult = struct {
     dense_embeddings: []JsonDenseEnrichmentWrite,
     sparse_embeddings: []JsonSparseEnrichmentWrite,
-    summaries: []JsonSummaryEnrichmentWrite,
     graph_writes: []JsonGraphWrite,
 
     fn deinit(self: *JsonExtractEnrichmentsResult, alloc: Allocator) void {
@@ -1128,8 +1108,6 @@ const JsonExtractEnrichmentsResult = struct {
         if (self.dense_embeddings.len > 0) alloc.free(self.dense_embeddings);
         for (self.sparse_embeddings) |*item| item.deinit(alloc);
         if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
-        for (self.summaries) |*item| item.deinit(alloc);
-        if (self.summaries.len > 0) alloc.free(self.summaries);
         for (self.graph_writes) |*item| item.deinit(alloc);
         if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
         self.* = undefined;
@@ -1181,17 +1159,6 @@ fn buildJsonExtractEnrichmentsResult(
         sparse_initialized += 1;
     }
 
-    var summaries = try alloc.alloc(JsonSummaryEnrichmentWrite, result.summaries.len);
-    var summaries_initialized: usize = 0;
-    errdefer {
-        for (summaries[0..summaries_initialized]) |*item| item.deinit(alloc);
-        alloc.free(summaries);
-    }
-    for (result.summaries, 0..) |item, i| {
-        summaries[i] = try JsonSummaryEnrichmentWrite.init(alloc, item);
-        summaries_initialized += 1;
-    }
-
     var graph_writes = try alloc.alloc(JsonGraphWrite, result.graph_writes.len);
     var graph_initialized: usize = 0;
     errdefer {
@@ -1206,7 +1173,6 @@ fn buildJsonExtractEnrichmentsResult(
     return .{
         .dense_embeddings = dense_embeddings,
         .sparse_embeddings = sparse_embeddings,
-        .summaries = summaries,
         .graph_writes = graph_writes,
     };
 }
@@ -3841,8 +3807,16 @@ fn parseTextQueryJson(alloc: std.mem.Allocator, value: std.json.Value) anyerror!
     if (value.object.get("bool")) |bool_query| {
         if (bool_query != .object) return error.InvalidArgument;
 
-        const must = if (bool_query.object.get("must")) |must_value|
-            try parseTextQueryArrayJson(alloc, must_value)
+        var must_list = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+        errdefer must_list.deinit(alloc);
+        if (bool_query.object.get("filter")) |filter_value| {
+            try appendTextQueryArrayJson(alloc, &must_list, filter_value);
+        }
+        if (bool_query.object.get("must")) |must_value| {
+            try appendTextQueryArrayJson(alloc, &must_list, must_value);
+        }
+        const must = if (must_list.items.len > 0)
+            try must_list.toOwnedSlice(alloc)
         else
             &.{};
         const should = if (bool_query.object.get("should")) |should_value|
@@ -4003,6 +3977,38 @@ fn parseTextQueryArrayJson(alloc: std.mem.Allocator, value: std.json.Value) anye
         clauses[i] = try parseTextQueryJson(alloc, item);
     }
     return clauses;
+}
+
+fn appendTextQueryArrayJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
+    value: std.json.Value,
+) anyerror!void {
+    if (value != .array or value.array.items.len == 0) return error.InvalidArgument;
+    try out.ensureUnusedCapacity(alloc, value.array.items.len);
+    for (value.array.items) |item| {
+        out.appendAssumeCapacity(try parseTextQueryJson(alloc, item));
+    }
+}
+
+test "c api bool text parser treats filter clauses as required" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool":{"must":[{"term":{"field":"body","term":"invoice"}}],"filter":[{"term":{"field":"tenant","term":"acme"}}]}}
+    , .{});
+    const query = try parseTextQueryJson(alloc, parsed.value);
+
+    try std.testing.expect(query == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), query.bool_query.must.len);
+    try std.testing.expect(query.bool_query.must[0] == .term);
+    try std.testing.expectEqualStrings("tenant", query.bool_query.must[0].term.field);
+    try std.testing.expectEqualStrings("acme", query.bool_query.must[0].term.term);
+    try std.testing.expect(query.bool_query.must[1] == .term);
+    try std.testing.expectEqualStrings("body", query.bool_query.must[1].term.field);
+    try std.testing.expectEqualStrings("invoice", query.bool_query.must[1].term.term);
 }
 
 pub export fn antfly_db_execute_graph_queries_json(

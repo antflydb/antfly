@@ -128,7 +128,17 @@ pub fn parseConfigFromValue(alloc: Allocator, value: json.Value) !Config {
     });
     defer chunk_options.deinit();
 
-    return try configFromOpenApi(alloc, provider_cfg.value, chunk_options.value);
+    var cfg = try configFromOpenApi(alloc, provider_cfg.value, chunk_options.value);
+    errdefer cfg.deinit(alloc);
+    if (value == .object) {
+        if (value.object.get("url")) |url_value| {
+            if (url_value == .null) return cfg;
+            if (url_value != .string) return error.InvalidChunkerConfig;
+            if (cfg.api_url.len > 0) alloc.free(@constCast(cfg.api_url));
+            cfg.api_url = try alloc.dupe(u8, url_value.string);
+        }
+    }
+    return cfg;
 }
 
 pub fn parseStoreChunksFromSlice(alloc: Allocator, raw: []const u8) !bool {
@@ -214,6 +224,7 @@ fn audioChunkOptionsFromOpenApi(generated: ?api_openapi.AudioChunkOptions) !Audi
 
 const CombinedChunkerConfig = struct {
     api_url: ?[]const u8 = null,
+    url: ?[]const u8 = null,
     model: ?[]const u8 = null,
     provider: provider_openapi.ChunkerProvider,
     store_chunks: ?bool = null,
@@ -241,7 +252,8 @@ fn openApiFromConfig(cfg: Config) CombinedChunkerConfig {
             .window_duration_ms = if (cfg.audio.window_duration_ms > 0) cfg.audio.window_duration_ms else null,
             .overlap_duration_ms = if (cfg.audio.overlap_duration_ms > 0) cfg.audio.overlap_duration_ms else null,
         } else null,
-        .api_url = if (cfg.api_url.len > 0) cfg.api_url else null,
+        .api_url = if (cfg.provider == .termite and cfg.api_url.len > 0) cfg.api_url else null,
+        .url = if (cfg.provider == .antfly and cfg.api_url.len > 0) cfg.api_url else null,
         .model = if (cfg.model.len > 0) cfg.model else null,
         .provider = provider,
         .store_chunks = if (cfg.store_chunks) true else null,

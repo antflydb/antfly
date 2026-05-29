@@ -223,17 +223,38 @@ def api(base_url):
             return r.json()
 
         def classify(self, text: list[str], labels: list[str], model: str = "", **kwargs):
-            body = {"model": model, "texts": text, "labels": labels, **kwargs}
-            r = self.post("/classify", json=body)
+            multi_label = bool(kwargs.pop("multi_label", False))
+            body = {
+                "model": model or "cross-encoder/nli-distilroberta-base",
+                "inputs": [{"content": value} for value in text],
+                "schema": {
+                    "classifications": [{
+                        "name": "classification",
+                        "labels": labels,
+                        "multi_label": multi_label,
+                    }],
+                },
+                **kwargs,
+            }
+            r = self.post("/extract", json=body)
             _check(r)
             return r.json()
 
         def recognize(self, text: list[str], model: str = "", labels: list[str] | None = None, **kwargs):
-            body: dict = {"model": model, "texts": text}
-            if labels is not None:
-                body["labels"] = labels
-            body.update(kwargs)
-            r = self.post("/recognize", json=body)
+            relation_labels = kwargs.pop("relation_labels", None)
+            schema: dict = {}
+            schema["entities"] = labels if labels is not None else ["PER", "ORG", "LOC", "MISC"]
+            if relation_labels is not None:
+                schema["relations"] = [{"type": label} for label in relation_labels]
+            if "resolver" in kwargs:
+                kwargs.pop("resolver")
+            body: dict = {
+                "model": model or "fastino/gliner2-base-v1",
+                "inputs": [{"content": value} for value in text],
+                "schema": schema,
+                **kwargs,
+            }
+            r = self.post("/extract", json=body)
             _check(r)
             return r.json()
 
@@ -258,11 +279,41 @@ def api(base_url):
             return r.json()
 
         def extract(self, texts: list[str] | None = None, images: list[str] | None = None, schema: dict | None = None, model: str = "", **kwargs):
-            body = {"model": model, "schema": schema or {}, **kwargs}
+            def structure_schema(raw: dict | None) -> dict:
+                structures: dict = {}
+                for name, fields in (raw or {}).items():
+                    field_map: dict = {}
+                    for field in fields:
+                        if isinstance(field, str):
+                            parts = field.split("::")
+                            field_map[parts[0]] = "list" if "list" in parts[1:] else "str"
+                        elif isinstance(field, dict):
+                            field_name = field.get("name")
+                            if field_name:
+                                field_map[field_name] = field.get("type", "str")
+                    structures[name] = {"fields": field_map}
+                return {"structures": structures}
+
+            options = {}
+            for key in ("threshold", "flat_ner", "include_confidence", "include_spans"):
+                if key in kwargs:
+                    options[key] = kwargs.pop(key)
+
+            body = {
+                "model": model,
+                "inputs": [],
+                "schema": structure_schema(schema),
+                **kwargs,
+            }
+            if options:
+                body["options"] = options
             if texts is not None:
-                body["texts"] = texts
+                body["inputs"].extend({"content": value} for value in texts)
             if images is not None:
-                body["images"] = [{"url": img} if isinstance(img, str) else img for img in images]
+                body["inputs"].extend(
+                    {"content": {"type": "image_url", "image_url": {"url": img}} if isinstance(img, str) else img}
+                    for img in images
+                )
             r = self.post("/extract", json=body)
             _check(r)
             return r.json()

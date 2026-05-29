@@ -16,13 +16,16 @@ const std = @import("std");
 const httpx = @import("httpx");
 const config_mod = @import("config.zig");
 const transcribing = @import("antfly_transcribing");
+const readers = @import("antfly_readers");
 const synthesizing = @import("antfly_synthesizing");
 
 pub const ActiveRuntime = struct {
     client: ?httpx.Client = null,
     transcribing_runtime: ?transcribing.Runtime = null,
+    readers_runtime: ?readers.Runtime = null,
     synthesizing_runtime: ?synthesizing.Runtime = null,
     previous_transcribing_runtime: ?*const transcribing.Runtime = null,
+    previous_readers_runtime: ?*const readers.Runtime = null,
     previous_synthesizing_runtime: ?*const synthesizing.Runtime = null,
 
     pub fn init(
@@ -32,9 +35,10 @@ pub const ActiveRuntime = struct {
     ) !ActiveRuntime {
         var out = ActiveRuntime{};
         const loaded = cfg orelse return out;
-        const has_transcribing = loaded.speech_to_text.defaultProviderName() != null;
+        const has_transcribing = loaded.transcribers.defaultProviderName() != null;
+        const has_readers = loaded.readers.defaultProviderName() != null;
         const has_synthesizing = loaded.text_to_speech.defaultProviderName() != null;
-        if (!has_transcribing and !has_synthesizing) return out;
+        if (!has_transcribing and !has_readers and !has_synthesizing) return out;
 
         out.client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
         errdefer if (out.client) |*client| client.deinit();
@@ -42,9 +46,17 @@ pub const ActiveRuntime = struct {
         if (has_transcribing) {
             out.transcribing_runtime = transcribing.Runtime.init(alloc);
             errdefer if (out.transcribing_runtime) |*runtime| runtime.deinit();
-            try out.transcribing_runtime.?.loadFromRegistry(&out.client.?, &loaded.speech_to_text);
+            try out.transcribing_runtime.?.loadFromRegistry(&out.client.?, &loaded.transcribers);
             out.previous_transcribing_runtime = transcribing.getActiveRuntime();
             transcribing.setActiveRuntime(&out.transcribing_runtime.?);
+        }
+
+        if (has_readers) {
+            out.readers_runtime = readers.Runtime.init(alloc);
+            errdefer if (out.readers_runtime) |*runtime| runtime.deinit();
+            try out.readers_runtime.?.loadFromRegistry(&out.client.?, &loaded.readers);
+            out.previous_readers_runtime = readers.getActiveRuntime();
+            readers.setActiveRuntime(&out.readers_runtime.?);
         }
 
         if (has_synthesizing) {
@@ -63,6 +75,10 @@ pub const ActiveRuntime = struct {
             synthesizing.setActiveRuntime(self.previous_synthesizing_runtime);
             runtime.deinit();
         }
+        if (self.readers_runtime) |*runtime| {
+            readers.setActiveRuntime(self.previous_readers_runtime);
+            runtime.deinit();
+        }
         if (self.transcribing_runtime) |*runtime| {
             transcribing.setActiveRuntime(self.previous_transcribing_runtime);
             runtime.deinit();
@@ -79,7 +95,8 @@ test "audio runtime activates configured transcribing and synthesizing providers
 
     var cfg = config_mod.Config{
         .registry = @import("provider_registry.zig").Registry.init(alloc),
-        .speech_to_text = transcribing.Registry.init(alloc),
+        .transcribers = transcribing.Registry.init(alloc),
+        .readers = readers.Registry.init(alloc),
         .text_to_speech = synthesizing.Registry.init(alloc),
     };
     defer cfg.deinit();
@@ -90,7 +107,7 @@ test "audio runtime activates configured transcribing and synthesizing providers
         .model = try alloc.dupe(u8, "whisper-small"),
     };
     defer transcribing.deinitConfig(alloc, &stt_cfg);
-    try cfg.speech_to_text.registerConfig("local-stt", stt_cfg);
+    try cfg.transcribers.registerConfig("local-stt", stt_cfg);
 
     var tts_cfg = synthesizing.Config{
         .provider = .openai,

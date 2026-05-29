@@ -1528,158 +1528,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ai/v1/recognize": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Recognize named entities
-         * @description Recognizes named entities (persons, organizations, locations, etc.) from text using ONNX recognition models.
-         *
-         *     ## Entity Types
-         *
-         *     Standard CoNLL entity types:
-         *     - **PER**: Person names (e.g., "John Smith")
-         *     - **ORG**: Organizations (e.g., "Google", "Apple Inc.")
-         *     - **LOC**: Locations (e.g., "New York", "France")
-         *     - **MISC**: Miscellaneous entities
-         *
-         *     ## Models
-         *
-         *     - Models are auto-discovered from `models_dir/recognizers/`
-         *     - Supports quantized variants (model_i8.onnx)
-         *     - Compatible with HuggingFace BERT-based recognition models
-         *     - GLiNER models support custom entity labels via the `labels` parameter
-         */
-        post: operations["recognizeEntities"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/ai/v1/classify": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Zero-shot text classification
-         * @description Classifies text into arbitrary categories using NLI-based zero-shot classification models.
-         *
-         *     ## How It Works
-         *
-         *     Zero-shot classification uses Natural Language Inference (NLI) to classify text
-         *     without requiring training data for the specific categories. The model determines
-         *     how well a text "entails" each candidate label.
-         *
-         *     ## Models
-         *
-         *     - Models are auto-discovered from `models_dir/classifiers/`
-         *     - Supports multilingual models like mDeBERTa-mnli-xnli
-         *     - Compatible with HuggingFace NLI/MNLI models exported to ONNX
-         *
-         *     ## Use Cases
-         *
-         *     - **Sentiment Analysis**: Classify as positive/negative/neutral
-         *     - **Topic Classification**: Categorize by topic without training
-         *     - **Intent Detection**: Identify user intents from text
-         *     - **Content Moderation**: Detect inappropriate content types
-         *
-         *     ## Multilingual Support
-         *
-         *     The mDeBERTa-mnli-xnli model supports 100+ languages. You can classify text
-         *     in any supported language using labels in that language.
-         */
-        post: operations["classifyText"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/ai/v1/classify/document": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Document classification
-         * @description Runs a native document classification head against a document image.
-         *
-         *     This endpoint serves `layoutdoc_sequence_head.safetensors` artifacts produced by
-         *     the Zig finetuning stack. It currently reconstructs the same compact visual/layout
-         *     feature vector used by the training code and applies the saved sequence head.
-         *
-         *     ## Current Scope
-         *
-         *     - Native `layoutdoc_sequence_head` checkpoints only
-         *     - Local image path input only
-         *     - Caller must supply labels in model output order
-         *     - Supports JPEG, PNG, and JPEG2000 image files
-         *
-         *     ## Not Yet Included
-         *
-         *     - Served `layoutdoc_token_head`
-         *     - OCR token / bbox request shapes
-         *     - Label vocab discovery from checkpoint artifacts
-         */
-        post: operations["classifyDocument"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/ai/v1/classify/document_tokens": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Document token classification
-         * @description Runs a native document token classification head against caller-provided OCR tokens and bounding boxes.
-         *
-         *     This endpoint serves `layoutdoc_token_head.safetensors` artifacts produced by the
-         *     Zig finetuning stack. It reconstructs the same compact 6-dimensional token feature
-         *     vector used by the training code for each OCR token.
-         *
-         *     ## Current Scope
-         *
-         *     - Native `layoutdoc_token_head` checkpoints only
-         *     - Caller-provided OCR token text and bboxes
-         *     - Caller must supply labels in model output order
-         *
-         *     ## Not Yet Included
-         *
-         *     - OCR extraction inside this endpoint
-         *     - Sequence-head image features
-         *     - Label vocab discovery from checkpoint artifacts
-         */
-        post: operations["classifyDocumentTokens"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/ai/v1/rewrite": {
         parameters: {
             query?: never;
@@ -1820,56 +1668,13 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Extract structured data from text
-         * @description Extracts structured data from text using GLiNER2 models.
-         *     Field names in the schema are treated as NER labels, and the model's
-         *     span extraction pipeline populates field values.
-         *
-         *     ## Schema Format
-         *
-         *     The schema maps structure names to arrays of field definitions:
-         *     ```json
-         *     {
-         *       "person": ["name::str", "age::str", "skills::list"]
-         *     }
-         *     ```
-         *
-         *     Field types:
-         *     - `::str` - Keep only the top-scoring span (default if no type specified)
-         *     - `::list` - Keep all extracted spans as an array
-         *     - `::[opt1|opt2]::str` - Choice field, classified against options
-         *
-         *     ## Example
-         *
-         *     ```json
-         *     {
-         *       "model": "fastino/gliner2-base-v1",
-         *       "texts": ["John Smith is 30 years old and works at Google."],
-         *       "schema": {
-         *         "person": ["name::str", "age::str", "company::str"]
-         *       }
-         *     }
-         *     ```
-         *
-         *     Response:
-         *     ```json
-         *     {
-         *       "model": "fastino/gliner2-base-v1",
-         *       "results": [
-         *         {
-         *           "person": [
-         *             {
-         *               "name": {"value": "John Smith"},
-         *               "age": {"value": "30"},
-         *               "company": {"value": "Google"}
-         *             }
-         *           ]
-         *         }
-         *       ]
-         *     }
-         *     ```
+         * Extract entities, relations, classifications, and structures
+         * @description Schema-driven extraction over shared AI content parts. This is the
+         *     canonical public API for named entity recognition, relation extraction,
+         *     text/document classification, token classification, and structured
+         *     document extraction.
          */
-        post: operations["extractJSON"];
+        post: operations["extract"];
         delete?: never;
         options?: never;
         head?: never;
@@ -8061,41 +7866,11 @@ export interface components {
             /** @description Error message */
             error: string;
         };
-        /** @description Text content for embedding */
-        InferenceTextContentPart: {
-            /** @enum {string} */
-            type: "text";
-            /** @description Text content to embed */
-            text: string;
-        };
-        /** @description Image URL or data URI */
-        InferenceImageURL: {
-            /**
-             * @description URL or data URI (data:image/png;base64,...)
-             * @example data:image/png;base64,iVBORw0KGgo...
-             */
-            url: string;
-        };
-        /** @description Image content for embedding (OpenAI-compatible format) */
-        InferenceImageURLContentPart: {
-            /** @enum {string} */
-            type: "image_url";
-            image_url: components["schemas"]["InferenceImageURL"];
-        };
-        /** @description Inline binary media content (audio, image, etc.) */
-        InferenceMediaContentPart: {
-            /** @enum {string} */
-            type: "media";
-            /**
-             * Format: byte
-             * @description Base64-encoded binary data
-             */
-            data: string;
-            /** @description MIME type (audio/wav, image/gif, image/png, etc.) */
-            mime_type: string;
-        };
-        /** @description A content part for multimodal input (text, image URL, or inline media) */
-        InferenceContentPart: components["schemas"]["InferenceTextContentPart"] | components["schemas"]["InferenceImageURLContentPart"] | components["schemas"]["InferenceMediaContentPart"];
+        InferenceTextContentPart: components["schemas"]["TextContentPart"];
+        InferenceImageURL: components["schemas"]["ImageURL"];
+        InferenceImageURLContentPart: components["schemas"]["ImageURLContentPart"];
+        InferenceMediaContentPart: components["schemas"]["MediaContentPart"];
+        InferenceContentPart: components["schemas"]["ContentPart"];
         /** @description OpenAI-compatible embedding request with inference multimodal content-part extension */
         InferenceEmbedRequest: {
             /** @description Model name to use for embedding generation */
@@ -9117,31 +8892,19 @@ export interface components {
              */
             strict?: boolean;
         };
-        /** @description A tool call made by the model */
+        /** @description OpenAI-compatible assistant tool call. */
         InferenceToolCall: {
-            /**
-             * @description Unique identifier for this tool call
-             * @example call_abc123
-             */
+            /** @description Tool call identifier. */
             id: string;
-            /**
-             * @description The type of tool call (currently only "function")
-             * @enum {string}
-             */
+            /** @enum {string} */
             type: "function";
             function: components["schemas"]["InferenceToolCallFunction"];
         };
-        /** @description The function called by the model */
+        /** @description The function called by a model tool call. */
         InferenceToolCallFunction: {
-            /**
-             * @description The name of the function called
-             * @example get_weather
-             */
+            /** @description Function name. */
             name: string;
-            /**
-             * @description JSON string of the arguments to the function
-             * @example {"location": "San Francisco, CA"}
-             */
+            /** @description JSON string of function arguments. */
             arguments: string;
         };
         /**
@@ -9159,11 +8922,7 @@ export interface components {
                 name: string;
             };
         };
-        /**
-         * @description The role of a message sender in a conversation
-         * @enum {string}
-         */
-        InferenceRole: "system" | "user" | "assistant" | "tool";
+        InferenceRole: components["schemas"]["ChatMessageRole"];
         /**
          * @description Reason why generation stopped
          * @enum {string}
@@ -9766,6 +9525,124 @@ export interface components {
             prompt_tokens: number;
             /** @description Total tokens used */
             total_tokens: number;
+        };
+        ExtractionToken: {
+            text: string;
+            box?: number[];
+        };
+        ExtractionInput: {
+            id?: string;
+            content: components["schemas"]["ChatMessageContent"];
+            tokens?: components["schemas"]["ExtractionToken"][];
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
+        ExtractionRelationSchema: {
+            type: string;
+            source?: string;
+            target?: string;
+        };
+        ExtractionClassificationSchema: {
+            name: string;
+            labels: string[];
+            /** @default false */
+            multi_label?: boolean;
+        };
+        ExtractionStructureField: string | {
+            [key: string]: unknown;
+        };
+        ExtractionStructureSchema: {
+            fields?: {
+                [key: string]: components["schemas"]["ExtractionStructureField"];
+            };
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionSchema: {
+            entities?: string[];
+            relations?: components["schemas"]["ExtractionRelationSchema"][];
+            classifications?: components["schemas"]["ExtractionClassificationSchema"][];
+            structures?: {
+                [key: string]: components["schemas"]["ExtractionStructureSchema"];
+            };
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionReaderOptions: {
+            provider?: string;
+            model?: string;
+            url?: string;
+            api_url?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionOptions: {
+            /** Format: float */
+            threshold?: number;
+            flat_ner?: boolean;
+            include_confidence?: boolean;
+            include_spans?: boolean;
+            reader?: components["schemas"]["ExtractionReaderOptions"];
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionRequest: {
+            model: string;
+            inputs: components["schemas"]["ExtractionInput"][];
+            schema: components["schemas"]["ExtractionSchema"];
+            options?: components["schemas"]["ExtractionOptions"];
+        };
+        ExtractionEntity: {
+            label: string;
+            text: string;
+            start?: number;
+            end?: number;
+            /** Format: float */
+            score?: number;
+        };
+        ExtractionRelationEndpoint: {
+            entity_index?: number;
+            id?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionRelation: {
+            type: string;
+            source?: components["schemas"]["ExtractionRelationEndpoint"];
+            target?: components["schemas"]["ExtractionRelationEndpoint"];
+            /** Format: float */
+            score?: number;
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionClassification: {
+            name: string;
+            label: string;
+            /** Format: float */
+            score?: number;
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionObject: {
+            id?: string;
+            entities?: components["schemas"]["ExtractionEntity"][];
+            relations?: components["schemas"]["ExtractionRelation"][];
+            classifications?: components["schemas"]["ExtractionClassification"][];
+            structures?: {
+                [key: string]: unknown;
+            };
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionResponse: {
+            /** @enum {string} */
+            object: "extraction";
+            model: string;
+            data: components["schemas"]["ExtractionObject"][];
+            usage?: {
+                [key: string]: unknown;
+            };
         };
     };
     responses: {
@@ -12635,228 +12512,6 @@ export interface operations {
             };
         };
     };
-    recognizeEntities: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["InferenceRecognizeRequest"];
-            };
-        };
-        responses: {
-            /** @description Entities extracted successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceRecognizeResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Recognition service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-        };
-    };
-    classifyText: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["InferenceClassifyRequest"];
-            };
-        };
-        responses: {
-            /** @description Classification completed successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceClassifyResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-        };
-    };
-    classifyDocument: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["InferenceDocumentClassificationRequest"];
-            };
-        };
-        responses: {
-            /** @description Document classification completed successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceDocumentClassificationResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Model or image not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-        };
-    };
-    classifyDocumentTokens: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["InferenceDocumentTokenClassificationRequest"];
-            };
-        };
-        responses: {
-            /** @description Document token classification completed successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceDocumentTokenClassificationResponse"];
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Classification service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-        };
-    };
     rewriteText: {
         parameters: {
             query?: never;
@@ -13037,7 +12692,7 @@ export interface operations {
             };
         };
     };
-    extractJSON: {
+    extract: {
         parameters: {
             query?: never;
             header?: never;
@@ -13046,7 +12701,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["InferenceExtractRequest"];
+                "application/json": components["schemas"]["ExtractionRequest"];
             };
         };
         responses: {
@@ -13056,7 +12711,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["InferenceExtractResponse"];
+                    "application/json": components["schemas"]["ExtractionResponse"];
                 };
             };
             /** @description Invalid request */

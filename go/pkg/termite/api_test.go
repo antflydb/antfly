@@ -21,6 +21,69 @@ import (
 	"github.com/antflydb/antfly/go/pkg/libaf/embeddings"
 )
 
+func TestConvertChatMessagePreservesMediaImageParts(t *testing.T) {
+	textPart := ContentPart{}
+	if err := textPart.FromTextContentPart(TextContentPart{
+		Type: TextContentPartTypeText,
+		Text: "describe",
+	}); err != nil {
+		t.Fatalf("text part: %v", err)
+	}
+
+	mediaURLPart := ContentPart{}
+	if err := mediaURLPart.FromMediaContentPart(MediaContentPart{
+		Type:     MediaContentPartTypeMedia,
+		Url:      "https://example.test/image.png",
+		MimeType: "image/png",
+	}); err != nil {
+		t.Fatalf("media url part: %v", err)
+	}
+
+	inlineMediaPart := ContentPart{}
+	if err := inlineMediaPart.FromMediaContentPart(MediaContentPart{
+		Type:     MediaContentPartTypeMedia,
+		Data:     []byte{1, 2, 3},
+		MimeType: "image/jpeg",
+	}); err != nil {
+		t.Fatalf("inline media part: %v", err)
+	}
+
+	audioPart := ContentPart{}
+	if err := audioPart.FromMediaContentPart(MediaContentPart{
+		Type:     MediaContentPartTypeMedia,
+		Url:      "https://example.test/audio.wav",
+		MimeType: "audio/wav",
+	}); err != nil {
+		t.Fatalf("audio media part: %v", err)
+	}
+
+	content := ChatMessageContent{}
+	if err := content.FromChatMessageContent1([]ContentPart{textPart, mediaURLPart, inlineMediaPart, audioPart}); err != nil {
+		t.Fatalf("content: %v", err)
+	}
+
+	msg := convertChatMessage(ChatMessage{
+		Role:    RoleUser,
+		Content: content,
+	})
+
+	if msg.Content != "describe" {
+		t.Fatalf("content = %q", msg.Content)
+	}
+	if len(msg.Parts) != 3 {
+		t.Fatalf("got %d parts, want 3", len(msg.Parts))
+	}
+	if msg.Parts[0].Type != "text" || msg.Parts[0].Text != "describe" {
+		t.Fatalf("text part = %#v", msg.Parts[0])
+	}
+	if msg.Parts[1].Type != "image_url" || msg.Parts[1].ImageURL != "https://example.test/image.png" {
+		t.Fatalf("media url image part = %#v", msg.Parts[1])
+	}
+	if msg.Parts[2].Type != "image_url" || msg.Parts[2].ImageURL != "data:image/jpeg;base64,AQID" {
+		t.Fatalf("inline media image part = %#v", msg.Parts[2])
+	}
+}
+
 func TestValidateContentTypes(t *testing.T) {
 	caps := embeddings.EmbedderCapabilities{
 		SupportedMIMETypes: []embeddings.MIMETypeSupport{

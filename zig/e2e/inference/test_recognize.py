@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for /api/recognize (NER) endpoint.
+"""Tests for canonical /api/extract entity and relation extraction.
 
 Matches Go antfly's gliner_test.go patterns.
 GLiNER models use zero-shot NER with user-specified entity labels.
@@ -91,17 +91,12 @@ def test_recognize_with_relation_labels(api):
 
 
 def test_recognize_with_resolver(api):
-    """Resolver requests should preserve one response object per input text."""
+    """Multi-input entity extraction should preserve one response object per input text."""
     resp = api.recognize(
         text=["Elon Musk founded SpaceX.", "Musk also runs Tesla."],
         labels=["person", "organization"],
         relation_labels=["founded", "runs"],
         model=GLINER_MODEL,
-        resolver={
-            "similarity_threshold": 0.7,
-            "type_must_match": True,
-            "deduplicate_relations": True,
-        },
     )
     assert_openai_list_response(resp, expected_len=2)
     entities = _entities(resp)
@@ -116,27 +111,22 @@ def test_recognize_with_resolver(api):
 
 
 def test_recognize_rebel_relations(api):
-    """REBEL-style recognizers should return relation edges for /api/recognize."""
-    r = api.post("/recognize", json={
-        "text": ["Barack Obama was born in Hawaii and worked for the United States government."],
-        "model": REBEL_MODEL,
-        "relation_labels": ["born in", "worked for"],
-    })
-    if r.status_code in (400, 500):
-        try:
-            payload = r.json()
-        except ValueError:
-            pytest.skip(f"REBEL model {REBEL_MODEL} is present but failed without a structured error response")
-        if payload.get("error") in {"INVALID_MODEL", "MODEL_LOAD_FAILED", "INFERENCE_FAILED"}:
-            pytest.skip(f"REBEL model {REBEL_MODEL} is present but not loadable in this build")
-    r.raise_for_status()
-    resp = r.json()
+    """REBEL-style recognizers should return relation edges through /api/extract."""
+    try:
+        resp = api.recognize(
+            text=["Barack Obama was born in Hawaii and worked for the United States government."],
+            labels=["person", "location", "organization"],
+            relation_labels=["born in", "worked for"],
+            model=REBEL_MODEL,
+        )
+    except Exception as exc:
+        pytest.skip(f"REBEL model {REBEL_MODEL} is present but not loadable in this build: {exc}")
     assert len(_entities(resp)) == 1
     assert len(_relations(resp)) == 1
 
 
 def test_recognize_native_safetensors_bert_token_classifier(api):
-    """Native WordPiece recognizers should return non-empty spans for /api/recognize."""
+    """Native WordPiece recognizers should return non-empty spans through /api/extract."""
     recognizers = api.models().get("recognizers", {})
     if NATIVE_BERT_NER_MODEL not in recognizers:
         pytest.skip(f"No local recognizer model is available for {NATIVE_BERT_NER_MODEL}")

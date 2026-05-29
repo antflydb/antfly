@@ -17,12 +17,12 @@ T = TypeVar("T", bound="InferenceToolCall")
 
 @_attrs_define
 class InferenceToolCall:
-    """A tool call made by the model
+    """OpenAI-compatible assistant tool call.
 
     Attributes:
-        id (str): Unique identifier for this tool call Example: call_abc123.
-        type_ (InferenceToolCallType): The type of tool call (currently only "function")
-        function (InferenceToolCallFunction): The function called by the model
+        id (str): Tool call identifier.
+        type_ (InferenceToolCallType):
+        function (InferenceToolCallFunction): The function called by a model tool call.
     """
 
     id: str

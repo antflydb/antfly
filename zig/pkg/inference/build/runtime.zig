@@ -55,6 +55,7 @@ pub const SharedModules = struct {
     platform: ?*std.Build.Module = null,
     vellum: ?*std.Build.Module = null,
     scraping: ?*std.Build.Module = null,
+    google: ?*std.Build.Module = null,
     objectstore: ?*std.Build.Module = null,
     regex: ?*std.Build.Module = null,
     jsonschema: ?*std.Build.Module = null,
@@ -69,6 +70,7 @@ pub const SharedModules = struct {
     pjrt: ?*std.Build.Module = null,
     inference_api: ?*std.Build.Module = null,
     generating_openapi: ?*std.Build.Module = null,
+    extraction_openapi: ?*std.Build.Module = null,
     inference_client: ?*std.Build.Module = null,
 };
 
@@ -135,10 +137,17 @@ pub fn create(config: Config) Graph {
     };
     const platform_mod = shared.platform orelse createSharedModule(config, "lib/platform/src/root.zig");
     const vellum_mod = shared.vellum orelse createSharedModule(config, "lib/vellum/src/mod.zig");
+    const google_mod = shared.google orelse blk: {
+        const mod = createSharedModule(config, "lib/google/src/root.zig");
+        mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_platform", platform_mod);
+        break :blk mod;
+    };
     const objectstore_mod = shared.objectstore orelse blk: {
         const mod = createSharedModule(config, "lib/objectstore/src/root.zig");
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_platform", platform_mod);
+        mod.addImport("antfly_google", google_mod);
         break :blk mod;
     };
     const scraping_mod = shared.scraping orelse blk: {
@@ -327,7 +336,7 @@ pub fn create(config: Config) Graph {
 
 pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
-        .name = "termite",
+        .name = "antfly-inference",
         .root_module = b.createModule(.{
             .root_source_file = b.path(pathJoin(b, inference_root, "src/main.zig")),
             .target = target,
@@ -460,7 +469,7 @@ fn addInferenceApiModule(
 
     const spec_path_override = b.option(
         []const u8,
-        "termite-openapi-spec",
+        "inference-openapi-spec",
         "Path to the inference OpenAPI YAML spec used to generate inference_api",
     );
 
@@ -472,6 +481,7 @@ fn addInferenceApiModule(
         });
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+        mod.addImport("antfly_extraction_openapi", shared.extraction_openapi orelse addExtractionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));
         return mod;
     }
 
@@ -493,6 +503,9 @@ fn addInferenceApiModule(
     codegen.addFileArg(json_spec);
     codegen.addArgs(&.{ "--package", "inference_api" });
     codegen.addArgs(&.{ "--generate", "types,server,client" });
+    codegen.addArgs(&.{"--import-mapping"});
+    codegen.addArg(b.fmt("{s}={s}", .{ "../shared/generating.yaml", "antfly_generating_openapi" }));
+    codegen.addArg(b.fmt("{s}={s}", .{ "../ai/extraction.yaml", "antfly_extraction_openapi" }));
     codegen.addArg("--output");
     const gen_dir = codegen.addOutputDirectoryArg("inference_api");
     const mod = addOrCreateModule(b, register_public_modules, "inference_api", .{
@@ -501,6 +514,23 @@ fn addInferenceApiModule(
         .optimize = optimize,
     });
     mod.addImport("httpx", httpx_mod);
+    mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    mod.addImport("antfly_extraction_openapi", shared.extraction_openapi orelse addExtractionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));
+    return mod;
+}
+
+fn addExtractionOpenApiModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    paths: Paths,
+    generating_openapi_mod: *std.Build.Module,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
     mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     return mod;
 }

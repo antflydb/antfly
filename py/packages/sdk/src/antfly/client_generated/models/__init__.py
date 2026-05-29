@@ -137,6 +137,28 @@ from .eval_summary import EvalSummary
 from .evaluator_name import EvaluatorName
 from .evaluator_score import EvaluatorScore
 from .evaluator_score_metadata import EvaluatorScoreMetadata
+from .extraction_classification import ExtractionClassification
+from .extraction_classification_schema import ExtractionClassificationSchema
+from .extraction_entity import ExtractionEntity
+from .extraction_input import ExtractionInput
+from .extraction_input_metadata import ExtractionInputMetadata
+from .extraction_object import ExtractionObject
+from .extraction_object_structures import ExtractionObjectStructures
+from .extraction_options import ExtractionOptions
+from .extraction_reader_options import ExtractionReaderOptions
+from .extraction_relation import ExtractionRelation
+from .extraction_relation_endpoint import ExtractionRelationEndpoint
+from .extraction_relation_schema import ExtractionRelationSchema
+from .extraction_request import ExtractionRequest
+from .extraction_response import ExtractionResponse
+from .extraction_response_object import ExtractionResponseObject
+from .extraction_response_usage import ExtractionResponseUsage
+from .extraction_schema import ExtractionSchema
+from .extraction_schema_structures import ExtractionSchemaStructures
+from .extraction_structure_field_type_1 import ExtractionStructureFieldType1
+from .extraction_structure_schema import ExtractionStructureSchema
+from .extraction_structure_schema_fields import ExtractionStructureSchemaFields
+from .extraction_token import ExtractionToken
 from .failed_operation import FailedOperation
 from .failed_operation_operation import FailedOperationOperation
 from .fetch_config import FetchConfig
@@ -662,6 +684,28 @@ __all__ = (
     "EvaluatorName",
     "EvaluatorScore",
     "EvaluatorScoreMetadata",
+    "ExtractionClassification",
+    "ExtractionClassificationSchema",
+    "ExtractionEntity",
+    "ExtractionInput",
+    "ExtractionInputMetadata",
+    "ExtractionObject",
+    "ExtractionObjectStructures",
+    "ExtractionOptions",
+    "ExtractionReaderOptions",
+    "ExtractionRelation",
+    "ExtractionRelationEndpoint",
+    "ExtractionRelationSchema",
+    "ExtractionRequest",
+    "ExtractionResponse",
+    "ExtractionResponseObject",
+    "ExtractionResponseUsage",
+    "ExtractionSchema",
+    "ExtractionSchemaStructures",
+    "ExtractionStructureFieldType1",
+    "ExtractionStructureSchema",
+    "ExtractionStructureSchemaFields",
+    "ExtractionToken",
     "FailedOperation",
     "FailedOperationOperation",
     "FetchConfig",

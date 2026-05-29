@@ -274,14 +274,6 @@ pub const Provider = struct {
     fn generateImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
-        const Message = struct {
-            role: []const u8,
-            content: []const u8,
-        };
-        const Request = struct {
-            model: []const u8,
-            messages: []const Message,
-        };
         const Response = struct {
             choices: []const struct {
                 message: struct {
@@ -290,25 +282,9 @@ pub const Provider = struct {
             },
         };
 
-        const api_messages = try alloc.alloc(Message, messages.len);
-        defer alloc.free(api_messages);
-        for (messages, 0..) |msg, i| {
-            api_messages[i] = .{
-                .role = switch (msg.role) {
-                    .system => "system",
-                    .user => "user",
-                    .assistant => "assistant",
-                },
-                .content = msg.content,
-            };
-        }
-
         const url = try std.fmt.allocPrint(self.allocator, "{s}/generate", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, Request{
-            .model = model,
-            .messages = api_messages,
-        });
+        const json_body = try inference.chatRequestJsonAlloc(self.allocator, model, messages, .termite_native);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
             .json = json_body,
@@ -446,7 +422,7 @@ test "antfly generate round trip" {
             defer provider.deinit();
 
             var gen = provider.generator();
-            var result = gen.generate(a, "test-model", &.{.{ .role = .user, .content = "Hello" }}) catch |e| {
+            var result = gen.generate(a, "test-model", &.{.{ .role = .user, .content = .{ .text = "Hello" } }}) catch |e| {
                 err_out.* = e;
                 return;
             };

@@ -23,6 +23,7 @@ pub const types = @import("types.zig");
 pub const bedrock = @import("bedrock.zig");
 pub const local = @import("local.zig");
 pub const openai = @import("openai.zig");
+pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
 
 pub const Embedder = types.Embedder;
@@ -34,12 +35,14 @@ pub const GenerateResult = types.GenerateResult;
 pub const RerankResult = types.RerankResult;
 pub const ChatMessage = types.ChatMessage;
 pub const Role = types.Role;
+pub const ContentPart = types.ContentPart;
 
 test "inference module compiles" {
     _ = types;
     _ = bedrock;
     _ = local;
     _ = openai;
+    _ = vertex;
     _ = managed_embedder;
 }
 

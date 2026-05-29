@@ -2663,14 +2663,20 @@ fn patternBoolFilterToSearchQuery(
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !search_mod.SearchQuery {
     if (value != .object) return error.InvalidArgument;
+    var must_out = std.ArrayListUnmanaged(search_mod.SearchQuery).empty;
+    errdefer must_out.deinit(alloc);
+    if (value.object.get("filter")) |filter| {
+        try appendPatternFilterArrayToSearchQueries(alloc, &must_out, filter, text_analysis, runtime_schema);
+    }
+    if (value.object.get("must")) |must| {
+        try appendPatternFilterArrayToSearchQueries(alloc, &must_out, must, text_analysis, runtime_schema);
+    }
     const has_must = value.object.get("must") != null or value.object.get("filter") != null;
     const has_should = value.object.get("should") != null;
     const only_must_not = !has_must and !has_should and value.object.get("must_not") != null;
     return .{ .bool_query = .{
-        .must = if (value.object.get("must")) |must|
-            try patternFilterArrayToSearchQueries(alloc, must, text_analysis, runtime_schema)
-        else if (value.object.get("filter")) |filter|
-            try patternFilterArrayToSearchQueries(alloc, filter, text_analysis, runtime_schema)
+        .must = if (must_out.items.len > 0)
+            try must_out.toOwnedSlice(alloc)
         else if (only_must_not)
             &.{.{ .match_all = {} }}
         else
@@ -2685,6 +2691,20 @@ fn patternBoolFilterToSearchQuery(
             &.{},
         .min_should = if (!has_must and has_should) 1 else 0,
     } };
+}
+
+fn appendPatternFilterArrayToSearchQueries(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(search_mod.SearchQuery),
+    value: std.json.Value,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !void {
+    if (value != .array or value.array.items.len == 0) return error.InvalidArgument;
+    try out.ensureUnusedCapacity(alloc, value.array.items.len);
+    for (value.array.items) |item| {
+        out.appendAssumeCapacity(try patternFilterValueToSearchQuery(alloc, item, text_analysis, runtime_schema));
+    }
 }
 
 fn patternFilterArrayToSearchQueries(
@@ -2856,6 +2876,24 @@ test "pattern filter single-field helpers accept explicit path alias" {
     try std.testing.expectEqualStrings("/tier", fuzzy.field);
     try std.testing.expectEqualStrings("gild", fuzzy.term);
     try std.testing.expectEqual(@as(u8, 1), fuzzy.prefix_len);
+}
+
+test "pattern bool filter clauses are merged into required search clauses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool":{"must":[{"doc_id":["doc:must"]}],"filter":[{"doc_id":["doc:filter"]}]}}
+    , .{});
+    const query = try patternFilterValueToSearchQuery(alloc, parsed.value, .{}, null);
+
+    try std.testing.expect(query == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), query.bool_query.must.len);
+    try std.testing.expect(query.bool_query.must[0] == .doc_id);
+    try std.testing.expectEqualStrings("doc:filter", query.bool_query.must[0].doc_id.ids[0]);
+    try std.testing.expect(query.bool_query.must[1] == .doc_id);
+    try std.testing.expectEqualStrings("doc:must", query.bool_query.must[1].doc_id.ids[0]);
 }
 
 fn parseFuzzyOptions(object: anytype, out: *FieldFuzzy) !void {
@@ -4218,7 +4256,7 @@ fn collectPatternFilterValueTerms(
             .object => |inner| inner,
             else => return,
         };
-        for ([_][]const u8{ "must", "should", "must_not" }) |key| {
+        for ([_][]const u8{ "must", "filter", "should", "must_not" }) |key| {
             const items = bool_object.get(key) orelse continue;
             const array = switch (items) {
                 .array => |array| array,

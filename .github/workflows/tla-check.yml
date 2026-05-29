@@ -21,6 +21,10 @@ concurrency:
 
 jobs:
   tla-check:
+    # TLA+ model checking now runs inside the Zig unit job in zig-tests.yml so
+    # this standalone workflow does not allocate an extra runner. Set
+    # ENABLE_STANDALONE_TLA_CI=true to opt back in.
+    if: ${{ vars.ENABLE_STANDALONE_TLA_CI == 'true' }}
     runs-on: arc-antfly-standard
     timeout-minutes: 15
     steps:

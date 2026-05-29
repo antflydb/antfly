@@ -905,50 +905,6 @@ pub const Client = struct {
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = resp.contentType(), .allocator = self.allocator };
     }
 
-    /// Recognize named entities
-    /// POST /ai/v1/recognize
-    pub fn recognizeEntities(self: *@This(), body: types.InferenceRecognizeRequest) !ApiResponse(types.InferenceRecognizeResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/recognize", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
-        defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InferenceRecognizeResponse).fromResponse(self.allocator, &resp);
-    }
-
-    /// Zero-shot text classification
-    /// POST /ai/v1/classify
-    pub fn classifyText(self: *@This(), body: types.InferenceClassifyRequest) !ApiResponse(types.InferenceClassifyResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/classify", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
-        defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InferenceClassifyResponse).fromResponse(self.allocator, &resp);
-    }
-
-    /// Document classification
-    /// POST /ai/v1/classify/document
-    pub fn classifyDocument(self: *@This(), body: types.InferenceDocumentClassificationRequest) !ApiResponse(types.InferenceDocumentClassificationResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/classify/document", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
-        defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InferenceDocumentClassificationResponse).fromResponse(self.allocator, &resp);
-    }
-
-    /// Document token classification
-    /// POST /ai/v1/classify/document_tokens
-    pub fn classifyDocumentTokens(self: *@This(), body: types.InferenceDocumentTokenClassificationRequest) !ApiResponse(types.InferenceDocumentTokenClassificationResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/classify/document_tokens", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
-        defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InferenceDocumentTokenClassificationResponse).fromResponse(self.allocator, &resp);
-    }
-
     /// Rewrite text using Seq2Seq models
     /// POST /ai/v1/rewrite
     pub fn rewriteText(self: *@This(), body: types.InferenceRewriteRequest) !ApiResponse(types.InferenceRewriteResponse) {
@@ -982,15 +938,15 @@ pub const Client = struct {
         return ApiResponse(types.InferenceTranscribeResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Extract structured data from text
+    /// Extract entities, relations, classifications, and structures
     /// POST /ai/v1/extract
-    pub fn extractJSON(self: *@This(), body: types.InferenceExtractRequest) !ApiResponse(types.InferenceExtractResponse) {
+    pub fn extract(self: *@This(), body: types.ExtractionRequest) !ApiResponse(types.ExtractionResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InferenceExtractResponse).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.ExtractionResponse).fromResponse(self.allocator, &resp);
     }
 
     /// List available models

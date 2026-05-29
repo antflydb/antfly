@@ -84,6 +84,7 @@ jobs:
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/**' \
+            ':(glob)scripts/ci/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/zig-container.yml
@@ -95,6 +96,7 @@ jobs:
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/**' \
+            ':(glob)scripts/ci/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/zig-container.yml
@@ -135,8 +137,9 @@ jobs:
 
   unit:
     needs: changes
-    if: github.event_name != 'schedule' && needs.changes.outputs.zig_tests == 'true'
+    if: (github.event_name != 'schedule' && needs.changes.outputs.zig_tests == 'true') || needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
     runs-on: arc-antfly-heavy
+    timeout-minutes: 45
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
@@ -171,6 +174,7 @@ jobs:
         run: make zig-openapi-check
 
       - name: Run hermetic Antfly unit tests
+        if: needs.changes.outputs.zig_tests == 'true'
         run: make zig-unit-test
 
   full-default:
@@ -345,7 +349,8 @@ jobs:
         if: needs.changes.outputs.trace_validate == 'true'
         run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 
-      - name: Set up Java
+      - name: Set up Java for TLA+
+        if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
         uses: actions/setup-java@v5
         with:
           distribution: "temurin"
@@ -390,3 +395,129 @@ jobs:
         if: needs.changes.outputs.trace_validate == 'true'
         working-directory: zig
         run: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson
+
+  full-default:
+    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    runs-on: arc-antfly-heavy
+    env:
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Prepare ARC cache dirs
+        run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Run full Zig unit tests
+        run: make zig-test
+
+  e2e-base:
+    needs: changes
+    if: github.event_name != 'schedule' && needs.changes.outputs.e2e == 'true'
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 45
+    env:
+      UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
+      HF_HOME: /mnt/cache/antfly/zig/hf
+      TERMITE_HOME: /mnt/cache/antfly/zig/termite
+      ANTFLY_CI_TRACE: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Prepare ARC cache dirs
+        run: |
+          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$TERMITE_HOME"
+          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-termite
+          rm -rf ~/.cache ~/.termite
+          ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
+          ln -s /mnt/cache/antfly/zig/home-termite ~/.termite
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Build E2E binaries
+        run: scripts/ci/zig-build-e2e-binaries.sh
+
+      - name: Run base E2E
+        env:
+          SKIP_BUILD: "1"
+        run: scripts/ci/zig-e2e-base-linux.sh
+
+  e2e-full:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 90
+    env:
+      UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
+      HF_HOME: /mnt/cache/antfly/zig/hf
+      TERMITE_HOME: /mnt/cache/antfly/zig/termite
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Prepare ARC cache dirs
+        run: |
+          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$TERMITE_HOME"
+          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-termite
+          rm -rf ~/.cache ~/.termite
+          ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
+          ln -s /mnt/cache/antfly/zig/home-termite ~/.termite
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Build E2E binaries
+        run: scripts/ci/zig-build-e2e-binaries.sh
+
+      - name: Run Antfly full E2E
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_LSM_OPEN_DEBUG: "1"
+          ANTFLY_FS_PATH_DEBUG: "1"
+        run: |
+          chmod +x ./zig-out/bin/antfly ./zig-out/bin/termite
+          uv run --project e2e/antfly pytest -q -x e2e/antfly
+
+      - name: Run Termite full E2E
+        working-directory: zig
+        env:
+          TERMITE_BIN: ./zig-out/bin/termite
+        run: uv run --project e2e/termite pytest -q -x e2e/termite

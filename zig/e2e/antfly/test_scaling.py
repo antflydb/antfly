@@ -785,7 +785,7 @@ def split_scaling_cluster() -> MultiNodeScalingCluster:
     cluster = MultiNodeScalingCluster(
         _scaling_antfly_binary(),
         initial_data_node_count=5,
-        max_shard_size_bytes=2048,
+        max_shard_size_bytes=512,
     )
     try:
         yield cluster

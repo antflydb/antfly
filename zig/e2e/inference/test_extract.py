@@ -54,7 +54,7 @@ def test_extract_basic(api):
     results = resp["data"]
     assert len(results) == 1
 
-    result = results[0]["results"]
+    result = results[0]["structures"]
     assert "person" in result
     assert isinstance(result["person"], list)
     if result["person"]:
@@ -95,7 +95,7 @@ def test_extract_include_confidence_and_spans(api):
         include_confidence=True,
         include_spans=True,
     )
-    person_instances = resp["data"][0]["results"]["person"]
+    person_instances = resp["data"][0]["structures"]["person"]
     if person_instances:
         for value in person_instances[0].values():
             values = value if isinstance(value, list) else [value]
@@ -128,8 +128,8 @@ def test_extract_from_images_via_reader(api):
     )
     results = resp["data"]
     assert len(results) == 1
-    assert "person" in results[0]["results"]
-    assert isinstance(results[0]["results"]["person"], list)
+    assert "person" in results[0]["structures"]
+    assert isinstance(results[0]["structures"]["person"], list)
 
 
 def test_extract_rejects_missing_texts_and_images(api):
@@ -138,13 +138,14 @@ def test_extract_rejects_missing_texts_and_images(api):
         "/extract",
         json={
             "model": GLINER_MODEL,
-            "schema": {"person": ["name::str"]},
+            "inputs": [],
+            "schema": {"structures": {"person": {"fields": {"name": "str"}}}},
         },
     )
     assert resp.status_code == 400
     body = resp.json()
     assert body["error"] == "INVALID_REQUEST"
-    assert "exactly one of texts or images" in body["message"]
+    assert "inputs are required" in body["message"]
 
 
 def test_extract_rejects_both_texts_and_images(api):
@@ -154,12 +155,14 @@ def test_extract_rejects_both_texts_and_images(api):
         "/extract",
         json={
             "model": GLINER_MODEL,
-            "texts": ["John Smith works at Google."],
-            "images": [{"url": test_image}],
-            "schema": {"person": ["name::str"]},
+            "inputs": [
+                {"content": "John Smith works at Google."},
+                {"content": {"type": "image_url", "image_url": {"url": test_image}}},
+            ],
+            "schema": {"structures": {"person": {"fields": {"name": "str"}}}},
         },
     )
     assert resp.status_code == 400
     body = resp.json()
     assert body["error"] == "INVALID_REQUEST"
-    assert "exactly one of texts or images" in body["message"]
+    assert "inputs must be all text or all image content" in body["message"]

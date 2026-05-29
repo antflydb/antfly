@@ -26,6 +26,8 @@ pub const artifact_kind: u8 = 0x20;
 pub const chunk_record_kind: u8 = 0x30;
 pub const derived_embedding_kind: u8 = 0x31;
 pub const graph_edge_record_kind: u8 = 0x32;
+pub const asset_state_kind: u8 = 0x33;
+pub const graph_asset_state_kind: u8 = 0x34;
 
 pub const replay_key_len: usize = 1 + 1 + @sizeOf(u64);
 pub const replay_meta_init_key = [_]u8{ replay_namespace, 0xff, 0x01 };
@@ -196,6 +198,22 @@ pub fn artifactRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     defer list.deinit(alloc);
     try appendDocumentPrefix(&list, alloc, doc_key);
     try list.append(alloc, artifact_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn assetStateRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, asset_state_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphAssetStateRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_asset_state_kind);
     return try list.toOwnedSlice(alloc);
 }
 
@@ -528,6 +546,19 @@ pub fn isEmbeddingArtifactKey(key: []const u8) bool {
     const type_term = findComponentTerminator(key, pos) orelse return false;
     pos = type_term + 2;
     // Must have exactly one more component (the artifact name)
+    const name_term = findComponentTerminator(key, pos) orelse return false;
+    return name_term + 2 == key.len;
+}
+
+pub fn isAssetArtifactKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    pos += 1;
+    if (!componentEquals(key, pos, "asset")) return false;
+    const type_term = findComponentTerminator(key, pos) orelse return false;
+    pos = type_term + 2;
     const name_term = findComponentTerminator(key, pos) orelse return false;
     return name_term + 2 == key.len;
 }

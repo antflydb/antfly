@@ -13,12 +13,12 @@ T = TypeVar("T", bound="InferenceMediaContentPart")
 
 @_attrs_define
 class InferenceMediaContentPart:
-    """Inline binary media content (audio, image, etc.)
+    """Inline binary media content (audio, image, etc.).
 
     Attributes:
         type_ (InferenceMediaContentPartType):
-        data (str): Base64-encoded binary data
-        mime_type (str): MIME type (audio/wav, image/gif, image/png, etc.)
+        data (str): Base64-encoded binary data.
+        mime_type (str): MIME type (audio/wav, image/gif, image/png, etc.).
     """
 
     type_: InferenceMediaContentPartType

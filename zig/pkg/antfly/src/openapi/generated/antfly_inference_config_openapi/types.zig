@@ -25,13 +25,15 @@ pub const ImageURL = struct {
     url: []const u8,
 };
 
-/// Inline binary media content (audio, image, etc.)
+/// Binary or URL media content for providers that support non-image media parts.
 pub const MediaContentPart = struct {
     type: []const u8,
-    /// Base64-encoded binary data
-    data: []const u8,
-    /// MIME type (audio/wav, image/gif, image/png, etc.)
-    mime_type: []const u8,
+    /// Base64-encoded binary data. Use either data or url.
+    data: ?[]const u8 = null,
+    /// URL or data URI media reference. Use either url or data.
+    url: ?[]const u8 = null,
+    /// MIME type such as image/png, audio/wav, or application/pdf. Required with data and optional with url when the URL can resolve content type.
+    mime_type: ?[]const u8 = null,
 };
 
 /// A sparse vector with parallel index/value arrays, sorted by index ascending
@@ -536,6 +538,7 @@ pub const ContentPart = union(enum) {
         if (objectHasAnyKey(source.object, &.{
             "type",
             "data",
+            "url",
             "mime_type",
         })) {
             if (try parseStructuralVariant(MediaContentPart, allocator, source, options)) |parsed| return .{ .media_content_part = parsed };

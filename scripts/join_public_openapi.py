@@ -94,10 +94,13 @@ def walk_refs(value: object, rename_schema) -> object:
             if key == "$ref" and isinstance(child, str):
                 prefix = "#/components/schemas/"
                 shared_generating_prefix = "../shared/generating.yaml#/components/schemas/"
+                ai_extraction_prefix = "../ai/extraction.yaml#/components/schemas/"
                 if child.startswith(prefix):
                     out[key] = prefix + rename_schema(child[len(prefix) :])
                 elif child.startswith(shared_generating_prefix):
                     out[key] = prefix + child[len(shared_generating_prefix) :]
+                elif child.startswith(ai_extraction_prefix):
+                    out[key] = "specs/openapi/ai/extraction.yaml#/components/schemas/" + child[len(ai_extraction_prefix) :]
                 else:
                     out[key] = child
                 continue
@@ -167,7 +170,7 @@ def join_specs() -> dict:
         seen_tags.add(name)
         tags.append(copy.deepcopy(item))
 
-    return {
+    joined = {
         "openapi": "3.0.3",
         "info": {
             "title": "Antfly Public API",
@@ -207,6 +210,8 @@ def join_specs() -> dict:
             },
         ],
     }
+    joiner = load_join_openapi().load_shared_joiner()
+    return joiner.bundle_joined_spec(joined)
 
 
 def dump_yaml(data: dict, output: Path) -> None:

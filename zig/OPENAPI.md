@@ -32,12 +32,39 @@ Repo-local specs:
 - `../specs/openapi/antfly/metadata.yaml`: Antfly metadata/table API
 - `../specs/openapi/auth/api.yaml`: Antfly authentication/user-management API
 - `../specs/openapi/inference/api.yaml`: inference public API
+- `../specs/openapi/antfly/usermgr.yaml`: Antfly user-management API
+- `../specs/openapi/shared/generating.yaml`: shared provider-neutral generating/chat schemas
 - `specs/openai-openapi.yaml`: vendored OpenAI API schema used for types
 
 Some shared provider/config schemas are still read from the sibling
 `../antfly` checkout when regenerating. The checked-in generated Zig means a
 normal build does not need that sibling checkout, but `make generate` currently
 does.
+
+## Shared Generating Schemas
+
+Antfly services share provider-neutral generating and chat/message schemas from
+`../specs/openapi/shared/generating.yaml`. That spec owns the OpenAI-compatible
+message primitives used across Antfly inference and metadata APIs:
+
+- `ChatMessage`
+- `ChatMessageRole`
+- `ChatMessageContent`
+- `ContentPart`
+- `ToolCall`
+- `ToolCallFunction`
+
+Service specs should reference those schemas instead of redefining local chat
+message objects. The runtime can still use typed Zig structs/unions internally,
+but provider and public API boundaries should serialize to the shared
+OpenAI-compatible shape: `role`, optional string-or-content-parts `content`,
+assistant `tool_calls`, and tool-message `tool_call_id`.
+
+When adding a new shared generating primitive, update `specs/openapi/shared/generating.yaml`,
+then reference it from the owning service spec with an external `$ref`. If the
+reference is used by checked-in Zig generated code, add the matching
+`--import-mapping` in `zig/build.zig` and import the generated shared module
+into the dependent generated module.
 
 ## Generated Modules
 
@@ -51,6 +78,18 @@ The generated inference API module lives under:
 
 ```text
 pkg/inference/src/api/generated/inference_api/
+```
+
+The shared generating module is generated under:
+
+```text
+pkg/antfly/src/openapi/generated/antfly_generating_openapi/
+```
+
+The shared AI extraction module is generated under:
+
+```text
+pkg/antfly/src/openapi/generated/antfly_extraction_openapi/
 ```
 
 Generated files start with:

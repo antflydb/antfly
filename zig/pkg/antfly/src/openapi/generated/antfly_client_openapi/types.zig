@@ -2790,28 +2790,6 @@ pub const InferenceError = struct {
     @"error": []const u8,
 };
 
-/// Text content for embedding
-pub const InferenceTextContentPart = struct {
-    type: []const u8,
-    /// Text content to embed
-    text: []const u8,
-};
-
-/// Image URL or data URI
-pub const InferenceImageURL = struct {
-    /// URL or data URI (data:image/png;base64,...)
-    url: []const u8,
-};
-
-/// Inline binary media content (audio, image, etc.)
-pub const InferenceMediaContentPart = struct {
-    type: []const u8,
-    /// Base64-encoded binary data
-    data: []const u8,
-    /// MIME type (audio/wav, image/gif, image/png, etc.)
-    mime_type: []const u8,
-};
-
 /// A sparse vector with parallel index/value arrays, sorted by index ascending
 pub const InferenceSparseVector = struct {
     /// Token IDs from the model vocabulary (sorted ascending)
@@ -3034,48 +3012,16 @@ pub const InferenceFunctionDefinition = struct {
     strict: ?bool = null,
 };
 
-/// The function called by the model
+/// The function called by a model tool call.
 pub const InferenceToolCallFunction = struct {
-    /// The name of the function called
+    /// Function name.
     name: []const u8,
-    /// JSON string of the arguments to the function
+    /// JSON string of function arguments.
     arguments: []const u8,
 };
 
 /// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
 pub const InferenceToolChoice = std.json.Value;
-
-/// The role of a message sender in a conversation
-pub const InferenceRole = enum {
-    system,
-    user,
-    assistant,
-    tool,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .system => "system",
-            .user => "user",
-            .assistant => "assistant",
-            .tool => "tool",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "system", .system },
-            .{ "user", .user },
-            .{ "assistant", .assistant },
-            .{ "tool", .tool },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
 
 /// Reason why generation stopped
 pub const InferenceFinishReason = enum {
@@ -3290,6 +3236,51 @@ pub const InferenceEmbeddingUsage = struct {
     prompt_tokens: i64,
     /// Total tokens used
     total_tokens: i64,
+};
+
+pub const ExtractionToken = struct {
+    text: []const u8,
+    box: ?[]const i64 = null,
+};
+
+pub const ExtractionRelationSchema = struct {
+    type: []const u8,
+    source: ?[]const u8 = null,
+    target: ?[]const u8 = null,
+};
+
+pub const ExtractionClassificationSchema = struct {
+    name: []const u8,
+    labels: []const []const u8,
+    multi_label: ?bool = null,
+};
+
+pub const ExtractionStructureField = std.json.Value;
+
+pub const ExtractionReaderOptions = struct {
+    provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    api_url: ?[]const u8 = null,
+};
+
+pub const ExtractionEntity = struct {
+    label: []const u8,
+    text: []const u8,
+    start: ?i64 = null,
+    end: ?i64 = null,
+    score: ?f32 = null,
+};
+
+pub const ExtractionRelationEndpoint = struct {
+    entity_index: ?i64 = null,
+    id: ?[]const u8 = null,
+};
+
+pub const ExtractionClassification = struct {
+    name: []const u8,
+    label: []const u8,
+    score: ?f32 = null,
 };
 
 /// Typed Zig status view for table data topology and range placement.
@@ -4005,11 +3996,19 @@ pub const FetchConfig = struct {
     timeout_seconds: ?i64 = null,
 };
 
+pub const InferenceRole = ChatMessageRole;
+
+pub const InferenceTextContentPart = TextContentPart;
+
 /// Image content in OpenAI-compatible format.
 pub const ImageURLContentPart = struct {
     type: []const u8,
     image_url: ImageURL,
 };
+
+pub const InferenceImageURL = ImageURL;
+
+pub const InferenceMediaContentPart = MediaContentPart;
 
 /// Query classification and transformation result combining all query enhancements including strategy selection and semantic optimization
 pub const ClassificationTransformationResult = struct {
@@ -4126,47 +4125,6 @@ pub const GraphQueryParams = struct {
     algorithm_params: ?std.json.Value = null,
 };
 
-/// Image content for embedding (OpenAI-compatible format)
-pub const InferenceImageURLContentPart = struct {
-    type: []const u8,
-    image_url: InferenceImageURL,
-};
-
-/// Exactly one of `texts` or `images` must be provided. When using `images`, the server selects a compatible reader internally and processes the request as: read document text -> run structured extraction.
-pub const InferenceExtractRequest = struct {
-    /// Name of extractor model with 'extraction' capability
-    model: []const u8,
-    /// Texts to extract structured data from
-    texts: ?[]const []const u8 = null,
-    /// Optional images to extract structured data from. When provided, the server first reads document text with a compatible reader and then runs schema extraction on the read text.
-    images: ?[]const InferenceImageURL = null,
-    /// Optional read-stage prompt used only when `images` are provided. Passed through to the reader before schema extraction.
-    prompt: ?[]const u8 = null,
-    /// Maximum tokens for the read stage when `images` are provided. Ignored for text-only extraction requests.
-    max_tokens: ?i64 = null,
-    /// Extraction schema mapping structure names to field definitions. Each field is defined as "field_name::type" where type is "str" or "list". Optional choice fields: "field_name::[opt1|opt2]::str". If no type is specified, defaults to "str".
-    schema: std.json.ArrayHashMap([]const []const u8),
-    /// Score threshold for span extraction (0.0-1.0)
-    threshold: ?f32 = null,
-    /// If true, don't allow nested/overlapping entities
-    flat_ner: ?bool = null,
-    /// If true, include confidence scores in output
-    include_confidence: ?bool = null,
-    /// If true, include character offset spans in output
-    include_spans: ?bool = null,
-};
-
-pub const InferenceReadRequest = struct {
-    /// Name of reader model from models_dir/readers/
-    model: []const u8,
-    /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
-    images: []const InferenceImageURL,
-    /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
-    prompt: ?[]const u8 = null,
-    /// Maximum tokens to generate
-    max_tokens: ?i64 = null,
-};
-
 /// A single embedding result
 pub const InferenceEmbeddingObject = struct {
     /// Object type, always "embedding"
@@ -4263,11 +4221,10 @@ pub const InferenceTool = struct {
     function: InferenceFunctionDefinition,
 };
 
-/// A tool call made by the model
+/// OpenAI-compatible assistant tool call.
 pub const InferenceToolCall = struct {
-    /// Unique identifier for this tool call
+    /// Tool call identifier.
     id: []const u8,
-    /// The type of tool call (currently only "function")
     type: []const u8,
     function: InferenceToolCallFunction,
 };
@@ -4388,6 +4345,25 @@ pub const InferenceChunk = struct {
 pub const InferenceschemasConfig = struct {
     level: ?InferenceLevel = null,
     style: ?InferenceStyle = null,
+};
+
+pub const ExtractionStructureSchema = struct {
+    fields: ?std.json.ArrayHashMap(ExtractionStructureField) = null,
+};
+
+pub const ExtractionOptions = struct {
+    threshold: ?f32 = null,
+    flat_ner: ?bool = null,
+    include_confidence: ?bool = null,
+    include_spans: ?bool = null,
+    reader: ?ExtractionReaderOptions = null,
+};
+
+pub const ExtractionRelation = struct {
+    type: []const u8,
+    source: ?ExtractionRelationEndpoint = null,
+    target: ?ExtractionRelationEndpoint = null,
+    score: ?f32 = null,
 };
 
 pub const ClusterTopology = struct {
@@ -4827,6 +4803,43 @@ pub const ContentPart = union(enum) {
     }
 };
 
+pub const InferenceImageURLContentPart = ImageURLContentPart;
+
+/// Exactly one of `texts` or `images` must be provided. When using `images`, the server selects a compatible reader internally and processes the request as: read document text -> run structured extraction.
+pub const InferenceExtractRequest = struct {
+    /// Name of extractor model with 'extraction' capability
+    model: []const u8,
+    /// Texts to extract structured data from
+    texts: ?[]const []const u8 = null,
+    /// Optional images to extract structured data from. When provided, the server first reads document text with a compatible reader and then runs schema extraction on the read text.
+    images: ?[]const InferenceImageURL = null,
+    /// Optional read-stage prompt used only when `images` are provided. Passed through to the reader before schema extraction.
+    prompt: ?[]const u8 = null,
+    /// Maximum tokens for the read stage when `images` are provided. Ignored for text-only extraction requests.
+    max_tokens: ?i64 = null,
+    /// Extraction schema mapping structure names to field definitions. Each field is defined as "field_name::type" where type is "str" or "list". Optional choice fields: "field_name::[opt1|opt2]::str". If no type is specified, defaults to "str".
+    schema: std.json.ArrayHashMap([]const []const u8),
+    /// Score threshold for span extraction (0.0-1.0)
+    threshold: ?f32 = null,
+    /// If true, don't allow nested/overlapping entities
+    flat_ner: ?bool = null,
+    /// If true, include confidence scores in output
+    include_confidence: ?bool = null,
+    /// If true, include character offset spans in output
+    include_spans: ?bool = null,
+};
+
+pub const InferenceReadRequest = struct {
+    /// Name of reader model from models_dir/readers/
+    model: []const u8,
+    /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
+    images: []const InferenceImageURL,
+    /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
+    prompt: ?[]const u8 = null,
+    /// Maximum tokens to generate
+    max_tokens: ?i64 = null,
+};
+
 /// Complete evaluation result
 pub const EvalResult = struct {
     /// Scores organized by category
@@ -4847,62 +4860,6 @@ pub const QueryProfile = struct {
     reranker: ?RerankerProfile = null,
     /// Result merge statistics (present for hybrid search).
     merge: ?MergeProfile = null,
-};
-
-/// A content part for multimodal input (text, image URL, or inline media)
-pub const InferenceContentPart = union(enum) {
-    inference_media_content_part: *InferenceMediaContentPart,
-    inference_image_url_content_part: *InferenceImageURLContentPart,
-    inference_text_content_part: *InferenceTextContentPart,
-
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed.value;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "data",
-            "mime_type",
-        })) {
-            if (try parseStructuralVariant(InferenceMediaContentPart, allocator, source, options)) |parsed| return .{ .inference_media_content_part = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "image_url",
-        })) {
-            if (try parseStructuralVariant(InferenceImageURLContentPart, allocator, source, options)) |parsed| return .{ .inference_image_url_content_part = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "text",
-        })) {
-            if (try parseStructuralVariant(InferenceTextContentPart, allocator, source, options)) |parsed| return .{ .inference_text_content_part = parsed };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .inference_media_content_part => |v| try jw.write(v.*),
-            .inference_image_url_content_part => |v| try jw.write(v.*),
-            .inference_text_content_part => |v| try jw.write(v.*),
-        }
-    }
 };
 
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
@@ -5056,6 +5013,21 @@ pub const InferenceConfig = struct {
     /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,
     log: ?InferenceschemasConfig = null,
+};
+
+pub const ExtractionSchema = struct {
+    entities: ?[]const []const u8 = null,
+    relations: ?[]const ExtractionRelationSchema = null,
+    classifications: ?[]const ExtractionClassificationSchema = null,
+    structures: ?std.json.ArrayHashMap(ExtractionStructureSchema) = null,
+};
+
+pub const ExtractionObject = struct {
+    id: ?[]const u8 = null,
+    entities: ?[]const ExtractionEntity = null,
+    relations: ?[]const ExtractionRelation = null,
+    classifications: ?[]const ExtractionClassification = null,
+    structures: ?std.json.Value = null,
 };
 
 /// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
@@ -5227,6 +5199,8 @@ pub const TableSchema = struct {
 /// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts: [{"type": "text", "text": "Hello"}]
 pub const ChatMessageContent = std.json.Value;
 
+pub const InferenceContentPart = ContentPart;
+
 /// OpenAI-compatible embedding request with inference multimodal content-part extension
 pub const InferenceEmbedRequest = struct {
     /// Model name to use for embedding generation
@@ -5307,6 +5281,13 @@ pub const InferenceChunkResponse = struct {
     usage: InferenceGenerateUsage,
     /// Whether result was served from cache
     cache_hit: bool,
+};
+
+pub const ExtractionResponse = struct {
+    object: []const u8,
+    model: []const u8,
+    data: []const ExtractionObject,
+    usage: ?std.json.Value = null,
 };
 
 /// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
@@ -5411,6 +5392,13 @@ pub const InferenceChatMessage = struct {
     tool_calls: ?[]const InferenceToolCall = null,
     /// ID of the tool call this message is responding to (only for role=tool)
     tool_call_id: ?[]const u8 = null,
+};
+
+pub const ExtractionInput = struct {
+    id: ?[]const u8 = null,
+    content: ChatMessageContent,
+    tokens: ?[]const ExtractionToken = null,
+    metadata: ?std.json.Value = null,
 };
 
 /// OpenAI-compatible chat completion response
@@ -5556,6 +5544,13 @@ pub const InferenceGenerateRequest = struct {
     compiled_target: ?[]const u8 = null,
     /// Controls how the model uses tools
     tool_choice: ?InferenceToolChoice = null,
+};
+
+pub const ExtractionRequest = struct {
+    model: []const u8,
+    inputs: []const ExtractionInput,
+    schema: ExtractionSchema,
+    options: ?ExtractionOptions = null,
 };
 
 pub const IndexStatus = struct {

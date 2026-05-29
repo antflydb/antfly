@@ -27,6 +27,10 @@ const bedrock_provider = @import("bedrock.zig");
 const openai_provider = @import("openai.zig");
 const antfly_provider_mod = @import("local.zig");
 const chunking_types = @import("../chunking/types.zig");
+const termite_chunker = @import("termite_chunker");
+const transcribing = @import("antfly_transcribing");
+const readers = @import("antfly_readers");
+const extracting = @import("antfly_extracting");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
     @import("../storage/db/template_stub.zig")
 else
@@ -79,6 +83,37 @@ pub const AntflyProvider = struct {
         roles: []const []const u8,
         contents: []const []const u8,
     ) anyerror![]u8 = null,
+    generate_messages: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        messages: []const inference_types.ChatMessage,
+    ) anyerror![]u8 = null,
+    chunk_input: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        input: termite_chunker.Input,
+        config: chunking_types.Config,
+    ) anyerror![]termite_chunker.Chunk = null,
+    transcribe_audio: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: transcribing.Request,
+    ) anyerror!transcribing.Response = null,
+    read_images: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: readers.Request,
+    ) anyerror![]readers.Result = null,
+    extract: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: extracting.Request,
+    ) anyerror!extracting.Response = null,
 };
 
 pub const InitOptions = struct {

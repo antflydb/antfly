@@ -21,7 +21,7 @@ class InferenceGenerateDelta:
     """Delta content for streaming
 
     Attributes:
-        role (InferenceRole | Unset): The role of a message sender in a conversation
+        role (InferenceRole | Unset): Role of the message sender in a generation/chat conversation
         content (None | str | Unset): Token content delta
         tool_calls (list[InferenceToolCallDelta] | Unset): Tool call deltas for streaming tool calls
     """

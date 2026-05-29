@@ -36,13 +36,14 @@ function SharedConfigSync({
 }
 
 export default function Antfly({ children, url, table, onChange, headers = {} }: AntflyProps) {
-  const _headersKey = JSON.stringify(headers);
-  const stableHeaders = useMemo(() => headers, [headers]);
+  const headersKey = JSON.stringify(headers);
+  const stableHeaders = useMemo(() => headers, [headersKey]);
 
   const initialState: SharedState = {
     url,
     table,
     listenerEffect: null,
+    configVersion: 0,
     widgets: new Map(),
     headers: stableHeaders,
   };
@@ -106,14 +107,27 @@ export default function Antfly({ children, url, table, onChange, headers = {} }:
         return { ...state, widgets: newWidgets };
       }
       case "setListenerEffect":
+        if (
+          action.contextVersion !== undefined &&
+          action.contextVersion !== (state.configVersion ?? 0)
+        ) {
+          return state;
+        }
         return { ...state, listenerEffect: action.value };
-      case "setSharedConfig":
+      case "setSharedConfig": {
+        const configChanged =
+          action.url !== state.url ||
+          action.table !== state.table ||
+          action.headers !== state.headers;
         return {
           ...state,
           url: action.url,
           table: action.table,
           headers: action.headers,
+          listenerEffect: configChanged ? null : state.listenerEffect,
+          configVersion: configChanged ? (state.configVersion ?? 0) + 1 : state.configVersion,
         };
+      }
       default:
         return state;
     }

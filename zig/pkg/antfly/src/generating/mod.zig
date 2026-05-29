@@ -19,9 +19,12 @@ const inference = @import("../inference/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const openai_provider = @import("../inference/openai.zig");
 const antfly_provider = @import("../inference/local.zig");
+const vertex_provider = @import("../inference/vertex.zig");
 const common_secrets = @import("../common/secrets.zig");
 
 pub const Role = lib.Role;
+pub const ContentPart = lib.ContentPart;
+pub const ChatMessageContent = lib.ChatMessageContent;
 pub const ChatMessage = lib.ChatMessage;
 pub const GenerateResult = lib.GenerateResult;
 pub const Provider = lib.Provider;
@@ -33,6 +36,7 @@ pub const RetryConfig = lib.RetryConfig;
 pub const ChainCondition = lib.ChainCondition;
 pub const ChainLink = lib.ChainLink;
 pub const GeneratorFactory = lib.GeneratorFactory;
+pub const parseConfigFromSlice = lib.parseConfigFromSlice;
 
 pub const BackendFactory = struct {
     alloc: std.mem.Allocator,
@@ -96,6 +100,8 @@ const BackendState = struct {
         openai: openai_provider.Provider,
         remote_antfly: antfly_provider.Provider,
         embedded_antfly: managed_embedder.AntflyProvider,
+        vertex: vertex_provider.Provider,
+        gemini: vertex_provider.GeminiProvider,
     },
 
     fn init(
@@ -113,6 +119,7 @@ const BackendState = struct {
         state.cfg = cfg;
         state.api_key = switch (cfg.provider) {
             .antfly => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key orelse inference_api_key, "ANTFLY_INFERENCE_API_KEY"),
+            .gemini => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, "GEMINI_API_KEY"),
             else => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
         };
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
@@ -122,6 +129,26 @@ const BackendState = struct {
             .openai, .ollama => blk: {
                 const provider = openai_provider.Provider.init(alloc, http, cfg.url);
                 break :blk .{ .openai = provider };
+            },
+            .gemini => blk: {
+                const api_key_ref = state.api_key orelse return error.MissingGeneratorCredentials;
+                const api_key = (try api_key_ref.resolveOwned(alloc, secret_store)) orelse return error.MissingGeneratorCredentials;
+                defer alloc.free(api_key);
+                break :blk .{ .gemini = try vertex_provider.GeminiProvider.init(alloc, http, .{
+                    .base_url = if (cfg.url.len > 0) cfg.url else "https://generativelanguage.googleapis.com/v1beta",
+                    .api_key = api_key,
+                }) };
+            },
+            .vertex => blk: {
+                const bearer_token = if (state.api_key) |*api_key_ref| try api_key_ref.resolveOwned(alloc, secret_store) else null;
+                defer if (bearer_token) |value| alloc.free(value);
+                break :blk .{ .vertex = try vertex_provider.Provider.init(alloc, http, .{
+                    .base_url = if (cfg.url.len > 0) cfg.url else "https://aiplatform.googleapis.com/v1",
+                    .project_id = cfg.project_id,
+                    .location = cfg.location orelse "us-central1",
+                    .credentials_path = cfg.credentials_path,
+                    .bearer_token = bearer_token,
+                }) };
             },
             .antfly => if (cfg.url.len == 0 and embedded_antfly_provider != null)
                 .{ .embedded_antfly = embedded_antfly_provider.? }
@@ -145,6 +172,8 @@ const BackendState = struct {
             .openai => |*provider| provider.deinit(),
             .remote_antfly => |*provider| provider.deinit(),
             .embedded_antfly => {},
+            .vertex => |*provider| provider.deinit(),
+            .gemini => |*provider| provider.deinit(),
         }
         self.auth_header_cache.deinit(self.alloc);
         if (self.api_key) |*api_key| api_key.deinit(self.alloc);
@@ -153,50 +182,43 @@ const BackendState = struct {
 
     fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
-        const inference_messages = try alloc.alloc(inference.ChatMessage, messages.len);
-        defer alloc.free(inference_messages);
-
-        for (messages, 0..) |message, i| {
-            inference_messages[i] = .{
-                .role = switch (message.role) {
-                    .system => .system,
-                    .user => .user,
-                    .assistant => .assistant,
-                },
-                .content = message.content,
-            };
-        }
-
         var result = switch (self.provider) {
             .openai => |*provider| blk: {
                 if (self.api_key) |*api_key_ref| {
-                    const auth_header = try self.auth_header_cache.getOwned(self.alloc, alloc, api_key_ref, self.secret_store);
-                    defer alloc.free(auth_header);
-                    try provider.setAuthorizationHeader(auth_header);
+                    if (try optionalBearerAuthHeaderOwned(self, alloc, api_key_ref)) |auth_header| {
+                        defer alloc.free(auth_header);
+                        try provider.setAuthorizationHeader(auth_header);
+                    }
                 }
-                break :blk try provider.generator().generate(alloc, model, inference_messages);
+                break :blk try provider.generator().generate(alloc, model, messages);
             },
             .remote_antfly => |*provider| blk: {
                 if (self.api_key) |*api_key_ref| {
-                    const auth_header = try self.auth_header_cache.getOwned(self.alloc, alloc, api_key_ref, self.secret_store);
-                    defer alloc.free(auth_header);
-                    try provider.setAuthorizationHeader(auth_header);
+                    if (try optionalBearerAuthHeaderOwned(self, alloc, api_key_ref)) |auth_header| {
+                        defer alloc.free(auth_header);
+                        try provider.setAuthorizationHeader(auth_header);
+                    }
                 }
-                break :blk try provider.generator().generate(alloc, model, inference_messages);
+                break :blk try provider.generator().generate(alloc, model, messages);
             },
+            .vertex => |*provider| try provider.generator().generate(alloc, model, messages),
+            .gemini => |*provider| try provider.generator().generate(alloc, model, messages),
             .embedded_antfly => |local| blk: {
+                if (local.generate_messages) |generate_messages| {
+                    const content = try generate_messages(local.ptr, alloc, model, messages);
+                    break :blk inference.GenerateResult{
+                        .content = content,
+                        .allocator = alloc,
+                    };
+                }
                 const generate_text = local.generate_text orelse return error.UnsupportedGeneratorProvider;
                 const roles = try alloc.alloc([]const u8, messages.len);
                 defer alloc.free(roles);
                 const contents = try alloc.alloc([]const u8, messages.len);
                 defer alloc.free(contents);
                 for (messages, 0..) |message, i| {
-                    roles[i] = switch (message.role) {
-                        .system => "system",
-                        .user => "user",
-                        .assistant => "assistant",
-                    };
-                    contents[i] = message.content;
+                    roles[i] = message.role.toSlice();
+                    contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
                 const content = try generate_text(local.ptr, alloc, model, roles, contents);
                 break :blk inference.GenerateResult{
@@ -213,6 +235,65 @@ const BackendState = struct {
         };
     }
 };
+
+fn optionalBearerAuthHeaderOwned(
+    state: *BackendState,
+    alloc: std.mem.Allocator,
+    api_key_ref: *const common_secrets.SecretValue,
+) !?[]u8 {
+    return state.auth_header_cache.getOwned(state.alloc, alloc, api_key_ref, state.secret_store) catch |err| switch (err) {
+        error.SecretNotFound => switch (api_key_ref.*) {
+            .env_var => return null,
+            else => return err,
+        },
+        else => return err,
+    };
+}
+
+fn textContent(message: ChatMessage) ?[]const u8 {
+    const content = message.content orelse return "";
+    return switch (content) {
+        .text => |text| text,
+        .parts => null,
+    };
+}
+
+test "generating optional env auth is skipped when unset" {
+    const alloc = std.testing.allocator;
+    var api_key = try common_secrets.SecretValue.initConfigOrEnv(alloc, null, "ANTFLY_TEST_GENERATING_MISSING_API_KEY");
+    defer api_key.deinit(alloc);
+
+    var state = BackendState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .api_key = null,
+        .auth_header_cache = .{},
+        .secret_store = null,
+        .provider = undefined,
+    };
+    defer state.auth_header_cache.deinit(alloc);
+
+    const header = try optionalBearerAuthHeaderOwned(&state, alloc, &api_key);
+    try std.testing.expectEqual(@as(?[]u8, null), header);
+}
+
+test "generating explicit missing secret auth remains strict" {
+    const alloc = std.testing.allocator;
+    var api_key = try common_secrets.SecretValue.initConfig(alloc, "secret://missing.generator_key") orelse return error.TestUnexpectedResult;
+    defer api_key.deinit(alloc);
+
+    var state = BackendState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .api_key = null,
+        .auth_header_cache = .{},
+        .secret_store = null,
+        .provider = undefined,
+    };
+    defer state.auth_header_cache.deinit(alloc);
+
+    try std.testing.expectError(error.SecretNotFound, optionalBearerAuthHeaderOwned(&state, alloc, &api_key));
+}
 
 pub fn executeChain(
     alloc: std.mem.Allocator,
@@ -289,14 +370,13 @@ test "generating backend factory executes fallback chain across providers" {
     const Fiber = struct {
         fn run(
             a: std.mem.Allocator,
-            test_io: std.Io,
-            test_client: *httpx.Client,
-            links: []const ChainLink,
+            h: *httpx.Client,
+            chain_arg: []const ChainLink,
             out: *?[]u8,
             err_out: *?anyerror,
         ) std.Io.Cancelable!void {
-            _ = test_io;
-            var result = executeChain(a, test_client, links, &.{.{ .role = .user, .content = "hello" }}) catch |err| {
+            const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+            var result = executeChain(a, h, chain_arg, &messages) catch |err| {
                 err_out.* = err;
                 return;
             };
@@ -308,13 +388,13 @@ test "generating backend factory executes fallback chain across providers" {
         }
     };
 
-    group.concurrent(io, Fiber.run, .{ alloc, io, &client, &chain, &content, &run_err }) catch return;
+    group.concurrent(io, Fiber.run, .{ alloc, &client, &chain, &content, &run_err }) catch return;
     try ts.handleOne();
     try ts.handleOne();
     group.await(io) catch {};
     if (run_err) |err| return err;
 
-    try std.testing.expectEqualStrings("fallback ok", content orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("fallback ok", content.?);
 }
 
 test "generating backend routes antfly and url-less antfly to local provider" {
@@ -380,7 +460,7 @@ test "generating backend routes antfly and url-less antfly to local provider" {
         .generate_text = FakeLocal.generateText,
     };
 
-    const messages = [_]ChatMessage{.{ .role = .user, .content = "hello" }};
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
     const antfly_chain = [_]ChainLink{.{
         .generator = .{
             .provider = .antfly,
@@ -392,5 +472,78 @@ test "generating backend routes antfly and url-less antfly to local provider" {
     defer antfly_result.deinit();
     try std.testing.expectEqualStrings("local ok", antfly_result.content);
 
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "generating backend passes multimodal messages to local provider callback" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const FakeLocal = struct {
+        calls: usize = 0,
+
+        fn embedDenseTexts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparseTexts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn generateMessages(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            model: []const u8,
+            messages: []const ChatMessage,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("local-model", model);
+            try std.testing.expectEqual(@as(usize, 1), messages.len);
+            const content = messages[0].content orelse return error.TestUnexpectedResult;
+            const parts = switch (content) {
+                .parts => |items| items,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(@as(usize, 2), parts.len);
+            switch (parts[0]) {
+                .text => |text| try std.testing.expectEqualStrings("describe", text),
+                else => return error.TestUnexpectedResult,
+            }
+            switch (parts[1]) {
+                .media => |media| try std.testing.expectEqualStrings("image/png", media.mime_type),
+                else => return error.TestUnexpectedResult,
+            }
+            return try a.dupe(u8, "local multimodal ok");
+        }
+    };
+
+    var fake = FakeLocal{};
+    const local_provider = managed_embedder.AntflyProvider{
+        .ptr = &fake,
+        .embed_dense_texts = FakeLocal.embedDenseTexts,
+        .embed_sparse_texts = FakeLocal.embedSparseTexts,
+        .generate_messages = FakeLocal.generateMessages,
+    };
+
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .parts = &.{
+        .{ .text = "describe" },
+        .{ .media = .{ .mime_type = "image/png", .data = "AA==" } },
+    } } }};
+    const chain = [_]ChainLink{.{
+        .generator = .{
+            .provider = .antfly,
+            .model = "local-model",
+            .url = "",
+        },
+    }};
+    var result = try executeChainWithAntflyProvider(alloc, &client, &chain, local_provider, &messages);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("local multimodal ok", result.content);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
