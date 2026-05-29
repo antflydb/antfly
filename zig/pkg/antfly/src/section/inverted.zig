@@ -1022,8 +1022,12 @@ pub const InvertedIndexReader = struct {
 
     pub const LayoutStats = struct {
         header_bytes: u64 = 0,
+        term_dict_bytes: u64 = 0,
+        term_block_bytes: u64 = 0,
+        term_index_bytes: u64 = 0,
         fst_bytes: u64 = 0,
         bloom_bytes: u64 = 0,
+        postings_bytes: u64 = 0,
         postings_header_bytes: u64 = 0,
         block_max_bytes: u64 = 0,
         chunk_meta_bytes: u64 = 0,
@@ -1037,11 +1041,30 @@ pub const InvertedIndexReader = struct {
     pub fn layoutStats(self: *const InvertedIndexReader) LayoutStats {
         const dict_len = std.mem.readInt(u32, self.data[21..25], .little);
         const bloom_len = std.mem.readInt(u32, self.data[25..29], .little);
-        return .{
+        var stats = LayoutStats{
             .header_bytes = v7_header_size,
-            .fst_bytes = dict_len,
+            .term_dict_bytes = dict_len,
             .bloom_bytes = bloom_len,
+            .postings_bytes = if (self.data.len >= v7_header_size + @as(usize, dict_len) + @as(usize, bloom_len))
+                @intCast(self.data.len - v7_header_size - @as(usize, dict_len) - @as(usize, bloom_len))
+            else
+                0,
         };
+        const dict_offset = self.data.len - @as(usize, dict_len);
+        if (dict_len >= term_dict_header_size and dict_offset < self.data.len) {
+            const dict_data = self.data[dict_offset..];
+            if (std.mem.eql(u8, dict_data[0..4], term_dict_magic)) {
+                const block_data_len = std.mem.readInt(u32, dict_data[8..12], .little);
+                const block_index_len = std.mem.readInt(u32, dict_data[12..16], .little);
+                const block_fst_len = std.mem.readInt(u32, dict_data[16..20], .little);
+                if (term_dict_header_size + @as(usize, block_data_len) + @as(usize, block_index_len) + @as(usize, block_fst_len) == @as(usize, dict_len)) {
+                    stats.term_block_bytes = block_data_len;
+                    stats.term_index_bytes = block_index_len;
+                    stats.fst_bytes = block_fst_len;
+                }
+            }
+        }
+        return stats;
     }
 
     pub fn detailedLayoutStats(self: *const InvertedIndexReader) !LayoutStats {

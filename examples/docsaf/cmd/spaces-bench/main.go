@@ -88,8 +88,12 @@ type diagSnapshot struct {
 	FullTextStoredFieldsBytes            int64          `json:"full_text_stored_fields_bytes,omitempty"`
 	FullTextInvertedBytes                int64          `json:"full_text_inverted_bytes,omitempty"`
 	FullTextInvertedHeaderBytes          int64          `json:"full_text_inverted_header_bytes,omitempty"`
+	FullTextInvertedTermDictBytes        int64          `json:"full_text_inverted_term_dict_bytes,omitempty"`
+	FullTextInvertedTermBlockBytes       int64          `json:"full_text_inverted_term_block_bytes,omitempty"`
+	FullTextInvertedTermIndexBytes       int64          `json:"full_text_inverted_term_index_bytes,omitempty"`
 	FullTextInvertedFSTBytes             int64          `json:"full_text_inverted_fst_bytes,omitempty"`
 	FullTextInvertedBloomBytes           int64          `json:"full_text_inverted_bloom_bytes,omitempty"`
+	FullTextInvertedPostingsBytes        int64          `json:"full_text_inverted_postings_bytes,omitempty"`
 	FullTextInvertedPostingsHeaderBytes  int64          `json:"full_text_inverted_postings_header_bytes,omitempty"`
 	FullTextInvertedBlockMaxBytes        int64          `json:"full_text_inverted_block_max_bytes,omitempty"`
 	FullTextInvertedChunkMetaBytes       int64          `json:"full_text_inverted_chunk_meta_bytes,omitempty"`
@@ -388,15 +392,19 @@ func main() {
 		finalDiag.SegmentFiles,
 		finalDiag.SegmentBytes,
 	)
-	fmt.Printf("full_text_layout segments=%d segment_bytes=%d mmap_segment_bytes=%d heap_segment_bytes=%d stored_fields_bytes=%d inverted_bytes=%d postings_payload_bytes=%d positions_bytes=%d term_dict_bytes=%d typed_doc_values_bytes=%d doc_ordinals_bytes=%d section_index_bytes=%d\n",
+	fmt.Printf("full_text_layout segments=%d segment_bytes=%d mmap_segment_bytes=%d heap_segment_bytes=%d stored_fields_bytes=%d inverted_bytes=%d postings_bytes=%d postings_payload_bytes=%d positions_bytes=%d term_dict_bytes=%d term_block_bytes=%d term_index_bytes=%d term_fst_bytes=%d typed_doc_values_bytes=%d doc_ordinals_bytes=%d section_index_bytes=%d\n",
 		finalDiag.FullTextSegments,
 		finalDiag.FullTextSegmentBytes,
 		finalDiag.FullTextMmapSegmentBytes,
 		finalDiag.FullTextHeapSegmentBytes,
 		finalDiag.FullTextStoredFieldsBytes,
 		finalDiag.FullTextInvertedBytes,
+		finalDiag.FullTextInvertedPostingsBytes,
 		finalDiag.FullTextInvertedPostingsPayloadBytes,
 		finalDiag.FullTextInvertedPositionsBytes,
+		finalDiag.FullTextInvertedTermDictBytes,
+		finalDiag.FullTextInvertedTermBlockBytes,
+		finalDiag.FullTextInvertedTermIndexBytes,
 		finalDiag.FullTextInvertedFSTBytes,
 		finalDiag.FullTextTypedDocValuesBytes,
 		finalDiag.FullTextDocOrdinalsBytes,
@@ -514,8 +522,12 @@ func collectDiagnostics(pid int, healthURL, dataDir string, elapsed time.Duratio
 			out.FullTextStoredFieldsBytes = int64(promValue(metrics, "antfly_full_text_stored_fields_bytes", nil))
 			out.FullTextInvertedBytes = int64(promValue(metrics, "antfly_full_text_inverted_bytes", nil))
 			out.FullTextInvertedHeaderBytes = int64(promValue(metrics, "antfly_full_text_inverted_header_bytes", nil))
+			out.FullTextInvertedTermDictBytes = int64(promValue(metrics, "antfly_full_text_inverted_term_dict_bytes", nil))
+			out.FullTextInvertedTermBlockBytes = int64(promValue(metrics, "antfly_full_text_inverted_term_block_bytes", nil))
+			out.FullTextInvertedTermIndexBytes = int64(promValue(metrics, "antfly_full_text_inverted_term_index_bytes", nil))
 			out.FullTextInvertedFSTBytes = int64(promValue(metrics, "antfly_full_text_inverted_fst_bytes", nil))
 			out.FullTextInvertedBloomBytes = int64(promValue(metrics, "antfly_full_text_inverted_bloom_bytes", nil))
+			out.FullTextInvertedPostingsBytes = int64(promValue(metrics, "antfly_full_text_inverted_postings_bytes", nil))
 			out.FullTextInvertedPostingsHeaderBytes = int64(promValue(metrics, "antfly_full_text_inverted_postings_header_bytes", nil))
 			out.FullTextInvertedBlockMaxBytes = int64(promValue(metrics, "antfly_full_text_inverted_block_max_bytes", nil))
 			out.FullTextInvertedChunkMetaBytes = int64(promValue(metrics, "antfly_full_text_inverted_chunk_meta_bytes", nil))

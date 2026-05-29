@@ -75,8 +75,12 @@ pub const SegmentLayoutStats = struct {
     stored_fields_bytes: u64 = 0,
     inverted_text_bytes: u64 = 0,
     inverted_header_bytes: u64 = 0,
+    inverted_term_dict_bytes: u64 = 0,
+    inverted_term_block_bytes: u64 = 0,
+    inverted_term_index_bytes: u64 = 0,
     inverted_fst_bytes: u64 = 0,
     inverted_bloom_bytes: u64 = 0,
+    inverted_postings_bytes: u64 = 0,
     inverted_postings_header_bytes: u64 = 0,
     inverted_block_max_bytes: u64 = 0,
     inverted_chunk_meta_bytes: u64 = 0,
@@ -609,8 +613,12 @@ pub const SegmentReader = struct {
                                 reader.layoutStats();
                             {
                                 stats.inverted_header_bytes +|= inverted_layout.header_bytes;
+                                stats.inverted_term_dict_bytes +|= inverted_layout.term_dict_bytes;
+                                stats.inverted_term_block_bytes +|= inverted_layout.term_block_bytes;
+                                stats.inverted_term_index_bytes +|= inverted_layout.term_index_bytes;
                                 stats.inverted_fst_bytes +|= inverted_layout.fst_bytes;
                                 stats.inverted_bloom_bytes +|= inverted_layout.bloom_bytes;
+                                stats.inverted_postings_bytes +|= inverted_layout.postings_bytes;
                                 stats.inverted_postings_header_bytes +|= inverted_layout.postings_header_bytes;
                                 stats.inverted_block_max_bytes +|= inverted_layout.block_max_bytes;
                                 stats.inverted_chunk_meta_bytes +|= inverted_layout.chunk_meta_bytes;

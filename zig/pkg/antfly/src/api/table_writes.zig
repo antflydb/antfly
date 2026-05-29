@@ -97,8 +97,12 @@ fn accumulateTextMemoryAttributionStats(dst: *db_mod.TextMemoryAttributionStats,
     dst.stored_fields_bytes +|= src.stored_fields_bytes;
     dst.inverted_text_bytes +|= src.inverted_text_bytes;
     dst.inverted_header_bytes +|= src.inverted_header_bytes;
+    dst.inverted_term_dict_bytes +|= src.inverted_term_dict_bytes;
+    dst.inverted_term_block_bytes +|= src.inverted_term_block_bytes;
+    dst.inverted_term_index_bytes +|= src.inverted_term_index_bytes;
     dst.inverted_fst_bytes +|= src.inverted_fst_bytes;
     dst.inverted_bloom_bytes +|= src.inverted_bloom_bytes;
+    dst.inverted_postings_bytes +|= src.inverted_postings_bytes;
     dst.inverted_postings_header_bytes +|= src.inverted_postings_header_bytes;
     dst.inverted_block_max_bytes +|= src.inverted_block_max_bytes;
     dst.inverted_chunk_meta_bytes +|= src.inverted_chunk_meta_bytes;

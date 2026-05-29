@@ -501,8 +501,12 @@ fn writeFullTextMemoryMetrics(writer: *std.Io.Writer, stats: antfly.db.TextMemor
     try health_metrics.appendPromMetric(writer, "antfly_full_text_stored_fields_bytes", "gauge", "Full-text stored-field section bytes across cached write DBs", stats.stored_fields_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_bytes", "gauge", "Full-text inverted section bytes across cached write DBs", stats.inverted_text_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_header_bytes", "gauge", "Full-text inverted section header bytes", stats.inverted_header_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_term_dict_bytes", "gauge", "Full-text inverted term dictionary bytes", stats.inverted_term_dict_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_term_block_bytes", "gauge", "Full-text inverted term dictionary block bytes", stats.inverted_term_block_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_term_index_bytes", "gauge", "Full-text inverted term dictionary block index bytes", stats.inverted_term_index_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_fst_bytes", "gauge", "Full-text inverted term dictionary FST bytes", stats.inverted_fst_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_bloom_bytes", "gauge", "Full-text inverted bloom filter bytes", stats.inverted_bloom_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_postings_bytes", "gauge", "Full-text inverted postings bytes", stats.inverted_postings_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_postings_header_bytes", "gauge", "Full-text inverted postings header bytes", stats.inverted_postings_header_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_block_max_bytes", "gauge", "Full-text inverted block-max metadata bytes", stats.inverted_block_max_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_chunk_meta_bytes", "gauge", "Full-text inverted postings chunk metadata bytes", stats.inverted_chunk_meta_bytes);
@@ -12062,7 +12066,11 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .text_segment_bytes = 4096,
         .text_mmap_segment_bytes = 3072,
         .text_heap_segment_bytes = 1024,
+        .inverted_term_dict_bytes = 512,
+        .inverted_term_block_bytes = 256,
+        .inverted_term_index_bytes = 128,
         .inverted_fst_bytes = 64,
+        .inverted_postings_bytes = 2048,
         .inverted_postings_payload_bytes = 128,
         .inverted_skip_bytes = 32,
         .configured_lmdb_main_map_bytes = 8192,
@@ -12070,6 +12078,8 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     const full_text_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_segment_bytes 4096") != null);
     try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_mmap_segment_bytes 3072") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_inverted_term_dict_bytes 512") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_inverted_postings_bytes 2048") != null);
     try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_inverted_fst_bytes 64") != null);
     try std.testing.expect(std.mem.indexOf(u8, full_text_output, "antfly_full_text_inverted_skip_bytes 32") != null);
 
