@@ -26,7 +26,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const roaring = @import("../encoding/roaring.zig");
 const chunked = @import("../encoding/chunked_coder.zig");
-const svb = @import("../encoding/streamvbyte.zig");
 const vellum = @import("antfly_vellum");
 const bloom = @import("bloom");
 
@@ -34,13 +33,11 @@ const bloom = @import("bloom");
 // Wire format versions
 // ============================================================================
 //
-//   v7: FST + block-delta doc stream + StreamVByte freq/norm + positions + bloom
-//   v8: v7 plus sparse block-max metadata with a base chunk id per term
+//   v9: FST + sparse block-max metadata + packed per-chunk doc/freq/norm columns
 //
-// This project is pre-release; writers emit the current v8 format.
+// This project is pre-release; writers emit the current v9 format.
 
-const wire_version_v7: u8 = 7;
-const wire_version_v8: u8 = 8;
+const wire_version_v9: u8 = 9;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4; // 29 bytes
 const v7_chunk_meta_size: usize = 44;
 
@@ -49,10 +46,10 @@ const v7_chunk_meta_size: usize = 44;
 /// dominate the section size.
 const bloom_min_terms: usize = 64;
 
-/// Write the 29-byte v7 section header into `dst[0..v7_header_size]`. Shared
+/// Write the 29-byte v9 section header into `dst[0..v7_header_size]`. Shared
 /// between `InvertedIndexBuilder.build` and the merger's
 /// `assembleMergedSection` so the wire layout lives in exactly one place.
-fn writeV7Header(
+fn writeV9Header(
     dst: []u8,
     doc_count: u32,
     total_field_len: u64,
@@ -62,24 +59,12 @@ fn writeV7Header(
 ) void {
     std.debug.assert(dst.len >= v7_header_size);
     @memcpy(dst[0..4], "INVT");
-    dst[4] = wire_version_v7;
+    dst[4] = wire_version_v9;
     dst[5..9].* = @bitCast(std.mem.nativeToLittle(u32, doc_count));
     dst[9..17].* = @bitCast(std.mem.nativeToLittle(u64, total_field_len));
     dst[17..21].* = @bitCast(std.mem.nativeToLittle(u32, chunk_size));
     dst[21..25].* = @bitCast(std.mem.nativeToLittle(u32, vellum_len));
     dst[25..29].* = @bitCast(std.mem.nativeToLittle(u32, bloom_len));
-}
-
-fn writeV8Header(
-    dst: []u8,
-    doc_count: u32,
-    total_field_len: u64,
-    chunk_size: u32,
-    vellum_len: u32,
-    bloom_len: u32,
-) void {
-    writeV7Header(dst, doc_count, total_field_len, chunk_size, vellum_len, bloom_len);
-    dst[4] = wire_version_v8;
 }
 
 // ============================================================================
@@ -259,7 +244,7 @@ pub const InvertedIndexBuilder = struct {
     ///   - General: postings offset within postings_data
     ///   - 1-hit: packed docNum + normBits (for single-doc, freq=1 terms)
     ///
-    /// Postings per term, v8:
+    /// Postings per term, v9:
     ///   [doc_freq: u32 LE]
     ///   [stored_chunks: u32 LE]
     ///   [block_max_base_chunk: u32 LE]
@@ -267,10 +252,10 @@ pub const InvertedIndexBuilder = struct {
     ///   [positions_section_len: u32 LE]
     ///   [block_max_chunks × 6-byte block-max records]
     ///   [stored_chunks × chunk metadata]
-    ///   [StreamVByte doc deltas + freqHasLocs/norm payloads]
+    ///   [packed per-chunk doc-delta/freqHasLocs/norm payloads]
     ///   [positions: varint count + varint deltas per doc]
     ///
-    /// v8 stores postings first, then an optional per-segment term bloom filter,
+    /// v9 stores postings first, then an optional per-segment term bloom filter,
     /// then the FST. `bloom_len` in the header tells the reader how many bytes
     /// to skip past postings before the FST starts.
     pub fn build(self: *InvertedIndexBuilder) ![]u8 {
@@ -355,7 +340,7 @@ pub const InvertedIndexBuilder = struct {
                 try fst_builder.insert(term, fstValEncode1Hit(doc_num, norm_bits));
             } else {
                 const postings_offset: u64 = @intCast(output.items.len - v7_header_size);
-                try acc.serializeV8(output_alloc, &output, &serialize_scratch, self.config.chunk_size);
+                try acc.serializeV9(output_alloc, &output, &serialize_scratch, self.config.chunk_size);
                 try fst_builder.insert(term, postings_offset);
             }
         }
@@ -377,13 +362,13 @@ pub const InvertedIndexBuilder = struct {
             bloom_bytes = try filter.encodeAlloc(scratch_alloc);
         }
 
-        // Step 3: Finish final v7 section
+        // Step 3: Finish final section.
         if (bloom_bytes.len > 0) {
             try output.appendSlice(output_alloc, bloom_bytes);
         }
         try output.appendSlice(output_alloc, fst_data);
 
-        writeV8Header(
+        writeV9Header(
             output.items[0..v7_header_size],
             self.doc_count,
             self.total_field_len,
@@ -420,7 +405,8 @@ const V7ChunkMeta = struct {
 const PostingSerializeScratch = struct {
     chunks: std.ArrayListUnmanaged(V7ChunkMeta) = .empty,
     doc_deltas: std.ArrayListUnmanaged(u32) = .empty,
-    freq_norm_values: std.ArrayListUnmanaged(u32) = .empty,
+    freq_values: std.ArrayListUnmanaged(u32) = .empty,
+    norm_values: std.ArrayListUnmanaged(u32) = .empty,
     block_max: std.ArrayListUnmanaged(u8) = .empty,
     payload: std.ArrayListUnmanaged(u8) = .empty,
     positions: std.ArrayListUnmanaged(u8) = .empty,
@@ -430,7 +416,8 @@ const PostingSerializeScratch = struct {
     fn reset(self: *PostingSerializeScratch) void {
         self.chunks.clearRetainingCapacity();
         self.doc_deltas.clearRetainingCapacity();
-        self.freq_norm_values.clearRetainingCapacity();
+        self.freq_values.clearRetainingCapacity();
+        self.norm_values.clearRetainingCapacity();
         self.block_max.clearRetainingCapacity();
         self.payload.clearRetainingCapacity();
         self.positions.clearRetainingCapacity();
@@ -441,7 +428,8 @@ const PostingSerializeScratch = struct {
     fn deinit(self: *PostingSerializeScratch, alloc: Allocator) void {
         self.chunks.deinit(alloc);
         self.doc_deltas.deinit(alloc);
-        self.freq_norm_values.deinit(alloc);
+        self.freq_values.deinit(alloc);
+        self.norm_values.deinit(alloc);
         self.block_max.deinit(alloc);
         self.payload.deinit(alloc);
         self.positions.deinit(alloc);
@@ -482,30 +470,141 @@ fn readChunkMetaV7(src: []const u8) V7ChunkMeta {
     };
 }
 
-fn appendStreamVByte(
-    alloc: Allocator,
-    scratch: *PostingSerializeScratch,
-    payload: *std.ArrayListUnmanaged(u8),
-    values: []const u32,
-) !struct { ctrl_off: u32, ctrl_len: u32, data_off: u32, data_len: u32 } {
-    const ctrl_len = svb.encodedControlLen(values.len);
-    const data_cap = svb.encodedDataCapacity(values.len);
-    try scratch.svb_control.ensureTotalCapacity(alloc, ctrl_len);
-    try scratch.svb_data.ensureTotalCapacity(alloc, data_cap);
-    scratch.svb_control.items.len = ctrl_len;
-    scratch.svb_data.items.len = data_cap;
-    const encoded = try svb.encodeInto(scratch.svb_control.items, scratch.svb_data.items, values);
+fn bitWidthU32(value: u32) u8 {
+    if (value == 0) return 0;
+    return @intCast(32 - @clz(value));
+}
 
-    const ctrl_off: u32 = @intCast(payload.items.len);
-    try payload.appendSlice(alloc, scratch.svb_control.items[0..encoded.control_len]);
-    const data_off: u32 = @intCast(payload.items.len);
-    try payload.appendSlice(alloc, scratch.svb_data.items[0..encoded.data_len]);
-    return .{
-        .ctrl_off = ctrl_off,
-        .ctrl_len = @intCast(encoded.control_len),
-        .data_off = data_off,
-        .data_len = @intCast(encoded.data_len),
-    };
+fn maxBitWidth(values: []const u32) u8 {
+    var bits: u8 = 0;
+    for (values) |value| bits = @max(bits, bitWidthU32(value));
+    return bits;
+}
+
+fn packedU32ByteLen(count: usize, bits: u8) usize {
+    if (bits == 0 or count == 0) return 0;
+    return (count * @as(usize, bits) + 7) / 8;
+}
+
+fn appendPackedU32(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    values: []const u32,
+    bits: u8,
+) !struct { off: u32, len: u32 } {
+    const off: u32 = @intCast(out.items.len);
+    const len = packedU32ByteLen(values.len, bits);
+    if (len == 0) return .{ .off = off, .len = 0 };
+
+    const start = out.items.len;
+    try out.appendNTimes(alloc, 0, len);
+    var bit_pos: usize = 0;
+    for (values) |value| {
+        var remaining = bits;
+        var shifted = value;
+        while (remaining > 0) {
+            const byte_index = start + bit_pos / 8;
+            const bit_in_byte: u3 = @intCast(bit_pos % 8);
+            const avail: u8 = 8 - @as(u8, bit_in_byte);
+            const take: u8 = @min(remaining, avail);
+            const mask: u32 = if (take == 32) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(take)) - 1;
+            out.items[byte_index] |= @as(u8, @truncate(shifted & mask)) << bit_in_byte;
+            shifted >>= @intCast(take);
+            remaining -= take;
+            bit_pos += take;
+        }
+    }
+    return .{ .off = off, .len = @intCast(len) };
+}
+
+fn decodePackedU32Into(data: []const u8, values: []u32, bits: u8) !void {
+    if (bits == 0) {
+        @memset(values, 0);
+        return;
+    }
+    const needed = packedU32ByteLen(values.len, bits);
+    if (data.len < needed) return error.InvalidData;
+
+    var bit_pos: usize = 0;
+    for (values) |*value| {
+        var out: u32 = 0;
+        var shift: u5 = 0;
+        var remaining = bits;
+        while (remaining > 0) {
+            const byte_index = bit_pos / 8;
+            const bit_in_byte: u3 = @intCast(bit_pos % 8);
+            const avail: u8 = 8 - @as(u8, bit_in_byte);
+            const take: u8 = @min(remaining, avail);
+            const mask: u8 = if (take == 8) 0xff else @as(u8, @truncate((@as(u16, 1) << @intCast(take)) - 1));
+            const part: u32 = (data[byte_index] >> bit_in_byte) & mask;
+            out |= part << shift;
+            shift += @intCast(take);
+            remaining -= take;
+            bit_pos += take;
+        }
+        value.* = out;
+    }
+}
+
+fn decodePackedU32IntoStrided(
+    data: []const u8,
+    out: []u32,
+    count: usize,
+    bits: u8,
+    start: usize,
+    stride: usize,
+) !void {
+    if (count == 0) return;
+    if (start + (count - 1) * stride >= out.len) return error.InvalidData;
+    if (bits == 0) {
+        var i: usize = 0;
+        while (i < count) : (i += 1) out[start + i * stride] = 0;
+        return;
+    }
+    const needed = packedU32ByteLen(count, bits);
+    if (data.len < needed) return error.InvalidData;
+
+    var bit_pos: usize = 0;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        var value: u32 = 0;
+        var shift: u5 = 0;
+        var remaining = bits;
+        while (remaining > 0) {
+            const byte_index = bit_pos / 8;
+            const bit_in_byte: u3 = @intCast(bit_pos % 8);
+            const avail: u8 = 8 - @as(u8, bit_in_byte);
+            const take: u8 = @min(remaining, avail);
+            const mask: u8 = if (take == 8) 0xff else @as(u8, @truncate((@as(u16, 1) << @intCast(take)) - 1));
+            const part: u32 = (data[byte_index] >> bit_in_byte) & mask;
+            value |= part << shift;
+            shift += @intCast(take);
+            remaining -= take;
+            bit_pos += take;
+        }
+        out[start + i * stride] = value;
+    }
+}
+
+fn appendPackedPostingChunk(
+    alloc: Allocator,
+    payload: *std.ArrayListUnmanaged(u8),
+    doc_values: []const u32,
+    freq_values: []const u32,
+    norm_values: []const u32,
+) !struct { off: u32, len: u32 } {
+    std.debug.assert(doc_values.len == freq_values.len);
+    std.debug.assert(doc_values.len == norm_values.len);
+
+    const off: u32 = @intCast(payload.items.len);
+    const doc_bits = maxBitWidth(doc_values);
+    const freq_bits = maxBitWidth(freq_values);
+    const norm_bits = maxBitWidth(norm_values);
+    try payload.appendSlice(alloc, &.{ doc_bits, freq_bits, norm_bits, 0 });
+    _ = try appendPackedU32(alloc, payload, doc_values, doc_bits);
+    _ = try appendPackedU32(alloc, payload, freq_values, freq_bits);
+    _ = try appendPackedU32(alloc, payload, norm_values, norm_bits);
+    return .{ .off = off, .len = @intCast(payload.items.len - off) };
 }
 
 /// Accumulates postings for a single term during index building.
@@ -541,7 +640,7 @@ const PostingAccumulator = struct {
         try self.all_positions.appendSlice(alloc, positions);
     }
 
-    fn serializeV8(
+    fn serializeV9(
         self: *const PostingAccumulator,
         alloc: Allocator,
         out: *std.ArrayListUnmanaged(u8),
@@ -573,18 +672,21 @@ const PostingAccumulator = struct {
             while (doc_end < self.doc_ids.items.len and self.doc_ids.items[doc_end] / chunk_size == chunk_id) : (doc_end += 1) {}
 
             scratch.doc_deltas.clearRetainingCapacity();
-            scratch.freq_norm_values.clearRetainingCapacity();
+            scratch.freq_values.clearRetainingCapacity();
+            scratch.norm_values.clearRetainingCapacity();
             try scratch.doc_deltas.ensureTotalCapacity(alloc, doc_end - doc_start);
-            try scratch.freq_norm_values.ensureTotalCapacity(alloc, (doc_end - doc_start) * 2);
+            try scratch.freq_values.ensureTotalCapacity(alloc, doc_end - doc_start);
+            try scratch.norm_values.ensureTotalCapacity(alloc, doc_end - doc_start);
 
             var prev_doc: u32 = 0;
             var i = doc_start;
             while (i < doc_end) : (i += 1) {
                 const doc_id = self.doc_ids.items[i];
                 const meta = self.metas.items[i];
-                scratch.doc_deltas.appendAssumeCapacity(if (i == doc_start) doc_id else doc_id - prev_doc);
-                scratch.freq_norm_values.appendAssumeCapacity(@intCast(encodeFreqHasLocs(meta.freq, false)));
-                scratch.freq_norm_values.appendAssumeCapacity(meta.norm);
+                scratch.doc_deltas.appendAssumeCapacity(if (i == doc_start) doc_id - chunk_id * chunk_size else doc_id - prev_doc);
+                const encoded_freq_has_locs: u32 = @intCast(encodeFreqHasLocs(meta.freq, false));
+                scratch.freq_values.appendAssumeCapacity(encoded_freq_has_locs);
+                scratch.norm_values.appendAssumeCapacity(meta.norm);
                 prev_doc = doc_id;
 
                 const bm_off = @as(usize, chunk_id - first_chunk_id) * 6;
@@ -611,20 +713,25 @@ const PostingAccumulator = struct {
                 pos_offset += count;
             }
 
-            const doc_encoded = try appendStreamVByte(alloc, scratch, &scratch.payload, scratch.doc_deltas.items);
-            const freq_encoded = try appendStreamVByte(alloc, scratch, &scratch.payload, scratch.freq_norm_values.items);
+            const packed_chunk = try appendPackedPostingChunk(
+                alloc,
+                &scratch.payload,
+                scratch.doc_deltas.items,
+                scratch.freq_values.items,
+                scratch.norm_values.items,
+            );
             try scratch.chunks.append(alloc, .{
                 .chunk_id = chunk_id,
                 .max_doc = self.doc_ids.items[doc_end - 1],
                 .doc_count = @intCast(doc_end - doc_start),
-                .doc_ctrl_off = doc_encoded.ctrl_off,
-                .doc_ctrl_len = doc_encoded.ctrl_len,
-                .doc_data_off = doc_encoded.data_off,
-                .doc_data_len = doc_encoded.data_len,
-                .freq_ctrl_off = freq_encoded.ctrl_off,
-                .freq_ctrl_len = freq_encoded.ctrl_len,
-                .freq_data_off = freq_encoded.data_off,
-                .freq_data_len = freq_encoded.data_len,
+                .doc_ctrl_off = packed_chunk.off,
+                .doc_ctrl_len = packed_chunk.len,
+                .doc_data_off = 0,
+                .doc_data_len = 0,
+                .freq_ctrl_off = 0,
+                .freq_ctrl_len = 0,
+                .freq_data_off = 0,
+                .freq_data_len = 0,
             });
 
             doc_start = doc_end;
@@ -657,7 +764,7 @@ const PostingAccumulator = struct {
 // Index reader (query path)
 // ============================================================================
 
-/// Reads a serialized inverted index section (v7, with Vellum FST).
+/// Reads a serialized inverted index section (v9, with Vellum FST).
 pub const InvertedIndexReader = struct {
     alloc: Allocator,
     data: []const u8,
@@ -675,7 +782,7 @@ pub const InvertedIndexReader = struct {
         if (data.len < v7_header_size) return error.InvalidData;
         if (!std.mem.eql(u8, data[0..4], "INVT")) return error.InvalidMagic;
         const version = data[4];
-        if (version != wire_version_v8 and version != wire_version_v7) return error.UnsupportedVersion;
+        if (version != wire_version_v9) return error.UnsupportedVersion;
 
         const doc_count = std.mem.readInt(u32, data[5..9], .little);
         const total_field_len = std.mem.readInt(u64, data[9..17], .little);
@@ -746,7 +853,7 @@ pub const InvertedIndexReader = struct {
                 .one_hit => stats.one_hit_terms +|= 1,
                 .postings => |postings| {
                     stats.postings_terms +|= 1;
-                    stats.postings_header_bytes +|= if (self.version >= wire_version_v8) 20 else 16;
+                    stats.postings_header_bytes +|= 20;
                     if (postings.block_max) |block_max_info| {
                         stats.block_max_bytes +|= @intCast(block_max_info.meta.len);
                     }
@@ -815,20 +922,10 @@ pub const InvertedIndexReader = struct {
         const base = self.postings_offset + offset;
         const doc_freq = std.mem.readInt(u32, self.data[base..][0..4], .little);
         const stored_chunks = std.mem.readInt(u32, self.data[base + 4 ..][0..4], .little);
-        const block_max_base_chunk: u32 = if (self.version >= wire_version_v8)
-            std.mem.readInt(u32, self.data[base + 8 ..][0..4], .little)
-        else
-            0;
-        const doc_chunks = if (self.version >= wire_version_v8)
-            std.mem.readInt(u32, self.data[base + 12 ..][0..4], .little)
-        else
-            std.mem.readInt(u32, self.data[base + 8 ..][0..4], .little);
-        const positions_len = if (self.version >= wire_version_v8)
-            std.mem.readInt(u32, self.data[base + 16 ..][0..4], .little)
-        else
-            std.mem.readInt(u32, self.data[base + 12 ..][0..4], .little);
-        const postings_header_len: usize = if (self.version >= wire_version_v8) 20 else 16;
-        const block_max_start = base + postings_header_len;
+        const block_max_base_chunk = std.mem.readInt(u32, self.data[base + 8 ..][0..4], .little);
+        const doc_chunks = std.mem.readInt(u32, self.data[base + 12 ..][0..4], .little);
+        const positions_len = std.mem.readInt(u32, self.data[base + 16 ..][0..4], .little);
+        const block_max_start = base + 20;
         const block_max_len = @as(usize, doc_chunks) * 6;
         const chunk_meta_start = block_max_start + block_max_len;
         const chunk_meta_len = @as(usize, stored_chunks) * v7_chunk_meta_size;
@@ -1000,7 +1097,7 @@ pub const PostingsIterator = struct {
     current_chunk_index: usize = std.math.maxInt(usize),
     next_chunk_index: usize = 0,
     chunk_doc_pos: usize = 0,
-    version: u8 = wire_version_v8,
+    version: u8 = wire_version_v9,
     positions_data: ?[]const u8 = null,
     positions_cursor: usize = 0,
     doc_values: std.ArrayListUnmanaged(u32) = .empty,
@@ -1050,21 +1147,38 @@ pub const PostingsIterator = struct {
         self.doc_values.clearRetainingCapacity();
         try self.doc_values.ensureTotalCapacity(self.alloc, meta.doc_count);
         self.doc_values.items.len = meta.doc_count;
-        const doc_control = self.payload_data[meta.doc_ctrl_off..][0..meta.doc_ctrl_len];
-        const doc_data = self.payload_data[meta.doc_data_off..][0..meta.doc_data_len];
-        _ = svb.decodeInto(doc_control, doc_data, self.doc_values.items);
-        if (self.doc_values.items.len > 1) {
-            for (1..self.doc_values.items.len) |i| {
-                self.doc_values.items[i] +%= self.doc_values.items[i - 1];
-            }
-        }
 
         self.freq_norm_values.clearRetainingCapacity();
         try self.freq_norm_values.ensureTotalCapacity(self.alloc, meta.doc_count * 2);
         self.freq_norm_values.items.len = meta.doc_count * 2;
-        const freq_control = self.payload_data[meta.freq_ctrl_off..][0..meta.freq_ctrl_len];
-        const freq_data = self.payload_data[meta.freq_data_off..][0..meta.freq_data_len];
-        _ = svb.decodeInto(freq_control, freq_data, self.freq_norm_values.items);
+
+        const chunk_data = self.payload_data[meta.doc_ctrl_off..][0..meta.doc_ctrl_len];
+        if (chunk_data.len < 4) return error.InvalidData;
+        const doc_bits = chunk_data[0];
+        const freq_bits = chunk_data[1];
+        const norm_bits = chunk_data[2];
+        if (doc_bits > 32 or freq_bits > 32 or norm_bits > 32) return error.InvalidData;
+
+        const count: usize = meta.doc_count;
+        const doc_len = packedU32ByteLen(count, doc_bits);
+        const freq_len = packedU32ByteLen(count, freq_bits);
+        const norm_len = packedU32ByteLen(count, norm_bits);
+        const expected_len = 4 + doc_len + freq_len + norm_len;
+        if (chunk_data.len < expected_len) return error.InvalidData;
+
+        var pos: usize = 4;
+        try decodePackedU32Into(chunk_data[pos..][0..doc_len], self.doc_values.items, doc_bits);
+        pos += doc_len;
+        try decodePackedU32IntoStrided(chunk_data[pos..][0..freq_len], self.freq_norm_values.items, count, freq_bits, 0, 2);
+        pos += freq_len;
+        try decodePackedU32IntoStrided(chunk_data[pos..][0..norm_len], self.freq_norm_values.items, count, norm_bits, 1, 2);
+
+        if (self.doc_values.items.len > 0) {
+            self.doc_values.items[0] +%= meta.chunk_id * self.chunk_size;
+            for (1..self.doc_values.items.len) |i| {
+                self.doc_values.items[i] +%= self.doc_values.items[i - 1];
+            }
+        }
 
         self.current_chunk_index = index;
         self.next_chunk_index = index + 1;
@@ -1748,7 +1862,7 @@ fn appendMergedTerm(
 
     const postings_offset: u64 = @intCast(postings_data.items.len);
     _ = merged_doc_count;
-    try acc.serializeV8(alloc, postings_data, serialize_scratch, config.chunk_size);
+    try acc.serializeV9(alloc, postings_data, serialize_scratch, config.chunk_size);
     try fst_builder.insert(term, postings_offset);
 }
 
@@ -1801,7 +1915,7 @@ fn assembleMergedSection(
 
     const total = v7_header_size + postings_data.len + bloom_bytes.len + fst_data.len;
     var output = try alloc.alloc(u8, total);
-    writeV8Header(
+    writeV9Header(
         output,
         doc_count,
         total_field_len,
@@ -2163,9 +2277,9 @@ test "1-hit optimization end-to-end" {
     const section = try builder.build();
     defer alloc.free(section);
 
-    // Builders emit v8 by default; the FST version-encoding (1-hit packing) is
+    // Builders emit v9 by default; the FST version-encoding (1-hit packing) is
     // unchanged from v3+, so the "unique" term still lands on the 1-hit path.
-    try std.testing.expectEqual(@as(u8, wire_version_v8), section[4]);
+    try std.testing.expectEqual(@as(u8, wire_version_v9), section[4]);
 
     var reader = try InvertedIndexReader.init(alloc, section);
 
@@ -2256,7 +2370,7 @@ test "v4 block-max metadata round-trip" {
     defer alloc.free(section);
 
     var reader = try InvertedIndexReader.init(alloc, section);
-    try std.testing.expectEqual(@as(u8, wire_version_v8), reader.version);
+    try std.testing.expectEqual(@as(u8, wire_version_v9), reader.version);
 
     const result = reader.lookup("term") orelse return error.TestExpectedEqual;
     switch (result) {
@@ -2282,7 +2396,7 @@ test "v4 block-max metadata round-trip" {
     }
 }
 
-test "v8 block-max metadata stores only term chunk window" {
+test "v9 block-max metadata stores only term chunk window" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
     defer builder.deinit();
@@ -2333,7 +2447,7 @@ test "positions round-trip v6 delta+varint" {
     defer alloc.free(section);
 
     var reader = try InvertedIndexReader.init(alloc, section);
-    try std.testing.expectEqual(@as(u8, wire_version_v8), reader.version);
+    try std.testing.expectEqual(@as(u8, wire_version_v9), reader.version);
 
     // Check "hello" positions
     const hello = reader.lookup("hello") orelse return error.TestExpectedEqual;
@@ -2715,7 +2829,7 @@ test "v6 reads back positions across the varint multi-byte boundary" {
     defer alloc.free(section);
 
     var reader = try InvertedIndexReader.init(alloc, section);
-    try std.testing.expectEqual(@as(u8, wire_version_v8), reader.version);
+    try std.testing.expectEqual(@as(u8, wire_version_v9), reader.version);
 
     const lookup = reader.lookup("term") orelse return error.TestExpectedEqual;
     var iter = try lookup.iterator(alloc);
@@ -2782,7 +2896,7 @@ test "v6 below bloom threshold skips bloom payload" {
     try std.testing.expect(reader.lookup("missing") == null);
 }
 
-test "legacy section versions are rejected by v7-only reader" {
+test "legacy section versions are rejected by v9-only reader" {
     const alloc = std.testing.allocator;
 
     var fst_builder = try vellum.Builder.init(alloc, .{});
