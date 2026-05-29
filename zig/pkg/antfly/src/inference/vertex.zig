@@ -32,12 +32,18 @@ pub const GeminiProvider = struct {
     api_key_header: [2][]const u8,
 
     pub fn init(allocator: Allocator, http: *httpx.Client, options: GeminiOptions) !GeminiProvider {
-        return .{
+        var provider = GeminiProvider{
             .allocator = allocator,
             .http = http,
-            .base_url = try allocator.dupe(u8, options.base_url),
-            .api_key_header = .{ "x-goog-api-key", try allocator.dupe(u8, options.api_key) },
+            .base_url = &.{},
+            .api_key_header = .{ "x-goog-api-key", &.{} },
         };
+        errdefer provider.deinit();
+
+        provider.base_url = try allocator.dupe(u8, options.base_url);
+        provider.api_key_header[1] = try allocator.dupe(u8, options.api_key);
+
+        return provider;
     }
 
     pub fn deinit(self: *GeminiProvider) void {
@@ -95,14 +101,18 @@ pub const Provider = struct {
         var provider = Provider{
             .allocator = allocator,
             .http = http,
-            .base_url = try allocator.dupe(u8, options.base_url),
-            .project_id = if (options.project_id) |value|
-                try allocator.dupe(u8, value)
-            else
-                (try vertexProjectIdFromConfigAlloc(allocator, options.credentials_path) orelse return error.MissingVertexCredentials),
-            .location = try allocator.dupe(u8, options.location),
+            .base_url = &.{},
+            .project_id = &.{},
+            .location = &.{},
         };
         errdefer provider.deinit();
+
+        provider.base_url = try allocator.dupe(u8, options.base_url);
+        provider.project_id = if (options.project_id) |value|
+            try allocator.dupe(u8, value)
+        else
+            (try vertexProjectIdFromConfigAlloc(allocator, options.credentials_path) orelse return error.MissingVertexCredentials);
+        provider.location = try allocator.dupe(u8, options.location);
 
         if (options.bearer_token) |token| {
             try provider.setBearer(token);
