@@ -29,10 +29,10 @@ const roaring = @import("encoding/roaring.zig");
 
 /// Merge policy configuration.
 pub const MergePolicy = struct {
-    max_segments_per_tier: u32 = 10,
+    max_segments_per_tier: u32 = 8,
     max_merge_at_once: u32 = 10,
-    max_segment_size: u64 = 5 * 1024 * 1024,
-    floor_segment_size: u64 = 2048,
+    max_segment_size: u64 = 5 * 1024 * 1024 * 1024,
+    floor_segment_size: u64 = 16 * 1024 * 1024,
     skew_weight: f64 = 1.0,
     size_weight: f64 = 1.0,
     delete_reclaim_weight: f64 = 2.0,
@@ -117,11 +117,14 @@ pub const MergePolicy = struct {
                     @as(f64, @floatFromInt(segments.len - max_segments_per_tier)) / @as(f64, @floatFromInt(max_segments_per_tier))
                 else
                     0.0;
+                const width_ratio = @as(f64, @floatFromInt(len)) / @as(f64, @floatFromInt(max_merge_at_once));
+                const backlog_width_bonus = if (budget_pressure > 1.0) (budget_pressure - 1.0) * width_ratio else 0.0;
                 const score = (skew * self.skew_weight) +
                     (size_ratio * self.size_weight) -
                     (delete_ratio * self.delete_reclaim_weight) -
                     floor_bonus -
-                    budget_pressure;
+                    budget_pressure -
+                    backlog_width_bonus;
 
                 if (best == null or score < best.?.score) {
                     best = .{

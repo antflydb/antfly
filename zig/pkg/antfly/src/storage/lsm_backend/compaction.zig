@@ -489,10 +489,10 @@ fn appendPlanRunSnapshots(
 ) !void {
     try out.ensureUnusedCapacity(backend.allocator, plan.source_len + plan.target_len);
     for (backend.runs.items[plan.source_start .. plan.source_start + plan.source_len]) |run| {
-        out.appendAssumeCapacity(try repository_mod.cloneRunSnapshot(backend.allocator, run));
+        out.appendAssumeCapacity(try repository_mod.cloneRunCompactionSnapshot(backend.allocator, run));
     }
     for (backend.runs.items[plan.target_start .. plan.target_start + plan.target_len]) |run| {
-        out.appendAssumeCapacity(try repository_mod.cloneRunSnapshot(backend.allocator, run));
+        out.appendAssumeCapacity(try repository_mod.cloneRunCompactionSnapshot(backend.allocator, run));
     }
 }
 

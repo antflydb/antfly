@@ -313,6 +313,13 @@ const SegmentFileStore = struct {
         return .fromMapped(try mapSegmentFile(path));
     }
 
+    fn mapPublished(self: *SegmentFileStore, seg_id: u64) !index_mod.SegmentData {
+        if (self.storage_owner == null) return error.Unsupported;
+        const path = try self.pathAlloc(seg_id);
+        defer self.allocator.free(path);
+        return .fromMapped(try mapSegmentFile(path));
+    }
+
     fn delete(self: *SegmentFileStore, seg_id: u64) void {
         const path = self.pathAlloc(seg_id) catch return;
         defer self.allocator.free(path);
@@ -436,6 +443,18 @@ pub const StoredSegment = struct {
     pub fn deinit(self: *StoredSegment, alloc: Allocator) void {
         alloc.free(self.segment_bytes);
         if (self.deletion_bitmap_bytes) |bytes| alloc.free(bytes);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedMergeSegment = struct {
+    id: u64,
+    data: index_mod.SegmentData,
+    key_range: SegmentKeyRange,
+
+    pub fn deinit(self: *PreparedMergeSegment, alloc: Allocator) void {
+        self.data.deinit(alloc);
+        self.key_range.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1591,6 +1610,140 @@ pub const PersistentIndex = struct {
         const new_seg_ids = try self.reserveSegmentIds(segment_bytes_list.len);
         defer self.alloc.free(new_seg_ids);
         return try self.replaceSegmentsWithReservedIdsOwned(old_seg_ids, new_seg_ids, segment_bytes_list, true);
+    }
+
+    pub fn prepareMergedSegmentToFile(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot, segment_indices: []const usize) ![]PreparedMergeSegment {
+        if (segment_indices.len == 0) return error.NoSegments;
+        const store = &(self.segment_files orelse return error.Unsupported);
+        if (store.storage_owner == null) return error.Unsupported;
+
+        const new_seg_id = self.reserveSegmentId();
+        errdefer self.deleteSegmentFile(new_seg_id);
+
+        var inputs = try self.alloc.alloc(segment_mod.MergeInput, segment_indices.len);
+        defer self.alloc.free(inputs);
+        for (segment_indices, 0..) |seg_idx, i| {
+            const seg = &snap.segments[seg_idx];
+            inputs[i] = .{
+                .reader = &seg.reader,
+                .deleted = seg.deleted,
+            };
+        }
+
+        const path = try store.pathAlloc(new_seg_id);
+        defer store.allocator.free(path);
+
+        var writer = try store.storage.beginAtomicWrite(self.alloc, path);
+        var writer_active = true;
+        errdefer if (writer_active) writer.abort();
+
+        var sink_adapter = AtomicSegmentSink{ .writer = &writer };
+        var sink = sink_adapter.sink();
+        try segment_mod.writeMergedSegmentToSink(self.alloc, &sink, inputs);
+
+        writer_active = false;
+        try writer.finish();
+
+        var data: ?index_mod.SegmentData = try store.mapPublished(new_seg_id);
+        errdefer if (data) |*segment_data| segment_data.deinit(self.alloc);
+
+        var key_range = try extractSegmentKeyRange(self.alloc, data.?.bytes());
+        errdefer key_range.deinit(self.alloc);
+        key_range.seg_id = new_seg_id;
+
+        const prepared = try self.alloc.alloc(PreparedMergeSegment, 1);
+        errdefer self.alloc.free(prepared);
+        prepared[0] = .{
+            .id = new_seg_id,
+            .data = data.?,
+            .key_range = key_range,
+        };
+        data = null;
+        return prepared;
+    }
+
+    pub fn replaceSegmentsIfActiveManyPrepared(self: *PersistentIndex, old_seg_ids: []const u64, prepared_segments: []PreparedMergeSegment) !bool {
+        if (old_seg_ids.len == 0) {
+            self.discardPreparedMergeSegments(prepared_segments);
+            return false;
+        }
+        if (prepared_segments.len == 0) {
+            self.alloc.free(prepared_segments);
+            return try self.removeSegmentsIfActive(old_seg_ids);
+        }
+
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        var published_to_writer = false;
+        defer {
+            if (!published_to_writer) {
+                for (prepared_segments) |*segment| {
+                    const id = segment.id;
+                    segment.deinit(self.alloc);
+                    self.deleteSegmentFile(id);
+                }
+            } else {
+                for (prepared_segments) |*segment| {
+                    segment.key_range.deinit(self.alloc);
+                }
+            }
+            self.alloc.free(prepared_segments);
+        }
+
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+
+        const active_ids = try self.loadActiveSegmentIds(&txn, self.alloc);
+        defer self.alloc.free(active_ids);
+        for (old_seg_ids) |old_id| {
+            if (!containsSegmentId(active_ids, old_id)) {
+                txn.abort();
+                return false;
+            }
+        }
+
+        for (old_seg_ids) |old_id| {
+            const old_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, old_id));
+            try self.updateActiveSegments(&txn, old_id, .remove);
+            txn.delete(.segments, &old_seg_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            txn.delete(.deletions, &old_seg_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            try self.deleteSegmentRange(&txn, old_id);
+        }
+
+        for (prepared_segments) |*segment| {
+            try self.saveSegmentRange(&txn, segment.id, segment.key_range);
+            try self.updateActiveSegments(&txn, segment.id, .add);
+        }
+        try txn.commit();
+
+        var replacements = try self.alloc.alloc(index_mod.ReplacementSegmentData, prepared_segments.len);
+        defer self.alloc.free(replacements);
+        for (prepared_segments, 0..) |*segment, i| {
+            replacements[i] = .{
+                .id = segment.id,
+                .data = segment.data,
+            };
+        }
+        try self.writer.replaceSegmentsManyData(old_seg_ids, replacements);
+        published_to_writer = true;
+        for (old_seg_ids) |old_id| self.deleteSegmentFile(old_id);
+        return true;
+    }
+
+    pub fn discardPreparedMergeSegments(self: *PersistentIndex, prepared_segments: []PreparedMergeSegment) void {
+        for (prepared_segments) |*segment| {
+            const id = segment.id;
+            segment.deinit(self.alloc);
+            self.deleteSegmentFile(id);
+        }
+        self.alloc.free(prepared_segments);
     }
 
     pub fn removeSegmentsIfActive(self: *PersistentIndex, old_seg_ids: []const u64) !bool {

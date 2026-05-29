@@ -90,9 +90,9 @@ var text_segment_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_projection_source_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var sparse_replay_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
 const default_merge_policy = merger_mod.MergePolicy{
-    .max_segments_per_tier = 10,
-    .max_segment_size = 256 * 1024 * 1024,
-    .floor_segment_size = 16 * 1024,
+    .max_segments_per_tier = 8,
+    .max_segment_size = 5 * 1024 * 1024 * 1024,
+    .floor_segment_size = 16 * 1024 * 1024,
 };
 const default_text_segment_build_target_bytes: usize = 16 * 1024 * 1024;
 const default_text_projection_source_build_target_bytes: usize = 8 * 1024 * 1024;
@@ -732,6 +732,7 @@ pub const IndexManager = struct {
 
     pub const TextMergeTask = struct {
         index_name: []u8,
+        persistent: *persistent_mod.PersistentIndex,
         source: []TextMergeSourceSegment,
         merge_indices: []usize,
         snapshot: *index_mod.IndexSnapshot,
@@ -750,9 +751,21 @@ pub const IndexManager = struct {
 
     pub const TextMergeResult = struct {
         segments: [][]u8 = &.{},
+        prepared_segments: []persistent_mod.PreparedMergeSegment = &.{},
+        prepared_owner: ?*persistent_mod.PersistentIndex = null,
 
         pub fn deinit(self: *TextMergeResult, alloc: Allocator) void {
             merger_mod.freeMergedSegments(alloc, self.segments);
+            if (self.prepared_segments.len > 0) {
+                if (self.prepared_owner) |owner| {
+                    owner.discardPreparedMergeSegments(self.prepared_segments);
+                } else {
+                    for (self.prepared_segments) |*segment| {
+                        segment.deinit(alloc);
+                    }
+                    alloc.free(self.prepared_segments);
+                }
+            }
             self.* = undefined;
         }
     };
@@ -5680,6 +5693,21 @@ pub const IndexManager = struct {
     }
 
     pub fn executeTextMergeTask(alloc: Allocator, task: *const TextMergeTask) !TextMergeResult {
+        if (task.persistent.prepareMergedSegmentToFile(task.snapshot, task.merge_indices)) |prepared| {
+            return .{
+                .prepared_segments = prepared,
+                .prepared_owner = task.persistent,
+            };
+        } else |err| switch (err) {
+            error.Unsupported => {},
+            else => {
+                if (builtin.os.tag != .freestanding) {
+                    std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
+                }
+                return err;
+            },
+        }
+
         const merged = merger_mod.mergeSegmentsBounded(alloc, task.snapshot, task.merge_indices, .{
             .target_segment_bytes = @intCast(default_merge_policy.max_segment_size),
         }) catch |err| {
@@ -5703,16 +5731,32 @@ pub const IndexManager = struct {
 
         const old_ids = try textMergeSourceIds(self.alloc, task.source);
         defer self.alloc.free(old_ids);
-        const applied = entry.persistent.replaceSegmentsIfActiveManyOwned(old_ids, result.segments) catch |err| switch (err) {
-            error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
-            else => {
-                if (builtin.os.tag != .freestanding) {
-                    std.log.err("scheduled text merge apply failed index={s}: {s}", .{ task.index_name, @errorName(err) });
-                }
-                return err;
-            },
+        const applied = if (result.prepared_segments.len > 0) blk: {
+            const prepared_segments = result.prepared_segments;
+            result.prepared_segments = &.{};
+            result.prepared_owner = null;
+            break :blk entry.persistent.replaceSegmentsIfActiveManyPrepared(old_ids, prepared_segments) catch |err| switch (err) {
+                error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
+                else => {
+                    if (builtin.os.tag != .freestanding) {
+                        std.log.err("scheduled text merge apply failed index={s}: {s}", .{ task.index_name, @errorName(err) });
+                    }
+                    return err;
+                },
+            };
+        } else blk: {
+            const segments = result.segments;
+            result.segments = &.{};
+            break :blk entry.persistent.replaceSegmentsIfActiveManyOwned(old_ids, segments) catch |err| switch (err) {
+                error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
+                else => {
+                    if (builtin.os.tag != .freestanding) {
+                        std.log.err("scheduled text merge apply failed index={s}: {s}", .{ task.index_name, @errorName(err) });
+                    }
+                    return err;
+                },
+            };
         };
-        result.segments = &.{};
 
         if (applied and !try self.textIndexNeedsMerge(&entry.persistent, default_merge_policy)) {
             TextMergeScheduler.noteComplete(entry);
@@ -5765,13 +5809,13 @@ pub const IndexManager = struct {
         defer self.alloc.free(planned);
         if (planned.len < 2) return null;
 
-        var task = try self.copyTextMergeTask(entry.config.name, snap, planned);
+        var task = try self.copyTextMergeTask(entry.config.name, &entry.persistent, snap, planned);
         errdefer task.deinit(self.alloc);
         try self.text_merge_scheduler.registerSource(self.alloc, task.index_name, task.source);
         return task;
     }
 
-    fn copyTextMergeTask(self: *IndexManager, index_name: []const u8, snap: *index_mod.IndexSnapshot, planned: []const usize) !TextMergeTask {
+    fn copyTextMergeTask(self: *IndexManager, index_name: []const u8, persistent: *persistent_mod.PersistentIndex, snap: *index_mod.IndexSnapshot, planned: []const usize) !TextMergeTask {
         const owned_index_name = try self.alloc.dupe(u8, index_name);
         errdefer self.alloc.free(owned_index_name);
 
@@ -5800,6 +5844,7 @@ pub const IndexManager = struct {
 
         return .{
             .index_name = owned_index_name,
+            .persistent = persistent,
             .source = source,
             .merge_indices = merge_indices,
             .snapshot = snap.retain(),

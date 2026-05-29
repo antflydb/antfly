@@ -164,6 +164,45 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
     return out;
 }
 
+pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
+    const smallest_namespace_name = if (source.smallest_namespace_name) |name| try allocator.dupe(u8, name) else null;
+    errdefer if (smallest_namespace_name) |name| allocator.free(name);
+    const smallest_key = try allocator.dupe(u8, source.smallest_key);
+    errdefer allocator.free(smallest_key);
+    const largest_namespace_name = if (source.largest_namespace_name) |name| try allocator.dupe(u8, name) else null;
+    errdefer if (largest_namespace_name) |name| allocator.free(name);
+    const largest_key = try allocator.dupe(u8, source.largest_key);
+    errdefer allocator.free(largest_key);
+
+    var out = Run{
+        .id = source.id,
+        .level = source.level,
+        .size_bytes = source.size_bytes,
+        .compression_stats = source.compression_stats,
+        .path = if (source.path) |path| try allocator.dupe(u8, path) else null,
+        .smallest_namespace_name = smallest_namespace_name,
+        .smallest_key = smallest_key,
+        .largest_namespace_name = largest_namespace_name,
+        .largest_key = largest_key,
+        .entry_count = source.entry_count,
+        .bloom_filter = null,
+        .encoded_bloom_filter = null,
+        .owns_bloom_filter = false,
+        .cached_state_index = null,
+        .cached_index_index = null,
+        .cached_table_index = null,
+        .table_index = null,
+        .state = null,
+    };
+    errdefer out.deinit(allocator);
+
+    if (source.path == null) {
+        const state = source.state orelse return error.RunStateUnavailable;
+        out.state = try state.clone(allocator);
+    }
+    return out;
+}
+
 pub fn ensureOpenDirs(root_dir: []const u8) !void {
     var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
     defer native.deinit();

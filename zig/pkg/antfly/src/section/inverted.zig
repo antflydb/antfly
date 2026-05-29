@@ -1142,6 +1142,21 @@ pub const PostingsIterator = struct {
         return readChunkMetaV7(self.chunk_meta_data[index * v7_chunk_meta_size ..][0..v7_chunk_meta_size]);
     }
 
+    fn nextChunkIndexForTarget(self: *const PostingsIterator, target: u32) usize {
+        var lo = self.next_chunk_index;
+        var hi = self.chunkCount();
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const meta = self.chunkMeta(mid);
+            if (meta.max_doc < target) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
     fn loadChunk(self: *PostingsIterator, index: usize) !void {
         const meta = self.chunkMeta(index);
         self.doc_values.clearRetainingCapacity();
@@ -1261,12 +1276,9 @@ pub const PostingsIterator = struct {
             }
         }
 
-        while (self.next_chunk_index < self.chunkCount()) : (self.next_chunk_index += 1) {
-            const meta = self.chunkMeta(self.next_chunk_index);
-            if (meta.max_doc < target) continue;
-            try self.loadChunk(self.next_chunk_index);
-            break;
-        }
+        const target_chunk_index = self.nextChunkIndexForTarget(target);
+        if (target_chunk_index >= self.chunkCount()) return null;
+        try self.loadChunk(target_chunk_index);
         if (self.current_chunk_index == std.math.maxInt(usize) or self.current_chunk_index >= self.chunkCount()) return null;
 
         while (self.chunk_doc_pos < self.doc_values.items.len and self.doc_values.items[self.chunk_doc_pos] < target) {
@@ -1737,23 +1749,25 @@ pub fn mergeInvertedSectionSlotsWithDeletes(
     while (true) {
         const min_term = findMinCurrentTerm(current_entries) orelse break;
 
-        const merged_term = try alloc.dupe(u8, min_term);
-        defer alloc.free(merged_term);
+        {
+            const merged_term = try alloc.dupe(u8, min_term);
+            defer alloc.free(merged_term);
 
-        var acc = PostingAccumulator.init();
-        defer acc.deinit(alloc);
+            var acc = PostingAccumulator.init();
+            defer acc.deinit(alloc);
 
-        for (current_entries, 0..) |entry_opt, seg_idx| {
-            const entry = entry_opt orelse continue;
-            if (!std.mem.eql(u8, entry.term, merged_term)) continue;
+            for (current_entries, 0..) |entry_opt, seg_idx| {
+                const entry = entry_opt orelse continue;
+                if (!std.mem.eql(u8, entry.term, merged_term)) continue;
 
-            const rmap = renumber_maps[seg_idx].?;
-            try appendLookupResultToAccumulator(alloc, &acc, entry.result, rmap, &total_field_len);
-            current_entries[seg_idx] = try nextTermIteratorEntry(term_iters, seg_idx);
+                const rmap = renumber_maps[seg_idx].?;
+                try appendLookupResultToAccumulator(alloc, &acc, entry.result, rmap, &total_field_len);
+                current_entries[seg_idx] = try nextTermIteratorEntry(term_iters, seg_idx);
+            }
+
+            if (acc.doc_ids.items.len == 0) continue;
+            try appendMergedTerm(alloc, &fst_builder, &postings_data, &serialize_scratch, merged_term, &acc, config, running_offset);
         }
-
-        if (acc.doc_ids.items.len == 0) continue;
-        try appendMergedTerm(alloc, &fst_builder, &postings_data, &serialize_scratch, merged_term, &acc, config, running_offset);
     }
 
     return assembleMergedSection(alloc, running_offset, total_field_len, config.chunk_size, postings_data.items, try fst_builder.finish(), config);
