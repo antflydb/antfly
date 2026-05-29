@@ -53,7 +53,7 @@ const AggregationCard: React.FC<AggregationCardProps> = ({
   })();
 
   return (
-    <div className="flex items-start justify-between p-2.5 bg-muted/30 rounded-lg border group">
+    <div className="flex items-start justify-between p-2.5 bg-muted/30 rounded-none border group">
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-1">
           <span className="font-medium text-sm truncate">{name}</span>
@@ -62,7 +62,7 @@ const AggregationCard: React.FC<AggregationCardProps> = ({
           </Badge>
         </div>
         <div className="text-xs text-muted-foreground flex items-center gap-1.5">
-          <code className="bg-muted px-1 py-0.5 rounded">{aggregation.field || "none"}</code>
+          <code className="bg-muted px-1 py-0.5 rounded-none">{aggregation.field || "none"}</code>
           {details && <span>· {details}</span>}
         </div>
       </div>

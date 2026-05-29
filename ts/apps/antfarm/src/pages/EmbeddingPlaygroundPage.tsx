@@ -104,7 +104,7 @@ function EmbeddingSparkline({
     <svg
       width={width}
       height={height}
-      className="shrink-0 rounded"
+      className="shrink-0 rounded-none"
       aria-label="Embedding vector preview"
     >
       <rect width={width} height={height} className="fill-muted/50" rx={2} />
@@ -399,7 +399,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -489,7 +489,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
               <div className="max-h-[600px] overflow-y-auto space-y-3">
                 {/* Query embedding preview */}
                 {queryEmbedding && showSparklines && (
-                  <div className="p-3 bg-muted/30 rounded-lg border border-dashed space-y-2">
+                  <div className="p-3 bg-muted/30 rounded-none border border-dashed space-y-2">
                     <div className="flex items-center gap-2">
                       <span className="text-xs font-medium text-muted-foreground">
                         Query vector
@@ -500,7 +500,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
                 )}
 
                 {results.map((doc, rank) => (
-                  <div key={doc.index} className="p-3 bg-muted/30 rounded-lg border space-y-2">
+                  <div key={doc.index} className="p-3 bg-muted/30 rounded-none border space-y-2">
                     <div className="flex items-center gap-2">
                       <span className="flex items-center justify-center w-6 h-6 rounded-full bg-primary/10 text-primary text-xs font-bold shrink-0">
                         {rank + 1}

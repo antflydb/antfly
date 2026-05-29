@@ -131,7 +131,7 @@ const SchemaEditor: React.FC<SchemaEditorProps> = ({
   };
 
   return (
-    <div className="p-4 border border-border rounded-md mb-4">
+    <div className="p-4 border border-border rounded-none mb-4">
       <div className="flex justify-between items-center mb-4">
         <div className="flex gap-4">
           <FormField
@@ -244,7 +244,7 @@ const SchemaEditor: React.FC<SchemaEditorProps> = ({
       </div>
 
       {fields.length > 0 ? (
-        <div className="border rounded-md">
+        <div className="border rounded-none">
           <Table>
             <TableHeader>
               <TableRow>
@@ -275,7 +275,7 @@ const SchemaEditor: React.FC<SchemaEditorProps> = ({
           </Table>
         </div>
       ) : (
-        <div className="border rounded-md p-8 text-center text-muted-foreground">
+        <div className="border rounded-none p-8 text-center text-muted-foreground">
           <p>No fields defined yet.</p>
           <p className="text-sm mt-1">Add fields manually or import from JSON.</p>
         </div>

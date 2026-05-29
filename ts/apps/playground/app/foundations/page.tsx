@@ -1,4 +1,5 @@
 import {
+  AntyPixel,
   Button,
   Card,
   CardContent,
@@ -6,10 +7,12 @@ import {
   CardHeader,
   CardTitle,
   GraphPaperBg,
+  Highlight,
+  Kicker,
   Lockup,
   Logo,
-  MonoLabel,
   Separator,
+  TypeOn,
   Wordmark,
 } from "@antfly/design-system";
 
@@ -20,7 +23,7 @@ export const metadata = {
 };
 
 /**
- * Semantic color tokens. Both light and dark values are listed explicitly so
+ * Token specimens. Both light and dark hex values are listed explicitly so
  * every swatch can render both modes side-by-side regardless of which theme
  * the playground is currently in. Values here must stay in sync with
  * packages/design-system/src/tokens/colors.css — there isn't a programmatic
@@ -34,187 +37,139 @@ interface TokenDef {
   description?: string;
 }
 
-const SEMANTIC_COLORS: TokenDef[] = [
+const AMBER_RAMP: TokenDef[] = [
+  { name: "Amber 50", varName: "--amber-50", light: "#fdf6e3", dark: "#fdf6e3" },
+  { name: "Amber 100", varName: "--amber-100", light: "#f9e9bf", dark: "#f9e9bf" },
+  { name: "Amber 200", varName: "--amber-200", light: "#f3d488", dark: "#f3d488" },
+  { name: "Amber 300", varName: "--amber-300", light: "#ecbc4a", dark: "#ecbc4a" },
   {
-    name: "Background",
-    varName: "--background",
-    light: "oklch(0.98 0.003 265)",
-    dark: "oklch(0.135 0.005 275)",
+    name: "Amber 400",
+    varName: "--amber-400",
+    light: "#e3a112",
+    dark: "#ecb52e",
+    description: "Primary fill. Slightly brighter on dark for legibility.",
   },
+  {
+    name: "Amber 500",
+    varName: "--amber-500",
+    light: "#c4850b",
+    dark: "#c4850b",
+    description: "Default border on primary controls — Button, Badge solid.",
+  },
+  { name: "Amber 600", varName: "--amber-600", light: "#9c6907", dark: "#9c6907" },
+  { name: "Amber 700", varName: "--amber-700", light: "#6f4a05", dark: "#6f4a05" },
+];
+
+const SEMANTIC_COLORS: TokenDef[] = [
+  { name: "Background", varName: "--background", light: "#fafafa", dark: "#121212" },
   {
     name: "Background secondary",
     varName: "--background-secondary",
-    light: "oklch(0.965 0.003 265)",
-    dark: "oklch(0.11 0.005 275)",
+    light: "#f2f2f1",
+    dark: "#1a1a1a",
     description: "Optional app-shell background used by dashboard surfaces.",
   },
-  {
-    name: "Foreground",
-    varName: "--foreground",
-    light: "oklch(0.185 0.02 275)",
-    dark: "oklch(0.91 0.005 265)",
-  },
-  {
-    name: "Card",
-    varName: "--card",
-    light: "oklch(0.995 0.001 265)",
-    dark: "oklch(0.185 0.005 275)",
-  },
-  {
-    name: "Card foreground",
-    varName: "--card-foreground",
-    light: "oklch(0.185 0.02 275)",
-    dark: "oklch(0.91 0.005 265)",
-  },
-  {
-    name: "Popover",
-    varName: "--popover",
-    light: "oklch(0.995 0.001 265)",
-    dark: "oklch(0.185 0.005 275)",
-  },
-  {
-    name: "Popover foreground",
-    varName: "--popover-foreground",
-    light: "oklch(0.185 0.02 275)",
-    dark: "oklch(0.91 0.005 265)",
-  },
+  { name: "Foreground", varName: "--foreground", light: "#1b1b1a", dark: "#ededec" },
+  { name: "Card", varName: "--card", light: "#ffffff", dark: "#1c1c1c" },
+  { name: "Card foreground", varName: "--card-foreground", light: "#1b1b1a", dark: "#ededec" },
+  { name: "Popover", varName: "--popover", light: "#ffffff", dark: "#1c1c1c" },
+  { name: "Popover foreground", varName: "--popover-foreground", light: "#1b1b1a", dark: "#ededec" },
   {
     name: "Primary",
     varName: "--primary",
-    light: "oklch(0.7 0.15 285)",
-    dark: "oklch(0.7 0.15 285)",
-    description: "Purple accent — identical in light and dark, used sparingly.",
+    light: "#e3a112",
+    dark: "#ecb52e",
+    description: "var(--amber-400) — the single accent hue.",
   },
   {
     name: "Primary foreground",
     varName: "--primary-foreground",
-    light: "oklch(1 0 0)",
-    dark: "oklch(0.135 0.005 275)",
+    light: "#221a06",
+    dark: "#1c1407",
+    description: "Ink on amber fills. Never use white on amber.",
   },
-  {
-    name: "Secondary",
-    varName: "--secondary",
-    light: "oklch(0.955 0.003 265)",
-    dark: "oklch(0.22 0.005 275)",
-  },
-  {
-    name: "Secondary foreground",
-    varName: "--secondary-foreground",
-    light: "oklch(0.185 0.02 275)",
-    dark: "oklch(0.91 0.005 265)",
-  },
-  {
-    name: "Muted",
-    varName: "--muted",
-    light: "oklch(0.955 0.003 265)",
-    dark: "oklch(0.22 0.005 275)",
-  },
-  {
-    name: "Muted foreground",
-    varName: "--muted-foreground",
-    light: "oklch(0.55 0.01 265)",
-    dark: "oklch(0.65 0.005 265)",
-  },
-  {
-    name: "Accent",
-    varName: "--accent",
-    light: "oklch(0.955 0.003 265)",
-    dark: "oklch(0.22 0.005 275)",
-  },
-  {
-    name: "Accent foreground",
-    varName: "--accent-foreground",
-    light: "oklch(0.185 0.02 275)",
-    dark: "oklch(0.91 0.005 265)",
-  },
+  { name: "Secondary", varName: "--secondary", light: "#f2f2f1", dark: "#1a1a1a" },
+  { name: "Secondary foreground", varName: "--secondary-foreground", light: "#1b1b1a", dark: "#ededec" },
+  { name: "Muted", varName: "--muted", light: "#f2f2f1", dark: "#1a1a1a" },
+  { name: "Muted foreground", varName: "--muted-foreground", light: "#54534f", dark: "#b2b1ad" },
+  { name: "Accent", varName: "--accent", light: "#f2f2f1", dark: "#1a1a1a" },
+  { name: "Accent foreground", varName: "--accent-foreground", light: "#1b1b1a", dark: "#ededec" },
   {
     name: "Destructive",
     varName: "--destructive",
-    light: "oklch(0.577 0.245 27.325)",
-    dark: "oklch(0.704 0.191 22.216)",
+    light: "#b23c34",
+    dark: "#d96a61",
+    description: "Restrained red — express via border/text, not loud fills.",
   },
-  {
-    name: "Destructive foreground",
-    varName: "--destructive-foreground",
-    light: "oklch(0.985 0 0)",
-    dark: "oklch(0.985 0 0)",
-  },
-  {
-    name: "Success",
-    varName: "--success",
-    light: "oklch(0.7 0.17 150)",
-    dark: "oklch(0.72 0.17 150)",
-  },
+  { name: "Success", varName: "--success", light: "#4d7a45", dark: "#6fa362" },
   {
     name: "Warning",
     varName: "--warning",
-    light: "oklch(0.78 0.16 75)",
-    dark: "oklch(0.82 0.16 75)",
+    light: "#d3641a",
+    dark: "#e8854a",
+    description: "HOT-ORANGE — deliberately distinct from brand amber.",
   },
-  {
-    name: "Info",
-    varName: "--info",
-    light: "oklch(0.72 0.13 230)",
-    dark: "oklch(0.72 0.13 230)",
-  },
+  { name: "Info", varName: "--info", light: "#3f6c98", dark: "#6fa0cf" },
   {
     name: "Border",
     varName: "--border",
-    light: "oklch(0.91 0.005 265)",
-    dark: "oklch(1 0 0 / 8%)",
+    light: "#e4e3e0",
+    dark: "#2c2c2c",
+    description: "Subtle separators — table rows, card-head divider.",
   },
   {
-    name: "Input",
-    varName: "--input",
-    light: "oklch(0.91 0.005 265)",
-    dark: "oklch(1 0 0 / 12%)",
+    name: "Border strong",
+    varName: "--border-strong",
+    light: "#cbcac6",
+    dark: "#444443",
+    description: "Chassis border — card outer, dialog, badge, button-outline.",
   },
-  {
-    name: "Ring",
-    varName: "--ring",
-    light: "oklch(0.65 0.005 265)",
-    dark: "oklch(0.5 0.005 265)",
-  },
+  { name: "Input", varName: "--input", light: "#e4e3e0", dark: "#2c2c2c" },
+  { name: "Ring", varName: "--ring", light: "#1b1b1a", dark: "#ededec" },
 ];
 
 const CHART_COLORS: TokenDef[] = [
   {
     name: "Chart 1",
     varName: "--chart-1",
-    light: "oklch(0.7 0.15 285)",
-    dark: "oklch(0.7 0.15 285)",
-    description: "var(--primary) — purple accent.",
+    light: "#e3a112",
+    dark: "#ecb52e",
+    description: "var(--primary) — amber accent.",
   },
   {
     name: "Chart 2",
     varName: "--chart-2",
-    light: "oklch(0.55 0.01 265)",
-    dark: "oklch(0.65 0.005 265)",
-    description: "var(--muted-foreground) — cool gray.",
+    light: "#54534f",
+    dark: "#b2b1ad",
+    description: "var(--muted-foreground) — neutral.",
   },
   {
     name: "Chart 3",
     varName: "--chart-3",
-    light: "oklch(0.78 0.15 92)",
-    dark: "#FADF5A",
+    light: "#f3d488",
+    dark: "#f3d488",
+    description: "var(--amber-200) — soft amber wash.",
   },
   {
     name: "Chart 4",
     varName: "--chart-4",
-    light: "oklch(0.58 0.12 145)",
-    dark: "#477F4F",
+    light: "#4d7a45",
+    dark: "#6fa362",
+    description: "var(--success).",
   },
   {
     name: "Chart 5",
     varName: "--chart-5",
-    light: "oklch(0.70 0.13 28)",
-    dark: "#F7978D",
+    light: "#d3641a",
+    dark: "#e8854a",
+    description: "var(--warning).",
   },
   {
     name: "Chart 6",
     varName: "--chart-6",
-    light: "oklch(0.64 0.13 225)",
-    dark: "oklch(0.64 0.13 225)",
+    light: "#3f6c98",
+    dark: "#6fa0cf",
+    description: "var(--info).",
   },
 ];
 
@@ -298,13 +253,13 @@ const COMPATIBILITY_SCALES: TokenScale[] = [
     tokens: [
       { varName: "--searchaf-1", light: "#ffffff", dark: "#0a0a0a" },
       { varName: "--searchaf-2", light: "#fafafa", dark: "#0f0f0f" },
-      { varName: "--searchaf-3", light: "#f5f5f5", dark: "#131313" },
-      { varName: "--searchaf-4", light: "#e5e5e5", dark: "#262626" },
-      { varName: "--searchaf-5", light: "#d4d4d4", dark: "#3a3a3a" },
-      { varName: "--searchaf-6", light: "#a3a3a3", dark: "#525252" },
-      { varName: "--searchaf-7", light: "#737373", dark: "#737373" },
-      { varName: "--searchaf-8", light: "#525252", dark: "#a1a1a1" },
-      { varName: "--searchaf-9", light: "#1c2024", dark: "#e5e5e5" },
+      { varName: "--searchaf-3", light: "#f4f4f4", dark: "#131313" },
+      { varName: "--searchaf-4", light: "#e4e4e3", dark: "#262626" },
+      { varName: "--searchaf-5", light: "#cbcac6", dark: "#3a3a3a" },
+      { varName: "--searchaf-6", light: "#a3a29e", dark: "#525252" },
+      { varName: "--searchaf-7", light: "#777572", dark: "#737373" },
+      { varName: "--searchaf-8", light: "#555350", dark: "#a1a1a1" },
+      { varName: "--searchaf-9", light: "#1f1e1c", dark: "#e5e5e5" },
       { varName: "--searchaf-10", light: "#18181b", dark: "#f5f5f5" },
       { varName: "--searchaf-11", light: "#09090b", dark: "#fafafa" },
       { varName: "--searchaf-12", light: "#000000", dark: "#ffffff" },
@@ -349,7 +304,7 @@ export default function FoundationsPage() {
   return (
     <div className="mx-auto max-w-5xl space-y-16">
       <header className="space-y-3">
-        <MonoLabel>Design tokens</MonoLabel>
+        <Kicker>Design tokens</Kicker>
         <h1 className="font-display text-4xl font-bold tracking-tight">Foundations</h1>
         <p className="max-w-2xl text-muted-foreground">
           Live specimens for every token shipped by{" "}
@@ -358,11 +313,43 @@ export default function FoundationsPage() {
           <code className="font-mono text-sm">src/styles.css</code>. Colors show both light and dark
           values per swatch.
         </p>
+        <p className="max-w-2xl text-sm text-muted-foreground">
+          The visual language is <Highlight>square, flat, amber</Highlight> — borders carry
+          hierarchy, shadows are neutralized, and a single honey-amber hue is the only accent on a
+          neutral paper/ink base.
+        </p>
       </header>
 
-      {/* Colors ---------------------------------------------------------- */}
+      {/* Color: Amber ramp ----------------------------------------------- */}
+      <section className="space-y-6">
+        <SectionHeading
+          eyebrow="Color"
+          title="Amber ramp — the single accent"
+          file="src/tokens/colors.css"
+        />
+        <p className="max-w-2xl text-sm text-muted-foreground">
+          One hue, eight stops. Amber 400 is the primary fill; 500 is the default border on primary
+          controls (Button, Badge solid). The ramp is exposed as Tailwind utilities —{" "}
+          <code className="font-mono text-xs">bg-amber-300</code>,{" "}
+          <code className="font-mono text-xs">border-amber-500</code>,{" "}
+          <code className="font-mono text-xs">text-amber-600</code> all work directly.
+        </p>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          {AMBER_RAMP.map((c) => (
+            <ColorSwatch key={c.varName} {...c} />
+          ))}
+        </div>
+      </section>
+
+      {/* Color: Semantic palette ----------------------------------------- */}
       <section className="space-y-6">
         <SectionHeading eyebrow="Color" title="Semantic palette" file="src/tokens/colors.css" />
+        <p className="max-w-2xl text-sm text-muted-foreground">
+          Neutral paper/ink base. Note the distinction between{" "}
+          <code className="font-mono text-xs">--border</code> (subtle row separators) and{" "}
+          <code className="font-mono text-xs">--border-strong</code> (chassis borders — card outer,
+          dialog, badge, button-outline).
+        </p>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           {SEMANTIC_COLORS.map((c) => (
             <ColorSwatch key={c.varName} {...c} />
@@ -372,6 +359,10 @@ export default function FoundationsPage() {
 
       <section className="space-y-6">
         <SectionHeading eyebrow="Color" title="Chart palette" />
+        <p className="max-w-2xl text-sm text-muted-foreground">
+          Amber leads, then the semantic family. <code className="font-mono text-xs">--chart-2</code>{" "}
+          is muted neutral so single-series charts default to ink rather than a competing hue.
+        </p>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           {CHART_COLORS.map((c) => (
             <ColorSwatch key={c.varName} {...c} />
@@ -390,6 +381,13 @@ export default function FoundationsPage() {
 
       <section className="space-y-6">
         <SectionHeading eyebrow="Color" title="Migration compatibility scales" />
+        <p className="max-w-2xl text-sm text-muted-foreground">
+          <code className="font-mono text-xs">--searchaf-*</code> and{" "}
+          <code className="font-mono text-xs">--gray-*</code> are retained for surfaces still
+          migrating. Prefer the semantic tokens (<code className="font-mono text-xs">--foreground</code>
+          , <code className="font-mono text-xs">--muted-foreground</code>,{" "}
+          <code className="font-mono text-xs">--border-strong</code>) for new work.
+        </p>
         <div className="grid gap-4 md:grid-cols-2">
           {COMPATIBILITY_SCALES.map((scale) => (
             <TokenScaleSwatch key={scale.name} scale={scale} />
@@ -399,7 +397,45 @@ export default function FoundationsPage() {
 
       <Separator />
 
-      {/* Typography ------------------------------------------------------ */}
+      {/* Typography: registers ------------------------------------------- */}
+      <section className="space-y-6">
+        <SectionHeading
+          eyebrow="Typography"
+          title="Three registers + decision rule"
+          file="TYPOGRAPHY.md"
+        />
+        <Card>
+          <CardContent className="space-y-4">
+            <p className="text-sm">
+              <Highlight>The rule.</Highlight> Is this content read as a label/identifier or as a
+              phrase?
+            </p>
+            <ul className="space-y-2 text-sm text-foreground">
+              <li>
+                <strong className="font-medium">Mono</strong> if it's a label, ID, value, kind, or
+                anything that's part of the instrument chassis (menu item, accordion trigger,
+                button, badge, tab).
+              </li>
+              <li>
+                <strong className="font-medium">Inter</strong> if it's a heading or sentence the user
+                reads as a phrase (Card/Dialog/Sheet titles, page H1/H2, paragraphs, descriptions).
+              </li>
+              <li>
+                <strong className="font-medium">Aeonik</strong> only when it's a brand moment
+                (marketing hero, wordmark). Using it elsewhere dilutes the moment.
+              </li>
+            </ul>
+            <p className="text-sm text-muted-foreground">
+              <Highlight>Chrome beats content shape.</Highlight> Menu items and accordion triggers
+              stay mono even when their text reads as a sentence — the chassis voice wins. See{" "}
+              <code className="font-mono text-xs">TYPOGRAPHY.md</code> for the full breakdown,
+              including tracking conventions and the per-component reference table.
+            </p>
+          </CardContent>
+        </Card>
+      </section>
+
+      {/* Typography: font families --------------------------------------- */}
       <section className="space-y-8">
         <SectionHeading
           eyebrow="Typography"
@@ -413,41 +449,70 @@ export default function FoundationsPage() {
           sample="Built for the data your other databases can't touch."
           style={{ fontFamily: "var(--font-display)", fontWeight: 700, letterSpacing: "-0.02em" }}
           className="text-5xl md:text-7xl"
-          caption="Aeonik Bold — used by all heading elements automatically."
+          caption="Aeonik Bold — reserved for marketing hero and wordmarks. Not for in-product headings."
         />
 
         <FontSpecimen
-          label="Sans"
+          label="Sans (body)"
           varName="--font-sans"
           sample="Hybrid search. Local ML inference. Multimodal documents."
           style={{ fontFamily: "var(--font-sans)" }}
           className="text-xl"
-          caption="System sans stack — body text, descriptions, UI copy."
+          caption="Inter — body text, descriptions, Card/Dialog/Sheet titles. Consumer-loaded webfont."
         />
 
         <FontSpecimen
-          label="Mono"
+          label="Mono (instrument)"
           varName="--font-mono"
-          sample="curl -sSL https://antfly.io/install | sh"
+          sample="shard-0a1f · healthy · p99 ms 4.21"
           style={{ fontFamily: "var(--font-mono)" }}
           className="text-base"
-          caption="Roboto Mono (consumer-loaded). Used for code + technical annotations."
+          caption="Roboto Mono — buttons, menus, badges, table heads, IDs, values, anything chassis."
         />
 
-        <div className="rounded-lg border border-border p-6">
-          <MonoLabel className="mb-3 block">.mono-label utility</MonoLabel>
-          <p className="text-body-sm text-muted-foreground">
-            Uppercase Roboto Mono with <code className="font-mono">letter-spacing: 0.1em</code>,
-            size <code className="font-mono">--label-size</code>, color{" "}
-            <code className="font-mono">--label-color</code>. The &ldquo;technical voice&rdquo;.
-          </p>
-        </div>
+        <FontSpecimen
+          label="Pixel (loud brand)"
+          varName="--font-pixel"
+          sample="BUILT FOR ANSWER ENGINES"
+          style={{ fontFamily: "var(--font-pixel)", letterSpacing: "0.04em" }}
+          className="text-base"
+          caption="Silkscreen — pixel-font kicker for loud brand moments only. Used by <Kicker>."
+        />
+      </section>
+
+      {/* Typography: tracking / weight ----------------------------------- */}
+      <section className="space-y-6">
+        <SectionHeading eyebrow="Typography" title="Tracking and weight" />
+        <Card>
+          <CardContent className="space-y-3 text-sm">
+            <p>
+              <strong className="font-medium">Buttons get zero letter-spacing.</strong> Earlier
+              tracked specs felt exaggerated — keep buttons tight.
+            </p>
+            <p>
+              Mono UPPERCASE kickers (form labels, table headers, card-head labels, dropdown labels,
+              tab labels): <code className="font-mono text-xs">tracking-[0.1em]</code>.
+            </p>
+            <p>
+              Mono UPPERCASE callouts (badges, alert titles — shorter and prouder):{" "}
+              <code className="font-mono text-xs">tracking-[0.05em]</code>.
+            </p>
+            <p>
+              Mono readouts (sentence-case — menu items, button text, IDs, values):{" "}
+              <code className="font-mono text-xs">tracking-[0]</code>.
+            </p>
+            <p>
+              Inter headings stay <code className="font-mono text-xs">font-medium</code>, not
+              semibold. Restraint is part of the voice.
+            </p>
+          </CardContent>
+        </Card>
       </section>
 
       <section className="space-y-4">
         <SectionHeading eyebrow="Typography" title="Heading elements" />
-        <div className="rounded-lg border border-border bg-muted/30 p-4 text-sm text-muted-foreground">
-          Tailwind&apos;s preflight resets <code className="font-mono text-xs">h1</code>&ndash;
+        <div className="border-[1.5px] border-border-strong bg-muted/30 p-4 text-sm text-muted-foreground">
+          Tailwind's preflight resets <code className="font-mono text-xs">h1</code>&ndash;
           <code className="font-mono text-xs">h6</code> to inherit font-size. Our base styles apply
           Aeonik / bold / tight tracking to every heading automatically, but{" "}
           <strong>size is applied per-usage</strong> with a Tailwind utility. Raw headings therefore
@@ -455,9 +520,7 @@ export default function FoundationsPage() {
         </div>
 
         <div className="space-y-3">
-          <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-            Raw (no size utility — body-sized)
-          </p>
+          <Kicker>Raw — no size utility</Kicker>
           {(["h1", "h2", "h3", "h4", "h5", "h6"] as const).map((tag) => {
             const Tag = tag;
             return (
@@ -473,10 +536,9 @@ export default function FoundationsPage() {
       <section className="space-y-4">
         <SectionHeading eyebrow="Typography" title="Recommended scale" />
         <p className="max-w-2xl text-sm text-muted-foreground">
-          The sizes the library&apos;s own <code className="font-mono text-xs">Hero</code>,{" "}
+          The sizes the library's own <code className="font-mono text-xs">Hero</code>,{" "}
           <code className="font-mono text-xs">CTA</code>, and{" "}
-          <code className="font-mono text-xs">PageHeader</code> components apply. Copy these classes
-          onto your own headings for a consistent feel.
+          <code className="font-mono text-xs">PageHeader</code> components apply.
         </p>
 
         <div className="space-y-4">
@@ -495,25 +557,47 @@ export default function FoundationsPage() {
             classes="text-2xl md:text-3xl"
             sample="One database for everything."
           />
-          <ScaleRow name="Card title" classes="text-lg" sample="Hybrid Search" />
+          <ScaleRow
+            name="Card title"
+            classes="text-base font-medium"
+            sample="Hybrid Search"
+            font="sans"
+          />
         </div>
       </section>
 
       <Separator />
 
-      {/* Radii ----------------------------------------------------------- */}
+      {/* Radii ------------------------------------------------------------ */}
       <section className="space-y-6">
-        <SectionHeading eyebrow="Shape" title="Radii" file="src/tokens/radii.css" />
+        <SectionHeading
+          eyebrow="Shape"
+          title="Radii — zero everywhere"
+          file="src/tokens/radii.css"
+        />
+        <div className="border-l-4 border-l-foreground bg-card p-4 text-sm">
+          <strong className="block font-mono text-[12px] uppercase tracking-[0.06em]">
+            By design
+          </strong>
+          <p className="mt-1 text-muted-foreground">
+            All <code className="font-mono text-xs">--radius-*</code> tokens are{" "}
+            <code className="font-mono text-xs">0</code>. The design language is square — borders
+            carry hierarchy instead of rounded corners. The tokens remain for backward compatibility
+            (consumers using <code className="font-mono text-xs">rounded-[var(--radius)]</code> get
+            square corners automatically). Don't introduce new rounded utilities in components.
+          </p>
+        </div>
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
           {RADII.map((r) => (
             <div key={r.varName} className="flex flex-col items-center gap-3">
               <div
-                className="size-24 border border-border bg-muted"
+                className="size-24 border-[1.5px] border-border-strong bg-muted"
                 style={{ borderRadius: `var(${r.varName})` }}
               />
               <div className="text-center">
                 <p className="font-medium">{r.name}</p>
                 <code className="font-mono text-xs text-muted-foreground">{r.varName}</code>
+                <code className="block font-mono text-[10px] text-muted-foreground">= 0</code>
               </div>
             </div>
           ))}
@@ -524,19 +608,139 @@ export default function FoundationsPage() {
 
       {/* Shadows --------------------------------------------------------- */}
       <section className="space-y-6">
-        <SectionHeading eyebrow="Elevation" title="Shadows" file="src/tokens/shadows.css" />
+        <SectionHeading
+          eyebrow="Elevation"
+          title="Shadows — neutralized"
+          file="src/tokens/shadows.css"
+        />
+        <div className="border-l-4 border-l-foreground bg-card p-4 text-sm">
+          <strong className="block font-mono text-[12px] uppercase tracking-[0.06em]">
+            By design
+          </strong>
+          <p className="mt-1 text-muted-foreground">
+            All <code className="font-mono text-xs">--shadow-*</code> tokens resolve to{" "}
+            <code className="font-mono text-xs">0 0 #0000</code>. The chassis is flat — borders
+            (especially <code className="font-mono text-xs">--border-strong</code>) carry the
+            visual hierarchy. Existing consumers using{" "}
+            <code className="font-mono text-xs">shadow-md</code> classes will get no shadow rather
+            than a broken cascade. Don't add new shadow utilities.
+          </p>
+        </div>
         <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-5">
           {SHADOWS.map((s) => (
             <div key={s.varName} className="flex flex-col items-center gap-3">
               <div
-                className="flex size-28 items-center justify-center rounded-lg border border-border bg-card"
+                className="flex size-28 items-center justify-center border-[1.5px] border-border-strong bg-card"
                 style={{ boxShadow: `var(${s.varName})` }}
               >
                 <span className="font-mono text-xs text-muted-foreground">{s.name}</span>
               </div>
               <code className="font-mono text-xs text-muted-foreground">{s.varName}</code>
+              <code className="font-mono text-[10px] text-muted-foreground">= 0 0 #0000</code>
             </div>
           ))}
+        </div>
+      </section>
+
+      <Separator />
+
+      {/* Brand register: Kicker / Highlight / TypeOn --------------------- */}
+      <section className="space-y-6">
+        <SectionHeading
+          eyebrow="Brand"
+          title="Brand register"
+          file="components/brand/{kicker,highlight,type-on}.tsx"
+        />
+        <p className="max-w-2xl text-sm text-muted-foreground">
+          Three primitives for brand moments. Use sparingly — these are loud, and overuse drains
+          their effect. Reserved for hero / marketing surfaces.
+        </p>
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <Card>
+            <CardHeader>
+              <CardTitle>Kicker</CardTitle>
+              <CardDescription>
+                Silkscreen pixel overline for the loudest brand kickers. Amber 600 on light, amber
+                400 on dark.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Kicker>Built for answer engines</Kicker>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Highlight</CardTitle>
+              <CardDescription>
+                Amber-fill inline marker for accent words inside headlines. Amber is a fill with
+                ink-on-amber text, not amber text on paper.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <p className="text-xl font-display font-bold tracking-tight">
+                Hybrid <Highlight>search</Highlight> meets vector recall.
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card className="md:col-span-2">
+            <CardHeader>
+              <CardTitle>TypeOn</CardTitle>
+              <CardDescription>
+                Mono steps() typewriter for brand taglines. The reveal target is computed from text
+                length in <code className="font-mono text-xs">ch</code> units; the amber caret
+                blinks until the line finishes typing.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <TypeOn text="curl -sSL https://antfly.io/install | sh" />
+            </CardContent>
+          </Card>
+        </div>
+      </section>
+
+      <Separator />
+
+      {/* Brand: AntyPixel ------------------------------------------------- */}
+      <section className="space-y-6">
+        <SectionHeading
+          eyebrow="Brand"
+          title="AntyPixel"
+          file="components/brand/anty/anty-pixel.tsx"
+        />
+        <p className="max-w-2xl text-sm text-muted-foreground">
+          Pixel-sprite Anty mark for loud brand chrome. Two variants: <strong>square</strong>{" "}
+          (12×12 resolution, sharp notches at top-right and bottom-left) and{" "}
+          <strong>diagonal</strong> (24×24 with stair-step notches). Amber halo glow, stepped eye
+          blink. Pair with Kicker; never use inside in-product chrome.
+        </p>
+
+        <div className="grid gap-6 md:grid-cols-2">
+          <div className="space-y-4 border-[1.5px] border-border-strong bg-card p-6">
+            <Kicker>Square — 12×12</Kicker>
+            <div className="flex items-end gap-6">
+              {(["sm", "md", "lg", "xl"] as const).map((s) => (
+                <div key={s} className="flex flex-col items-center gap-2">
+                  <AntyPixel variant="square" size={s} />
+                  <code className="font-mono text-[10px] text-muted-foreground">{s}</code>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="space-y-4 border-[1.5px] border-border-strong bg-card p-6">
+            <Kicker>Diagonal — 24×24 stair-step</Kicker>
+            <div className="flex items-end gap-6">
+              {(["sm", "md", "lg", "xl"] as const).map((s) => (
+                <div key={s} className="flex flex-col items-center gap-2">
+                  <AntyPixel variant="diagonal" size={s} />
+                  <code className="font-mono text-[10px] text-muted-foreground">{s}</code>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       </section>
 
@@ -549,10 +753,10 @@ export default function FoundationsPage() {
           title="Graph paper"
           file="src/styles.css :: .grid-paper"
         />
-        <GraphPaperBg className="rounded-lg border border-border">
+        <GraphPaperBg className="border-[1.5px] border-border-strong">
           <div className="p-12 text-center">
-            <MonoLabel className="mb-3 block">--grid-color / --grid-size</MonoLabel>
-            <p className="font-display text-xl font-bold">
+            <Kicker>--grid-color · --grid-size</Kicker>
+            <p className="mt-3 font-display text-xl font-bold">
               Subtle hex honeycomb behind hero content.
             </p>
             <p className="mt-2 text-sm text-muted-foreground">
@@ -576,13 +780,13 @@ export default function FoundationsPage() {
           not the SVG assets themselves. Consumers pass their own mark via{" "}
           <code className="font-mono text-xs">src</code> (URL) or{" "}
           <code className="font-mono text-xs">children</code> (inline SVG). Examples below use the
-          canonical Antfly mark served from the playground&apos;s{" "}
+          canonical Antfly mark served from the playground's{" "}
           <code className="font-mono text-xs">public/af-logo.svg</code>.
         </p>
 
         <div className="space-y-3">
-          <MonoLabel>Size scale</MonoLabel>
-          <div className="flex items-end gap-8 rounded-lg border border-border p-6">
+          <Kicker>Size scale</Kicker>
+          <div className="flex items-end gap-8 border-[1.5px] border-border-strong p-6">
             {(
               [
                 { size: "sm" as const, px: "24px", use: "inline, badges" },
@@ -603,8 +807,8 @@ export default function FoundationsPage() {
         </div>
 
         <div className="space-y-3">
-          <MonoLabel>Lockup</MonoLabel>
-          <div className="flex flex-wrap items-center gap-10 rounded-lg border border-border p-6">
+          <Kicker>Lockup</Kicker>
+          <div className="flex flex-wrap items-center gap-10 border-[1.5px] border-border-strong p-6">
             <Lockup>
               <Logo src="/af-logo.svg" srcDark="/af-logo-dark.svg" alt="Antfly" />
               <Wordmark className="text-lg">Antfly</Wordmark>
@@ -621,41 +825,49 @@ export default function FoundationsPage() {
         </div>
 
         <div className="grid gap-4 md:grid-cols-2">
-          <div className="rounded-lg border border-border p-5">
-            <h3 className="mb-2 text-sm font-semibold">Minimum size</h3>
-            <p className="text-sm text-muted-foreground">
-              Don&apos;t render below <code className="font-mono text-xs">size="sm"</code> (24px).
-              Below that, legibility and the dark-mode invert both start to fail. For inline
-              contexts smaller than 24px, use a text wordmark instead.
-            </p>
-          </div>
-          <div className="rounded-lg border border-border p-5">
-            <h3 className="mb-2 text-sm font-semibold">Clear space</h3>
-            <p className="text-sm text-muted-foreground">
-              Keep padding equal to <strong>half the logo&apos;s height</strong> clear of other
-              content on every side. Lockup&apos;s default{" "}
-              <code className="font-mono text-xs">gap-2.5</code> already respects this between mark
-              and wordmark.
-            </p>
-          </div>
-          <div className="rounded-lg border border-border p-5">
-            <h3 className="mb-2 text-sm font-semibold">Dark mode</h3>
-            <p className="text-sm text-muted-foreground">
-              Pair assets with <code className="font-mono text-xs">src</code> +{" "}
-              <code className="font-mono text-xs">srcDark</code> — the component renders both and
-              toggles visibility via the <code className="font-mono text-xs">.dark</code> class.
-              Falls back to <code className="font-mono text-xs">dark:brightness-0 dark:invert</code>{" "}
-              for single-asset monochrome marks.
-            </p>
-          </div>
-          <div className="rounded-lg border border-border p-5">
-            <h3 className="mb-2 text-sm font-semibold">Mark-only vs lockup</h3>
-            <p className="text-sm text-muted-foreground">
-              Use <strong>mark-only</strong> in dense UI (nav icons, avatars, cramped footers). Use
-              the full <strong>lockup</strong> (Logo + Wordmark) anywhere the brand needs to read at
-              a glance — headers, marketing heroes, email signatures.
-            </p>
-          </div>
+          <Card>
+            <CardHeader>
+              <CardTitle>Minimum size</CardTitle>
+              <CardDescription>
+                Don't render below <code className="font-mono text-xs">size="sm"</code> (24px).
+                Below that, legibility and the dark-mode invert both start to fail. For inline
+                contexts smaller than 24px, use a text wordmark instead.
+              </CardDescription>
+            </CardHeader>
+          </Card>
+          <Card>
+            <CardHeader>
+              <CardTitle>Clear space</CardTitle>
+              <CardDescription>
+                Keep padding equal to <strong>half the logo's height</strong> clear of other content
+                on every side. Lockup's default <code className="font-mono text-xs">gap-2.5</code>{" "}
+                already respects this between mark and wordmark.
+              </CardDescription>
+            </CardHeader>
+          </Card>
+          <Card>
+            <CardHeader>
+              <CardTitle>Dark mode</CardTitle>
+              <CardDescription>
+                Pair assets with <code className="font-mono text-xs">src</code> +{" "}
+                <code className="font-mono text-xs">srcDark</code> — the component renders both and
+                toggles visibility via the <code className="font-mono text-xs">.dark</code> class.
+                Falls back to{" "}
+                <code className="font-mono text-xs">dark:brightness-0 dark:invert</code> for
+                single-asset monochrome marks.
+              </CardDescription>
+            </CardHeader>
+          </Card>
+          <Card>
+            <CardHeader>
+              <CardTitle>Mark-only vs lockup</CardTitle>
+              <CardDescription>
+                Use <strong>mark-only</strong> in dense UI (nav icons, avatars, cramped footers).
+                Use the full <strong>lockup</strong> (Logo + Wordmark) anywhere the brand needs to
+                read at a glance — headers, marketing heroes, email signatures.
+              </CardDescription>
+            </CardHeader>
+          </Card>
         </div>
       </section>
 
@@ -681,7 +893,7 @@ export default function FoundationsPage() {
           container.
         </p>
 
-        <div className="rounded-lg border border-border bg-muted/30 p-4 text-xs text-muted-foreground">
+        <div className="border-[1.5px] border-border-strong bg-muted/30 p-4 text-xs text-muted-foreground">
           <p className="font-mono">
             compact = 0.22rem · default = 0.25rem (Tailwind) · comfortable = 0.3rem
           </p>
@@ -707,9 +919,9 @@ function DensitySample({
   return (
     <div
       data-density={density}
-      className="flex h-full flex-col gap-4 rounded-lg border border-border bg-card p-6"
+      className="flex h-full flex-col gap-4 border-[1.5px] border-border-strong bg-card p-6"
     >
-      <MonoLabel>{label}</MonoLabel>
+      <Kicker>{label}</Kicker>
       <Card>
         <CardHeader>
           <CardTitle>Cluster prod-east</CardTitle>
@@ -740,10 +952,10 @@ function SectionHeading({
   file?: string;
 }) {
   return (
-    <div className="flex flex-wrap items-end justify-between gap-2 border-b border-border pb-2">
+    <div className="flex flex-wrap items-end justify-between gap-2 border-b-[1.5px] border-border-strong pb-2">
       <div>
-        <MonoLabel className="mb-2 block">{eyebrow}</MonoLabel>
-        <h2 className="font-display text-2xl font-bold tracking-tight">{title}</h2>
+        <Kicker>{eyebrow}</Kicker>
+        <h2 className="mt-2 font-display text-2xl font-bold tracking-tight">{title}</h2>
       </div>
       {file ? <code className="font-mono text-xs text-muted-foreground">{file}</code> : null}
     </div>
@@ -757,7 +969,7 @@ function SectionHeading({
  */
 function ColorSwatch({ name, varName, light, dark, description }: TokenDef) {
   return (
-    <div className="overflow-hidden rounded-lg border border-border">
+    <div className="overflow-hidden border-[1.5px] border-border-strong">
       <div className="grid grid-cols-2">
         <Chip mode="light" color={light} />
         <Chip mode="dark" color={dark} />
@@ -781,12 +993,10 @@ function Chip({ mode, color }: { mode: "light" | "dark"; color: string }) {
       className="relative h-20"
       style={{
         backgroundColor: color,
-        // Use a paired neutral base so transparent / low-alpha colors
-        // read correctly against a surface resembling their intended use.
         backgroundImage:
           mode === "light"
-            ? "linear-gradient(oklch(0.98 0.003 265),oklch(0.98 0.003 265))"
-            : "linear-gradient(oklch(0.135 0.005 275),oklch(0.135 0.005 275))",
+            ? "linear-gradient(#fafafa,#fafafa)"
+            : "linear-gradient(#121212,#121212)",
         backgroundBlendMode: "normal",
       }}
     >
@@ -795,7 +1005,7 @@ function Chip({ mode, color }: { mode: "light" | "dark"; color: string }) {
       <span
         className="absolute bottom-1 left-2 font-mono text-[10px] uppercase tracking-wider"
         style={{
-          color: mode === "light" ? "oklch(0.185 0.02 275)" : "oklch(0.91 0.005 265)",
+          color: mode === "light" ? "#1b1b1a" : "#ededec",
           opacity: 0.7,
         }}
       >
@@ -807,7 +1017,7 @@ function Chip({ mode, color }: { mode: "light" | "dark"; color: string }) {
 
 function TokenScaleSwatch({ scale }: { scale: TokenScale }) {
   return (
-    <div className="rounded-lg border border-border p-4">
+    <div className="border-[1.5px] border-border-strong p-4">
       <div className="mb-3">
         <p className="text-sm font-medium">{scale.name}</p>
         <p className="text-xs text-muted-foreground">{scale.description}</p>
@@ -818,7 +1028,7 @@ function TokenScaleSwatch({ scale }: { scale: TokenScale }) {
             <p className="mb-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
               {mode}
             </p>
-            <div className="grid grid-cols-5 overflow-hidden rounded-md border border-border">
+            <div className="grid grid-cols-5 overflow-hidden border border-border">
               {scale.tokens.map((token) => (
                 <div
                   key={`${mode}-${token.varName}`}
@@ -842,14 +1052,30 @@ function TokenScaleSwatch({ scale }: { scale: TokenScale }) {
   );
 }
 
-function ScaleRow({ name, classes, sample }: { name: string; classes: string; sample: string }) {
+function ScaleRow({
+  name,
+  classes,
+  sample,
+  font = "display",
+}: {
+  name: string;
+  classes: string;
+  sample: string;
+  font?: "display" | "sans";
+}) {
   return (
     <div className="space-y-3 border-b border-border pb-6">
       <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
         <p className="text-sm font-medium">{name}</p>
         <code className="font-mono text-xs text-muted-foreground">{classes}</code>
       </div>
-      <h3 className={`${classes} font-display font-bold tracking-tight`}>{sample}</h3>
+      <h3
+        className={`${classes} ${
+          font === "display" ? "font-display font-bold tracking-tight" : "text-foreground"
+        }`}
+      >
+        {sample}
+      </h3>
     </div>
   );
 }
@@ -870,9 +1096,9 @@ function FontSpecimen({
   caption?: string;
 }) {
   return (
-    <div className="space-y-3 rounded-lg border border-border p-6">
+    <div className="space-y-3 border-[1.5px] border-border-strong p-6">
       <div className="flex items-baseline justify-between gap-4">
-        <MonoLabel>{label}</MonoLabel>
+        <Kicker>{label}</Kicker>
         <code className="font-mono text-xs text-muted-foreground">{varName}</code>
       </div>
       <p className={className} style={style}>

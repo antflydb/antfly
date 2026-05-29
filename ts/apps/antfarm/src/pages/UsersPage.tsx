@@ -535,7 +535,7 @@ export function UsersPage() {
                     {permissions.map((perm) => (
                       <div
                         key={`${perm.type}-${perm.resource_type}-${perm.resource}`}
-                        className="flex items-center justify-between rounded-lg border p-3"
+                        className="flex items-center justify-between rounded-none border p-3"
                       >
                         <div className="space-y-1">
                           <div className="flex items-center gap-2">

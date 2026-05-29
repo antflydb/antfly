@@ -9,17 +9,27 @@ import { defineConfig, type ViteUserConfig } from "vitest/config";
 const dirname =
   typeof __dirname !== "undefined" ? __dirname : path.dirname(fileURLToPath(import.meta.url));
 
+// Backend proxy target — override at startup with ANTFARM_API_PROXY_TARGET
+// to point Antfarm at a different Antfly backend (e.g. one preloaded with
+// fixture data on a non-default port).
+const apiProxyTarget = process.env.ANTFARM_API_PROXY_TARGET ?? "http://localhost:8080";
+
 // More info at: https://storybook.js.org/docs/next/writing-tests/integrations/vitest-addon
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
       "/api": {
-        target: "http://localhost:8080",
+        target: apiProxyTarget,
         changeOrigin: true,
       },
+      "/registry": {
+        target: "https://registry.antfly.io/v1",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/registry/, ""),
+      },
       "/ml": {
-        target: "http://localhost:8080",
+        target: apiProxyTarget,
         changeOrigin: true,
       },
     },
