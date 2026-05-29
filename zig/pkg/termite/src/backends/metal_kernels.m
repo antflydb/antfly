@@ -5650,6 +5650,7 @@ static void termite_metal_log_command_buffer_failure(id<MTLCommandBuffer> comman
         domain,
         code,
         desc);
+    fflush(stderr);
 }
 
 static int termite_metal_commit_and_wait(id<MTLCommandBuffer> command_buffer, const char *context, int failure_code) {
@@ -5658,6 +5659,7 @@ static int termite_metal_commit_and_wait(id<MTLCommandBuffer> command_buffer, co
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
     if (command_buffer.status == MTLCommandBufferStatusCompleted) return 0;
+    termite_metal_log_command_buffer_failure(command_buffer, context);
     return failure_code;
 }
 
@@ -5889,6 +5891,7 @@ static int termite_metal_decode_runtime_apply_mpsgraph_ffn_layer_norm_device(
         runtime->mpsgraph_ffn_calls += 1;
         return 0;
     }
+    termite_metal_log_command_buffer_failure(mps_command_buffer, __func__);
     return -9;
 }
 
@@ -5896,7 +5899,9 @@ static int termite_metal_decode_runtime_finish_command_buffer(id<MTLCommandBuffe
     if (!frame_owned) return 0;
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
-    return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : failure_code;
+    if (command_buffer.status == MTLCommandBufferStatusCompleted) return 0;
+    termite_metal_log_command_buffer_failure(command_buffer, __func__);
+    return failure_code;
 }
 
 static void termite_metal_decode_runtime_set_quant_linear_descriptor(

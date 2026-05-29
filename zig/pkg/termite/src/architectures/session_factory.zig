@@ -132,6 +132,10 @@ fn glinerArchitectureAuditEnabled() bool {
     return platform.env.getenvBool("TERMITE_GLINER_ARCH_AUDIT");
 }
 
+fn glinerTraceMetalStages() bool {
+    return platform.env.getenvBool("TERMITE_METAL_TRACE_GLINER_STAGES");
+}
+
 fn glinerSessionFrameEnabled() bool {
     if (platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_SESSION_FRAME")) return false;
     return true;
@@ -5315,7 +5319,10 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             errdefer if (session_frame_active) cb.decoderRuntimeCancelFrame() catch {};
             const encoder_start_ns = glinerProfileNowNs();
             var encoder_profile: deberta_arch.EncoderProfile = .{};
-            const hidden = try deberta_arch.forwardCtProfiled(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, if (profile_enabled) &encoder_profile else null);
+            const hidden = deberta_arch.forwardCtProfiled(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, if (profile_enabled) &encoder_profile else null) catch |err| {
+                if (glinerTraceMetalStages()) std.debug.print("gliner_session_error: stage=encoder err={s}\n", .{@errorName(err)});
+                return err;
+            };
             defer cb.free(hidden);
             const encoder_ms = glinerProfileElapsedMs(encoder_start_ns);
 
@@ -5324,22 +5331,31 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             // round-trip the legacy []f32-typed APIs do.
             var head_profile: gliner_head.ForwardProfile = .{};
             const head_start_ns = glinerProfileNowNs();
-            const head_result = try gliner_head.forwardCtProfiledWithLabelMarkers(&cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, cfg.hidden_size, .{
+            const head_result = gliner_head.forwardCtProfiledWithLabelMarkers(&cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, cfg.hidden_size, .{
                 .classification = cfg.classification_token_id,
                 .entity = cfg.entity_token_id,
                 .relation = cfg.relation_token_id,
-            }, if (profile_enabled) &head_profile else null);
+            }, if (profile_enabled) &head_profile else null) catch |err| {
+                if (glinerTraceMetalStages()) std.debug.print("gliner_session_error: stage=head err={s}\n", .{@errorName(err)});
+                return err;
+            };
             defer cb.free(head_result.logits);
             const head_ms = glinerProfileElapsedMs(head_start_ns);
 
             var session_frame_wait_ms: f64 = 0.0;
             if (session_frame_active) {
                 if (session_barriers_suppressed) {
-                    try cb.decoderRuntimePopPlannedComputeBarrierSuppression();
+                    cb.decoderRuntimePopPlannedComputeBarrierSuppression() catch |err| {
+                        if (glinerTraceMetalStages()) std.debug.print("gliner_session_trace: stage=session_frame_pop_barrier_suppression err={s} action=ignored\n", .{@errorName(err)});
+                        if (err != error.SubmissionFailed) return err;
+                    };
                     session_barriers_suppressed = false;
                 }
                 const frame_wait_start_ns = glinerProfileNowNs();
-                try cb.decoderRuntimeSubmitAndWaitFrame();
+                cb.decoderRuntimeSubmitAndWaitFrame() catch |err| {
+                    if (glinerTraceMetalStages()) std.debug.print("gliner_session_error: stage=session_frame_submit_wait err={s}\n", .{@errorName(err)});
+                    return err;
+                };
                 session_frame_wait_ms = glinerProfileElapsedMs(frame_wait_start_ns);
                 session_frame_active = false;
             }
