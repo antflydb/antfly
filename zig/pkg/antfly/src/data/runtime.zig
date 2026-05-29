@@ -501,6 +501,7 @@ fn writeFullTextMemoryMetrics(writer: *std.Io.Writer, stats: antfly.db.TextMemor
     try health_metrics.appendPromMetric(writer, "antfly_full_text_stored_fields_bytes", "gauge", "Full-text stored-field section bytes across cached write DBs", stats.stored_fields_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_bytes", "gauge", "Full-text inverted section bytes across cached write DBs", stats.inverted_text_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_header_bytes", "gauge", "Full-text inverted section header bytes", stats.inverted_header_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_norm_bytes", "gauge", "Full-text inverted per-document norm table bytes", stats.inverted_norm_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_term_dict_bytes", "gauge", "Full-text inverted term dictionary bytes", stats.inverted_term_dict_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_term_block_bytes", "gauge", "Full-text inverted term dictionary block bytes", stats.inverted_term_block_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_full_text_inverted_term_index_bytes", "gauge", "Full-text inverted term dictionary block index bytes", stats.inverted_term_index_bytes);

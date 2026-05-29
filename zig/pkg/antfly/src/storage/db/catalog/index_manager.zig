@@ -227,6 +227,7 @@ pub const TextMemoryAttributionStats = struct {
     stored_fields_bytes: u64 = 0,
     inverted_text_bytes: u64 = 0,
     inverted_header_bytes: u64 = 0,
+    inverted_norm_bytes: u64 = 0,
     inverted_term_dict_bytes: u64 = 0,
     inverted_term_block_bytes: u64 = 0,
     inverted_term_index_bytes: u64 = 0,
@@ -1713,6 +1714,7 @@ pub const IndexManager = struct {
                 stats.stored_fields_bytes +|= layout.stored_fields_bytes;
                 stats.inverted_text_bytes +|= layout.inverted_text_bytes;
                 stats.inverted_header_bytes +|= layout.inverted_header_bytes;
+                stats.inverted_norm_bytes +|= layout.inverted_norm_bytes;
                 stats.inverted_term_dict_bytes +|= layout.inverted_term_dict_bytes;
                 stats.inverted_term_block_bytes +|= layout.inverted_term_block_bytes;
                 stats.inverted_term_index_bytes +|= layout.inverted_term_index_bytes;
@@ -1807,12 +1809,13 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_memory_segment_layout label={s} stored_fields_bytes={d} inverted_text_bytes={d} inverted_header_bytes={d} inverted_term_dict_bytes={d} inverted_term_block_bytes={d} inverted_term_index_bytes={d} inverted_fst_bytes={d} inverted_bloom_bytes={d} inverted_postings_bytes={d} inverted_postings_header_bytes={d} inverted_block_max_bytes={d} inverted_chunk_meta_bytes={d} inverted_postings_payload_bytes={d} inverted_positions_bytes={d} inverted_skip_bytes={d} inverted_one_hit_terms={d} inverted_postings_terms={d} typed_doc_values_bytes={d} doc_ordinals_bytes={d} section_index_bytes={d}",
+            "antfly_bench_memory_segment_layout label={s} stored_fields_bytes={d} inverted_text_bytes={d} inverted_header_bytes={d} inverted_norm_bytes={d} inverted_term_dict_bytes={d} inverted_term_block_bytes={d} inverted_term_index_bytes={d} inverted_fst_bytes={d} inverted_bloom_bytes={d} inverted_postings_bytes={d} inverted_postings_header_bytes={d} inverted_block_max_bytes={d} inverted_chunk_meta_bytes={d} inverted_postings_payload_bytes={d} inverted_positions_bytes={d} inverted_skip_bytes={d} inverted_one_hit_terms={d} inverted_postings_terms={d} typed_doc_values_bytes={d} doc_ordinals_bytes={d} section_index_bytes={d}",
             .{
                 label,
                 text_stats.stored_fields_bytes,
                 text_stats.inverted_text_bytes,
                 text_stats.inverted_header_bytes,
+                text_stats.inverted_norm_bytes,
                 text_stats.inverted_term_dict_bytes,
                 text_stats.inverted_term_block_bytes,
                 text_stats.inverted_term_index_bytes,
