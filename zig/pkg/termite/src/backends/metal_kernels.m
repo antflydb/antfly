@@ -22255,7 +22255,8 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
         const BOOL gemm_attention_requested = getenv("TERMITE_METAL_DISABLE_DEBERTA_GEMM_ATTENTION") == NULL &&
             ((batch == 1 && seq_len >= 384) || (batch >= 2 && batch <= 8 && seq_len >= 256));
         const BOOL flash4_attention_requested = getenv("TERMITE_METAL_DISABLE_DEBERTA_FLASH_ATTENTION") == NULL &&
-            batch >= 1 && batch <= 8 && seq_len >= 384 && seq_len <= 512 && head_dim <= 256;
+            ((batch == 1 && seq_len >= 384) || (batch >= 2 && batch <= 8 && seq_len >= 256)) &&
+            seq_len <= 512 && head_dim <= 256;
         if (flash4_attention_requested &&
             runtime->disentangled_relative_attention_f32_flash4_pipeline != nil)
         {
