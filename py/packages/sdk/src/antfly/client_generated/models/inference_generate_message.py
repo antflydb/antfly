@@ -10,7 +10,7 @@ from ..models.inference_role import InferenceRole
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.inference_tool_call import InferenceToolCall
+    from ..models.tool_call import ToolCall
 
 
 T = TypeVar("T", bound="InferenceGenerateMessage")
@@ -22,13 +22,13 @@ class InferenceGenerateMessage:
     Attributes:
         role (InferenceRole): Role of the message sender in a generation/chat conversation
         content (None | str | Unset): The generated message content (null when tool_calls is present)
-        tool_calls (list[InferenceToolCall] | Unset): Tool calls made by the model (only present when finish_reason is
+        tool_calls (list[ToolCall] | Unset): Tool calls made by the model (only present when finish_reason is
             tool_calls)
     """
 
     role: InferenceRole
     content: None | str | Unset = UNSET
-    tool_calls: list[InferenceToolCall] | Unset = UNSET
+    tool_calls: list[ToolCall] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -63,7 +63,7 @@ class InferenceGenerateMessage:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inference_tool_call import InferenceToolCall
+        from ..models.tool_call import ToolCall
 
         d = dict(src_dict)
         role = InferenceRole(d.pop("role"))
@@ -78,11 +78,11 @@ class InferenceGenerateMessage:
         content = _parse_content(d.pop("content", UNSET))
 
         _tool_calls = d.pop("tool_calls", UNSET)
-        tool_calls: list[InferenceToolCall] | Unset = UNSET
+        tool_calls: list[ToolCall] | Unset = UNSET
         if _tool_calls is not UNSET:
             tool_calls = []
             for tool_calls_item_data in _tool_calls:
-                tool_calls_item = InferenceToolCall.from_dict(tool_calls_item_data)
+                tool_calls_item = ToolCall.from_dict(tool_calls_item_data)
 
                 tool_calls.append(tool_calls_item)
 

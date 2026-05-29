@@ -6,11 +6,11 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="InferenceToolCallFunction")
+T = TypeVar("T", bound="ToolCallFunction")
 
 
 @_attrs_define
-class InferenceToolCallFunction:
+class ToolCallFunction:
     """The function called by a model tool call.
 
     Attributes:
@@ -45,13 +45,13 @@ class InferenceToolCallFunction:
 
         arguments = d.pop("arguments")
 
-        inference_tool_call_function = cls(
+        tool_call_function = cls(
             name=name,
             arguments=arguments,
         )
 
-        inference_tool_call_function.additional_properties = d
-        return inference_tool_call_function
+        tool_call_function.additional_properties = d
+        return tool_call_function
 
     @property
     def additional_keys(self) -> list[str]:

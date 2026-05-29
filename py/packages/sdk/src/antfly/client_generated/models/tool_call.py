@@ -6,28 +6,28 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.inference_tool_call_type import InferenceToolCallType
+from ..models.tool_call_type import ToolCallType
 
 if TYPE_CHECKING:
-    from ..models.inference_tool_call_function import InferenceToolCallFunction
+    from ..models.tool_call_function import ToolCallFunction
 
 
-T = TypeVar("T", bound="InferenceToolCall")
+T = TypeVar("T", bound="ToolCall")
 
 
 @_attrs_define
-class InferenceToolCall:
+class ToolCall:
     """OpenAI-compatible assistant tool call.
 
     Attributes:
         id (str): Tool call identifier.
-        type_ (InferenceToolCallType):
-        function (InferenceToolCallFunction): The function called by a model tool call.
+        type_ (ToolCallType):
+        function (ToolCallFunction): The function called by a model tool call.
     """
 
     id: str
-    type_: InferenceToolCallType
-    function: InferenceToolCallFunction
+    type_: ToolCallType
+    function: ToolCallFunction
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -51,23 +51,23 @@ class InferenceToolCall:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inference_tool_call_function import InferenceToolCallFunction
+        from ..models.tool_call_function import ToolCallFunction
 
         d = dict(src_dict)
         id = d.pop("id")
 
-        type_ = InferenceToolCallType(d.pop("type"))
+        type_ = ToolCallType(d.pop("type"))
 
-        function = InferenceToolCallFunction.from_dict(d.pop("function"))
+        function = ToolCallFunction.from_dict(d.pop("function"))
 
-        inference_tool_call = cls(
+        tool_call = cls(
             id=id,
             type_=type_,
             function=function,
         )
 
-        inference_tool_call.additional_properties = d
-        return inference_tool_call
+        tool_call.additional_properties = d
+        return tool_call
 
     @property
     def additional_keys(self) -> list[str]:

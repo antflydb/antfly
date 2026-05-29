@@ -11,9 +11,9 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.image_url_content_part import ImageURLContentPart
-    from ..models.inference_tool_call import InferenceToolCall
     from ..models.media_content_part import MediaContentPart
     from ..models.text_content_part import TextContentPart
+    from ..models.tool_call import ToolCall
 
 
 T = TypeVar("T", bound="InferenceChatMessage")
@@ -28,13 +28,13 @@ class InferenceChatMessage:
             Supports two formats:
             - Simple string: "Hello, how are you?"
             - Array of content parts: [{"type": "text", "text": "Hello"}]
-        tool_calls (list[InferenceToolCall] | Unset): Tool calls made by the assistant (only for role=assistant)
+        tool_calls (list[ToolCall] | Unset): Tool calls made by the assistant (only for role=assistant)
         tool_call_id (str | Unset): ID of the tool call this message is responding to (only for role=tool)
     """
 
     role: InferenceRole
     content: list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset = UNSET
-    tool_calls: list[InferenceToolCall] | Unset = UNSET
+    tool_calls: list[ToolCall] | Unset = UNSET
     tool_call_id: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -97,9 +97,9 @@ class InferenceChatMessage:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.image_url_content_part import ImageURLContentPart
-        from ..models.inference_tool_call import InferenceToolCall
         from ..models.media_content_part import MediaContentPart
         from ..models.text_content_part import TextContentPart
+        from ..models.tool_call import ToolCall
 
         d = dict(src_dict)
         role = InferenceRole(d.pop("role"))
@@ -161,11 +161,11 @@ class InferenceChatMessage:
         content = _parse_content(d.pop("content", UNSET))
 
         _tool_calls = d.pop("tool_calls", UNSET)
-        tool_calls: list[InferenceToolCall] | Unset = UNSET
+        tool_calls: list[ToolCall] | Unset = UNSET
         if _tool_calls is not UNSET:
             tool_calls = []
             for tool_calls_item_data in _tool_calls:
-                tool_calls_item = InferenceToolCall.from_dict(tool_calls_item_data)
+                tool_calls_item = ToolCall.from_dict(tool_calls_item_data)
 
                 tool_calls.append(tool_calls_item)
 
