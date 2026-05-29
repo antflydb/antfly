@@ -291,6 +291,7 @@ pub fn create(config: Config) Graph {
     termite_internal_mod.addImport("protobuf", protobuf_mod);
     termite_internal_mod.addImport("antfly_platform", platform_mod);
     termite_internal_mod.addImport("onnx_graph", onnx_graph_mod);
+    configureOnnxRuntime(b, termite_internal_mod, backend.enable_onnx, backend.onnx_root);
 
     termite_mod.addImport("termite_internal", termite_mod);
 
