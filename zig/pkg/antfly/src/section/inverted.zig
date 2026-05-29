@@ -34,10 +34,11 @@ const bloom = @import("bloom");
 // ============================================================================
 //
 //   v11: v10 postings + BlockTree-style blocked term dictionary
+//   v12: v11 + bit-packed position deltas
 //
-// This project is pre-release; writers emit the current v11 format.
+// This project is pre-release; writers emit the current v12 format.
 
-const wire_version_current: u8 = 11;
+const wire_version_current: u8 = 12;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4; // 29 bytes
 const v7_chunk_meta_size: usize = 44;
 const postings_header_size: usize = 24;
@@ -624,6 +625,7 @@ fn appendPackedU32(
 }
 
 fn decodePackedU32Into(data: []const u8, values: []u32, bits: u8) !void {
+    if (bits > 32) return error.InvalidData;
     if (bits == 0) {
         @memset(values, 0);
         return;
@@ -634,7 +636,7 @@ fn decodePackedU32Into(data: []const u8, values: []u32, bits: u8) !void {
     var bit_pos: usize = 0;
     for (values) |*value| {
         var out: u32 = 0;
-        var shift: u5 = 0;
+        var shift: u8 = 0;
         var remaining = bits;
         while (remaining > 0) {
             const byte_index = bit_pos / 8;
@@ -643,8 +645,8 @@ fn decodePackedU32Into(data: []const u8, values: []u32, bits: u8) !void {
             const take: u8 = @min(remaining, avail);
             const mask: u8 = if (take == 8) 0xff else @as(u8, @truncate((@as(u16, 1) << @intCast(take)) - 1));
             const part: u32 = (data[byte_index] >> bit_in_byte) & mask;
-            out |= part << shift;
-            shift += @intCast(take);
+            out |= part << @intCast(shift);
+            shift += take;
             remaining -= take;
             bit_pos += take;
         }
@@ -660,6 +662,7 @@ fn decodePackedU32IntoStrided(
     start: usize,
     stride: usize,
 ) !void {
+    if (bits > 32) return error.InvalidData;
     if (count == 0) return;
     if (start + (count - 1) * stride >= out.len) return error.InvalidData;
     if (bits == 0) {
@@ -674,7 +677,7 @@ fn decodePackedU32IntoStrided(
     var i: usize = 0;
     while (i < count) : (i += 1) {
         var value: u32 = 0;
-        var shift: u5 = 0;
+        var shift: u8 = 0;
         var remaining = bits;
         while (remaining > 0) {
             const byte_index = bit_pos / 8;
@@ -683,8 +686,8 @@ fn decodePackedU32IntoStrided(
             const take: u8 = @min(remaining, avail);
             const mask: u8 = if (take == 8) 0xff else @as(u8, @truncate((@as(u16, 1) << @intCast(take)) - 1));
             const part: u32 = (data[byte_index] >> bit_in_byte) & mask;
-            value |= part << shift;
-            shift += @intCast(take);
+            value |= part << @intCast(shift);
+            shift += take;
             remaining -= take;
             bit_pos += take;
         }
@@ -711,6 +714,35 @@ fn appendPackedPostingChunk(
     _ = try appendPackedU32(alloc, payload, freq_values, freq_bits);
     _ = try appendPackedU32(alloc, payload, norm_values, norm_bits);
     return .{ .off = off, .len = @intCast(payload.items.len - off) };
+}
+
+fn appendPackedPositionsForDoc(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    positions: []const u32,
+) !void {
+    try writeVarintU32(alloc, out, @intCast(positions.len));
+    if (positions.len == 0) return;
+
+    var deltas_buf: [64]u32 = undefined;
+    var heap_deltas: ?[]u32 = null;
+    defer if (heap_deltas) |values| alloc.free(values);
+    const deltas = if (positions.len <= deltas_buf.len)
+        deltas_buf[0..positions.len]
+    else blk: {
+        heap_deltas = try alloc.alloc(u32, positions.len);
+        break :blk heap_deltas.?;
+    };
+
+    var prev: u32 = 0;
+    for (positions, 0..) |p, i| {
+        deltas[i] = if (p >= prev) p - prev else 0;
+        prev = p;
+    }
+
+    const bits = maxBitWidth(deltas);
+    try out.append(alloc, bits);
+    _ = try appendPackedU32(alloc, out, deltas, bits);
 }
 
 /// Accumulates postings for a single term during index building.
@@ -805,17 +837,12 @@ const PostingAccumulator = struct {
                 if (norm_u16 < cur_min_norm) scratch.block_max.items[bm_off + 2 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, norm_u16));
                 if (norm_u16 > cur_max_norm) scratch.block_max.items[bm_off + 4 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, norm_u16));
 
-                const count = meta.position_count;
-                try writeVarintU32(alloc, &scratch.positions, count);
-                if (count > 0) {
-                    var prev_pos: u32 = 0;
-                    var p_i: usize = 0;
-                    while (p_i < count) : (p_i += 1) {
-                        const p = self.all_positions.items[pos_offset + p_i];
-                        try writeVarintU32(alloc, &scratch.positions, if (p >= prev_pos) p - prev_pos else 0);
-                        prev_pos = p;
-                    }
-                }
+                const count: usize = meta.position_count;
+                try appendPackedPositionsForDoc(
+                    alloc,
+                    &scratch.positions,
+                    self.all_positions.items[pos_offset..][0..count],
+                );
                 pos_offset += count;
             }
 
@@ -1479,15 +1506,23 @@ pub const PostingsIterator = struct {
         if (self.decode_positions) {
             if (self.positions_data) |pd| {
                 if (self.positions_cursor < pd.len) {
-                    const num_pos = readVarintU32(pd, &self.positions_cursor) catch 0;
+                    const num_pos = readVarintU32(pd, &self.positions_cursor) catch return error.InvalidData;
                     if (num_pos > 0) {
-                        try self.positions_buf.ensureTotalCapacity(self.alloc, num_pos);
+                        if (self.positions_cursor >= pd.len) return error.InvalidData;
+                        const bits = pd[self.positions_cursor];
+                        self.positions_cursor += 1;
+                        if (bits > 32) return error.InvalidData;
+                        const count: usize = @intCast(num_pos);
+                        const packed_len = packedU32ByteLen(count, bits);
+                        if (self.positions_cursor + packed_len > pd.len) return error.InvalidData;
+                        try self.positions_buf.ensureTotalCapacity(self.alloc, count);
+                        self.positions_buf.items.len = count;
+                        try decodePackedU32Into(pd[self.positions_cursor..][0..packed_len], self.positions_buf.items, bits);
+                        self.positions_cursor += packed_len;
                         var prev: u32 = 0;
-                        var i: u32 = 0;
-                        while (i < num_pos) : (i += 1) {
-                            const delta = readVarintU32(pd, &self.positions_cursor) catch 0;
-                            const p = prev +% delta;
-                            self.positions_buf.appendAssumeCapacity(p);
+                        for (self.positions_buf.items) |*delta| {
+                            const p = prev +% delta.*;
+                            delta.* = p;
                             prev = p;
                         }
                     }
@@ -2305,7 +2340,7 @@ test "term iterator enumerates all terms" {
     try std.testing.expect(try iter.next() == null);
 }
 
-test "v11 term dictionary stores prefix blocks indexed by fst" {
+test "v12 term dictionary stores prefix blocks indexed by fst" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{});
     defer builder.deinit();
@@ -2715,7 +2750,7 @@ test "v10 block-max metadata stores only term chunk window" {
     }
 }
 
-test "positions round-trip v6 delta+varint" {
+test "positions round-trip v12 bit-packed deltas" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
     defer builder.deinit();
@@ -3111,10 +3146,10 @@ test "varint u32 round-trip" {
     try std.testing.expectError(error.Truncated, readVarintU32(truncated, &trunc_cursor));
 }
 
-test "v6 positions are smaller than v5 raw u32" {
+test "v12 positions are bit-packed smaller than raw u32" {
     // Smoke-test the shrinkage claim: dense, monotonic positions like a
-    // tokenized document produces should pack much smaller in delta+varint
-    // than 4 bytes per position.
+    // tokenized document produces should pack much smaller as bit-packed
+    // deltas than 4 bytes per position.
     const alloc = std.testing.allocator;
 
     var positions: [256]u32 = undefined;
@@ -3128,19 +3163,28 @@ test "v6 positions are smaller than v5 raw u32" {
     const section = try builder.build();
     defer alloc.free(section);
 
-    // v5 would have written: 4 (section_len) + 2 (num_pos) + 256 * 4 = 1030 bytes
-    // for the positions section alone. v6 emits 256 deltas of value 0 or 1, all
-    // single-byte varints, plus a 2-byte num_positions varint and the 4-byte
-    // section_len → ~262 bytes. Verify the assembled section is well below v5.
+    // A raw u32 payload would spend 1024 bytes on the position values alone.
+    // v12 emits a count varint, one bit-width byte, and bit-packed deltas.
     try std.testing.expect(section.len < 800);
+
+    var reader = try InvertedIndexReader.init(alloc, section);
+    const lookup = reader.lookup("hello") orelse return error.TestExpectedEqual;
+    switch (lookup) {
+        .postings => |postings| {
+            const positions_data = postings.positions_data orelse return error.TestExpectedEqual;
+            try std.testing.expect(positions_data.len <= 40);
+        },
+        .one_hit => return error.TestUnexpectedResult,
+    }
 }
 
-test "v6 reads back positions across the varint multi-byte boundary" {
+test "v12 reads back positions with wide packed deltas" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{});
     defer builder.deinit();
 
-    // Mix of single-byte (delta < 128) and multi-byte (delta ≥ 128) cases.
+    // Mix narrow and wide deltas so the packed payload crosses byte boundaries
+    // and exercises bit widths larger than one byte.
     const positions = [_]u32{ 0, 1, 127, 200, 1000, 100_000, 100_001 };
     try builder.addDocument(0, &.{
         .{ .term = "term", .freq = positions.len, .norm = 10, .positions = &positions },
