@@ -1221,7 +1221,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const QueryBuilderGenerationRunner = struct {
-            local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
 
             fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
@@ -1242,10 +1242,10 @@ pub const AntflyApiHandler = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = QueryBuilderGenerationRunner{ .local_termite_provider = self.api_server.local_termite_provider, .secret_store = self.api_server.cfg.secret_store };
+        var generation_runner = QueryBuilderGenerationRunner{ .antfly_provider = self.api_server.antfly_provider, .secret_store = self.api_server.cfg.secret_store };
         var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
         const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
             error.InvalidQueryBuilderRequest => {
@@ -1296,7 +1296,7 @@ pub const AntflyApiHandler = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var semantic_resolver = http_server_mod.SemanticStatusResolver{ .source = runner.server.source, .local_termite_provider = runner.server.local_termite_provider };
+                var semantic_resolver = http_server_mod.SemanticStatusResolver{ .source = runner.server.source, .antfly_provider = runner.server.antfly_provider };
                 var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
@@ -1352,7 +1352,7 @@ pub const AntflyApiHandler = struct {
         };
 
         const RetrievalGenerationRunner = struct {
-            local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
@@ -1373,10 +1373,10 @@ pub const AntflyApiHandler = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.api_server.local_termite_provider, .secret_store = self.api_server.cfg.secret_store };
+        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.api_server.antfly_provider, .secret_store = self.api_server.cfg.secret_store };
 
         var query_runner = RetrievalQueryRunner{
             .server = self.api_server,
@@ -2646,11 +2646,11 @@ const HttpxE2eServer = struct {
         errdefer self.server.deinit();
 
         const metadata_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(&self.handler);
-        var prefixed = PrefixedServer("/api/v1", httpx.Server){ .inner = &self.server };
+        var prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = &self.server };
         try metadata_router.register(&prefixed);
 
         const usermgr_router = usermgr_openapi.server.ServerRouter(AntflyApiHandler).init(&self.handler);
-        try usermgr_router.register(&prefixed);
+        try usermgr_router.register(&self.server);
 
         try self.server.bind();
         self.thread = try std.Thread.spawn(.{}, listenHttpxE2eServer, .{&self.server});
@@ -2906,7 +2906,7 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
 
-    const status_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/status", .{base_url});
+    const status_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/status", .{base_url});
     defer alloc.free(status_url);
     var unauthorized = try getWithRetry(&client, client_io.io(), status_url, null, 20);
     defer unauthorized.deinit();
@@ -2919,7 +2919,7 @@ test "httpx antfly routes require auth and enforce admin middleware" {
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
-    const secrets_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/secrets", .{base_url});
+    const secrets_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/secrets", .{base_url});
     defer alloc.free(secrets_url);
     const reader_headers = [_][2][]const u8{.{ "authorization", reader_auth }};
     var forbidden = try getWithRetry(&client, client_io.io(), secrets_url, &reader_headers, 20);
@@ -2930,7 +2930,7 @@ test "httpx antfly routes require auth and enforce admin middleware" {
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
-    const me_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/auth/v1/me", .{base_url});
+    const me_url = try std.fmt.allocPrint(alloc, "{s}/auth/v1/me", .{base_url});
     defer alloc.free(me_url);
     const admin_headers = [_][2][]const u8{.{ "authorization", admin_auth }};
     var me_resp = try getWithRetry(&client, client_io.io(), me_url, &admin_headers, 20);
@@ -2984,7 +2984,7 @@ test "httpx antfly lookup route preserves projection and headers" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
-    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/tables/docs/lookup/doc:a?fields=title", .{base_url});
+    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/lookup/doc:a?fields=title", .{base_url});
     defer alloc.free(lookup_url);
 
     var resp = try getWithRetry(&client, client_io.io(), lookup_url, null, 20);
@@ -3040,7 +3040,7 @@ test "httpx antfly lookup decodes percent-encoded path keys" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
-    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/tables/docs/lookup/docs%2Fgetting-started.md?fields=title", .{base_url});
+    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/lookup/docs%2Fgetting-started.md?fields=title", .{base_url});
     defer alloc.free(lookup_url);
 
     var resp = try getWithRetry(&client, client_io.io(), lookup_url, null, 20);
@@ -3071,7 +3071,7 @@ test "httpx antfly schema update returns full table status after projection" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
-    const schema_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/tables/docs/schema", .{base_url});
+    const schema_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/schema", .{base_url});
     defer alloc.free(schema_url);
     const schema_body = try test_contract_helpers.encodeSchemaUpdateRequest(alloc);
     defer alloc.free(schema_body);
@@ -3115,7 +3115,7 @@ test "httpx antfly cluster restore preserves backup location validation" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
-    const restore_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/restore", .{base_url});
+    const restore_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/restore", .{base_url});
     defer alloc.free(restore_url);
     const restore_body = "{\"backup_id\":\"snap1\",\"location\":\"ftp://bad\"}";
     const headers = [_][2][]const u8{.{ "content-type", "application/json" }};

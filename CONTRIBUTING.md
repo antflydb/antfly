@@ -25,8 +25,7 @@ go/pkg/
   genkit/            Firebase Genkit plugins (antfly, openrouter)
   memoryaf/          Memory-focused Antfly helpers
   operator/          Kubernetes operator
-  proxy/             Antfly and Termite proxy packages
-  termite/           ML inference service (Go module)
+  proxy/             Antfly and Inference proxy packages
 ts/
   packages/sdk/      TypeScript SDK (@antfly/sdk)
   packages/components/  React component library (@antfly/components)
@@ -54,14 +53,14 @@ Run `make help` for the full list. Key targets:
 | Target | Description |
 |--------|-------------|
 | `make build` | Build the `antfly` binary (includes Antfarm frontend and code generation) |
-| `make generate` | Regenerate all code: OpenAPI types, Go/TS/Python SDKs, Termite, docs |
-| `make lint` | Run linters across Go (root + all submodules), Termite, and TypeScript |
+| `make generate` | Regenerate all code: OpenAPI types, Go/TS/Python SDKs, inference runtime, docs |
+| `make lint` | Run linters across Go (root + all submodules), inference runtime, and TypeScript |
 | `make tidy` | Run `go mod tidy` across the root module and Go submodules |
 | `make tidy-check` | Verify `go.mod`/`go.sum` are already tidy across the root module and Go submodules |
 | `make e2e` | Run E2E tests with ONNX+XLA (downloads deps on first run) |
 | `make e2e E2E_TEST=TestName` | Run a specific E2E test |
 | `make build-omni` | Build with all ML backends (ONNX + XLA) |
-| `make build-antfarm` | Build the Antfarm dashboard and Termite dashboard |
+| `make build-antfarm` | Build the Antfarm dashboard |
 | `make build-docs` | Join and lint OpenAPI specs with Redocly |
 | `make update-deps` | Update Go dependencies across all modules |
 | `make license-headers` | Add first-party license headers |
@@ -89,14 +88,14 @@ Run `make help` for the full list. Key targets:
 
 ### Swarm Mode (Single Process)
 
-Runs metadata, storage, and [Termite](go/pkg/termite) together:
+Runs metadata, storage, and Antfly inference together:
 
 ```bash
 cd go/pkg/antfly
 go run ./cmd swarm
 ```
 
-Dashboard at `http://localhost:8080`. Termite auto-discovers models from `~/.termite/models/`.
+Dashboard at `http://localhost:8080`. Antfly inference auto-discovers models from `~/.antfly/inference/models/`.
 
 ### Docker
 
@@ -119,14 +118,13 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | Go SDK | `go/pkg/sdk/` |
 | Operator | `go/pkg/operator/` |
 | Antfly proxy | `go/pkg/proxy/antfly/` |
-| Termite proxy | `go/pkg/proxy/termite/` |
+| Inference proxy | `go/pkg/proxy/inference/` |
 | libaf | `go/pkg/libaf/` |
 | docsaf | `go/pkg/docsaf/` |
 | evalaf | `go/pkg/evalaf/` |
 | evalaf antfly plugin | `go/pkg/evalaf/plugins/antfly/` |
 | Genkit plugin | `go/pkg/genkit/antfly/` |
 | Genkit OpenRouter | `go/pkg/genkit/openrouter/` |
-| Termite | `go/pkg/termite/` |
 
 `make generate`, `make lint`, and `make update-deps` iterate over all submodules automatically.
 `make tidy` and `make tidy-check` do too.
@@ -191,7 +189,7 @@ cd rs/pgaf && make test-e2e   # E2E (requires running Antfly server)
 
 ## Code Generation
 
-After changing OpenAPI specs under `specs/openapi/` or component specs under `go/pkg/antfly/` and `go/pkg/termite/`, or after changing protobuf definitions:
+After changing OpenAPI specs under `specs/openapi/`, component specs under `go/pkg/antfly/`, or inference runtime specs, or after changing protobuf definitions:
 
 ```bash
 make generate
@@ -200,7 +198,7 @@ make generate
 This runs:
 1. Redocly join + lint on OpenAPI specs
 2. `go generate ./...` across root and all submodules (oapi-codegen)
-3. Termite code generation
+3. Inference runtime code generation
 4. TypeScript SDK generation (`@antfly/sdk`)
 5. Python SDK generation
 
@@ -237,4 +235,4 @@ go tool goreleaser release --clean
 
 ## License
 
-Core Antfly code is licensed under [Elastic License 2.0 (ELv2)](LICENSE). The SDKs, shared libraries, Termite, TypeScript, Python, and Rust packages are Apache 2.0 — check individual LICENSE files.
+Core Antfly code is licensed under [Elastic License 2.0 (ELv2)](LICENSE). The SDKs, shared libraries, inference runtime, TypeScript, Python, and Rust packages are Apache 2.0 — check individual LICENSE files.

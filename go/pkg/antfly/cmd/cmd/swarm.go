@@ -27,13 +27,13 @@ import (
 	"syscall"
 	"time"
 
+	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/inference"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/pebbleutils"
-	libtermite "github.com/antflydb/antfly/go/pkg/antfly/lib/termite"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/metadata"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
 	"github.com/antflydb/antfly/go/pkg/libaf/healthserver"
-	"github.com/antflydb/antfly/go/pkg/termite"
+	inferenceRuntime "github.com/antflydb/antfly/go/pkg/termite"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
@@ -57,8 +57,8 @@ func init() {
 		String("metadata-cluster", `{ "1": "http://0.0.0.0:9017" }`, "metadata cluster peer URLs (json object)")
 	swarmCmd.Flags().String("store-raft", "http://0.0.0.0:9021", "store raft server URL")
 	swarmCmd.Flags().String("store-api", "http://0.0.0.0:12380", "store api server URL")
-	swarmCmd.Flags().Bool("termite", true, "also run as a termite node")
-	swarmCmd.Flags().String("termite-api-url", "", "Termite API URL (http://host:port)")
+	swarmCmd.Flags().Bool("inference", true, "also run the inference runtime")
+	swarmCmd.Flags().String("inference-api-url", "", "Inference API URL (http://host:port)")
 	swarmCmd.Flags().Bool("health", true, "enable health/metrics server")
 	swarmCmd.Flags().Int("health-port", 4200, "health/metrics server port")
 
@@ -68,8 +68,8 @@ func init() {
 	mustBindPFlag("swarm.metadata-cluster", swarmCmd.Flags().Lookup("metadata-cluster"))
 	mustBindPFlag("swarm.store-raft", swarmCmd.Flags().Lookup("store-raft"))
 	mustBindPFlag("swarm.store-api", swarmCmd.Flags().Lookup("store-api"))
-	mustBindPFlag("swarm.termite", swarmCmd.Flags().Lookup("termite"))
-	mustBindPFlag("termite.api_url", swarmCmd.Flags().Lookup("termite-api-url"))
+	mustBindPFlag("swarm.inference", swarmCmd.Flags().Lookup("inference"))
+	mustBindPFlag("inference.api_url", swarmCmd.Flags().Lookup("inference-api-url"))
 	mustBindPFlag("health_enabled", swarmCmd.Flags().Lookup("health"))
 	mustBindPFlag("health_port", swarmCmd.Flags().Lookup("health-port"))
 }
@@ -79,14 +79,13 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 	defer cancel()
 
 	id := viper.GetUint64("swarm.id")
-	enableTermite := viper.GetBool("swarm.termite")
-	// When termite is enabled, decide whether to run it in-process (mounted on
-	// antfly's metadata listener under /ml/v1/) or as a separate HTTP server.
+	enableInference := viper.GetBool("swarm.inference")
+	// When inference is enabled, decide whether to run it in-process (mounted on
+	// Antfly's metadata listener under /ai/v1/) or as a separate HTTP server.
 	// In-process is the default. If the user explicitly provides
-	// --termite-api-url, we run termite standalone on that URL and the
-	// metadata server reverse-proxies /termite/* to it.
-	termiteAPIURL := viper.GetString("termite.api_url")
-	runTermiteInProcess := enableTermite && termiteAPIURL == ""
+	// --inference-api-url, we run inference standalone on that URL.
+	inferenceAPIURL := viper.GetString("inference.api_url")
+	runInferenceInProcess := enableInference && inferenceAPIURL == ""
 	viper.SetDefault("cors.enabled", true)
 	viper.SetDefault("replication_factor", 1)
 	viper.SetDefault("default_shards_per_table", 1)
@@ -121,12 +120,12 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 	tid := types.ID(id)
 	metadataReadyC := make(chan struct{})
 	storeReadyC := make(chan struct{})
-	var termiteReadyC chan struct{}
-	// Only create termiteReadyC when termite is run as a separate HTTP
-	// server. In-process termite is ready as soon as NewTermiteNode returns,
+	var inferenceReadyC chan struct{}
+	// Only create inferenceReadyC when inference is run as a separate HTTP
+	// server. In-process inference is ready as soon as the runtime node returns,
 	// before the metadata server is even started.
-	if enableTermite && !runTermiteInProcess {
-		termiteReadyC = make(chan struct{})
+	if enableInference && !runInferenceInProcess {
+		inferenceReadyC = make(chan struct{})
 	}
 
 	// Aggregate readiness: health server reports ready once all sub-servers are ready
@@ -134,8 +133,8 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 	go func() {
 		<-metadataReadyC
 		<-storeReadyC
-		if termiteReadyC != nil {
-			<-termiteReadyC
+		if inferenceReadyC != nil {
+			<-inferenceReadyC
 		}
 		ready.Store(true)
 		logger.Info("Swarm mode: all servers are ready")
@@ -158,28 +157,28 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 
 	localProvider := metadata.NewDeferredLocalExecutionProvider()
 
-	// If termite is running in-process, construct the node synchronously so
-	// we can mount its /ml/v1/ handler on the metadata server. The node
+	// If inference is running in-process, construct the node synchronously so
+	// we can mount its /ai/v1/ handler on the metadata server. The node
 	// holds Pebble resources that need to be closed at shutdown.
-	var termiteNode *termite.TermiteNode
-	if runTermiteInProcess {
-		termiteNode = termite.NewTermiteNode(ctx, logger, termiteConfigWithSecurity(config))
+	var inferenceNode *inferenceRuntime.TermiteNode
+	if runInferenceInProcess {
+		inferenceNode = inferenceRuntime.NewTermiteNode(ctx, logger, inferenceConfigWithSecurity(config))
 		defer func() {
-			if err := termiteNode.Close(); err != nil {
-				logger.Error("failed to close termite node", zap.Error(err))
+			if err := inferenceNode.Close(); err != nil {
+				logger.Error("failed to close inference node", zap.Error(err))
 			}
 		}()
-		// Point the default Termite URL at the metadata listener — the
-		// termite-client appends /ml/v1 automatically, and the metadata
-		// handler mounts the in-process TermiteNode under /ml/v1/.
-		libtermite.SetDefaultURL(metaConf.ApiURL)
+		// Point the default inference URL at the metadata listener; the client
+		// appends /ai/v1 automatically, and metadata mounts the in-process
+		// inference handler under /ai/v1.
+		libinference.SetDefaultURL(metaConf.ApiURL)
 	}
 
 	runtimeOpts := metadata.RuntimeOptions{
 		ExecutionProvider: localProvider,
 	}
-	if termiteNode != nil {
-		runtimeOpts.TermiteMLHandler = termiteNode.APIMLHandler()
+	if inferenceNode != nil {
+		runtimeOpts.InferenceMLHandler = inferenceNode.APIMLHandler()
 	}
 
 	metaRuntime, err := metadata.NewRuntime(
@@ -202,10 +201,10 @@ func runSwarm(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	if enableTermite && !runTermiteInProcess {
-		go termite.RunAsTermite(ctx, logger, termiteConfigWithSecurity(config), termiteReadyC)
-		// Wait for termite to finish Pebble initialization before opening store Pebble.
-		<-termiteReadyC
+	if enableInference && !runInferenceInProcess {
+		go inferenceRuntime.RunAsTermite(ctx, logger, inferenceConfigWithSecurity(config), inferenceReadyC)
+		// Wait for inference to finish Pebble initialization before opening store Pebble.
+		<-inferenceReadyC
 	}
 
 	storeRuntime, err := store.NewRuntime(logger.Named("store"), config, storeConf, cache)

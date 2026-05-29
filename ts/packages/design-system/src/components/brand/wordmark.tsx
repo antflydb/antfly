@@ -3,8 +3,8 @@ import { cn } from "@/lib/utils";
 
 interface WordmarkProps extends React.HTMLAttributes<HTMLSpanElement> {
   /** Weight applied to the wordmark. Defaults to `bold` — which is correct
-   * for every Antfly-family brand ("Antfly", "SearchAF", "Termite"). Only
-   * override if a non-Antfly consumer needs a lighter identity.
+   * for every Antfly-family brand ("Antfly", "SearchAF", "Antfly Inference").
+   * Only override if a non-Antfly consumer needs a lighter identity.
    */
   weight?: "regular" | "bold";
 }

@@ -75,7 +75,7 @@ pub const graph_pattern = @import("graph/pattern.zig");
 // Sparse embeddings
 pub const sparse = @import("sparse/sparse.zig");
 
-// Inference clients (Termite, OpenAI/Ollama)
+// Inference clients (Antfly, OpenAI/Ollama)
 pub const inference = @import("inference/mod.zig");
 pub const table_schema = @import("schema/mod.zig");
 pub const image = @import("antfly_image");
@@ -108,7 +108,7 @@ pub const metadata_replication_backfill = @import("metadata/replication_backfill
 pub const metadata_placement_planner = @import("metadata/placement_planner.zig");
 pub const data = @import("data/mod.zig");
 pub const swarm = @import("swarm/mod.zig");
-pub const termite_runtime = @import("termite/runtime.zig");
+pub const inference_runtime = @import("inference_runtime/runtime.zig");
 pub const usermgr = @import("usermgr/mod.zig");
 
 // Template rendering (handlebars)
@@ -263,7 +263,7 @@ test {
     _ = metadata_placement_planner;
     _ = data;
     _ = swarm;
-    _ = termite_runtime;
+    _ = inference_runtime;
 
     // Template
     _ = template;

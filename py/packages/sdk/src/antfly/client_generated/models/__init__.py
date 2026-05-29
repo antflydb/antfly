@@ -24,7 +24,9 @@ from .analyses import Analyses
 from .analyses_result import AnalysesResult
 from .answer_agent_result import AnswerAgentResult
 from .answer_agent_steps import AnswerAgentSteps
+from .antfly_chunker_config import AntflyChunkerConfig
 from .antfly_embedder_config import AntflyEmbedderConfig
+from .antfly_generator_config import AntflyGeneratorConfig
 from .antfly_reranker_config import AntflyRerankerConfig
 from .antfly_type import AntflyType
 from .antfly_type_2 import AntflyType2
@@ -205,6 +207,158 @@ from .incomplete_details_reason import IncompleteDetailsReason
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
+from .inference_audio_chunk_config import InferenceAudioChunkConfig
+from .inference_backend_runtimes import InferenceBackendRuntimes
+from .inference_binary_content import InferenceBinaryContent
+from .inference_chat_message import InferenceChatMessage
+from .inference_chunk import InferenceChunk
+from .inference_chunk_config import InferenceChunkConfig
+from .inference_chunk_object import InferenceChunkObject
+from .inference_chunk_object_object import InferenceChunkObjectObject
+from .inference_chunk_request import InferenceChunkRequest
+from .inference_chunk_response import InferenceChunkResponse
+from .inference_chunk_response_object import InferenceChunkResponseObject
+from .inference_classify_object import InferenceClassifyObject
+from .inference_classify_object_object import InferenceClassifyObjectObject
+from .inference_classify_request import InferenceClassifyRequest
+from .inference_classify_response import InferenceClassifyResponse
+from .inference_classify_response_object import InferenceClassifyResponseObject
+from .inference_classify_result import InferenceClassifyResult
+from .inference_config import InferenceConfig
+from .inference_config_model_strategies import InferenceConfigModelStrategies
+from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
+from .inference_content_security_config import InferenceContentSecurityConfig
+from .inference_credentials import InferenceCredentials
+from .inference_document_classification_features import InferenceDocumentClassificationFeatures
+from .inference_document_classification_object import InferenceDocumentClassificationObject
+from .inference_document_classification_object_input import InferenceDocumentClassificationObjectInput
+from .inference_document_classification_object_object import InferenceDocumentClassificationObjectObject
+from .inference_document_classification_request import InferenceDocumentClassificationRequest
+from .inference_document_classification_response import InferenceDocumentClassificationResponse
+from .inference_document_classification_response_object import InferenceDocumentClassificationResponseObject
+from .inference_document_classification_result import InferenceDocumentClassificationResult
+from .inference_document_token_box import InferenceDocumentTokenBox
+from .inference_document_token_classification_features import InferenceDocumentTokenClassificationFeatures
+from .inference_document_token_classification_object import InferenceDocumentTokenClassificationObject
+from .inference_document_token_classification_object_object import InferenceDocumentTokenClassificationObjectObject
+from .inference_document_token_classification_prediction import InferenceDocumentTokenClassificationPrediction
+from .inference_document_token_classification_request import InferenceDocumentTokenClassificationRequest
+from .inference_document_token_classification_response import InferenceDocumentTokenClassificationResponse
+from .inference_document_token_classification_response_object import InferenceDocumentTokenClassificationResponseObject
+from .inference_document_token_classification_result import InferenceDocumentTokenClassificationResult
+from .inference_embed_request import InferenceEmbedRequest
+from .inference_embed_request_encoding_format import InferenceEmbedRequestEncodingFormat
+from .inference_embed_request_input_type import InferenceEmbedRequestInputType
+from .inference_embed_request_task_type import InferenceEmbedRequestTaskType
+from .inference_embed_response import InferenceEmbedResponse
+from .inference_embed_response_object import InferenceEmbedResponseObject
+from .inference_embedding_object import InferenceEmbeddingObject
+from .inference_embedding_object_object import InferenceEmbeddingObjectObject
+from .inference_embedding_usage import InferenceEmbeddingUsage
+from .inference_error import InferenceError
+from .inference_extract_field_value import InferenceExtractFieldValue
+from .inference_extract_object import InferenceExtractObject
+from .inference_extract_object_object import InferenceExtractObjectObject
+from .inference_extract_object_results import InferenceExtractObjectResults
+from .inference_extract_object_results_additional_property_item import (
+    InferenceExtractObjectResultsAdditionalPropertyItem,
+)
+from .inference_extract_request import InferenceExtractRequest
+from .inference_extract_request_schema import InferenceExtractRequestSchema
+from .inference_extract_response import InferenceExtractResponse
+from .inference_extract_response_object import InferenceExtractResponseObject
+from .inference_finish_reason import InferenceFinishReason
+from .inference_function_definition import InferenceFunctionDefinition
+from .inference_function_definition_parameters import InferenceFunctionDefinitionParameters
+from .inference_generate_choice import InferenceGenerateChoice
+from .inference_generate_choice_logprobs_type_0 import InferenceGenerateChoiceLogprobsType0
+from .inference_generate_chunk import InferenceGenerateChunk
+from .inference_generate_chunk_choice import InferenceGenerateChunkChoice
+from .inference_generate_chunk_object import InferenceGenerateChunkObject
+from .inference_generate_delta import InferenceGenerateDelta
+from .inference_generate_json_schema_config import InferenceGenerateJsonSchemaConfig
+from .inference_generate_json_schema_config_schema import InferenceGenerateJsonSchemaConfigSchema
+from .inference_generate_message import InferenceGenerateMessage
+from .inference_generate_request import InferenceGenerateRequest
+from .inference_generate_request_backend import InferenceGenerateRequestBackend
+from .inference_generate_request_cache_dtype import InferenceGenerateRequestCacheDtype
+from .inference_generate_request_compiled_target import InferenceGenerateRequestCompiledTarget
+from .inference_generate_request_mode import InferenceGenerateRequestMode
+from .inference_generate_response import InferenceGenerateResponse
+from .inference_generate_response_format import InferenceGenerateResponseFormat
+from .inference_generate_response_format_type import InferenceGenerateResponseFormatType
+from .inference_generate_response_object import InferenceGenerateResponseObject
+from .inference_generate_usage import InferenceGenerateUsage
+from .inference_image_url import InferenceImageURL
+from .inference_image_url_content_part import InferenceImageURLContentPart
+from .inference_image_url_content_part_type import InferenceImageURLContentPartType
+from .inference_level import InferenceLevel
+from .inference_media_content_part import InferenceMediaContentPart
+from .inference_media_content_part_type import InferenceMediaContentPartType
+from .inference_model_info import InferenceModelInfo
+from .inference_models_response import InferenceModelsResponse
+from .inference_models_response_chunkers import InferenceModelsResponseChunkers
+from .inference_models_response_classifiers import InferenceModelsResponseClassifiers
+from .inference_models_response_data_item import InferenceModelsResponseDataItem
+from .inference_models_response_embedders import InferenceModelsResponseEmbedders
+from .inference_models_response_extractors import InferenceModelsResponseExtractors
+from .inference_models_response_generators import InferenceModelsResponseGenerators
+from .inference_models_response_object import InferenceModelsResponseObject
+from .inference_models_response_readers import InferenceModelsResponseReaders
+from .inference_models_response_recognizers import InferenceModelsResponseRecognizers
+from .inference_models_response_rerankers import InferenceModelsResponseRerankers
+from .inference_models_response_rewriters import InferenceModelsResponseRewriters
+from .inference_models_response_transcribers import InferenceModelsResponseTranscribers
+from .inference_read_object import InferenceReadObject
+from .inference_read_object_object import InferenceReadObjectObject
+from .inference_read_request import InferenceReadRequest
+from .inference_read_response import InferenceReadResponse
+from .inference_read_response_object import InferenceReadResponseObject
+from .inference_read_result import InferenceReadResult
+from .inference_read_result_fields import InferenceReadResultFields
+from .inference_recognize_entity import InferenceRecognizeEntity
+from .inference_recognize_object import InferenceRecognizeObject
+from .inference_recognize_object_object import InferenceRecognizeObjectObject
+from .inference_recognize_request import InferenceRecognizeRequest
+from .inference_recognize_response import InferenceRecognizeResponse
+from .inference_recognize_response_object import InferenceRecognizeResponseObject
+from .inference_relation import InferenceRelation
+from .inference_rerank_multimodal_document import InferenceRerankMultimodalDocument
+from .inference_rerank_multimodal_request import InferenceRerankMultimodalRequest
+from .inference_rerank_object import InferenceRerankObject
+from .inference_rerank_object_object import InferenceRerankObjectObject
+from .inference_rerank_request import InferenceRerankRequest
+from .inference_rerank_response import InferenceRerankResponse
+from .inference_rerank_response_object import InferenceRerankResponseObject
+from .inference_resolver_config import InferenceResolverConfig
+from .inference_rewrite_object import InferenceRewriteObject
+from .inference_rewrite_object_object import InferenceRewriteObjectObject
+from .inference_rewrite_request import InferenceRewriteRequest
+from .inference_rewrite_response import InferenceRewriteResponse
+from .inference_rewrite_response_object import InferenceRewriteResponseObject
+from .inference_role import InferenceRole
+from .inference_sparse_vector import InferenceSparseVector
+from .inference_style import InferenceStyle
+from .inference_text_chunk_options import InferenceTextChunkOptions
+from .inference_text_content import InferenceTextContent
+from .inference_text_content_part import InferenceTextContentPart
+from .inference_text_content_part_type import InferenceTextContentPartType
+from .inference_text_region import InferenceTextRegion
+from .inference_tool import InferenceTool
+from .inference_tool_call_delta import InferenceToolCallDelta
+from .inference_tool_call_delta_type import InferenceToolCallDeltaType
+from .inference_tool_call_function_delta import InferenceToolCallFunctionDelta
+from .inference_tool_choice_type_0 import InferenceToolChoiceType0
+from .inference_tool_choice_type_1_function import InferenceToolChoiceType1Function
+from .inference_tool_choice_type_1_type import InferenceToolChoiceType1Type
+from .inference_tool_type import InferenceToolType
+from .inference_transcribe_object import InferenceTranscribeObject
+from .inference_transcribe_object_object import InferenceTranscribeObjectObject
+from .inference_transcribe_request import InferenceTranscribeRequest
+from .inference_transcribe_response import InferenceTranscribeResponse
+from .inference_transcribe_response_object import InferenceTranscribeResponseObject
+from .inference_vad_options import InferenceVADOptions
+from .inferenceschemas_config import InferenceschemasConfig
 from .ip_range_query import IPRangeQuery
 from .join_condition import JoinCondition
 from .join_operator import JoinOperator
@@ -340,162 +494,6 @@ from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
 from .template_field_mapping import TemplateFieldMapping
 from .term_query import TermQuery
 from .term_range_query import TermRangeQuery
-from .termite_audio_chunk_config import TermiteAudioChunkConfig
-from .termite_backend_capabilities import TermiteBackendCapabilities
-from .termite_binary_content import TermiteBinaryContent
-from .termite_chat_message import TermiteChatMessage
-from .termite_chunk import TermiteChunk
-from .termite_chunk_config import TermiteChunkConfig
-from .termite_chunk_object import TermiteChunkObject
-from .termite_chunk_object_object import TermiteChunkObjectObject
-from .termite_chunk_request import TermiteChunkRequest
-from .termite_chunk_response import TermiteChunkResponse
-from .termite_chunk_response_object import TermiteChunkResponseObject
-from .termite_chunker_config import TermiteChunkerConfig
-from .termite_classify_object import TermiteClassifyObject
-from .termite_classify_object_object import TermiteClassifyObjectObject
-from .termite_classify_request import TermiteClassifyRequest
-from .termite_classify_response import TermiteClassifyResponse
-from .termite_classify_response_object import TermiteClassifyResponseObject
-from .termite_classify_result import TermiteClassifyResult
-from .termite_config import TermiteConfig
-from .termite_config_model_strategies import TermiteConfigModelStrategies
-from .termite_config_model_strategies_additional_property import TermiteConfigModelStrategiesAdditionalProperty
-from .termite_content_security_config import TermiteContentSecurityConfig
-from .termite_credentials import TermiteCredentials
-from .termite_document_classification_features import TermiteDocumentClassificationFeatures
-from .termite_document_classification_object import TermiteDocumentClassificationObject
-from .termite_document_classification_object_input import TermiteDocumentClassificationObjectInput
-from .termite_document_classification_object_object import TermiteDocumentClassificationObjectObject
-from .termite_document_classification_request import TermiteDocumentClassificationRequest
-from .termite_document_classification_response import TermiteDocumentClassificationResponse
-from .termite_document_classification_response_object import TermiteDocumentClassificationResponseObject
-from .termite_document_classification_result import TermiteDocumentClassificationResult
-from .termite_document_token_box import TermiteDocumentTokenBox
-from .termite_document_token_classification_features import TermiteDocumentTokenClassificationFeatures
-from .termite_document_token_classification_object import TermiteDocumentTokenClassificationObject
-from .termite_document_token_classification_object_object import TermiteDocumentTokenClassificationObjectObject
-from .termite_document_token_classification_prediction import TermiteDocumentTokenClassificationPrediction
-from .termite_document_token_classification_request import TermiteDocumentTokenClassificationRequest
-from .termite_document_token_classification_response import TermiteDocumentTokenClassificationResponse
-from .termite_document_token_classification_response_object import TermiteDocumentTokenClassificationResponseObject
-from .termite_document_token_classification_result import TermiteDocumentTokenClassificationResult
-from .termite_embed_request import TermiteEmbedRequest
-from .termite_embed_request_encoding_format import TermiteEmbedRequestEncodingFormat
-from .termite_embed_request_input_type import TermiteEmbedRequestInputType
-from .termite_embed_request_task_type import TermiteEmbedRequestTaskType
-from .termite_embed_response import TermiteEmbedResponse
-from .termite_embed_response_object import TermiteEmbedResponseObject
-from .termite_embedder_config import TermiteEmbedderConfig
-from .termite_embedding_object import TermiteEmbeddingObject
-from .termite_embedding_object_object import TermiteEmbeddingObjectObject
-from .termite_embedding_usage import TermiteEmbeddingUsage
-from .termite_error import TermiteError
-from .termite_extract_field_value import TermiteExtractFieldValue
-from .termite_extract_object import TermiteExtractObject
-from .termite_extract_object_object import TermiteExtractObjectObject
-from .termite_extract_object_results import TermiteExtractObjectResults
-from .termite_extract_object_results_additional_property_item import TermiteExtractObjectResultsAdditionalPropertyItem
-from .termite_extract_request import TermiteExtractRequest
-from .termite_extract_request_schema import TermiteExtractRequestSchema
-from .termite_extract_response import TermiteExtractResponse
-from .termite_extract_response_object import TermiteExtractResponseObject
-from .termite_finish_reason import TermiteFinishReason
-from .termite_function_definition import TermiteFunctionDefinition
-from .termite_function_definition_parameters import TermiteFunctionDefinitionParameters
-from .termite_generate_choice import TermiteGenerateChoice
-from .termite_generate_choice_logprobs_type_0 import TermiteGenerateChoiceLogprobsType0
-from .termite_generate_chunk import TermiteGenerateChunk
-from .termite_generate_chunk_choice import TermiteGenerateChunkChoice
-from .termite_generate_chunk_object import TermiteGenerateChunkObject
-from .termite_generate_delta import TermiteGenerateDelta
-from .termite_generate_json_schema_config import TermiteGenerateJsonSchemaConfig
-from .termite_generate_json_schema_config_schema import TermiteGenerateJsonSchemaConfigSchema
-from .termite_generate_message import TermiteGenerateMessage
-from .termite_generate_request import TermiteGenerateRequest
-from .termite_generate_request_backend import TermiteGenerateRequestBackend
-from .termite_generate_request_cache_dtype import TermiteGenerateRequestCacheDtype
-from .termite_generate_request_compiled_target import TermiteGenerateRequestCompiledTarget
-from .termite_generate_request_mode import TermiteGenerateRequestMode
-from .termite_generate_response import TermiteGenerateResponse
-from .termite_generate_response_format import TermiteGenerateResponseFormat
-from .termite_generate_response_format_type import TermiteGenerateResponseFormatType
-from .termite_generate_response_object import TermiteGenerateResponseObject
-from .termite_generate_usage import TermiteGenerateUsage
-from .termite_generator_config import TermiteGeneratorConfig
-from .termite_image_url import TermiteImageURL
-from .termite_image_url_content_part import TermiteImageURLContentPart
-from .termite_image_url_content_part_type import TermiteImageURLContentPartType
-from .termite_level import TermiteLevel
-from .termite_media_content_part import TermiteMediaContentPart
-from .termite_media_content_part_type import TermiteMediaContentPartType
-from .termite_model_info import TermiteModelInfo
-from .termite_models_response import TermiteModelsResponse
-from .termite_models_response_chunkers import TermiteModelsResponseChunkers
-from .termite_models_response_classifiers import TermiteModelsResponseClassifiers
-from .termite_models_response_embedders import TermiteModelsResponseEmbedders
-from .termite_models_response_extractors import TermiteModelsResponseExtractors
-from .termite_models_response_generators import TermiteModelsResponseGenerators
-from .termite_models_response_readers import TermiteModelsResponseReaders
-from .termite_models_response_recognizers import TermiteModelsResponseRecognizers
-from .termite_models_response_rerankers import TermiteModelsResponseRerankers
-from .termite_models_response_rewriters import TermiteModelsResponseRewriters
-from .termite_models_response_transcribers import TermiteModelsResponseTranscribers
-from .termite_read_object import TermiteReadObject
-from .termite_read_object_object import TermiteReadObjectObject
-from .termite_read_request import TermiteReadRequest
-from .termite_read_response import TermiteReadResponse
-from .termite_read_response_object import TermiteReadResponseObject
-from .termite_read_result import TermiteReadResult
-from .termite_read_result_fields import TermiteReadResultFields
-from .termite_recognize_entity import TermiteRecognizeEntity
-from .termite_recognize_object import TermiteRecognizeObject
-from .termite_recognize_object_object import TermiteRecognizeObjectObject
-from .termite_recognize_request import TermiteRecognizeRequest
-from .termite_recognize_response import TermiteRecognizeResponse
-from .termite_recognize_response_object import TermiteRecognizeResponseObject
-from .termite_relation import TermiteRelation
-from .termite_rerank_multimodal_document import TermiteRerankMultimodalDocument
-from .termite_rerank_multimodal_request import TermiteRerankMultimodalRequest
-from .termite_rerank_object import TermiteRerankObject
-from .termite_rerank_object_object import TermiteRerankObjectObject
-from .termite_rerank_request import TermiteRerankRequest
-from .termite_rerank_response import TermiteRerankResponse
-from .termite_rerank_response_object import TermiteRerankResponseObject
-from .termite_reranker_config import TermiteRerankerConfig
-from .termite_resolver_config import TermiteResolverConfig
-from .termite_rewrite_object import TermiteRewriteObject
-from .termite_rewrite_object_object import TermiteRewriteObjectObject
-from .termite_rewrite_request import TermiteRewriteRequest
-from .termite_rewrite_response import TermiteRewriteResponse
-from .termite_rewrite_response_object import TermiteRewriteResponseObject
-from .termite_role import TermiteRole
-from .termite_sparse_vector import TermiteSparseVector
-from .termite_style import TermiteStyle
-from .termite_text_chunk_options import TermiteTextChunkOptions
-from .termite_text_content import TermiteTextContent
-from .termite_text_content_part import TermiteTextContentPart
-from .termite_text_content_part_type import TermiteTextContentPartType
-from .termite_text_region import TermiteTextRegion
-from .termite_tool import TermiteTool
-from .termite_tool_call import TermiteToolCall
-from .termite_tool_call_delta import TermiteToolCallDelta
-from .termite_tool_call_delta_type import TermiteToolCallDeltaType
-from .termite_tool_call_function import TermiteToolCallFunction
-from .termite_tool_call_function_delta import TermiteToolCallFunctionDelta
-from .termite_tool_call_type import TermiteToolCallType
-from .termite_tool_choice_type_0 import TermiteToolChoiceType0
-from .termite_tool_choice_type_1_function import TermiteToolChoiceType1Function
-from .termite_tool_choice_type_1_type import TermiteToolChoiceType1Type
-from .termite_tool_type import TermiteToolType
-from .termite_transcribe_object import TermiteTranscribeObject
-from .termite_transcribe_object_object import TermiteTranscribeObjectObject
-from .termite_transcribe_request import TermiteTranscribeRequest
-from .termite_transcribe_response import TermiteTranscribeResponse
-from .termite_transcribe_response_object import TermiteTranscribeResponseObject
-from .termite_vad_options import TermiteVADOptions
-from .termite_version_response import TermiteVersionResponse
-from .termiteschemas_config import TermiteschemasConfig
 from .text_chunk_options import TextChunkOptions
 from .text_content_part import TextContentPart
 from .text_content_part_type import TextContentPartType
@@ -569,7 +567,9 @@ __all__ = (
     "AnalysesResult",
     "AnswerAgentResult",
     "AnswerAgentSteps",
+    "AntflyChunkerConfig",
     "AntflyEmbedderConfig",
+    "AntflyGeneratorConfig",
     "AntflyRerankerConfig",
     "AntflyType",
     "AntflyType2",
@@ -750,6 +750,156 @@ __all__ = (
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",
+    "InferenceAudioChunkConfig",
+    "InferenceBackendRuntimes",
+    "InferenceBinaryContent",
+    "InferenceChatMessage",
+    "InferenceChunk",
+    "InferenceChunkConfig",
+    "InferenceChunkObject",
+    "InferenceChunkObjectObject",
+    "InferenceChunkRequest",
+    "InferenceChunkResponse",
+    "InferenceChunkResponseObject",
+    "InferenceClassifyObject",
+    "InferenceClassifyObjectObject",
+    "InferenceClassifyRequest",
+    "InferenceClassifyResponse",
+    "InferenceClassifyResponseObject",
+    "InferenceClassifyResult",
+    "InferenceConfig",
+    "InferenceConfigModelStrategies",
+    "InferenceConfigModelStrategiesAdditionalProperty",
+    "InferenceContentSecurityConfig",
+    "InferenceCredentials",
+    "InferenceDocumentClassificationFeatures",
+    "InferenceDocumentClassificationObject",
+    "InferenceDocumentClassificationObjectInput",
+    "InferenceDocumentClassificationObjectObject",
+    "InferenceDocumentClassificationRequest",
+    "InferenceDocumentClassificationResponse",
+    "InferenceDocumentClassificationResponseObject",
+    "InferenceDocumentClassificationResult",
+    "InferenceDocumentTokenBox",
+    "InferenceDocumentTokenClassificationFeatures",
+    "InferenceDocumentTokenClassificationObject",
+    "InferenceDocumentTokenClassificationObjectObject",
+    "InferenceDocumentTokenClassificationPrediction",
+    "InferenceDocumentTokenClassificationRequest",
+    "InferenceDocumentTokenClassificationResponse",
+    "InferenceDocumentTokenClassificationResponseObject",
+    "InferenceDocumentTokenClassificationResult",
+    "InferenceEmbeddingObject",
+    "InferenceEmbeddingObjectObject",
+    "InferenceEmbeddingUsage",
+    "InferenceEmbedRequest",
+    "InferenceEmbedRequestEncodingFormat",
+    "InferenceEmbedRequestInputType",
+    "InferenceEmbedRequestTaskType",
+    "InferenceEmbedResponse",
+    "InferenceEmbedResponseObject",
+    "InferenceError",
+    "InferenceExtractFieldValue",
+    "InferenceExtractObject",
+    "InferenceExtractObjectObject",
+    "InferenceExtractObjectResults",
+    "InferenceExtractObjectResultsAdditionalPropertyItem",
+    "InferenceExtractRequest",
+    "InferenceExtractRequestSchema",
+    "InferenceExtractResponse",
+    "InferenceExtractResponseObject",
+    "InferenceFinishReason",
+    "InferenceFunctionDefinition",
+    "InferenceFunctionDefinitionParameters",
+    "InferenceGenerateChoice",
+    "InferenceGenerateChoiceLogprobsType0",
+    "InferenceGenerateChunk",
+    "InferenceGenerateChunkChoice",
+    "InferenceGenerateChunkObject",
+    "InferenceGenerateDelta",
+    "InferenceGenerateJsonSchemaConfig",
+    "InferenceGenerateJsonSchemaConfigSchema",
+    "InferenceGenerateMessage",
+    "InferenceGenerateRequest",
+    "InferenceGenerateRequestBackend",
+    "InferenceGenerateRequestCacheDtype",
+    "InferenceGenerateRequestCompiledTarget",
+    "InferenceGenerateRequestMode",
+    "InferenceGenerateResponse",
+    "InferenceGenerateResponseFormat",
+    "InferenceGenerateResponseFormatType",
+    "InferenceGenerateResponseObject",
+    "InferenceGenerateUsage",
+    "InferenceImageURL",
+    "InferenceImageURLContentPart",
+    "InferenceImageURLContentPartType",
+    "InferenceLevel",
+    "InferenceMediaContentPart",
+    "InferenceMediaContentPartType",
+    "InferenceModelInfo",
+    "InferenceModelsResponse",
+    "InferenceModelsResponseChunkers",
+    "InferenceModelsResponseClassifiers",
+    "InferenceModelsResponseDataItem",
+    "InferenceModelsResponseEmbedders",
+    "InferenceModelsResponseExtractors",
+    "InferenceModelsResponseGenerators",
+    "InferenceModelsResponseObject",
+    "InferenceModelsResponseReaders",
+    "InferenceModelsResponseRecognizers",
+    "InferenceModelsResponseRerankers",
+    "InferenceModelsResponseRewriters",
+    "InferenceModelsResponseTranscribers",
+    "InferenceReadObject",
+    "InferenceReadObjectObject",
+    "InferenceReadRequest",
+    "InferenceReadResponse",
+    "InferenceReadResponseObject",
+    "InferenceReadResult",
+    "InferenceReadResultFields",
+    "InferenceRecognizeEntity",
+    "InferenceRecognizeObject",
+    "InferenceRecognizeObjectObject",
+    "InferenceRecognizeRequest",
+    "InferenceRecognizeResponse",
+    "InferenceRecognizeResponseObject",
+    "InferenceRelation",
+    "InferenceRerankMultimodalDocument",
+    "InferenceRerankMultimodalRequest",
+    "InferenceRerankObject",
+    "InferenceRerankObjectObject",
+    "InferenceRerankRequest",
+    "InferenceRerankResponse",
+    "InferenceRerankResponseObject",
+    "InferenceResolverConfig",
+    "InferenceRewriteObject",
+    "InferenceRewriteObjectObject",
+    "InferenceRewriteRequest",
+    "InferenceRewriteResponse",
+    "InferenceRewriteResponseObject",
+    "InferenceRole",
+    "InferenceschemasConfig",
+    "InferenceSparseVector",
+    "InferenceStyle",
+    "InferenceTextChunkOptions",
+    "InferenceTextContent",
+    "InferenceTextContentPart",
+    "InferenceTextContentPartType",
+    "InferenceTextRegion",
+    "InferenceTool",
+    "InferenceToolCallDelta",
+    "InferenceToolCallDeltaType",
+    "InferenceToolCallFunctionDelta",
+    "InferenceToolChoiceType0",
+    "InferenceToolChoiceType1Function",
+    "InferenceToolChoiceType1Type",
+    "InferenceToolType",
+    "InferenceTranscribeObject",
+    "InferenceTranscribeObjectObject",
+    "InferenceTranscribeRequest",
+    "InferenceTranscribeResponse",
+    "InferenceTranscribeResponseObject",
+    "InferenceVADOptions",
     "IPRangeQuery",
     "JoinCondition",
     "JoinOperator",
@@ -883,162 +1033,6 @@ __all__ = (
     "TavilySearchConfig",
     "TavilySearchConfigSearchDepth",
     "TemplateFieldMapping",
-    "TermiteAudioChunkConfig",
-    "TermiteBackendCapabilities",
-    "TermiteBinaryContent",
-    "TermiteChatMessage",
-    "TermiteChunk",
-    "TermiteChunkConfig",
-    "TermiteChunkerConfig",
-    "TermiteChunkObject",
-    "TermiteChunkObjectObject",
-    "TermiteChunkRequest",
-    "TermiteChunkResponse",
-    "TermiteChunkResponseObject",
-    "TermiteClassifyObject",
-    "TermiteClassifyObjectObject",
-    "TermiteClassifyRequest",
-    "TermiteClassifyResponse",
-    "TermiteClassifyResponseObject",
-    "TermiteClassifyResult",
-    "TermiteConfig",
-    "TermiteConfigModelStrategies",
-    "TermiteConfigModelStrategiesAdditionalProperty",
-    "TermiteContentSecurityConfig",
-    "TermiteCredentials",
-    "TermiteDocumentClassificationFeatures",
-    "TermiteDocumentClassificationObject",
-    "TermiteDocumentClassificationObjectInput",
-    "TermiteDocumentClassificationObjectObject",
-    "TermiteDocumentClassificationRequest",
-    "TermiteDocumentClassificationResponse",
-    "TermiteDocumentClassificationResponseObject",
-    "TermiteDocumentClassificationResult",
-    "TermiteDocumentTokenBox",
-    "TermiteDocumentTokenClassificationFeatures",
-    "TermiteDocumentTokenClassificationObject",
-    "TermiteDocumentTokenClassificationObjectObject",
-    "TermiteDocumentTokenClassificationPrediction",
-    "TermiteDocumentTokenClassificationRequest",
-    "TermiteDocumentTokenClassificationResponse",
-    "TermiteDocumentTokenClassificationResponseObject",
-    "TermiteDocumentTokenClassificationResult",
-    "TermiteEmbedderConfig",
-    "TermiteEmbeddingObject",
-    "TermiteEmbeddingObjectObject",
-    "TermiteEmbeddingUsage",
-    "TermiteEmbedRequest",
-    "TermiteEmbedRequestEncodingFormat",
-    "TermiteEmbedRequestInputType",
-    "TermiteEmbedRequestTaskType",
-    "TermiteEmbedResponse",
-    "TermiteEmbedResponseObject",
-    "TermiteError",
-    "TermiteExtractFieldValue",
-    "TermiteExtractObject",
-    "TermiteExtractObjectObject",
-    "TermiteExtractObjectResults",
-    "TermiteExtractObjectResultsAdditionalPropertyItem",
-    "TermiteExtractRequest",
-    "TermiteExtractRequestSchema",
-    "TermiteExtractResponse",
-    "TermiteExtractResponseObject",
-    "TermiteFinishReason",
-    "TermiteFunctionDefinition",
-    "TermiteFunctionDefinitionParameters",
-    "TermiteGenerateChoice",
-    "TermiteGenerateChoiceLogprobsType0",
-    "TermiteGenerateChunk",
-    "TermiteGenerateChunkChoice",
-    "TermiteGenerateChunkObject",
-    "TermiteGenerateDelta",
-    "TermiteGenerateJsonSchemaConfig",
-    "TermiteGenerateJsonSchemaConfigSchema",
-    "TermiteGenerateMessage",
-    "TermiteGenerateRequest",
-    "TermiteGenerateRequestBackend",
-    "TermiteGenerateRequestCacheDtype",
-    "TermiteGenerateRequestCompiledTarget",
-    "TermiteGenerateRequestMode",
-    "TermiteGenerateResponse",
-    "TermiteGenerateResponseFormat",
-    "TermiteGenerateResponseFormatType",
-    "TermiteGenerateResponseObject",
-    "TermiteGenerateUsage",
-    "TermiteGeneratorConfig",
-    "TermiteImageURL",
-    "TermiteImageURLContentPart",
-    "TermiteImageURLContentPartType",
-    "TermiteLevel",
-    "TermiteMediaContentPart",
-    "TermiteMediaContentPartType",
-    "TermiteModelInfo",
-    "TermiteModelsResponse",
-    "TermiteModelsResponseChunkers",
-    "TermiteModelsResponseClassifiers",
-    "TermiteModelsResponseEmbedders",
-    "TermiteModelsResponseExtractors",
-    "TermiteModelsResponseGenerators",
-    "TermiteModelsResponseReaders",
-    "TermiteModelsResponseRecognizers",
-    "TermiteModelsResponseRerankers",
-    "TermiteModelsResponseRewriters",
-    "TermiteModelsResponseTranscribers",
-    "TermiteReadObject",
-    "TermiteReadObjectObject",
-    "TermiteReadRequest",
-    "TermiteReadResponse",
-    "TermiteReadResponseObject",
-    "TermiteReadResult",
-    "TermiteReadResultFields",
-    "TermiteRecognizeEntity",
-    "TermiteRecognizeObject",
-    "TermiteRecognizeObjectObject",
-    "TermiteRecognizeRequest",
-    "TermiteRecognizeResponse",
-    "TermiteRecognizeResponseObject",
-    "TermiteRelation",
-    "TermiteRerankerConfig",
-    "TermiteRerankMultimodalDocument",
-    "TermiteRerankMultimodalRequest",
-    "TermiteRerankObject",
-    "TermiteRerankObjectObject",
-    "TermiteRerankRequest",
-    "TermiteRerankResponse",
-    "TermiteRerankResponseObject",
-    "TermiteResolverConfig",
-    "TermiteRewriteObject",
-    "TermiteRewriteObjectObject",
-    "TermiteRewriteRequest",
-    "TermiteRewriteResponse",
-    "TermiteRewriteResponseObject",
-    "TermiteRole",
-    "TermiteschemasConfig",
-    "TermiteSparseVector",
-    "TermiteStyle",
-    "TermiteTextChunkOptions",
-    "TermiteTextContent",
-    "TermiteTextContentPart",
-    "TermiteTextContentPartType",
-    "TermiteTextRegion",
-    "TermiteTool",
-    "TermiteToolCall",
-    "TermiteToolCallDelta",
-    "TermiteToolCallDeltaType",
-    "TermiteToolCallFunction",
-    "TermiteToolCallFunctionDelta",
-    "TermiteToolCallType",
-    "TermiteToolChoiceType0",
-    "TermiteToolChoiceType1Function",
-    "TermiteToolChoiceType1Type",
-    "TermiteToolType",
-    "TermiteTranscribeObject",
-    "TermiteTranscribeObjectObject",
-    "TermiteTranscribeRequest",
-    "TermiteTranscribeResponse",
-    "TermiteTranscribeResponseObject",
-    "TermiteVADOptions",
-    "TermiteVersionResponse",
     "TermQuery",
     "TermRangeQuery",
     "TextChunkOptions",

@@ -38,21 +38,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
-	termitev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/termite/v1alpha1"
+	inferencev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
 	"github.com/antflydb/antfly/go/pkg/operator/controllers/internal/poddiagnostics"
 )
 
 // AntflyClusterReconciler reconciles an AntflyCluster object
 type AntflyClusterReconciler struct {
 	client.Client
-	Scheme              *runtime.Scheme
-	AutoScaler          *AutoScaler
-	KubeClient          kubernetes.Interface
-	NodeStatsFetcher    func(context.Context, string) (*kubeletStatsSummary, error)
-	HTTPClient          *http.Client
-	Recorder            events.EventRecorder
-	ManageTermitePools  bool
-	DefaultTermiteImage string
+	Scheme                *runtime.Scheme
+	AutoScaler            *AutoScaler
+	KubeClient            kubernetes.Interface
+	NodeStatsFetcher      func(context.Context, string) (*kubeletStatsSummary, error)
+	HTTPClient            *http.Client
+	Recorder              events.EventRecorder
+	ManageInferencePools  bool
+	DefaultInferenceImage string
 
 	// validationAttempts tracks consecutive validation failure counts per cluster
 	// (namespace/name -> int). Reset on successful validation. Used for
@@ -84,9 +84,9 @@ const (
 //+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
-//+kubebuilder:rbac:groups=antfly.io,resources=termitepools,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=antfly.io,resources=termitepools/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=antfly.io,resources=termitepools/finalizers,verbs=update
+//+kubebuilder:rbac:groups=antfly.io,resources=inferencepools,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=antfly.io,resources=inferencepools/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=antfly.io,resources=inferencepools/finalizers,verbs=update
 // No delete on CRDs: startup bootstrap applies CRDs but never removes them.
 //+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch;create;update;patch
 
@@ -596,13 +596,13 @@ func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster)
 		if cluster.Spec.Swarm.Health.Port == 0 {
 			cluster.Spec.Swarm.Health.Port = 4200
 		}
-		if cluster.Spec.Swarm.Termite == nil {
-			cluster.Spec.Swarm.Termite = &antflyv1.SwarmTermiteSpec{
+		if cluster.Spec.Swarm.Inference == nil {
+			cluster.Spec.Swarm.Inference = &antflyv1.SwarmInferenceSpec{
 				Enabled: true,
 				APIURL:  "http://0.0.0.0:11433",
 			}
-		} else if cluster.Spec.Swarm.Termite.APIURL == "" {
-			cluster.Spec.Swarm.Termite.APIURL = "http://0.0.0.0:11433"
+		} else if cluster.Spec.Swarm.Inference.APIURL == "" {
+			cluster.Spec.Swarm.Inference.APIURL = "http://0.0.0.0:11433"
 		}
 	}
 
@@ -1076,7 +1076,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// during pod admission/startup, which avoids granting dangerous Secret RBAC here.
 	r.markEnvFromSecretsUnchecked(workingCluster)
 
-	if err := r.reconcileTermitePool(ctx, workingCluster); err != nil {
+	if err := r.reconcileInferencePool(ctx, workingCluster); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1392,12 +1392,12 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return ctrl.Result{}, nil
 }
 
-func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
-	mode := antflyTermiteMode(cluster.Spec.Termite)
-	if !r.ManageTermitePools {
-		if mode == antflyv1.AntflyTermiteModeManaged {
-			r.setTermitePoolReadyCondition(cluster, metav1.ConditionUnknown, antflyv1.ReasonTermitePoolManagementDisabled,
-				"TermitePool management is disabled by --enable-termite-controllers=false; existing owned pools are left unchanged")
+func (r *AntflyClusterReconciler) reconcileInferencePool(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	mode := antflyInferenceMode(cluster.Spec.Inference)
+	if !r.ManageInferencePools {
+		if mode == antflyv1.AntflyInferenceModeManaged {
+			r.setInferencePoolReadyCondition(cluster, metav1.ConditionUnknown, antflyv1.ReasonInferencePoolManagementDisabled,
+				"InferencePool management is disabled by --enable-inference-controllers=false; existing owned pools are left unchanged")
 		}
 		return nil
 	}
@@ -1405,78 +1405,78 @@ func (r *AntflyClusterReconciler) reconcileTermitePool(ctx context.Context, clus
 	logger := log.FromContext(ctx)
 
 	desired := map[string]struct{}{}
-	if mode == antflyv1.AntflyTermiteModeManaged && cluster.Spec.Termite != nil {
-		for i, managed := range cluster.Spec.Termite.ManagedPools {
-			name := managedTermitePoolName(cluster, managed, len(cluster.Spec.Termite.ManagedPools), i)
+	if mode == antflyv1.AntflyInferenceModeManaged && cluster.Spec.Inference != nil {
+		for i, managed := range cluster.Spec.Inference.ManagedPools {
+			name := managedInferencePoolName(cluster, managed, len(cluster.Spec.Inference.ManagedPools), i)
 			key := types.NamespacedName{Name: name, Namespace: cluster.Namespace}
 			desired[name] = struct{}{}
-			if err := r.reconcileManagedTermitePool(ctx, cluster, managed, name); err != nil {
-				var conflictErr *termitePoolNameConflictError
+			if err := r.reconcileManagedInferencePool(ctx, cluster, managed, name); err != nil {
+				var conflictErr *inferencePoolNameConflictError
 				if stderrors.As(err, &conflictErr) {
-					logger.Info("Refusing to adopt same-name TermitePool because it is not controlled by this AntflyCluster", "termitePool", key.String())
-					r.setTermitePoolReadyCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonTermitePoolNameConflict, conflictErr.Error())
+					logger.Info("Refusing to adopt same-name InferencePool because it is not controlled by this AntflyCluster", "inferencePool", key.String())
+					r.setInferencePoolReadyCondition(cluster, metav1.ConditionFalse, antflyv1.ReasonInferencePoolNameConflict, conflictErr.Error())
 					return nil
 				}
 				return err
 			}
-			if i == len(cluster.Spec.Termite.ManagedPools)-1 {
-				r.setTermitePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonTermitePoolReady,
-					fmt.Sprintf("%d managed TermitePool(s) reconciled", len(cluster.Spec.Termite.ManagedPools)))
+			if i == len(cluster.Spec.Inference.ManagedPools)-1 {
+				r.setInferencePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonInferencePoolReady,
+					fmt.Sprintf("%d managed InferencePool(s) reconciled", len(cluster.Spec.Inference.ManagedPools)))
 			}
 		}
 	}
 
-	if err := r.deleteStaleOwnedTermitePools(ctx, cluster, desired); err != nil {
+	if err := r.deleteStaleOwnedInferencePools(ctx, cluster, desired); err != nil {
 		return err
 	}
 
 	switch mode {
-	case antflyv1.AntflyTermiteModeDisabled:
-		r.setTermitePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonTermitePoolReady, "Termite integration is disabled")
-	case antflyv1.AntflyTermiteModeSharedRef:
-		r.setTermitePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonTermitePoolReady,
-			fmt.Sprintf("%d shared TermitePool reference(s) configured", len(cluster.Spec.Termite.SharedPools)))
-	case antflyv1.AntflyTermiteModePlatformShared:
-		r.setTermitePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonTermitePoolReady,
-			fmt.Sprintf("%d platform TermitePool reference(s) configured", len(cluster.Spec.Termite.PlatformPools)))
+	case antflyv1.AntflyInferenceModeDisabled:
+		r.setInferencePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonInferencePoolReady, "Inference integration is disabled")
+	case antflyv1.AntflyInferenceModeSharedRef:
+		r.setInferencePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonInferencePoolReady,
+			fmt.Sprintf("%d shared InferencePool reference(s) configured", len(cluster.Spec.Inference.SharedPools)))
+	case antflyv1.AntflyInferenceModePlatformShared:
+		r.setInferencePoolReadyCondition(cluster, metav1.ConditionTrue, antflyv1.ReasonInferencePoolReady,
+			fmt.Sprintf("%d platform InferencePool reference(s) configured", len(cluster.Spec.Inference.PlatformPools)))
 	}
 	return nil
 }
 
-func antflyTermiteMode(spec *antflyv1.AntflyTermiteSpec) antflyv1.AntflyTermiteMode {
+func antflyInferenceMode(spec *antflyv1.AntflyInferenceSpec) antflyv1.AntflyInferenceMode {
 	if spec == nil {
-		return antflyv1.AntflyTermiteModeDisabled
+		return antflyv1.AntflyInferenceModeDisabled
 	}
 	if spec.Mode != "" {
 		return spec.Mode
 	}
 	if len(spec.SharedPools) > 0 {
-		return antflyv1.AntflyTermiteModeSharedRef
+		return antflyv1.AntflyInferenceModeSharedRef
 	}
 	if len(spec.PlatformPools) > 0 {
-		return antflyv1.AntflyTermiteModePlatformShared
+		return antflyv1.AntflyInferenceModePlatformShared
 	}
-	return antflyv1.AntflyTermiteModeManaged
+	return antflyv1.AntflyInferenceModeManaged
 }
 
-func managedTermitePoolName(cluster *antflyv1.AntflyCluster, managed antflyv1.ManagedTermitePoolSpec, total, index int) string {
+func managedInferencePoolName(cluster *antflyv1.AntflyCluster, managed antflyv1.ManagedInferencePoolSpec, total, index int) string {
 	if managed.Name != "" {
 		return managed.Name
 	}
 	if total == 1 {
-		return cluster.Name + "-termite"
+		return cluster.Name + "-inference"
 	}
-	return fmt.Sprintf("%s-termite-%d", cluster.Name, index)
+	return fmt.Sprintf("%s-inference-%d", cluster.Name, index)
 }
 
-func (r *AntflyClusterReconciler) reconcileManagedTermitePool(
+func (r *AntflyClusterReconciler) reconcileManagedInferencePool(
 	ctx context.Context,
 	cluster *antflyv1.AntflyCluster,
-	managed antflyv1.ManagedTermitePoolSpec,
+	managed antflyv1.ManagedInferencePoolSpec,
 	name string,
 ) error {
 	key := types.NamespacedName{Name: name, Namespace: cluster.Namespace}
-	pool := &termitev1alpha1.TermitePool{
+	pool := &inferencev1alpha1.InferencePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: cluster.Namespace,
@@ -1485,7 +1485,7 @@ func (r *AntflyClusterReconciler) reconcileManagedTermitePool(
 
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, pool, func() error {
 		if pool.UID != "" && !metav1.IsControlledBy(pool, cluster) {
-			return &termitePoolNameConflictError{
+			return &inferencePoolNameConflictError{
 				namespacedName: key.String(),
 				cluster:        types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}.String(),
 			}
@@ -1494,51 +1494,51 @@ func (r *AntflyClusterReconciler) reconcileManagedTermitePool(
 		if pool.Labels == nil {
 			pool.Labels = map[string]string{}
 		}
-		pool.Labels["app.kubernetes.io/name"] = "termite"
-		pool.Labels["app.kubernetes.io/component"] = "termitepool"
+		pool.Labels["app.kubernetes.io/name"] = "inference"
+		pool.Labels["app.kubernetes.io/component"] = "inferencepool"
 		pool.Labels["app.kubernetes.io/instance"] = cluster.Name
 		pool.Labels["app.kubernetes.io/managed-by"] = "antfly-operator"
 
-		// AntflyCluster.spec.termite.managedPools is authoritative for managed pools.
-		// Do not add TermitePool mutating-webhook defaults for spec fields
+		// AntflyCluster.spec.inference.managedPools is authoritative for managed pools.
+		// Do not add InferencePool mutating-webhook defaults for spec fields
 		// unless the same defaults are applied before this assignment.
 		pool.Spec = *managed.Spec.DeepCopy()
 		if pool.Spec.Image == "" {
-			pool.Spec.Image = r.DefaultTermiteImage
+			pool.Spec.Image = r.DefaultInferenceImage
 		}
 		if err := controllerutil.SetControllerReference(cluster, pool, r.Scheme); err != nil {
-			return fmt.Errorf("failed to set owner reference on TermitePool %s: %w", name, err)
+			return fmt.Errorf("failed to set owner reference on InferencePool %s: %w", name, err)
 		}
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("failed to reconcile managed TermitePool %s: %w", name, err)
+		return fmt.Errorf("failed to reconcile managed InferencePool %s: %w", name, err)
 	}
 	return nil
 }
 
-func (r *AntflyClusterReconciler) deleteStaleOwnedTermitePools(ctx context.Context, cluster *antflyv1.AntflyCluster, desired map[string]struct{}) error {
-	defaultName := cluster.Name + "-termite"
+func (r *AntflyClusterReconciler) deleteStaleOwnedInferencePools(ctx context.Context, cluster *antflyv1.AntflyCluster, desired map[string]struct{}) error {
+	defaultName := cluster.Name + "-inference"
 	if _, ok := desired[defaultName]; !ok {
-		pool := &termitev1alpha1.TermitePool{}
+		pool := &inferencev1alpha1.InferencePool{}
 		key := types.NamespacedName{Name: defaultName, Namespace: cluster.Namespace}
 		if err := r.Get(ctx, key, pool); err != nil {
 			if !errors.IsNotFound(err) {
-				return fmt.Errorf("failed to get managed TermitePool %s: %w", key.String(), err)
+				return fmt.Errorf("failed to get managed InferencePool %s: %w", key.String(), err)
 			}
 		} else if metav1.IsControlledBy(pool, cluster) {
 			if err := client.IgnoreNotFound(r.Delete(ctx, pool)); err != nil {
-				return fmt.Errorf("failed to delete stale managed TermitePool %s: %w", key.String(), err)
+				return fmt.Errorf("failed to delete stale managed InferencePool %s: %w", key.String(), err)
 			}
 		}
 	}
 
-	var pools termitev1alpha1.TermitePoolList
+	var pools inferencev1alpha1.InferencePoolList
 	if err := r.List(ctx, &pools, client.InNamespace(cluster.Namespace), client.MatchingLabels{
 		"app.kubernetes.io/instance":   cluster.Name,
 		"app.kubernetes.io/managed-by": "antfly-operator",
 	}); err != nil {
-		return fmt.Errorf("failed to list managed TermitePools for %s/%s: %w", cluster.Namespace, cluster.Name, err)
+		return fmt.Errorf("failed to list managed InferencePools for %s/%s: %w", cluster.Namespace, cluster.Name, err)
 	}
 	for i := range pools.Items {
 		pool := &pools.Items[i]
@@ -1549,24 +1549,24 @@ func (r *AntflyClusterReconciler) deleteStaleOwnedTermitePools(ctx context.Conte
 			continue
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, pool)); err != nil {
-			return fmt.Errorf("failed to delete stale managed TermitePool %s/%s: %w", pool.Namespace, pool.Name, err)
+			return fmt.Errorf("failed to delete stale managed InferencePool %s/%s: %w", pool.Namespace, pool.Name, err)
 		}
 	}
 	return nil
 }
 
-type termitePoolNameConflictError struct {
+type inferencePoolNameConflictError struct {
 	namespacedName string
 	cluster        string
 }
 
-func (e *termitePoolNameConflictError) Error() string {
-	return fmt.Sprintf("TermitePool %s already exists and is not controlled by AntflyCluster %s", e.namespacedName, e.cluster)
+func (e *inferencePoolNameConflictError) Error() string {
+	return fmt.Sprintf("InferencePool %s already exists and is not controlled by AntflyCluster %s", e.namespacedName, e.cluster)
 }
 
-func (r *AntflyClusterReconciler) setTermitePoolReadyCondition(cluster *antflyv1.AntflyCluster, status metav1.ConditionStatus, reason, message string) {
+func (r *AntflyClusterReconciler) setInferencePoolReadyCondition(cluster *antflyv1.AntflyCluster, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
-		Type:               antflyv1.TypeTermitePoolReady,
+		Type:               antflyv1.TypeInferencePoolReady,
 		Status:             status,
 		Reason:             reason,
 		Message:            message,
@@ -1723,10 +1723,10 @@ func (r *AntflyClusterReconciler) generateSwarmConfig(cluster *antflyv1.AntflyCl
 	if swarm == nil {
 		return "", fmt.Errorf("spec.swarm is required when spec.mode=Swarm")
 	}
-	termiteEnabled := swarm.Termite == nil || swarm.Termite.Enabled
-	termiteAPIURL := "http://0.0.0.0:11433"
-	if swarm.Termite != nil && swarm.Termite.APIURL != "" {
-		termiteAPIURL = swarm.Termite.APIURL
+	inferenceEnabled := swarm.Inference == nil || swarm.Inference.Enabled
+	inferenceAPIURL := "http://0.0.0.0:11433"
+	if swarm.Inference != nil && swarm.Inference.APIURL != "" {
+		inferenceAPIURL = swarm.Inference.APIURL
 	}
 
 	// Parse user-provided configuration
@@ -1766,13 +1766,13 @@ func (r *AntflyClusterReconciler) generateSwarmConfig(cluster *antflyv1.AntflyCl
 	completeConfig["disable_shard_alloc"] = true
 	completeConfig["swarm_mode"] = true
 
-	if termiteEnabled {
-		termiteConfig := map[string]any{}
-		if userTermite, ok := userConfig["termite"].(map[string]any); ok {
-			maps.Copy(termiteConfig, userTermite)
+	if inferenceEnabled {
+		inferenceConfig := map[string]any{}
+		if userInference, ok := userConfig["inference"].(map[string]any); ok {
+			maps.Copy(inferenceConfig, userInference)
 		}
-		termiteConfig["api_url"] = termiteAPIURL
-		completeConfig["termite"] = termiteConfig
+		inferenceConfig["api_url"] = inferenceAPIURL
+		completeConfig["inference"] = inferenceConfig
 	}
 
 	storageConfig := map[string]any{
@@ -2980,11 +2980,11 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			cluster.Status.SwarmStatus = &antflyv1.SwarmStatus{}
 		}
 		oldStatus := *cluster.Status.SwarmStatus
-		termiteEnabled := swarm.Termite == nil || swarm.Termite.Enabled
+		inferenceEnabled := swarm.Inference == nil || swarm.Inference.Enabled
 		cluster.Status.SwarmStatus.Ready = readyReplicas >= swarm.Replicas && swarm.Replicas > 0
 		cluster.Status.SwarmStatus.MetadataReady = cluster.Status.SwarmStatus.Ready
 		cluster.Status.SwarmStatus.StoreReady = cluster.Status.SwarmStatus.Ready
-		cluster.Status.SwarmStatus.TermiteReady = !termiteEnabled || cluster.Status.SwarmStatus.Ready
+		cluster.Status.SwarmStatus.InferenceReady = !inferenceEnabled || cluster.Status.SwarmStatus.Ready
 		cluster.Status.SwarmStatus.NodeID = swarm.NodeID
 
 		if completeConfig, err := r.generateSwarmConfig(cluster); err == nil {
@@ -3009,14 +3009,14 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			cluster.Status.SwarmStatus.Ready = false
 			cluster.Status.SwarmStatus.MetadataReady = false
 			cluster.Status.SwarmStatus.StoreReady = false
-			cluster.Status.SwarmStatus.TermiteReady = !termiteEnabled
+			cluster.Status.SwarmStatus.InferenceReady = !inferenceEnabled
 		}
 
 		if oldStatus.LastTransitionTime == nil ||
 			cluster.Status.SwarmStatus.Ready != oldStatus.Ready ||
 			cluster.Status.SwarmStatus.MetadataReady != oldStatus.MetadataReady ||
 			cluster.Status.SwarmStatus.StoreReady != oldStatus.StoreReady ||
-			cluster.Status.SwarmStatus.TermiteReady != oldStatus.TermiteReady ||
+			cluster.Status.SwarmStatus.InferenceReady != oldStatus.InferenceReady ||
 			cluster.Status.SwarmStatus.PodName != oldStatus.PodName ||
 			cluster.Status.SwarmStatus.PodIP != oldStatus.PodIP ||
 			cluster.Status.SwarmStatus.NodeID != oldStatus.NodeID ||
@@ -3029,15 +3029,15 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		r.setComponentCondition(cluster, antflyv1.TypeSwarmReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm")
 		r.setComponentCondition(cluster, antflyv1.TypeMetadataReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm metadata")
 		r.setComponentCondition(cluster, antflyv1.TypeDataReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm store")
-		if termiteEnabled {
-			r.setComponentCondition(cluster, antflyv1.TypeTermiteReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm termite")
+		if inferenceEnabled {
+			r.setComponentCondition(cluster, antflyv1.TypeInferenceReady, readyReplicas, swarm.Replicas, swarmFindings, "swarm inference")
 		} else {
 			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
-				Type:               antflyv1.TypeTermiteReady,
+				Type:               antflyv1.TypeInferenceReady,
 				Status:             metav1.ConditionTrue,
 				ObservedGeneration: cluster.Generation,
 				Reason:             antflyv1.ReasonComponentReady,
-				Message:            "Termite is disabled",
+				Message:            "Inference is disabled",
 			})
 		}
 		r.setAvailableCondition(cluster, swarmFindings, readyReplicas >= swarm.Replicas && swarm.Replicas > 0)
@@ -3384,7 +3384,7 @@ func (r *AntflyClusterReconciler) recordClusterRuntimeFailureEvents(cluster *ant
 		if condition.Type != antflyv1.TypeMetadataReady &&
 			condition.Type != antflyv1.TypeDataReady &&
 			condition.Type != antflyv1.TypeSwarmReady &&
-			condition.Type != antflyv1.TypeTermiteReady &&
+			condition.Type != antflyv1.TypeInferenceReady &&
 			condition.Type != antflyv1.TypeAvailable {
 			continue
 		}
@@ -3411,8 +3411,8 @@ func (r *AntflyClusterReconciler) updateProductTierStatus(cluster *antflyv1.Antf
 		SwarmTier:          tier.SwarmTier,
 		MetadataTier:       tier.MetadataTier,
 		DataTier:           tier.DataTier,
-		TermiteTier:        tier.TermiteTier,
-		TermiteEnabled:     cluster.Spec.Termite != nil && antflyTermiteMode(cluster.Spec.Termite) != antflyv1.AntflyTermiteModeDisabled,
+		InferenceTier:      tier.InferenceTier,
+		InferenceEnabled:   cluster.Spec.Inference != nil && antflyInferenceMode(cluster.Spec.Inference) != antflyv1.AntflyInferenceModeDisabled,
 		ObservedGeneration: cluster.Generation,
 	}
 
@@ -3439,16 +3439,16 @@ func (r *AntflyClusterReconciler) updateProductTierStatus(cluster *antflyv1.Antf
 		}
 	}
 
-	if cluster.Spec.Termite != nil {
-		switch antflyTermiteMode(cluster.Spec.Termite) {
-		case antflyv1.AntflyTermiteModeManaged:
-			status.TermiteReplicas = fmt.Sprintf("managed=%d", len(cluster.Spec.Termite.ManagedPools))
-		case antflyv1.AntflyTermiteModeSharedRef:
-			status.TermiteReplicas = fmt.Sprintf("shared=%d", len(cluster.Spec.Termite.SharedPools))
-		case antflyv1.AntflyTermiteModePlatformShared:
-			status.TermiteReplicas = fmt.Sprintf("platform=%d", len(cluster.Spec.Termite.PlatformPools))
+	if cluster.Spec.Inference != nil {
+		switch antflyInferenceMode(cluster.Spec.Inference) {
+		case antflyv1.AntflyInferenceModeManaged:
+			status.InferenceReplicas = fmt.Sprintf("managed=%d", len(cluster.Spec.Inference.ManagedPools))
+		case antflyv1.AntflyInferenceModeSharedRef:
+			status.InferenceReplicas = fmt.Sprintf("shared=%d", len(cluster.Spec.Inference.SharedPools))
+		case antflyv1.AntflyInferenceModePlatformShared:
+			status.InferenceReplicas = fmt.Sprintf("platform=%d", len(cluster.Spec.Inference.PlatformPools))
 		default:
-			status.TermiteReplicas = "disabled"
+			status.InferenceReplicas = "disabled"
 		}
 	}
 
@@ -4265,8 +4265,8 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPod))
-	if r.ManageTermitePools {
-		builder = builder.Owns(&termitev1alpha1.TermitePool{})
+	if r.ManageInferencePools {
+		builder = builder.Owns(&inferencev1alpha1.InferencePool{})
 	}
 	return builder.Complete(r)
 }

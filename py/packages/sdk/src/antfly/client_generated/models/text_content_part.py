@@ -13,7 +13,7 @@ T = TypeVar("T", bound="TextContentPart")
 
 @_attrs_define
 class TextContentPart:
-    """Text content part.
+    """Text content for multimodal input.
 
     Attributes:
         type_ (TextContentPartType):

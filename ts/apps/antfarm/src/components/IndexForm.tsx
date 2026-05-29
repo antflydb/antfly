@@ -36,7 +36,6 @@ interface ModelsResponse {
 
 const staticModelSuggestions: Record<EmbedderProvider, string[]> = {
   antfly: ["all-MiniLM-L6-v2"],
-  termite: [], // Populated dynamically from Termite service
   ollama: ["all-minilm", "nomic-embed-text", "embeddinggemma"],
   gemini: ["embeddinggemma", "gemini-embedding-001"],
   vertex: ["text-embedding-004", "text-multilingual-embedding-002"],
@@ -59,38 +58,38 @@ interface IndexFormProps {
 
 const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = [] }) => {
   const { control, watch } = useFormContext();
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const prefix = fieldPrefix ? `${fieldPrefix}.` : "";
 
-  // Termite model detection
-  const [termiteEmbedders, setTermiteEmbedders] = useState<string[]>([]);
-  const [termiteModelsLoading, setTermiteModelsLoading] = useState(false);
+  // Antfly inference model detection
+  const [inferenceEmbedders, setInferenceEmbedders] = useState<string[]>([]);
+  const [inferenceModelsLoading, setInferenceModelsLoading] = useState(false);
 
   useEffect(() => {
-    const fetchTermiteModels = async () => {
-      setTermiteModelsLoading(true);
+    const fetchInferenceModels = async () => {
+      setInferenceModelsLoading(true);
       try {
-        const response = await fetch(`${termiteApiUrl}/ml/v1/models`);
+        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`);
         if (response.ok) {
           const data: ModelsResponse = await response.json();
-          setTermiteEmbedders(Object.keys(data.embedders || {}));
+          setInferenceEmbedders(Object.keys(data.embedders || {}));
         }
       } catch {
-        // Termite might not be running - this is fine
-        console.debug("Termite not available for model detection");
+        // Antfly inference might not be running - this is fine.
+        console.debug("Antfly inference not available for model detection");
       } finally {
-        setTermiteModelsLoading(false);
+        setInferenceModelsLoading(false);
       }
     };
-    fetchTermiteModels();
-  }, [termiteApiUrl]);
+    fetchInferenceModels();
+  }, [inferenceApiUrl]);
 
   const modelSuggestions = useMemo(
     () => ({
       ...staticModelSuggestions,
-      termite: termiteEmbedders,
+      antfly: inferenceEmbedders.length > 0 ? inferenceEmbedders : staticModelSuggestions.antfly,
     }),
-    [termiteEmbedders]
+    [inferenceEmbedders]
   );
 
   const sourceType = watch(`${prefix}sourceType`, "field");
@@ -235,14 +234,16 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
                 allowCustomValue={true}
               />
             </FormControl>
-            {provider === "termite" && termiteModelsLoading && (
-              <p className="text-xs text-muted-foreground">Loading models from Termite...</p>
-            )}
-            {provider === "termite" && !termiteModelsLoading && (
+            {provider === "antfly" && inferenceModelsLoading && (
               <p className="text-xs text-muted-foreground">
-                {termiteEmbedders.length > 0
-                  ? "Select a model or enter a custom name for Termite to pull."
-                  : "Enter a model name (e.g., sentence-transformers/all-MiniLM-L6-v2) for Termite to pull."}
+                Loading models from Antfly inference...
+              </p>
+            )}
+            {provider === "antfly" && !inferenceModelsLoading && (
+              <p className="text-xs text-muted-foreground">
+                {inferenceEmbedders.length > 0
+                  ? "Select a model or enter a custom name for Antfly inference to pull."
+                  : "Enter a model name (e.g., sentence-transformers/all-MiniLM-L6-v2) for Antfly inference to pull."}
               </p>
             )}
             <FormMessage />

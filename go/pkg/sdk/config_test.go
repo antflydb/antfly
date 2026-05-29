@@ -4,7 +4,7 @@ import "testing"
 
 func TestNewEmbedderConfigSupportsAntfly(t *testing.T) {
 	cfg, err := NewEmbedderConfig(AntflyEmbedderConfig{
-		"model": "antflydb/clipclap",
+		Model: "antflydb/clipclap",
 	})
 	if err != nil {
 		t.Fatalf("NewEmbedderConfig failed: %v", err)
@@ -17,7 +17,7 @@ func TestNewEmbedderConfigSupportsAntfly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AsAntflyEmbedderConfig failed: %v", err)
 	}
-	if embedder["model"] != "antflydb/clipclap" {
-		t.Fatalf("model = %q, want %q", embedder["model"], "antflydb/clipclap")
+	if embedder.Model != "antflydb/clipclap" {
+		t.Fatalf("model = %q, want %q", embedder.Model, "antflydb/clipclap")
 	}
 }

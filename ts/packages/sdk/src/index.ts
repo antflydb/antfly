@@ -58,44 +58,42 @@ export {
   term,
 } from "./query-helpers.js";
 export { Client, type SDKConfig } from "./sdk.js";
-export { TermiteClient } from "./termite-client.js";
-export { deserializeEmbeddings, serializeEmbeddings } from "./termite-codec.js";
+export { InferenceClient } from "./inference-client.js";
+export { deserializeEmbeddings, serializeEmbeddings } from "./inference-codec.js";
 export type {
   Chunk,
   ChunkConfig,
   ChunkRequest,
   ChunkResponse,
-  Config as TermiteRuntimeConfig,
+  Config as InferenceRuntimeConfig,
   ContentPart,
   ContentSecurityConfig,
   Credentials,
   EmbedInput,
   EmbedRequest,
   EmbedResponse,
-  ExtractFieldValue,
+  ExtractClassification,
+  ExtractEntity,
+  ExtractRelation,
   ExtractRequest,
   ExtractResponse,
   ImageURL,
   ImageURLContentPart,
   Level,
   ModelsResponse,
-  RecognizeEntity,
-  RecognizeRequest,
-  RecognizeResponse,
   RequestOptions,
   RerankRequest,
   RerankResponse,
   RewriteRequest,
   RewriteResponse,
   Style,
-  TermiteConfig,
-  TermiteError,
+  InferenceConfig,
+  InferenceError,
   TextContentPart,
   TranscribeRequest,
   TranscribeResponse,
-  VersionResponse,
-} from "./termite-types.js";
-export { logLevels, logStyles } from "./termite-types.js";
+} from "./inference-types.js";
+export { logLevels, logStyles } from "./inference-types.js";
 // Type exports
 export type {
   // Chat Agent types

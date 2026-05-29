@@ -408,7 +408,7 @@ test "provider registry parses named generators rerankers and chains" {
     const raw =
         \\{
         \\  "generators": {
-        \\    "primary": { "provider": "termite", "model": "m1", "api_url": "http://localhost:8082" },
+        \\    "primary": { "provider": "antfly", "model": "m1", "api_url": "http://localhost:8082" },
         \\    "fallback": { "provider": "ollama", "model": "llama3", "url": "http://localhost:11434" }
         \\  },
         \\  "chains": {
@@ -418,7 +418,7 @@ test "provider registry parses named generators rerankers and chains" {
         \\    ]
         \\  },
         \\  "rerankers": {
-        \\    "cross-encoder": { "provider": "termite", "model": "rerank", "field": "body", "url": "http://localhost:8082" }
+        \\    "cross-encoder": { "provider": "antfly", "model": "rerank", "field": "body", "url": "http://localhost:8082" }
         \\  }
         \\}
     ;
@@ -431,7 +431,7 @@ test "provider registry parses named generators rerankers and chains" {
     try std.testing.expectEqualStrings("cross-encoder", registry.defaultRerankerName().?);
 
     const generator_cfg = try registry.getGeneratorConfig(null);
-    try std.testing.expectEqual(.termite, generator_cfg.provider);
+    try std.testing.expectEqual(.antfly, generator_cfg.provider);
 
     const chain = try registry.getChain(null);
     try std.testing.expectEqual(@as(usize, 2), chain.len);
@@ -439,7 +439,7 @@ test "provider registry parses named generators rerankers and chains" {
     try std.testing.expect(chain[1].generator_config != null);
 
     const reranker_cfg = try registry.getRerankerConfig(null);
-    try std.testing.expectEqual(.termite, reranker_cfg.provider);
+    try std.testing.expectEqual(.antfly, reranker_cfg.provider);
     try std.testing.expectEqualStrings("body", reranker_cfg.field);
 }
 
@@ -473,7 +473,7 @@ test "provider registry parses named chunkers and tracks default" {
         \\{
         \\  "chunkers": {
         \\    "fixed": {
-        \\      "provider": "termite",
+        \\      "provider": "antfly",
         \\      "api_url": "http://localhost:8082",
         \\      "model": "fixed",
         \\      "text": { "target_tokens": 256, "overlap_tokens": 32 }
@@ -487,7 +487,7 @@ test "provider registry parses named chunkers and tracks default" {
 
     try std.testing.expectEqualStrings("fixed", registry.defaultChunkerName().?);
     const cfg = try registry.getChunkerConfig(null);
-    try std.testing.expectEqual(.termite, cfg.provider);
+    try std.testing.expectEqual(.antfly, cfg.provider);
     try std.testing.expectEqual(@as(u32, 256), cfg.text.target_tokens);
 }
 

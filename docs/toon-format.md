@@ -39,7 +39,7 @@ All RAG queries now automatically render documents using TOON format. No configu
 
 ```bash
 # RAG query will use TOON format by default
-curl -X POST http://localhost:8080/api/v1/rag \
+curl -X POST http://localhost:8080/db/v1/rag \
   -H "Content-Type: application/json" \
   -d '{
     "queries": [{

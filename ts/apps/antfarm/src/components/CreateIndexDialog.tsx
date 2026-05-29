@@ -38,7 +38,6 @@ const indexFormSchema = z.object({
   embedder: z.object({
     provider: z.enum([
       "antfly",
-      "termite",
       "ollama",
       "gemini",
       "vertex",
@@ -57,7 +56,7 @@ const indexFormSchema = z.object({
   }),
   chunker: z
     .object({
-      provider: z.enum(["termite", "mock", "antfly"]),
+      provider: z.enum(["antfly", "mock"]),
       strategy: z.enum(["hugot", "fixed"]),
       api_url: z.string().optional(),
       target_tokens: z.number().optional(),
@@ -131,9 +130,6 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
         let embedderConfig: EmbedderConfig;
         const { provider, model, api_key, url, region } = data.embedder;
         switch (provider) {
-          case "termite":
-            embedderConfig = { provider: "termite", model };
-            break;
           case "ollama":
             embedderConfig = { provider: "ollama", model, url };
             break;

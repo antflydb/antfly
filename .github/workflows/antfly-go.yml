@@ -39,7 +39,7 @@ jobs:
     # Runs on heavy because the standard runner's 10Gi ephemeral cap was
     # being exhausted by go build + module cache + workspace + Pebble dbs
     # written during "Test swarm startup", leading to silent SIGTERM.
-    # Heavy provides /mnt/cache (50Gi PVC) for GOCACHE/GOMODCACHE. Termite
+    # Heavy provides /mnt/cache (50Gi PVC) for GOCACHE/GOMODCACHE. Inference
     # omni also runs here so regular Go CI and omni consume one heavy runner
     # slot instead of two.
     runs-on: arc-antfly-heavy
@@ -171,21 +171,20 @@ jobs:
           done < <(cd go/pkg/antfly && GOWORK=off go list ./...)
           (cd go/pkg/antfly && GOWORK=off go test -v "${packages[@]}")
 
-      - name: Build termite (pure Go)
+      - name: Test SDK (pure Go)
         env:
           CGO_ENABLED: "0"
-        run: |
-          for mod in go/pkg/termite go/pkg/sdk; do
-            (cd $mod && GOWORK=off go build -v ./...)
-          done
+        run: cd go/pkg/sdk && GOWORK=off go test -v ./...
 
-      - name: Test termite (pure Go)
+      - name: Build Go inference runtime (pure Go)
         env:
           CGO_ENABLED: "0"
-        run: |
-          for mod in go/pkg/termite go/pkg/sdk; do
-            (cd $mod && GOWORK=off go test -v ./...)
-          done
+        run: cd go/pkg/termite && GOWORK=off go build -v ./...
+
+      - name: Test Go inference runtime (pure Go)
+        env:
+          CGO_ENABLED: "0"
+        run: cd go/pkg/termite && GOWORK=off go test -v ./...
 
       - name: Download libtokenizers
         run: |
@@ -227,15 +226,12 @@ jobs:
             echo "GOMLX_BACKEND=xla:cpu"
           } >> "$GITHUB_ENV"
 
-      - name: Download termite dependencies
-        run: cd go/pkg/termite && GOWORK=off go mod download
-
-      - name: Build termite (omni)
+      - name: Build Go inference runtime (omni)
         env:
           CGO_ENABLED: "1"
         run: cd go/pkg/termite && GOWORK=off go build -v -tags="onnx,ORT,xla,XLA" ./...
 
-      - name: Test termite (omni)
+      - name: Test Go inference runtime (omni)
         env:
           CGO_ENABLED: "1"
         run: cd go/pkg/termite && GOWORK=off go test -v -tags="onnx,ORT,xla,XLA" ./...
@@ -293,29 +289,30 @@ jobs:
     runs-on: arc-antfly-heavy
     needs: unit
     # The heavy profile mounts a 50Gi ephemeral PVC at /mnt/cache so large
-    # caches (Go build/module cache, HuggingFace downloads, Termite models)
+    # caches (Go build/module cache, HuggingFace downloads, inference models)
     # live outside the pod's 10Gi Autopilot ephemeral-storage allotment.
     env:
       GOCACHE: /mnt/cache/go-build
       GOMODCACHE: /mnt/cache/go-mod
       HF_HOME: /mnt/cache/huggingface
-      TERMITE_HOME: /mnt/cache/termite-home
+      ANTFLY_INFERENCE_HOME: /mnt/cache/antfly-inference-home
     steps:
       - name: Prepare cache directories
         run: |
           set -eux
-          mkdir -p "$GOCACHE" "$GOMODCACHE" "$HF_HOME" "$TERMITE_HOME"
+          mkdir -p "$GOCACHE" "$GOMODCACHE" "$HF_HOME" "$ANTFLY_INFERENCE_HOME"
           # HuggingFace downloader falls back to $HOME/.cache/huggingface;
           # symlink $HOME/.cache to the cache volume to keep the ~5Gi ONNX
           # downloads off the runner's 10Gi root ephemeral disk.
           mkdir -p /mnt/cache/home-cache
           rm -rf "$HOME/.cache"
           ln -sfn /mnt/cache/home-cache "$HOME/.cache"
-          # Termite copies final models into $HOME/.termite/models by
-          # default; redirect the whole $HOME/.termite onto the cache volume
+          # Antfly inference copies final models into $HOME/.antfly/inference/models by
+          # default; redirect that path onto the cache volume
           # so the copied payload lands there too.
-          rm -rf "$HOME/.termite"
-          ln -sfn "$TERMITE_HOME" "$HOME/.termite"
+          mkdir -p "$HOME/.antfly"
+          rm -rf "$HOME/.antfly/inference"
+          ln -sfn "$ANTFLY_INFERENCE_HOME" "$HOME/.antfly/inference"
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential

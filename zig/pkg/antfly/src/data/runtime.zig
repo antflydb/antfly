@@ -67,6 +67,7 @@ const CliConfig = struct {
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
+    snapshot_root_dir: ?[]const u8 = null,
     secret_store_path: ?[]const u8 = null,
     help: bool = false,
 
@@ -79,11 +80,13 @@ const CliConfig = struct {
 const ResolvedPaths = struct {
     replica_root_dir: []u8,
     replica_catalog_path: []u8,
+    snapshot_root_dir: []u8,
     auth_store_root_dir: []u8,
 
     fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
+        alloc.free(self.snapshot_root_dir);
         alloc.free(self.auth_store_root_dir);
     }
 };
@@ -239,7 +242,7 @@ const RaftTableApplyStateMachine = struct {
         self.write_cache.hbc_cache = &storage.hbc_cache;
         self.write_cache.resource_manager = &storage.resource_manager;
         self.write_cache.backend_runtime = storage.backend_runtime;
-        self.write_cache.local_termite_provider = self.write_source.local_termite_provider;
+        self.write_cache.antfly_provider = self.write_source.antfly_provider;
         self.write_cache.secret_store = self.write_source.secret_store;
         self.write_cache.remote_content = self.write_source.remote_content;
         self.write_source.read_cache = &storage.read_cache;
@@ -1101,6 +1104,7 @@ pub const DataServerConfig = struct {
     data_raft_state_backend: antfly.raft.ReplicaStateBackend = .wal,
     replica_root_dir: []const u8,
     replica_catalog_path: ?[]const u8 = null,
+    snapshot_root_dir: ?[]const u8 = null,
     store_registration: ?StoreRegistrationConfig = null,
     group_leadership_source: ?GroupLeadershipSource = null,
     group_membership_source: ?GroupMembershipSource = null,
@@ -1634,20 +1638,20 @@ pub const DataServer = struct {
             self.read_source.source(),
             self.write_source.source(),
         );
-        self.http_server.?.local_termite_provider = self.read_source.local_termite_provider;
+        self.http_server.?.antfly_provider = self.read_source.antfly_provider;
     }
 
-    pub fn setLocalTermiteProvider(
+    pub fn setAntflyProvider(
         self: *DataServer,
-        provider: ?antfly.inference.managed_embedder.LocalTermiteProvider,
+        provider: ?antfly.inference.managed_embedder.AntflyProvider,
     ) void {
-        _ = self.read_source.withLocalTermiteProvider(provider);
-        _ = self.write_source.withLocalTermiteProvider(provider);
+        _ = self.read_source.withAntflyProvider(provider);
+        _ = self.write_source.withAntflyProvider(provider);
         if (self.data_raft_apply) |apply_sm| {
-            _ = apply_sm.write_source.withLocalTermiteProvider(provider);
-            apply_sm.write_cache.local_termite_provider = provider;
+            _ = apply_sm.write_source.withAntflyProvider(provider);
+            apply_sm.write_cache.antfly_provider = provider;
         }
-        if (self.http_server) |*server| server.local_termite_provider = provider;
+        if (self.http_server) |*server| server.antfly_provider = provider;
     }
 
     pub fn start(self: *DataServer) !void {
@@ -5229,7 +5233,7 @@ pub const DataServer = struct {
                         },
                         .transport = .{
                             .snapshot = .{
-                                .root_dir = cfg.replica_root_dir,
+                                .root_dir = cfg.snapshot_root_dir orelse cfg.replica_root_dir,
                             },
                         },
                     },
@@ -7006,6 +7010,7 @@ pub fn runFromIterator(
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
     defer setup_io.deinit();
     try ensureDirAndParent(setup_io.io(), resolved.replica_root_dir, resolved.replica_catalog_path);
+    try fs_paths.createDirPathPortable(setup_io.io(), resolved.snapshot_root_dir);
     try fs_paths.createDirPathPortable(setup_io.io(), resolved.auth_store_root_dir);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
@@ -7048,6 +7053,8 @@ pub fn runFromIterator(
         .raft_bind_host = cli.raft_bind_host orelse "127.0.0.1",
         .raft_bind_port = cli.raft_bind_port orelse 0,
         .replica_root_dir = resolved.replica_root_dir,
+        .replica_catalog_path = resolved.replica_catalog_path,
+        .snapshot_root_dir = resolved.snapshot_root_dir,
         .store_registration = if (cli.node_id != null and cli.store_id != null) .{
             .node_id = cli.node_id.?,
             .store_id = cli.store_id.?,
@@ -7187,6 +7194,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.replica_catalog_path = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--snapshot-root-dir")) {
+            cfg.snapshot_root_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--secret-store-path")) {
             cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
             continue;
@@ -7212,6 +7223,8 @@ fn resolvePaths(
 ) !ResolvedPaths {
     const local_base = try resolveLocalBaseDir(alloc, cli, cfg);
     defer alloc.free(local_base);
+    const metadata_base = try std.fmt.allocPrint(alloc, "{s}/metadata", .{local_base});
+    defer alloc.free(metadata_base);
 
     if (cli.replica_root_dir != null and cli.replica_catalog_path != null) {
         const base = try std.fmt.allocPrint(alloc, "{s}/data", .{local_base});
@@ -7220,14 +7233,24 @@ fn resolvePaths(
         errdefer alloc.free(replica_root_dir);
         const replica_catalog_path = try normalizeResolvedPathAlloc(alloc, cli.replica_catalog_path.?);
         errdefer alloc.free(replica_catalog_path);
-        const auth_store_root_dir = blk: {
-            const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{base});
+        const snapshot_root_dir = if (cli.snapshot_root_dir) |path|
+            try normalizeResolvedPathAlloc(alloc, path)
+        else blk: {
+            const raw = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{base});
             defer alloc.free(raw);
             break :blk try normalizeResolvedPathAlloc(alloc, raw);
         };
+        errdefer alloc.free(snapshot_root_dir);
+        const auth_store_root_dir = blk: {
+            const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{metadata_base});
+            defer alloc.free(raw);
+            break :blk try normalizeResolvedPathAlloc(alloc, raw);
+        };
+        errdefer alloc.free(auth_store_root_dir);
         return .{
             .replica_root_dir = replica_root_dir,
             .replica_catalog_path = replica_catalog_path,
+            .snapshot_root_dir = snapshot_root_dir,
             .auth_store_root_dir = auth_store_root_dir,
         };
     }
@@ -7250,14 +7273,24 @@ fn resolvePaths(
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(replica_catalog_path);
-    const auth_store_root_dir = blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{base});
+    const snapshot_root_dir = if (cli.snapshot_root_dir) |path|
+        try normalizeResolvedPathAlloc(alloc, path)
+    else blk: {
+        const raw = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
+    errdefer alloc.free(snapshot_root_dir);
+    const auth_store_root_dir = blk: {
+        const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{metadata_base});
+        defer alloc.free(raw);
+        break :blk try normalizeResolvedPathAlloc(alloc, raw);
+    };
+    errdefer alloc.free(auth_store_root_dir);
     return .{
         .replica_root_dir = replica_root_dir,
         .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = snapshot_root_dir,
         .auth_store_root_dir = auth_store_root_dir,
     };
 }
@@ -7359,6 +7392,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --data-dir <path>              Local storage root for data node data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
+        \\  --snapshot-root-dir <path>     Data raft snapshot root directory
         \\  --secret-store-path <path>     Antfly secrets.json file path
         \\  -h, --help                     Show this help
         \\
@@ -7480,7 +7514,8 @@ test "data runtime resolves paths from common storage base dir" {
     defer resolved.deinit(alloc);
     try std.testing.expectEqualStrings("/tmp/antflydb/data/replicas", resolved.replica_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/data/catalog.txt", resolved.replica_catalog_path);
-    try std.testing.expectEqualStrings("/tmp/antflydb/data/auth", resolved.auth_store_root_dir);
+    try std.testing.expectEqualStrings("/tmp/antflydb/data/snapshots", resolved.snapshot_root_dir);
+    try std.testing.expectEqualStrings("/tmp/antflydb/metadata/auth", resolved.auth_store_root_dir);
 }
 
 test "data runtime parses optional split store registration flags" {

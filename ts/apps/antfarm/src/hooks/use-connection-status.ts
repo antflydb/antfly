@@ -6,7 +6,7 @@ export type ServerStatus = "connected" | "disconnected" | "checking";
 
 export interface ConnectionStatus {
   antfly: ServerStatus;
-  termite: ServerStatus;
+  inference: ServerStatus;
   retry: () => void;
 }
 
@@ -14,9 +14,9 @@ const CHECK_INTERVAL_DISCONNECTED = 30000; // 30 seconds when disconnected
 const CONNECTION_CHECK_TIMEOUT = 5000; // 5 seconds timeout for health checks
 
 export function useConnectionStatus(): ConnectionStatus {
-  const { apiUrl, termiteApiUrl } = useApiConfig();
+  const { apiUrl, inferenceApiUrl } = useApiConfig();
   const [antflyStatus, setAntflyStatus] = useState<ServerStatus>("checking");
-  const [termiteStatus, setTermiteStatus] = useState<ServerStatus>("checking");
+  const [inferenceStatus, setInferenceStatus] = useState<ServerStatus>("checking");
   const isMountedRef = useRef(true);
 
   const checkAntfly = useCallback(
@@ -43,40 +43,40 @@ export function useConnectionStatus(): ConnectionStatus {
     [apiUrl]
   );
 
-  const checkTermite = useCallback(
+  const checkInference = useCallback(
     async (signal?: AbortSignal) => {
-      if (!isProductEnabled("termite")) {
-        setTermiteStatus("connected"); // Skip check if product disabled
+      if (!isProductEnabled("inference")) {
+        setInferenceStatus("connected"); // Skip check if product disabled
         return;
       }
 
       try {
-        const response = await fetch(`${termiteApiUrl}/healthz`, {
+        const response = await fetch(`${inferenceApiUrl}/healthz`, {
           method: "GET",
           signal: signal ?? AbortSignal.timeout(CONNECTION_CHECK_TIMEOUT),
         });
         if (isMountedRef.current) {
-          setTermiteStatus(response.ok ? "connected" : "disconnected");
+          setInferenceStatus(response.ok ? "connected" : "disconnected");
         }
       } catch {
         if (isMountedRef.current) {
-          setTermiteStatus("disconnected");
+          setInferenceStatus("disconnected");
         }
       }
     },
-    [termiteApiUrl]
+    [inferenceApiUrl]
   );
 
   const retry = useCallback(() => {
     if (isProductEnabled("antfly")) {
       setAntflyStatus("checking");
     }
-    if (isProductEnabled("termite")) {
-      setTermiteStatus("checking");
+    if (isProductEnabled("inference")) {
+      setInferenceStatus("checking");
     }
     checkAntfly();
-    checkTermite();
-  }, [checkAntfly, checkTermite]);
+    checkInference();
+  }, [checkAntfly, checkInference]);
 
   // Initial check on mount with cleanup
   useEffect(() => {
@@ -84,17 +84,17 @@ export function useConnectionStatus(): ConnectionStatus {
     const controller = new AbortController();
 
     checkAntfly(controller.signal);
-    checkTermite(controller.signal);
+    checkInference(controller.signal);
 
     return () => {
       isMountedRef.current = false;
       controller.abort();
     };
-  }, [checkAntfly, checkTermite]);
+  }, [checkAntfly, checkInference]);
 
   // Re-check every 30 seconds if any server is disconnected
   useEffect(() => {
-    const shouldRetry = antflyStatus === "disconnected" || termiteStatus === "disconnected";
+    const shouldRetry = antflyStatus === "disconnected" || inferenceStatus === "disconnected";
 
     if (!shouldRetry) return;
 
@@ -102,17 +102,17 @@ export function useConnectionStatus(): ConnectionStatus {
       if (antflyStatus === "disconnected") {
         checkAntfly();
       }
-      if (termiteStatus === "disconnected") {
-        checkTermite();
+      if (inferenceStatus === "disconnected") {
+        checkInference();
       }
     }, CHECK_INTERVAL_DISCONNECTED);
 
     return () => clearInterval(interval);
-  }, [antflyStatus, termiteStatus, checkAntfly, checkTermite]);
+  }, [antflyStatus, inferenceStatus, checkAntfly, checkInference]);
 
   return {
     antfly: antflyStatus,
-    termite: termiteStatus,
+    inference: inferenceStatus,
     retry,
   };
 }

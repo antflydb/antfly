@@ -20,7 +20,7 @@ var (
 	embeddingRequestOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "embedding_request_ops_total",
 			Help:      "The total number of embedding requests.",
 		},
@@ -29,7 +29,7 @@ var (
 	embeddingCreationOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "embedding_creation_ops_total",
 			Help:      "The total number of embedding creations.",
 		},
@@ -39,7 +39,7 @@ var (
 	rerankerRequestOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "reranker_request_ops_total",
 			Help:      "The total number of reranker requests.",
 		},
@@ -48,7 +48,7 @@ var (
 	rerankingCreationOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "reranking_creation_ops_total",
 			Help:      "The total number of documents reranked.",
 		},
@@ -58,7 +58,7 @@ var (
 	chunkerRequestOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "chunker_request_ops_total",
 			Help:      "The total number of chunker requests.",
 		},
@@ -67,7 +67,7 @@ var (
 	chunkCreationOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "chunk_creation_ops_total",
 			Help:      "The total number of chunks created.",
 		},
@@ -77,7 +77,7 @@ var (
 	generatorRequestOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "generator_request_ops_total",
 			Help:      "The total number of generator (LLM) requests.",
 		},
@@ -86,7 +86,7 @@ var (
 	tokenGenerationOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "token_generation_ops_total",
 			Help:      "The total number of tokens generated.",
 		},
@@ -95,7 +95,7 @@ var (
 	nerRequestOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "ner_request_ops_total",
 			Help:      "The total number of NER requests.",
 		},
@@ -104,7 +104,7 @@ var (
 	nerCreationOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "ner_creation_ops_total",
 			Help:      "The total number of entities extracted.",
 		},
@@ -114,7 +114,7 @@ var (
 	extractionRequestOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "extraction_request_ops_total",
 			Help:      "The total number of JSON extraction requests.",
 		},
@@ -123,7 +123,7 @@ var (
 	extractionFieldsOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "extraction_fields_total",
 			Help:      "The total number of fields extracted.",
 		},
@@ -133,7 +133,7 @@ var (
 	readerRequestOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "reader_request_ops_total",
 			Help:      "The total number of reader (OCR/Vision2Seq) requests.",
 		},
@@ -143,7 +143,7 @@ var (
 	transcriberRequestOps = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "transcriber_request_ops_total",
 			Help:      "The total number of transcriber (Speech2Seq) requests.",
 		},
@@ -153,7 +153,7 @@ var (
 	modelLoadDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "model_load_duration_seconds",
 			Help:      "Time taken to load a model.",
 			Buckets:   []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60},
@@ -164,7 +164,7 @@ var (
 	requestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "request_duration_seconds",
 			Help:      "Time taken to process a request.",
 			Buckets:   []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
@@ -175,7 +175,7 @@ var (
 	cacheHits = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "cache_hits_total",
 			Help:      "Total number of cache hits.",
 		},
@@ -185,7 +185,7 @@ var (
 	cacheMisses = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "cache_misses_total",
 			Help:      "Total number of cache misses.",
 		},
@@ -196,7 +196,7 @@ var (
 	queueDepth = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "queue_depth",
 			Help:      "Number of requests currently waiting in queue.",
 		},
@@ -205,7 +205,7 @@ var (
 	queueActiveRequests = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "queue_active_requests",
 			Help:      "Number of requests currently being processed.",
 		},
@@ -214,7 +214,7 @@ var (
 	queueRejectedTotal = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "queue_rejected_total",
 			Help:      "Total number of requests rejected due to full queue.",
 		},
@@ -223,7 +223,7 @@ var (
 	queueTimedOutTotal = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "queue_timed_out_total",
 			Help:      "Total number of requests that timed out while waiting in queue.",
 		},
@@ -232,7 +232,7 @@ var (
 	queueWaitDuration = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: "antfly",
-			Subsystem: "termite",
+			Subsystem: "inference",
 			Name:      "queue_wait_duration_seconds",
 			Help:      "Time spent waiting in queue before processing.",
 			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},

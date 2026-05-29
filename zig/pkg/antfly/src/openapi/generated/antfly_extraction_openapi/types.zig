@@ -2,11 +2,10 @@
 // Package: antfly_extraction_openapi
 
 const std = @import("std");
-const antfly_ai_messages_openapi = @import("antfly_ai_messages_openapi");
+const antfly_generating_openapi = @import("antfly_generating_openapi");
 
 pub const ExtractionProvider = enum {
     antfly,
-    termite,
     pioneer,
     openai,
     mock,
@@ -14,7 +13,6 @@ pub const ExtractionProvider = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .antfly => "antfly",
-            .termite => "termite",
             .pioneer => "pioneer",
             .openai => "openai",
             .mock => "mock",
@@ -29,7 +27,6 @@ pub const ExtractionProvider = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "antfly", .antfly },
-            .{ "termite", .termite },
             .{ "pioneer", .pioneer },
             .{ "openai", .openai },
             .{ "mock", .mock },
@@ -85,7 +82,7 @@ pub const ExtractionClassification = struct {
 
 pub const ExtractionInput = struct {
     id: ?[]const u8 = null,
-    content: antfly_ai_messages_openapi.ChatMessageContent,
+    content: antfly_generating_openapi.ChatMessageContent,
     tokens: ?[]const ExtractionToken = null,
     metadata: ?std.json.Value = null,
 };

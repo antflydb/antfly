@@ -19,7 +19,7 @@ const builtin = @import("builtin");
 //   - WASM (32 or 64): 128-bit SIMD = 4 lanes
 //   - x86_64 with AVX-512F: 512-bit zmm = 16 lanes
 //   - else (AVX/AVX2, NEON): 256-bit = 8 lanes
-// Mirrors pkg/termite/src/web/profile.zig::simd_f32_lanes; kept here so
+// Mirrors pkg/inference/src/web/profile.zig::simd_f32_lanes; kept here so
 // lib/linalg has no termite import dependency.  termite's activations.zig
 // re-exports `vec_len` and `expVec` from this file so the two sides cannot
 // diverge.
@@ -73,7 +73,7 @@ pub fn axpyPtrs(alpha: f32, x: [*]const f32, y: [*]f32, len: usize) void {
 // for exp(r).  Saturates: x > 88.7 -> +inf, x < -87.34 -> 0 (so masked
 // attention scores at -inf underflow cleanly to 0 instead of producing NaN).
 //
-// Mirrors pkg/termite/src/backends/activations.zig::expVec; copied here so
+// Mirrors pkg/inference/src/backends/activations.zig::expVec; copied here so
 // lib/linalg stays free of termite imports.  Used by softmaxRow and
 // expSubtractAndSum on the attention hot path where @exp(@Vector) currently
 // lowers to per-lane libm expf.

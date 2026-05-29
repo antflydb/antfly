@@ -19,7 +19,6 @@ const Allocator = std.mem.Allocator;
 
 pub const Provider = enum {
     antfly,
-    termite,
     pioneer,
     openai,
     mock,
@@ -27,7 +26,6 @@ pub const Provider = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.write(switch (self) {
             .antfly => "antfly",
-            .termite => "termite",
             .pioneer => "pioneer",
             .openai => "openai",
             .mock => "mock",
@@ -40,7 +38,6 @@ pub const Provider = enum {
             else => return error.UnexpectedToken,
         };
         if (std.mem.eql(u8, raw, "antfly")) return .antfly;
-        if (std.mem.eql(u8, raw, "termite")) return .termite;
         if (std.mem.eql(u8, raw, "pioneer")) return .pioneer;
         if (std.mem.eql(u8, raw, "openai")) return .openai;
         if (std.mem.eql(u8, raw, "mock")) return .mock;
@@ -271,7 +268,7 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
 
 pub fn initExtractor(alloc: Allocator, http: *httpx.Client, cfg: Config) !Extractor {
     return switch (cfg.provider) {
-        .antfly, .termite, .pioneer, .openai => try HttpExtractorState.init(alloc, http, cfg),
+        .antfly, .pioneer, .openai => try HttpExtractorState.init(alloc, http, cfg),
         .mock => error.UnsupportedExtractionProvider,
     };
 }
@@ -323,7 +320,7 @@ const HttpExtractorState = struct {
         defer alloc.free(body);
 
         const base = self.cfg.resolvedUrl() orelse switch (self.cfg.provider) {
-            .antfly, .termite => "http://127.0.0.1:8080",
+            .antfly => "http://127.0.0.1:8080",
             else => return error.InvalidExtractionConfig,
         };
         const path = switch (self.cfg.provider) {
@@ -412,7 +409,6 @@ fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: [
 
 fn parseProvider(raw: []const u8) !Provider {
     if (std.mem.eql(u8, raw, "antfly")) return .antfly;
-    if (std.mem.eql(u8, raw, "termite")) return .termite;
     if (std.mem.eql(u8, raw, "pioneer")) return .pioneer;
     if (std.mem.eql(u8, raw, "openai")) return .openai;
     if (std.mem.eql(u8, raw, "mock")) return .mock;

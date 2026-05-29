@@ -15,4 +15,4 @@
 // Package audio provides text-to-speech (TTS) and speech-to-text (STT) capabilities.
 package audio
 
-//go:generate go tool oapi-codegen --config=cfg.yaml ./openapi.yaml
+//go:generate go tool oapi-codegen --config=cfg.yaml ../../../../../specs/openapi/antfly/audio.yaml

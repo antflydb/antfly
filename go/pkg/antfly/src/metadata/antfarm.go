@@ -56,10 +56,10 @@ func addAntfarmRoutes(mux *http.ServeMux) {
 	mux.Handle("/", http.FileServer(spaFileSystem{http.FS(subFS)}))
 }
 
-// addTermiteProxy adds a reverse proxy that forwards /termite/* requests
-// to the Termite API, stripping the /termite prefix.
-func addTermiteProxy(mux *http.ServeMux, termiteURL string) {
-	target, err := url.Parse(termiteURL)
+// addInferenceProxy adds a reverse proxy that forwards /ai/v1/* requests
+// to the Antfly inference API.
+func addInferenceProxy(mux *http.ServeMux, inferenceURL string) {
+	target, err := url.Parse(inferenceURL)
 	if err != nil {
 		return
 	}
@@ -67,14 +67,18 @@ func addTermiteProxy(mux *http.ServeMux, termiteURL string) {
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
-			stripped := strings.TrimPrefix(r.In.URL.Path, "/termite")
-			if stripped == "" {
-				stripped = "/"
+			incomingPath := r.In.URL.Path
+			targetPath := strings.TrimRight(target.Path, "/")
+			if strings.HasSuffix(targetPath, "/ai/v1") {
+				incomingPath = strings.TrimPrefix(incomingPath, "/ai/v1")
+				if incomingPath == "" {
+					incomingPath = "/"
+				}
 			}
-			r.Out.URL.Path = path.Join(target.Path, stripped)
+			r.Out.URL.Path = path.Join(targetPath, incomingPath)
 			r.Out.URL.RawPath = ""
 			r.Out.Host = target.Host
-			// Don't leak antfly auth credentials to Termite
+			// Don't leak Antfly auth credentials to the inference service.
 			r.Out.Header.Del("Authorization")
 			r.Out.Header.Del("Cookie")
 			r.Out.Header.Del("Accept-Encoding")
@@ -84,5 +88,5 @@ func addTermiteProxy(mux *http.ServeMux, termiteURL string) {
 		},
 	}
 
-	mux.Handle("/termite/", proxy)
+	mux.Handle("/ai/v1/", proxy)
 }

@@ -8,8 +8,8 @@ import {
   getModelsWithCapability,
   type ModelType,
   type RecognizerCapability,
-} from "@/data/termite-models";
-import { useTermiteRegistry } from "@/hooks/use-termite-registry";
+} from "@/data/inference-models";
+import { useInferenceRegistry } from "@/hooks/use-inference-registry";
 
 function CopyCommandButton({ command }: { command: string }) {
   const [copied, setCopied] = useState(false);
@@ -50,7 +50,7 @@ export function NoModelsGuide({
   typeName,
   soft = false,
 }: NoModelsGuideProps) {
-  const { models, loading } = useTermiteRegistry();
+  const { models, loading } = useInferenceRegistry();
 
   // Don't flash while loading
   if (loading) return null;
@@ -117,7 +117,7 @@ export function NoModelsGuide({
 
           <div className="mt-3">
             <Button variant="link" size="sm" className="h-auto p-0 text-xs" asChild>
-              <Link to="/models">
+              <Link to="/inference/models">
                 Browse all models
                 <ExternalLink className="h-3 w-3 ml-1" />
               </Link>

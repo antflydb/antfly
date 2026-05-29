@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// ONNX model parser and graph converter for termite.
+// ONNX model parser and graph converter for inference.
 //
 // Parses ONNX protobuf models and converts them into termite's native
 // Graph IR, enabling execution on any termite backend (BLAS, MLX,

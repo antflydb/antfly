@@ -8,20 +8,20 @@ surfaces from one package per language.
 - Source specs live under `specs/openapi/` and stay split by implementation
   owner:
   - `specs/openapi/antfly/metadata.yaml`
-  - `specs/openapi/antfly/usermgr.yaml`
+  - `specs/openapi/auth/api.yaml`
   - `specs/openapi/antfly/query.yaml`
-  - `specs/openapi/termite/api.yaml`
+  - `specs/openapi/inference/api.yaml`
 - The public SDK contract is the root `openapi.yaml`.
 - `scripts/join_openapi.py` builds the Antfly public source contract.
-- `scripts/join_public_openapi.py` joins Antfly and Termite into `openapi.yaml`.
+- `scripts/join_public_openapi.py` joins Antfly and inference into `openapi.yaml`.
 - Public route prefixes are part of the joined contract:
-  - Antfly data API: `/api/v1`
+  - Antfly data API: `/db/v1`
   - Auth API: `/auth/v1`
-  - Termite ML API: `/ml/v1`
+  - Inference ML API: `/ai/v1`
 
 Zig remains the owner of the source OpenAPI contracts and generated server/client
 code. Public SDKs must generate from root `openapi.yaml`, not from the split
-Antfly or Termite source specs.
+Antfly or inference source specs.
 
 ## Package Layout
 
@@ -36,7 +36,7 @@ under `zig/`; there is no `zig/scripts/` directory.
 
 ## SDK Shape
 
-Each language exposes one SDK package. Antfly and Termite are product surfaces
+Each language exposes one SDK package. Antfly and inference are product surfaces
 inside that package, not separate packages.
 
 Go:
@@ -46,7 +46,7 @@ client, err := sdk.NewClient(sdk.Config{
     BaseURL: "http://localhost:8080",
 })
 antfly := client.Antfly()
-termite := client.Termite()
+inference := client.Inference()
 ```
 
 TypeScript:
@@ -54,18 +54,18 @@ TypeScript:
 ```ts
 const client = new Client({ baseUrl: "http://localhost:8080" });
 const antfly = client.Antfly();
-const termite = client.Termite();
+const inference = client.Inference();
 ```
 
-Configuration has one required base URL and an optional Termite override:
+Configuration has one required base URL and an optional inference override:
 
 - `BaseURL` / `baseUrl` points at the joined public server.
-- `TermiteBaseURL` / `termiteBaseUrl` points ML operations at hosted Termite
+- `InferenceBaseURL` / `inferenceBaseUrl` points ML operations at hosted inference
   when needed.
-- When the Termite override is empty, Termite uses the same base URL.
+- When the inference override is empty, inference uses the same base URL.
 
-Hosted Termite is the exception: it may serve only `/ml/v1`. SDK constructors
-accept legacy base URLs ending in `/api/v1` or `/ml/v1` and normalize them to the
+Hosted inference is the exception: it may serve only `/ai/v1`. SDK constructors
+accept legacy base URLs ending in `/db/v1` or `/ai/v1` and normalize them to the
 server root before issuing requests to the joined paths.
 
 ## Generation Rule

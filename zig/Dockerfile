@@ -33,7 +33,7 @@ RUN case "${TARGETARCH}" in \
         *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac && \
     cd zig && \
-    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseFast install-antfly --prefix /out
+    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseFast -Dedition=full install --prefix /out
 
 FROM --platform=$TARGETPLATFORM alpine:3.21
 

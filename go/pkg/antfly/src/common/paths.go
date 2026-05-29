@@ -31,15 +31,15 @@ func DefaultDataDir() string {
 	return filepath.Join(home, ".antfly")
 }
 
-// DefaultModelsDir returns the platform-specific default models directory for Termite.
-// Returns ~/.termite/models on Unix-like systems and %USERPROFILE%\.termite\models on Windows.
+// DefaultModelsDir returns the platform-specific default models directory for Antfly inference.
+// Returns ~/.antfly/inference/models on Unix-like systems and %USERPROFILE%\.antfly\inference\models on Windows.
 // Falls back to "./models" if home directory cannot be determined.
 func DefaultModelsDir() string {
 	home := userHomeDir()
 	if home == "" {
 		return filepath.FromSlash("./models") // fallback to legacy behavior
 	}
-	return filepath.Join(home, ".termite", "models")
+	return filepath.Join(home, ".antfly", "inference", "models")
 }
 
 // userHomeDir returns the user's home directory in a cross-platform manner.

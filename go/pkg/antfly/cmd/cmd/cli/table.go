@@ -75,7 +75,7 @@ Without --table, lists all tables.`,
 		Long: `Creates a new table with the specified name and number of shards.
 
 Example with indexes:
-  antfly table create --table products --index '{"name":"product_embeddings","field":"description","embedder":{"provider":"termite","model":"BAAI/bge-small-en-v1.5"}}'
+  antfly table create --table products --index '{"name":"product_embeddings","field":"description","embedder":{"provider":"antfly","model":"BAAI/bge-small-en-v1.5"}}'
 
 Example with config file:
   antfly table create --table products --file table-config.json

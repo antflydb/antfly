@@ -23,8 +23,10 @@ T = TypeVar("T", bound="ExtractionInput")
 class ExtractionInput:
     """
     Attributes:
-        content (list[ImageURLContentPart | MediaContentPart | TextContentPart] | str): OpenAI-compatible message
-            content: either text or an array of content parts.
+        content (list[ImageURLContentPart | MediaContentPart | TextContentPart] | str): Message content. Supports two
+            formats:
+            - Simple string: "Hello, how are you?"
+            - Array of content parts: [{"type": "text", "text": "Hello"}]
         id (str | Unset):
         tokens (list[ExtractionToken] | Unset):
         metadata (ExtractionInputMetadata | Unset):

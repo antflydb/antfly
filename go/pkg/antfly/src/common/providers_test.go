@@ -37,20 +37,20 @@ func TestRegistry_EmbedderConfig(t *testing.T) {
 	}
 
 	// Register second embedder - should not change default
-	config2 := embeddings.EmbedderConfig{Provider: "termite"}
-	reg.RegisterEmbedderConfig("termite-local", config2)
+	config2 := embeddings.EmbedderConfig{Provider: "antfly"}
+	reg.RegisterEmbedderConfig("antfly-local", config2)
 
 	if reg.DefaultEmbedderName() != "openai-small" {
 		t.Errorf("expected default embedder to still be 'openai-small', got %q", reg.DefaultEmbedderName())
 	}
 
 	// Get by name
-	got, err := reg.GetEmbedderConfig("termite-local")
+	got, err := reg.GetEmbedderConfig("antfly-local")
 	if err != nil {
 		t.Fatalf("GetEmbedderConfig failed: %v", err)
 	}
-	if got.Provider != "termite" {
-		t.Errorf("expected provider 'termite', got %q", got.Provider)
+	if got.Provider != "antfly" {
+		t.Errorf("expected provider 'antfly', got %q", got.Provider)
 	}
 
 	// Get default (empty name)
@@ -126,7 +126,7 @@ func TestRegistry_ChunkerConfig(t *testing.T) {
 		chunkerConfigs: make(map[string]chunking.ChunkerConfig),
 	}
 
-	config := chunking.ChunkerConfig{Provider: "termite"}
+	config := chunking.ChunkerConfig{Provider: "antfly"}
 	reg.RegisterChunkerConfig("fixed-500", config)
 
 	if reg.DefaultChunkerName() != "fixed-500" {
@@ -137,8 +137,8 @@ func TestRegistry_ChunkerConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetChunkerConfig failed: %v", err)
 	}
-	if got.Provider != "termite" {
-		t.Errorf("expected provider 'termite', got %q", got.Provider)
+	if got.Provider != "antfly" {
+		t.Errorf("expected provider 'antfly', got %q", got.Provider)
 	}
 }
 
@@ -253,7 +253,7 @@ func TestRegistry_Clear(t *testing.T) {
 	reg.RegisterEmbedderConfig("test", embeddings.EmbedderConfig{Provider: "test"})
 	reg.RegisterGeneratorConfig("test", generating.GeneratorConfig{Provider: "test"})
 	reg.RegisterRerankerConfig("test", reranking.RerankerConfig{Provider: "cohere"})
-	reg.RegisterChunkerConfig("test", chunking.ChunkerConfig{Provider: "termite"})
+	reg.RegisterChunkerConfig("test", chunking.ChunkerConfig{Provider: "antfly"})
 	reg.RegisterChain("test", []ChainLinkConfig{})
 
 	// Clear

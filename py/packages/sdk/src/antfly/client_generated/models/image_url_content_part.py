@@ -17,7 +17,7 @@ T = TypeVar("T", bound="ImageURLContentPart")
 
 @_attrs_define
 class ImageURLContentPart:
-    """Image content in the OpenAI-compatible content part format.
+    """Image content in OpenAI-compatible format.
 
     Attributes:
         type_ (ImageURLContentPartType):

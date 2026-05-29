@@ -5,21 +5,21 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.termite_error import TermiteError
-from ...models.termite_generate_request import TermiteGenerateRequest
-from ...models.termite_generate_response import TermiteGenerateResponse
+from ...models.inference_error import InferenceError
+from ...models.inference_generate_request import InferenceGenerateRequest
+from ...models.inference_generate_response import InferenceGenerateResponse
 from ...types import Response
 
 
 def _get_kwargs(
     *,
-    body: TermiteGenerateRequest,
+    body: InferenceGenerateRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/ml/v1/chat/completions",
+        "url": "/ai/v1/chat/completions",
     }
 
     _kwargs["json"] = body.to_dict()
@@ -32,29 +32,29 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> TermiteError | TermiteGenerateResponse | None:
+) -> InferenceError | InferenceGenerateResponse | None:
     if response.status_code == 200:
-        response_200 = TermiteGenerateResponse.from_dict(response.json())
+        response_200 = InferenceGenerateResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 400:
-        response_400 = TermiteError.from_dict(response.json())
+        response_400 = InferenceError.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 404:
-        response_404 = TermiteError.from_dict(response.json())
+        response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
     if response.status_code == 500:
-        response_500 = TermiteError.from_dict(response.json())
+        response_500 = InferenceError.from_dict(response.json())
 
         return response_500
 
     if response.status_code == 503:
-        response_503 = TermiteError.from_dict(response.json())
+        response_503 = InferenceError.from_dict(response.json())
 
         return response_503
 
@@ -66,7 +66,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[TermiteError | TermiteGenerateResponse]:
+) -> Response[InferenceError | InferenceGenerateResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -78,22 +78,22 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteGenerateRequest,
-) -> Response[TermiteError | TermiteGenerateResponse]:
+    body: InferenceGenerateRequest,
+) -> Response[InferenceError | InferenceGenerateResponse]:
     """OpenAI Chat Completions endpoint
 
      OpenAI-compatible chat completions path for SDKs that call
     `/chat/completions` relative to the configured base URL.
 
     Args:
-        body (TermiteGenerateRequest):
+        body (InferenceGenerateRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteGenerateResponse]
+        Response[InferenceError | InferenceGenerateResponse]
     """
 
     kwargs = _get_kwargs(
@@ -110,22 +110,22 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteGenerateRequest,
-) -> TermiteError | TermiteGenerateResponse | None:
+    body: InferenceGenerateRequest,
+) -> InferenceError | InferenceGenerateResponse | None:
     """OpenAI Chat Completions endpoint
 
      OpenAI-compatible chat completions path for SDKs that call
     `/chat/completions` relative to the configured base URL.
 
     Args:
-        body (TermiteGenerateRequest):
+        body (InferenceGenerateRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteGenerateResponse
+        InferenceError | InferenceGenerateResponse
     """
 
     return sync_detailed(
@@ -137,22 +137,22 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteGenerateRequest,
-) -> Response[TermiteError | TermiteGenerateResponse]:
+    body: InferenceGenerateRequest,
+) -> Response[InferenceError | InferenceGenerateResponse]:
     """OpenAI Chat Completions endpoint
 
      OpenAI-compatible chat completions path for SDKs that call
     `/chat/completions` relative to the configured base URL.
 
     Args:
-        body (TermiteGenerateRequest):
+        body (InferenceGenerateRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteGenerateResponse]
+        Response[InferenceError | InferenceGenerateResponse]
     """
 
     kwargs = _get_kwargs(
@@ -167,22 +167,22 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteGenerateRequest,
-) -> TermiteError | TermiteGenerateResponse | None:
+    body: InferenceGenerateRequest,
+) -> InferenceError | InferenceGenerateResponse | None:
     """OpenAI Chat Completions endpoint
 
      OpenAI-compatible chat completions path for SDKs that call
     `/chat/completions` relative to the configured base URL.
 
     Args:
-        body (TermiteGenerateRequest):
+        body (InferenceGenerateRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteGenerateResponse
+        InferenceError | InferenceGenerateResponse
     """
 
     return (

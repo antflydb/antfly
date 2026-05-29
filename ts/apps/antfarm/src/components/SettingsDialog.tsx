@@ -27,32 +27,33 @@ interface SettingsDialogProps {
 
 interface SettingsFormValues {
   apiUrl: string;
-  termiteUrl: string;
+  inferenceUrl: string;
 }
 
 export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
-  const { apiUrl, setApiUrl, resetToDefault, termiteApiUrl, setTermiteApiUrl, resetTermiteApiUrl } =
+  const { apiUrl, setApiUrl, resetToDefault, inferenceApiUrl, setInferenceApiUrl, resetInferenceApiUrl } =
     useApiConfig();
   const [isOpen, setIsOpen] = useState(false);
+  const effectiveInferenceApiUrl = inferenceApiUrl || "same origin (/ai/v1)";
 
   const form = useForm<SettingsFormValues>({
-    defaultValues: { apiUrl, termiteUrl: termiteApiUrl },
+    defaultValues: { apiUrl, inferenceUrl: inferenceApiUrl },
   });
 
   const handleSave = (data: SettingsFormValues) => {
     setApiUrl(data.apiUrl);
-    setTermiteApiUrl(data.termiteUrl);
+    setInferenceApiUrl(data.inferenceUrl);
     setIsOpen(false);
   };
 
   const handleReset = () => {
     resetToDefault();
-    resetTermiteApiUrl();
-    form.reset({ apiUrl, termiteUrl: termiteApiUrl });
+    resetInferenceApiUrl();
+    form.reset({ apiUrl, inferenceUrl: inferenceApiUrl });
   };
 
   const handleCancel = () => {
-    form.reset({ apiUrl, termiteUrl: termiteApiUrl });
+    form.reset({ apiUrl, inferenceUrl: inferenceApiUrl });
     setIsOpen(false);
   };
 
@@ -69,8 +70,8 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
         <DialogHeader>
           <DialogTitle>API Settings</DialogTitle>
           <DialogDescription>
-            Configure the Antfly and Termite servers to connect to. This is useful when accessing
-            the dashboard remotely or connecting to different servers.
+            Configure the Antfly data and inference APIs. This is useful when accessing the
+            dashboard remotely or connecting to separate Antfly deployments.
           </DialogDescription>
         </DialogHeader>
         <Form form={form} onSubmit={form.handleSubmit(handleSave)} className="gap-6 py-4">
@@ -79,19 +80,19 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
             name="apiUrl"
             render={({ field }) => (
               <FormItem>
-                <FormLabel>Antfly API URL</FormLabel>
+                <FormLabel>Antfly Data API URL</FormLabel>
                 <FormControl>
-                  <Input placeholder="http://localhost:8082/api/v1" {...field} />
+                  <Input placeholder="http://localhost:8082/db/v1" {...field} />
                 </FormControl>
                 <FormDescription>
                   Current:{" "}
                   <code className="text-xs bg-muted px-1 py-0.5 rounded-none">{apiUrl}</code>
                 </FormDescription>
                 <FormDescription className="text-xs">
-                  Examples: <code className="bg-muted px-1 py-0.5 rounded-none">/api/v1</code>{" "}
+                  Examples: <code className="bg-muted px-1 py-0.5 rounded-none">/db/v1</code>{" "}
                   (default),{" "}
                   <code className="bg-muted px-1 py-0.5 rounded-none">
-                    http://server:8082/api/v1
+                    http://server:8082/db/v1
                   </code>
                 </FormDescription>
               </FormItem>
@@ -100,23 +101,24 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
 
           <FormField
             control={form.control}
-            name="termiteUrl"
+            name="inferenceUrl"
             render={({ field }) => (
               <FormItem>
-                <FormLabel>Termite API URL</FormLabel>
+                <FormLabel>Antfly Inference API URL</FormLabel>
                 <FormControl>
-                  <Input placeholder="http://localhost:11433" {...field} />
+                  <Input placeholder="/ai/v1" {...field} />
                 </FormControl>
                 <FormDescription>
                   Current:{" "}
-                  <code className="text-xs bg-muted px-1 py-0.5 rounded-none">{termiteApiUrl}</code>
+                  <code className="text-xs bg-muted px-1 py-0.5 rounded-none">
+                    {effectiveInferenceApiUrl}
+                  </code>
                 </FormDescription>
                 <FormDescription className="text-xs">
-                  Examples:{" "}
-                  <code className="bg-muted px-1 py-0.5 rounded-none">http://localhost:11433</code>{" "}
+                  Examples: <code className="bg-muted px-1 py-0.5 rounded-none">/ai/v1</code>{" "}
                   (default),{" "}
                   <code className="bg-muted px-1 py-0.5 rounded-none">
-                    https://termite.company.com
+                    https://antfly.company.com/ai/v1
                   </code>
                 </FormDescription>
               </FormItem>

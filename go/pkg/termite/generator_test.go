@@ -36,7 +36,7 @@ func TestTermiteNode_HandleApiGenerate_NoModels(t *testing.T) {
 	}
 
 	t.Run("Returns503WhenNoRegistry", func(t *testing.T) {
-		req := httptest.NewRequest("POST", "/ml/v1/generate", bytes.NewBufferString(`{"model":"test","messages":[{"role":"user","content":"hi"}]}`))
+		req := httptest.NewRequest("POST", "/ai/v1/generate", bytes.NewBufferString(`{"model":"test","messages":[{"role":"user","content":"hi"}]}`))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		node.handleApiGenerate(w, req)
@@ -89,7 +89,7 @@ func TestTermiteNode_HandleApiGenerate_InvalidRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("POST", "/ml/v1/generate", bytes.NewBufferString(tt.body))
+			req := httptest.NewRequest("POST", "/ai/v1/generate", bytes.NewBufferString(tt.body))
 			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
 			node.handleApiGenerate(w, req)

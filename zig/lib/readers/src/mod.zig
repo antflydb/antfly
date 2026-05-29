@@ -15,21 +15,19 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
-const termite_api = @import("termite_api");
+const inference_api = @import("inference_api");
 
 const Allocator = std.mem.Allocator;
 const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
 
 pub const Provider = enum {
     antfly,
-    termite,
     openai,
     vertex,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.write(switch (self) {
             .antfly => "antfly",
-            .termite => "termite",
             .openai => "openai",
             .vertex => "vertex",
         });
@@ -41,7 +39,6 @@ pub const Provider = enum {
             else => return error.UnexpectedToken,
         };
         if (std.mem.eql(u8, raw, "antfly")) return .antfly;
-        if (std.mem.eql(u8, raw, "termite")) return .termite;
         if (std.mem.eql(u8, raw, "openai")) return .openai;
         if (std.mem.eql(u8, raw, "vertex")) return .vertex;
         return error.UnexpectedToken;
@@ -262,7 +259,7 @@ fn deinitConfigValue(alloc: Allocator, cfg: Config) void {
 
 fn initReader(alloc: Allocator, http: *httpx.Client, cfg: Config) !Reader {
     return switch (cfg.provider) {
-        .antfly, .termite => try AntflyReaderState.init(alloc, http, cfg),
+        .antfly => try AntflyReaderState.init(alloc, http, cfg),
         .openai => try OpenAiReaderState.init(alloc, http, cfg),
         .vertex => try VertexReaderState.init(alloc, http, cfg),
     };
@@ -310,11 +307,11 @@ const AntflyReaderState = struct {
 
     fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
         const self: *AntflyReaderState = @ptrCast(@alignCast(ptr));
-        const images = try alloc.alloc(termite_api.types.ImageURL, req.images.len);
+        const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
         defer alloc.free(images);
         for (req.images, 0..) |image, i| images[i] = .{ .url = image };
 
-        const body = try httpx.json.Json.stringify(alloc, termite_api.types.ReadRequest{
+        const body = try httpx.json.Json.stringify(alloc, inference_api.ReadRequest{
             .model = self.model,
             .images = images,
             .prompt = req.prompt orelse self.prompt,
@@ -334,7 +331,7 @@ const AntflyReaderState = struct {
         if (!resp.ok()) return error.ReadRequestFailed;
 
         const payload = resp.body orelse return error.EmptyResponse;
-        var parsed = try std.json.parseFromSlice(termite_api.types.ReadResponse, alloc, payload, .{
+        var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, alloc, payload, .{
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();

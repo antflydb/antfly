@@ -601,7 +601,7 @@ func parseFlags() Config {
 		os.Getenv("POSTGRES_URL"),
 		"Postgres connection URL",
 	)
-	flag.StringVar(&config.AntflyURL, "antfly", "http://localhost:8080/api/v1", "Antfly API URL")
+	flag.StringVar(&config.AntflyURL, "antfly", "http://localhost:8080/db/v1", "Antfly API URL")
 	flag.StringVar(&config.TableName, "pg-table", "documents", "Postgres table name")
 	flag.StringVar(&config.IDColumn, "id-column", "id", "ID column name")
 	flag.StringVar(&config.DataColumn, "data-column", "data", "JSONB data column name")

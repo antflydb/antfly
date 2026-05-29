@@ -18,8 +18,9 @@ import (
 	"testing"
 
 	libafchunking "github.com/antflydb/antfly/go/pkg/libaf/chunking"
-	termchunking "github.com/antflydb/antfly/go/pkg/termite/lib/chunking"
 )
+
+const modelFixedBert = "fixed-bert-tokenizer"
 
 func TestNewChunkerConfig(t *testing.T) {
 	tests := []struct {
@@ -29,12 +30,12 @@ func TestNewChunkerConfig(t *testing.T) {
 		wantProvider ChunkerProvider
 	}{
 		{
-			name: "termite config",
-			config: TermiteChunkerConfig{
-				Model: termchunking.ModelFixedBert,
+			name: "antfly inference config",
+			config: AntflyChunkerConfig{
+				Model: modelFixedBert,
 			},
 			wantErr:      false,
-			wantProvider: ChunkerProviderTermite,
+			wantProvider: ChunkerProviderAntfly,
 		},
 		{
 			name:    "unknown config type",
@@ -60,15 +61,15 @@ func TestNewChunkerConfig(t *testing.T) {
 func TestGetProviderConfig(t *testing.T) {
 	targetTokens := 500
 	overlapTokens := 50
-	termiteConfig := TermiteChunkerConfig{
-		Model: termchunking.ModelFixedBert,
+	antflyConfig := AntflyChunkerConfig{
+		Model: modelFixedBert,
 		Text: libafchunking.TextChunkOptions{
 			TargetTokens:  targetTokens,
 			OverlapTokens: overlapTokens,
 		},
 	}
 
-	chunkerConfig, err := NewChunkerConfig(termiteConfig)
+	chunkerConfig, err := NewChunkerConfig(antflyConfig)
 	if err != nil {
 		t.Fatalf("NewChunkerConfig() failed: %v", err)
 	}
@@ -78,19 +79,19 @@ func TestGetProviderConfig(t *testing.T) {
 		t.Fatalf("GetProviderConfig() failed: %v", err)
 	}
 
-	termite, ok := got.(TermiteChunkerConfig)
+	antfly, ok := got.(AntflyChunkerConfig)
 	if !ok {
 		t.Fatalf("GetProviderConfig() returned wrong type: %T", got)
 	}
 
-	if termite.Model != termchunking.ModelFixedBert {
-		t.Errorf("Model = %v, want %v", termite.Model, termchunking.ModelFixedBert)
+	if antfly.Model != modelFixedBert {
+		t.Errorf("Model = %v, want %v", antfly.Model, modelFixedBert)
 	}
-	if termite.Text.TargetTokens != 500 {
-		t.Errorf("TargetTokens = %v, want 500", termite.Text.TargetTokens)
+	if antfly.Text.TargetTokens != 500 {
+		t.Errorf("TargetTokens = %v, want 500", antfly.Text.TargetTokens)
 	}
-	if termite.Text.OverlapTokens != 50 {
-		t.Errorf("OverlapTokens = %v, want 50", termite.Text.OverlapTokens)
+	if antfly.Text.OverlapTokens != 50 {
+		t.Errorf("OverlapTokens = %v, want 50", antfly.Text.OverlapTokens)
 	}
 }
 
@@ -98,7 +99,7 @@ func TestRoundTrip(t *testing.T) {
 	// Test that we can round-trip a config through NewChunkerConfig and GetProviderConfig
 	targetTokens := 1000
 	maxChunks := 100
-	original := TermiteChunkerConfig{
+	original := AntflyChunkerConfig{
 		Model:     "chonky-mmbert-small-multilingual-1", // Use actual model name (directory-based)
 		MaxChunks: maxChunks,
 		Text: libafchunking.TextChunkOptions{
@@ -116,18 +117,18 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatalf("GetProviderConfig() failed: %v", err)
 	}
 
-	termite, ok := extracted.(TermiteChunkerConfig)
+	antfly, ok := extracted.(AntflyChunkerConfig)
 	if !ok {
 		t.Fatalf("GetProviderConfig() returned wrong type: %T", extracted)
 	}
 
-	if termite.Model != original.Model {
-		t.Errorf("Model mismatch: got %v, want %v", termite.Model, original.Model)
+	if antfly.Model != original.Model {
+		t.Errorf("Model mismatch: got %v, want %v", antfly.Model, original.Model)
 	}
-	if termite.Text.TargetTokens != original.Text.TargetTokens {
-		t.Errorf("TargetTokens mismatch: got %v, want %v", termite.Text.TargetTokens, original.Text.TargetTokens)
+	if antfly.Text.TargetTokens != original.Text.TargetTokens {
+		t.Errorf("TargetTokens mismatch: got %v, want %v", antfly.Text.TargetTokens, original.Text.TargetTokens)
 	}
-	if termite.MaxChunks != original.MaxChunks {
-		t.Errorf("MaxChunks mismatch: got %v, want %v", termite.MaxChunks, original.MaxChunks)
+	if antfly.MaxChunks != original.MaxChunks {
+		t.Errorf("MaxChunks mismatch: got %v, want %v", antfly.MaxChunks, original.MaxChunks)
 	}
 }

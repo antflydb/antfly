@@ -22,7 +22,6 @@ export const GENERATOR_PROVIDER_DEFAULTS: Record<GeneratorProvider, string> = {
   anthropic: "claude-sonnet-4-5-20250929",
   vertex: "gemini-2.5-flash",
   cohere: "command-r-plus",
-  termite: "gemma-3-1b-it",
   openrouter: "openai/gpt-4.1",
   bedrock: "anthropic.claude-sonnet-4-5-20250929-v1:0",
   mock: "mock",
@@ -36,7 +35,6 @@ export const GENERATOR_PROVIDER_LABELS: Record<GeneratorProvider, string> = {
   anthropic: "Anthropic (Claude)",
   vertex: "Google Cloud Vertex AI",
   cohere: "Cohere",
-  termite: "Termite (Local)",
   openrouter: "OpenRouter",
   bedrock: "AWS Bedrock",
   mock: "Mock (Testing)",
@@ -59,7 +57,7 @@ export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
   "ollama",
   "cohere",
   "openrouter",
-  "termite",
+  "antfly",
   "mock",
 ];
 

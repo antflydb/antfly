@@ -55,8 +55,8 @@ func TestEmbedderProviderValidate(t *testing.T) {
 			wantErr:  false,
 		},
 		{
-			name:     "valid termite",
-			provider: EmbedderProviderTermite,
+			name:     "valid antfly",
+			provider: EmbedderProviderAntfly,
 			wantErr:  false,
 		},
 		{
@@ -107,7 +107,7 @@ func TestValidEmbedderProviders(t *testing.T) {
 		EmbedderProviderGemini,
 		EmbedderProviderOllama,
 		EmbedderProviderOpenai,
-		EmbedderProviderTermite,
+		EmbedderProviderAntfly,
 		EmbedderProviderVertex,
 	}
 

@@ -684,7 +684,7 @@ Current binary/image split:
 
 Build graph steps:
 
-- `zig build install-antfly`
+- `zig build install -Dedition=full`
 - `zig build serverless-test`
 
 GitHub Actions:
@@ -696,7 +696,7 @@ GitHub Actions:
   - nightly scheduled `zig build test` + `zig build serverless-test`
 - `.github/workflows/container-smoke.yml`
   - PR / push smoke build for `Dockerfile.serverless`
-  - builds `install-antfly`
+  - builds `install -Dedition=full`
   - smoke-checks the nested `antfly serverless <role>` commands
   - smoke-builds the shared Zig runtime container before tag-time publish
 - `.github/workflows/container.yml`
@@ -971,7 +971,7 @@ export ANTFLY_SERVERLESS_SPARSE_EMBEDDING_INDEX_NAME=serverless_sparse
 export ANTFLY_SERVERLESS_CHUNK_EMBEDDING_INDEX_NAME=serverless_chunk
 export ANTFLY_SERVERLESS_CHUNK_EMBEDDING_DIMS=768
 
-zig build install-antfly
+zig build install -Dedition=full
 ./zig-out/bin/antfly serverless maintenance
 ```
 

@@ -42,7 +42,7 @@ import { useApiConfig } from "@/hooks/use-api-config";
 import { useEvalSets } from "@/hooks/use-eval-sets";
 import { fetchWithRetry } from "@/lib/utils";
 
-// Rewrite response types matching Termite API
+// Rewrite response types matching the Antfly inference API.
 interface RewriteResponse {
   model: string;
   texts: string[][];
@@ -91,7 +91,7 @@ function formatInput(ctx: string, ans: string): string {
 }
 
 const RewritingPlaygroundPage: React.FC = () => {
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -148,7 +148,7 @@ const RewritingPlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/ml/v1/models`, {
+        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -168,7 +168,7 @@ const RewritingPlaygroundPage: React.FC = () => {
       }
     })();
     return () => controller.abort();
-  }, [termiteApiUrl]);
+  }, [inferenceApiUrl]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
@@ -222,7 +222,7 @@ const RewritingPlaygroundPage: React.FC = () => {
     try {
       const formattedInput = formatInput(context, answer);
 
-      const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/rewrite`, {
+      const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/rewrite`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -249,12 +249,12 @@ const RewritingPlaygroundPage: React.FC = () => {
       setError(
         err instanceof Error
           ? err.message
-          : "Failed to connect to Termite. Make sure Termite is running."
+          : "Failed to connect to Antfly inference. Make sure the runtime is running."
       );
     } finally {
       setIsLoading(false);
     }
-  }, [context, answer, selectedModel, termiteApiUrl]);
+  }, [context, answer, selectedModel, inferenceApiUrl]);
 
   // Cmd+Enter shortcut
   useEffect(() => {

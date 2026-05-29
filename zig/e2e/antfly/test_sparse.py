@@ -537,7 +537,7 @@ def test_semantic_query_embedding_template_supports_remote_text(table_api, opena
         text_server.stop()
 
 
-def test_managed_sparse_hybrid_query_with_termite_embeddings(backup_api, termite_embedder, termite_reranker):
+def test_managed_sparse_hybrid_query_with_antfly_embeddings(backup_api, inference_embedder, inference_reranker):
     table_name = f"sparse_hybrid_managed_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -556,9 +556,9 @@ def test_managed_sparse_hybrid_query_with_termite_embeddings(backup_api, termite
                 "field": "content",
                 "dimension": 3,
                 "embedder": {
-                    "provider": "termite",
-                    "model": "termite-embed-v1",
-                    "api_url": termite_embedder,
+                    "provider": "antfly",
+                    "model": "antfly-embed-v1",
+                    "api_url": inference_embedder,
                 },
             },
         )
@@ -575,9 +575,9 @@ def test_managed_sparse_hybrid_query_with_termite_embeddings(backup_api, termite
                 "field": "content",
                 "sparse": True,
                 "embedder": {
-                    "provider": "termite",
-                    "model": "termite-sparse-v1",
-                    "api_url": termite_embedder,
+                    "provider": "antfly",
+                    "model": "antfly-sparse-v1",
+                    "api_url": inference_embedder,
                 },
             },
         )
@@ -643,9 +643,9 @@ def test_managed_sparse_hybrid_query_with_termite_embeddings(backup_api, termite
                     "require_multi_index": True,
                 },
                 "reranker": {
-                    "provider": "termite",
+                    "provider": "antfly",
                     "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                    "url": termite_reranker,
+                    "url": inference_reranker,
                     "field": "content",
                     "top_n": 2,
                 },
@@ -668,7 +668,7 @@ def test_managed_sparse_hybrid_query_with_termite_embeddings(backup_api, termite
     assert profile["reranker"]["model"] == "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
-def test_sparse_hybrid_query_supports_reranker_and_pruner(backup_api, termite_reranker):
+def test_sparse_hybrid_query_supports_reranker_and_pruner(backup_api, inference_reranker):
     table_name = f"sparse_hybrid_rerank_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -746,9 +746,9 @@ def test_sparse_hybrid_query_supports_reranker_and_pruner(backup_api, termite_re
             "require_multi_index": True,
         },
         "reranker": {
-            "provider": "termite",
+            "provider": "antfly",
             "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-            "url": termite_reranker,
+            "url": inference_reranker,
             "field": "content",
             "top_n": 2,
         },
@@ -858,7 +858,7 @@ def test_sparse_hybrid_query_rejects_invalid_reranker_provider(backup_api):
         raise AssertionError("expected invalid reranker provider to fail")
 
 
-def test_sparse_hybrid_query_rejects_invalid_reranker_config(backup_api, termite_reranker):
+def test_sparse_hybrid_query_rejects_invalid_reranker_config(backup_api, inference_reranker):
     table_name = f"sparse_hybrid_invalid_reranker_cfg_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -920,9 +920,9 @@ def test_sparse_hybrid_query_rejects_invalid_reranker_config(backup_api, termite
                 },
                 "indexes": [sparse_index],
                 "reranker": {
-                    "provider": "termite",
+                    "provider": "antfly",
                     "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                    "url": termite_reranker,
+                    "url": inference_reranker,
                     "field": "content",
                     "top_n": 0,
                 },

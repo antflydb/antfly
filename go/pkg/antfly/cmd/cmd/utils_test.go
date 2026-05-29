@@ -341,18 +341,18 @@ replication_factor: 6
 }
 
 func TestParseConfigCommandSpecificMetadataValidation(t *testing.T) {
-	t.Run("termite_does_not_require_metadata_and_defaults_api_url", func(t *testing.T) {
+	t.Run("inference_does_not_require_metadata_and_defaults_api_url", func(t *testing.T) {
 		v := viper.New()
 		v.SetConfigType("yaml")
 		require.NoError(t, v.ReadConfig(strings.NewReader(`{}`)))
 
 		config, err := parseConfigWithOptions(v, parseConfigOptions{
-			RequireMetadata:      false,
-			DefaultTermiteAPIURL: defaultTermiteAPIURL,
+			RequireMetadata:        false,
+			DefaultInferenceAPIURL: defaultInferenceAPIURL,
 		})
 		require.NoError(t, err)
 		require.Empty(t, config.Metadata.OrchestrationUrls)
-		require.Equal(t, defaultTermiteAPIURL, config.Termite.ApiUrl)
+		require.Equal(t, defaultInferenceAPIURL, config.Inference.ApiUrl)
 	})
 
 	t.Run("swarm_does_not_require_user_metadata", func(t *testing.T) {
@@ -384,12 +384,12 @@ metadata:
 	})
 }
 
-func TestParseConfigTermiteURL(t *testing.T) {
+func TestParseConfigInferenceURL(t *testing.T) {
 	configYAML := `
 metadata:
   orchestration_urls:
     "1": "http://localhost:5001"
-termite:
+inference:
   api_url: "http://localhost:8082"
 `
 	v := viper.New()
@@ -399,7 +399,7 @@ termite:
 	config, err := parseConfig(v)
 	require.NoError(t, err)
 
-	require.Equal(t, "http://localhost:8082", config.Termite.ApiUrl)
+	require.Equal(t, "http://localhost:8082", config.Inference.ApiUrl)
 }
 
 func TestParseConfigRemoteContentSecurityExplicitFalse(t *testing.T) {

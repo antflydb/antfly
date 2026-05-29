@@ -23,7 +23,7 @@ func TestConfigValidateRejectsPromptTextVariable(t *testing.T) {
 }
 
 func TestGeneratorRenderPromptUsesInstructionContextOnly(t *testing.T) {
-	extractor := termiteGeneratorExtractor{
+	extractor := inferenceGeneratorExtractor{
 		model:          "functiongemma",
 		promptTemplate: "Labels: {{#each EntityLabels}}{{this}} {{/each}}",
 	}
@@ -43,7 +43,7 @@ func TestGeneratorRenderPromptUsesInstructionContextOnly(t *testing.T) {
 }
 
 func TestGeneratorRenderPromptDefaultIncludesFunctionInstruction(t *testing.T) {
-	extractor := termiteGeneratorExtractor{model: "functiongemma"}
+	extractor := inferenceGeneratorExtractor{model: "functiongemma"}
 
 	prompt, err := extractor.renderPrompt(docsafentity.ExtractOptions{
 		EntityLabels: []string{"technology"},

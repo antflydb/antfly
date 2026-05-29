@@ -63,7 +63,7 @@ pub const Config = struct {
         if (self.field.len == 0 and self.template.len == 0) return error.InvalidRerankerConfig;
         switch (self.provider) {
             .antfly => {},
-            .ollama, .termite, .cohere, .vertex => {
+            .ollama, .cohere, .vertex => {
                 if (self.model.len == 0) return error.InvalidRerankerConfig;
             },
         }
@@ -79,7 +79,7 @@ pub const Config = struct {
         if (self.url.len > 0) return self.url;
         return switch (self.provider) {
             .ollama => "http://127.0.0.1:11434",
-            .termite => "http://127.0.0.1:8082",
+            .antfly => "http://127.0.0.1:8082",
             else => "",
         };
     }
@@ -144,12 +144,12 @@ pub fn openApiFromConfig(cfg: Config) openapi.RerankerConfig {
 test "reranker config round trip" {
     const alloc = std.testing.allocator;
     const raw =
-        \\{"provider":"termite","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","url":"http://localhost:8082","field":"body","top_n":8}
+        \\{"provider":"antfly","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","url":"http://localhost:8082","field":"body","top_n":8}
     ;
     var cfg = try parseConfigFromSlice(alloc, raw);
     defer cfg.deinit(alloc);
 
-    try std.testing.expectEqual(.termite, cfg.provider);
+    try std.testing.expectEqual(.antfly, cfg.provider);
     try std.testing.expectEqualStrings("body", cfg.field);
     try std.testing.expectEqualStrings("cross-encoder/ms-marco-MiniLM-L-6-v2", cfg.model);
     try std.testing.expectEqual(@as(?u32, 8), cfg.top_n);
@@ -158,7 +158,7 @@ test "reranker config round trip" {
     defer alloc.free(encoded);
     var reparsed = try parseConfigFromSlice(alloc, encoded);
     defer reparsed.deinit(alloc);
-    try std.testing.expectEqual(.termite, reparsed.provider);
+    try std.testing.expectEqual(.antfly, reparsed.provider);
     try std.testing.expectEqualStrings("body", reparsed.field);
 }
 

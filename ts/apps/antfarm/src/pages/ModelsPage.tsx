@@ -65,12 +65,12 @@ import {
   type QuantizationOption,
   type QuantizationType,
   type RecognizerCapability,
-  type TermiteModel,
+  type InferenceModel,
   VARIANT_PRESETS,
   type VariantPreset,
-} from "@/data/termite-models";
+} from "@/data/inference-models";
 import { useApiConfig } from "@/hooks/use-api-config";
-import { useTermiteRegistry } from "@/hooks/use-termite-registry";
+import { useInferenceRegistry } from "@/hooks/use-inference-registry";
 import { cn } from "@/lib/utils";
 
 // Icon mapping for model types
@@ -401,7 +401,7 @@ const TypePill: React.FC<{
 };
 
 const ModelCard: React.FC<{
-  model: TermiteModel;
+  model: InferenceModel;
   onClick: () => void;
 }> = ({ model, onClick }) => {
   const Icon = MODEL_TYPE_ICONS[model.type];
@@ -464,7 +464,7 @@ const ModelCard: React.FC<{
 
 // Model detail sheet - refined documentation style
 const ModelDetailSheet: React.FC<{
-  model: TermiteModel | null;
+  model: InferenceModel | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   types: { type: ModelType; name: string }[];
@@ -613,12 +613,12 @@ const ModelDetailSheet: React.FC<{
                   <>
                     Use{" "}
                     <code className="font-mono bg-muted px-1 py-0.5 rounded-none">
-                      termite pull
+                      antfly inference pull
                     </code>{" "}
-                    CLI or the Termite operator to manage models in production deployments.
+                    CLI or the Antfly inference operator to manage models in production deployments.
                   </>
                 ) : (
-                  "This model is provided by the running Termite runtime and does not need a download command."
+                  "This model is provided by the running Antfly inference runtime and does not need a download command."
                 )}
               </p>
             </div>
@@ -902,12 +902,12 @@ const TypeContextBanner: React.FC<{
 
 // Main page component
 const ModelsPage: React.FC = () => {
-  const { models, types, quantizationOptions, loading, error, retry } = useTermiteRegistry();
-  const { apiUrl, termiteApiUrl } = useApiConfig();
+  const { models, types, quantizationOptions, loading, error, retry } = useInferenceRegistry();
+  const { apiUrl, inferenceApiUrl } = useApiConfig();
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedType, setSelectedType] = useState<ModelType | "all">("all");
-  const [selectedModel, setSelectedModel] = useState<TermiteModel | null>(null);
+  const [selectedModel, setSelectedModel] = useState<InferenceModel | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [allowDownloads, setAllowDownloads] = useState(false);
 
@@ -923,8 +923,8 @@ const ModelsPage: React.FC = () => {
             setAllowDownloads(data.swarm_mode === true);
           }
         } else {
-          // Termite-only build: check allow_downloads from Termite version
-          const response = await fetch(`${termiteApiUrl}/ml/v1/version`);
+          // Inference-only build: check allow_downloads from the model listing metadata.
+          const response = await fetch(`${inferenceApiUrl}/ai/v1/models`);
           if (response.ok) {
             const data = await response.json();
             setAllowDownloads(data.allow_downloads === true);
@@ -935,7 +935,7 @@ const ModelsPage: React.FC = () => {
       }
     };
     checkDownloads();
-  }, [apiUrl, termiteApiUrl]);
+  }, [apiUrl, inferenceApiUrl]);
 
   const filteredModels = useMemo(() => {
     return models.filter((model) => {
@@ -955,7 +955,7 @@ const ModelsPage: React.FC = () => {
   }, [models, searchQuery, selectedType]);
 
   const modelsByType = useMemo(() => {
-    const grouped: Record<ModelType, TermiteModel[]> = {
+    const grouped: Record<ModelType, InferenceModel[]> = {
       embedder: [],
       reranker: [],
       chunker: [],
@@ -994,7 +994,7 @@ const ModelsPage: React.FC = () => {
     return counts;
   }, [models]);
 
-  const handleModelClick = (model: TermiteModel) => {
+  const handleModelClick = (model: InferenceModel) => {
     setSelectedModel(model);
     setSheetOpen(true);
   };
@@ -1040,7 +1040,7 @@ const ModelsPage: React.FC = () => {
     return (
       <DashboardPage className="min-h-full items-center justify-center">
         <ErrorState
-          message="Could not load models from Termite. Check the runtime connection and try again."
+          message="Could not load models from Antfly inference. Check the runtime connection and try again."
           onRetry={retry}
         />
       </DashboardPage>
@@ -1051,10 +1051,10 @@ const ModelsPage: React.FC = () => {
     <DashboardPage>
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Model Directory</DashboardPageTitle>
+          <DashboardPageTitle className="font-aeonik">Models & Runtime</DashboardPageTitle>
           <DashboardPageDescription>
-            Browse {models.length} models reported by Termite. Models run locally through the Zig
-            runtime.
+            Browse {models.length} models reported by Antfly inference. Models run locally through
+            the Zig runtime.
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>

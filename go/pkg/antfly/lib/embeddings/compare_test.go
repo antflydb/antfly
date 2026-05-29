@@ -59,6 +59,40 @@ func getOllamaEmbedderB(b *testing.B) Embedder {
 	return emb
 }
 
+func getAntflyEmbedder(t *testing.T) Embedder {
+	t.Helper()
+	cfg := EmbedderConfig{Provider: EmbedderProviderAntfly}
+	if err := cfg.FromAntflyEmbedderConfig(AntflyEmbedderConfig{Model: "all-minilm"}); err != nil {
+		t.Fatalf("FromAntflyEmbedderConfig: %v", err)
+	}
+	emb, err := NewAntflyEmbedderFromConfig(cfg)
+	if err != nil {
+		t.Skipf("skipping: antfly inference embedder not available: %v", err)
+	}
+	_, err = emb.Embed(context.Background(), [][]ai.ContentPart{{ai.TextContent{Text: "probe"}}})
+	if err != nil {
+		t.Skipf("skipping: antfly inference embed probe failed: %v", err)
+	}
+	return emb
+}
+
+func getAntflyEmbedderB(b *testing.B) Embedder {
+	b.Helper()
+	cfg := EmbedderConfig{Provider: EmbedderProviderAntfly}
+	if err := cfg.FromAntflyEmbedderConfig(AntflyEmbedderConfig{Model: "all-minilm"}); err != nil {
+		b.Fatalf("FromAntflyEmbedderConfig: %v", err)
+	}
+	emb, err := NewAntflyEmbedderFromConfig(cfg)
+	if err != nil {
+		b.Skipf("skipping: antfly inference embedder not available: %v", err)
+	}
+	_, err = emb.Embed(context.Background(), [][]ai.ContentPart{{ai.TextContent{Text: "probe"}}})
+	if err != nil {
+		b.Skipf("skipping: antfly inference embed probe failed: %v", err)
+	}
+	return emb
+}
+
 func BenchmarkCompare_SingleEmbed(b *testing.B) {
 	contents := [][]ai.ContentPart{{ai.TextContent{Text: "hello world"}}}
 	ctx := context.Background()
@@ -223,4 +257,26 @@ func magnitude(v []float32) float64 {
 		sum += float64(x) * float64(x)
 	}
 	return math.Sqrt(sum)
+}
+
+func cosineSim(a, b []float32) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	var dot, magA, magB float64
+	for i := 0; i < n; i++ {
+		av := float64(a[i])
+		bv := float64(b[i])
+		dot += av * bv
+		magA += av * av
+		magB += bv * bv
+	}
+	if magA == 0 || magB == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(magA) * math.Sqrt(magB))
 }

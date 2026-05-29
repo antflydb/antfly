@@ -1200,7 +1200,7 @@ demoCategories.brand.demos = [
     slug: "wordmark",
     name: "Wordmark",
     description:
-      "Aeonik type-only identity, always bold. The Antfly family brands (Antfly, SearchAF, Termite) never use split weights.",
+      "Aeonik type-only identity, always bold. The Antfly family brands (Antfly, SearchAF, Antfly Inference) never use split weights.",
     render: () => (
       <div className="space-y-6">
         <div>
@@ -1208,7 +1208,7 @@ demoCategories.brand.demos = [
           <div className="flex flex-wrap items-baseline gap-8">
             <Wordmark className="text-lg">Antfly</Wordmark>
             <Wordmark className="text-2xl">SearchAF</Wordmark>
-            <Wordmark className="text-4xl">Termite</Wordmark>
+            <Wordmark className="text-4xl">Antfly Inference</Wordmark>
           </div>
         </div>
       </div>
@@ -1231,8 +1231,13 @@ demoCategories.brand.demos = [
         </Lockup>
 
         <Lockup>
-          <Logo src="/af-logo.svg" srcDark="/af-logo-dark.svg" alt="Termite" size="xl" />
-          <Wordmark className="text-4xl">Termite</Wordmark>
+          <Logo
+            src="/af-logo.svg"
+            srcDark="/af-logo-dark.svg"
+            alt="Antfly Inference"
+            size="xl"
+          />
+          <Wordmark className="text-4xl">Antfly Inference</Wordmark>
         </Lockup>
       </div>
     ),
@@ -1297,7 +1302,7 @@ demoCategories.brand.demos = [
               {
                 title: "Local ML Inference",
                 description:
-                  "Built-in Termite engine for embedding, reranking, and chunking. No external API calls.",
+                  "Built-in Antfly inference for embedding, reranking, and chunking. No external API calls.",
               },
               {
                 title: "Distributed by Design",

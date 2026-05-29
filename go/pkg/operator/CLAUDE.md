@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Kubernetes operator for deploying and managing Antfly database clusters and Termite ML pools. Built with Kubebuilder/controller-runtime. Supports GKE Autopilot and AWS EKS with Spot instances.
+Kubernetes operator for deploying and managing Antfly database clusters and Inference ML pools. Built with Kubebuilder/controller-runtime. Supports GKE Autopilot and AWS EKS with Spot instances.
 
 ## Commands
 
@@ -23,12 +23,12 @@ All Go commands use `GOWORK=off` (set in Makefile).
 
 Both deployed as StatefulSets with persistent volumes. Defaults applied in `controllers/antflycluster_controller.go` `applyDefaults()`.
 
-**CRDs:** AntflyCluster, AntflyBackup, AntflyRestore, TermitePool, TermiteRoute (defined in `api/antfly/v1/` and `api/termite/v1alpha1/`).
+**CRDs:** AntflyCluster, AntflyBackup, AntflyRestore, InferencePool, InferenceProxy (defined in `api/antfly/v1/` and `api/inference/v1alpha1/`).
 Startup CRD bootstrap installs all five CRDs unless `--skip-crd-install` is set,
-even when `--enable-termite-controllers=false`.
-`--enable-termite-controllers=false` disables TermitePool/TermiteRoute controllers
-and AntflyCluster `spec.termite` management, but it does not delete previously
-owned TermitePools. Admission webhooks are independently gated by the
+even when `--enable-inference-controllers=false`.
+`--enable-inference-controllers=false` disables InferencePool/InferenceProxy controllers
+and AntflyCluster `spec.inference` management, but it does not delete previously
+owned InferencePools. Admission webhooks are independently gated by the
 `ENABLE_WEBHOOKS` environment variable.
 
 **Reconciliation order** (`controllers/antflycluster_controller.go`):
@@ -40,12 +40,12 @@ owned TermitePools. Admission webhooks are independently gated by the
 ```
 cmd/antfly-operator/main.go    # Integrated operator entrypoint
 api/antfly/v1/                 # Antfly CRD types, webhooks, deepcopy
-api/termite/v1alpha1/          # Termite CRD types, webhooks, deepcopy
+api/inference/v1alpha1/          # Inference CRD types, webhooks, deepcopy
 controllers/antfly/            # Antfly reconcilers + autoscaler
-controllers/termite/           # Termite reconcilers
+controllers/inference/           # Inference reconcilers
 bootstrap/antfly/              # CRD self-installation at startup
-webhook/{antfly,termite}/      # Webhook setup packages
-internal/webhook/{antfly,termite}/ # Webhook validator implementations
+webhook/{antfly,inference}/      # Webhook setup packages
+internal/webhook/{antfly,inference}/ # Webhook validator implementations
 manifests/                     # Shared embedded CRD/RBAC YAML (go:embed)
 config/manager/                # Deployment manifest
 examples/                      # Sample cluster YAMLs
@@ -66,7 +66,7 @@ docs/                          # User-facing documentation
 - EKS: Spot node selectors, tolerations, IRSA annotations — triggered by `spec.eks.enabled: true`
 - Cannot enable both GKE Autopilot and EKS simultaneously (webhook-enforced)
 
-**Webhook validation** (`api/v1/antflycluster_webhook.go`): Enforces immutability, enum validation, conflict detection, and managed `spec.termite` validation. Controller has fallback validation with exponential backoff if webhook disabled.
+**Webhook validation** (`api/v1/antflycluster_webhook.go`): Enforces immutability, enum validation, conflict detection, and managed `spec.inference` validation. Controller has fallback validation with exponential backoff if webhook disabled.
 
 ## Autoscaling
 

@@ -6,7 +6,9 @@ go 1.26.0
 // kin-openapi v0.134.0 breaks oapi-codegen (MappingRef type change) and
 // oasdiff/yaml v0.0.1 breaks kin-openapi v0.133.0 (OriginOpt API change).
 replace (
+	github.com/antflydb/antfly/go/pkg/generating => ../generating
 	github.com/antflydb/antfly/go/pkg/libaf => ../libaf
+	github.com/dprotaso/go-yit v0.0.0-20250909171706-0a81c39169bc => github.com/dprotaso/go-yit v0.0.0-20250513224043-18a80f8f6df4
 	github.com/getkin/kin-openapi v0.134.0 => github.com/getkin/kin-openapi v0.133.0
 	github.com/gomlx/gomlx => github.com/ajroetker/gomlx v0.0.0-antfly011
 	github.com/gomlx/onnx-gomlx => github.com/ajroetker/onnx-gomlx v0.0.0-antfly011
@@ -18,6 +20,7 @@ replace (
 
 require (
 	github.com/ajroetker/go-highway v0.0.13-0.20260309234436-8d249c4caa48
+	github.com/antflydb/antfly/go/pkg/generating v0.0.0
 	github.com/antflydb/antfly/go/pkg/libaf v0.0.1
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/daulet/tokenizers v1.26.0
@@ -49,7 +52,7 @@ require (
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
-	github.com/dprotaso/go-yit v0.0.0-20250513224043-18a80f8f6df4 // indirect
+	github.com/dprotaso/go-yit v0.0.0-20250909171706-0a81c39169bc // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect

@@ -77,7 +77,7 @@ func TestAPIHandlerServesRootOperationalRoutesOutsideMLPrefix(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code, path)
 	}
 
-	for _, path := range []string{"/ml/v1/healthz", "/ml/v1/readyz"} {
+	for _, path := range []string{"/ai/v1/healthz", "/ai/v1/readyz"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
@@ -91,12 +91,7 @@ func TestAPIMLHandlerDoesNotExposeOperationalRoutes(t *testing.T) {
 	}
 	handler := node.APIMLHandler()
 
-	versionReq := httptest.NewRequest(http.MethodGet, "/ml/v1/version", nil)
-	versionRec := httptest.NewRecorder()
-	handler.ServeHTTP(versionRec, versionReq)
-	require.Equal(t, http.StatusOK, versionRec.Code)
-
-	for _, path := range []string{"/healthz", "/readyz", "/ml/v1/healthz", "/ml/v1/readyz"} {
+	for _, path := range []string{"/healthz", "/readyz", "/ai/v1/healthz", "/ai/v1/readyz", "/ai/v1/version"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
@@ -130,7 +125,7 @@ func TestTermiteNode_HandleApiEmbed_NoRegistry(t *testing.T) {
 	body, err := json.Marshal(reqBody)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("POST", "/ml/v1/embed", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/ai/v1/embed", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -149,7 +144,7 @@ func TestTermiteNode_HandleApiEmbed_InvalidRequest(t *testing.T) {
 	handler := NewTermiteAPI(logger, node)
 
 	// Test invalid JSON - should return 503 (registry check first) or 400
-	req := httptest.NewRequest("POST", "/ml/v1/embed", bytes.NewReader([]byte("invalid json")))
+	req := httptest.NewRequest("POST", "/ai/v1/embed", bytes.NewReader([]byte("invalid json")))
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	assert.True(t, w.Code == http.StatusServiceUnavailable || w.Code == http.StatusBadRequest)
@@ -259,7 +254,7 @@ func TestTermiteNode_HandleApiRerank_Success(t *testing.T) {
 	body, err := json.Marshal(reqBody)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("POST", "/ml/v1/rerank", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/ai/v1/rerank", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -323,7 +318,7 @@ func TestTermiteNode_HandleApiRerank_NotAvailable(t *testing.T) {
 	body, err := json.Marshal(reqBody)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("POST", "/ml/v1/rerank", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/ai/v1/rerank", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -409,7 +404,7 @@ func TestTermiteNode_HandleApiRerank_InvalidRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("POST", "/ml/v1/rerank", bytes.NewReader([]byte(tt.body)))
+			req := httptest.NewRequest("POST", "/ai/v1/rerank", bytes.NewReader([]byte(tt.body)))
 			req.Header.Set("Content-Type", "application/json")
 
 			w := httptest.NewRecorder()
@@ -571,7 +566,7 @@ func TestTermiteNode_ListModels_IncludesAllRegistries(t *testing.T) {
 	}
 	handler := NewTermiteAPI(logger, node)
 
-	req := httptest.NewRequest("GET", "/ml/v1/models", nil)
+	req := httptest.NewRequest("GET", "/ai/v1/models", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
@@ -608,7 +603,7 @@ func TestTermiteNode_ListModels_EmptyRegistries(t *testing.T) {
 	}
 	handler := NewTermiteAPI(logger, node)
 
-	req := httptest.NewRequest("GET", "/ml/v1/models", nil)
+	req := httptest.NewRequest("GET", "/ai/v1/models", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
@@ -640,7 +635,7 @@ func TestTermiteNode_ListModels_OnlyRerankers(t *testing.T) {
 	}
 	handler := NewTermiteAPI(logger, node)
 
-	req := httptest.NewRequest("GET", "/ml/v1/models", nil)
+	req := httptest.NewRequest("GET", "/ai/v1/models", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
@@ -654,199 +649,4 @@ func TestTermiteNode_ListModels_OnlyRerankers(t *testing.T) {
 	assert.Contains(t, resp.Rerankers, "antfly-builtin-reranker")
 	assert.Empty(t, resp.Embedders)
 	assert.Empty(t, resp.Recognizers)
-}
-
-func TestTermiteNode_HandleApiNER_Success(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-
-	// Create mock NER model
-	mockNER := &MockNER{
-		recognizeFunc: func(ctx context.Context, texts []string) ([][]ner.Entity, error) {
-			results := make([][]ner.Entity, len(texts))
-			for i := range texts {
-				results[i] = []ner.Entity{
-					{Text: "John Smith", Label: "PER", Start: 0, End: 10, Score: 0.99},
-					{Text: "Google", Label: "ORG", Start: 20, End: 26, Score: 0.98},
-				}
-			}
-			return results, nil
-		},
-	}
-
-	// Create mock registry with the mock NER model
-	mockRegistry := &MockNERRegistry{
-		models: map[string]ner.Model{
-			"bert-base-ner": mockNER,
-		},
-	}
-
-	// Create Termite node with NER registry
-	node := &TermiteNode{
-		logger:      logger,
-		nerRegistry: mockRegistry,
-		requestQueue: NewRequestQueue(RequestQueueConfig{
-			MaxConcurrentRequests: 10,
-			MaxQueueSize:          100,
-		}, logger.Named("queue")),
-		nerCache: NewResultCache[[][]ner.Entity]("NER", 2*time.Minute, logger.Named("ner-cache")),
-	}
-
-	// Create NER request
-	reqBody := struct {
-		Model string   `json:"model"`
-		Texts []string `json:"texts"`
-	}{
-		Model: "bert-base-ner",
-		Texts: []string{
-			"John Smith works at Google.",
-			"Apple Inc. is in Cupertino.",
-		},
-	}
-	body, err := json.Marshal(reqBody)
-	require.NoError(t, err)
-
-	req := httptest.NewRequest("POST", "/internal/recognize", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	w := httptest.NewRecorder()
-	node.handleApiRecognize(w, req)
-
-	// Should return 200 OK
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	// Decode response
-	var resp struct {
-		Model    string              `json:"model"`
-		Entities [][]RecognizeEntity `json:"entities"`
-	}
-	err = json.NewDecoder(w.Body).Decode(&resp)
-	require.NoError(t, err)
-
-	// Verify response
-	assert.Equal(t, "bert-base-ner", resp.Model)
-	assert.Len(t, resp.Entities, 2)
-	assert.Len(t, resp.Entities[0], 2)
-	assert.Equal(t, "John Smith", resp.Entities[0][0].Text)
-	assert.Equal(t, "PER", resp.Entities[0][0].Label)
-	assert.Equal(t, "Google", resp.Entities[0][1].Text)
-	assert.Equal(t, "ORG", resp.Entities[0][1].Label)
-
-	// Verify mock was called
-	assert.Equal(t, int32(1), mockNER.GetCallCount())
-}
-
-func TestTermiteNode_HandleApiNER_NotAvailable(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-
-	// Create Termite node without NER registry
-	node := &TermiteNode{
-		logger:      logger,
-		nerRegistry: nil, // No NER configured
-	}
-
-	// Create NER request
-	reqBody := struct {
-		Model string   `json:"model"`
-		Texts []string `json:"texts"`
-	}{
-		Model: "bert-base-ner",
-		Texts: []string{"Test text"},
-	}
-	body, err := json.Marshal(reqBody)
-	require.NoError(t, err)
-
-	req := httptest.NewRequest("POST", "/internal/recognize", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	w := httptest.NewRecorder()
-	node.handleApiRecognize(w, req)
-
-	// Should return 503 Service Unavailable
-	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
-	assert.Contains(t, w.Body.String(), "NER not available")
-}
-
-func TestTermiteNode_HandleApiNER_InvalidRequest(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-
-	// Create mock NER model
-	mockNER := &MockNER{}
-	mockRegistry := &MockNERRegistry{
-		models: map[string]ner.Model{
-			"bert-base-ner": mockNER,
-		},
-	}
-
-	node := &TermiteNode{
-		logger:      logger,
-		nerRegistry: mockRegistry,
-		requestQueue: NewRequestQueue(RequestQueueConfig{
-			MaxConcurrentRequests: 10,
-			MaxQueueSize:          100,
-		}, logger.Named("queue")),
-		nerCache: NewResultCache[[][]ner.Entity]("NER", 2*time.Minute, logger.Named("ner-cache")),
-	}
-
-	tests := []struct {
-		name       string
-		body       string
-		wantStatus int
-		wantError  string
-	}{
-		{
-			name:       "invalid JSON",
-			body:       "invalid json",
-			wantStatus: http.StatusBadRequest,
-			wantError:  "",
-		},
-		{
-			name: "missing model",
-			body: `{
-				"texts": ["test"]
-			}`,
-			wantStatus: http.StatusBadRequest,
-			wantError:  "model is required",
-		},
-		{
-			name: "missing texts",
-			body: `{
-				"model": "bert-base-ner"
-			}`,
-			wantStatus: http.StatusBadRequest,
-			wantError:  "texts are required",
-		},
-		{
-			name: "empty texts",
-			body: `{
-				"model": "bert-base-ner",
-				"texts": []
-			}`,
-			wantStatus: http.StatusBadRequest,
-			wantError:  "texts are required",
-		},
-		{
-			name: "model not found",
-			body: `{
-				"model": "nonexistent-model",
-				"texts": ["test"]
-			}`,
-			wantStatus: http.StatusNotFound,
-			wantError:  "model not found",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("POST", "/internal/recognize", bytes.NewReader([]byte(tt.body)))
-			req.Header.Set("Content-Type", "application/json")
-
-			w := httptest.NewRecorder()
-			node.handleApiRecognize(w, req)
-
-			assert.Equal(t, tt.wantStatus, w.Code)
-			if tt.wantError != "" {
-				assert.Contains(t, w.Body.String(), tt.wantError)
-			}
-		})
-	}
 }

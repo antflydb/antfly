@@ -13,7 +13,7 @@ testpaths = ["."]
 addopts = "-v"
 markers = [
     "objectstore_integration: requires real S3 or GCS objectstore credentials and buckets",
-    "swarm_integration: requires local antfly swarm plus a live termite generator model",
+    "swarm_integration: requires local antfly swarm plus a live inference generator model",
     "real_model: requires local or downloadable model weights",
     "postgres_integration: requires a local PostgreSQL instance",
     "slow: marks tests that are too long-running for required E2E base CI",
