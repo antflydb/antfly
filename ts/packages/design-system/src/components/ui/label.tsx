@@ -10,7 +10,12 @@ function Label({ className, ...props }: React.ComponentProps<typeof LabelPrimiti
     <LabelPrimitive.Root
       data-slot="label"
       className={cn(
-        "flex items-center gap-2 text-sm leading-none font-semibold text-foreground select-none group-data-[disabled=true]:pointer-events-none group-data-[disabled=true]:opacity-50 peer-disabled:cursor-not-allowed peer-disabled:opacity-50",
+        // mono-label voice — same family as table headers and section eyebrows
+        "font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground",
+        "leading-none select-none",
+        "flex items-center gap-2",
+        "group-data-[disabled=true]:pointer-events-none group-data-[disabled=true]:opacity-50",
+        "peer-disabled:cursor-not-allowed peer-disabled:opacity-50",
         className
       )}
       {...props}

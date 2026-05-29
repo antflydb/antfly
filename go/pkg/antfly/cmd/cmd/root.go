@@ -43,7 +43,7 @@ var rootCmd = &cobra.Command{
 - store: Run as a data storage node (default)
 - metadata: Run as a metadata server to manage cluster metadata
 - swarm: Run as both metadata and raft services
-- termite: Run in termite mode for specialized operations
+- inference: Run the inference runtime
 
 Each mode has its own set of configuration options. Use 'antfly [mode] --help' for mode-specific options.`,
 	SilenceUsage: true,
@@ -98,8 +98,8 @@ func init() {
 		viper.SetDefault("log_style", "logfmt")
 	}
 
-	// Termite defaults
-	viper.SetDefault("termite.models_dir", common.DefaultModelsDir())
+	// Inference defaults
+	viper.SetDefault("inference.models_dir", common.DefaultModelsDir())
 }
 
 // initConfig reads in config file and ENV variables if set.

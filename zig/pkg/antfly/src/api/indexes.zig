@@ -366,12 +366,16 @@ fn appendIndexStatus(
         embeddingsIsSparse(config)
     else
         false;
+    const graph_source_status = if (index_type == .graph)
+        graphSourceStatus(config)
+    else
+        null;
     try out.appendSlice(alloc, "{\"config\":");
     try appendIndexConfig(alloc, out, index_name, config);
     try out.appendSlice(alloc, ",\"status\":");
-    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_require_table_coverage, embeddings_sparse, expected_group_ids, local_statuses, false);
+    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, expected_group_ids, local_statuses, false);
     try out.appendSlice(alloc, ",\"shard_status\":");
-    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_require_table_coverage, embeddings_sparse, expected_group_ids, local_statuses, true);
+    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, expected_group_ids, local_statuses, true);
     try out.append(alloc, '}');
 }
 
@@ -442,6 +446,33 @@ fn embeddingsIsSparse(config: std.json.Value) bool {
     };
 }
 
+const GraphSourceStatus = struct {
+    artifact: []const u8,
+    path: []const u8 = "",
+    format: []const u8 = "extraction_relation",
+};
+
+fn graphSourceStatus(config: std.json.Value) ?GraphSourceStatus {
+    if (config != .object) return null;
+    const source = config.object.get("source") orelse return null;
+    if (source != .object) return null;
+    const kind = source.object.get("kind") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "artifact")) return null;
+    const artifact = source.object.get("artifact") orelse return null;
+    if (artifact != .string or artifact.string.len == 0) return null;
+    return .{
+        .artifact = artifact.string,
+        .path = if (source.object.get("path")) |value| switch (value) {
+            .string => value.string,
+            else => "",
+        } else "",
+        .format = if (source.object.get("format")) |value| switch (value) {
+            .string => value.string,
+            else => "extraction_relation",
+        } else "extraction_relation",
+    };
+}
+
 fn indexTypeName(index_type: ApiIndexType) []const u8 {
     return switch (index_type) {
         .full_text => "full_text",
@@ -508,6 +539,7 @@ fn appendIndexRuntimeStatus(
     index_type: ApiIndexType,
     embeddings_require_table_coverage: bool,
     embeddings_sparse: bool,
+    graph_source_status: ?GraphSourceStatus,
     expected_group_ids: []const u64,
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
     shard_view: bool,
@@ -539,7 +571,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
             }
         }
         if (expected_group_ids.len > 0) {
@@ -552,7 +584,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_require_table_coverage, embeddings_sparse, .{}, null, .{
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, .{}, null, .{
                     .source = .synthetic_config,
                     .freshness = .missing,
                 }, false);
@@ -572,7 +604,7 @@ fn appendIndexRuntimeStatus(
         try out.appendSlice(alloc, "{}");
         return;
     };
-    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, null, item.runtime_present);
+    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, null, item.runtime_present);
 }
 
 const AggregatedIndexStatus = struct {
@@ -1059,6 +1091,7 @@ fn appendSingleIndexRuntimeStatus(
     table_doc_count: u64,
     embeddings_require_table_coverage: bool,
     embeddings_sparse: bool,
+    graph_source_status: ?GraphSourceStatus,
     async_indexing: db_mod.types.AsyncIndexingStats,
     enrichment: ?db_mod.types.EnrichmentStats,
     metadata: ?runtime_status.RuntimeStatusMetadata,
@@ -1179,6 +1212,23 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"result_nodes\":");
         try appendIntValue(alloc, out, item.algebraic_graph_traversal_result_node_count);
         try out.appendSlice(alloc, "}}");
+        if (graph_source_status) |source| {
+            try out.appendSlice(alloc, ",\"source_artifact\":{");
+            try appendJsonString(alloc, out, "name");
+            try out.append(alloc, ':');
+            try appendJsonString(alloc, out, source.artifact);
+            try out.append(alloc, ',');
+            try appendJsonString(alloc, out, "path");
+            try out.append(alloc, ':');
+            try appendJsonString(alloc, out, source.path);
+            try out.append(alloc, ',');
+            try appendJsonString(alloc, out, "format");
+            try out.append(alloc, ':');
+            try appendJsonString(alloc, out, source.format);
+            try out.appendSlice(alloc, ",\"materialization_pending\":");
+            try out.appendSlice(alloc, if (catch_up_active or replay_catch_up_required) "true" else "false");
+            try out.append(alloc, '}');
+        }
     }
     if (index_type == .algebraic) try appendAlgebraicIndexStatsFields(alloc, out, item);
     try out.appendSlice(alloc, ",\"replay_applied_sequence\":");
@@ -1833,6 +1883,53 @@ test "index encoders expose algebraic graph traversal health" {
     defer alloc.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_edges\":12") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"algebraic_graph\":{\"traversal\":{\"attempted\":3,\"proven\":2,\"rejected\":1,\"fallback\":4,\"result_nodes\":9}}") != null);
+}
+
+test "index encoders expose graph artifact source materialization status" {
+    const alloc = std.testing.allocator;
+    const indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
+    defer alloc.free(indexes);
+    indexes[0] = .{
+        .name = try alloc.dupe(u8, "relations_graph"),
+        .kind = .graph,
+        .edge_count = 4,
+        .replay_applied_sequence = 3,
+        .replay_target_sequence = 5,
+        .replay_catch_up_required = true,
+    };
+    defer alloc.free(indexes[0].name);
+
+    const local_items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    defer alloc.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .stats = .{
+            .doc_count = 2,
+            .index_count = 1,
+            .indexes = indexes,
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\"}}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "relations_graph", &local_status)).?;
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifact\":{\"name\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\",\"materialization_pending\":true}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
 }
 
 test "index encoders expose compact algebraic public status" {

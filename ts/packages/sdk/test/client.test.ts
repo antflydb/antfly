@@ -60,11 +60,13 @@ describe("AntflyClient", () => {
     it("should normalize local and CloudAF base URLs", () => {
       expect(normalizeBaseUrl("http://localhost:8080")).toBe("http://localhost:8080");
       expect(normalizeBaseUrl("http://localhost:8080/")).toBe("http://localhost:8080");
-      expect(normalizeBaseUrl("http://localhost:8080/api/v1")).toBe("http://localhost:8080");
+      expect(normalizeBaseUrl("http://localhost:8080/db/v1")).toBe("http://localhost:8080");
+      expect(normalizeBaseUrl("http://localhost:8080/auth/v1")).toBe("http://localhost:8080");
+      expect(normalizeBaseUrl("http://localhost:8080/ai/v1")).toBe("http://localhost:8080");
       expect(normalizeBaseUrl("https://platform.antfly.io/cloud/v1/instance")).toBe(
         "https://platform.antfly.io/cloud/v1/instance"
       );
-      expect(normalizeBaseUrl("https://platform.antfly.io/cloud/v1/instance/api/v1")).toBe(
+      expect(normalizeBaseUrl("https://platform.antfly.io/cloud/v1/instance/db/v1")).toBe(
         "https://platform.antfly.io/cloud/v1/instance"
       );
     });
@@ -113,7 +115,7 @@ describe("AntflyClient", () => {
 
       const result = await client.query(request);
       expect(result).toEqual(mockResponse.responses[0]);
-      expect(mockPost).toHaveBeenCalledWith("/api/v1/query", {
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/query", {
         body: request,
       });
     });
@@ -151,7 +153,7 @@ describe("AntflyClient", () => {
 
       const result = await client.query(request);
       expect(result?.hits?.total).toBe(2);
-      expect(mockPost).toHaveBeenCalledWith("/api/v1/query", {
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/query", {
         body: request,
       });
     });
@@ -181,7 +183,7 @@ describe("AntflyClient", () => {
 
       const tables = await client.tables.list();
       expect(tables).toEqual(mockTables);
-      expect(mockGet).toHaveBeenCalledWith("/api/v1/tables", {
+      expect(mockGet).toHaveBeenCalledWith("/db/v1/tables", {
         params: undefined,
       });
     });
@@ -205,7 +207,7 @@ describe("AntflyClient", () => {
 
       const result = await client.tables.create("new_table", config);
       expect(result).toEqual(mockTable);
-      expect(mockPost).toHaveBeenCalledWith("/api/v1/tables/{tableName}", {
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/tables/{tableName}", {
         params: { path: { tableName: "new_table" } },
         body: config,
       });
@@ -239,7 +241,7 @@ describe("AntflyClient", () => {
 
       const result = await client.tables.query("products", request);
       expect(result).toEqual(mockResponse);
-      expect(mockPost).toHaveBeenCalledWith("/api/v1/tables/{tableName}/query", {
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName: "products" } },
         body: request,
       });
@@ -260,7 +262,7 @@ describe("AntflyClient", () => {
 
       const result = await client.tables.lookup("users", "user:123");
       expect(result).toEqual(mockDocument);
-      expect(mockGet).toHaveBeenCalledWith("/api/v1/tables/{tableName}/lookup/{key}", {
+      expect(mockGet).toHaveBeenCalledWith("/db/v1/tables/{tableName}/lookup/{key}", {
         params: {
           path: { tableName: "users", key: "user:123" },
           query: undefined,
@@ -284,7 +286,7 @@ describe("AntflyClient", () => {
         fields: "name,email",
       });
       expect(result).toEqual(mockDocument);
-      expect(mockGet).toHaveBeenCalledWith("/api/v1/tables/{tableName}/lookup/{key}", {
+      expect(mockGet).toHaveBeenCalledWith("/db/v1/tables/{tableName}/lookup/{key}", {
         params: {
           path: { tableName: "users", key: "user:123" },
           query: { fields: "name,email" },
@@ -359,7 +361,7 @@ describe("AntflyClient", () => {
       expect(results[2]).toEqual({ _key: "user:3", name: "Charlie" });
 
       expect(mockFetch).toHaveBeenCalledWith(
-        "http://localhost:8080/api/v1/tables/users/lookup",
+        "http://localhost:8080/db/v1/tables/users/lookup",
         expect.objectContaining({
           method: "POST",
           body: "{}",
@@ -392,7 +394,7 @@ describe("AntflyClient", () => {
       expect(results).toHaveLength(2);
 
       expect(mockFetch).toHaveBeenCalledWith(
-        "http://localhost:8080/api/v1/tables/users/lookup",
+        "http://localhost:8080/db/v1/tables/users/lookup",
         expect.objectContaining({
           method: "POST",
           body: JSON.stringify({

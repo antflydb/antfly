@@ -1,19 +1,19 @@
 import { AntflyClient } from "./client.js";
-import { TermiteClient } from "./termite-client.js";
+import { InferenceClient } from "./inference-client.js";
 import type { AntflyConfig } from "./types.js";
 
 export interface SDKConfig extends AntflyConfig {
-  termiteBaseUrl?: string;
+  inferenceBaseUrl?: string;
 }
 
 export class Client {
   private readonly antflyClient: AntflyClient;
-  private readonly termiteClient: TermiteClient;
+  private readonly inferenceClient: InferenceClient;
 
   constructor(config: SDKConfig) {
     this.antflyClient = new AntflyClient(config);
-    this.termiteClient = new TermiteClient({
-      baseUrl: config.termiteBaseUrl ?? config.baseUrl,
+    this.inferenceClient = new InferenceClient({
+      baseUrl: config.inferenceBaseUrl ?? config.baseUrl,
       headers: config.headers,
     });
   }
@@ -22,15 +22,15 @@ export class Client {
     return this.antflyClient;
   }
 
-  Termite(): TermiteClient {
-    return this.termiteClient;
+  Inference(): InferenceClient {
+    return this.inferenceClient;
   }
 
   get antfly(): AntflyClient {
     return this.antflyClient;
   }
 
-  get termite(): TermiteClient {
-    return this.termiteClient;
+  get inference(): InferenceClient {
+    return this.inferenceClient;
   }
 }

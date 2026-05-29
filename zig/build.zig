@@ -17,7 +17,7 @@ const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
 const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
-const termite_runtime_build = @import("pkg/termite/build/runtime.zig");
+const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
 
 const LmdbBackend = antfly_storage_build.LmdbBackend;
 const chainLabeledFilteredTests = antfly_tests_build.chainLabeledFilteredTests;
@@ -29,6 +29,11 @@ const makeLmdbEngineModule = antfly_storage_build.makeLmdbEngineModule;
 const makeLmdbModule = antfly_storage_build.makeLmdbModule;
 const makeRootBuildOptions = antfly_storage_build.makeRootBuildOptions;
 const selectTestFilters = antfly_tests_build.selectTestFilters;
+
+const BuildEdition = enum {
+    full,
+    inference,
+};
 
 const snowball_languages = [_][]const u8{
     "danish",
@@ -91,7 +96,34 @@ fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const
     return run;
 }
 
-const termite_delegated_steps = [_][]const u8{
+const openapi_join_input_paths = [_][]const u8{
+    "../scripts/join_openapi.py",
+    "../scripts/openapi_joiner.py",
+    "../specs/openapi/antfly/audio.yaml",
+    "../specs/openapi/antfly/chunking.yaml",
+    "../specs/openapi/antfly/config.yaml",
+    "../specs/openapi/antfly/embeddings.yaml",
+    "../specs/openapi/antfly/eval.yaml",
+    "../specs/openapi/antfly/generating.yaml",
+    "../specs/openapi/antfly/metadata.yaml",
+    "../specs/openapi/antfly/query.yaml",
+    "../specs/openapi/antfly/reranking.yaml",
+    "../specs/openapi/antfly/websearch.yaml",
+    "../specs/openapi/auth/api.yaml",
+    "../specs/openapi/inference/api.yaml",
+    "../specs/openapi/inference/config.yaml",
+    "../specs/openapi/shared/generating.yaml",
+    "../specs/openapi/antfly/schema.yaml",
+    "../specs/openapi/antfly/indexes.yaml",
+};
+
+fn addOpenApiJoinInputs(b: *std.Build, run: *std.Build.Step.Run) void {
+    for (openapi_join_input_paths) |path| {
+        run.addFileInput(b.path(path));
+    }
+}
+
+const inference_delegated_steps = [_][]const u8{
     "run",
     "finetune",
     "bench-paged-attention",
@@ -110,9 +142,8 @@ const DelegatedPackageStep = struct {
     step: *std.Build.Step,
 };
 
-const DelegatedTermiteBuildSteps = struct {
-    termite_install: *std.Build.Step,
-    termite_test: *std.Build.Step,
+const DelegatedInferenceBuildSteps = struct {
+    inference_test: *std.Build.Step,
 };
 
 fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) void {
@@ -152,7 +183,7 @@ fn forwardBuildArgs(b: *std.Build, run: *std.Build.Step.Run) void {
     }
 }
 
-fn addDelegatedTermiteOptions(
+fn addDelegatedInferenceOptions(
     b: *std.Build,
     run: *std.Build.Step.Run,
     enable_mlx: bool,
@@ -192,7 +223,7 @@ fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
     return &run.step;
 }
 
-fn addDelegatedTermiteBuildSteps(
+fn addDelegatedInferenceBuildSteps(
     b: *std.Build,
     enable_mlx: bool,
     mlx_root: ?[]const u8,
@@ -203,32 +234,19 @@ fn addDelegatedTermiteBuildSteps(
     cuda_artifacts: []const u8,
     enable_system_blas: bool,
     blas_root: ?[]const u8,
-) DelegatedTermiteBuildSteps {
+) DelegatedInferenceBuildSteps {
     var test_step: ?*std.Build.Step = null;
-    for (termite_delegated_steps) |step_name| {
-        const delegated = addDelegatedPackageStep(b, "termite", "pkg/termite", step_name, "pkg/termite");
+    for (inference_delegated_steps) |step_name| {
+        const delegated = addDelegatedPackageStep(b, "inference", "pkg/inference", step_name, "pkg/inference");
         const run = delegated.run;
-        addDelegatedTermiteOptions(b, run, enable_mlx, mlx_root, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
+        addDelegatedInferenceOptions(b, run, enable_mlx, mlx_root, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
         forwardBuildArgs(b, run);
         if (std.mem.eql(u8, step_name, "test")) {
             test_step = delegated.step;
         }
     }
-    const install_run = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "build",
-        "install",
-        "--prefix",
-        b.install_path,
-    });
-    install_run.setCwd(b.path("pkg/termite"));
-    addDelegatedTermiteOptions(b, install_run, enable_mlx, mlx_root, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
-    forwardBuildArgs(b, install_run);
-    const termite_install_step = b.step("install-termite", "Build and install the top-level Termite CLI");
-    termite_install_step.dependOn(&install_run.step);
     return .{
-        .termite_install = termite_install_step,
-        .termite_test = test_step.?,
+        .inference_test = test_step.?,
     };
 }
 
@@ -257,7 +275,7 @@ fn detectMlxRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 {
     return null;
 }
 
-fn defaultTermiteOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
+fn defaultInferenceOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
     const platform_str = switch (target.result.os.tag) {
         .macos => "darwin",
         .linux => "linux",
@@ -268,7 +286,7 @@ fn defaultTermiteOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []con
         .x86_64 => "amd64",
         else => "unknown",
     };
-    return b.fmt("pkg/termite/onnxruntime/{s}-{s}", .{ platform_str, arch_str });
+    return b.fmt("pkg/inference/onnxruntime/{s}-{s}", .{ platform_str, arch_str });
 }
 
 fn detectFfmpegPaths(b: *std.Build, target: std.Build.ResolvedTarget) ?FfmpegPaths {
@@ -343,7 +361,7 @@ fn addLocalSentencePieceProtoModule(
     const fixup_tool = b.addExecutable(.{
         .name = "patch_sentencepiece_proto",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/termite/tools/patch_sentencepiece_proto.zig"),
+            .root_source_file = b.path("pkg/inference/tools/patch_sentencepiece_proto.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
         }),
@@ -405,7 +423,7 @@ const AntflyRootImports = struct {
     client_openapi: *std.Build.Module,
     schema_openapi: *std.Build.Module,
     indexes_openapi: *std.Build.Module,
-    ai_openapi: *std.Build.Module,
+    generating_api_openapi: *std.Build.Module,
     eval_openapi: *std.Build.Module,
     query_openapi: *std.Build.Module,
     metadata_openapi: *std.Build.Module,
@@ -416,7 +434,7 @@ const AntflyRootImports = struct {
     scraping_openapi: *std.Build.Module,
     scraping: *std.Build.Module,
     s3_openapi: *std.Build.Module,
-    termite_config_openapi: *std.Build.Module,
+    inference_config_openapi: *std.Build.Module,
     chunking_api_openapi: *std.Build.Module,
     chunking_openapi: *std.Build.Module,
     chunking: *std.Build.Module,
@@ -425,9 +443,13 @@ const AntflyRootImports = struct {
     common_openapi: *std.Build.Module,
     generating_openapi: *std.Build.Module,
     reranking_openapi: *std.Build.Module,
+    extraction_openapi: *std.Build.Module,
     transcribing: *std.Build.Module,
+    readers: *std.Build.Module,
+    extracting: *std.Build.Module,
     synthesizing: *std.Build.Module,
     httpx: *std.Build.Module,
+    google: *std.Build.Module,
     objectstore: *std.Build.Module,
     bloom: *std.Build.Module,
     vector: *std.Build.Module,
@@ -441,16 +463,16 @@ const AntflyRootImports = struct {
     a2a: *std.Build.Module,
     generating: *std.Build.Module,
     reranking: *std.Build.Module,
-    termite_api: *std.Build.Module,
-    termite_hf_tokenizer: *std.Build.Module,
-    termite_fixed_tokenizer_data: *std.Build.Module,
-    termite_chunker: *std.Build.Module,
+    inference_api: *std.Build.Module,
+    inference_hf_tokenizer: *std.Build.Module,
+    inference_fixed_tokenizer_data: *std.Build.Module,
+    inference_chunker: *std.Build.Module,
     image: *std.Build.Module,
     font: *std.Build.Module,
     pdf: *std.Build.Module,
     openai_api: *std.Build.Module,
     handlebars: *std.Build.Module,
-    termite_server: *std.Build.Module,
+    inference_server: *std.Build.Module,
     prometheus: *std.Build.Module,
     structlog: *std.Build.Module,
     platform: *std.Build.Module,
@@ -462,7 +484,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_client_openapi", .field = "client_openapi" },
         .{ .name = "antfly_schema_openapi", .field = "schema_openapi" },
         .{ .name = "antfly_indexes_openapi", .field = "indexes_openapi" },
-        .{ .name = "antfly_ai_openapi", .field = "ai_openapi" },
+        .{ .name = "antfly_generating_api_openapi", .field = "generating_api_openapi" },
         .{ .name = "antfly_eval_openapi", .field = "eval_openapi" },
         .{ .name = "antfly_query_openapi", .field = "query_openapi" },
         .{ .name = "antfly_metadata_openapi", .field = "metadata_openapi" },
@@ -473,7 +495,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_scraping_openapi", .field = "scraping_openapi" },
         .{ .name = "antfly_scraping", .field = "scraping" },
         .{ .name = "antfly_s3_openapi", .field = "s3_openapi" },
-        .{ .name = "antfly_termite_config_openapi", .field = "termite_config_openapi" },
+        .{ .name = "antfly_inference_config_openapi", .field = "inference_config_openapi" },
         .{ .name = "antfly_chunking_api_openapi", .field = "chunking_api_openapi" },
         .{ .name = "antfly_chunking_openapi", .field = "chunking_openapi" },
         .{ .name = "antfly_chunking", .field = "chunking" },
@@ -482,9 +504,13 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_common_openapi", .field = "common_openapi" },
         .{ .name = "antfly_generating_openapi", .field = "generating_openapi" },
         .{ .name = "antfly_reranking_openapi", .field = "reranking_openapi" },
+        .{ .name = "antfly_extraction_openapi", .field = "extraction_openapi" },
         .{ .name = "antfly_transcribing", .field = "transcribing" },
+        .{ .name = "antfly_readers", .field = "readers" },
+        .{ .name = "antfly_extracting", .field = "extracting" },
         .{ .name = "antfly_synthesizing", .field = "synthesizing" },
         .{ .name = "httpx", .field = "httpx" },
+        .{ .name = "antfly_google", .field = "google" },
         .{ .name = "objectstore", .field = "objectstore" },
         .{ .name = "bloom", .field = "bloom" },
         .{ .name = "antfly_vector", .field = "vector" },
@@ -498,16 +524,16 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_a2a", .field = "a2a" },
         .{ .name = "antfly_generating", .field = "generating" },
         .{ .name = "antfly_reranking", .field = "reranking" },
-        .{ .name = "termite_api", .field = "termite_api" },
-        .{ .name = "termite_hf_tokenizer", .field = "termite_hf_tokenizer" },
-        .{ .name = "termite_fixed_tokenizer_data", .field = "termite_fixed_tokenizer_data" },
-        .{ .name = "termite_chunker", .field = "termite_chunker" },
+        .{ .name = "inference_api", .field = "inference_api" },
+        .{ .name = "inference_hf_tokenizer", .field = "inference_hf_tokenizer" },
+        .{ .name = "inference_fixed_tokenizer_data", .field = "inference_fixed_tokenizer_data" },
+        .{ .name = "inference_chunker", .field = "inference_chunker" },
         .{ .name = "antfly_image", .field = "image" },
         .{ .name = "antfly_font", .field = "font" },
         .{ .name = "antfly_pdf", .field = "pdf" },
         .{ .name = "openai_api", .field = "openai_api" },
         .{ .name = "handlebars", .field = "handlebars" },
-        .{ .name = "termite_server", .field = "termite_server" },
+        .{ .name = "inference_server", .field = "inference_server" },
         .{ .name = "prometheus", .field = "prometheus" },
         .{ .name = "structlog", .field = "structlog" },
         .{ .name = "antfly_platform", .field = "platform" },
@@ -726,13 +752,21 @@ fn addYamlOpenApiModule(
 
 fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
     const check = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{"--compare"});
+    addOpenApiJoinInputs(b, check);
     check.addFileArg(b.path("../openapi.yaml"));
     return check;
 }
 
 fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--joined-only"});
+    addOpenApiJoinInputs(b, join);
     return join.addOutputFileArg("openapi.public.joined.yaml");
+}
+
+fn addPrefixedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
+    const join = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{});
+    addOpenApiJoinInputs(b, join);
+    return join.addOutputFileArg("openapi.public.prefixed.yaml");
 }
 
 fn addPublicOpenApiModule(
@@ -751,12 +785,12 @@ fn addPublicOpenApiModule(
         "antfly_public_openapi",
         "types,extractors",
         &.{
-            .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
-            .{ "go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
-            .{ "go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
-            .{ "go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
+            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
+            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
+            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
+            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
             .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         },
     );
@@ -774,17 +808,17 @@ fn addPublicClientOpenApiModule(
         target,
         optimize,
         openapi_codegen,
-        addJoinedPublicOpenApiSpec(b),
+        addPrefixedPublicOpenApiSpec(b),
         "antfly_client_openapi",
         "antfly_client_openapi",
         "types,client",
         &.{
-            .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
-            .{ "go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
-            .{ "go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
-            .{ "go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
+            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
+            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
+            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
+            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
             .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         },
         httpx_mod,
@@ -916,87 +950,94 @@ fn addOpenApiRegenStep(
     const regen_step = b.step("regen-openapi", "Regenerate checked-in Zig OpenAPI modules");
 
     const antfly_generated_root = "pkg/antfly/src/openapi/generated";
-    const termite_generated_root = "pkg/termite/src/api/generated";
+    const inference_generated_root = "pkg/inference/src/api/generated";
     const runs = [_]*std.Build.Step.Run{
         addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
-            .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
-            .{ "go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
-            .{ "go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
-            .{ "go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
+            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
+            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
+            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
+            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
             .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", "types,client", &.{
-            .{ "go/pkg/antfly/lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "go/pkg/antfly/src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
-            .{ "go/pkg/antfly/lib/ai/openapi.yaml", "antfly_ai_openapi" },
-            .{ "go/pkg/antfly/lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
-            .{ "go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "go/pkg/antfly/lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
+        addOpenApiRegenRun(b, openapi_codegen, addPrefixedPublicOpenApiSpec(b), "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", "types,client", &.{
+            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
+            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
+            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
+            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
+            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
             .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/schema/openapi.yaml"), "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/src/store/db/indexes/openapi.yaml"), "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi", "types", &.{
-            .{ "../../../../lib/embeddings/openapi.yaml", "antfly_embeddings_openapi" },
-            .{ "../../../../../generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "../../../../lib/chunking/openapi.yaml", "antfly_chunking_openapi" },
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/schema.yaml"), "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/indexes.yaml"), "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi", "types", &.{
+            .{ "embeddings.yaml", "antfly_embeddings_openapi" },
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "chunking.yaml", "antfly_chunking_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/websearch/openapi.yaml"), "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi", "types", &.{
-            .{ "../../../libaf/s3/openapi.yaml", "antfly_s3_openapi" },
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/websearch.yaml"), "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi", "types", &.{
+            .{ "../shared/s3.yaml", "antfly_s3_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/ai/eval/openapi.yaml"), "antfly_eval_openapi", antfly_generated_root ++ "/antfly_eval_openapi", "types", &.{
-            .{ "../../../../generating/openapi.yaml", "antfly_generating_openapi" },
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/eval.yaml"), "antfly_eval_openapi", antfly_generated_root ++ "/antfly_eval_openapi", "types", &.{
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/query.yaml"), "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/usermgr.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/auth/api.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
-            .{ "usermgr.yaml", "antfly_usermgr_openapi" },
-            .{ "../../../src/store/db/indexes/openapi.yaml", "antfly_indexes_openapi" },
-            .{ "../../../lib/schema/openapi.yaml", "antfly_schema_openapi" },
-            .{ "../../../lib/ai/openapi.yaml", "antfly_ai_openapi" },
-            .{ "../../../lib/ai/eval/openapi.yaml", "antfly_eval_openapi" },
-            .{ "../../../go/pkg/generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "../../../lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
+            .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
+            .{ "indexes.yaml", "antfly_indexes_openapi" },
+            .{ "schema.yaml", "antfly_schema_openapi" },
+            .{ "generating.yaml", "antfly_generating_api_openapi" },
+            .{ "eval.yaml", "antfly_eval_openapi" },
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "reranking.yaml", "antfly_reranking_openapi" },
             .{ "query.yaml", "antfly_query_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/libaf/logging/openapi.yaml"), "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/audio/openapi.yaml"), "antfly_audio_openapi", antfly_generated_root ++ "/antfly_audio_openapi", "types", &.{
-            .{ "../../../libaf/s3/openapi.yaml", "antfly_s3_openapi" },
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/logging.yaml"), "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/audio.yaml"), "antfly_audio_openapi", antfly_generated_root ++ "/antfly_audio_openapi", "types", &.{
+            .{ "../shared/s3.yaml", "antfly_s3_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/middleware/openapi.yaml"), "antfly_middleware_openapi", antfly_generated_root ++ "/antfly_middleware_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/libaf/scraping/openapi.yaml"), "antfly_scraping_openapi", antfly_generated_root ++ "/antfly_scraping_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/libaf/s3/openapi.yaml"), "antfly_s3_openapi", antfly_generated_root ++ "/antfly_s3_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/termite/openapi.yaml"), "antfly_termite_config_openapi", antfly_generated_root ++ "/antfly_termite_config_openapi", "types", &.{
-            .{ "../libaf/chunking/openapi.yaml", "antfly_chunking_api_openapi" },
-            .{ "../libaf/scraping/openapi.yaml", "antfly_scraping_openapi" },
-            .{ "../libaf/s3/openapi.yaml", "antfly_s3_openapi" },
-            .{ "../libaf/logging/openapi.yaml", "antfly_logging_openapi" },
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/scraping.yaml"), "antfly_scraping_openapi", antfly_generated_root ++ "/antfly_scraping_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/s3.yaml"), "antfly_s3_openapi", antfly_generated_root ++ "/antfly_s3_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/inference/config.yaml"), "antfly_inference_config_openapi", antfly_generated_root ++ "/antfly_inference_config_openapi", "types", &.{
+            .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
+            .{ "../shared/scraping.yaml", "antfly_scraping_openapi" },
+            .{ "../shared/s3.yaml", "antfly_s3_openapi" },
+            .{ "../shared/logging.yaml", "antfly_logging_openapi" },
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/libaf/chunking/openapi.yaml"), "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/chunking/openapi.yaml"), "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi", "types", &.{
-            .{ "../../../libaf/chunking/openapi.yaml", "antfly_chunking_api_openapi" },
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/chunking.yaml"), "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/chunking.yaml"), "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi", "types", &.{
+            .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/embeddings/openapi.yaml"), "antfly_embeddings_openapi", antfly_generated_root ++ "/antfly_embeddings_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/src/common/openapi.yaml"), "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi", "types", &.{
-            .{ "../../../libaf/logging/openapi.yaml", "antfly_logging_openapi" },
-            .{ "../../lib/audio/openapi.yaml", "antfly_audio_openapi" },
-            .{ "../../lib/middleware/openapi.yaml", "antfly_middleware_openapi" },
-            .{ "../../lib/embeddings/openapi.yaml", "antfly_embeddings_openapi" },
-            .{ "../../../generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "../../lib/reranking/openapi.yaml", "antfly_reranking_openapi" },
-            .{ "../../lib/chunking/openapi.yaml", "antfly_chunking_openapi" },
-            .{ "../../../libaf/scraping/openapi.yaml", "antfly_scraping_openapi" },
-            .{ "../../../libaf/s3/openapi.yaml", "antfly_s3_openapi" },
-            .{ "../../../termite/openapi.yaml", "antfly_termite_config_openapi" },
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/embeddings.yaml"), "antfly_embeddings_openapi", antfly_generated_root ++ "/antfly_embeddings_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/config.yaml"), "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi", "types", &.{
+            .{ "../shared/logging.yaml", "antfly_logging_openapi" },
+            .{ "audio.yaml", "antfly_audio_openapi" },
+            .{ "../../../go/pkg/antfly/lib/middleware/openapi.yaml", "antfly_middleware_openapi" },
+            .{ "embeddings.yaml", "antfly_embeddings_openapi" },
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "reranking.yaml", "antfly_reranking_openapi" },
+            .{ "chunking.yaml", "antfly_chunking_openapi" },
+            .{ "../shared/scraping.yaml", "antfly_scraping_openapi" },
+            .{ "../shared/s3.yaml", "antfly_s3_openapi" },
+            .{ "../inference/config.yaml", "antfly_inference_config_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/generating/openapi.yaml"), "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/reranking/openapi.yaml"), "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/ai/openapi.yaml"), "antfly_ai_openapi", antfly_generated_root ++ "/antfly_ai_openapi", "types", &.{
-            .{ "../../../generating/openapi.yaml", "antfly_generating_openapi" },
-            .{ "../websearch/openapi.yaml", "antfly_websearch_openapi" },
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/generating.yaml"), "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/reranking.yaml"), "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/ai/extraction.yaml"), "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi", "types", &.{
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/termite/api.yaml"), "termite_api", termite_generated_root ++ "/termite_api", "types,server", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/generating.yaml"), "antfly_generating_api_openapi", antfly_generated_root ++ "/antfly_generating_api_openapi", "types", &.{
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "websearch.yaml", "antfly_websearch_openapi" },
+        }),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", inference_generated_root ++ "/inference_api", "types,server", &.{
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
+        }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
     };
 
@@ -1004,7 +1045,7 @@ fn addOpenApiRegenStep(
         b.graph.zig_exe,
         "fmt",
         antfly_generated_root,
-        termite_generated_root,
+        inference_generated_root,
     });
     for (runs) |run| {
         fmt.step.dependOn(&run.step);
@@ -1024,6 +1065,7 @@ pub fn build(b: *std.Build) void {
     const lmdb_evented_async_io = b.option(bool, "lmdb_evented_async_io", "Use std.Io.Evented for the Zig LMDB async_io backend") orelse false;
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
+    const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
@@ -1031,21 +1073,21 @@ pub fn build(b: *std.Build) void {
     if (!link_libc and lmdb_backend == .c) {
         @panic("-Dlink-libc=false requires -Dlmdb_backend=zig");
     }
-    const termite_mlx_option = b.option(bool, "mlx", "Enable MLX termite support when available");
+    const termite_mlx_option = b.option(bool, "mlx", "Enable MLX inference support when available");
     const termite_mlx_requested = if (link_libc)
         termite_mlx_option orelse false
     else
         false;
     const termite_mlx_root_opt = b.option([]const u8, "mlx-root", "Path to MLX C root with include/ and lib/");
-    const termite_onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime support for embedded Termite");
+    const termite_onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime support for embedded inference");
     const termite_enable_onnx = if (link_libc)
         termite_onnx_option orelse false
     else
         false;
-    const termite_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded Termite");
-    const termite_onnx_root = termite_onnx_root_opt orelse defaultTermiteOnnxRoot(b, target);
+    const termite_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded inference");
+    const termite_onnx_root = termite_onnx_root_opt orelse defaultInferenceOnnxRoot(b, target);
     const termite_enable_metal = if (link_libc)
-        b.option(bool, "metal", "Enable Apple Metal kernels for embedded Termite") orelse if (target.result.os.tag == .macos) true else termite_mlx_requested
+        b.option(bool, "metal", "Enable Apple Metal kernels for embedded inference") orelse if (target.result.os.tag == .macos) true else termite_mlx_requested
     else
         false;
     const termite_enable_mlx = termite_enable_metal and termite_mlx_requested;
@@ -1053,7 +1095,7 @@ pub fn build(b: *std.Build) void {
         termite_mlx_root_opt orelse detectMlxRoot(b, target)
     else
         termite_mlx_root_opt;
-    const termite_enable_cuda = b.option(bool, "cuda", "Enable CUDA termite support through the NVIDIA Driver API") orelse false;
+    const termite_enable_cuda = b.option(bool, "cuda", "Enable CUDA inference support through the NVIDIA Driver API") orelse false;
     const termite_cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: portable PTX; fatbin is not implemented yet") orelse "portable";
     if (!std.mem.eql(u8, termite_cuda_artifacts, "portable")) {
         @panic("invalid -Dcuda-artifacts (expected portable; fatbin is not implemented yet)");
@@ -1082,7 +1124,7 @@ pub fn build(b: *std.Build) void {
             @panic("-Donnx=true requires an ONNX Runtime install; pass -Donnx-root=<path>");
         }
     }
-    const delegated_termite_steps = addDelegatedTermiteBuildSteps(
+    const delegated_inference_steps = addDelegatedInferenceBuildSteps(
         b,
         termite_enable_mlx,
         termite_mlx_root,
@@ -1136,31 +1178,33 @@ pub fn build(b: *std.Build) void {
     const middleware_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_middleware_openapi", antfly_generated_root ++ "/antfly_middleware_openapi");
     const scraping_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_scraping_openapi", antfly_generated_root ++ "/antfly_scraping_openapi");
     const s3_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_s3_openapi", antfly_generated_root ++ "/antfly_s3_openapi");
-    const termite_config_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_termite_config_openapi", antfly_generated_root ++ "/antfly_termite_config_openapi");
+    const inference_config_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_inference_config_openapi", antfly_generated_root ++ "/antfly_inference_config_openapi");
     const chunking_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi");
     const chunking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi");
     const embeddings_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_embeddings_openapi", antfly_generated_root ++ "/antfly_embeddings_openapi");
     const common_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi");
     const generating_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi");
     const reranking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi");
-    const ai_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_ai_openapi", antfly_generated_root ++ "/antfly_ai_openapi");
+    const generating_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_api_openapi", antfly_generated_root ++ "/antfly_generating_api_openapi");
+    const extraction_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi");
+    extraction_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     indexes_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     indexes_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     indexes_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
     websearch_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     eval_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    ai_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    ai_openapi_mod.addImport("antfly_websearch_openapi", websearch_openapi_mod);
+    generating_api_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    generating_api_openapi_mod.addImport("antfly_websearch_openapi", websearch_openapi_mod);
     public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
-    public_openapi_mod.addImport("antfly_ai_openapi", ai_openapi_mod);
+    public_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     public_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     public_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
     public_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
     client_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     client_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
-    client_openapi_mod.addImport("antfly_ai_openapi", ai_openapi_mod);
+    client_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     client_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     client_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     client_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
@@ -1168,17 +1212,18 @@ pub fn build(b: *std.Build) void {
     metadata_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
     metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     metadata_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_ai_openapi", ai_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     metadata_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     metadata_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     metadata_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
     metadata_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
     chunking_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
     audio_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    termite_config_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
-    termite_config_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
-    termite_config_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    termite_config_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
+    inference_config_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
+    inference_config_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
+    inference_config_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
+    inference_config_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
+    inference_config_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     common_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
     common_openapi_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     common_openapi_mod.addImport("antfly_middleware_openapi", middleware_openapi_mod);
@@ -1188,7 +1233,7 @@ pub fn build(b: *std.Build) void {
     common_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
     common_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
     common_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    common_openapi_mod.addImport("antfly_termite_config_openapi", termite_config_openapi_mod);
+    common_openapi_mod.addImport("antfly_inference_config_openapi", inference_config_openapi_mod);
 
     // Handlebars template engine
     const handlebars_dep = b.dependency("handlebars", .{});
@@ -1212,15 +1257,31 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const google_mod = b.createModule(.{
+        .root_source_file = b.path("lib/google/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    google_mod.addImport("httpx", httpx_mod);
+    google_mod.addImport("antfly_platform", platform_mod);
     objectstore_mod.addImport("httpx", httpx_mod);
     objectstore_mod.addImport("antfly_platform", platform_mod);
+    objectstore_mod.addImport("antfly_google", google_mod);
     const wasm_objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
+    const wasm_google_mod = b.createModule(.{
+        .root_source_file = b.path("lib/google/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_google_mod.addImport("httpx", httpx_mod);
+    wasm_google_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_objectstore_mod.addImport("httpx", httpx_mod);
     wasm_objectstore_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_objectstore_mod.addImport("antfly_google", wasm_google_mod);
     const bloom_mod = b.createModule(.{
         .root_source_file = b.path("lib/bloom/src/mod.zig"),
         .target = target,
@@ -1274,6 +1335,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    usermgr_mod.link_libc = link_libc;
     usermgr_mod.addImport("antfly_casbin", casbin_mod);
     usermgr_mod.addImport("usermgr_storage", storage_mod);
     const wasm_bloom_mod = b.createModule(.{
@@ -1355,11 +1417,18 @@ pub fn build(b: *std.Build) void {
     });
     reranking_mod.addImport("antfly-json", json_mod);
     reranking_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
+    const extracting_mod = b.createModule(.{
+        .root_source_file = b.path("lib/extracting/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    extracting_mod.addImport("httpx", httpx_mod);
+    extracting_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
 
     // Inference dependencies
     const openai_api_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "openai_api", antfly_generated_root ++ "/openai_api", httpx_mod);
 
-    // --- Termite backend detection (must precede module creation) ---
+    // --- Inference backend detection (must precede module creation) ---
     const termite_ffmpeg_paths = if (link_libc) detectFfmpegPaths(b, target) else null;
     const image_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
@@ -1428,12 +1497,12 @@ pub fn build(b: *std.Build) void {
     termite_pjrt_mod.addImport("protobuf", protobuf_mod);
     termite_pjrt_mod.addImport("xla_proto", termite_pjrt_xla_proto_mod);
 
-    const termite_graph = termite_runtime_build.create(.{
+    const inference_graph = inference_runtime_build.create(.{
         .b = b,
         .target = target,
         .optimize = optimize,
         .paths = .{
-            .termite_root = "pkg/termite",
+            .inference_root = "pkg/inference",
             .shared_lib_root = "",
         },
         .backend = .{
@@ -1455,11 +1524,7 @@ pub fn build(b: *std.Build) void {
             } else null,
             .link_libc = link_libc,
             .skip_openapi = false,
-            .termite_version = "0.1.0",
-            .git_commit = "embedded",
-            .build_time = "embedded",
-            .go_version = "n/a",
-            .allow_downloads = true,
+            .inference_version = antfly_version,
         },
         .shared = .{
             .json = json_mod,
@@ -1467,6 +1532,7 @@ pub fn build(b: *std.Build) void {
             .platform = platform_mod,
             .vellum = vellum_mod,
             .scraping = scraping_mod,
+            .google = google_mod,
             .objectstore = objectstore_mod,
             .regex = regex_mod,
             .jsonschema = jsonschema_mod,
@@ -1479,14 +1545,17 @@ pub fn build(b: *std.Build) void {
             .ml = termite_ml_mod,
             .onnx_graph = termite_onnx_graph_mod,
             .pjrt = termite_pjrt_mod,
+            .generating_openapi = generating_openapi_mod,
         },
     });
-    const termite_build_options_mod = termite_graph.build_options_mod;
-    const termite_api_mod = termite_graph.termite_api_mod;
-    const termite_hf_tokenizer_mod = termite_graph.termite_hf_tokenizer_mod;
-    const termite_fixed_tokenizer_data_mod = termite_graph.termite_fixed_tokenizer_data_mod;
-    const termite_chunker_mod = termite_graph.termite_chunker_mod;
-    const termite_server_mod = termite_graph.termite_mod;
+    const inference_build_options_mod = inference_graph.build_options_mod;
+    const inference_api_mod = inference_graph.inference_api_mod;
+    inference_api_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    inference_api_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+    const inference_hf_tokenizer_mod = inference_graph.inference_hf_tokenizer_mod;
+    const inference_fixed_tokenizer_data_mod = inference_graph.inference_fixed_tokenizer_data_mod;
+    const inference_chunker_mod = inference_graph.inference_chunker_mod;
+    const inference_server_mod = inference_graph.inference_mod;
 
     const transcribing_mod = b.createModule(.{
         .root_source_file = b.path("lib/transcribing/src/mod.zig"),
@@ -1495,8 +1564,20 @@ pub fn build(b: *std.Build) void {
     });
     transcribing_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     transcribing_mod.addImport("httpx", httpx_mod);
-    transcribing_mod.addImport("termite_api", termite_api_mod);
+    transcribing_mod.addImport("inference_api", inference_api_mod);
     transcribing_mod.addImport("antfly_scraping", scraping_mod);
+    transcribing_mod.addImport("antfly_google", google_mod);
+    const readers_mod = b.createModule(.{
+        .root_source_file = b.path("lib/readers/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    readers_mod.addImport("httpx", httpx_mod);
+    readers_mod.addImport("inference_api", inference_api_mod);
+    readers_mod.addImport("antfly_google", google_mod);
+    inference_server_mod.addImport("antfly_readers", readers_mod);
+    inference_server_mod.addImport("antfly_transcribing", transcribing_mod);
+    inference_server_mod.addImport("antfly_extracting", extracting_mod);
     const synthesizing_mod = b.createModule(.{
         .root_source_file = b.path("lib/synthesizing/src/mod.zig"),
         .target = target,
@@ -1513,7 +1594,7 @@ pub fn build(b: *std.Build) void {
         .client_openapi = client_openapi_mod,
         .schema_openapi = schema_openapi_mod,
         .indexes_openapi = indexes_openapi_mod,
-        .ai_openapi = ai_openapi_mod,
+        .generating_api_openapi = generating_api_openapi_mod,
         .eval_openapi = eval_openapi_mod,
         .query_openapi = query_openapi_mod,
         .metadata_openapi = metadata_openapi_mod,
@@ -1524,7 +1605,7 @@ pub fn build(b: *std.Build) void {
         .scraping_openapi = scraping_openapi_mod,
         .scraping = scraping_mod,
         .s3_openapi = s3_openapi_mod,
-        .termite_config_openapi = termite_config_openapi_mod,
+        .inference_config_openapi = inference_config_openapi_mod,
         .chunking_api_openapi = chunking_api_openapi_mod,
         .chunking_openapi = chunking_openapi_mod,
         .chunking = chunking_mod,
@@ -1533,9 +1614,13 @@ pub fn build(b: *std.Build) void {
         .common_openapi = common_openapi_mod,
         .generating_openapi = generating_openapi_mod,
         .reranking_openapi = reranking_openapi_mod,
+        .extraction_openapi = extraction_openapi_mod,
         .transcribing = transcribing_mod,
+        .readers = readers_mod,
+        .extracting = extracting_mod,
         .synthesizing = synthesizing_mod,
         .httpx = httpx_mod,
+        .google = google_mod,
         .objectstore = objectstore_mod,
         .bloom = bloom_mod,
         .vector = vector_mod,
@@ -1549,16 +1634,16 @@ pub fn build(b: *std.Build) void {
         .a2a = a2a_mod,
         .generating = generating_mod,
         .reranking = reranking_mod,
-        .termite_api = termite_api_mod,
-        .termite_hf_tokenizer = termite_hf_tokenizer_mod,
-        .termite_fixed_tokenizer_data = termite_fixed_tokenizer_data_mod,
-        .termite_chunker = termite_chunker_mod,
+        .inference_api = inference_api_mod,
+        .inference_hf_tokenizer = inference_hf_tokenizer_mod,
+        .inference_fixed_tokenizer_data = inference_fixed_tokenizer_data_mod,
+        .inference_chunker = inference_chunker_mod,
         .image = image_mod,
         .font = font_mod,
         .pdf = pdf_mod,
         .openai_api = openai_api_mod,
         .handlebars = handlebars_mod,
-        .termite_server = termite_server_mod,
+        .inference_server = inference_server_mod,
         .prometheus = prometheus_mod,
         .structlog = structlog_mod,
         .platform = platform_mod,
@@ -1755,86 +1840,82 @@ pub fn build(b: *std.Build) void {
     });
     antfly_embedded_pkg_wasm_mod.addImport("embedded_surface", embedded_wasm_mod);
 
-    // --- Termite WASM modules for unified antfly.wasm ---
-    const termite_wasm_build_options = b.addOptions();
-    termite_wasm_build_options.addOption(bool, "enable_onnx", false);
-    termite_wasm_build_options.addOption(bool, "enable_mlx", false);
-    termite_wasm_build_options.addOption(bool, "enable_pjrt", false);
-    termite_wasm_build_options.addOption(bool, "enable_cuda", false);
-    termite_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");
-    termite_wasm_build_options.addOption(bool, "enable_metal", false);
-    termite_wasm_build_options.addOption(bool, "enable_native", false);
-    termite_wasm_build_options.addOption(bool, "enable_system_blas", false);
-    termite_wasm_build_options.addOption(bool, "enable_wasm", true);
-    termite_wasm_build_options.addOption(bool, "enable_webgpu", true);
-    termite_wasm_build_options.addOption(bool, "enable_ffmpeg_audio", false);
-    termite_wasm_build_options.addOption(bool, "link_libc", false);
-    termite_wasm_build_options.addOption(bool, "skip_openapi", false);
-    termite_wasm_build_options.addOption([]const u8, "termite_version", "0.1.0");
-    termite_wasm_build_options.addOption([]const u8, "git_commit", "embedded");
-    termite_wasm_build_options.addOption([]const u8, "build_time", "embedded");
-    termite_wasm_build_options.addOption([]const u8, "go_version", "n/a");
-    termite_wasm_build_options.addOption(bool, "allow_downloads", false);
-    termite_wasm_build_options.addOption([]const u8, "wasm_memory_model", "wasm32");
-    const termite_wasm_build_options_mod = termite_wasm_build_options.createModule();
+    // --- Inference WASM modules for unified antfly.wasm ---
+    const inference_wasm_build_options = b.addOptions();
+    inference_wasm_build_options.addOption(bool, "enable_onnx", false);
+    inference_wasm_build_options.addOption(bool, "enable_mlx", false);
+    inference_wasm_build_options.addOption(bool, "enable_pjrt", false);
+    inference_wasm_build_options.addOption(bool, "enable_cuda", false);
+    inference_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");
+    inference_wasm_build_options.addOption(bool, "enable_metal", false);
+    inference_wasm_build_options.addOption(bool, "enable_native", false);
+    inference_wasm_build_options.addOption(bool, "enable_system_blas", false);
+    inference_wasm_build_options.addOption(bool, "enable_wasm", true);
+    inference_wasm_build_options.addOption(bool, "enable_webgpu", true);
+    inference_wasm_build_options.addOption(bool, "enable_ffmpeg_audio", false);
+    inference_wasm_build_options.addOption(bool, "link_libc", false);
+    inference_wasm_build_options.addOption(bool, "skip_openapi", false);
+    inference_wasm_build_options.addOption([]const u8, "inference_version", antfly_version);
+    inference_wasm_build_options.addOption([]const u8, "wasm_memory_model", "wasm32");
+    const inference_wasm_build_options_mod = inference_wasm_build_options.createModule();
 
-    const wasm_termite_jinja_mod = b.createModule(.{
+    const wasm_inference_jinja_mod = b.createModule(.{
         .root_source_file = b.path("lib/jinja/src/jinja.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSafe,
         .single_threaded = true,
     });
-    const wasm_termite_tokenizer_mod = b.createModule(.{
+    const wasm_inference_tokenizer_mod = b.createModule(.{
         .root_source_file = b.path("lib/tokenizer/src/tokenizer.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSafe,
     });
-    wasm_termite_tokenizer_mod.addImport("sentencepiece_proto", sentencepiece_proto_mod);
-    const wasm_termite_hf_tokenizer_mod = b.createModule(.{
+    wasm_inference_tokenizer_mod.addImport("sentencepiece_proto", sentencepiece_proto_mod);
+    const wasm_inference_hf_tokenizer_mod = b.createModule(.{
         .root_source_file = b.path("lib/tokenizer/src/hf_root.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSafe,
     });
-    wasm_termite_hf_tokenizer_mod.addImport("termite_tokenizer", wasm_termite_tokenizer_mod);
-    const wasm_termite_linalg_mod = b.createModule(.{
+    wasm_inference_hf_tokenizer_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);
+    const wasm_inference_linalg_mod = b.createModule(.{
         .root_source_file = b.path("lib/linalg/src/mod.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSafe,
     });
-    const wasm_termite_ml_mod = b.createModule(.{
+    const wasm_inference_ml_mod = b.createModule(.{
         .root_source_file = b.path("lib/ml/src/root.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSafe,
         .single_threaded = true,
     });
-    const wasm_termite_onnx_graph_mod = b.createModule(.{
+    const wasm_inference_onnx_graph_mod = b.createModule(.{
         .root_source_file = b.path("lib/onnx/src/root.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSafe,
         .single_threaded = true,
     });
-    wasm_termite_onnx_graph_mod.addImport("protobuf", protobuf_mod);
-    wasm_termite_onnx_graph_mod.addImport("ml", wasm_termite_ml_mod);
-    const wasm_termite_audio_mod = b.createModule(.{
+    wasm_inference_onnx_graph_mod.addImport("protobuf", protobuf_mod);
+    wasm_inference_onnx_graph_mod.addImport("ml", wasm_inference_ml_mod);
+    const wasm_inference_audio_mod = b.createModule(.{
         .root_source_file = b.path("lib/audio/src/mod.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSafe,
     });
-    const termite_wasm_inference_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/termite/src/wasm_entry.zig"),
+    const inference_wasm_inference_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/wasm_entry.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSafe,
     });
-    termite_wasm_inference_mod.addImport("build_options", termite_wasm_build_options_mod);
-    termite_wasm_inference_mod.addImport("termite_audio", wasm_termite_audio_mod);
-    termite_wasm_inference_mod.addImport("termite_linalg", wasm_termite_linalg_mod);
-    termite_wasm_inference_mod.addImport("termite_tokenizer", wasm_termite_tokenizer_mod);
-    termite_wasm_inference_mod.addImport("termite_hf_tokenizer", wasm_termite_hf_tokenizer_mod);
-    termite_wasm_inference_mod.addImport("antfly_image", wasm_image_mod);
-    termite_wasm_inference_mod.addImport("antfly_platform", wasm_platform_mod);
-    termite_wasm_inference_mod.addImport("jinja", wasm_termite_jinja_mod);
-    termite_wasm_inference_mod.addImport("ml", wasm_termite_ml_mod);
-    termite_wasm_inference_mod.addImport("onnx_graph", wasm_termite_onnx_graph_mod);
+    inference_wasm_inference_mod.addImport("build_options", inference_wasm_build_options_mod);
+    inference_wasm_inference_mod.addImport("inference_audio", wasm_inference_audio_mod);
+    inference_wasm_inference_mod.addImport("inference_linalg", wasm_inference_linalg_mod);
+    inference_wasm_inference_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);
+    inference_wasm_inference_mod.addImport("inference_hf_tokenizer", wasm_inference_hf_tokenizer_mod);
+    inference_wasm_inference_mod.addImport("antfly_image", wasm_image_mod);
+    inference_wasm_inference_mod.addImport("antfly_platform", wasm_platform_mod);
+    inference_wasm_inference_mod.addImport("jinja", wasm_inference_jinja_mod);
+    inference_wasm_inference_mod.addImport("ml", wasm_inference_ml_mod);
+    inference_wasm_inference_mod.addImport("onnx_graph", wasm_inference_onnx_graph_mod);
 
     const antfly_wasm_mod = b.createModule(.{
         .root_source_file = b.path("examples/antfly_wasm.zig"),
@@ -1843,7 +1924,7 @@ pub fn build(b: *std.Build) void {
     });
     antfly_wasm_mod.addImport("antfly_embedded_db", antfly_embedded_db_pkg_wasm_mod);
     antfly_wasm_mod.addImport("antfly_embedded_api", antfly_embedded_api_pkg_wasm_mod);
-    antfly_wasm_mod.addImport("termite_inference", termite_wasm_inference_mod);
+    antfly_wasm_mod.addImport("inference_runtime", inference_wasm_inference_mod);
 
     const antfly_wasm = b.addExecutable(.{
         .name = "antfly_wasm",
@@ -1900,7 +1981,7 @@ pub fn build(b: *std.Build) void {
         install_shader_steps[i] = &install_shader.step;
     }
 
-    const install_wasm_step = b.step("install-wasm", "Build and install the unified antfly wasm target (antfly-embedded + termite inference)");
+    const install_wasm_step = b.step("install-wasm", "Build and install the unified antfly wasm target (antfly-embedded + inference runtime)");
     install_wasm_step.dependOn(&install_antfly_wasm.step);
     install_wasm_step.dependOn(&install_antfly_wasm_smoke_run.step);
     install_wasm_step.dependOn(&install_antfly_wasm_client.step);
@@ -1929,7 +2010,7 @@ pub fn build(b: *std.Build) void {
         .name = "antfly-zig",
         .root_module = lib_mod,
     });
-    b.installArtifact(lib);
+    _ = lib;
 
     const capi_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
@@ -2116,6 +2197,20 @@ pub fn build(b: *std.Build) void {
     const lib_chunking_test_step = b.step("lib-chunking-test", "Run standalone lib/chunking tests");
     lib_chunking_test_step.dependOn(&run_lib_chunking_tests.step);
 
+    const lib_readers_tests = b.addTest(.{
+        .root_module = readers_mod,
+    });
+    const run_lib_readers_tests = b.addRunArtifact(lib_readers_tests);
+    const lib_readers_test_step = b.step("lib-readers-test", "Run standalone lib/readers tests");
+    lib_readers_test_step.dependOn(&run_lib_readers_tests.step);
+
+    const lib_extracting_tests = b.addTest(.{
+        .root_module = extracting_mod,
+    });
+    const run_lib_extracting_tests = b.addRunArtifact(lib_extracting_tests);
+    const lib_extracting_test_step = b.step("lib-extracting-test", "Run standalone lib/extracting tests");
+    lib_extracting_test_step.dependOn(&run_lib_extracting_tests.step);
+
     const image_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/image_test_root.zig"),
         .target = target,
@@ -2152,7 +2247,6 @@ pub fn build(b: *std.Build) void {
         lib_image_bench.root_module.linkSystemLibrary("spng", .{});
         lib_image_bench.root_module.link_libc = true;
     }
-    b.installArtifact(lib_image_bench);
     const run_lib_image_bench = b.addRunArtifact(lib_image_bench);
     if (b.args) |args| {
         run_lib_image_bench.addArgs(args);
@@ -2195,7 +2289,6 @@ pub fn build(b: *std.Build) void {
         .name = "lib-pdf-bench",
         .root_module = pdf_bench_mod,
     });
-    b.installArtifact(lib_pdf_bench);
     const run_lib_pdf_bench = b.addRunArtifact(lib_pdf_bench);
     if (b.args) |args| {
         run_lib_pdf_bench.addArgs(args);
@@ -2374,7 +2467,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"generating backend factory executes fallback chain across providers"},
+        .filters = &.{ "generating backend factory executes fallback chain across providers", "asset producer runtime" },
     });
     const run_lib_generating_runtime_tests = b.addRunArtifact(lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
@@ -2632,6 +2725,7 @@ pub fn build(b: *std.Build) void {
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime status refresh budget reuses cached group status instead of opening db",
         "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
+        "data runtime keeps status refresh dirty for non-startup async index work",
         "data runtime runRound does not refresh provisioned replica root inline while worker is active",
         "data runtime data changes mark provisioned startup catch-up dirty",
         "data runtime structural changes preserve writer-published runtime status",
@@ -3342,6 +3436,7 @@ pub fn build(b: *std.Build) void {
             "bound table write source backs up and restores a local table",
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned restore repair open rejects stale doc identity namespace",
+            "write cache reserves retirement slots when pruning multiple leased generations",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3661,8 +3756,13 @@ pub fn build(b: *std.Build) void {
         .root_module = audio_test_mod,
     });
     const run_lib_audio_tests = b.addRunArtifact(lib_audio_tests);
+    const lib_transcribing_tests = b.addTest(.{
+        .root_module = transcribing_mod,
+    });
+    const run_lib_transcribing_tests = b.addRunArtifact(lib_transcribing_tests);
     const lib_audio_test_step = b.step("lib-audio-test", "Run audio transcribing and synthesizing runtime tests");
     lib_audio_test_step.dependOn(&run_lib_audio_tests.step);
+    lib_audio_test_step.dependOn(&run_lib_transcribing_tests.step);
 
     const lib_audio_xiph_conformance = b.addExecutable(.{
         .name = "lib-audio-xiph-conformance",
@@ -3672,7 +3772,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
-    lib_audio_xiph_conformance.root_module.addImport("build_options", termite_build_options_mod);
+    lib_audio_xiph_conformance.root_module.addImport("build_options", inference_build_options_mod);
     if (termite_ffmpeg_paths) |ffmpeg_paths| {
         lib_audio_xiph_conformance.root_module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
     }
@@ -3686,7 +3786,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
-    lib_audio_misc_conformance.root_module.addImport("build_options", termite_build_options_mod);
+    lib_audio_misc_conformance.root_module.addImport("build_options", inference_build_options_mod);
     if (termite_ffmpeg_paths) |ffmpeg_paths| {
         lib_audio_misc_conformance.root_module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
     }
@@ -4107,8 +4207,8 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("antfly_chunking", chunking_mod);
     db_test_mod.addImport("antfly_regex", regex_mod);
     db_test_mod.addImport("raft_engine", raft_engine_mod);
-    db_test_mod.addImport("termite_chunker", termite_chunker_mod);
-    db_test_mod.addImport("termite_api", termite_api_mod);
+    db_test_mod.addImport("inference_chunker", inference_chunker_mod);
+    db_test_mod.addImport("inference_api", inference_api_mod);
     db_test_mod.addImport("antfly_reranking", reranking_mod);
     db_test_mod.addImport("antfly_scraping", scraping_mod);
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
@@ -4322,7 +4422,6 @@ pub fn build(b: *std.Build) void {
         .name = "lmdb_bench_c",
         .root_module = lmdb_bench_mod_c,
     });
-    b.installArtifact(lmdb_bench_c);
 
     const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
     const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, antfly_version);
@@ -4340,7 +4439,6 @@ pub fn build(b: *std.Build) void {
         .name = "lmdb_bench_zig",
         .root_module = lmdb_bench_mod_zig,
     });
-    b.installArtifact(lmdb_bench_zig);
 
     const run_lmdb_bench_c = b.addRunArtifact(lmdb_bench_c);
     run_lmdb_bench_c.addArgs(&.{ "--cycles", "8", "--keys", "512", "--dups", "32", "--named-keys", "128" });
@@ -4398,7 +4496,6 @@ pub fn build(b: *std.Build) void {
         .name = "split_bench",
         .root_module = split_bench_mod,
     });
-    b.installArtifact(split_bench);
 
     const run_split_bench = b.addRunArtifact(split_bench);
     const split_bench_step = b.step("split-bench", "Benchmark median-key selection and split range copy");
@@ -4420,7 +4517,6 @@ pub fn build(b: *std.Build) void {
         .name = "db_split_bench",
         .root_module = db_split_bench_mod,
     });
-    b.installArtifact(db_split_bench);
 
     const run_db_split_bench = b.addRunArtifact(db_split_bench);
     const db_split_bench_step = b.step("db-split-bench", "Benchmark DB split preparation old vs current");
@@ -4447,7 +4543,6 @@ pub fn build(b: *std.Build) void {
         .name = "docid_doc_set_bench",
         .root_module = docid_doc_set_bench_mod,
     });
-    b.installArtifact(docid_doc_set_bench);
 
     const run_docid_doc_set_bench = b.addRunArtifact(docid_doc_set_bench);
     if (b.args) |args| {
@@ -4468,7 +4563,6 @@ pub fn build(b: *std.Build) void {
         .name = "backend_bench",
         .root_module = backend_bench_mod,
     });
-    b.installArtifact(backend_bench);
 
     const run_backend_bench = b.addRunArtifact(backend_bench);
     if (b.args) |args| {
@@ -4489,7 +4583,6 @@ pub fn build(b: *std.Build) void {
         .name = "lsm_backend_bench",
         .root_module = lsm_backend_bench_mod,
     });
-    b.installArtifact(lsm_backend_bench);
 
     const run_lsm_backend_bench = b.addRunArtifact(lsm_backend_bench);
     if (b.args) |args| {
@@ -4523,7 +4616,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_storage_read_bench",
         .root_module = hbc_storage_read_bench_mod,
     });
-    b.installArtifact(hbc_storage_read_bench);
 
     const run_hbc_storage_read_bench = b.addRunArtifact(hbc_storage_read_bench);
     if (b.args) |args| {
@@ -4558,7 +4650,6 @@ pub fn build(b: *std.Build) void {
         .name = "lsm_write_bench",
         .root_module = lsm_write_bench_mod,
     });
-    b.installArtifact(lsm_write_bench);
 
     const run_lsm_write_bench = b.addRunArtifact(lsm_write_bench);
     if (b.args) |args| {
@@ -4587,7 +4678,6 @@ pub fn build(b: *std.Build) void {
         .name = "lsm_write_bench_compare",
         .root_module = lsm_write_bench_compare_mod,
     });
-    b.installArtifact(lsm_write_bench_compare);
 
     const run_lsm_write_bench_compare = b.addRunArtifact(lsm_write_bench_compare);
     if (b.args) |args| {
@@ -4621,7 +4711,6 @@ pub fn build(b: *std.Build) void {
         .name = "text_segment_write_bench",
         .root_module = text_segment_write_bench_mod,
     });
-    b.installArtifact(text_segment_write_bench);
 
     const run_text_segment_write_bench = b.addRunArtifact(text_segment_write_bench);
     if (b.args) |args| {
@@ -4648,7 +4737,6 @@ pub fn build(b: *std.Build) void {
         .name = "lsm_backend_bench_compare",
         .root_module = lsm_backend_bench_compare_mod,
     });
-    b.installArtifact(lsm_backend_bench_compare);
 
     const run_lsm_backend_bench_compare = b.addRunArtifact(lsm_backend_bench_compare);
     if (b.args) |args| {
@@ -4675,7 +4763,6 @@ pub fn build(b: *std.Build) void {
         .name = "regex_bench",
         .root_module = regex_bench_mod,
     });
-    b.installArtifact(regex_bench);
 
     const run_regex_bench = b.addRunArtifact(regex_bench);
     if (b.args) |args| {
@@ -4700,7 +4787,6 @@ pub fn build(b: *std.Build) void {
         .name = "wal_bench",
         .root_module = wal_bench_mod,
     });
-    b.installArtifact(wal_bench);
 
     const run_wal_bench = b.addRunArtifact(wal_bench);
     const wal_bench_step = b.step("wal-bench", "Benchmark WAL append throughput with and without group commit");
@@ -4800,7 +4886,6 @@ pub fn build(b: *std.Build) void {
         .name = "derived_log_bench",
         .root_module = derived_log_bench_mod,
     });
-    b.installArtifact(derived_log_bench);
 
     const run_derived_log_bench = b.addRunArtifact(derived_log_bench);
     const derived_log_bench_step = b.step("derived-log-bench", "Benchmark derived log throughput with and without group commit");
@@ -4887,7 +4972,6 @@ pub fn build(b: *std.Build) void {
         .name = "json_bench",
         .root_module = json_bench_mod,
     });
-    b.installArtifact(json_bench);
 
     const run_json_bench = b.addRunArtifact(json_bench);
     if (b.args) |args| {
@@ -4908,7 +4992,6 @@ pub fn build(b: *std.Build) void {
         .name = "bench",
         .root_module = bench_mod,
     });
-    b.installArtifact(bench);
 
     const run_bench = b.addRunArtifact(bench);
     const bench_step = b.step("bench", "Run benchmarks");
@@ -4940,7 +5023,6 @@ pub fn build(b: *std.Build) void {
         .name = "quickstart_bench",
         .root_module = quickstart_bench_mod,
     });
-    b.installArtifact(quickstart_bench);
 
     const run_quickstart_bench = b.addRunArtifact(quickstart_bench);
     if (b.args) |args| {
@@ -4960,7 +5042,6 @@ pub fn build(b: *std.Build) void {
         .name = "compat_runner",
         .root_module = compat_mod,
     });
-    b.installArtifact(compat);
 
     const run_compat = b.addRunArtifact(compat);
     run_compat.addArg("compat/cases");
@@ -5041,7 +5122,6 @@ pub fn build(b: *std.Build) void {
         .name = "storage_fixture_promote",
         .root_module = storage_fixture_promote_mod,
     });
-    b.installArtifact(storage_fixture_promote);
 
     const run_storage_fixture_promote = b.addRunArtifact(storage_fixture_promote);
     if (b.args) |args| {
@@ -5064,7 +5144,6 @@ pub fn build(b: *std.Build) void {
         .name = "merge_cycle_bench",
         .root_module = merge_cycle_mod,
     });
-    b.installArtifact(merge_cycle);
 
     const run_merge_cycle = b.addRunArtifact(merge_cycle);
     const merge_cycle_step = b.step("merge-cycle", "Run the merge-cycle benchmark");
@@ -5081,7 +5160,6 @@ pub fn build(b: *std.Build) void {
         .name = "merge_cost_bench",
         .root_module = merge_cost_mod,
     });
-    b.installArtifact(merge_cost);
 
     const run_merge_cost = b.addRunArtifact(merge_cost);
     const merge_cost_step = b.step("merge-cost", "Run the direct merge cost benchmark");
@@ -5098,7 +5176,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_parity",
         .root_module = hbc_parity_mod,
     });
-    b.installArtifact(hbc_parity);
 
     const run_hbc_parity = b.addRunArtifact(hbc_parity);
     const hbc_parity_step = b.step("hbc-parity", "Run the deterministic HBC parity harness");
@@ -5115,7 +5192,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_bench",
         .root_module = hbc_bench_mod,
     });
-    b.installArtifact(hbc_bench);
 
     const run_hbc_bench = b.addRunArtifact(hbc_bench);
     if (b.args) |args| {
@@ -5135,7 +5211,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_write_bench",
         .root_module = hbc_write_bench_mod,
     });
-    b.installArtifact(hbc_write_bench);
 
     const run_hbc_write_bench = b.addRunArtifact(hbc_write_bench);
     if (b.args) |args| {
@@ -5180,7 +5255,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_read_bench",
         .root_module = hbc_read_bench_mod,
     });
-    b.installArtifact(hbc_read_bench);
 
     const run_hbc_read_bench = b.addRunArtifact(hbc_read_bench);
     if (b.args) |args| {
@@ -5222,7 +5296,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_isolate",
         .root_module = hbc_isolate_mod,
     });
-    b.installArtifact(hbc_isolate);
 
     const run_hbc_isolate = b.addRunArtifact(hbc_isolate);
     if (b.args) |args| {
@@ -5249,7 +5322,6 @@ pub fn build(b: *std.Build) void {
         .name = "dense_stack_bench",
         .root_module = dense_stack_bench_mod,
     });
-    b.installArtifact(dense_stack_bench);
 
     const run_dense_stack_bench = b.addRunArtifact(dense_stack_bench);
     if (b.args) |args| {
@@ -5297,7 +5369,6 @@ pub fn build(b: *std.Build) void {
         .name = "replay_bench",
         .root_module = replay_bench_mod,
     });
-    b.installArtifact(replay_bench);
 
     const run_replay_bench = b.addRunArtifact(replay_bench);
     if (b.args) |args| {
@@ -5358,7 +5429,6 @@ pub fn build(b: *std.Build) void {
         .name = "batch_bench",
         .root_module = batch_bench_mod,
     });
-    b.installArtifact(batch_bench);
 
     const run_batch_bench = b.addRunArtifact(batch_bench);
     if (b.args) |args| {
@@ -5378,7 +5448,6 @@ pub fn build(b: *std.Build) void {
         .name = "docid_write_bench",
         .root_module = docid_write_bench_mod,
     });
-    b.installArtifact(docid_write_bench);
 
     const run_docid_write_bench = b.addRunArtifact(docid_write_bench);
     if (b.args) |args| {
@@ -5400,7 +5469,6 @@ pub fn build(b: *std.Build) void {
         .name = "docid_query_bench",
         .root_module = docid_query_bench_mod,
     });
-    b.installArtifact(docid_query_bench);
 
     const run_docid_query_bench = b.addRunArtifact(docid_query_bench);
     if (b.args) |args| {
@@ -5440,7 +5508,6 @@ pub fn build(b: *std.Build) void {
         .name = "algebraic_bench",
         .root_module = algebraic_bench_mod,
     });
-    b.installArtifact(algebraic_bench);
 
     const run_algebraic_bench = b.addRunArtifact(algebraic_bench);
     if (b.args) |args| {
@@ -5467,7 +5534,6 @@ pub fn build(b: *std.Build) void {
         .name = "algebraic_summary",
         .root_module = algebraic_summary_mod,
     });
-    b.installArtifact(algebraic_summary);
     const run_algebraic_summary = b.addRunArtifact(algebraic_summary);
     if (b.args) |args| {
         run_algebraic_summary.addArgs(args);
@@ -5616,7 +5682,6 @@ pub fn build(b: *std.Build) void {
         .name = "rw_lock_bench",
         .root_module = rw_lock_bench_mod,
     });
-    b.installArtifact(rw_lock_bench);
 
     const run_rw_lock_bench = b.addRunArtifact(rw_lock_bench);
     if (b.args) |args| {
@@ -5636,7 +5701,6 @@ pub fn build(b: *std.Build) void {
         .name = "open_bench",
         .root_module = open_bench_mod,
     });
-    b.installArtifact(open_bench);
 
     const run_open_bench = b.addRunArtifact(open_bench);
     if (b.args) |args| {
@@ -5656,7 +5720,6 @@ pub fn build(b: *std.Build) void {
         .name = "artifact_rebuild_bench",
         .root_module = artifact_rebuild_bench_mod,
     });
-    b.installArtifact(artifact_rebuild_bench);
 
     const run_artifact_rebuild_bench = b.addRunArtifact(artifact_rebuild_bench);
     if (b.args) |args| {
@@ -5678,7 +5741,6 @@ pub fn build(b: *std.Build) void {
         .name = "provisioned_warmup_bench",
         .root_module = provisioned_warmup_bench_mod,
     });
-    b.installArtifact(provisioned_warmup_bench);
 
     const run_provisioned_warmup_bench = b.addRunArtifact(provisioned_warmup_bench);
     if (b.args) |args| {
@@ -5733,7 +5795,6 @@ pub fn build(b: *std.Build) void {
         .name = "public_query_guardrail",
         .root_module = public_query_guardrail_mod,
     });
-    b.installArtifact(public_query_guardrail);
 
     const run_public_query_guardrail = b.addRunArtifact(public_query_guardrail);
     if (b.args) |args| {
@@ -5760,7 +5821,7 @@ pub fn build(b: *std.Build) void {
     }
     const build_public_query_guardrail_step = b.step("public-query-guardrail-build", "Build the dedicated public query guardrail without running it");
     build_public_query_guardrail_step.dependOn(&public_query_guardrail.step);
-    const public_query_guardrail_step = b.step("public-query-guardrail", "Benchmark the public /api/v1/tables/<table>/query path against direct DB search and health responsiveness");
+    const public_query_guardrail_step = b.step("public-query-guardrail", "Benchmark the public /db/v1/tables/<table>/query path against direct DB search and health responsiveness");
     public_query_guardrail_step.dependOn(&run_public_query_guardrail.step);
 
     const raft_apply_bench_mod = b.createModule(.{
@@ -5775,7 +5836,6 @@ pub fn build(b: *std.Build) void {
         .name = "raft_apply_bench",
         .root_module = raft_apply_bench_mod,
     });
-    b.installArtifact(raft_apply_bench);
 
     const run_raft_apply_bench = b.addRunArtifact(raft_apply_bench);
     if (b.args) |args| {
@@ -5796,7 +5856,6 @@ pub fn build(b: *std.Build) void {
         .name = "managed_host_wal_bench",
         .root_module = managed_host_wal_bench_mod,
     });
-    b.installArtifact(managed_host_wal_bench);
 
     const run_managed_host_wal_bench = b.addRunArtifact(managed_host_wal_bench);
     if (b.args) |args| {
@@ -5820,7 +5879,6 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
-    b.installArtifact(dense_profile_summary);
 
     const run_dense_profile_summary = b.addRunArtifact(dense_profile_summary);
     if (b.args) |args| {
@@ -5840,7 +5898,6 @@ pub fn build(b: *std.Build) void {
         .name = "lmdb_commit_compare",
         .root_module = lmdb_commit_compare_mod,
     });
-    b.installArtifact(lmdb_commit_compare);
 
     const run_lmdb_commit_compare = b.addRunArtifact(lmdb_commit_compare);
     if (b.args) |args| {
@@ -5860,7 +5917,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_split_bench",
         .root_module = hbc_split_bench_mod,
     });
-    b.installArtifact(hbc_split_bench);
 
     const run_hbc_split_bench = b.addRunArtifact(hbc_split_bench);
     if (b.args) |args| {
@@ -5880,7 +5936,6 @@ pub fn build(b: *std.Build) void {
         .name = "sparse_split_bench",
         .root_module = sparse_split_bench_mod,
     });
-    b.installArtifact(sparse_split_bench);
 
     const run_sparse_split_bench = b.addRunArtifact(sparse_split_bench);
     if (b.args) |args| {
@@ -5901,7 +5956,6 @@ pub fn build(b: *std.Build) void {
         .name = "rabitq_bench",
         .root_module = rabitq_bench_mod,
     });
-    b.installArtifact(rabitq_bench);
 
     const run_rabitq_bench = b.addRunArtifact(rabitq_bench);
     if (b.args) |args| {
@@ -5921,7 +5975,6 @@ pub fn build(b: *std.Build) void {
         .name = "recall_harness",
         .root_module = recall_harness_mod,
     });
-    b.installArtifact(recall_harness);
 
     const run_recall_harness = b.addRunArtifact(recall_harness);
     if (b.args) |args| {
@@ -5930,19 +5983,43 @@ pub fn build(b: *std.Build) void {
     const recall_harness_step = b.step("recall-harness", "Run Zig recall suites against exported vector datasets");
     recall_harness_step.dependOn(&run_recall_harness.step);
 
-    const antfly_main_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    antfly_main_mod.addImport("antfly-zig", lib_mod);
-    antfly_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    antfly_main_mod.addImport("httpx", httpx_mod);
-    antfly_main_mod.addImport("antfly_vellum", vellum_mod);
-    antfly_main_mod.addImport("raft_engine", raft_engine_mod);
-    antfly_main_mod.addImport("structlog", structlog_mod);
-    antfly_main_mod.addImport("antfly_platform", platform_mod);
-    antfly_main_mod.addOptions("build_options", build_options);
+    const antfly_main_mod = if (edition == .full) blk: {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("antfly-zig", lib_mod);
+        mod.addImport("antfly-client", antfly_client_pkg_mod);
+        mod.addImport("httpx", httpx_mod);
+        mod.addImport("antfly_vellum", vellum_mod);
+        mod.addImport("raft_engine", raft_engine_mod);
+        mod.addImport("structlog", structlog_mod);
+        mod.addImport("antfly_platform", platform_mod);
+        mod.addOptions("build_options", build_options);
+        break :blk mod;
+    } else blk: {
+        const inference_cli_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/inference/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        inference_cli_mod.addImport("inference", inference_server_mod);
+        inference_cli_mod.addImport("build_options", inference_build_options_mod);
+        inference_cli_mod.addImport("antfly_platform", platform_mod);
+        inference_cli_mod.addImport("structlog", structlog_mod);
+
+        const mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/inference_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("inference_cli", inference_cli_mod);
+        mod.addImport("antfly_platform", platform_mod);
+        mod.addImport("structlog", structlog_mod);
+        mod.addOptions("build_options", build_options);
+        break :blk mod;
+    };
 
     const antfly_main = b.addExecutable(.{
         .name = "antfly",
@@ -5955,7 +6032,9 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "share/antfly/antfarm",
     });
     b.getInstallStep().dependOn(&install_antfly.step);
-    b.getInstallStep().dependOn(&install_antfarm_assets.step);
+    if (edition == .full) {
+        b.getInstallStep().dependOn(&install_antfarm_assets.step);
+    }
 
     const run_antfly = b.addRunArtifact(antfly_main);
     if (b.args) |args| {
@@ -5963,9 +6042,6 @@ pub fn build(b: *std.Build) void {
     }
     const antfly_step = b.step("antfly", "Run the top-level Antfly CLI");
     antfly_step.dependOn(&run_antfly.step);
-    const install_antfly_step = b.step("install-antfly", "Build and install the top-level Antfly CLI");
-    install_antfly_step.dependOn(&install_antfly.step);
-    install_antfly_step.dependOn(&install_antfarm_assets.step);
 
     const run_recall_harness_default = b.addRunArtifact(recall_harness);
     run_recall_harness_default.addArgs(&.{
@@ -5983,7 +6059,7 @@ pub fn build(b: *std.Build) void {
 
     dependOnAll(test_step, &.{
         antfly_test_step,
-        delegated_termite_steps.termite_test,
+        delegated_inference_steps.inference_test,
     });
 
     const hbc_trace_mod = b.createModule(.{
@@ -6004,7 +6080,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_trace",
         .root_module = hbc_trace_mod,
     });
-    b.installArtifact(hbc_trace);
 
     const run_hbc_trace = b.addRunArtifact(hbc_trace);
     if (b.args) |args| {
@@ -6025,7 +6100,6 @@ pub fn build(b: *std.Build) void {
         .name = "hbc_leaf_debug",
         .root_module = hbc_leaf_debug_mod,
     });
-    b.installArtifact(hbc_leaf_debug);
 
     const run_hbc_leaf_debug = b.addRunArtifact(hbc_leaf_debug);
     if (b.args) |args| {

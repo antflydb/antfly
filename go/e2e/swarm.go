@@ -33,12 +33,12 @@ import (
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db"
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
-	"github.com/antflydb/antfly/go/pkg/termite"
+	inferenceRuntime "github.com/antflydb/antfly/go/pkg/termite"
 	"go.uber.org/zap"
 )
 
 // SwarmInstance represents a running single-node Antfly swarm for testing.
-// It includes a metadata server, store server, and Termite ML server.
+// It includes a metadata server, store server, and Antfly inference ML server.
 type SwarmInstance struct {
 	T               *testing.T
 	Logger          *zap.Logger
@@ -62,9 +62,9 @@ func (s *SwarmInstance) Cleanup() {
 
 // SwarmOptions configures optional behaviour for startAntflySwarmWithOptions.
 type SwarmOptions struct {
-	// DisableTermite skips starting the Termite ML server. Useful for tests
+	// DisableInference skips starting the Antfly inference ML server. Useful for tests
 	// that don't need embeddings/chunking/reranking.
-	DisableTermite bool
+	DisableInference bool
 
 	// EnableAuth enables authentication and authorization. When enabled, a
 	// default admin:admin user with full permissions is auto-created at startup.
@@ -75,7 +75,7 @@ type SwarmOptions struct {
 	LocalBypass bool
 }
 
-// startAntflySwarm starts a full Antfly swarm (metadata + store + Termite) for testing.
+// startAntflySwarm starts a full Antfly swarm (metadata + store + Antfly inference) for testing.
 func startAntflySwarm(t *testing.T, ctx context.Context) *SwarmInstance {
 	return startAntflySwarmWithOptions(t, ctx, SwarmOptions{})
 }
@@ -109,21 +109,21 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 		nodeID.String(): metadataAPIURL,
 	}
 
-	if !opts.DisableTermite {
-		termiteAPIPort := GetFreePort(t)
-		termiteAPIURL := fmt.Sprintf("http://localhost:%d", termiteAPIPort)
+	if !opts.DisableInference {
+		inferenceAPIPort := GetFreePort(t)
+		inferenceAPIURL := fmt.Sprintf("http://localhost:%d", inferenceAPIPort)
 
-		// Configure Termite for chunking and reranking
+		// Configure Antfly inference for chunking and reranking
 		repoRoot := findRepoRoot(t)
 		modelsDir := filepath.Join(repoRoot, "models")
 
-		config.Termite = termite.Config{
-			ApiUrl:          termiteAPIURL,
+		config.Inference = inferenceRuntime.Config{
+			ApiUrl:          inferenceAPIURL,
 			ModelsDir:       modelsDir,
 			MaxLoadedModels: 2, // Limit concurrent models to reduce memory pressure
 			PoolSize:        1, // Single pipeline per model (default: min(NumCPU, 4))
 		}
-		t.Logf("Configured Termite with models directory: %s (max_loaded_models=2, pool_size=1)", modelsDir)
+		t.Logf("Configured Antfly inference with models directory: %s (max_loaded_models=2, pool_size=1)", modelsDir)
 	}
 
 	// Clean any existing raft logs
@@ -136,25 +136,25 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 	metadataReadyC := make(chan struct{})
 	storeReadyC := make(chan struct{})
 
-	if !opts.DisableTermite {
-		termiteReadyC := make(chan struct{})
+	if !opts.DisableInference {
+		inferenceReadyC := make(chan struct{})
 
-		go termite.RunAsTermite(
+		go inferenceRuntime.RunAsTermite(
 			swarmCtx,
-			logger.Named("termite"),
-			config.Termite,
-			termiteReadyC,
+			logger.Named("antfly inference"),
+			config.Inference,
+			inferenceReadyC,
 		)
 
-		// Wait for Termite to be ready
+		// Wait for Antfly inference to be ready
 		// Generator models (e.g., Gemma) can take 30+ seconds to load
 		select {
-		case <-termiteReadyC:
-			logger.Info("Termite server ready", zap.String("termite_api", config.Termite.ApiUrl))
-			SetTermiteURL(config.Termite.ApiUrl)
+		case <-inferenceReadyC:
+			logger.Info("Inference server ready", zap.String("inference_api", config.Inference.ApiUrl))
+			SetInferenceURL(config.Inference.ApiUrl)
 		case <-time.After(60 * time.Second):
 			cancel()
-			t.Fatal("Timeout waiting for Termite server to be ready")
+			t.Fatal("Timeout waiting for Antfly inference server to be ready")
 		}
 	}
 
@@ -201,7 +201,7 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 	time.Sleep(500 * time.Millisecond)
 
 	// Create client with timeout to prevent hanging on slow LLM responses
-	apiURL := metadataAPIURL + "/api/v1"
+	apiURL := metadataAPIURL + "/db/v1"
 	httpClient := &http.Client{Timeout: 10 * time.Minute}
 	client, err := antfly.NewAntflyClient(apiURL, httpClient)
 	if err != nil {
@@ -210,7 +210,7 @@ func startAntflySwarmWithOptions(t *testing.T, ctx context.Context, opts SwarmOp
 	}
 
 	logger.Info("Swarm started successfully",
-		zap.String("termite_api", config.Termite.ApiUrl),
+		zap.String("inference_api", config.Inference.ApiUrl),
 		zap.String("metadata_api", metadataAPIURL),
 		zap.String("store_api", storeAPIURL),
 	)

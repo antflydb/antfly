@@ -2848,10 +2848,10 @@ spec:
                     description: SwarmTier optionally records the swarm sub-tier name
                       when Mode=Swarm.
                     type: string
-                  termiteTier:
+                  inferenceTier:
                     description: |-
-                      TermiteTier optionally records the TermitePool sub-tier name when
-                      spec.termite is set.
+                      InferenceTier optionally records the InferencePool sub-tier name when
+                      spec.inference is set.
                     type: string
                 type: object
               publicAPI:
@@ -4088,15 +4088,15 @@ spec:
                         format: int32
                         type: integer
                     type: object
-                  termite:
-                    description: Termite controls the optional termite sidecar runtime
+                  inference:
+                    description: Inference controls the optional inference sidecar runtime
                       integrated into swarm mode.
                     properties:
                       apiURL:
-                        description: APIURL is the termite API URL.
+                        description: APIURL is the inference API URL.
                         type: string
                       enabled:
-                        description: Enabled controls whether termite runs alongside
+                        description: Enabled controls whether inference runs alongside
                           the swarm node.
                         type: boolean
                     type: object
@@ -4318,27 +4318,27 @@ spec:
                 required:
                 - resources
                 type: object
-              termite:
+              inference:
                 description: |-
-                  Termite configures inference pools used by this cluster.
+                  Inference configures inference pools used by this cluster.
                   Pools may be owned by this cluster, referenced as customer-managed shared
                   pools, or referenced as platform-managed shared pools.
                 properties:
                   managedPools:
                     description: |-
-                      ManagedPools are TermitePools created and owned by this AntflyCluster.
+                      ManagedPools are InferencePools created and owned by this AntflyCluster.
                       Valid when mode is Managed.
                     items:
-                      description: ManagedTermitePoolSpec describes one TermitePool
+                      description: ManagedInferencePoolSpec describes one InferencePool
                         owned by an AntflyCluster.
                       properties:
                         name:
                           description: |-
-                            Name is the child TermitePool name. If omitted for a single managed pool,
-                            the operator uses "<antflycluster-name>-termite".
+                            Name is the child InferencePool name. If omitted for a single managed pool,
+                            the operator uses "<antflycluster-name>-inference".
                           type: string
                         spec:
-                          description: Spec is the TermitePool spec to apply to the
+                          description: Spec is the InferencePool spec to apply to the
                             child pool.
                           properties:
                             affinity:
@@ -5501,9 +5501,9 @@ spec:
                               type: object
                             config:
                               description: |-
-                                Config is the Termite configuration as a JSON string.
-                                This is merged with auto-generated configuration and passed to termite via --config.
-                                Supports all termite config options including logging, GPU settings, keep_alive, etc.
+                                Config is the Inference configuration as a JSON string.
+                                This is merged with auto-generated configuration and passed to inference via --config.
+                                Supports all inference config options including logging, GPU settings, keep_alive, etc.
                                 Example: {"log": {"level": "debug", "style": "json"}, "gpu": "auto"}
                               type: string
                             eks:
@@ -5623,8 +5623,8 @@ spec:
                               type: object
                             image:
                               description: |-
-                                Image is the Antfly container image used for this TermitePool.
-                                The image must provide the `/antfly termite ...` runtime contract.
+                                Image is the Antfly container image used for this InferencePool.
+                                The image must provide the `/antfly inference ...` runtime contract.
                               type: string
                             imagePullSecrets:
                               description: ImagePullSecrets for private registries
@@ -6095,7 +6095,7 @@ spec:
                     type: array
                   mode:
                     default: Managed
-                    description: Mode selects how Termite pools are provided.
+                    description: Mode selects how Inference pools are provided.
                     enum:
                     - Disabled
                     - PlatformShared
@@ -6104,19 +6104,19 @@ spec:
                     type: string
                   platformPools:
                     description: |-
-                      PlatformPools references platform-operated shared TermitePools.
+                      PlatformPools references platform-operated shared InferencePools.
                       Valid when mode is PlatformShared.
                     items:
-                      description: TermitePoolReference points at an existing shared
-                        TermitePool or service.
+                      description: InferencePoolReference points at an existing shared
+                        InferencePool or service.
                       properties:
                         apiURL:
                           description: |-
-                            APIURL optionally pins the Termite API URL for this reference. When omitted,
+                            APIURL optionally pins the Inference API URL for this reference. When omitted,
                             higher-level platform wiring may resolve the URL from the referenced pool.
                           type: string
                         name:
-                          description: Name is the referenced TermitePool or logical
+                          description: Name is the referenced InferencePool or logical
                             platform pool name.
                           minLength: 1
                           type: string
@@ -6131,19 +6131,19 @@ spec:
                     type: array
                   sharedPools:
                     description: |-
-                      SharedPools references existing customer-managed TermitePools.
+                      SharedPools references existing customer-managed InferencePools.
                       Valid when mode is SharedRef.
                     items:
-                      description: TermitePoolReference points at an existing shared
-                        TermitePool or service.
+                      description: InferencePoolReference points at an existing shared
+                        InferencePool or service.
                       properties:
                         apiURL:
                           description: |-
-                            APIURL optionally pins the Termite API URL for this reference. When omitted,
+                            APIURL optionally pins the Inference API URL for this reference. When omitted,
                             higher-level platform wiring may resolve the URL from the referenced pool.
                           type: string
                         name:
-                          description: Name is the referenced TermitePool or logical
+                          description: Name is the referenced InferencePool or logical
                             platform pool name.
                           minLength: 1
                           type: string
@@ -6406,16 +6406,16 @@ spec:
                   swarmTier:
                     description: SwarmTier records the observed swarm sub-tier name.
                     type: string
-                  termiteEnabled:
-                    description: TermiteEnabled reports whether this tier has an operator-managed
-                      TermitePool.
+                  inferenceEnabled:
+                    description: InferenceEnabled reports whether this tier has an operator-managed
+                      InferencePool.
                     type: boolean
-                  termiteReplicas:
-                    description: TermiteReplicas reports the observed TermitePool
+                  inferenceReplicas:
+                    description: InferenceReplicas reports the observed InferencePool
                       replica bounds.
                     type: string
-                  termiteTier:
-                    description: TermiteTier records the observed termite sub-tier
+                  inferenceTier:
+                    description: InferenceTier records the observed inference sub-tier
                       name.
                     type: string
                 type: object
@@ -6533,8 +6533,8 @@ spec:
                   storeReady:
                     description: StoreReady indicates that the store API is ready.
                     type: boolean
-                  termiteReady:
-                    description: TermiteReady indicates that termite is ready when
+                  inferenceReady:
+                    description: InferenceReady indicates that inference is ready when
                       enabled.
                     type: boolean
                 type: object

@@ -17,7 +17,7 @@ beforeEach(() => {
 
 // MSW server setup
 const server = setupServer(
-  http.post("http://localhost:8082/api/v1/multiquery", () => {
+  http.post("http://localhost:8082/db/v1/multiquery", () => {
     return HttpResponse.json({
       responses: [
         {
@@ -66,7 +66,7 @@ function WidgetSpy({ widgetId, onWidgetUpdate }: WidgetSpyProps) {
 // Wrapper component to provide required context
 const TestWrapper = ({ children }: { children: React.ReactNode }) => {
   return (
-    <Antfly url="http://localhost:8082/api/v1" table="test">
+    <Antfly url="http://localhost:8082/db/v1" table="test">
       {children}
     </Antfly>
   );

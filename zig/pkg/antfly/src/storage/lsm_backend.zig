@@ -568,7 +568,13 @@ pub const Backend = struct {
     pub const BulkIngestFinishOptions = backend_types.BulkIngestFinishOptions;
 
     pub fn init(allocator: Allocator, options: Options) Backend {
-        return .{
+        var backend: Backend = undefined;
+        initInPlace(&backend, allocator, options);
+        return backend;
+    }
+
+    pub fn initInPlace(self: *Backend, allocator: Allocator, options: Options) void {
+        self.* = .{
             .allocator = allocator,
             .options = options,
             .root_generation = options.root_generation,
@@ -581,6 +587,10 @@ pub const Backend = struct {
 
     pub fn open(allocator: Allocator, root_dir: []const u8, options: Options) !Backend {
         return try recovery_mod.open(Backend, allocator, root_dir, options.backend, options);
+    }
+
+    pub fn openInto(self: *Backend, allocator: Allocator, root_dir: []const u8, options: Options) !void {
+        try recovery_mod.openInto(Backend, self, allocator, root_dir, options.backend, options);
     }
 
     pub fn close(self: *Backend) void {
@@ -2798,7 +2808,7 @@ pub const BackendHandle = struct {
     pub fn open(allocator: Allocator, root_dir: []const u8, options: Options) !BackendHandle {
         const backend = try allocator.create(Backend);
         errdefer allocator.destroy(backend);
-        backend.* = try Backend.open(allocator, root_dir, options);
+        try backend.openInto(allocator, root_dir, options);
         return .{
             .allocator = allocator,
             .backend = backend,

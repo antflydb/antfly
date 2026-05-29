@@ -50,7 +50,6 @@ pub const ExtractedWrite = struct {
     mentioned_graph_indexes: [][]u8,
     dense_embeddings: []DenseEmbeddingWrite,
     sparse_embeddings: []SparseEmbeddingWrite,
-    summaries: []SummaryWrite,
 
     pub fn deinit(self: *ExtractedWrite, alloc: Allocator) void {
         if (self.cleaned_value) |value| alloc.free(value);
@@ -79,12 +78,6 @@ pub const ExtractedWrite = struct {
             if (embedding.values.len > 0) alloc.free(embedding.values);
         }
         if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
-        for (self.summaries) |summary| {
-            alloc.free(summary.index_name);
-            alloc.free(summary.doc_key);
-            alloc.free(summary.text);
-        }
-        if (self.summaries.len > 0) alloc.free(self.summaries);
         self.* = undefined;
     }
 };
@@ -103,12 +96,6 @@ pub const SparseEmbeddingWrite = struct {
     artifact_key: ?[]u8 = null,
     indices: []u32,
     values: []f32,
-};
-
-pub const SummaryWrite = struct {
-    index_name: []u8,
-    doc_key: []u8,
-    text: []u8,
 };
 
 pub const ObservedFieldAnalyzer = struct {
@@ -1120,7 +1107,6 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
             .mentioned_graph_indexes = &.{},
             .dense_embeddings = &.{},
             .sparse_embeddings = &.{},
-            .summaries = &.{},
         };
     }
 
@@ -1139,10 +1125,9 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
             .mentioned_graph_indexes = &.{},
             .dense_embeddings = &.{},
             .sparse_embeddings = &.{},
-            .summaries = &.{},
         };
     }
-    if (root.object.contains("_summaries")) return error.UnsupportedSummaryField;
+    if (root.object.contains("_summaries")) return error.UnsupportedReservedField;
 
     var graph_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
     errdefer {
@@ -1277,7 +1262,6 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
         .mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc),
         .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
         .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
-        .summaries = &.{},
     };
 }
 
@@ -1331,7 +1315,7 @@ fn extractWriteFastDenseEmbeddingsOnly(alloc: Allocator, key: []const u8, data: 
             saw_embeddings = true;
             continue;
         }
-        if (std.mem.eql(u8, field_name, "_summaries")) return error.UnsupportedSummaryField;
+        if (std.mem.eql(u8, field_name, "_summaries")) return error.UnsupportedReservedField;
         if (std.mem.eql(u8, field_name, "_edges")) return null;
         if (!(try appendFastScalarField(alloc, &scanner, field_name, &json_writer))) return null;
         has_non_special_fields = true;
@@ -1348,7 +1332,6 @@ fn extractWriteFastDenseEmbeddingsOnly(alloc: Allocator, key: []const u8, data: 
         .mentioned_graph_indexes = &.{},
         .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
         .sparse_embeddings = &.{},
-        .summaries = &.{},
     };
 }
 

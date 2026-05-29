@@ -18,7 +18,6 @@ pub const filesystem = @import("filesystem.zig");
 pub const memory = @import("memory.zig");
 pub const s3 = @import("s3.zig");
 pub const gcs = @import("gcs.zig");
-pub const google_auth = @import("google_auth.zig");
 pub const s3_compat = @import("s3_compat.zig");
 
 pub const ObjectMetadata = types.ObjectMetadata;
@@ -39,7 +38,6 @@ pub const FilesystemClient = filesystem.FilesystemClient;
 pub const MemoryClient = memory.MemoryClient;
 pub const S3 = s3;
 pub const Gcs = gcs;
-pub const GoogleAuth = google_auth;
 
 pub const S3Scheme = s3_compat.Scheme;
 pub const S3AddressingStyle = s3_compat.AddressingStyle;
@@ -62,7 +60,6 @@ test "objectstore module compiles" {
     _ = memory;
     _ = s3;
     _ = gcs;
-    _ = google_auth;
     _ = s3_compat;
     _ = ObjectMetadata;
     _ = PutOptions;
@@ -81,7 +78,6 @@ test "objectstore module compiles" {
     _ = MemoryClient;
     _ = S3;
     _ = Gcs;
-    _ = GoogleAuth;
     _ = S3Scheme;
     _ = S3AddressingStyle;
     _ = S3Credentials;

@@ -22,7 +22,6 @@ export const GENERATOR_PROVIDER_DEFAULTS: Record<GeneratorProvider, string> = {
   anthropic: "claude-sonnet-4-5-20250929",
   vertex: "gemini-2.5-flash",
   cohere: "command-r-plus",
-  termite: "gemma-3-1b-it",
   openrouter: "openai/gpt-4.1",
   bedrock: "anthropic.claude-sonnet-4-5-20250929-v1:0",
   mock: "mock",
@@ -36,7 +35,6 @@ export const GENERATOR_PROVIDER_LABELS: Record<GeneratorProvider, string> = {
   anthropic: "Anthropic (Claude)",
   vertex: "Google Cloud Vertex AI",
   cohere: "Cohere",
-  termite: "Termite (Local)",
   openrouter: "OpenRouter",
   bedrock: "AWS Bedrock",
   mock: "Mock (Testing)",
@@ -59,7 +57,7 @@ export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
   "ollama",
   "cohere",
   "openrouter",
-  "termite",
+  "antfly",
   "mock",
 ];
 
@@ -152,7 +150,7 @@ export function GeneratorSelector({
       <RadioGroup value={mode} onValueChange={handleModeChange} className="gap-2">
         <label
           htmlFor={defaultId}
-          className="flex items-start gap-3 rounded-lg border p-3 cursor-pointer hover:bg-muted/30"
+          className="flex items-start gap-3 rounded-none border p-3 cursor-pointer hover:bg-muted/30"
         >
           <RadioGroupItem value="default" id={defaultId} className="mt-0.5" />
           <div className="space-y-1">
@@ -164,7 +162,7 @@ export function GeneratorSelector({
         </label>
         <label
           htmlFor={customId}
-          className="flex items-start gap-3 rounded-lg border p-3 cursor-pointer hover:bg-muted/30"
+          className="flex items-start gap-3 rounded-none border p-3 cursor-pointer hover:bg-muted/30"
         >
           <RadioGroupItem value="custom" id={customId} className="mt-0.5" />
           <div className="space-y-1">

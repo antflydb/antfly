@@ -1,7 +1,7 @@
 // Package logging provides configurable zap logger creation for Antfly/Termite services.
 package logging
 
-//go:generate go tool oapi-codegen --config=cfg.yaml ./openapi.yaml
+//go:generate go tool oapi-codegen --config=cfg.yaml ../../../../specs/openapi/shared/logging.yaml
 
 import (
 	"log"

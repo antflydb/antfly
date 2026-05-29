@@ -88,7 +88,7 @@ type ExtractOptions struct {
 }
 
 // Extractor extracts entities from a batch of texts.
-// Implementations may use GLiNER2 (via Termite), tool-calling LLMs, or any other backend.
+// Implementations may use GLiNER2 (via Antfly inference), tool-calling LLMs, or any other backend.
 type Extractor interface {
 	Extract(ctx context.Context, texts []string, opts ExtractOptions) ([]Extraction, error)
 }
@@ -129,9 +129,9 @@ type SessionInfo struct {
 
 // HealthStatus is a lightweight HTTP health payload for the dashboard/API.
 type HealthStatus struct {
-	Status  string `json:"status"`
-	Antfly  bool   `json:"antfly"`
-	Termite bool   `json:"termite"`
+	Status    string `json:"status"`
+	Antfly    bool   `json:"antfly"`
+	Extractor bool   `json:"extractor"`
 }
 
 // ServerInfo describes the running memoryaf service.

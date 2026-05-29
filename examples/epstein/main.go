@@ -34,7 +34,7 @@ import (
 	libai "github.com/antflydb/antfly/go/pkg/libaf/ai"
 	libreading "github.com/antflydb/antfly/go/pkg/libaf/reading"
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
-	termiteoapi "github.com/antflydb/antfly/go/pkg/sdk/oapi"
+	inferenceoapi "github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
@@ -60,37 +60,37 @@ type SplitMetadata struct {
 // OCRConfig holds configuration for OCR fallback when text extraction fails.
 type OCRConfig struct {
 	Enabled       bool     // Enable OCR fallback
-	TermiteURL    string   // Termite service URL (e.g., "http://localhost:8082")
+	InferenceURL  string   // Inference service URL (e.g., "http://localhost:8082")
 	Models        []string // OCR models to try in order (e.g., ["trocr-base-printed", "florence-2"])
 	MinContentLen int      // Trigger OCR if extracted text is shorter than this
 	RenderDPI     float64  // DPI for rendering PDF pages to images (default 150)
 }
 
-// OCRClient wraps the Termite client for OCR operations.
+// OCRClient wraps the Inference client for OCR operations.
 type OCRClient struct {
-	readReader    *generatingreading.TermiteReadReader
-	visionReader  *generatingreading.TermiteGenerateReader
+	readReader    *generatingreading.AntflyReadReader
+	visionReader  *generatingreading.AntflyGenerateReader
 	renderDPI     float64
 	lastUsedModel string
 }
 
-// NewOCRClient creates a new OCR client connected to Termite.
-func NewOCRClient(termiteURL string, models []string, renderDPI float64) (*OCRClient, error) {
-	cfg := generatingreading.TermiteConfig{
-		BaseURL:          termiteURL,
+// NewOCRClient creates a new OCR client connected to Inference.
+func NewOCRClient(inferenceURL string, models []string, renderDPI float64) (*OCRClient, error) {
+	cfg := generatingreading.AntflyConfig{
+		BaseURL:          inferenceURL,
 		Models:           models,
 		DefaultMaxTokens: 2048,
 		RenderDPI:        renderDPI,
 	}
 
-	readReader, err := generatingreading.NewTermiteReadReader(cfg)
+	readReader, err := generatingreading.NewAntflyReadReader(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("create termite read reader: %w", err)
+		return nil, fmt.Errorf("create inference read reader: %w", err)
 	}
 
-	visionReader, err := generatingreading.NewTermiteGenerateReader(cfg)
+	visionReader, err := generatingreading.NewAntflyGenerateReader(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("create termite generate reader: %w", err)
+		return nil, fmt.Errorf("create inference generate reader: %w", err)
 	}
 
 	return &OCRClient{
@@ -137,7 +137,7 @@ func (o *OCRClient) LastUsedModel() string {
 	return o.lastUsedModel
 }
 
-// ReadPageWithPrompt renders a single-page PDF and sends to Termite with a custom prompt and model.
+// ReadPageWithPrompt renders a single-page PDF and sends to Inference with a custom prompt and model.
 // Returns (text, model_used, error). The page PDF is expected to be a single-page document
 // (as produced by split-pages mode).
 func (o *OCRClient) ReadPageWithPrompt(ctx context.Context, pdfData []byte, prompt string, maxTokens int) (string, string, error) {
@@ -160,7 +160,7 @@ func (o *OCRClient) ReadPageWithPrompt(ctx context.Context, pdfData []byte, prom
 	return "", "", fmt.Errorf("all models failed to produce text")
 }
 
-// GeneratePageWithPrompt renders a single-page PDF and sends it to Termite's generate
+// GeneratePageWithPrompt renders a single-page PDF and sends it to Inference's generate
 // endpoint (e.g. Gemma 3 vision) instead of the reader endpoint. Used for vision captioning
 // of image pages. Returns (text, model_used, error).
 func (o *OCRClient) GeneratePageWithPrompt(ctx context.Context, pdfData []byte, prompt string, maxTokens int) (string, string, error) {
@@ -189,8 +189,8 @@ var needsOCRFallback = docsaf.NeedsOCRFallback
 var templatesFS embed.FS
 
 const (
-	DefaultAntflyURL       = "http://localhost:8080/api/v1"
-	DefaultTermiteURL      = "http://localhost:8080"
+	DefaultAntflyURL       = "http://localhost:8080/db/v1"
+	DefaultInferenceURL    = "http://localhost:8080"
 	DefaultFullTextIndex   = "full_text_index_v0"
 	DefaultEmbeddingIndex  = "embeddings"
 	DefaultEmbeddingModel  = "antflydb/clipclap"
@@ -255,29 +255,29 @@ func envDefault(name, fallback string) string {
 	return fallback
 }
 
-func defaultTermiteURL() string {
-	return envDefault("ANTFLY_TERMITE_URL", DefaultTermiteURL)
+func defaultInferenceURL() string {
+	return envDefault("ANTFLY_INFERENCE_URL", DefaultInferenceURL)
 }
 
-func termiteMLBaseURL(raw string) (string, error) {
+func inferenceMLBaseURL(raw string) (string, error) {
 	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
 	if trimmed == "" {
-		return "", fmt.Errorf("termite URL is required")
+		return "", fmt.Errorf("inference URL is required")
 	}
-	if strings.HasSuffix(trimmed, "/ml/v1") {
+	if strings.HasSuffix(trimmed, "/ai/v1") {
 		return trimmed, nil
 	}
 	if strings.HasSuffix(trimmed, "/api") {
-		return "", fmt.Errorf("legacy Termite /api URLs are unsupported; use the Antfly root URL or a /ml/v1 URL")
+		return "", fmt.Errorf("legacy Inference /api URLs are unsupported; use the Antfly root URL or a /ai/v1 URL")
 	}
 	root := strings.TrimRight(antfly.NormalizeBaseURL(trimmed), "/")
 	if root == "" {
-		return "", fmt.Errorf("termite URL is required")
+		return "", fmt.Errorf("inference URL is required")
 	}
-	if strings.HasSuffix(root, "/ml/v1") {
+	if strings.HasSuffix(root, "/ai/v1") {
 		return root, nil
 	}
-	return root + "/ml/v1", nil
+	return root + "/ai/v1", nil
 }
 
 func splitCSV(value string) []string {
@@ -924,7 +924,7 @@ func prepareCmd(args []string) error {
 
 	// OCR fallback flags
 	enableOCR := fs.Bool("enable-ocr", false, "Enable OCR fallback when text extraction fails or produces poor results")
-	ocrTermiteURL := fs.String("ocr-url", defaultTermiteURL(), "Termite URL for OCR")
+	ocrInferenceURL := fs.String("ocr-url", defaultInferenceURL(), "Inference URL for OCR")
 	ocrModels := fs.String("ocr-models", DefaultOCRModel, "OCR models to try (comma-separated, in order)")
 	ocrMinContent := fs.Int("ocr-min-content", 50, "Trigger OCR if extracted content is shorter than this")
 	ocrDPI := fs.Float64("ocr-dpi", 150, "DPI for rendering PDF pages to images for OCR")
@@ -960,7 +960,7 @@ func prepareCmd(args []string) error {
 	}
 	if *enableOCR {
 		fmt.Printf("OCR fallback: enabled\n")
-		fmt.Printf("OCR Termite URL: %s\n", *ocrTermiteURL)
+		fmt.Printf("OCR Inference URL: %s\n", *ocrInferenceURL)
 		fmt.Printf("OCR models: %s\n", *ocrModels)
 		fmt.Printf("OCR min content: %d chars\n", *ocrMinContent)
 		fmt.Printf("OCR render DPI: %.0f\n", *ocrDPI)
@@ -972,7 +972,7 @@ func prepareCmd(args []string) error {
 	if *enableOCR {
 		models := splitCSV(*ocrModels)
 		var err error
-		ocrClient, err = NewOCRClient(*ocrTermiteURL, models, *ocrDPI)
+		ocrClient, err = NewOCRClient(*ocrInferenceURL, models, *ocrDPI)
 		if err != nil {
 			return fmt.Errorf("failed to create OCR client: %w", err)
 		}
@@ -1388,7 +1388,7 @@ func prepareCmd(args []string) error {
 func loadCmd(args []string) error {
 	fs := flag.NewFlagSet("load", flag.ExitOnError)
 	antflyURL := fs.String("url", DefaultAntflyURL, "Antfly API URL")
-	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite API URL for managed chunking")
+	inferenceURL := fs.String("inference-url", defaultInferenceURL(), "Inference API URL for managed chunking")
 	tableName := fs.String("table", "epstein_docs", "Table name to merge into")
 	inputFile := fs.String("input", "epstein-docs.json", "Input JSON file path")
 	dryRun := fs.Bool("dry-run", false, "Preview changes without applying them")
@@ -1414,7 +1414,7 @@ func loadCmd(args []string) error {
 
 	fmt.Printf("=== Epstein Documents Load ===\n")
 	fmt.Printf("Antfly URL: %s\n", *antflyURL)
-	fmt.Printf("Termite URL: %s\n", *termiteURL)
+	fmt.Printf("Inference URL: %s\n", *inferenceURL)
 	fmt.Printf("Table: %s\n", *tableName)
 	fmt.Printf("Input: %s\n", *inputFile)
 	fmt.Printf("Dry run: %v\n\n", *dryRun)
@@ -1423,7 +1423,7 @@ func loadCmd(args []string) error {
 	if *createTable {
 		fmt.Printf("Creating table '%s' with %d shards...\n", *tableName, *numShards)
 
-		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *termiteURL, *chunkerModel, *targetTokens, *overlapTokens)
+		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *inferenceURL, *chunkerModel, *targetTokens, *overlapTokens)
 		if err != nil {
 			return fmt.Errorf("failed to create embedding index config: %w", err)
 		}
@@ -1478,7 +1478,7 @@ func loadCmd(args []string) error {
 func syncCmd(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
 	antflyURL := fs.String("url", DefaultAntflyURL, "Antfly API URL")
-	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite API URL for managed chunking")
+	inferenceURL := fs.String("inference-url", defaultInferenceURL(), "Inference API URL for managed chunking")
 	tableName := fs.String("table", "epstein_docs", "Table name")
 	dirPath := fs.String("dir", "./epstein-docs", "Path to PDF directory")
 	baseURL := fs.String("base-url", "", "Base URL for document links")
@@ -1509,7 +1509,7 @@ func syncCmd(args []string) error {
 
 	fmt.Printf("=== Epstein Documents Sync ===\n")
 	fmt.Printf("Antfly URL: %s\n", *antflyURL)
-	fmt.Printf("Termite URL: %s\n", *termiteURL)
+	fmt.Printf("Inference URL: %s\n", *inferenceURL)
 	fmt.Printf("Directory: %s\n", *dirPath)
 	fmt.Printf("Table: %s\n", *tableName)
 	if len(zipPaths) > 0 {
@@ -1524,7 +1524,7 @@ func syncCmd(args []string) error {
 	if *createTable {
 		fmt.Printf("Creating table '%s'...\n", *tableName)
 
-		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *termiteURL, *chunkerModel, *targetTokens, *overlapTokens)
+		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *inferenceURL, *chunkerModel, *targetTokens, *overlapTokens)
 		if err != nil {
 			return fmt.Errorf("failed to create embedding index: %w", err)
 		}
@@ -1665,7 +1665,7 @@ func syncCmd(args []string) error {
 // serveCmd starts a web server with a search interface
 func serveCmd(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	antflyURL := fs.String("url", "http://localhost:8080/api/v1", "Antfly API URL")
+	antflyURL := fs.String("url", "http://localhost:8080/db/v1", "Antfly API URL")
 	tableName := fs.String("table", "epstein_docs", "Table name to search")
 	listenAddr := fs.String("listen", ":3000", "Listen address for web server")
 	pdfDir := fs.String("pdf-dir", "./epstein-docs", "Directory containing PDF files (including pages/ subdirectory)")
@@ -1891,26 +1891,26 @@ func extractEntityChips(value any, limit int) []EntityChip {
 
 // Helper functions
 
-func createEmbeddingIndex(embeddingModel, termiteURL, chunkerModel string, targetTokens, overlapTokens int) (*antfly.IndexConfig, error) {
+func createEmbeddingIndex(embeddingModel, inferenceURL, chunkerModel string, targetTokens, overlapTokens int) (*antfly.IndexConfig, error) {
 	embeddingIndexConfig := antfly.IndexConfig{
 		Name: DefaultEmbeddingIndex,
 		Type: antfly.IndexTypeEmbeddings,
 	}
 
 	embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
-		"model": embeddingModel,
+		Model: embeddingModel,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure embedder: %w", err)
 	}
 
-	chunkerURL, err := termiteMLBaseURL(termiteURL)
+	chunkerURL, err := inferenceMLBaseURL(inferenceURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure chunker URL: %w", err)
 	}
 
 	chunker := antfly.ChunkerConfig{}
-	err = chunker.FromTermiteChunkerConfig(antfly.TermiteChunkerConfig{
+	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
 		ApiUrl: chunkerURL,
 		Model:  chunkerModel,
 		Text: antfly.TextChunkOptions{
@@ -2810,12 +2810,12 @@ func extractPageFromZip(zipIndex map[string]*zip.File, sourceFile string, pageNu
 }
 
 // enrichCmd implements the "enrich" subcommand: a second pass over prepare output
-// that re-OCRs low-quality pages using Florence 2 (via Termite).
+// that re-OCRs low-quality pages using Florence 2 (via Inference).
 func enrichCmd(args []string) error {
 	fs := flag.NewFlagSet("enrich", flag.ExitOnError)
 	inputFile := fs.String("input", "epstein-docs.json", "Input JSON file from prepare")
 	outputFile := fs.String("output", "", "Output JSON file (default: {input-base}-enriched.json)")
-	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite service URL")
+	inferenceURL := fs.String("inference-url", defaultInferenceURL(), "Inference service URL")
 	model := fs.String("model", DefaultOCRModel, "Reader model for OCR")
 	prompt := fs.String("prompt", "", "Reader prompt")
 	maxTokens := fs.Int("max-tokens", 4096, "Max generation tokens")
@@ -2949,7 +2949,7 @@ func enrichCmd(args []string) error {
 	}
 
 	// Init OCR client
-	ocrClient, err := NewOCRClient(*termiteURL, []string{*model}, *dpi)
+	ocrClient, err := NewOCRClient(*inferenceURL, []string{*model}, *dpi)
 	if err != nil {
 		return fmt.Errorf("create OCR client: %w", err)
 	}
@@ -3147,24 +3147,24 @@ type entityWindowSpan struct {
 }
 
 type entityAccum struct {
-	entities         []termiteoapi.TermiteRecognizeEntity
-	relations        []termiteoapi.TermiteRelation
+	entities         []inferenceoapi.InferenceRecognizeEntity
+	relations        []inferenceoapi.InferenceRelation
 	failed           []entityWindowSpan
 	windows          int
 	errors           int
 	preserveExisting bool
 }
 
-// entitiesCmd enriches prepared page records with NER metadata from Termite.
+// entitiesCmd enriches prepared page records with NER metadata from Inference.
 func entitiesCmd(args []string) error {
 	fs := flag.NewFlagSet("entities", flag.ExitOnError)
 	inputFile := fs.String("input", "epstein-docs.json", "Input JSON file from prepare or enrich")
 	outputFile := fs.String("output", "", "Output JSON file (default: {input-base}-entities.json)")
-	termiteURL := fs.String("termite-url", defaultTermiteURL(), "Termite service URL")
+	inferenceURL := fs.String("inference-url", defaultInferenceURL(), "Inference service URL")
 	model := fs.String("model", DefaultRecognizerModel, "Recognizer model for entity extraction")
 	labelsCSV := fs.String("labels", DefaultEntityLabels, "Entity labels to extract (comma-separated)")
 	relationLabelsCSV := fs.String("relation-labels", DefaultRelationLabels, "Relation labels to extract (comma-separated; pass an empty value to disable)")
-	batchSize := fs.Int("batch-size", 16, "Text windows per Termite recognize request")
+	batchSize := fs.Int("batch-size", 16, "Text windows per Inference recognize request")
 	maxChars := fs.Int("max-chars", DefaultEntityMaxChars, "Maximum characters per recognizer window")
 	overlapChars := fs.Int("overlap-chars", DefaultEntityOverlap, "Characters of overlap between recognizer windows")
 	dryRun := fs.Bool("dry-run", false, "Report candidates only, don't process")
@@ -3198,7 +3198,7 @@ func entitiesCmd(args []string) error {
 	fmt.Printf("=== Epstein Documents Entities ===\n\n")
 	fmt.Printf("Input:  %s\n", *inputFile)
 	fmt.Printf("Output: %s\n", outPath)
-	fmt.Printf("Termite URL: %s\n", *termiteURL)
+	fmt.Printf("Inference URL: %s\n", *inferenceURL)
 	fmt.Printf("Model:  %s\n", *model)
 	fmt.Printf("Labels: %s\n", strings.Join(labels, ", "))
 	if len(relationLabels) > 0 {
@@ -3225,9 +3225,9 @@ func entitiesCmd(args []string) error {
 		return writeJSONSorted(outPath, records)
 	}
 
-	client, err := antfly.NewTermiteClient(*termiteURL, http.DefaultClient)
+	client, err := antfly.NewInferenceClient(*inferenceURL, http.DefaultClient)
 	if err != nil {
-		return fmt.Errorf("create termite client: %w", err)
+		return fmt.Errorf("create inference client: %w", err)
 	}
 
 	accum := make(map[string]*entityAccum, len(candidates))
@@ -3494,7 +3494,7 @@ func chooseEntityWindowEnd(runes []rune, start, hardEnd int) int {
 
 func recognizeEntityWindows(
 	ctx context.Context,
-	client *antfly.TermiteClient,
+	client *antfly.InferenceClient,
 	model string,
 	labels []string,
 	relationLabels []string,
@@ -3519,7 +3519,7 @@ func recognizeEntityWindows(
 
 func recognizeEntityWindowBatch(
 	ctx context.Context,
-	client *antfly.TermiteClient,
+	client *antfly.InferenceClient,
 	model string,
 	labels []string,
 	relationLabels []string,
@@ -3535,15 +3535,23 @@ func recognizeEntityWindowBatch(
 		texts[i] = window.content
 	}
 
-	var (
-		resp *termiteoapi.TermiteRecognizeResponse
-		err  error
-	)
-	if len(relationLabels) > 0 {
-		resp, err = client.ExtractRelations(ctx, model, texts, labels, relationLabels)
-	} else {
-		resp, err = client.Recognize(ctx, model, texts, labels)
+	inputs, err := inferenceExtractionInputs(texts)
+	if err != nil {
+		log.Printf("Warning: entity recognition request build failed: %v", err)
+		return "", 0, len(windows)
 	}
+	relations := make([]inferenceoapi.ExtractionRelationSchema, 0, len(relationLabels))
+	for _, label := range relationLabels {
+		relations = append(relations, inferenceoapi.ExtractionRelationSchema{Type: label})
+	}
+	resp, err := client.Extract(ctx, inferenceoapi.ExtractionRequest{
+		Model:  model,
+		Inputs: inputs,
+		Schema: inferenceoapi.ExtractionSchema{
+			Entities:  labels,
+			Relations: relations,
+		},
+	})
 	if err != nil {
 		if len(windows) > 1 {
 			mid := len(windows) / 2
@@ -3569,14 +3577,11 @@ func recognizeEntityWindowBatch(
 		usedModel = model
 	}
 
-	resultsByIndex := make(map[int]termiteoapi.TermiteRecognizeObject, len(resp.Data))
+	resultsByIndex := make(map[int]inferenceoapi.InferenceRecognizeObject, len(resp.Data))
 	for resultIdx, result := range resp.Data {
-		idx := result.Index
-		if idx < 0 || idx >= len(windows) {
-			idx = resultIdx
-		}
+		idx := resultIdx
 		if idx >= 0 && idx < len(windows) {
-			resultsByIndex[idx] = result
+			resultsByIndex[idx] = inferenceRecognizeObjectFromExtraction(result)
 		}
 	}
 
@@ -3598,22 +3603,75 @@ func recognizeEntityWindowBatch(
 	return usedModel, len(windows), 0
 }
 
-func offsetEntities(entities []termiteoapi.TermiteRecognizeEntity, base int) []termiteoapi.TermiteRecognizeEntity {
-	out := make([]termiteoapi.TermiteRecognizeEntity, len(entities))
+func inferenceExtractionInputs(texts []string) ([]inferenceoapi.ExtractionInput, error) {
+	inputs := make([]inferenceoapi.ExtractionInput, len(texts))
+	for i, text := range texts {
+		content, err := json.Marshal(text)
+		if err != nil {
+			return nil, err
+		}
+		inputs[i] = inferenceoapi.ExtractionInput{Content: inferenceoapi.ChatMessageContent(content)}
+	}
+	return inputs, nil
+}
+
+func inferenceRecognizeObjectFromExtraction(item inferenceoapi.ExtractionObject) inferenceoapi.InferenceRecognizeObject {
+	entities := make([]inferenceoapi.InferenceRecognizeEntity, len(item.Entities))
+	for i, entity := range item.Entities {
+		entities[i] = inferenceoapi.InferenceRecognizeEntity{
+			Text:  entity.Text,
+			Label: entity.Label,
+			Score: entity.Score,
+			Start: entity.Start,
+			End:   entity.End,
+		}
+	}
+	relations := make([]inferenceoapi.InferenceRelation, 0, len(item.Relations))
+	for _, relation := range item.Relations {
+		relations = append(relations, inferenceoapi.InferenceRelation{
+			Head:  inferenceRelationEndpointEntity(relation.Source, entities),
+			Label: relation.Type,
+			Score: relation.Score,
+			Tail:  inferenceRelationEndpointEntity(relation.Target, entities),
+		})
+	}
+	return inferenceoapi.InferenceRecognizeObject{
+		Entities:  entities,
+		Object:    inferenceoapi.InferenceRecognizeObjectObjectRecognition,
+		Relations: relations,
+	}
+}
+
+func inferenceRelationEndpointEntity(endpoint inferenceoapi.ExtractionRelationEndpoint, entities []inferenceoapi.InferenceRecognizeEntity) inferenceoapi.InferenceRecognizeEntity {
+	if endpoint.EntityIndex >= 0 && endpoint.EntityIndex < len(entities) {
+		return entities[endpoint.EntityIndex]
+	}
+	if endpoint.Id != "" {
+		for _, entity := range entities {
+			if entity.Text == endpoint.Id {
+				return entity
+			}
+		}
+	}
+	return inferenceoapi.InferenceRecognizeEntity{}
+}
+
+func offsetEntities(entities []inferenceoapi.InferenceRecognizeEntity, base int) []inferenceoapi.InferenceRecognizeEntity {
+	out := make([]inferenceoapi.InferenceRecognizeEntity, len(entities))
 	for i, entity := range entities {
 		out[i] = offsetEntity(entity, base)
 	}
 	return out
 }
 
-func offsetEntity(entity termiteoapi.TermiteRecognizeEntity, base int) termiteoapi.TermiteRecognizeEntity {
+func offsetEntity(entity inferenceoapi.InferenceRecognizeEntity, base int) inferenceoapi.InferenceRecognizeEntity {
 	entity.Start += base
 	entity.End += base
 	return entity
 }
 
-func offsetRelations(relations []termiteoapi.TermiteRelation, base int) []termiteoapi.TermiteRelation {
-	out := make([]termiteoapi.TermiteRelation, len(relations))
+func offsetRelations(relations []inferenceoapi.InferenceRelation, base int) []inferenceoapi.InferenceRelation {
+	out := make([]inferenceoapi.InferenceRelation, len(relations))
 	for i, relation := range relations {
 		relation.Head = offsetEntity(relation.Head, base)
 		relation.Tail = offsetEntity(relation.Tail, base)
@@ -3622,15 +3680,15 @@ func offsetRelations(relations []termiteoapi.TermiteRelation, base int) []termit
 	return out
 }
 
-func metadataEntities(value any) []termiteoapi.TermiteRecognizeEntity {
+func metadataEntities(value any) []inferenceoapi.InferenceRecognizeEntity {
 	items, ok := value.([]any)
 	if !ok {
-		if entities, ok := value.([]termiteoapi.TermiteRecognizeEntity); ok {
-			return append([]termiteoapi.TermiteRecognizeEntity(nil), entities...)
+		if entities, ok := value.([]inferenceoapi.InferenceRecognizeEntity); ok {
+			return append([]inferenceoapi.InferenceRecognizeEntity(nil), entities...)
 		}
 		return nil
 	}
-	entities := make([]termiteoapi.TermiteRecognizeEntity, 0, len(items))
+	entities := make([]inferenceoapi.InferenceRecognizeEntity, 0, len(items))
 	for _, item := range items {
 		entity, ok := metadataEntity(item)
 		if ok {
@@ -3640,15 +3698,15 @@ func metadataEntities(value any) []termiteoapi.TermiteRecognizeEntity {
 	return entities
 }
 
-func metadataRelations(value any) []termiteoapi.TermiteRelation {
+func metadataRelations(value any) []inferenceoapi.InferenceRelation {
 	items, ok := value.([]any)
 	if !ok {
-		if relations, ok := value.([]termiteoapi.TermiteRelation); ok {
-			return append([]termiteoapi.TermiteRelation(nil), relations...)
+		if relations, ok := value.([]inferenceoapi.InferenceRelation); ok {
+			return append([]inferenceoapi.InferenceRelation(nil), relations...)
 		}
 		return nil
 	}
-	relations := make([]termiteoapi.TermiteRelation, 0, len(items))
+	relations := make([]inferenceoapi.InferenceRelation, 0, len(items))
 	for _, item := range items {
 		relation, ok := metadataRelation(item)
 		if ok {
@@ -3658,15 +3716,15 @@ func metadataRelations(value any) []termiteoapi.TermiteRelation {
 	return relations
 }
 
-func metadataEntity(value any) (termiteoapi.TermiteRecognizeEntity, bool) {
-	if entity, ok := value.(termiteoapi.TermiteRecognizeEntity); ok {
+func metadataEntity(value any) (inferenceoapi.InferenceRecognizeEntity, bool) {
+	if entity, ok := value.(inferenceoapi.InferenceRecognizeEntity); ok {
 		return entity, true
 	}
 	m, ok := value.(map[string]any)
 	if !ok {
-		return termiteoapi.TermiteRecognizeEntity{}, false
+		return inferenceoapi.InferenceRecognizeEntity{}, false
 	}
-	return termiteoapi.TermiteRecognizeEntity{
+	return inferenceoapi.InferenceRecognizeEntity{
 		Text:  metadataString(m["text"]),
 		Label: metadataString(m["label"]),
 		Start: metadataInt(m["start"]),
@@ -3675,20 +3733,20 @@ func metadataEntity(value any) (termiteoapi.TermiteRecognizeEntity, bool) {
 	}, true
 }
 
-func metadataRelation(value any) (termiteoapi.TermiteRelation, bool) {
-	if relation, ok := value.(termiteoapi.TermiteRelation); ok {
+func metadataRelation(value any) (inferenceoapi.InferenceRelation, bool) {
+	if relation, ok := value.(inferenceoapi.InferenceRelation); ok {
 		return relation, true
 	}
 	m, ok := value.(map[string]any)
 	if !ok {
-		return termiteoapi.TermiteRelation{}, false
+		return inferenceoapi.InferenceRelation{}, false
 	}
 	head, headOK := metadataEntity(m["head"])
 	tail, tailOK := metadataEntity(m["tail"])
 	if !headOK || !tailOK {
-		return termiteoapi.TermiteRelation{}, false
+		return inferenceoapi.InferenceRelation{}, false
 	}
-	return termiteoapi.TermiteRelation{
+	return inferenceoapi.InferenceRelation{
 		Head:  head,
 		Label: metadataString(m["label"]),
 		Score: metadataFloat32(m["score"]),
@@ -3760,8 +3818,8 @@ func stringSlicesEqual(a, b []string) bool {
 	return true
 }
 
-func dedupeEntities(entities []termiteoapi.TermiteRecognizeEntity) []termiteoapi.TermiteRecognizeEntity {
-	byKey := make(map[string]termiteoapi.TermiteRecognizeEntity, len(entities))
+func dedupeEntities(entities []inferenceoapi.InferenceRecognizeEntity) []inferenceoapi.InferenceRecognizeEntity {
+	byKey := make(map[string]inferenceoapi.InferenceRecognizeEntity, len(entities))
 	for _, entity := range entities {
 		key := entityKey(entity)
 		if existing, ok := byKey[key]; !ok || entity.Score > existing.Score {
@@ -3769,11 +3827,11 @@ func dedupeEntities(entities []termiteoapi.TermiteRecognizeEntity) []termiteoapi
 		}
 	}
 
-	out := make([]termiteoapi.TermiteRecognizeEntity, 0, len(byKey))
+	out := make([]inferenceoapi.InferenceRecognizeEntity, 0, len(byKey))
 	for _, entity := range byKey {
 		out = append(out, entity)
 	}
-	slices.SortFunc(out, func(a, b termiteoapi.TermiteRecognizeEntity) int {
+	slices.SortFunc(out, func(a, b inferenceoapi.InferenceRecognizeEntity) int {
 		if a.Start != b.Start {
 			return a.Start - b.Start
 		}
@@ -3788,8 +3846,8 @@ func dedupeEntities(entities []termiteoapi.TermiteRecognizeEntity) []termiteoapi
 	return out
 }
 
-func dedupeRelations(relations []termiteoapi.TermiteRelation) []termiteoapi.TermiteRelation {
-	byKey := make(map[string]termiteoapi.TermiteRelation, len(relations))
+func dedupeRelations(relations []inferenceoapi.InferenceRelation) []inferenceoapi.InferenceRelation {
+	byKey := make(map[string]inferenceoapi.InferenceRelation, len(relations))
 	for _, relation := range relations {
 		key := relationKey(relation)
 		if existing, ok := byKey[key]; !ok || relation.Score > existing.Score {
@@ -3797,11 +3855,11 @@ func dedupeRelations(relations []termiteoapi.TermiteRelation) []termiteoapi.Term
 		}
 	}
 
-	out := make([]termiteoapi.TermiteRelation, 0, len(byKey))
+	out := make([]inferenceoapi.InferenceRelation, 0, len(byKey))
 	for _, relation := range byKey {
 		out = append(out, relation)
 	}
-	slices.SortFunc(out, func(a, b termiteoapi.TermiteRelation) int {
+	slices.SortFunc(out, func(a, b inferenceoapi.InferenceRelation) int {
 		if a.Head.Start != b.Head.Start {
 			return a.Head.Start - b.Head.Start
 		}
@@ -3819,11 +3877,11 @@ func dedupeRelations(relations []termiteoapi.TermiteRelation) []termiteoapi.Term
 	return out
 }
 
-func entityKey(entity termiteoapi.TermiteRecognizeEntity) string {
+func entityKey(entity inferenceoapi.InferenceRecognizeEntity) string {
 	return fmt.Sprintf("%s\x00%s\x00%d\x00%d", entity.Label, entity.Text, entity.Start, entity.End)
 }
 
-func relationKey(relation termiteoapi.TermiteRelation) string {
+func relationKey(relation inferenceoapi.InferenceRelation) string {
 	return fmt.Sprintf("%s\x00%s\x00%s", relation.Label, entityKey(relation.Head), entityKey(relation.Tail))
 }
 
@@ -3848,11 +3906,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  epstein sync [flags]      - Full pipeline (process + load)\n")
 		fmt.Fprintf(os.Stderr, "  epstein serve [flags]     - Start web search interface\n")
 		fmt.Fprintf(os.Stderr, "  epstein audit [flags]     - Audit parsed documents for errors\n")
-		fmt.Fprintf(os.Stderr, "  epstein enrich [flags]    - Re-OCR low-quality pages with Termite readers\n")
-		fmt.Fprintf(os.Stderr, "  epstein entities [flags]  - Add Termite entity metadata to prepared JSON\n")
+		fmt.Fprintf(os.Stderr, "  epstein enrich [flags]    - Re-OCR low-quality pages with Antfly inference readers\n")
+		fmt.Fprintf(os.Stderr, "  epstein entities [flags]  - Add Antfly inference entity metadata to prepared JSON\n")
 		fmt.Fprintf(os.Stderr, "\nQuick Start:\n")
 		fmt.Fprintf(os.Stderr, "  # 1. Build and start Zig Antfly\n")
-		fmt.Fprintf(os.Stderr, "  cd zig && zig build install-antfly && ./zig-out/bin/antfly swarm\n\n")
+		fmt.Fprintf(os.Stderr, "  cd zig && zig build install && ./zig-out/bin/antfly swarm\n\n")
 		fmt.Fprintf(os.Stderr, "  # 2. Download documents (choose dataset)\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset court-2024    # ~23MB, 943 pages\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset doj-complete  # ~4.8GB, 8 datasets (Dec 2025)\n")
@@ -3860,7 +3918,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  # 3. Prepare with page splitting (enables PDF viewing)\n")
 		fmt.Fprintf(os.Stderr, "  epstein prepare --split-pages\n\n")
 		fmt.Fprintf(os.Stderr, "  # 3b. (Optional) Enable OCR for scanned documents\n")
-		fmt.Fprintf(os.Stderr, "  #     Requires Termite running with OCR models\n")
+		fmt.Fprintf(os.Stderr, "  #     Requires Inference running with OCR models\n")
 		fmt.Fprintf(os.Stderr, "  epstein prepare --split-pages --enable-ocr\n\n")
 		fmt.Fprintf(os.Stderr, "  # 4. Index and load\n")
 		fmt.Fprintf(os.Stderr, "  epstein load --create-table\n\n")
@@ -3868,8 +3926,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  epstein serve\n\n")
 		fmt.Fprintf(os.Stderr, "OCR Fallback:\n")
 		fmt.Fprintf(os.Stderr, "  The --enable-ocr flag enables automatic OCR when text extraction fails.\n")
-		fmt.Fprintf(os.Stderr, "  This requires Termite running with OCR models such as %s.\n", DefaultOCRModel)
-		fmt.Fprintf(os.Stderr, "  Pages are rendered to images and sent to Termite for text recognition.\n")
+		fmt.Fprintf(os.Stderr, "  This requires Inference running with OCR models such as %s.\n", DefaultOCRModel)
+		fmt.Fprintf(os.Stderr, "  Pages are rendered to images and sent to Inference for text recognition.\n")
 		fmt.Fprintf(os.Stderr, "  Useful for scanned documents or PDFs with garbled text extraction.\n\n")
 		fmt.Fprintf(os.Stderr, "Datasets:\n")
 		fmt.Fprintf(os.Stderr, "  court-2024    January 2024 court unsealing (Giuffre v. Maxwell)\n")

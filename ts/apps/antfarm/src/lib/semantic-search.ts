@@ -1,9 +1,9 @@
 /**
  * Semantic search for the command palette.
- * Uses pre-computed embeddings and Termite's /api/embed for query embedding.
+ * Uses pre-computed embeddings and Antfly inference's /ai/v1/embed for query embedding.
  */
 
-import type { TermiteClient } from "@antfly/sdk";
+import type { InferenceClient } from "@antfly/sdk";
 import commandIndex from "@/data/command-index.json";
 
 export interface CommandItem {
@@ -69,23 +69,23 @@ function cosineSimilarity(a: number[], b: number[]): number {
 
 /**
  * Performs semantic search against the command palette items.
- * Uses Termite's /api/embed endpoint to embed the query, then
+ * Uses Antfly inference's /ai/v1/embed endpoint to embed the query, then
  * computes cosine similarity against pre-embedded command vectors.
  *
  * @param query - The user's search query
- * @param termiteClient - TermiteClient instance for embedding
+ * @param inferenceClient - InferenceClient instance for embedding
  * @param limit - Maximum number of results to return (default: 3)
  * @returns Promise resolving to semantic search results sorted by score
  */
 export async function semanticSearch(
   query: string,
-  termiteClient: TermiteClient,
+  inferenceClient: InferenceClient,
   limit = 3
 ): Promise<SemanticResult[]> {
   try {
-    // Get query embedding from Termite
+    // Get query embedding from Antfly inference.
     // Use the same model as the pre-computed embeddings
-    const response = await termiteClient.embed(index.model, query);
+    const response = await inferenceClient.embed(index.model, query);
     const queryVec = response.data[0]?.embedding;
     if (!Array.isArray(queryVec)) {
       return [];
@@ -108,7 +108,7 @@ export async function semanticSearch(
     // Return top-k results sorted by score (highest first)
     return scored.sort((a, b) => b.score - a.score).slice(0, limit);
   } catch (e) {
-    // Graceful degradation - Termite unavailable or model not loaded
+    // Graceful degradation - Antfly inference unavailable or model not loaded.
     console.error("Semantic search failed:", e);
     return [];
   }

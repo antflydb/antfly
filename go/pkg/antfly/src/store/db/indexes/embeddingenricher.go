@@ -45,7 +45,7 @@ import (
 // waitRateLimiter splits a WaitN call into burst-sized chunks so that it
 // works when n exceeds the limiter's burst (which can happen after document
 // chunking expands a batch into more prompts than the original batch size).
-// If limiter is nil (local providers like Termite), it returns immediately.
+// If limiter is nil (local providers like Antfly inference), it returns immediately.
 func waitRateLimiter(ctx context.Context, limiter *rate.Limiter, n int) error {
 	if limiter == nil {
 		return nil
@@ -97,7 +97,7 @@ type EmbeddingEnricher struct {
 
 	generatePrompts generatePromptsFunc
 
-	// Per-provider rate limiter (nil for local providers like Termite).
+	// Per-provider rate limiter (nil for local providers like Antfly inference).
 	rateLimiter *rate.Limiter
 
 	// Optional: called after embeddings are persisted (used for ephemeral chunk offset writes)

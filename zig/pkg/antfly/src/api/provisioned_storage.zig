@@ -198,7 +198,7 @@ pub const ProvisionedGroupStorage = struct {
         self.read_cache.hbc_cache = &self.hbc_cache;
         self.read_cache.resource_manager = &self.resource_manager;
         self.read_cache.backend_runtime = self.backend_runtime;
-        self.read_cache.local_termite_provider = read_source.local_termite_provider;
+        self.read_cache.antfly_provider = read_source.antfly_provider;
         self.read_cache.secret_store = read_source.secret_store;
         // Keep the shared LSM block cache query-side. Writer DBs should use
         // transient read buffers during ingest/build work rather than warming
@@ -207,7 +207,7 @@ pub const ProvisionedGroupStorage = struct {
         self.write_cache.hbc_cache = &self.hbc_cache;
         self.write_cache.resource_manager = &self.resource_manager;
         self.write_cache.backend_runtime = self.backend_runtime;
-        self.write_cache.local_termite_provider = write_source.local_termite_provider;
+        self.write_cache.antfly_provider = write_source.antfly_provider;
         self.write_cache.secret_store = write_source.secret_store;
         read_source.cache = &self.read_cache;
         read_source.runtime_status_cache = &self.runtime_status_cache;

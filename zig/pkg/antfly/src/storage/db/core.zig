@@ -681,20 +681,52 @@ pub const DBCore = struct {
         deleted: *std.ArrayListUnmanaged([]u8),
     ) !void {
         if (!self.hasArtifactCleanupMaybe()) return;
-        const prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
-        defer alloc.free(prefix);
+
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+        var unrecorded_delete_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (unrecorded_delete_keys.items) |key| alloc.free(key);
+            unrecorded_delete_keys.deinit(alloc);
+        }
+
+        const artifact_prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
+        defer alloc.free(artifact_prefix);
+        try self.collectDeleteKeysForPrefix(alloc, artifact_prefix, &deletes, deleted, &unrecorded_delete_keys);
+
+        const asset_state_prefix = try internal_keys.assetStateRootPrefixAlloc(alloc, doc_key);
+        defer alloc.free(asset_state_prefix);
+        try self.collectDeleteKeysForPrefix(alloc, asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
+
+        const graph_asset_state_prefix = try internal_keys.graphAssetStateRootPrefixAlloc(alloc, doc_key);
+        defer alloc.free(graph_asset_state_prefix);
+        try self.collectDeleteKeysForPrefix(alloc, graph_asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
+
+        if (deletes.items.len > 0) {
+            try self.putStoreBatch(&.{}, deletes.items);
+        }
+    }
+
+    fn collectDeleteKeysForPrefix(
+        self: *DBCore,
+        alloc: Allocator,
+        prefix: []const u8,
+        deletes: *std.ArrayListUnmanaged([]const u8),
+        recorded: ?*std.ArrayListUnmanaged([]u8),
+        unrecorded: *std.ArrayListUnmanaged([]u8),
+    ) !void {
         const existing = try self.scanStorePrefix(alloc, prefix);
         defer docstore_mod.DocStore.freeResults(alloc, existing);
-        if (existing.len == 0) return;
-
-        var deletes = try alloc.alloc([]const u8, existing.len);
-        defer alloc.free(deletes);
-        for (existing, 0..) |entry, i| {
-            const duped = try alloc.dupe(u8, entry.key);
-            deletes[i] = duped;
-            try deleted.append(alloc, duped);
+        for (existing) |entry| {
+            const owned = try alloc.dupe(u8, entry.key);
+            errdefer alloc.free(owned);
+            try deletes.append(alloc, owned);
+            if (recorded) |out| {
+                try out.append(alloc, owned);
+            } else {
+                try unrecorded.append(alloc, owned);
+            }
         }
-        try self.putStoreBatch(&.{}, deletes);
     }
 
     pub fn loadIndexes(self: *DBCore) !void {

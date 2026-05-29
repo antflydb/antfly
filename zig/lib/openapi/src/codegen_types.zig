@@ -1038,7 +1038,7 @@ test "allOf flattens nested oneOf member properties into struct" {
             },
         },
     });
-    try schemas.put(arena, "TermiteChunkerConfig", .{
+    try schemas.put(arena, "AntflyChunkerConfig", .{
         .schema = .{
             .all_of = &.{
                 .{ .ref = .{ .ref_string = "#/components/schemas/ChunkOptions" } },
@@ -1055,19 +1055,11 @@ test "allOf flattens nested oneOf member properties into struct" {
             },
         },
     });
-    try schemas.put(arena, "AntflyChunkerConfig", .{
-        .schema = .{
-            .all_of = &.{
-                .{ .ref = .{ .ref_string = "#/components/schemas/ChunkOptions" } },
-            },
-        },
-    });
     try schemas.put(arena, "ChunkerConfig", .{
         .schema = .{
             .all_of = &.{
                 .{ .schema = .{
                     .one_of = &.{
-                        .{ .ref = .{ .ref_string = "#/components/schemas/TermiteChunkerConfig" } },
                         .{ .ref = .{ .ref_string = "#/components/schemas/AntflyChunkerConfig" } },
                     },
                 } },

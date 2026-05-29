@@ -85,7 +85,8 @@ jobs:
           zig build \
             -Dtarget="${{ matrix.zig_target }}" \
             -Doptimize=ReleaseFast \
-            install-antfly \
+            -Dedition=full \
+            install \
             --prefix "$RUNNER_TEMP/zig-out" \
             --global-cache-dir "$CACHE_ROOT/global"
           test -x "$RUNNER_TEMP/zig-out/bin/antfly"

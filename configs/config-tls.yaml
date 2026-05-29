@@ -3,7 +3,7 @@ metadata:
     b: "https://127.0.0.1:12277"
     c: "https://127.0.0.1:12278"
     d: "https://127.0.0.1:12279"
-termite:
+inference:
   api_url: "http://127.0.0.1:11433"
 tls:
   cert: "certificate.crt"

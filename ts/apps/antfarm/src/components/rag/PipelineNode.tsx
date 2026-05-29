@@ -64,7 +64,7 @@ export const PipelineNode: React.FC<PipelineNodeProps> = ({
       type="button"
       onClick={onClick}
       className={cn(
-        "absolute flex items-center gap-2 rounded-xl border px-3 transition-all cursor-pointer select-none",
+        "absolute flex items-center gap-2 rounded-none border px-3 transition-all cursor-pointer select-none",
         // Status-dependent styles
         status === "pending" && "border-border/50 bg-muted/30 opacity-50",
         status === "running" &&

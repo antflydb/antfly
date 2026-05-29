@@ -203,8 +203,13 @@ func indexAntflyDocsWithHierarchy(t *testing.T, ctx context.Context, client *ant
 	embedder, err := GetDefaultEmbedderConfig(t)
 	require.NoError(t, err, "Failed to configure embedder")
 
+	inferenceURL := GetInferenceURL()
+	require.NotEmpty(t, inferenceURL, "Antfly inference URL should be set after swarm start")
+
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
+		Model:  "fixed",
+		ApiUrl: inferenceURL,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  512,
 			OverlapTokens: 50,
@@ -348,8 +353,13 @@ func indexAntflyDocs(t *testing.T, ctx context.Context, client *antfly.AntflyCli
 	require.NoError(t, err, "Failed to configure embedder")
 
 	// Configure fixed-size chunker (no ML model needed - reduces memory usage)
+	inferenceURL := GetInferenceURL()
+	require.NotEmpty(t, inferenceURL, "Antfly inference URL should be set after swarm start")
+
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
+		Model:  "fixed",
+		ApiUrl: inferenceURL,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  512,
 			OverlapTokens: 50,
@@ -489,7 +499,7 @@ func executeRetrievalAgentQueries(
 	results := make([]QueryResult, len(queries))
 
 	provider := GetE2EProvider()
-	if provider == "gemini" || provider == "termite" {
+	if provider == "gemini" || provider == "antfly" {
 		t.Logf("Running %d queries in parallel (%s mode, concurrency=4)", len(queries), provider)
 		executeQueriesParallel(t, ctx, client, cfg, queries, results)
 	} else {
@@ -867,12 +877,12 @@ type testQueryConfig struct {
 	tableName      string
 }
 
-func newTestQueryConfig(t *testing.T, tableName, termiteURL string) testQueryConfig {
+func newTestQueryConfig(t *testing.T, tableName, inferenceURL string) testQueryConfig {
 	t.Helper()
 
-	rerankerConfig, err := antfly.NewRerankerConfig(antfly.TermiteRerankerConfig{
+	rerankerConfig, err := antfly.NewRerankerConfig(antfly.AntflyRerankerConfig{
 		Model: "mixedbread-ai/mxbai-rerank-base-v1",
-		Url:   termiteURL,
+		Url:   inferenceURL,
 	})
 	require.NoError(t, err, "Failed to create reranker config")
 	rerankerConfig.Field = "content"
@@ -891,7 +901,7 @@ Key concepts:
 - Shards: Horizontal partitions for scalability
 - Indexes: BM25 (full-text), embedding (vector), and enrichers
 - Multi-Raft: Separate consensus groups for metadata and storage
-- Termite: ML service for embeddings, chunking, and reranking
+- Antfly inference: ML service for embeddings, chunking, and reranking
 
 Use precise technical terminology when discussing Antfly features.`,
 		generator: GetDefaultGeneratorConfig(t),
@@ -1163,7 +1173,7 @@ func TestE2E_RetrievalAgent_DocsEval(t *testing.T) {
 	require.NotEmpty(t, queries, "No test queries loaded")
 
 	t.Log("Executing retrieval agent queries with hybrid search and inline evaluation...")
-	cfg := newTestQueryConfig(t, tableName, setup.Swarm.Config.Termite.ApiUrl)
+	cfg := newTestQueryConfig(t, tableName, setup.Swarm.Config.Inference.ApiUrl)
 	results := executeRetrievalAgentQueries(t, setup.Ctx, setup.Swarm.Client, cfg, queries)
 
 	// Aggregate and report

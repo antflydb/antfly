@@ -8,30 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Changed
-- Consolidated the previous Antfly and Termite operator modules into
+- Consolidated the previous Antfly and Inference operator modules into
   `go/pkg/operator` with one `cmd/antfly-operator` binary and one operator image.
 - Operator release tags now use `go/pkg/operator/v*`; the previous
   `pkg/antfly-operator/v*` and `go/pkg/termite-operator/v*` tag streams are
   removed.
 
 ### Added
-- Added `AntflyCluster.spec.termite` for an AntflyCluster-owned TermitePool.
+- Added `AntflyCluster.spec.inference` for an AntflyCluster-owned InferencePool.
 
 ### Removed
-- Removed the standalone Termite operator image and Dockerfile.
+- Removed the standalone Inference operator image and Dockerfile.
 
 ## [0.0.16] - 2026-03-16
 
 ### Changed
 - Simplified architecture to two-tier design (leader + data nodes)
-- Removed termite deployment components entirely
+- Removed inference deployment components entirely
 - Updated all documentation and examples to reflect simplified architecture
-- Streamlined CRD definition to remove unused termite configurations
+- Streamlined CRD definition to remove unused inference configurations
 - Updated Makefile with improved targets and cleanup
 
 ### Removed
-- Termite nodes deployment and configuration support
-- All termite-related code from controller and CRD types
+- Inference nodes deployment and configuration support
+- All inference-related code from controller and CRD types
 - Unused build artifacts and empty directories
 - Kustomize references from documentation
 
@@ -52,5 +52,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Previous Versions
 
-This changelog starts from the refactored version that removed termite components.
+This changelog starts from the refactored version that removed inference components.
 For earlier history, see git commit history.

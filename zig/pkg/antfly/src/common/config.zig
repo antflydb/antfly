@@ -23,6 +23,7 @@ const s3_openapi = @import("antfly_s3_openapi");
 const provider_registry = @import("provider_registry.zig");
 const secrets = @import("secrets.zig");
 const transcribing = @import("antfly_transcribing");
+const readers = @import("antfly_readers");
 const synthesizing = @import("antfly_synthesizing");
 const platform = @import("antfly_platform");
 
@@ -34,7 +35,8 @@ pub const default_health_port: u16 = 4200;
 
 pub const Config = struct {
     registry: provider_registry.Registry,
-    speech_to_text: transcribing.Registry,
+    transcribers: transcribing.Registry,
+    readers: readers.Registry,
     text_to_speech: synthesizing.Registry,
     auth_enabled: bool = false,
     swarm_mode: bool = false,
@@ -45,7 +47,7 @@ pub const Config = struct {
     cors: ?CorsConfig = null,
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
-    termite: TermiteConfig = .{},
+    inference: InferenceConfig = .{},
     remote_content: ?RemoteContentConfig = null,
     shard_allocation: ShardAllocationConfig = .{},
 
@@ -93,14 +95,16 @@ pub const Config = struct {
         }
     };
 
-    pub const TermiteConfig = struct {
+    pub const InferenceConfig = struct {
         api_url: ?[]u8 = null,
+        api_key: ?[]u8 = null,
         models_dir: ?[]u8 = null,
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
 
-        fn deinit(self: *TermiteConfig, alloc: std.mem.Allocator) void {
+        fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
+            if (self.api_key) |value| alloc.free(value);
             if (self.models_dir) |value| alloc.free(value);
             if (self.content_security) |*security| security.deinit(alloc);
             if (self.s3_credentials) |*credentials| credentials.deinit(alloc);
@@ -187,11 +191,16 @@ pub const Config = struct {
 
         var registry = try provider_registry.Registry.parseFromValue(alloc, raw_tree.value);
         errdefer registry.deinit();
-        var speech_to_text = if (root.get("speech_to_text")) |speech_to_text_value|
-            try transcribing.Registry.parseFromValue(alloc, speech_to_text_value)
+        var transcribers = if (root.get("transcribers")) |transcribers_value|
+            try transcribing.Registry.parseFromValue(alloc, transcribers_value)
         else
             transcribing.Registry.init(alloc);
-        errdefer speech_to_text.deinit();
+        errdefer transcribers.deinit();
+        var reader_registry = if (root.get("readers")) |readers_value|
+            try readers.Registry.parseFromValue(alloc, readers_value)
+        else
+            readers.Registry.init(alloc);
+        errdefer reader_registry.deinit();
         var text_to_speech = if (root.get("text_to_speech")) |text_to_speech_value|
             try synthesizing.Registry.parseFromValue(alloc, text_to_speech_value)
         else
@@ -201,7 +210,8 @@ pub const Config = struct {
         const swarm_mode = try optionalBoolField(root, "swarm_mode") orelse false;
         return .{
             .registry = registry,
-            .speech_to_text = speech_to_text,
+            .transcribers = transcribers,
+            .readers = reader_registry,
             .text_to_speech = text_to_speech,
             .auth_enabled = try optionalBoolField(root, "enable_auth") orelse false,
             .swarm_mode = swarm_mode,
@@ -222,11 +232,12 @@ pub const Config = struct {
                 if (validated.value.metadata) |metadata| metadata.orchestration_urls else null,
             ),
             .storage = try storageFromOpenApi(alloc, validated.value.storage),
-            .termite = if (validated.value.termite) |termite| .{
-                .api_url = if (termite.api_url.len > 0) try alloc.dupe(u8, termite.api_url) else null,
-                .models_dir = if (termite.models_dir) |value| try alloc.dupe(u8, value) else null,
-                .content_security = if (termite.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
-                .s3_credentials = try parseRawTermiteS3Credentials(alloc, raw_root, termite.s3_credentials),
+            .inference = if (validated.value.inference) |inference| .{
+                .api_url = if (inference.api_url.len > 0) try alloc.dupe(u8, inference.api_url) else null,
+                .api_key = try rawOptionalStringField(alloc, raw_root.get("inference"), "api_key"),
+                .models_dir = if (inference.models_dir) |value| try alloc.dupe(u8, value) else null,
+                .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
+                .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
@@ -274,17 +285,18 @@ pub const Config = struct {
         if (self.cors) |*cors| cors.deinit(self.registry.allocator);
         self.metadata.deinit(self.registry.allocator);
         self.storage.deinit(self.registry.allocator);
-        self.termite.deinit(self.registry.allocator);
-        self.speech_to_text.deinit();
+        self.inference.deinit(self.registry.allocator);
+        self.transcribers.deinit();
+        self.readers.deinit();
         self.text_to_speech.deinit();
         if (self.remote_content) |*remote_content| remote_content.deinit(self.registry.allocator);
         self.registry.deinit();
         self.* = undefined;
     }
 
-    pub fn effectiveTermiteContentSecurity(self: *const Config) ?*const ContentSecurityConfig {
+    pub fn effectiveAntflyContentSecurity(self: *const Config) ?*const ContentSecurityConfig {
         return scraping.effectiveContentSecurity(
-            if (self.termite.content_security) |*security| security else null,
+            if (self.inference.content_security) |*security| security else null,
             if (self.remote_content) |*remote_content|
                 if (remote_content.security) |*security| security else null
             else
@@ -459,6 +471,20 @@ fn optionalObjectStringFieldDup(
     };
 }
 
+fn rawOptionalStringField(
+    alloc: std.mem.Allocator,
+    object_value: ?std.json.Value,
+    field_name: []const u8,
+) !?[]u8 {
+    const value = object_value orelse return null;
+    if (value != .object) return error.InvalidConfig;
+    const field_value = value.object.get(field_name) orelse return null;
+    return switch (field_value) {
+        .string => try alloc.dupe(u8, field_value.string),
+        else => error.InvalidConfig,
+    };
+}
+
 fn parseRemoteContentConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.RemoteContentConfig {
     const parsed = try std.json.parseFromValue(scraping_openapi.RemoteContentConfig, alloc, value, .{
         .allocate = .alloc_always,
@@ -552,14 +578,14 @@ fn s3CredentialsFromOpenApi(
     };
 }
 
-fn parseRawTermiteS3Credentials(
+fn parseRawInferenceS3Credentials(
     alloc: std.mem.Allocator,
     raw_root: std.json.ObjectMap,
     fallback: ?s3_openapi.Credentials,
 ) !?Config.S3CredentialsConfig {
-    if (raw_root.get("termite")) |termite_value| {
-        if (termite_value == .object) {
-            if (termite_value.object.get("s3_credentials")) |credentials_value| {
+    if (raw_root.get("inference")) |inference_value| {
+        if (inference_value == .object) {
+            if (inference_value.object.get("s3_credentials")) |credentials_value| {
                 const parsed = try std.json.parseFromValue(s3_openapi.Credentials, alloc, credentials_value, .{
                     .allocate = .alloc_always,
                     .ignore_unknown_fields = true,
@@ -724,8 +750,8 @@ test "common config parses provider maps" {
         \\  "chunkers": {
         \\    "fixed": { "provider": "antfly" }
         \\  },
-        \\  "speech_to_text": {
-        \\    "whisper-local": { "provider": "termite", "api_url": "http://127.0.0.1:8080", "model": "openai/whisper-base" }
+        \\  "transcribers": {
+        \\    "whisper-local": { "provider": "antfly", "api_url": "http://127.0.0.1:8080", "model": "openai/whisper-base" }
         \\  },
         \\  "text_to_speech": {
         \\    "nova": { "provider": "openai", "model": "tts-1", "voice": "nova" }
@@ -748,9 +774,9 @@ test "common config parses provider maps" {
     try std.testing.expectEqualStrings("reranker", cfg.registry.defaultRerankerName().?);
     try std.testing.expectEqualStrings("fixed", cfg.registry.defaultChunkerName().?);
     try std.testing.expectEqualStrings("default", cfg.registry.defaultChainName().?);
-    try std.testing.expectEqualStrings("whisper-local", cfg.speech_to_text.defaultProviderName().?);
+    try std.testing.expectEqualStrings("whisper-local", cfg.transcribers.defaultProviderName().?);
     try std.testing.expectEqualStrings("nova", cfg.text_to_speech.defaultProviderName().?);
-    try std.testing.expectEqual(transcribing.Provider.termite, (try cfg.speech_to_text.getConfig(null)).provider);
+    try std.testing.expectEqual(transcribing.Provider.antfly, (try cfg.transcribers.getConfig(null)).provider);
     try std.testing.expectEqual(synthesizing.Provider.openai, (try cfg.text_to_speech.getConfig(null)).provider);
     try std.testing.expectEqual(@as(u32, 1), cfg.shard_allocation.default_shards_per_table);
     try std.testing.expectEqual(@as(u64, 1024), cfg.shard_allocation.max_shard_size_bytes);
@@ -759,7 +785,7 @@ test "common config parses provider maps" {
     try std.testing.expectEqual(@as(u64, 180000), cfg.shard_allocation.min_shard_merge_age_millis);
 }
 
-test "common config extracts termite settings" {
+test "common config extracts antfly settings" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
@@ -775,7 +801,7 @@ test "common config extracts termite settings" {
         \\  "default_shards_per_table": 1,
         \\  "max_shard_size_bytes": 1024,
         \\  "max_shards_per_table": 4,
-        \\  "termite": {
+        \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
         \\    "content_security": {
@@ -784,8 +810,8 @@ test "common config extracts termite settings" {
         \\    },
         \\    "s3_credentials": {
         \\      "endpoint": "s3.amazonaws.com",
-        \\      "access_key_id": "termite-key",
-        \\      "secret_access_key": "termite-secret"
+        \\      "access_key_id": "antfly-key",
+        \\      "secret_access_key": "antfly-secret"
         \\    }
         \\  }
         \\}
@@ -797,13 +823,13 @@ test "common config extracts termite settings" {
     try std.testing.expectEqual(@as(u64, 1), cfg.metadata.orchestration_urls[0].node_id);
     try std.testing.expectEqualStrings("http://127.0.0.1:7001", cfg.metadata.orchestration_urls[0].url);
     try std.testing.expectEqualStrings("antflydb", cfg.storage.local_base_dir.?);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.termite.api_url.?);
-    try std.testing.expectEqualStrings("/tmp/models", cfg.termite.models_dir.?);
-    try std.testing.expectEqualStrings("models.example.com", cfg.termite.content_security.?.allowed_hosts.?[0]);
-    try std.testing.expectEqual(@as(?bool, true), cfg.termite.content_security.?.block_private_ips);
-    try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.termite.s3_credentials.?.endpoint.?);
-    try std.testing.expectEqualStrings("termite-key", cfg.termite.s3_credentials.?.access_key_id.?);
-    try std.testing.expectEqualStrings("termite-secret", cfg.termite.s3_credentials.?.secret_access_key.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
+    try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
+    try std.testing.expectEqualStrings("models.example.com", cfg.inference.content_security.?.allowed_hosts.?[0]);
+    try std.testing.expectEqual(@as(?bool, true), cfg.inference.content_security.?.block_private_ips);
+    try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.inference.s3_credentials.?.endpoint.?);
+    try std.testing.expectEqualStrings("antfly-key", cfg.inference.s3_credentials.?.access_key_id.?);
+    try std.testing.expectEqualStrings("antfly-secret", cfg.inference.s3_credentials.?.secret_access_key.?);
 }
 
 test "common config defaults shard scalar fields" {
@@ -1000,9 +1026,9 @@ test "common config preserves named audio provider maps and defaults" {
         \\  "default_shards_per_table": 1,
         \\  "max_shard_size_bytes": 1024,
         \\  "max_shards_per_table": 4,
-        \\  "speech_to_text": {
+        \\  "transcribers": {
         \\    "whisper-local": {
-        \\      "provider": "termite",
+        \\      "provider": "antfly",
         \\      "api_url": "http://127.0.0.1:8080",
         \\      "model": "openai/whisper-base"
         \\    },
@@ -1027,10 +1053,10 @@ test "common config preserves named audio provider maps and defaults" {
     var cfg = try Config.parseFromSlice(alloc, raw);
     defer cfg.deinit();
 
-    try std.testing.expectEqualStrings("whisper-local", cfg.speech_to_text.defaultProviderName().?);
+    try std.testing.expectEqualStrings("whisper-local", cfg.transcribers.defaultProviderName().?);
     try std.testing.expectEqualStrings("narrator", cfg.text_to_speech.defaultProviderName().?);
-    try std.testing.expectEqual(transcribing.Provider.termite, (try cfg.speech_to_text.getConfig(null)).provider);
-    try std.testing.expectEqualStrings("openai/whisper-base", (try cfg.speech_to_text.getConfig(null)).model.?);
+    try std.testing.expectEqual(transcribing.Provider.antfly, (try cfg.transcribers.getConfig(null)).provider);
+    try std.testing.expectEqualStrings("openai/whisper-base", (try cfg.transcribers.getConfig(null)).model.?);
     try std.testing.expectEqual(synthesizing.Provider.elevenlabs, (try cfg.text_to_speech.getConfig("premium")).provider);
     try std.testing.expectEqualStrings("voice-123", (try cfg.text_to_speech.getConfig("premium")).voice_id.?);
 }
@@ -1045,7 +1071,7 @@ test "common config resolves secret references through the provided store" {
     }
     var secret_store = try secrets.FileStore.init(alloc, store_path);
     defer secret_store.deinit();
-    var stored = try secret_store.put(alloc, "termite.api_url", "http://127.0.0.1:8089");
+    var stored = try secret_store.put(alloc, "inference.api_url", "http://127.0.0.1:8089");
     stored.deinit(alloc);
 
     const raw =
@@ -1062,17 +1088,17 @@ test "common config resolves secret references through the provided store" {
         \\  "default_shards_per_table": 1,
         \\  "max_shard_size_bytes": 1024,
         \\  "max_shards_per_table": 4,
-        \\  "termite": {
-        \\    "api_url": "${secret:termite.api_url}"
+        \\  "inference": {
+        \\    "api_url": "${secret:inference.api_url}"
         \\  }
         \\}
     ;
     var cfg = try Config.parseFromSliceWithSecrets(alloc, raw, &secret_store);
     defer cfg.deinit();
-    try std.testing.expectEqualStrings("http://127.0.0.1:8089", cfg.termite.api_url.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8089", cfg.inference.api_url.?);
 }
 
-test "common config inherits termite content security from remote content" {
+test "common config inherits antfly content security from remote content" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
@@ -1090,7 +1116,7 @@ test "common config inherits termite content security from remote content" {
         \\      "allowed_hosts": ["cdn.example.com"]
         \\    }
         \\  },
-        \\  "termite": {
+        \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083"
         \\  },
         \\  "replication_factor": 1,
@@ -1102,12 +1128,12 @@ test "common config inherits termite content security from remote content" {
     var cfg = try Config.parseFromSlice(alloc, raw);
     defer cfg.deinit();
 
-    const effective = cfg.effectiveTermiteContentSecurity().?;
+    const effective = cfg.effectiveAntflyContentSecurity().?;
     try std.testing.expectEqual(@as(?bool, true), effective.block_private_ips);
     try std.testing.expectEqualStrings("cdn.example.com", effective.allowed_hosts.?[0]);
 }
 
-test "common config prefers termite content security over inherited remote content security" {
+test "common config prefers antfly content security over inherited remote content security" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
@@ -1125,7 +1151,7 @@ test "common config prefers termite content security over inherited remote conte
         \\      "allowed_hosts": ["cdn.example.com"]
         \\    }
         \\  },
-        \\  "termite": {
+        \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "content_security": {
         \\      "block_private_ips": false,
@@ -1141,12 +1167,12 @@ test "common config prefers termite content security over inherited remote conte
     var cfg = try Config.parseFromSlice(alloc, raw);
     defer cfg.deinit();
 
-    const effective = cfg.effectiveTermiteContentSecurity().?;
+    const effective = cfg.effectiveAntflyContentSecurity().?;
     try std.testing.expectEqual(@as(?bool, false), effective.block_private_ips);
     try std.testing.expectEqualStrings("models.example.com", effective.allowed_hosts.?[0]);
 }
 
-test "common config treats empty termite content security as inheritable" {
+test "common config treats empty antfly content security as inheritable" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
@@ -1164,7 +1190,7 @@ test "common config treats empty termite content security as inheritable" {
         \\      "allowed_hosts": ["cdn.example.com"]
         \\    }
         \\  },
-        \\  "termite": {
+        \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "content_security": {}
         \\  },
@@ -1177,7 +1203,7 @@ test "common config treats empty termite content security as inheritable" {
     var cfg = try Config.parseFromSlice(alloc, raw);
     defer cfg.deinit();
 
-    const effective = cfg.effectiveTermiteContentSecurity().?;
+    const effective = cfg.effectiveAntflyContentSecurity().?;
     try std.testing.expectEqual(@as(?bool, true), effective.block_private_ips);
     try std.testing.expectEqualStrings("cdn.example.com", effective.allowed_hosts.?[0]);
 }
@@ -1250,7 +1276,8 @@ test "common config resolves local role base dir from config" {
     const alloc = std.testing.allocator;
     var cfg = Config{
         .registry = provider_registry.Registry.init(alloc),
-        .speech_to_text = transcribing.Registry.init(alloc),
+        .transcribers = transcribing.Registry.init(alloc),
+        .readers = readers.Registry.init(alloc),
         .text_to_speech = synthesizing.Registry.init(alloc),
         .storage = .{
             .local_base_dir = try alloc.dupe(u8, "/tmp/antflydb"),

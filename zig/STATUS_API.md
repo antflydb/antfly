@@ -1,7 +1,7 @@
 # Status API
 
-`GET /api/v1/status` is the public summary endpoint used by health checks and
-operational tooling. `GET /api/v1/cluster` is the richer topology endpoint used
+`GET /db/v1/status` is the public summary endpoint used by health checks and
+operational tooling. `GET /db/v1/cluster` is the richer topology endpoint used
 by Antfarm cluster views.
 
 The canonical Zig topology shape is a summary plus typed `data` sections. The
@@ -12,7 +12,7 @@ should not add to them.
 
 ## Summary
 
-`GET /api/v1/status` returns only top-level fields about the cluster as a whole:
+`GET /db/v1/status` returns only top-level fields about the cluster as a whole:
 
 ```json
 {
@@ -29,7 +29,7 @@ usable even when detailed topology is unavailable.
 
 ## Data Section
 
-`GET /api/v1/cluster` returns the same top-level summary fields plus `data`,
+`GET /db/v1/cluster` returns the same top-level summary fields plus `data`,
 which contains the table-data runtime view. Use `data` terminology in public API
 and UI surfaces:
 

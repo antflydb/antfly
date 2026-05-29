@@ -26,7 +26,7 @@ def _get_kwargs(
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/api/v1/tables/{table_name}/lookup/{key}".format(
+        "url": "/db/v1/tables/{table_name}/lookup/{key}".format(
             table_name=quote(str(table_name), safe=""),
             key=quote(str(key), safe=""),
         ),

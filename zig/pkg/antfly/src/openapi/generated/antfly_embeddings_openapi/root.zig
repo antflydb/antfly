@@ -11,6 +11,5 @@ pub const OpenAIEmbedderConfig = types.OpenAIEmbedderConfig;
 pub const BedrockEmbedderConfig = types.BedrockEmbedderConfig;
 pub const CohereEmbedderConfig = types.CohereEmbedderConfig;
 pub const OpenRouterEmbedderConfig = types.OpenRouterEmbedderConfig;
-pub const TermiteEmbedderConfig = types.TermiteEmbedderConfig;
 pub const AntflyEmbedderConfig = types.AntflyEmbedderConfig;
 pub const EmbedderConfig = types.EmbedderConfig;

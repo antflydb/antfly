@@ -36,7 +36,7 @@ function TestProvider({ turns, children }: { turns: ChatTurn[]; children: React.
     abort: () => {},
     reset: () => {},
     config: {
-      url: "http://localhost:8082/api/v1",
+      url: "http://localhost:8082/db/v1",
       table: "test",
     },
   };

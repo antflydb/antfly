@@ -210,31 +210,31 @@ func NewModel(ctx context.Context, config generating.GeneratorConfig) (*Model, e
 		g = fgenkit.Init(ctx, fgenkit.WithPlugins(openrouterPlugin))
 		model = openrouterPlugin.DefineModel(g, openrouter.ModelDefinition{Models: models}, nil)
 
-	case generating.GeneratorProviderTermite:
-		c, err := config.AsTermiteGeneratorConfig()
+	case generating.GeneratorProviderAntfly:
+		c, err := config.AsAntflyGeneratorConfig()
 		if err != nil {
-			return nil, fmt.Errorf("parsing termite config: %w", err)
+			return nil, fmt.Errorf("parsing antfly inference config: %w", err)
 		}
 
 		configURL := ""
 		if c.ApiUrl != nil {
 			configURL = *c.ApiUrl
 		}
-		apiURL := resolveTermiteURL(configURL)
+		apiURL := resolveInferenceURL(configURL)
 		if apiURL == "" {
-			return nil, errors.New("termite: api_url is required (set via config or ANTFLY_TERMITE_URL env var)")
+			return nil, errors.New("antfly inference: api_url is required (set via config or ANTFLY_INFERENCE_URL env var)")
 		}
 
-		termiteURL := apiURL + "/openai/v1"
+		inferenceURL := apiURL + "/openai/v1"
 		timeout := 540
 		if c.Timeout != nil && *c.Timeout > 0 {
 			timeout = *c.Timeout
 		}
 
 		openaiPlugin := &openai.OpenAI{
-			APIKey: "termite-local",
+			APIKey: "antfly-inference",
 			Opts: []option.RequestOption{
-				option.WithBaseURL(termiteURL),
+				option.WithBaseURL(inferenceURL),
 				option.WithHTTPClient(&http.Client{Timeout: time.Duration(timeout) * time.Second}),
 			},
 		}
@@ -263,9 +263,9 @@ func getConfigOrEnv(configVal *string, envVar string) string {
 	return os.Getenv(envVar)
 }
 
-func resolveTermiteURL(configURL string) string {
+func resolveInferenceURL(configURL string) string {
 	if configURL != "" {
 		return configURL
 	}
-	return os.Getenv("ANTFLY_TERMITE_URL")
+	return os.Getenv("ANTFLY_INFERENCE_URL")
 }

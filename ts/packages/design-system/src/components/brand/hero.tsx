@@ -1,52 +1,74 @@
 import type * as React from "react";
 import { cn } from "@/lib/utils";
 import { GraphPaperBg } from "./graph-paper-bg";
+import { Kicker } from "./kicker";
 import { MonoLabel } from "./mono-label";
+import { TypeOn } from "./type-on";
 
 interface HeroProps extends Omit<React.HTMLAttributes<HTMLElement>, "title"> {
-  /** Small monospace eyebrow above the headline — e.g. "The AI-native database". */
+  /**
+   * Pixel-font overline for loud brand moments — rendered with {@link Kicker}.
+   * Use for marketing/hero/onboarding voice. Preferred over `eyebrow` here.
+   */
+  kicker?: React.ReactNode;
+  /**
+   * Small monospace eyebrow (technical voice) — rendered with {@link MonoLabel}.
+   * Kept for back-compat; prefer `kicker` for new hero treatments.
+   */
   eyebrow?: React.ReactNode;
   /**
-   * Headline. Pass ReactNode to accent a word with `<span className="text-primary">`.
-   * Typeset in Aeonik bold at display sizes (up to 8xl).
+   * Headline. Wrap an accent word with {@link Highlight} for the amber-fill
+   * marker, e.g. `<>Search the <Highlight>swarm</Highlight></>`. Typeset in
+   * Aeonik bold at display sizes.
    */
   title: React.ReactNode;
+  /**
+   * Optional `steps()` typewriter line beneath the headline. Pass a string and
+   * it renders with {@link TypeOn}.
+   */
+  tagline?: string;
   description?: React.ReactNode;
   /** CTAs — typically one primary and one outline button. */
   actions?: React.ReactNode;
-  /** Wrap the hero in a subtle hexagonal graph-paper background. Default: true. */
+  /**
+   * Right-side adornment (e.g. `<AntyPixel size="xl" />`). When provided,
+   * the hero lays out as a two-column grid on `md+`.
+   */
+  aside?: React.ReactNode;
+  /** Wrap the hero in a subtle hexagonal graph-paper background. @default true */
   graphPaper?: boolean;
-  /** Center the content horizontally. Default left-aligned (PR #184 antfly.io style). */
+  /** Center the content horizontally. @default "start" */
   align?: "start" | "center";
 }
 
 /**
- * The Antfly hero treatment from PR #184:
- *   - Small MonoLabel eyebrow
- *   - Aeonik headline (5xl → 8xl responsive) with tight tracking
+ * The Antfly hero treatment:
+ *   - Pixel-font {@link Kicker} (loud) or mono {@link MonoLabel} (technical) overline
+ *   - Aeonik headline (5xl → 8xl) with optional amber {@link Highlight}
+ *   - Optional {@link TypeOn} typewriter tagline
  *   - Restrained description in muted-foreground
- *   - Plain rounded-md buttons (no gradients, no pills)
- *   - Optional hexagonal graph-paper background (default on)
+ *   - Flat square buttons (the visual language is borders + amber accent, not gradients)
+ *   - Optional hexagonal graph-paper background
+ *   - Optional `aside` slot (right column) for an `<AntyPixel>` or other brand asset
  *
- * Deliberately sparse — the whitespace does the work. No animated flourishes,
- * no gradient text, no glassmorphism. Pair with `<span className="text-primary">`
- * inside `title` to accent a single word/phrase.
+ * Deliberately sparse — the whitespace and the amber accent do the work.
  */
 export function Hero({
+  kicker,
   eyebrow,
   title,
+  tagline,
   description,
   actions,
+  aside,
   graphPaper = true,
   align = "start",
   className,
   ...props
 }: HeroProps) {
-  const inner = (
-    <section
-      className={cn("container py-24 md:py-32", align === "center" && "text-center", className)}
-      {...props}
-    >
+  const content = (
+    <>
+      {kicker ? <Kicker className="mb-3 block">{kicker}</Kicker> : null}
       {eyebrow ? <MonoLabel className="mb-6 block">{eyebrow}</MonoLabel> : null}
       <h1
         className={cn(
@@ -56,6 +78,7 @@ export function Hero({
       >
         {title}
       </h1>
+      {tagline ? <TypeOn className="mt-6 block" text={tagline} /> : null}
       {description ? (
         <p
           className={cn(
@@ -71,6 +94,22 @@ export function Hero({
           {actions}
         </div>
       ) : null}
+    </>
+  );
+
+  const inner = (
+    <section
+      className={cn("container py-24 md:py-32", align === "center" && "text-center", className)}
+      {...props}
+    >
+      {aside ? (
+        <div className="grid items-center gap-12 md:grid-cols-[1fr_auto] md:gap-16">
+          <div>{content}</div>
+          <div className="justify-self-center md:justify-self-end">{aside}</div>
+        </div>
+      ) : (
+        content
+      )}
     </section>
   );
 

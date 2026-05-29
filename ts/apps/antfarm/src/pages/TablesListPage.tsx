@@ -181,7 +181,7 @@ const TablesListPage: React.FC = () => {
   return (
     <DashboardPage>
       <div className="relative isolate">
-        <GraphPaperBg className="absolute inset-0 -z-10 rounded-xl" />
+        <GraphPaperBg className="absolute inset-0 -z-10 rounded-none" />
         <DashboardPageHeader>
           <div>
             <DashboardPageTitle className="font-aeonik">Tables</DashboardPageTitle>

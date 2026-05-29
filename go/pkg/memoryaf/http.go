@@ -119,17 +119,17 @@ func (h *HTTPHandler) serveAPI(w http.ResponseWriter, r *http.Request) {
 func (h *HTTPHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	uctx, _ := h.userContextFn(r)
 	antflyAvailable := h.checkAntfly(r.Context(), uctx.Namespace)
-	termiteAvailable := h.checkExtractor(r.Context())
+	extractorAvailable := h.checkExtractor(r.Context())
 	level := "ok"
 	if !antflyAvailable {
 		level = "unhealthy"
-	} else if h.handler != nil && h.handler.extractor != nil && !termiteAvailable {
+	} else if h.handler != nil && h.handler.extractor != nil && !extractorAvailable {
 		level = "degraded"
 	}
 	status := HealthStatus{
-		Status:  level,
-		Antfly:  antflyAvailable,
-		Termite: termiteAvailable,
+		Status:    level,
+		Antfly:    antflyAvailable,
+		Extractor: extractorAvailable,
 	}
 	writeJSON(w, http.StatusOK, status)
 }

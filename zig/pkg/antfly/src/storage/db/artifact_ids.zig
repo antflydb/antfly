@@ -95,7 +95,7 @@ pub fn decodeEmbeddingArtifactIdentityAlloc(alloc: Allocator, key: []const u8) !
                 identity.parent_doc_key = try alloc.dupe(u8, artifact_ref.document_id);
                 identity.doc_key = try internal_keys.chunkArtifactKeyAlloc(alloc, artifact_ref.document_id, source.name, chunk_id);
             },
-            .summary, .embedding => {
+            .asset, .embedding => {
                 identity.doc_key = try alloc.dupe(u8, artifact_ref.document_id);
             },
         }
@@ -247,7 +247,7 @@ pub fn internalKeyForArtifactRefAlloc(alloc: Allocator, artifact_ref: types.Arti
 
     return switch (artifact_ref.kind) {
         .chunk => internal_keys.chunkArtifactKeyAlloc(alloc, artifact_ref.document_id, artifact_ref.name, artifact_ref.chunk_id.?),
-        .summary => internal_keys.artifactNamedPrefixAlloc(alloc, artifact_ref.document_id, "summary", artifact_ref.name),
+        .asset => internal_keys.artifactNamedPrefixAlloc(alloc, artifact_ref.document_id, "asset", artifact_ref.name),
         .embedding => {
             if (artifact_ref.source) |source| {
                 const base_ref = types.ArtifactRef{
@@ -276,7 +276,7 @@ fn decodeInternalKeyComponentAlloc(alloc: Allocator, key: []const u8, start: usi
 
 fn decodeArtifactKind(raw_kind: []const u8) !types.ArtifactKind {
     if (std.mem.eql(u8, raw_kind, "chunk")) return .chunk;
-    if (std.mem.eql(u8, raw_kind, "summary")) return .summary;
+    if (std.mem.eql(u8, raw_kind, "asset")) return .asset;
     if (std.mem.eql(u8, raw_kind, "embedding")) return .embedding;
     return error.InvalidInternalUserKey;
 }
@@ -307,7 +307,7 @@ fn decodeBase64UrlComponentAlloc(alloc: Allocator, encoded: []const u8) ![]u8 {
 fn artifactKindLabel(kind: types.ArtifactKind) []const u8 {
     return switch (kind) {
         .chunk => "chunk",
-        .summary => "summary",
+        .asset => "asset",
         .embedding => "embedding",
     };
 }
@@ -317,7 +317,7 @@ fn validateArtifactRef(artifact_ref: types.ArtifactRef) !void {
         .chunk => {
             if (artifact_ref.chunk_id == null or artifact_ref.source != null) return error.InvalidArgument;
         },
-        .summary => {
+        .asset => {
             if (artifact_ref.chunk_id != null or artifact_ref.source != null) return error.InvalidArgument;
         },
         .embedding => {
@@ -329,7 +329,7 @@ fn validateArtifactRef(artifact_ref: types.ArtifactRef) !void {
         if (artifact_ref.kind != .embedding) return error.InvalidArgument;
         switch (source.kind) {
             .chunk => if (source.chunk_id == null) return error.InvalidArgument,
-            .summary, .embedding => if (source.chunk_id != null) return error.InvalidArgument,
+            .asset, .embedding => if (source.chunk_id != null) return error.InvalidArgument,
         }
     }
 }

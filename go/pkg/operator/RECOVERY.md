@@ -36,7 +36,7 @@ Controllers should keep this order:
 1. Fetch the CR.
 2. Validate the current CR spec.
 3. Reconcile desired children, such as ConfigMaps, Services, StatefulSets,
-   HPAs, PDBs, and owned TermitePools.
+   HPAs, PDBs, and owned InferencePools.
 4. Observe owned workloads and pods.
 5. Write status conditions from observation.
 6. Requeue while not healthy.
@@ -46,7 +46,7 @@ Runtime health must not gate child reconciliation.
 Do not do this:
 
 ```go
-if pool.Status.Phase == TermitePoolPhaseDegraded {
+if pool.Status.Phase == InferencePoolPhaseDegraded {
     return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 ```
@@ -74,7 +74,7 @@ previous spec must not prevent a new valid spec from being applied.
 The operator should use conditions to separate spec validity, reconciliation,
 and runtime health.
 
-Recommended `TermitePool` conditions:
+Recommended `InferencePool` conditions:
 
 - `ConfigurationValid`: spec validation succeeded.
 - `WorkloadReconciled`: Service, ConfigMap, StatefulSet, HPA, and PDB were
@@ -92,7 +92,7 @@ Recommended `AntflyCluster` conditions:
 - `MetadataReady`
 - `DataReady`
 - `SwarmReady`
-- `TermiteReady`
+- `InferenceReady`
 - `Available`
 
 Every condition should set:
@@ -107,7 +107,7 @@ Every condition should set:
 condition. This lets users distinguish a stale failure from a failure observed
 after the latest deploy.
 
-Example `TermitePool` status:
+Example `InferencePool` status:
 
 ```yaml
 status:
@@ -136,7 +136,7 @@ status:
       status: "False"
       observedGeneration: 12
       reason: ModelPullFailed
-      message: 'pod termite-read-heavy-embedders-0 init container model-puller-0 failed: registry blob sha256:... returned 404'
+      message: 'pod inference-read-heavy-embedders-0 init container model-puller-0 failed: registry blob sha256:... returned 404'
     - type: PodsReady
       status: "False"
       observedGeneration: 12
@@ -151,7 +151,7 @@ status:
 
 ## Failure Classification
 
-Add a shared pod diagnosis helper used by both `TermitePoolReconciler` and
+Add a shared pod diagnosis helper used by both `InferencePoolReconciler` and
 `AntflyClusterReconciler`.
 
 The helper should inspect:
@@ -209,7 +209,7 @@ new image, and the next observation pass should clear `ImageAvailable`.
 
 ### Model Pull Failures
 
-TermitePool model pulls run in init containers. The operator should recognize
+InferencePool model pulls run in init containers. The operator should recognize
 model-puller init containers by name, for example `model-puller-0`.
 
 Classify:
@@ -236,7 +236,7 @@ Classify main containers waiting in `CrashLoopBackOff` as `CrashLooping`.
 Map this to:
 
 - component-specific readiness condition, such as `PodsReady=False`,
-  `TermiteReady=False`, `MetadataReady=False`, `DataReady=False`, or
+  `InferenceReady=False`, `MetadataReady=False`, `DataReady=False`, or
   `SwarmReady=False`
 - `Available=False`
 - `phase=Degraded`
@@ -332,11 +332,11 @@ The intended user experience should be:
 
 1. Add shared pod diagnosis helpers under `go/pkg/operator/controllers/internal`
    or another controller-local internal package.
-2. Add TermitePool conditions for image, model, pod readiness, workload
+2. Add InferencePool conditions for image, model, pod readiness, workload
    reconciliation, and availability.
-3. Update `TermitePoolReconciler.updateStatus` to call the diagnosis helper and
+3. Update `InferencePoolReconciler.updateStatus` to call the diagnosis helper and
    map findings to conditions.
-4. Add pod watches for TermitePool pods using labels such as
+4. Add pod watches for InferencePool pods using labels such as
    `antfly.io/pool=<pool-name>`.
 5. Add equivalent diagnosis mapping for AntflyCluster metadata, data, and swarm
    pods using `app.kubernetes.io/instance` and

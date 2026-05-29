@@ -20,7 +20,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@antfly/design-system";
-import { TermiteClient } from "@antfly/sdk";
+import { InferenceClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ArrowDownUp,
@@ -126,7 +126,7 @@ function RankDelta({ change }: { change: number }) {
 }
 
 const AntflyRerankingPlaygroundPage: React.FC = () => {
-  const { client, termiteApiUrl } = useApiConfig();
+  const { client, inferenceApiUrl } = useApiConfig();
   const { selectedTable, embeddingIndexes, selectedIndex, setSelectedIndex } = useTable();
 
   const [query, setQuery] = useState("");
@@ -148,16 +148,16 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: termiteApiUrl }),
-    [termiteApiUrl]
+  const inferenceClient = useMemo(
+    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
+    [inferenceApiUrl]
   );
 
   // Fetch available reranker models
   useEffect(() => {
     const fetchModels = async () => {
       try {
-        const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/models`);
+        const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/models`);
         if (response.ok) {
           const data: ModelsResponse = await response.json();
           const rerankers = Object.keys(data.rerankers || {});
@@ -174,7 +174,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
       }
     };
     fetchModels();
-  }, [termiteApiUrl]);
+  }, [inferenceApiUrl]);
 
   const handleSearch = async () => {
     if (!query.trim()) {
@@ -244,7 +244,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
 
     try {
       const prompts = searchResults.map((r) => r.text);
-      const response = await termiteClient.rerank(selectedModel, query, prompts);
+      const response = await inferenceClient.rerank(selectedModel, query, prompts);
       const scores = [...response.data].sort((a, b) => a.index - b.index).map((item) => item.score);
 
       if (scores.length !== searchResults.length) {
@@ -431,7 +431,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -503,7 +503,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
             </CardHeader>
             <CardContent className="flex-1 max-h-[600px] overflow-y-auto space-y-2">
               {searchResults.map((hit, rank) => (
-                <div key={hit.id} className="p-3 bg-muted/30 rounded-lg border space-y-1.5">
+                <div key={hit.id} className="p-3 bg-muted/30 rounded-none border space-y-1.5">
                   <div className="flex items-center gap-2">
                     <span className="flex items-center justify-center w-5 h-5 rounded-full bg-primary/10 text-primary text-xs font-bold shrink-0">
                       {rank + 1}
@@ -539,7 +539,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
               </CardHeader>
               <CardContent className="flex-1 max-h-[600px] overflow-y-auto space-y-2">
                 {rerankedResults.map((hit) => (
-                  <div key={hit.id} className="p-3 bg-muted/30 rounded-lg border space-y-1.5">
+                  <div key={hit.id} className="p-3 bg-muted/30 rounded-none border space-y-1.5">
                     <div className="flex items-center gap-2">
                       <span className="flex items-center justify-center w-5 h-5 rounded-full bg-primary/10 text-primary text-xs font-bold shrink-0">
                         {hit.newRank}

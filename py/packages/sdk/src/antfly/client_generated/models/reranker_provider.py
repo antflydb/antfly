@@ -5,7 +5,6 @@ class RerankerProvider(str, Enum):
     ANTFLY = "antfly"
     COHERE = "cohere"
     OLLAMA = "ollama"
-    TERMITE = "termite"
     VERTEX = "vertex"
 
     def __str__(self) -> str:

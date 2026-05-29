@@ -43,12 +43,12 @@ func TestE2E_Auth(t *testing.T) {
 	// Start swarm with auth enabled.
 	t.Log("Starting Antfly swarm with auth enabled...")
 	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{
-		DisableTermite: true,
-		EnableAuth:     true,
+		DisableInference: true,
+		EnableAuth:       true,
 	})
 	defer swarm.Cleanup()
 
-	baseURL := swarm.MetadataAPIURL + "/api/v1"
+	baseURL := swarm.MetadataAPIURL + "/db/v1"
 
 	// ---- 1. Unauthenticated request → 401 ----
 	t.Log("Step 1: Unauthenticated GET /secrets → 401")
@@ -199,24 +199,25 @@ func TestE2E_ApiKeys(t *testing.T) {
 	// Start swarm with auth enabled.
 	t.Log("Starting Antfly swarm with auth enabled...")
 	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{
-		DisableTermite: true,
-		EnableAuth:     true,
+		DisableInference: true,
+		EnableAuth:       true,
 	})
 	defer swarm.Cleanup()
 
-	baseURL := swarm.MetadataAPIURL + "/api/v1"
+	dbURL := swarm.MetadataAPIURL + "/db/v1"
+	authURL := swarm.MetadataAPIURL + "/auth/v1"
 	adminAuth := basicAuth("admin", "admin")
 
 	// ---- 1. Create a test user with permissions ----
 	t.Log("Step 1: Create test user 'alice' with table permissions")
-	createUser(t, ctx, baseURL, "alice", "password123", adminAuth)
+	createUser(t, ctx, authURL, "alice", "password123", adminAuth)
 	// Grant read on all tables (needed for ListTables which checks *, table, read)
-	grantPermission(t, ctx, baseURL, "alice", "*", "table", "read", adminAuth)
-	grantPermission(t, ctx, baseURL, "alice", "orders", "table", "write", adminAuth)
+	grantPermission(t, ctx, authURL, "alice", "*", "table", "read", adminAuth)
+	grantPermission(t, ctx, authURL, "alice", "orders", "table", "write", adminAuth)
 
 	// ---- 2. Create API key with no permission scoping (full access) ----
 	t.Log("Step 2: Create API key for alice (no scoping)")
-	key1 := createApiKey(t, ctx, baseURL, "alice", "full-access key", nil, adminAuth)
+	key1 := createApiKey(t, ctx, authURL, "alice", "full-access key", nil, adminAuth)
 	require.NotEmpty(t, key1.KeyID, "key_id should not be empty")
 	require.NotEmpty(t, key1.KeySecret, "key_secret should not be empty")
 	require.NotEmpty(t, key1.Encoded, "encoded should not be empty")
@@ -229,24 +230,24 @@ func TestE2E_ApiKeys(t *testing.T) {
 
 	// ---- 3. Authenticate using ApiKey scheme ----
 	t.Log("Step 3: Authenticate with ApiKey scheme")
-	doRequestExpectStatus(t, ctx, "GET", baseURL+"/status", "",
+	doRequestExpectStatus(t, ctx, "GET", dbURL+"/status", "",
 		apiKeyAuth(key1.Encoded), http.StatusOK)
 
 	// ---- 4. Authenticate using Bearer scheme with same credential ----
 	t.Log("Step 4: Authenticate with Bearer scheme (same credential)")
-	doRequestExpectStatus(t, ctx, "GET", baseURL+"/status", "",
+	doRequestExpectStatus(t, ctx, "GET", dbURL+"/status", "",
 		bearerAuth(key1.Encoded), http.StatusOK)
 
 	// ---- 5. List API keys ----
 	t.Log("Step 5: List API keys for alice")
-	keys := listApiKeys(t, ctx, baseURL, "alice", adminAuth)
+	keys := listApiKeys(t, ctx, authURL, "alice", adminAuth)
 	assert.Len(t, keys, 1, "expected 1 key")
 	assert.Equal(t, key1.KeyID, keys[0].KeyID)
 	assert.Equal(t, "full-access key", keys[0].Name)
 
 	// ---- 6. Unscoped key can list tables (alice has *, table, read) ----
 	t.Log("Step 6: Unscoped key can list tables")
-	doRequestExpectStatus(t, ctx, "GET", baseURL+"/tables", "",
+	doRequestExpectStatus(t, ctx, "GET", dbURL+"/tables", "",
 		apiKeyAuth(key1.Encoded), http.StatusOK)
 
 	// ---- 7. Create API key scoped to read-only on "orders" ----
@@ -254,13 +255,13 @@ func TestE2E_ApiKeys(t *testing.T) {
 	readOnlyPerms := []map[string]string{
 		{"resource": "orders", "resource_type": "table", "type": "read"},
 	}
-	key2 := createApiKey(t, ctx, baseURL, "alice", "read-only key", readOnlyPerms, adminAuth)
+	key2 := createApiKey(t, ctx, authURL, "alice", "read-only key", readOnlyPerms, adminAuth)
 	require.NotEmpty(t, key2.KeyID)
 	assert.Len(t, key2.Permissions, 1, "key should have 1 permission")
 
 	// ---- 8. Scoped key can still access authn-only endpoints ----
 	t.Log("Step 8: Scoped key can access status endpoint")
-	doRequestExpectStatus(t, ctx, "GET", baseURL+"/status", "",
+	doRequestExpectStatus(t, ctx, "GET", dbURL+"/status", "",
 		apiKeyAuth(key2.Encoded), http.StatusOK)
 
 	// ---- 9. Attempt privilege escalation: create key with admin perms alice doesn't have ----
@@ -268,36 +269,36 @@ func TestE2E_ApiKeys(t *testing.T) {
 	escalatedPerms := []map[string]string{
 		{"resource": "*", "resource_type": "*", "type": "admin"},
 	}
-	createApiKeyExpectError(t, ctx, baseURL, "alice", "escalated key", escalatedPerms,
+	createApiKeyExpectError(t, ctx, authURL, "alice", "escalated key", escalatedPerms,
 		adminAuth, http.StatusForbidden)
 
 	// ---- 10. Invalid credentials rejected ----
 	t.Log("Step 10: Invalid API key rejected")
 	fakeEncoded := base64.StdEncoding.EncodeToString([]byte("fakeid:fakesecret"))
-	doRequestExpectStatus(t, ctx, "GET", baseURL+"/status", "",
+	doRequestExpectStatus(t, ctx, "GET", dbURL+"/status", "",
 		apiKeyAuth(fakeEncoded), http.StatusUnauthorized)
 
 	// ---- 11. Delete API key ----
 	t.Log("Step 11: Delete API key")
-	deleteApiKey(t, ctx, baseURL, "alice", key1.KeyID, adminAuth)
+	deleteApiKey(t, ctx, authURL, "alice", key1.KeyID, adminAuth)
 
 	// Subsequent requests with deleted key should fail
-	doRequestExpectStatus(t, ctx, "GET", baseURL+"/status", "",
+	doRequestExpectStatus(t, ctx, "GET", dbURL+"/status", "",
 		apiKeyAuth(key1.Encoded), http.StatusUnauthorized)
 
 	// ---- 12. Verify second key still works ----
 	t.Log("Step 12: Second key still works after first deleted")
-	doRequestExpectStatus(t, ctx, "GET", baseURL+"/status", "",
+	doRequestExpectStatus(t, ctx, "GET", dbURL+"/status", "",
 		apiKeyAuth(key2.Encoded), http.StatusOK)
 
 	// ---- 13. List shows only remaining key ----
 	t.Log("Step 13: List shows 1 remaining key")
-	keys = listApiKeys(t, ctx, baseURL, "alice", adminAuth)
+	keys = listApiKeys(t, ctx, authURL, "alice", adminAuth)
 	assert.Len(t, keys, 1, "expected 1 key after deletion")
 	assert.Equal(t, key2.KeyID, keys[0].KeyID)
 
 	// Clean up
-	deleteApiKey(t, ctx, baseURL, "alice", key2.KeyID, adminAuth)
+	deleteApiKey(t, ctx, authURL, "alice", key2.KeyID, adminAuth)
 
 	t.Log("API Keys e2e test passed")
 }
