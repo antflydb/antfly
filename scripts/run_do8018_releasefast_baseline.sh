@@ -23,7 +23,7 @@ fi
 mkdir -p "${out_dir}"
 
 echo "building ReleaseFast antfly"
-(cd "${zig_dir}" && zig build install-antfly -Doptimize=ReleaseFast)
+(cd "${zig_dir}" && zig build install -Doptimize=ReleaseFast)
 
 run_one() {
   local mode="$1"
