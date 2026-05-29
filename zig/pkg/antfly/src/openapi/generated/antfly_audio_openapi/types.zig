@@ -37,13 +37,13 @@ pub const TTSProvider = enum {
 pub const STTProvider = enum {
     openai,
     vertex,
-    termite,
+    antfly,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .openai => "openai",
             .vertex => "vertex",
-            .termite => "termite",
+            .antfly => "antfly",
         };
         try jw.write(s);
     }
@@ -56,7 +56,7 @@ pub const STTProvider = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "openai", .openai },
             .{ "vertex", .vertex },
-            .{ "termite", .termite },
+            .{ "antfly", .antfly },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -176,9 +176,9 @@ pub const VertexSTTConfig = struct {
     model: ?[]const u8 = null,
 };
 
-/// Configuration for Termite STT (Whisper, Wav2Vec2, HuBERT) provider. Uses local Termite service for speech-to-text inference. **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC **Docs:** See Termite documentation
-pub const TermiteSTTConfig = struct {
-    /// Termite API URL. Falls back to ANTFLY_TERMITE_URL environment variable.
+/// Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider. Uses the Antfly inference service for speech-to-text inference. **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC **Docs:** See inference documentation
+pub const AntflySTTConfig = struct {
+    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
     /// Transcriber model name (e.g., 'openai/whisper-tiny'). If empty, uses default.
     model: ?[]const u8 = null,
@@ -283,7 +283,7 @@ pub const TTSConfig = struct {
     provider: TTSProvider,
 };
 
-/// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `termite` - Local Termite service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: termite api_url: "http://localhost:8080" model: openai/whisper-base ```
+/// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
 pub const STTConfig = struct {
     /// Whisper model to use.
     model: ?[]const u8 = null,
@@ -303,7 +303,7 @@ pub const STTConfig = struct {
     enable_automatic_punctuation: ?bool = null,
     /// Use enhanced models for better accuracy (costs more).
     use_enhanced: ?bool = null,
-    /// Termite API URL. Falls back to ANTFLY_TERMITE_URL environment variable.
+    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
     provider: STTProvider,
 };

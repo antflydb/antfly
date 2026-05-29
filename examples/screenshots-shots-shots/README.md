@@ -6,8 +6,8 @@ Point it at a folder of screenshots and ask questions like "terminal with error 
 
 ## Prerequisites
 
-- Antfly running with Termite and ONNX Runtime
-- CLIP model: `antfly termite pull openai/clip-vit-base-patch32`
+- Antfly running with Antfly inference and ONNX Runtime
+- CLIP model: `antfly inference pull openai/clip-vit-base-patch32`
 
 ## Supported File Types
 
@@ -62,7 +62,7 @@ Query: "chart or graph"
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `ANTFLY_URL` | `http://localhost:8080/api/v1` | Antfly API endpoint |
+| `ANTFLY_URL` | `http://localhost:8080/db/v1` | Antfly API endpoint |
 
 ## Tips
 
@@ -76,4 +76,4 @@ Query: "chart or graph"
 
 - [Image Search Example](../image-search/) — Search remote image collections with CLIP
 - [Multimodal Guide](/docs/guides/multimodal) — PDFs, audio, and remote content
-- [Termite Models](/termite) — Available CLIP variants
+- [Inference Models](/inference) — Available CLIP variants

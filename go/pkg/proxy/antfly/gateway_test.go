@@ -183,7 +183,7 @@ func TestGatewayRequiresAdminForTableRootMutation(t *testing.T) {
 			Table:         "docs",
 			Namespace:     "docs",
 			AllowStateful: true,
-			StatefulURL:   "http://stateful.invalid/api/v1/tables/docs",
+			StatefulURL:   "http://stateful.invalid/db/v1/tables/docs",
 		},
 	}))
 	gateway.authenticator = StaticBearerAuthenticator{

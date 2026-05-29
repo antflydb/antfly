@@ -3242,7 +3242,7 @@ fn convertCumSum(builder: *Builder, node: *const NodeProto, inputs: []const Node
 
     // CumSum can't be efficiently decomposed without scan primitive.
     // Return input as-is for now — models that need cumsum will need
-    // a scan primitive added to termite.
+    // a scan primitive added to inference.
     return inputs[0];
 }
 

@@ -1231,10 +1231,7 @@ func (t *TableApi) RunAgenticRetrieval(
 
 	// Append assistant message with generation output for multi-turn context
 	if result.Generation != "" {
-		result.Messages = append(result.Messages, ai.ChatMessage{
-			Role:    ai.ChatMessageRoleAssistant,
-			Content: ai.NewTextContent(result.Generation),
-		})
+		result.Messages = append(result.Messages, ai.NewTextChatMessage(ai.ChatMessageRoleAssistant, result.Generation))
 	}
 
 	finalizeRetrievalAgentSession(req, result)
@@ -1330,10 +1327,7 @@ func (t *TableApi) runAgenticWithTools(
 	// Include the input messages plus a new user message with the current query
 	// and an assistant message placeholder (generation content is added in runGenerationStep).
 	result.Messages = append(result.Messages, messages...)
-	result.Messages = append(result.Messages, ai.ChatMessage{
-		Role:    ai.ChatMessageRoleUser,
-		Content: ai.NewTextContent(req.Query),
-	})
+	result.Messages = append(result.Messages, ai.NewTextChatMessage(ai.ChatMessageRoleUser, req.Query))
 }
 
 // runAgenticWithStructuredOutput runs the agentic loop using XML-tagged structured output

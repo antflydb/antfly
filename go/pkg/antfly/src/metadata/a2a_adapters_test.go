@@ -101,8 +101,8 @@ func TestBuildRetrievalRequestWithMessages(t *testing.T) {
 	req := &a2afacade.RetrievalRequest{
 		Query: "follow up",
 		Messages: []ai.ChatMessage{
-			{Role: ai.ChatMessageRoleUser, Content: ai.NewTextContent("first question")},
-			{Role: ai.ChatMessageRoleAssistant, Content: ai.NewTextContent("first answer")},
+			ai.NewTextChatMessage(ai.ChatMessageRoleUser, "first question"),
+			ai.NewTextChatMessage(ai.ChatMessageRoleAssistant, "first answer"),
 		},
 	}
 

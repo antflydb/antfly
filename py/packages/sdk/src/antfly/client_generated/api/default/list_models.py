@@ -5,8 +5,8 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.termite_error import TermiteError
-from ...models.termite_models_response import TermiteModelsResponse
+from ...models.inference_error import InferenceError
+from ...models.inference_models_response import InferenceModelsResponse
 from ...types import Response
 
 
@@ -14,7 +14,7 @@ def _get_kwargs() -> dict[str, Any]:
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/ml/v1/models",
+        "url": "/ai/v1/models",
     }
 
     return _kwargs
@@ -22,19 +22,19 @@ def _get_kwargs() -> dict[str, Any]:
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> TermiteError | TermiteModelsResponse | None:
+) -> InferenceError | InferenceModelsResponse | None:
     if response.status_code == 200:
-        response_200 = TermiteModelsResponse.from_dict(response.json())
+        response_200 = InferenceModelsResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 400:
-        response_400 = TermiteError.from_dict(response.json())
+        response_400 = InferenceError.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 500:
-        response_500 = TermiteError.from_dict(response.json())
+        response_500 = InferenceError.from_dict(response.json())
 
         return response_500
 
@@ -46,7 +46,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[TermiteError | TermiteModelsResponse]:
+) -> Response[InferenceError | InferenceModelsResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -58,7 +58,7 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-) -> Response[TermiteError | TermiteModelsResponse]:
+) -> Response[InferenceError | InferenceModelsResponse]:
     r"""List available models
 
      Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and
@@ -113,7 +113,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteModelsResponse]
+        Response[InferenceError | InferenceModelsResponse]
     """
 
     kwargs = _get_kwargs()
@@ -128,7 +128,7 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-) -> TermiteError | TermiteModelsResponse | None:
+) -> InferenceError | InferenceModelsResponse | None:
     r"""List available models
 
      Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and
@@ -183,7 +183,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteModelsResponse
+        InferenceError | InferenceModelsResponse
     """
 
     return sync_detailed(
@@ -194,7 +194,7 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-) -> Response[TermiteError | TermiteModelsResponse]:
+) -> Response[InferenceError | InferenceModelsResponse]:
     r"""List available models
 
      Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and
@@ -249,7 +249,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteModelsResponse]
+        Response[InferenceError | InferenceModelsResponse]
     """
 
     kwargs = _get_kwargs()
@@ -262,7 +262,7 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-) -> TermiteError | TermiteModelsResponse | None:
+) -> InferenceError | InferenceModelsResponse | None:
     r"""List available models
 
      Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and
@@ -317,7 +317,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteModelsResponse
+        InferenceError | InferenceModelsResponse
     """
 
     return (

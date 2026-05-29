@@ -27,6 +27,14 @@ const (
 	BearerAuthScopes = "BearerAuth.Scopes"
 )
 
+// Defines values for AuthSubjectKind.
+const (
+	AuthSubjectKindGroup   AuthSubjectKind = "group"
+	AuthSubjectKindRole    AuthSubjectKind = "role"
+	AuthSubjectKindSubject AuthSubjectKind = "subject"
+	AuthSubjectKindUser    AuthSubjectKind = "user"
+)
+
 // Defines values for PermissionType.
 const (
 	PermissionTypeAdmin PermissionType = "admin"
@@ -58,7 +66,7 @@ type ApiKey struct {
 	// Permissions Optional permission scoping. If empty, inherits owner's full permissions.
 	Permissions *[]Permission `json:"permissions"`
 
-	// RowFilter Per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. Documents must match this query to be visible through this API key.
+	// RowFilter Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
 	RowFilter *map[string]interface{} `json:"row_filter"`
 
 	// Username Owner of the API key.
@@ -88,12 +96,24 @@ type ApiKeyWithSecret struct {
 	// Permissions Optional permission scoping. If empty, inherits owner's full permissions.
 	Permissions *[]Permission `json:"permissions"`
 
-	// RowFilter Per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. Documents must match this query to be visible through this API key.
+	// RowFilter Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
 	RowFilter *map[string]interface{} `json:"row_filter"`
 
 	// Username Owner of the API key.
 	Username string `json:"username"`
 }
+
+// AuthSubject defines model for AuthSubject.
+type AuthSubject struct {
+	// Kind Conservative subject classification inferred from user records and subject prefixes.
+	Kind AuthSubjectKind `json:"kind"`
+
+	// Subject Casbin subject name.
+	Subject string `json:"subject"`
+}
+
+// AuthSubjectKind Conservative subject classification inferred from user records and subject prefixes.
+type AuthSubjectKind string
 
 // CreateApiKeyRequest Request to create a new API key.
 type CreateApiKeyRequest struct {
@@ -106,7 +126,7 @@ type CreateApiKeyRequest struct {
 	// Permissions Optional permission scoping. Each permission must be a subset of the creator's permissions.
 	Permissions *[]Permission `json:"permissions"`
 
-	// RowFilter Per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. Documents must match this query to be visible through this API key.
+	// RowFilter Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
 	RowFilter *map[string]interface{} `json:"row_filter"`
 }
 
@@ -114,7 +134,10 @@ type CreateApiKeyRequest struct {
 type CreateUserRequest struct {
 	// InitialPolicies Optional list of initial permissions for the user.
 	InitialPolicies *[]Permission `json:"initial_policies"`
-	Password        string        `json:"password"`
+
+	// Metadata Auth metadata available to stored row-filter policies.
+	Metadata *map[string]interface{} `json:"metadata"`
+	Password string                  `json:"password"`
 
 	// Username Username for the new user. If provided in the path, this field can be omitted or must match the path parameter.
 	Username *string `json:"username,omitempty"`
@@ -143,6 +166,12 @@ type PermissionType string
 // ResourceType Type of the resource, e.g., table, user, or global ('*').
 type ResourceType string
 
+// RoleAssignment defines model for RoleAssignment.
+type RoleAssignment struct {
+	// Role Role or group subject to assign, usually prefixed with role: or group:.
+	Role string `json:"role"`
+}
+
 // RowFilterEntry A row filter policy for a user on a specific table.
 type RowFilterEntry struct {
 	// Filter Antfly query JSON that documents must match to be visible.
@@ -164,6 +193,9 @@ type UpdatePasswordRequest struct {
 
 // User defines model for User.
 type User struct {
+	// Metadata Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
+	Metadata *map[string]interface{} `json:"metadata"`
+
 	// PasswordHash Base64 encoded password hash. Exposing this is a security risk.
 	PasswordHash []byte `json:"password_hash"`
 	Username     string `json:"username"`
@@ -172,8 +204,14 @@ type User struct {
 // KeyIdPathParameter defines model for KeyIdPathParameter.
 type KeyIdPathParameter = string
 
+// SubjectPathParameter defines model for SubjectPathParameter.
+type SubjectPathParameter = string
+
 // UserNamePathParameter defines model for UserNamePathParameter.
 type UserNamePathParameter = string
+
+// SetSubjectRowFilterJSONBody defines parameters for SetSubjectRowFilter.
+type SetSubjectRowFilterJSONBody map[string]interface{}
 
 // RemovePermissionFromUserParams defines parameters for RemovePermissionFromUser.
 type RemovePermissionFromUserParams struct {
@@ -184,8 +222,17 @@ type RemovePermissionFromUserParams struct {
 	ResourceType ResourceType `form:"resourceType" json:"resourceType"`
 }
 
+// RemoveRoleFromUserParams defines parameters for RemoveRoleFromUser.
+type RemoveRoleFromUserParams struct {
+	// Role Role or group subject to remove.
+	Role string `form:"role" json:"role"`
+}
+
 // SetRowFilterJSONBody defines parameters for SetRowFilter.
 type SetRowFilterJSONBody map[string]interface{}
+
+// SetSubjectRowFilterJSONRequestBody defines body for SetSubjectRowFilter for application/json ContentType.
+type SetSubjectRowFilterJSONRequestBody SetSubjectRowFilterJSONBody
 
 // CreateUserJSONRequestBody defines body for CreateUser for application/json ContentType.
 type CreateUserJSONRequestBody = CreateUserRequest
@@ -199,58 +246,85 @@ type UpdateUserPasswordJSONRequestBody = UpdatePasswordRequest
 // AddPermissionToUserJSONRequestBody defines body for AddPermissionToUser for application/json ContentType.
 type AddPermissionToUserJSONRequestBody = Permission
 
+// AddRoleToUserJSONRequestBody defines body for AddRoleToUser for application/json ContentType.
+type AddRoleToUserJSONRequestBody = RoleAssignment
+
 // SetRowFilterJSONRequestBody defines body for SetRowFilter for application/json ContentType.
 type SetRowFilterJSONRequestBody SetRowFilterJSONBody
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
-	// List all users
-	// (GET /users)
-	ListUsers(w http.ResponseWriter, r *http.Request)
 	// Get current authenticated user
-	// (GET /users/me)
+	// (GET /auth/v1/me)
 	GetCurrentUser(w http.ResponseWriter, r *http.Request)
+	// List auth subjects
+	// (GET /auth/v1/subjects)
+	ListAuthSubjects(w http.ResponseWriter, r *http.Request)
+	// List row filters for an auth subject
+	// (GET /auth/v1/subjects/{subject}/row-filters)
+	ListSubjectRowFilters(w http.ResponseWriter, r *http.Request, subject SubjectPathParameter)
+	// Remove row filter for an auth subject on a table
+	// (DELETE /auth/v1/subjects/{subject}/row-filters/{table})
+	RemoveSubjectRowFilter(w http.ResponseWriter, r *http.Request, subject SubjectPathParameter, table string)
+	// Get row filter for an auth subject on a table
+	// (GET /auth/v1/subjects/{subject}/row-filters/{table})
+	GetSubjectRowFilter(w http.ResponseWriter, r *http.Request, subject SubjectPathParameter, table string)
+	// Set row filter for an auth subject on a table
+	// (PUT /auth/v1/subjects/{subject}/row-filters/{table})
+	SetSubjectRowFilter(w http.ResponseWriter, r *http.Request, subject SubjectPathParameter, table string)
+	// List all users
+	// (GET /auth/v1/users)
+	ListUsers(w http.ResponseWriter, r *http.Request)
 	// Delete a user
-	// (DELETE /users/{userName})
+	// (DELETE /auth/v1/users/{userName})
 	DeleteUser(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter)
 	// Get user details
-	// (GET /users/{userName})
+	// (GET /auth/v1/users/{userName})
 	GetUserByName(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter)
 	// Create a new user
-	// (POST /users/{userName})
+	// (POST /auth/v1/users/{userName})
 	CreateUser(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter)
 	// List API keys for a user
-	// (GET /users/{userName}/api-keys)
+	// (GET /auth/v1/users/{userName}/api-keys)
 	ListApiKeys(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter)
 	// Create a new API key
-	// (POST /users/{userName}/api-keys)
+	// (POST /auth/v1/users/{userName}/api-keys)
 	CreateApiKey(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter)
 	// Delete an API key
-	// (DELETE /users/{userName}/api-keys/{keyId})
+	// (DELETE /auth/v1/users/{userName}/api-keys/{keyId})
 	DeleteApiKey(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter, keyId KeyIdPathParameter)
 	// Update user password
-	// (PUT /users/{userName}/password)
+	// (PUT /auth/v1/users/{userName}/password)
 	UpdateUserPassword(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter)
 	// Remove permission from user
-	// (DELETE /users/{userName}/permissions)
+	// (DELETE /auth/v1/users/{userName}/permissions)
 	RemovePermissionFromUser(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter, params RemovePermissionFromUserParams)
 	// Get user permissions
-	// (GET /users/{userName}/permissions)
+	// (GET /auth/v1/users/{userName}/permissions)
 	GetUserPermissions(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter)
 	// Add permission to user
-	// (POST /users/{userName}/permissions)
+	// (POST /auth/v1/users/{userName}/permissions)
 	AddPermissionToUser(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter)
+	// Remove role from user
+	// (DELETE /auth/v1/users/{userName}/roles)
+	RemoveRoleFromUser(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter, params RemoveRoleFromUserParams)
+	// List user roles
+	// (GET /auth/v1/users/{userName}/roles)
+	ListUserRoles(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter)
+	// Add role to user
+	// (POST /auth/v1/users/{userName}/roles)
+	AddRoleToUser(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter)
 	// List row filters for a user
-	// (GET /users/{userName}/row-filters)
+	// (GET /auth/v1/users/{userName}/row-filters)
 	ListRowFilters(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter)
 	// Remove row filter for a user on a table
-	// (DELETE /users/{userName}/row-filters/{table})
+	// (DELETE /auth/v1/users/{userName}/row-filters/{table})
 	RemoveRowFilter(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter, table string)
 	// Get row filter for a user on a table
-	// (GET /users/{userName}/row-filters/{table})
+	// (GET /auth/v1/users/{userName}/row-filters/{table})
 	GetRowFilter(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter, table string)
 	// Set row filter for a user on a table
-	// (PUT /users/{userName}/row-filters/{table})
+	// (PUT /auth/v1/users/{userName}/row-filters/{table})
 	SetRowFilter(w http.ResponseWriter, r *http.Request, userName UserNamePathParameter, table string)
 }
 
@@ -262,30 +336,6 @@ type ServerInterfaceWrapper struct {
 }
 
 type MiddlewareFunc func(http.Handler) http.Handler
-
-// ListUsers operation middleware
-func (siw *ServerInterfaceWrapper) ListUsers(w http.ResponseWriter, r *http.Request) {
-
-	ctx := r.Context()
-
-	ctx = context.WithValue(ctx, BasicAuthScopes, []string{})
-
-	ctx = context.WithValue(ctx, ApiKeyAuthScopes, []string{})
-
-	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
-
-	r = r.WithContext(ctx)
-
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.ListUsers(w, r)
-	}))
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		handler = middleware(handler)
-	}
-
-	handler.ServeHTTP(w, r)
-}
 
 // GetCurrentUser operation middleware
 func (siw *ServerInterfaceWrapper) GetCurrentUser(w http.ResponseWriter, r *http.Request) {
@@ -302,6 +352,221 @@ func (siw *ServerInterfaceWrapper) GetCurrentUser(w http.ResponseWriter, r *http
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetCurrentUser(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListAuthSubjects operation middleware
+func (siw *ServerInterfaceWrapper) ListAuthSubjects(w http.ResponseWriter, r *http.Request) {
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BasicAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, ApiKeyAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListAuthSubjects(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListSubjectRowFilters operation middleware
+func (siw *ServerInterfaceWrapper) ListSubjectRowFilters(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "subject" -------------
+	var subject SubjectPathParameter
+
+	err = runtime.BindStyledParameterWithOptions("simple", "subject", r.PathValue("subject"), &subject, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "subject", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BasicAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, ApiKeyAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListSubjectRowFilters(w, r, subject)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RemoveSubjectRowFilter operation middleware
+func (siw *ServerInterfaceWrapper) RemoveSubjectRowFilter(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "subject" -------------
+	var subject SubjectPathParameter
+
+	err = runtime.BindStyledParameterWithOptions("simple", "subject", r.PathValue("subject"), &subject, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "subject", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "table" -------------
+	var table string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "table", r.PathValue("table"), &table, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "table", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BasicAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, ApiKeyAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RemoveSubjectRowFilter(w, r, subject, table)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetSubjectRowFilter operation middleware
+func (siw *ServerInterfaceWrapper) GetSubjectRowFilter(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "subject" -------------
+	var subject SubjectPathParameter
+
+	err = runtime.BindStyledParameterWithOptions("simple", "subject", r.PathValue("subject"), &subject, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "subject", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "table" -------------
+	var table string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "table", r.PathValue("table"), &table, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "table", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BasicAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, ApiKeyAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetSubjectRowFilter(w, r, subject, table)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// SetSubjectRowFilter operation middleware
+func (siw *ServerInterfaceWrapper) SetSubjectRowFilter(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "subject" -------------
+	var subject SubjectPathParameter
+
+	err = runtime.BindStyledParameterWithOptions("simple", "subject", r.PathValue("subject"), &subject, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "subject", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "table" -------------
+	var table string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "table", r.PathValue("table"), &table, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "table", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BasicAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, ApiKeyAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SetSubjectRowFilter(w, r, subject, table)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListUsers operation middleware
+func (siw *ServerInterfaceWrapper) ListUsers(w http.ResponseWriter, r *http.Request) {
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BasicAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, ApiKeyAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListUsers(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -703,6 +968,129 @@ func (siw *ServerInterfaceWrapper) AddPermissionToUser(w http.ResponseWriter, r 
 	handler.ServeHTTP(w, r)
 }
 
+// RemoveRoleFromUser operation middleware
+func (siw *ServerInterfaceWrapper) RemoveRoleFromUser(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "userName" -------------
+	var userName UserNamePathParameter
+
+	err = runtime.BindStyledParameterWithOptions("simple", "userName", r.PathValue("userName"), &userName, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "userName", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BasicAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, ApiKeyAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params RemoveRoleFromUserParams
+
+	// ------------- Required query parameter "role" -------------
+
+	if paramValue := r.URL.Query().Get("role"); paramValue != "" {
+
+	} else {
+		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "role"})
+		return
+	}
+
+	err = runtime.BindQueryParameter("form", true, true, "role", r.URL.Query(), &params.Role)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "role", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RemoveRoleFromUser(w, r, userName, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListUserRoles operation middleware
+func (siw *ServerInterfaceWrapper) ListUserRoles(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "userName" -------------
+	var userName UserNamePathParameter
+
+	err = runtime.BindStyledParameterWithOptions("simple", "userName", r.PathValue("userName"), &userName, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "userName", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BasicAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, ApiKeyAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListUserRoles(w, r, userName)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// AddRoleToUser operation middleware
+func (siw *ServerInterfaceWrapper) AddRoleToUser(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "userName" -------------
+	var userName UserNamePathParameter
+
+	err = runtime.BindStyledParameterWithOptions("simple", "userName", r.PathValue("userName"), &userName, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "userName", Err: err})
+		return
+	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BasicAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, ApiKeyAuthScopes, []string{})
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.AddRoleToUser(w, r, userName)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // ListRowFilters operation middleware
 func (siw *ServerInterfaceWrapper) ListRowFilters(w http.ResponseWriter, r *http.Request) {
 
@@ -990,22 +1378,30 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 		ErrorHandlerFunc:   options.ErrorHandlerFunc,
 	}
 
-	m.HandleFunc("GET "+options.BaseURL+"/users", wrapper.ListUsers)
-	m.HandleFunc("GET "+options.BaseURL+"/users/me", wrapper.GetCurrentUser)
-	m.HandleFunc("DELETE "+options.BaseURL+"/users/{userName}", wrapper.DeleteUser)
-	m.HandleFunc("GET "+options.BaseURL+"/users/{userName}", wrapper.GetUserByName)
-	m.HandleFunc("POST "+options.BaseURL+"/users/{userName}", wrapper.CreateUser)
-	m.HandleFunc("GET "+options.BaseURL+"/users/{userName}/api-keys", wrapper.ListApiKeys)
-	m.HandleFunc("POST "+options.BaseURL+"/users/{userName}/api-keys", wrapper.CreateApiKey)
-	m.HandleFunc("DELETE "+options.BaseURL+"/users/{userName}/api-keys/{keyId}", wrapper.DeleteApiKey)
-	m.HandleFunc("PUT "+options.BaseURL+"/users/{userName}/password", wrapper.UpdateUserPassword)
-	m.HandleFunc("DELETE "+options.BaseURL+"/users/{userName}/permissions", wrapper.RemovePermissionFromUser)
-	m.HandleFunc("GET "+options.BaseURL+"/users/{userName}/permissions", wrapper.GetUserPermissions)
-	m.HandleFunc("POST "+options.BaseURL+"/users/{userName}/permissions", wrapper.AddPermissionToUser)
-	m.HandleFunc("GET "+options.BaseURL+"/users/{userName}/row-filters", wrapper.ListRowFilters)
-	m.HandleFunc("DELETE "+options.BaseURL+"/users/{userName}/row-filters/{table}", wrapper.RemoveRowFilter)
-	m.HandleFunc("GET "+options.BaseURL+"/users/{userName}/row-filters/{table}", wrapper.GetRowFilter)
-	m.HandleFunc("PUT "+options.BaseURL+"/users/{userName}/row-filters/{table}", wrapper.SetRowFilter)
+	m.HandleFunc("GET "+options.BaseURL+"/auth/v1/me", wrapper.GetCurrentUser)
+	m.HandleFunc("GET "+options.BaseURL+"/auth/v1/subjects", wrapper.ListAuthSubjects)
+	m.HandleFunc("GET "+options.BaseURL+"/auth/v1/subjects/{subject}/row-filters", wrapper.ListSubjectRowFilters)
+	m.HandleFunc("DELETE "+options.BaseURL+"/auth/v1/subjects/{subject}/row-filters/{table}", wrapper.RemoveSubjectRowFilter)
+	m.HandleFunc("GET "+options.BaseURL+"/auth/v1/subjects/{subject}/row-filters/{table}", wrapper.GetSubjectRowFilter)
+	m.HandleFunc("PUT "+options.BaseURL+"/auth/v1/subjects/{subject}/row-filters/{table}", wrapper.SetSubjectRowFilter)
+	m.HandleFunc("GET "+options.BaseURL+"/auth/v1/users", wrapper.ListUsers)
+	m.HandleFunc("DELETE "+options.BaseURL+"/auth/v1/users/{userName}", wrapper.DeleteUser)
+	m.HandleFunc("GET "+options.BaseURL+"/auth/v1/users/{userName}", wrapper.GetUserByName)
+	m.HandleFunc("POST "+options.BaseURL+"/auth/v1/users/{userName}", wrapper.CreateUser)
+	m.HandleFunc("GET "+options.BaseURL+"/auth/v1/users/{userName}/api-keys", wrapper.ListApiKeys)
+	m.HandleFunc("POST "+options.BaseURL+"/auth/v1/users/{userName}/api-keys", wrapper.CreateApiKey)
+	m.HandleFunc("DELETE "+options.BaseURL+"/auth/v1/users/{userName}/api-keys/{keyId}", wrapper.DeleteApiKey)
+	m.HandleFunc("PUT "+options.BaseURL+"/auth/v1/users/{userName}/password", wrapper.UpdateUserPassword)
+	m.HandleFunc("DELETE "+options.BaseURL+"/auth/v1/users/{userName}/permissions", wrapper.RemovePermissionFromUser)
+	m.HandleFunc("GET "+options.BaseURL+"/auth/v1/users/{userName}/permissions", wrapper.GetUserPermissions)
+	m.HandleFunc("POST "+options.BaseURL+"/auth/v1/users/{userName}/permissions", wrapper.AddPermissionToUser)
+	m.HandleFunc("DELETE "+options.BaseURL+"/auth/v1/users/{userName}/roles", wrapper.RemoveRoleFromUser)
+	m.HandleFunc("GET "+options.BaseURL+"/auth/v1/users/{userName}/roles", wrapper.ListUserRoles)
+	m.HandleFunc("POST "+options.BaseURL+"/auth/v1/users/{userName}/roles", wrapper.AddRoleToUser)
+	m.HandleFunc("GET "+options.BaseURL+"/auth/v1/users/{userName}/row-filters", wrapper.ListRowFilters)
+	m.HandleFunc("DELETE "+options.BaseURL+"/auth/v1/users/{userName}/row-filters/{table}", wrapper.RemoveRowFilter)
+	m.HandleFunc("GET "+options.BaseURL+"/auth/v1/users/{userName}/row-filters/{table}", wrapper.GetRowFilter)
+	m.HandleFunc("PUT "+options.BaseURL+"/auth/v1/users/{userName}/row-filters/{table}", wrapper.SetRowFilter)
 
 	return m
 }
@@ -1013,61 +1409,74 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
+	"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",
+	"9v8LAAD//+WwJZz4ZwAA",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

@@ -2,7 +2,7 @@
 
 ## 2026-04-20: freestanding wasm stdlib breakage in Zig 0.16
 
-This repo's embedded Termite wasm build currently targets `wasm32-freestanding`.
+This repo's embedded Antfly inference wasm build currently targets `wasm32-freestanding`.
 While working on the `go/pkg/termite` wasm32/wasm64 split, the build hit a set of
 upstream Zig stdlib issues before repo codegen/typechecking could complete.
 
@@ -118,7 +118,7 @@ This strongly suggests the root issue is architectural:
 One useful repo-local mitigation did help, but it is only partial:
 
 - `std/Io/Dir.zig` already consults `root.os.PATH_MAX` / `root.os.NAME_MAX` for
-  unsupported targets, so the Termite wasm root can define those values locally
+  unsupported targets, so the Antfly inference wasm root can define those values locally
   without patching Zig for that specific part
 
 That addresses the `PATH_MAX`/`NAME_MAX` error path, but it does not solve the
@@ -135,7 +135,7 @@ freestanding workaround instead of trying to fully emulate hosted POSIX:
   backends for those targets
 - the shim only provides the minimal `Threaded` surface needed for freestanding
   wasm builds to typecheck
-- the Termite wasm root sets:
+- the Antfly inference wasm root sets:
   - `std_options_debug_threaded_io = null`
   - `std_options_debug_io = undefined`
   so the build does not try to materialize hosted debug IO at comptime
@@ -163,7 +163,7 @@ stdlib still imports and typechecks POSIX/hosted declarations too eagerly for
 `wasm32-freestanding`.
 
 This does not look specific to `go/pkg/termite`; it reproduces across both local
-0.16 toolchains and fails in stdlib before the Termite wasm build can complete.
+0.16 toolchains and fails in stdlib before the Antfly inference wasm build can complete.
 
 ### If we raise an upstream Zig bug
 

@@ -84,14 +84,14 @@ const TestEmbeddingRequest = struct {
     input: std.json.Value,
 };
 
-const TestTermiteChunkRequest = struct {
+const TestAntflyChunkRequest = struct {
     input: std.json.Value,
     config: struct {
         model: []const u8,
     },
 };
 
-const TestTermiteEmbedRequest = struct {
+const TestAntflyEmbedRequest = struct {
     model: []const u8,
     input: std.json.Value,
 };
@@ -187,7 +187,7 @@ const FakeEmbeddingProvider = struct {
     }
 };
 
-const FakeTermiteProvider = struct {
+const FakeAntflyProvider = struct {
     fn executor() http_common.RequestExecutor {
         return .{
             .ptr = undefined,
@@ -201,9 +201,9 @@ const FakeTermiteProvider = struct {
         try std.testing.expectEqual(http_common.Method.POST, req.method);
 
         if (std.mem.endsWith(u8, req.uri, "/api/chunk")) {
-            var parsed_req = try parseJsonBodyIgnoreUnknown(TestTermiteChunkRequest, req.body);
+            var parsed_req = try parseJsonBodyIgnoreUnknown(TestAntflyChunkRequest, req.body);
             defer parsed_req.deinit();
-            try std.testing.expectEqualStrings("termite-chunker-v1", parsed_req.value.config.model);
+            try std.testing.expectEqualStrings("antfly-chunker-v1", parsed_req.value.config.model);
             const body = if (jsonValueContainsText(parsed_req.value.input, "beta body") or jsonValueContainsText(parsed_req.value.input, "right beta body"))
                 try alloc.dupe(u8,
                     \\{"object":"list","data":[
@@ -226,9 +226,9 @@ const FakeTermiteProvider = struct {
         }
 
         if (std.mem.endsWith(u8, req.uri, "/embed") or std.mem.endsWith(u8, req.uri, "/embeddings")) {
-            var parsed_req = try parseJsonBodyIgnoreUnknown(TestTermiteEmbedRequest, req.body);
+            var parsed_req = try parseJsonBodyIgnoreUnknown(TestAntflyEmbedRequest, req.body);
             defer parsed_req.deinit();
-            if (std.mem.eql(u8, parsed_req.value.model, "termite-sparse-v1")) {
+            if (std.mem.eql(u8, parsed_req.value.model, "antfly-sparse-v1")) {
                 const body = if (jsonValueContainsText(parsed_req.value.input, "alpha body") or jsonValueContainsText(parsed_req.value.input, "left alpha body"))
                     try encodeSparseEmbeddingResponse(alloc, &.{ 7, 42 }, &.{ 1.5, 0.5 })
                 else if (jsonValueContainsText(parsed_req.value.input, "beta body") or jsonValueContainsText(parsed_req.value.input, "right beta body"))
@@ -5267,11 +5267,11 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
     const embed_base_uri = try embed_listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(embed_base_uri);
 
-    var termite_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeTermiteProvider.executor());
-    defer termite_listener.deinit();
-    try termite_listener.start();
-    const termite_base_uri = try termite_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(termite_base_uri);
+    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
+    defer antfly_listener.deinit();
+    try antfly_listener.start();
+    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(antfly_base_uri);
 
     var media_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeRemoteMedia.executor());
     defer media_listener.deinit();
@@ -5323,27 +5323,27 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
     var fixed_chunked_index = try client.createTableIndex(api_base_uris[0], "docs", "semantic_fixed_idx", fixed_chunked_index_body);
     defer fixed_chunked_index.deinit(std.heap.page_allocator);
 
-    const termite_chunk_api = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/api", .{termite_base_uri});
-    defer std.heap.page_allocator.free(termite_chunk_api);
-    const termite_chunked_index_body = try test_contract_helpers.encodeManagedEmbeddingsIndexRequest(
+    const antfly_chunk_api = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/api", .{antfly_base_uri});
+    defer std.heap.page_allocator.free(antfly_chunk_api);
+    const antfly_chunked_index_body = try test_contract_helpers.encodeManagedEmbeddingsIndexRequest(
         std.heap.page_allocator,
-        "semantic_termite_idx",
+        "semantic_antfly_idx",
         "body",
         3,
         .{
-            .provider = .termite,
-            .model = "termite-embed-v1",
-            .api_url = termite_base_uri,
+            .provider = .antfly,
+            .model = "antfly-embed-v1",
+            .api_url = antfly_base_uri,
         },
         .{
-            .provider = .termite,
-            .api_url = termite_chunk_api,
-            .model = "termite-chunker-v1",
+            .provider = .antfly,
+            .api_url = antfly_chunk_api,
+            .model = "antfly-chunker-v1",
         },
     );
-    defer std.heap.page_allocator.free(termite_chunked_index_body);
-    var termite_chunked_index = try client.createTableIndex(api_base_uris[0], "docs", "semantic_termite_idx", termite_chunked_index_body);
-    defer termite_chunked_index.deinit(std.heap.page_allocator);
+    defer std.heap.page_allocator.free(antfly_chunked_index_body);
+    var antfly_chunked_index = try client.createTableIndex(api_base_uris[0], "docs", "semantic_antfly_idx", antfly_chunked_index_body);
+    defer antfly_chunked_index.deinit(std.heap.page_allocator);
 
     const semantic_template_index_body = try test_contract_helpers.encodeManagedEmbeddingsIndexTemplateRequest(
         std.heap.page_allocator,
@@ -5351,9 +5351,9 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "{{remoteMedia url=photo}}",
         3,
         .{
-            .provider = .termite,
-            .model = "termite-clip-v1",
-            .api_url = termite_base_uri,
+            .provider = .antfly,
+            .model = "antfly-clip-v1",
+            .api_url = antfly_base_uri,
             .multimodal = true,
         },
     );
@@ -5385,9 +5385,9 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "sparse_idx",
         "body",
         .{
-            .provider = .termite,
-            .model = "termite-sparse-v1",
-            .api_url = termite_base_uri,
+            .provider = .antfly,
+            .model = "antfly-sparse-v1",
+            .api_url = antfly_base_uri,
         },
     );
     defer std.heap.page_allocator.free(sparse_index_body);
@@ -5440,7 +5440,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
     };
     try ensureGroupEmbeddingIndexes(&cluster, roots[group_leader_index], group_id, "semantic_idx", "sparse_idx", 64);
     try ensureGroupDenseIndex(&cluster, roots[group_leader_index], group_id, "semantic_fixed_idx", 64);
-    try ensureGroupDenseIndex(&cluster, roots[group_leader_index], group_id, "semantic_termite_idx", 64);
+    try ensureGroupDenseIndex(&cluster, roots[group_leader_index], group_id, "semantic_antfly_idx", 64);
     try ensureGroupDenseIndex(&cluster, roots[group_leader_index], group_id, "semantic_template_idx", 64);
     try ensureGroupDenseIndex(&cluster, roots[group_leader_index], group_id, "semantic_template_chunked_idx", 64);
 
@@ -5489,13 +5489,13 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
     defer parsed_fixed_chunked.deinit();
     try std.testing.expectEqualStrings("doc:a", parsed_fixed_chunked.value.responses.?[0].hits.?.hits.?[0]._id);
 
-    const termite_chunked_query_body = try test_contract_helpers.encodeSemanticQueryRequest(std.heap.page_allocator, "alpha concept", &.{"semantic_termite_idx"}, 5);
-    defer std.heap.page_allocator.free(termite_chunked_query_body);
-    var termite_chunked_query = try client.fetchQuery(client_base, "docs", termite_chunked_query_body);
-    defer termite_chunked_query.deinit(std.heap.page_allocator);
-    var parsed_termite_chunked = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, termite_chunked_query.body, .{});
-    defer parsed_termite_chunked.deinit();
-    try std.testing.expectEqualStrings("doc:a", parsed_termite_chunked.value.responses.?[0].hits.?.hits.?[0]._id);
+    const antfly_chunked_query_body = try test_contract_helpers.encodeSemanticQueryRequest(std.heap.page_allocator, "alpha concept", &.{"semantic_antfly_idx"}, 5);
+    defer std.heap.page_allocator.free(antfly_chunked_query_body);
+    var antfly_chunked_query = try client.fetchQuery(client_base, "docs", antfly_chunked_query_body);
+    defer antfly_chunked_query.deinit(std.heap.page_allocator);
+    var parsed_antfly_chunked = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, antfly_chunked_query.body, .{});
+    defer parsed_antfly_chunked.deinit();
+    try std.testing.expectEqualStrings("doc:a", parsed_antfly_chunked.value.responses.?[0].hits.?.hits.?[0]._id);
 
     const sparse_query_body = try test_contract_helpers.encodeSparseEmbeddingsQueryRequest(std.heap.page_allocator, "sparse_idx", &.{ 7, 42 }, &.{ 1.5, 0.5 }, 5);
     defer std.heap.page_allocator.free(sparse_query_body);
@@ -5511,7 +5511,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         std.heap.page_allocator,
         media_url,
         "{{remoteMedia url=this}}",
-        &.{"semantic_termite_idx"},
+        &.{"semantic_antfly_idx"},
         5,
     );
     defer std.heap.page_allocator.free(templated_query_body);
@@ -7064,11 +7064,11 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
     const embed_base_uri = try embed_listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(embed_base_uri);
 
-    var termite_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeTermiteProvider.executor());
-    defer termite_listener.deinit();
-    try termite_listener.start();
-    const termite_base_uri = try termite_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(termite_base_uri);
+    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
+    defer antfly_listener.deinit();
+    try antfly_listener.start();
+    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(antfly_base_uri);
 
     var media_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeRemoteMedia.executor());
     defer media_listener.deinit();
@@ -7126,9 +7126,9 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
         "sparse_idx",
         "body",
         .{
-            .provider = .termite,
-            .model = "termite-sparse-v1",
-            .api_url = termite_base_uri,
+            .provider = .antfly,
+            .model = "antfly-sparse-v1",
+            .api_url = antfly_base_uri,
         },
     );
     defer std.heap.page_allocator.free(sparse_index_body);
@@ -7411,11 +7411,11 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
     const embed_base_uri = try embed_listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(embed_base_uri);
 
-    var termite_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeTermiteProvider.executor());
-    defer termite_listener.deinit();
-    try termite_listener.start();
-    const termite_base_uri = try termite_listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(termite_base_uri);
+    var antfly_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeAntflyProvider.executor());
+    defer antfly_listener.deinit();
+    try antfly_listener.start();
+    const antfly_base_uri = try antfly_listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(antfly_base_uri);
 
     var media_listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeRemoteMedia.executor());
     defer media_listener.deinit();
@@ -7473,9 +7473,9 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
         "sparse_idx",
         "body",
         .{
-            .provider = .termite,
-            .model = "termite-sparse-v1",
-            .api_url = termite_base_uri,
+            .provider = .antfly,
+            .model = "antfly-sparse-v1",
+            .api_url = antfly_base_uri,
         },
     );
     defer std.heap.page_allocator.free(sparse_index_body);

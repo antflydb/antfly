@@ -88,9 +88,9 @@ webhooks:
       service:
         name: antfly-operator-webhook-service
         namespace: system
-        path: /validate-antfly-io-v1alpha1-termitepool
+        path: /validate-antfly-io-v1alpha1-inferencepool
     failurePolicy: Fail
-    name: vtermitepool.kb.io
+    name: vinferencepool.kb.io
     namespaceSelector:
       matchExpressions:
         - key: kubernetes.io/metadata.name
@@ -106,7 +106,7 @@ webhooks:
           - CREATE
           - UPDATE
         resources:
-          - termitepools
+          - inferencepools
     sideEffects: None
   - admissionReviewVersions:
       - v1
@@ -114,9 +114,9 @@ webhooks:
       service:
         name: antfly-operator-webhook-service
         namespace: system
-        path: /validate-antfly-io-v1alpha1-termiteroute
+        path: /validate-antfly-io-v1alpha1-inferenceproxy
     failurePolicy: Fail
-    name: vtermiteroute.kb.io
+    name: vinferenceproxy.kb.io
     namespaceSelector:
       matchExpressions:
         - key: kubernetes.io/metadata.name
@@ -132,5 +132,5 @@ webhooks:
           - CREATE
           - UPDATE
         resources:
-          - termiteroutes
+          - inferenceproxies
     sideEffects: None

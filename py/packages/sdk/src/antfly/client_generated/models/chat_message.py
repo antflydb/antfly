@@ -21,20 +21,24 @@ T = TypeVar("T", bound="ChatMessage")
 
 @_attrs_define
 class ChatMessage:
-    """OpenAI-compatible chat message.
+    """OpenAI-compatible message in a generation/chat conversation.
 
     Attributes:
-        role (ChatMessageRole): The role of a chat message sender.
-        content (list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset): OpenAI-compatible
-            message content: either text or an array of content parts.
-        tool_calls (list[ToolCall] | Unset): Assistant tool calls.
-        tool_call_id (str | Unset): Tool call ID this tool message responds to.
+        role (ChatMessageRole): Role of the message sender in a generation/chat conversation
+        content (list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset): Message content.
+            Supports two formats:
+            - Simple string: "Hello, how are you?"
+            - Array of content parts: [{"type": "text", "text": "Hello"}]
+        tool_calls (list[ToolCall] | Unset): Tool calls made by the assistant (only for role=assistant).
+        tool_call_id (str | Unset): ID of the tool call this message responds to (only for role=tool).
+        name (str | Unset): Optional tool name for tool messages when model templates need it.
     """
 
     role: ChatMessageRole
     content: list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset = UNSET
     tool_calls: list[ToolCall] | Unset = UNSET
     tool_call_id: str | Unset = UNSET
+    name: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -77,6 +81,8 @@ class ChatMessage:
 
         tool_call_id = self.tool_call_id
 
+        name = self.name
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -90,6 +96,8 @@ class ChatMessage:
             field_dict["tool_calls"] = tool_calls
         if tool_call_id is not UNSET:
             field_dict["tool_call_id"] = tool_call_id
+        if name is not UNSET:
+            field_dict["name"] = name
 
         return field_dict
 
@@ -170,11 +178,14 @@ class ChatMessage:
 
         tool_call_id = d.pop("tool_call_id", UNSET)
 
+        name = d.pop("name", UNSET)
+
         chat_message = cls(
             role=role,
             content=content,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
+            name=name,
         )
 
         chat_message.additional_properties = d

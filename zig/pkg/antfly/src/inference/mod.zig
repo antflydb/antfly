@@ -16,12 +16,12 @@
 //
 // Provides a provider-neutral interface for ML inference (embeddings,
 // chat/generation, reranking) with implementations for:
-//   - Termite (local ONNX inference, binary embedding format)
+//   - Local inference (ONNX inference, binary embedding format)
 //   - OpenAI (also works with Ollama, vLLM, and any OpenAI-compatible API)
 
 pub const types = @import("types.zig");
 pub const bedrock = @import("bedrock.zig");
-pub const termite = @import("termite.zig");
+pub const local = @import("local.zig");
 pub const openai = @import("openai.zig");
 pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
@@ -40,7 +40,7 @@ pub const ContentPart = types.ContentPart;
 test "inference module compiles" {
     _ = types;
     _ = bedrock;
-    _ = termite;
+    _ = local;
     _ = openai;
     _ = vertex;
     _ = managed_embedder;

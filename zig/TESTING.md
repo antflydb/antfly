@@ -14,7 +14,7 @@ zig build test
 `zig build test` depends on the default package aggregates:
 
 - `zig build antfly-test`
-- `zig build termite-test`
+- `zig build inference-test`
 
 The default aggregate is intended to be the normal local and CI confidence
 target. It does not fetch external corpora and does not run benchmark or soak
@@ -26,7 +26,7 @@ Pull-request CI runs fast required checks:
 
 - `zig build check-snowball`
 - `zig build unit-test`
-- `zig build -Doptimize=ReleaseFast install-antfly install-termite`
+- `zig build -Doptimize=ReleaseFast install -Dedition=full`
 - shared release-binary smoke checks
 - `e2e-base`
 - TLA checks when relevant files change
@@ -58,13 +58,13 @@ zig build antfly-test
 - the default recall harness over `testdata/vectorsets`
 - `chaos-test`
 
-Run only the Termite package tests:
+Run only the inference package tests:
 
 ```sh
-zig build termite-test
+zig build inference-test
 ```
 
-`termite-test` delegates to `go/pkg/termite` by running `zig build test` in that
+`inference-test` delegates to `pkg/inference` by running `zig build test` in that
 package with the root build's relevant backend options forwarded.
 
 ## Antfly Tiers
@@ -156,15 +156,15 @@ external-service, model, browser, or slow integration coverage. Run the same
 base tier locally with the release binaries:
 
 ```sh
-zig build -Doptimize=ReleaseFast install-antfly install-termite
+zig build -Doptimize=ReleaseFast install -Dedition=full
 
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest -q \
   -m "not objectstore_integration and not swarm_integration and not real_model and not postgres_integration and not slow" \
   e2e/antfly
 
-TERMITE_BIN=./zig-out/bin/termite uv run --project e2e/termite pytest -q \
+ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/inference pytest -q \
   -m "not slow and not multimodal and not model_integration and not browser_integration" \
-  e2e/termite
+  e2e/inference
 ```
 
 The GitHub `e2e-base` job uses shared scripts so the same path can be run
@@ -175,7 +175,7 @@ scripts/ci/zig-e2e-base-linux.sh
 ```
 
 Pass pytest selectors after the script name to run a focused Antfly E2E loop.
-Termite E2E is skipped for focused runs unless `RUN_TERMITE_E2E=1` is set:
+Inference E2E is skipped for focused runs unless `RUN_INFERENCE_E2E=1` is set:
 
 ```sh
 SKIP_BUILD=1 scripts/ci/zig-e2e-base-linux.sh \
@@ -208,8 +208,8 @@ docker run --rm --platform linux/amd64 \
 Useful script controls:
 
 - `SKIP_BUILD=1`: reuse existing `zig/zig-out/bin/antfly`.
-- `RUN_TERMITE_E2E=0`: skip Termite base E2E in the default run.
-- `ANTFLY_E2E_VENV` and `TERMITE_E2E_VENV`: override the script-managed
+- `RUN_INFERENCE_E2E=0`: skip inference base E2E in the default run.
+- `ANTFLY_E2E_VENV` and `ANTFLY_INFERENCE_E2E_VENV`: override the script-managed
   virtualenv paths, which default under `/tmp` so Docker runs do not rewrite
   project-local `.venv` directories.
 - `ANTFLY_CI_ZIG_TARGET`, `ANTFLY_CI_ZIG_CPU`, and `ANTFLY_CI_ZIG_OPTIMIZE`:
@@ -222,7 +222,7 @@ long-running scenarios so they stay in `e2e-full`.
 Run the Antfly product E2E suite:
 
 ```sh
-zig build install-antfly
+zig build install -Dedition=full
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest -q e2e/antfly
 ```
 
@@ -247,7 +247,7 @@ Common Antfly E2E environment variables:
 - `ANTFLY_BIN`: local Antfly binary to auto-start, usually `./zig-out/bin/antfly`.
 - `ANTFLY_SERVERLESS_URL`: existing serverless API endpoint.
 - `ANTFLY_STATEFUL_URL`: existing stateful API endpoint.
-- `ANTFLY_STATEFUL_API_ROOT`: stateful API root override; use `/api/v1` for Go Antfly.
+- `ANTFLY_STATEFUL_API_ROOT`: stateful API root override; use `/db/v1` for Go Antfly.
 - `ANTFLY_E2E_PRESERVE_ROOT=1`: preserve per-test data roots for debugging.
 - `ANTFLY_E2E_ALLOW_REAL_MODEL_DOWNLOAD=1`: allow real model downloads for model-backed tests.
 
@@ -272,19 +272,29 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 export GOOGLE_CLOUD_PROJECT=my-project
 ```
 
-Run the Termite product E2E suite:
+Run the inference product E2E suite:
 
 ```sh
-zig build install-termite
-TERMITE_BIN=./zig-out/bin/termite uv run --project e2e/termite pytest -q e2e/termite
+zig build install -Dedition=inference
+ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/inference pytest -q e2e/inference
 ```
 
-The Termite fixtures can also target an already-running service:
+The inference fixtures can also target an already-running service:
 
 ```sh
-TERMITE_URL=http://127.0.0.1:8080 uv run --project e2e/termite pytest -q e2e/termite
-TERMITE_URL=https://termite.example.com TERMITE_TOKEN=... uv run --project e2e/termite pytest -q e2e/termite
+ANTFLY_INFERENCE_URL=http://127.0.0.1:8080 uv run --project e2e/inference pytest -q e2e/inference
+ANTFLY_INFERENCE_URL=https://inference.example.com ANTFLY_INFERENCE_TOKEN=... uv run --project e2e/inference pytest -q e2e/inference
 ```
+
+Common inference E2E environment variables:
+
+- `ANTFLY_BIN`: local Antfly binary to auto-start via `antfly inference run`.
+- `ANTFLY_INFERENCE_URL`: existing inference API endpoint.
+- `ANTFLY_INFERENCE_TOKEN`: bearer token for remote inference endpoints.
+- `ANTFLY_INFERENCE_MODELS_DIR`: model directory override.
+- `ANTFLY_INFERENCE_DOWNLOAD=1`: allow model downloads through `antfly
+  inference pull` when tests request unavailable models.
+- `RUN_LARGE_MODEL_TESTS=1`: opt into large-model tests.
 
 ## TypeScript Components
 
@@ -301,15 +311,6 @@ Pass Vitest selectors after the script name when narrowing a failure:
 scripts/ci/ts-components.sh src/Listener.test.tsx -t config
 ```
 
-Common Termite E2E environment variables:
-
-- `TERMITE_BIN`: local Termite binary to auto-start.
-- `TERMITE_URL`: existing Termite API endpoint.
-- `TERMITE_TOKEN`: bearer token for remote Termite endpoints.
-- `TERMITE_MODELS_DIR`: model directory override.
-- `TERMITE_DOWNLOAD=1`: allow model downloads when tests request unavailable models.
-- `RUN_LARGE_MODEL_TESTS=1`: opt into large-model tests.
-
 Many E2E tests skip cleanly when required binaries, services, local PostgreSQL,
 remote object stores, or model files are unavailable.
 
@@ -318,7 +319,7 @@ E2E marker policy:
 - `postgres_integration`: requires local PostgreSQL.
 - `objectstore_integration`: requires S3 or GCS credentials and buckets.
 - `real_model` or `model_integration`: requires local or downloadable model weights.
-- `swarm_integration`: requires a local Antfly swarm plus live Termite model support.
+- `swarm_integration`: requires a local Antfly swarm plus live inference model support.
 - `browser_integration`: requires a browser or WebGPU runtime.
 - `slow`: too long-running for required E2E base CI.
 

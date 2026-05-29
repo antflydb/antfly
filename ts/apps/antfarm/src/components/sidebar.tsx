@@ -391,19 +391,19 @@ export function AppSidebar({
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location.pathname === "/playground/rag"}
+                    isActive={location.pathname === "/data/playground/rag"}
                     tooltip="RAG"
                     disabled={!selectedTable}
                     className="disabled:opacity-50"
                   >
                     <a
-                      href="/playground/rag"
+                      href="/data/playground/rag"
                       onClick={(e) => {
                         e.preventDefault();
                         navigate(
                           selectedTable
-                            ? `/playground/rag?table=${encodeURIComponent(selectedTable)}`
-                            : "/playground/rag"
+                            ? `/data/playground/rag?table=${encodeURIComponent(selectedTable)}`
+                            : "/data/playground/rag"
                         );
                       }}
                     >
@@ -415,19 +415,19 @@ export function AppSidebar({
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location.pathname === "/playground/chat"}
+                    isActive={location.pathname === "/data/playground/chat"}
                     tooltip="Chat"
                     disabled={!selectedTable}
                     className="disabled:opacity-50"
                   >
                     <a
-                      href="/playground/chat"
+                      href="/data/playground/chat"
                       onClick={(e) => {
                         e.preventDefault();
                         navigate(
                           selectedTable
-                            ? `/playground/chat?table=${encodeURIComponent(selectedTable)}`
-                            : "/playground/chat"
+                            ? `/data/playground/chat?table=${encodeURIComponent(selectedTable)}`
+                            : "/data/playground/chat"
                         );
                       }}
                     >
@@ -439,19 +439,19 @@ export function AppSidebar({
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location.pathname === "/playground/evals"}
+                    isActive={location.pathname === "/data/playground/evals"}
                     tooltip="Evals"
                     disabled={!selectedTable}
                     className="disabled:opacity-50"
                   >
                     <a
-                      href="/playground/evals"
+                      href="/data/playground/evals"
                       onClick={(e) => {
                         e.preventDefault();
                         navigate(
                           selectedTable
-                            ? `/playground/evals?table=${encodeURIComponent(selectedTable)}`
-                            : "/playground/evals"
+                            ? `/data/playground/evals?table=${encodeURIComponent(selectedTable)}`
+                            : "/data/playground/evals"
                         );
                       }}
                     >
@@ -463,19 +463,19 @@ export function AppSidebar({
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location.pathname === "/playground/embedding"}
+                    isActive={location.pathname === "/data/playground/embed"}
                     tooltip="Embedding"
                     disabled={!selectedTable}
                     className="disabled:opacity-50"
                   >
                     <a
-                      href="/playground/embedding"
+                      href="/data/playground/embed"
                       onClick={(e) => {
                         e.preventDefault();
                         navigate(
                           selectedTable
-                            ? `/playground/embedding?table=${encodeURIComponent(selectedTable)}`
-                            : "/playground/embedding"
+                            ? `/data/playground/embed?table=${encodeURIComponent(selectedTable)}`
+                            : "/data/playground/embed"
                         );
                       }}
                     >
@@ -487,19 +487,19 @@ export function AppSidebar({
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location.pathname === "/playground/reranking"}
+                    isActive={location.pathname === "/data/playground/rerank"}
                     tooltip="Reranking"
                     disabled={!selectedTable}
                     className="disabled:opacity-50"
                   >
                     <a
-                      href="/playground/reranking"
+                      href="/data/playground/rerank"
                       onClick={(e) => {
                         e.preventDefault();
                         navigate(
                           selectedTable
-                            ? `/playground/reranking?table=${encodeURIComponent(selectedTable)}`
-                            : "/playground/reranking"
+                            ? `/data/playground/rerank?table=${encodeURIComponent(selectedTable)}`
+                            : "/data/playground/rerank"
                         );
                       }}
                     >
@@ -511,19 +511,19 @@ export function AppSidebar({
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location.pathname === "/playground/chunking"}
+                    isActive={location.pathname === "/data/playground/chunk"}
                     tooltip="Chunking"
                     disabled={!selectedTable}
                     className="disabled:opacity-50"
                   >
                     <a
-                      href="/playground/chunking"
+                      href="/data/playground/chunk"
                       onClick={(e) => {
                         e.preventDefault();
                         navigate(
                           selectedTable
-                            ? `/playground/chunking?table=${encodeURIComponent(selectedTable)}`
-                            : "/playground/chunking"
+                            ? `/data/playground/chunk?table=${encodeURIComponent(selectedTable)}`
+                            : "/data/playground/chunk"
                         );
                       }}
                     >
@@ -537,8 +537,8 @@ export function AppSidebar({
           </SidebarGroup>
         )}
 
-        {/* Termite Management */}
-        {currentProduct === "termite" && (
+        {/* Inference Management */}
+        {currentProduct === "inference" && (
           <>
             <SidebarGroup>
               <SidebarGroupLabel className="mono-label">Management</SidebarGroupLabel>
@@ -547,18 +547,18 @@ export function AppSidebar({
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       asChild
-                      isActive={location.pathname === "/models"}
-                      tooltip="Models"
+                      isActive={location.pathname === "/inference/models"}
+                      tooltip="Models & Runtime"
                     >
                       <a
-                        href="/models"
+                        href="/inference/models"
                         onClick={(e) => {
                           e.preventDefault();
-                          navigate("/models");
+                          navigate("/inference/models");
                         }}
                       >
                         <Library className="size-4" />
-                        <span>Models</span>
+                        <span>Models & Runtime</span>
                       </a>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
@@ -573,14 +573,14 @@ export function AppSidebar({
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       asChild
-                      isActive={location.pathname === "/playground/chunk"}
+                      isActive={location.pathname === "/inference/playground/chunk"}
                       tooltip="Chunking"
                     >
                       <a
-                        href="/playground/chunk"
+                        href="/inference/playground/chunk"
                         onClick={(e) => {
                           e.preventDefault();
-                          navigate("/playground/chunk");
+                          navigate("/inference/playground/chunk");
                         }}
                       >
                         <Scissors className="size-4" />
@@ -591,32 +591,32 @@ export function AppSidebar({
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       asChild
-                      isActive={location.pathname === "/playground/recognize"}
-                      tooltip="Recognize"
+                      isActive={location.pathname === "/inference/playground/extract"}
+                      tooltip="Extraction"
                     >
                       <a
-                        href="/playground/recognize"
+                        href="/inference/playground/extract"
                         onClick={(e) => {
                           e.preventDefault();
-                          navigate("/playground/recognize");
+                          navigate("/inference/playground/extract");
                         }}
                       >
                         <Tag className="size-4" />
-                        <span>Recognize</span>
+                        <span>Extraction</span>
                       </a>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       asChild
-                      isActive={location.pathname === "/playground/rewrite"}
+                      isActive={location.pathname === "/inference/playground/rewrite"}
                       tooltip="Rewriting"
                     >
                       <a
-                        href="/playground/rewrite"
+                        href="/inference/playground/rewrite"
                         onClick={(e) => {
                           e.preventDefault();
-                          navigate("/playground/rewrite");
+                          navigate("/inference/playground/rewrite");
                         }}
                       >
                         <Repeat2 className="size-4" />
@@ -627,14 +627,14 @@ export function AppSidebar({
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       asChild
-                      isActive={location.pathname === "/playground/rerank"}
+                      isActive={location.pathname === "/inference/playground/rerank"}
                       tooltip="Reranking"
                     >
                       <a
-                        href="/playground/rerank"
+                        href="/inference/playground/rerank"
                         onClick={(e) => {
                           e.preventDefault();
-                          navigate("/playground/rerank");
+                          navigate("/inference/playground/rerank");
                         }}
                       >
                         <ArrowUpDown className="size-4" />
@@ -645,14 +645,14 @@ export function AppSidebar({
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       asChild
-                      isActive={location.pathname === "/playground/kg"}
+                      isActive={location.pathname === "/inference/playground/kg"}
                       tooltip="Knowledge Graph"
                     >
                       <a
-                        href="/playground/kg"
+                        href="/inference/playground/kg"
                         onClick={(e) => {
                           e.preventDefault();
-                          navigate("/playground/kg");
+                          navigate("/inference/playground/kg");
                         }}
                       >
                         <Network className="size-4" />
@@ -663,14 +663,14 @@ export function AppSidebar({
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       asChild
-                      isActive={location.pathname === "/playground/embed"}
+                      isActive={location.pathname === "/inference/playground/embed"}
                       tooltip="Embedding"
                     >
                       <a
-                        href="/playground/embed"
+                        href="/inference/playground/embed"
                         onClick={(e) => {
                           e.preventDefault();
-                          navigate("/playground/embed");
+                          navigate("/inference/playground/embed");
                         }}
                       >
                         <Waypoints className="size-4" />
@@ -681,14 +681,14 @@ export function AppSidebar({
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       asChild
-                      isActive={location.pathname === "/playground/read"}
+                      isActive={location.pathname === "/inference/playground/read"}
                       tooltip="Reader"
                     >
                       <a
-                        href="/playground/read"
+                        href="/inference/playground/read"
                         onClick={(e) => {
                           e.preventDefault();
-                          navigate("/playground/read");
+                          navigate("/inference/playground/read");
                         }}
                       >
                         <ScanLine className="size-4" />
@@ -699,14 +699,14 @@ export function AppSidebar({
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       asChild
-                      isActive={location.pathname === "/playground/transcribe"}
+                      isActive={location.pathname === "/inference/playground/transcribe"}
                       tooltip="Transcribe"
                     >
                       <a
-                        href="/playground/transcribe"
+                        href="/inference/playground/transcribe"
                         onClick={(e) => {
                           e.preventDefault();
-                          navigate("/playground/transcribe");
+                          navigate("/inference/playground/transcribe");
                         }}
                       >
                         <Mic className="size-4" />

@@ -32,7 +32,7 @@ jobs:
           submodules: true
 
       - name: Initialize submodules
-        run: git submodule update --init termite
+        run: git submodule update --init zig/deps/snowball
 
       - name: Authenticate to Google Cloud
         id: auth

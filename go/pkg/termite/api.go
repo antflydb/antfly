@@ -14,7 +14,7 @@
 
 //go:build go1.22
 
-//go:generate go tool oapi-codegen --config=cfg.yaml ./openapi.yaml
+//go:generate go tool oapi-codegen --config=cfg.yaml ../../../specs/openapi/inference/config.yaml
 package termite
 
 import (
@@ -30,17 +30,18 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"net/http"
-	"runtime"
 	"slices"
 	"strings"
 	"time"
 
+	generatingtypes "github.com/antflydb/antfly/go/pkg/generating"
 	"github.com/antflydb/antfly/go/pkg/libaf/ai"
 	"github.com/antflydb/antfly/go/pkg/libaf/chunking"
 	"github.com/antflydb/antfly/go/pkg/libaf/embeddings"
 	json "github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/libaf/s3"
 	"github.com/antflydb/antfly/go/pkg/libaf/scraping"
+	"github.com/antflydb/antfly/go/pkg/termite/lib/backends"
 	termchunking "github.com/antflydb/antfly/go/pkg/termite/lib/chunking"
 	"github.com/antflydb/antfly/go/pkg/termite/lib/classification"
 	"github.com/antflydb/antfly/go/pkg/termite/lib/generation"
@@ -67,7 +68,7 @@ func NewTermiteAPI(logger *zap.Logger, node *TermiteNode) http.Handler {
 		node:   node,
 	}
 	return HandlerWithOptions(api, StdHTTPServerOptions{
-		BaseURL:    "/ml/v1",
+		BaseURL:    "/ai/v1",
 		BaseRouter: http.NewServeMux(),
 	})
 }
@@ -85,6 +86,16 @@ func (t *TermiteAPI) ChunkText(w http.ResponseWriter, r *http.Request) {
 // RerankPrompts implements ServerInterface
 func (t *TermiteAPI) RerankPrompts(w http.ResponseWriter, r *http.Request) {
 	t.node.handleApiRerank(w, r)
+}
+
+// ClassifyText implements ServerInterface
+func (t *TermiteAPI) ClassifyText(w http.ResponseWriter, r *http.Request) {
+	t.node.handleApiClassify(w, r)
+}
+
+// RecognizeEntities implements ServerInterface
+func (t *TermiteAPI) RecognizeEntities(w http.ResponseWriter, r *http.Request) {
+	t.node.handleApiRecognize(w, r)
 }
 
 // GenerateContent implements ServerInterface
@@ -141,19 +152,55 @@ func capsMapToModelInfoMap(caps map[string][]string) map[string]ModelInfo {
 	return m
 }
 
+func backendRuntimesFromAvailable() BackendRuntimes {
+	var runtimes BackendRuntimes
+	for _, backend := range backends.ListAvailable() {
+		switch backend.Type() {
+		case backends.BackendONNX:
+			runtimes.Onnx = true
+		case backends.BackendXLA:
+			runtimes.Xla = true
+		case backends.BackendCoreML:
+			runtimes.Metal = true
+		}
+	}
+	return runtimes
+}
+
+func appendOpenAIModelData(data []map[string]interface{}, names map[string]ModelInfo, seen map[string]struct{}) []map[string]interface{} {
+	created := time.Now().Unix()
+	for name := range names {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		data = append(data, map[string]interface{}{
+			"id":       name,
+			"object":   "model",
+			"created":  created,
+			"owned_by": "antfly-inference",
+		})
+	}
+	return data
+}
+
 // ListModels implements ServerInterface
 func (t *TermiteAPI) ListModels(w http.ResponseWriter, r *http.Request) {
 	resp := ModelsResponse{
-		Chunkers:     map[string]ModelInfo{},
-		Rerankers:    map[string]ModelInfo{},
-		Embedders:    map[string]ModelInfo{},
-		Generators:   map[string]ModelInfo{},
-		Recognizers:  map[string]ModelInfo{},
-		Extractors:   map[string]ModelInfo{},
-		Rewriters:    map[string]ModelInfo{},
-		Classifiers:  map[string]ModelInfo{},
-		Readers:      map[string]ModelInfo{},
-		Transcribers: map[string]ModelInfo{},
+		Object:         ModelsResponseObjectList,
+		Data:           []map[string]interface{}{},
+		AllowDownloads: t.node.allowDownloads,
+		Backends:       backendRuntimesFromAvailable(),
+		Chunkers:       map[string]ModelInfo{},
+		Rerankers:      map[string]ModelInfo{},
+		Embedders:      map[string]ModelInfo{},
+		Generators:     map[string]ModelInfo{},
+		Recognizers:    map[string]ModelInfo{},
+		Extractors:     map[string]ModelInfo{},
+		Rewriters:      map[string]ModelInfo{},
+		Classifiers:    map[string]ModelInfo{},
+		Readers:        map[string]ModelInfo{},
+		Transcribers:   map[string]ModelInfo{},
 	}
 
 	if t.node.chunker != nil {
@@ -205,23 +252,9 @@ func (t *TermiteAPI) ListModels(w http.ResponseWriter, r *http.Request) {
 		resp.Transcribers = stringsToModelInfoMap(t.node.transcriberRegistry.List())
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		t.logger.Error("encoding response", zap.Error(err))
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
-// GetVersion implements ServerInterface
-func (t *TermiteAPI) GetVersion(w http.ResponseWriter, r *http.Request) {
-	resp := VersionResponse{
-		Version:        Version,
-		GitCommit:      GitCommit,
-		BuildTime:      BuildTime,
-		GoVersion:      runtime.Version(),
-		AllowDownloads: t.node.allowDownloads,
-	}
+	seenOpenAIModels := map[string]struct{}{}
+	resp.Data = appendOpenAIModelData(resp.Data, resp.Embedders, seenOpenAIModels)
+	resp.Data = appendOpenAIModelData(resp.Data, resp.Generators, seenOpenAIModels)
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
@@ -497,17 +530,6 @@ func parseEmbedInput(
 
 			// Try inline media content - check Type field
 			if mediaPart, err := part.AsMediaContentPart(); err == nil && mediaPart.Type == MediaContentPartTypeMedia {
-				if mediaPart.Url != "" {
-					mimeType, data, err := scraping.DownloadContent(ctx, mediaPart.Url, securityConfig, s3Creds)
-					if err != nil {
-						return nil, fmt.Errorf("downloading media at index %d: %w", i, err)
-					}
-					contents[i] = []ai.ContentPart{ai.BinaryContent{
-						MIMEType: mimeType,
-						Data:     data,
-					}}
-					continue
-				}
 				contents[i] = []ai.ContentPart{ai.BinaryContent{
 					MIMEType: mediaPart.MimeType,
 					Data:     mediaPart.Data,
@@ -672,14 +694,6 @@ func (ln *TermiteNode) handleApiChunk(w http.ResponseWriter, r *http.Request) {
 				if mediaPart, err := part.AsMediaContentPart(); err == nil && mediaPart.Type == MediaContentPartTypeMedia {
 					data := mediaPart.Data
 					mimeType := mediaPart.MimeType
-					if mediaPart.Url != "" {
-						mimeType, data, err = scraping.DownloadContent(ctx, mediaPart.Url, ln.contentSecurityConfig, ln.s3Credentials)
-						if err != nil {
-							ln.logger.Error("media download failed", zap.Error(err))
-							http.Error(w, fmt.Sprintf("downloading media: %v", err), http.StatusBadRequest)
-							return
-						}
-					}
 					chunks, err = ln.chunkMedia(ctx, data, mimeType, internalConfig.Model, mediaOpts)
 					if err != nil {
 						ln.logger.Error("media chunking failed", zap.Error(err))
@@ -1384,13 +1398,13 @@ func convertChatMessage(msg ChatMessage) generation.Message {
 }
 
 func mediaPartImageURL(part MediaContentPart) string {
-	if part.Url != "" {
-		if part.MimeType == "" || strings.HasPrefix(part.MimeType, "image/") || strings.HasPrefix(part.Url, "data:image/") {
-			return part.Url
-		}
+	if !strings.HasPrefix(part.MimeType, "image/") {
 		return ""
 	}
-	if len(part.Data) == 0 || !strings.HasPrefix(part.MimeType, "image/") {
+	if part.Url != "" {
+		return part.Url
+	}
+	if len(part.Data) == 0 {
 		return ""
 	}
 	return "data:" + part.MimeType + ";base64," + base64.StdEncoding.EncodeToString(part.Data)
@@ -1638,12 +1652,12 @@ func (ln *TermiteNode) handleApiGenerate(w http.ResponseWriter, r *http.Request)
 			respMessage.Content = responseText
 		}
 		// Convert internal tool calls to API format
-		apiToolCalls := make([]ToolCall, len(toolCalls))
+		apiToolCalls := make([]generatingtypes.ToolCall, len(toolCalls))
 		for i, tc := range toolCalls {
-			apiToolCalls[i] = ToolCall{
+			apiToolCalls[i] = generatingtypes.ToolCall{
 				Id:   tc.ID,
-				Type: ToolCallType(tc.Type),
-				Function: ToolCallFunction{
+				Type: generatingtypes.ToolCallType(tc.Type),
+				Function: generatingtypes.ToolCallFunction{
 					Name:      tc.Function.Name,
 					Arguments: tc.Function.Arguments,
 				},

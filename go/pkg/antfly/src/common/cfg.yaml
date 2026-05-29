@@ -11,13 +11,13 @@ output-options:
   prefer-skip-optional-pointer: true
   prefer-skip-optional-pointer-with-omitzero: true
 import-mapping:
-  ../../lib/middleware/openapi.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/middleware
-  ../../lib/embeddings/openapi.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/embeddings
-  ../../lib/ai/openapi.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/ai
-  ../../../generating/openapi.yaml: github.com/antflydb/antfly/go/pkg/generating
-  ../../lib/audio/openapi.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/audio
-  ../../lib/reranking/openapi.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/reranking
-  ../../lib/chunking/openapi.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/chunking
-  ../../../libaf/logging/openapi.yaml: github.com/antflydb/antfly/go/pkg/libaf/logging
-  ../../../libaf/scraping/openapi.yaml: github.com/antflydb/antfly/go/pkg/libaf/scraping
-  ../../../termite/openapi.yaml: github.com/antflydb/antfly/go/pkg/termite
+  ../../../go/pkg/antfly/lib/middleware/openapi.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/middleware
+  embeddings.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/embeddings
+  generating.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/ai
+  ../shared/generating.yaml: github.com/antflydb/antfly/go/pkg/generating
+  audio.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/audio
+  reranking.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/reranking
+  chunking.yaml: github.com/antflydb/antfly/go/pkg/antfly/lib/chunking
+  ../shared/logging.yaml: github.com/antflydb/antfly/go/pkg/libaf/logging
+  ../shared/scraping.yaml: github.com/antflydb/antfly/go/pkg/libaf/scraping
+  ../inference/config.yaml: github.com/antflydb/antfly/go/pkg/termite

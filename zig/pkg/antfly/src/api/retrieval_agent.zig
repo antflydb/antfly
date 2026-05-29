@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const ai_openapi = @import("antfly_ai_openapi");
+const generating_api_openapi = @import("antfly_generating_api_openapi");
 const eval_openapi = @import("antfly_eval_openapi");
 const generating_openapi = @import("antfly_generating_openapi");
 const indexes_openapi = @import("antfly_indexes_openapi");
@@ -233,7 +233,7 @@ const LiveEmitter = struct {
         }
     }
 
-    fn emitClassification(self: *LiveEmitter, classification: ai_openapi.ClassificationTransformationResult) !void {
+    fn emitClassification(self: *LiveEmitter, classification: generating_api_openapi.ClassificationTransformationResult) !void {
         try self.emitValue("classification", classification);
         if (classification.reasoning) |reasoning| try self.emitTextChunks("reasoning", reasoning);
         if (classification.sub_questions) |sub_questions| {
@@ -474,7 +474,7 @@ fn executeInternal(
     const clarification_state = try parseClarificationState(request);
     var steps_list = std.ArrayListUnmanaged(AgentStep).empty;
     defer steps_list.deinit(arena);
-    const classification_result: ?ai_openapi.ClassificationTransformationResult = if (classification_cfg) |cfg|
+    const classification_result: ?generating_api_openapi.ClassificationTransformationResult = if (classification_cfg) |cfg|
         try buildClassificationResult(arena, request.query, cfg)
     else if (agentic_mode)
         try buildClassificationResult(arena, request.query, .{
@@ -1365,8 +1365,8 @@ const ParsedGenerationConfig = struct {
 };
 
 const ParsedClassificationConfig = struct {
-    force_strategy: ?ai_openapi.QueryStrategy,
-    force_semantic_mode: ?ai_openapi.SemanticQueryMode,
+    force_strategy: ?generating_api_openapi.QueryStrategy,
+    force_semantic_mode: ?generating_api_openapi.SemanticQueryMode,
     with_reasoning: bool,
 };
 
@@ -1556,7 +1556,7 @@ fn buildTreeExpansionStepDetails(
 
 fn buildSelectStrategyAction(
     alloc: std.mem.Allocator,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_queries: []const RetrievalQueryRequest,
     selected_query_indices: []const usize,
 ) ![]const u8 {
@@ -1576,7 +1576,7 @@ fn buildSelectStrategyStepDetails(
     alloc: std.mem.Allocator,
     retrieval_queries: []const RetrievalQueryRequest,
     selected_query_indices: []const usize,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     source: AgenticSelectionSource,
     candidate_scores: []const AgenticCandidateScore,
     broadened_from_decision: bool,
@@ -1654,7 +1654,7 @@ fn buildEvaluationRefineQueryStepDetails(
     alloc: std.mem.Allocator,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
-    classification: ai_openapi.ClassificationTransformationResult,
+    classification: generating_api_openapi.ClassificationTransformationResult,
     refined_query: []const u8,
 ) !std.json.Value {
     var obj = std.json.ObjectMap.empty;
@@ -1968,7 +1968,7 @@ fn buildInitialRefineQueryStepDetails(
     alloc: std.mem.Allocator,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
-    classification: ai_openapi.ClassificationTransformationResult,
+    classification: generating_api_openapi.ClassificationTransformationResult,
     refined_query: []const u8,
 ) !std.json.Value {
     var obj = std.json.ObjectMap.empty;
@@ -2170,7 +2170,7 @@ fn parseConfidenceEnabled(request: RetrievalAgentRequest, has_generation: bool) 
 fn buildGenerationChain(
     alloc: std.mem.Allocator,
     request: RetrievalAgentRequest,
-    generation: ai_openapi.GenerationStepConfig,
+    generation: generating_api_openapi.GenerationStepConfig,
 ) ![]const generating.ChainLink {
     var links = std.ArrayListUnmanaged(generating.ChainLink).empty;
     errdefer links.deinit(alloc);
@@ -2188,7 +2188,7 @@ fn buildGenerationChain(
     return try links.toOwnedSlice(alloc);
 }
 
-fn generationStepFromPublic(generation: ai_openapi.GenerationStepConfig) ai_openapi.GenerationStepConfig {
+fn generationStepFromPublic(generation: generating_api_openapi.GenerationStepConfig) generating_api_openapi.GenerationStepConfig {
     return .{
         .enabled = generation.enabled,
         .generator = if (generation.generator) |cfg| publicGeneratorConfigToGenerated(cfg) else null,
@@ -2210,7 +2210,6 @@ fn publicGeneratorConfigToGenerated(cfg: generating_openapi.GeneratorConfig) gen
             .bedrock => .bedrock,
             .anthropic => .anthropic,
             .cohere => .cohere,
-            .termite => .termite,
             .antfly => .antfly,
             .mock => .mock,
         },
@@ -2235,14 +2234,12 @@ fn generatorConfigFromGenerated(cfg: generating_openapi.GeneratorConfig) !genera
         .vertex => .vertex,
         .openai => .openai,
         .ollama => .ollama,
-        .termite => .termite,
         .antfly => .antfly,
         else => return error.UnsupportedRetrievalAgentRequest,
     };
     const model = cfg.model orelse return error.InvalidRetrievalAgentRequest;
     const url = switch (provider) {
-        .termite => cfg.api_url orelse "",
-        .antfly => "",
+        .antfly => cfg.api_url orelse "",
         .gemini, .vertex => cfg.url orelse "",
         .openai, .ollama => cfg.url orelse return error.InvalidRetrievalAgentRequest,
         else => return error.UnsupportedRetrievalAgentRequest,
@@ -3209,8 +3206,8 @@ fn buildClassificationResult(
     alloc: std.mem.Allocator,
     query: []const u8,
     cfg: ParsedClassificationConfig,
-) !ai_openapi.ClassificationTransformationResult {
-    const route_type: ai_openapi.RouteType = if (isQuestionLike(query)) .question else .search;
+) !generating_api_openapi.ClassificationTransformationResult {
+    const route_type: generating_api_openapi.RouteType = if (isQuestionLike(query)) .question else .search;
     const strategy = cfg.force_strategy orelse inferClassificationStrategy(query);
     const semantic_mode = cfg.force_semantic_mode orelse inferSemanticMode(strategy);
     const improved_query = try buildImprovedQuery(alloc, query, route_type, strategy);
@@ -3240,14 +3237,14 @@ fn buildClassificationResult(
     };
 }
 
-fn inferClassificationStrategy(query: []const u8) ai_openapi.QueryStrategy {
+fn inferClassificationStrategy(query: []const u8) generating_api_openapi.QueryStrategy {
     if (containsAnyIgnoreCase(query, &.{ " and ", "compare", "versus", " vs ", "difference between" })) return .decompose;
     if (containsAnyIgnoreCase(query, &.{ "how does", "why does", "architecture", "workflow", "background" })) return .step_back;
     if (containsAnyIgnoreCase(query, &.{ "overview", "benefits", "tradeoffs", "concept", "summarize" })) return .hyde;
     return .simple;
 }
 
-fn inferSemanticMode(strategy: ai_openapi.QueryStrategy) ai_openapi.SemanticQueryMode {
+fn inferSemanticMode(strategy: generating_api_openapi.QueryStrategy) generating_api_openapi.SemanticQueryMode {
     return switch (strategy) {
         .hyde => .hypothetical,
         .simple, .decompose, .step_back => .rewrite,
@@ -3257,8 +3254,8 @@ fn inferSemanticMode(strategy: ai_openapi.QueryStrategy) ai_openapi.SemanticQuer
 fn buildImprovedQuery(
     alloc: std.mem.Allocator,
     query: []const u8,
-    route_type: ai_openapi.RouteType,
-    strategy: ai_openapi.QueryStrategy,
+    route_type: generating_api_openapi.RouteType,
+    strategy: generating_api_openapi.QueryStrategy,
 ) ![]const u8 {
     const route_hint = switch (route_type) {
         .question => "Question",
@@ -3274,8 +3271,8 @@ fn buildImprovedQuery(
 fn buildSemanticQuery(
     alloc: std.mem.Allocator,
     query: []const u8,
-    strategy: ai_openapi.QueryStrategy,
-    semantic_mode: ai_openapi.SemanticQueryMode,
+    strategy: generating_api_openapi.QueryStrategy,
+    semantic_mode: generating_api_openapi.SemanticQueryMode,
 ) ![]const u8 {
     return switch (semantic_mode) {
         .rewrite => switch (strategy) {
@@ -3318,7 +3315,7 @@ fn buildSubQuestions(alloc: std.mem.Allocator, query: []const u8) ![]const []con
 fn buildMultiPhrases(
     alloc: std.mem.Allocator,
     query: []const u8,
-    route_type: ai_openapi.RouteType,
+    route_type: generating_api_openapi.RouteType,
 ) ![]const []const u8 {
     const phrases = try alloc.alloc([]const u8, 3);
     phrases[0] = try alloc.dupe(u8, query);
@@ -3330,7 +3327,7 @@ fn buildMultiPhrases(
     return phrases;
 }
 
-fn classificationConfidence(strategy: ai_openapi.QueryStrategy, route_type: ai_openapi.RouteType) f32 {
+fn classificationConfidence(strategy: generating_api_openapi.QueryStrategy, route_type: generating_api_openapi.RouteType) f32 {
     const base: f32 = switch (strategy) {
         .simple => 0.86,
         .decompose => 0.74,
@@ -3754,7 +3751,7 @@ fn maybeProbeAgenticSelection(
     runner: QueryRunner,
     raw_queries: []const std.json.Value,
     retrieval_queries: []const RetrievalQueryRequest,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     selection: AgenticSelection,
 ) !?AgenticSelection {
     const existing_scores = selection.candidate_scores orelse return selection;
@@ -3834,7 +3831,7 @@ fn maybeProbeAgenticSelection(
 
 fn detectAgenticEvaluationTrigger(
     query: []const u8,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     attempted_strategy: RetrievalStrategy,
     attempt_summary: AttemptEvaluationSummary,
     candidate_scores: []const AgenticCandidateScore,
@@ -3886,7 +3883,7 @@ fn planNextAgenticFallback(
     runner: QueryRunner,
     raw_queries: []const std.json.Value,
     retrieval_queries: []const RetrievalQueryRequest,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     candidate_scores: []const AgenticCandidateScore,
     attempted_query_indices: []const bool,
 ) !?AgenticFallbackPlan {
@@ -3914,7 +3911,7 @@ fn probeAgenticFallbackCandidates(
     runner: QueryRunner,
     raw_queries: []const std.json.Value,
     retrieval_queries: []const RetrievalQueryRequest,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     candidate_scores: []const AgenticCandidateScore,
     attempted_query_indices: []const bool,
 ) ![]const AgenticCandidateScore {
@@ -4478,7 +4475,7 @@ fn compareProbeCandidate(lhs: AgenticCandidateScore, rhs: AgenticCandidateScore)
 }
 
 fn queryTextForProbe(
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
 ) []const u8 {
     if (classification_result) |classification| {
@@ -4509,7 +4506,7 @@ fn extractQueryString(value: std.json.Value) ?[]const u8 {
     };
 }
 
-fn preferredAgenticQueryStrategy(request: RetrievalAgentRequest) ai_openapi.QueryStrategy {
+fn preferredAgenticQueryStrategy(request: RetrievalAgentRequest) generating_api_openapi.QueryStrategy {
     if (request.steps) |steps| {
         if (steps.classification) |classification| {
             if (classification.force_strategy) |strategy| return strategy;
@@ -4554,7 +4551,7 @@ fn buildAgenticCandidateScores(
     alloc: std.mem.Allocator,
     query: []const u8,
     retrieval_queries: []const RetrievalQueryRequest,
-    preferred_strategy: ai_openapi.QueryStrategy,
+    preferred_strategy: generating_api_openapi.QueryStrategy,
 ) ![]const AgenticCandidateScore {
     const out = try alloc.alloc(AgenticCandidateScore, retrieval_queries.len);
     for (retrieval_queries, out, 0..) |retrieval_query, *slot, i| {
@@ -4697,7 +4694,7 @@ fn collectRemainingCandidateIndices(
 fn scoreAgenticQueryCandidate(
     query: []const u8,
     retrieval_query: RetrievalQueryRequest,
-    preferred_strategy: ai_openapi.QueryStrategy,
+    preferred_strategy: generating_api_openapi.QueryStrategy,
 ) i32 {
     const strategy = detectStrategy(retrieval_query);
     var score: i32 = switch (strategy) {
@@ -5109,7 +5106,7 @@ fn encodeQueryValueForRetrievalQuery(
     value: std.json.Value,
     retrieval_query: RetrievalQueryRequest,
     previous_query_hits: []const QueryHit,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query_index: usize,
     refinement_pass: QueryRefinementPass,
 ) ![]u8 {
@@ -5145,7 +5142,7 @@ fn encodeQueryValueForRetrievalQuery(
 
 fn applyClassificationRefinement(
     query_request: *QueryRequest,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query_index: usize,
     refinement_pass: QueryRefinementPass,
 ) void {
@@ -5167,7 +5164,7 @@ fn applyClassificationRefinement(
 }
 
 fn selectRefinedQueryText(
-    classification: ai_openapi.ClassificationTransformationResult,
+    classification: generating_api_openapi.ClassificationTransformationResult,
     retrieval_query_index: usize,
     refinement_pass: QueryRefinementPass,
 ) ?[]const u8 {
@@ -5198,7 +5195,7 @@ fn selectRefinedQueryText(
 }
 
 fn selectEvaluationQueryText(
-    classification: ai_openapi.ClassificationTransformationResult,
+    classification: generating_api_openapi.ClassificationTransformationResult,
     current_refined: []const u8,
 ) ?[]const u8 {
     if (classification.multi_phrases) |multi_phrases| {
@@ -5212,7 +5209,7 @@ fn selectEvaluationQueryText(
 }
 
 fn initialRefinedQueryText(
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
 ) ?[]const u8 {
@@ -5247,7 +5244,7 @@ fn containsUsedQueryText(
 }
 
 fn nextEvaluationRefinedQueryText(
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
     used_queries: []const []const u8,
@@ -5281,7 +5278,7 @@ fn shouldRunStepBackFollowup(
     agentic_mode: bool,
     max_internal_iterations: i64,
     tool_calls_made: i64,
-    classification_result: ?ai_openapi.ClassificationTransformationResult,
+    classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
 ) bool {
     if (!agentic_mode) return false;
@@ -5974,7 +5971,7 @@ test "build generation messages includes tree hierarchy context" {
     }, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "local-generator",
                 .url = "http://127.0.0.1:8082",
             } },
@@ -6064,7 +6061,7 @@ test "generation messages keep only the strongest tree branches" {
     }, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "local-generator",
                 .url = "http://127.0.0.1:8082",
             } },
@@ -6121,7 +6118,7 @@ test "generation messages prefer query-relevant tree branches" {
     }, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "local-generator",
                 .url = "http://127.0.0.1:8082",
             } },
@@ -6174,7 +6171,7 @@ test "generation messages trim branch context after ancestor-first limit" {
     const messages = try buildGenerationMessages(alloc, "trim the branch", hits.items, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "local-generator",
                 .url = "http://127.0.0.1:8082",
             } },
@@ -6229,7 +6226,7 @@ test "generation messages expand branch when deeper node is query-relevant" {
     const messages = try buildGenerationMessages(alloc, "payments rollout", hits.items, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "local-generator",
                 .url = "http://127.0.0.1:8082",
             } },
@@ -6298,7 +6295,7 @@ test "generation messages can expand to a deeply relevant descendant" {
     const messages = try buildGenerationMessages(alloc, "revenue forecast", hits.items, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
-                .provider = .termite,
+                .provider = .antfly,
                 .model = "local-generator",
                 .url = "http://127.0.0.1:8082",
             } },
@@ -6494,7 +6491,7 @@ test "attempt evaluation summary includes top tree branch quality" {
 }
 
 test "retrieval agent can select multiple evaluation refinement phrases" {
-    const classification = ai_openapi.ClassificationTransformationResult{
+    const classification = generating_api_openapi.ClassificationTransformationResult{
         .route_type = .question,
         .strategy = .simple,
         .improved_query = "improved architecture query",
@@ -6765,7 +6762,7 @@ test "retrieval agent supports bounded agentic mode" {
     };
 
     const body =
-        \\{"query":"How does Raft work?","stream":false,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"max_internal_iterations":3,"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"How does Raft work?","stream":false,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"max_internal_iterations":3,"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
     ;
     var runner = FakeRunner{};
     const encoded = try executeJson(std.testing.allocator, runner.ifaceWithState(), null, body);
@@ -6813,7 +6810,7 @@ test "retrieval agent agentic streaming emits tool mode" {
     };
 
     const body =
-        \\{"query":"How does Raft work?","stream":true,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"max_internal_iterations":3,"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"How does Raft work?","stream":true,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"max_internal_iterations":3,"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
     ;
     var runner = FakeRunner{};
     const encoded = try execute(std.testing.allocator, runner.ifaceWithState(), null, body);
@@ -7592,7 +7589,7 @@ test "retrieval agent agentic mode uses multiple tools for decompose queries" {
     try std.testing.expectEqual(@as(usize, 2), runner.call_count);
     try std.testing.expectEqual(@as(i64, 2), parsed.value.tool_calls_made.?);
     try std.testing.expectEqual(RetrievalStrategy.hybrid, parsed.value.strategy_used.?);
-    try std.testing.expectEqual(ai_openapi.QueryStrategy.decompose, parsed.value.classification.?.strategy);
+    try std.testing.expectEqual(generating_api_openapi.QueryStrategy.decompose, parsed.value.classification.?.strategy);
 }
 
 test "retrieval agent refines decompose queries before execution" {
@@ -7893,7 +7890,7 @@ test "retrieval agent supports generation step in phase 2" {
     };
 
     const body =
-        \\{"query":"find alpha","stream":false,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"find alpha","stream":false,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body);
     defer std.testing.allocator.free(encoded);
@@ -7993,7 +7990,7 @@ test "retrieval agent supports classification confidence and followup" {
     };
 
     const body =
-        \\{"query":"How does retrieval work?","stream":false,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"classification":{"enabled":true,"with_reasoning":true},"generation":{"enabled":true},"confidence":{"enabled":true},"followup":{"enabled":true,"count":3}},"queries":[{"table":"docs","semantic_search":"retrieval docs","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"How does retrieval work?","stream":false,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"classification":{"enabled":true,"with_reasoning":true},"generation":{"enabled":true},"confidence":{"enabled":true},"followup":{"enabled":true,"count":3}},"queries":[{"table":"docs","semantic_search":"retrieval docs","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body);
     defer std.testing.allocator.free(encoded);
@@ -8001,8 +7998,8 @@ test "retrieval agent supports classification confidence and followup" {
     var parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.classification != null);
-    try std.testing.expectEqual(ai_openapi.RouteType.question, parsed.value.classification.?.route_type);
-    try std.testing.expectEqual(ai_openapi.QueryStrategy.step_back, parsed.value.classification.?.strategy);
+    try std.testing.expectEqual(generating_api_openapi.RouteType.question, parsed.value.classification.?.route_type);
+    try std.testing.expectEqual(generating_api_openapi.QueryStrategy.step_back, parsed.value.classification.?.strategy);
     try std.testing.expect(parsed.value.classification.?.step_back_query != null);
     try std.testing.expect(parsed.value.classification.?.multi_phrases != null);
     try std.testing.expect(parsed.value.classification.?.reasoning != null);
@@ -8042,7 +8039,7 @@ test "retrieval agent supports inline eval" {
     };
 
     const body =
-        \\{"query":"Explain raft consensus in Antfly","stream":false,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true},"eval":{"evaluators":["relevance","faithfulness","precision","recall"],"judge":{"provider":"termite","model":"judge","api_url":"http://127.0.0.1:8082"},"ground_truth":{"relevant_ids":["doc:a"],"expectations":"raft consensus leader follower log replication"}}},"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"Explain raft consensus in Antfly","stream":false,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true},"eval":{"evaluators":["relevance","faithfulness","precision","recall"],"judge":{"provider":"antfly","model":"judge","api_url":"http://127.0.0.1:8082"},"ground_truth":{"relevant_ids":["doc:a"],"expectations":"raft consensus leader follower log replication"}}},"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body);
     defer std.testing.allocator.free(encoded);
@@ -8074,7 +8071,7 @@ test "retrieval agent classification can decompose multi-part queries" {
     };
 
     const body =
-        \\{"query":"Compare raft consensus and termite embeddings","stream":false,"steps":{"classification":{"enabled":true,"with_reasoning":true}},"queries":[{"table":"docs","full_text_search":{"query":"body:raft"},"limit":5}]}
+        \\{"query":"Compare raft consensus and Antfly embeddings","stream":false,"steps":{"classification":{"enabled":true,"with_reasoning":true}},"queries":[{"table":"docs","full_text_search":{"query":"body:raft"},"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, FakeRunner.iface(), null, body);
     defer std.testing.allocator.free(encoded);
@@ -8082,7 +8079,7 @@ test "retrieval agent classification can decompose multi-part queries" {
     var parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.classification != null);
-    try std.testing.expectEqual(ai_openapi.QueryStrategy.decompose, parsed.value.classification.?.strategy);
+    try std.testing.expectEqual(generating_api_openapi.QueryStrategy.decompose, parsed.value.classification.?.strategy);
     try std.testing.expect(parsed.value.classification.?.sub_questions != null);
     try std.testing.expect(parsed.value.classification.?.sub_questions.?.len >= 2);
 }
@@ -8122,7 +8119,7 @@ test "retrieval agent supports fixed-body sse streaming" {
     };
 
     const body =
-        \\{"query":"find alpha","stream":true,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"find alpha","stream":true,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try execute(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body);
     defer std.testing.allocator.free(encoded.body);
@@ -8180,7 +8177,7 @@ test "retrieval agent sse emits followup events" {
     };
 
     const body =
-        \\{"query":"How does retrieval work?","stream":true,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true},"followup":{"enabled":true,"count":2}},"queries":[{"table":"docs","semantic_search":"retrieval docs","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"How does retrieval work?","stream":true,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true},"followup":{"enabled":true,"count":2}},"queries":[{"table":"docs","semantic_search":"retrieval docs","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try execute(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body);
     defer std.testing.allocator.free(encoded.body);
@@ -8220,7 +8217,7 @@ test "retrieval agent sse emits eval events" {
     };
 
     const body =
-        \\{"query":"Explain raft consensus in Antfly","stream":true,"generator":{"provider":"termite","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true},"eval":{"evaluators":["relevance","faithfulness"],"ground_truth":{"expectations":"raft consensus"}}},"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
+        \\{"query":"Explain raft consensus in Antfly","stream":true,"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true},"eval":{"evaluators":["relevance","faithfulness"],"ground_truth":{"expectations":"raft consensus"}}},"queries":[{"table":"docs","semantic_search":"raft consensus","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try execute(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body);
     defer std.testing.allocator.free(encoded.body);

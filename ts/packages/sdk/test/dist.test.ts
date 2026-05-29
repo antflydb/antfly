@@ -15,10 +15,10 @@ describe.skipIf(!hasBuild)("CJS dist bundle", () => {
 
   it("instantiates CJS clients without throwing", () => {
     const req = createRequire(import.meta.url);
-    const { AntflyClient, TermiteClient } = req(cjsPath);
+    const { AntflyClient, InferenceClient } = req(cjsPath);
 
     expect(() => new AntflyClient({ baseUrl: "http://localhost" })).not.toThrow();
-    expect(() => new TermiteClient({ baseUrl: "http://localhost" })).not.toThrow();
+    expect(() => new InferenceClient({ baseUrl: "http://localhost" })).not.toThrow();
   });
 });
 

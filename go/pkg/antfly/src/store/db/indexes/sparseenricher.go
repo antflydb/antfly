@@ -107,7 +107,7 @@ func NewSparseEmbeddingEnricher(
 	byteRange types.Range,
 ) *SparseEmbeddingEnricher {
 	// If the sparse embedder also implements the full Embedder interface
-	// (e.g. TermiteClient), use its rate limiter. Otherwise no rate limit.
+	// (e.g. InferenceClient), use its rate limiter. Otherwise no rate limit.
 	var limiter *rate.Limiter
 	if e, ok := embedder.(embeddings.Embedder); ok {
 		limiter = resolveRateLimiter(e)

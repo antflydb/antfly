@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
-	termiteoapi "github.com/antflydb/antfly/go/pkg/sdk/oapi"
+	inferenceoapi "github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
@@ -116,7 +116,7 @@ func createTestZip(t *testing.T, files map[string][]byte) string {
 }
 
 func TestCreateEmbeddingIndexUsesAntflyClipClap(t *testing.T) {
-	idx, err := createEmbeddingIndex(DefaultEmbeddingModel, DefaultTermiteURL, DefaultChunkerModel, 512, 50)
+	idx, err := createEmbeddingIndex(DefaultEmbeddingModel, DefaultInferenceURL, DefaultChunkerModel, 512, 50)
 	if err != nil {
 		t.Fatalf("createEmbeddingIndex failed: %v", err)
 	}
@@ -133,52 +133,52 @@ func TestCreateEmbeddingIndexUsesAntflyClipClap(t *testing.T) {
 	if cfg.Embedder.Provider != antfly.EmbedderProviderAntfly {
 		t.Fatalf("embedder provider = %q, want %q", cfg.Embedder.Provider, antfly.EmbedderProviderAntfly)
 	}
-	if embedder["model"] != DefaultEmbeddingModel {
-		t.Fatalf("embedder model = %q, want %q", embedder["model"], DefaultEmbeddingModel)
+	if embedder.Model != DefaultEmbeddingModel {
+		t.Fatalf("embedder model = %q, want %q", embedder.Model, DefaultEmbeddingModel)
 	}
 
-	chunker, err := cfg.Chunker.AsTermiteChunkerConfig()
+	chunker, err := cfg.Chunker.AsAntflyChunkerConfig()
 	if err != nil {
-		t.Fatalf("AsTermiteChunkerConfig failed: %v", err)
+		t.Fatalf("AsAntflyChunkerConfig failed: %v", err)
 	}
-	wantChunkerURL := DefaultTermiteURL + "/ml/v1"
+	wantChunkerURL := DefaultInferenceURL + "/ai/v1"
 	if chunker.ApiUrl != wantChunkerURL {
 		t.Fatalf("chunker api URL = %q, want %q", chunker.ApiUrl, wantChunkerURL)
 	}
 }
 
-func TestTermiteMLBaseURLNormalizesRoots(t *testing.T) {
+func TestInferenceMLBaseURLNormalizesRoots(t *testing.T) {
 	tests := []struct {
 		name string
 		in   string
 		want string
 	}{
-		{name: "root", in: "http://localhost:8080", want: "http://localhost:8080/ml/v1"},
-		{name: "api root", in: "http://localhost:8080/api/v1", want: "http://localhost:8080/ml/v1"},
-		{name: "already ml", in: "http://localhost:8080/ml/v1/", want: "http://localhost:8080/ml/v1"},
-		{name: "cloud root", in: "https://platform.antfly.io/cloud/v1/instance", want: "https://platform.antfly.io/cloud/v1/instance/ml/v1"},
+		{name: "root", in: "http://localhost:8080", want: "http://localhost:8080/ai/v1"},
+		{name: "api root", in: "http://localhost:8080/db/v1", want: "http://localhost:8080/ai/v1"},
+		{name: "already ml", in: "http://localhost:8080/ai/v1/", want: "http://localhost:8080/ai/v1"},
+		{name: "cloud root", in: "https://platform.antfly.io/cloud/v1/instance", want: "https://platform.antfly.io/cloud/v1/instance/ai/v1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := termiteMLBaseURL(tt.in)
+			got, err := inferenceMLBaseURL(tt.in)
 			if err != nil {
-				t.Fatalf("termiteMLBaseURL failed: %v", err)
+				t.Fatalf("inferenceMLBaseURL failed: %v", err)
 			}
 			if got != tt.want {
-				t.Fatalf("termiteMLBaseURL(%q) = %q, want %q", tt.in, got, tt.want)
+				t.Fatalf("inferenceMLBaseURL(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestTermiteMLBaseURLRejectsLegacyAPI(t *testing.T) {
-	if _, err := termiteMLBaseURL("http://localhost:8082/api"); err == nil {
-		t.Fatalf("termiteMLBaseURL accepted legacy /api URL")
+func TestInferenceMLBaseURLRejectsLegacyAPI(t *testing.T) {
+	if _, err := inferenceMLBaseURL("http://localhost:8082/api"); err == nil {
+		t.Fatalf("inferenceMLBaseURL accepted legacy /api URL")
 	}
 }
 
 func TestCreateSearchTableIndexesIncludesQueriedIndexes(t *testing.T) {
-	embeddingIndex, err := createEmbeddingIndex(DefaultEmbeddingModel, DefaultTermiteURL, DefaultChunkerModel, 512, 50)
+	embeddingIndex, err := createEmbeddingIndex(DefaultEmbeddingModel, DefaultInferenceURL, DefaultChunkerModel, 512, 50)
 	if err != nil {
 		t.Fatalf("createEmbeddingIndex failed: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestSplitEntityWindowsRebasesAndOverlaps(t *testing.T) {
 }
 
 func TestOffsetAndDedupeEntities(t *testing.T) {
-	entities := []termiteoapi.TermiteRecognizeEntity{
+	entities := []inferenceoapi.InferenceRecognizeEntity{
 		{Text: "Jane", Label: "person", Start: 2, End: 6, Score: 0.2},
 		{Text: "Jane", Label: "person", Start: 2, End: 6, Score: 0.9},
 	}
@@ -312,9 +312,9 @@ func TestOffsetAndDedupeEntities(t *testing.T) {
 }
 
 func TestDedupeRelationsKeepsHighestScore(t *testing.T) {
-	head := termiteoapi.TermiteRecognizeEntity{Text: "Jane", Label: "person", Start: 12, End: 16}
-	tail := termiteoapi.TermiteRecognizeEntity{Text: "Acme", Label: "organization", Start: 25, End: 29}
-	relations := dedupeRelations([]termiteoapi.TermiteRelation{
+	head := inferenceoapi.InferenceRecognizeEntity{Text: "Jane", Label: "person", Start: 12, End: 16}
+	tail := inferenceoapi.InferenceRecognizeEntity{Text: "Acme", Label: "organization", Start: 25, End: 29}
+	relations := dedupeRelations([]inferenceoapi.InferenceRelation{
 		{Head: head, Tail: tail, Label: "worked for", Score: 0.4},
 		{Head: head, Tail: tail, Label: "worked for", Score: 0.8},
 	})

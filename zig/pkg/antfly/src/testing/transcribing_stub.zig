@@ -18,7 +18,7 @@ const httpx = @import("httpx");
 const Allocator = std.mem.Allocator;
 
 pub const Provider = enum {
-    termite,
+    antfly,
     openai,
     google,
 };
@@ -34,7 +34,7 @@ pub const Config = struct {
     enable_automatic_punctuation: ?bool = null,
     use_enhanced: ?bool = null,
     api_url: ?[]u8 = null,
-    provider: Provider = .termite,
+    provider: Provider = .antfly,
 };
 
 pub const Request = struct {

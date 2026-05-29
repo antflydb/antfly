@@ -6,7 +6,7 @@ import { initializeAntflyClient } from "./utils";
 
 export interface AntflyProps {
   children: ReactNode;
-  url: string; // Base URL only (e.g., http://localhost:8080/api/v1)
+  url: string; // Base URL only (e.g., http://localhost:8080/db/v1)
   table: string; // Required default table for all widgets
   onChange?: (params: Map<string, unknown>) => void;
   headers?: Record<string, string>;

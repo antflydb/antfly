@@ -10,7 +10,6 @@ components:
       type: string
       enum:
         - antfly
-        - termite
         - pioneer
         - openai
         - mock
@@ -43,7 +42,7 @@ components:
         id:
           type: string
         content:
-          $ref: "../ai/messages.yaml#/components/schemas/ChatMessageContent"
+          $ref: "../shared/generating.yaml#/components/schemas/ChatMessageContent"
         tokens:
           type: array
           items:

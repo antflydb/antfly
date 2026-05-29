@@ -403,9 +403,9 @@ pub const Model = struct {
     ) ConvertError!ConvertResult {
         const onnx_graph = self.graph() orelse return error.OutputNotFound;
 
-        var termite_graph = Graph.init(allocator);
-        errdefer termite_graph.deinit();
-        var builder = Builder.init(&termite_graph);
+        var inference_graph = Graph.init(allocator);
+        errdefer inference_graph.deinit();
+        var builder = Builder.init(&inference_graph);
 
         // Memoization: ONNX output name → termite NodeId
         var converted: std.StringHashMapUnmanaged(NodeId) = .empty;
@@ -436,11 +436,11 @@ pub const Model = struct {
                 output.name,
             );
             try output_ids.append(allocator, node_id);
-            try termite_graph.markOutput(node_id);
+            try inference_graph.markOutput(node_id);
         }
 
         return .{
-            .graph = termite_graph,
+            .graph = inference_graph,
             .output_ids = try output_ids.toOwnedSlice(allocator),
             .parameter_names = try param_names.toOwnedSlice(allocator),
         };
@@ -465,9 +465,9 @@ pub const Model = struct {
     ) ConvertError!ConvertResult {
         const onnx_graph = self.graph() orelse return error.OutputNotFound;
 
-        var termite_graph = Graph.init(allocator);
-        errdefer termite_graph.deinit();
-        var builder = Builder.init(&termite_graph);
+        var inference_graph = Graph.init(allocator);
+        errdefer inference_graph.deinit();
+        var builder = Builder.init(&inference_graph);
 
         var converted: std.StringHashMapUnmanaged(NodeId) = .empty;
         defer converted.deinit(allocator);
@@ -501,11 +501,11 @@ pub const Model = struct {
                 output.name,
             );
             try output_ids.append(allocator, node_id);
-            try termite_graph.markOutput(node_id);
+            try inference_graph.markOutput(node_id);
         }
 
         return .{
-            .graph = termite_graph,
+            .graph = inference_graph,
             .output_ids = try output_ids.toOwnedSlice(allocator),
             .parameter_names = try param_names.toOwnedSlice(allocator),
         };

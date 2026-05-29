@@ -12,7 +12,7 @@ for DB-layer storage/query execution boundaries.
 
 The API layer has:
 
-- public `/api/v1/...` request routing and OpenAPI-shaped contracts
+- public `/db/v1/...` request routing and OpenAPI-shaped contracts
 - internal `/internal/v1/...` forwarding for hosted group reads, writes, and
   transaction participant work
 - metadata-backed table and index lifecycle
@@ -30,7 +30,7 @@ runtime behavior stays handwritten in Zig modules.
 
 Boundary rules:
 
-- public product APIs stay under `/api/v1/...`
+- public product APIs stay under `/db/v1/...`
 - internal shard/node routing stays under `/internal/v1/...`
 - generated OpenAPI types shape requests and responses
 - metadata owns topology snapshots, leader routing, and placement visibility

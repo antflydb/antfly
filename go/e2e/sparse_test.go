@@ -66,41 +66,41 @@ func TestE2E_Sparse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// Start swarm with Termite so the SPLADE model is loaded.
-	t.Log("Starting Antfly swarm with Termite...")
+	// Start swarm with Antfly inference so the SPLADE model is loaded.
+	t.Log("Starting Antfly swarm with Antfly inference...")
 	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{})
 	defer swarm.Cleanup()
 
-	termiteURL := GetTermiteURL()
-	require.NotEmpty(t, termiteURL, "Termite URL should be set after swarm start")
+	inferenceURL := GetInferenceURL()
+	require.NotEmpty(t, inferenceURL, "Antfly inference URL should be set after swarm start")
 
 	t.Run("SparseSearch", func(t *testing.T) {
-		testSparseSearch(t, ctx, swarm, termiteURL)
+		testSparseSearch(t, ctx, swarm, inferenceURL)
 	})
 
 	t.Run("HybridSearch", func(t *testing.T) {
-		testHybridSearch(t, ctx, swarm, termiteURL)
+		testHybridSearch(t, ctx, swarm, inferenceURL)
 	})
 
 	t.Run("SparseImport", func(t *testing.T) {
-		testSparseImport(t, ctx, swarm, termiteURL)
+		testSparseImport(t, ctx, swarm, inferenceURL)
 	})
 }
 
 // testSparseSearch creates a table with a sparse_v0 index, inserts documents,
 // waits for SPLADE enrichment, and verifies that sparse search returns
 // semantically relevant results.
-func testSparseSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, termiteURL string) {
+func testSparseSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, inferenceURL string) {
 	t.Helper()
 
 	tableName := "sparse_search_test"
 
-	// -- Create embedder config pointing at the SPLADE model in Termite --
+	// -- Create embedder config pointing at the SPLADE model in Antfly inference --
 	embedderConfig := antfly.EmbedderConfig{}
-	embedderConfig.Provider = antfly.EmbedderProviderTermite
-	err := embedderConfig.FromTermiteEmbedderConfig(antfly.TermiteEmbedderConfig{
+	embedderConfig.Provider = antfly.EmbedderProviderAntfly
+	err := embedderConfig.FromAntflyEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model:  spladeModel,
-		ApiUrl: termiteURL,
+		ApiUrl: inferenceURL,
 	})
 	require.NoError(t, err)
 
@@ -197,19 +197,24 @@ func testSparseSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, t
 // testHybridSearch creates a table with both dense (aknn_v0) and sparse
 // (sparse_v0) indexes to verify three-way hybrid search (BM25 + dense + sparse)
 // with RRF fusion.
-func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, termiteURL string) {
+func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, inferenceURL string) {
 	t.Helper()
 
 	tableName := "hybrid_search_test"
 
-	// -- Dense embedder (built-in antfly embedder) --
+	// -- Dense embedder via Antfly inference --
 	denseEmbedder := &antfly.EmbedderConfig{}
 	denseEmbedder.Provider = antfly.EmbedderProviderAntfly
-	err := denseEmbedder.FromAntflyEmbedderConfig(antfly.AntflyEmbedderConfig{})
+	err := denseEmbedder.FromAntflyEmbedderConfig(antfly.AntflyEmbedderConfig{
+		Model:  "BAAI/bge-small-en-v1.5",
+		ApiUrl: inferenceURL,
+	})
 	require.NoError(t, err)
 
 	chunker := antfly.ChunkerConfig{}
 	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
+		Model:  "fixed",
+		ApiUrl: inferenceURL,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  256,
 			OverlapTokens: 25,
@@ -228,12 +233,12 @@ func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, t
 	})
 	require.NoError(t, err)
 
-	// -- Sparse embedder (Termite SPLADE) --
+	// -- Sparse embedder via Antfly inference --
 	sparseEmbedder := antfly.EmbedderConfig{}
-	sparseEmbedder.Provider = antfly.EmbedderProviderTermite
-	err = sparseEmbedder.FromTermiteEmbedderConfig(antfly.TermiteEmbedderConfig{
+	sparseEmbedder.Provider = antfly.EmbedderProviderAntfly
+	err = sparseEmbedder.FromAntflyEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model:  spladeModel,
-		ApiUrl: termiteURL,
+		ApiUrl: inferenceURL,
 	})
 	require.NoError(t, err)
 
@@ -323,17 +328,17 @@ func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, t
 
 // testSparseImport tests importing pre-computed sparse embeddings via the
 // _embeddings field, bypassing the SPLADE enrichment pipeline.
-func testSparseImport(t *testing.T, ctx context.Context, swarm *SwarmInstance, termiteURL string) {
+func testSparseImport(t *testing.T, ctx context.Context, swarm *SwarmInstance, inferenceURL string) {
 	t.Helper()
 
 	tableName := "sparse_import_test"
 
 	// -- Create sparse index (no embedder needed for import-only) --
 	sparseEmbedder := antfly.EmbedderConfig{}
-	sparseEmbedder.Provider = antfly.EmbedderProviderTermite
-	err := sparseEmbedder.FromTermiteEmbedderConfig(antfly.TermiteEmbedderConfig{
+	sparseEmbedder.Provider = antfly.EmbedderProviderAntfly
+	err := sparseEmbedder.FromAntflyEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model:  spladeModel,
-		ApiUrl: termiteURL,
+		ApiUrl: inferenceURL,
 	})
 	require.NoError(t, err)
 

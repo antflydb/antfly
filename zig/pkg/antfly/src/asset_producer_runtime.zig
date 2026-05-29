@@ -28,11 +28,11 @@ pub const Runtime = struct {
     alloc: Allocator,
     http: *httpx.Client,
     owned_http: ?*httpx.Client = null,
-    local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
 
     pub const Options = struct {
-        local_termite_provider: ?managed_embedder.LocalTermiteProvider = null,
+        antfly_provider: ?managed_embedder.AntflyProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
     };
 
@@ -44,7 +44,7 @@ pub const Runtime = struct {
         return .{
             .alloc = alloc,
             .http = http,
-            .local_termite_provider = options.local_termite_provider,
+            .antfly_provider = options.antfly_provider,
             .secret_store = options.secret_store,
         };
     }
@@ -115,7 +115,7 @@ pub const Runtime = struct {
         } else .{ .text = request.source_text };
         const link = generating_runtime.ChainLink{ .generator = cfg };
         var result = try generating_runtime.executeChainWithOptions(alloc, self.http, &.{link}, .{
-            .local_termite_provider = self.local_termite_provider,
+            .antfly_provider = self.antfly_provider,
             .secret_store = self.secret_store,
         }, &.{
             .{ .role = .user, .content = content },
@@ -135,7 +135,7 @@ pub const Runtime = struct {
         defer source.deinit(alloc);
 
         if (isLocalReaderProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
-            const local = self.local_termite_provider orelse return error.UnsupportedReaderProvider;
+            const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
             const results = try read_images(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
                 .images = source.images,
@@ -178,7 +178,7 @@ pub const Runtime = struct {
         defer cfg_parsed.deinit();
 
         if (isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
-            const local = self.local_termite_provider orelse return error.UnsupportedTranscriberProvider;
+            const local = self.antfly_provider orelse return error.UnsupportedTranscriberProvider;
             const transcribe_audio = local.transcribe_audio orelse return error.UnsupportedTranscriberProvider;
             var result = try transcribe_audio(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
                 .url = request.source_text,
@@ -224,7 +224,7 @@ pub const Runtime = struct {
         };
 
         var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
-            const local = self.local_termite_provider orelse return error.UnsupportedExtractionProvider;
+            const local = self.antfly_provider orelse return error.UnsupportedExtractionProvider;
             const extract_fn = local.extract orelse return error.UnsupportedExtractionProvider;
             break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request);
         } else try extracting.extractWithConfig(alloc, self.http, cfg, extract_request);
@@ -238,15 +238,15 @@ pub const Runtime = struct {
 };
 
 fn isLocalReaderProvider(provider: readers.Provider, url: ?[]const u8) bool {
-    return (provider == .antfly or provider == .termite) and url == null;
+    return provider == .antfly and url == null;
 }
 
 fn isLocalTranscriberProvider(provider: transcribing.Provider, url: ?[]const u8) bool {
-    return (provider == .antfly or provider == .termite) and url == null;
+    return provider == .antfly and url == null;
 }
 
 fn isLocalExtractionProvider(provider: extracting.Provider, url: ?[]const u8) bool {
-    return (provider == .antfly or provider == .termite) and url == null;
+    return provider == .antfly and url == null;
 }
 
 const ReaderSource = struct {
@@ -538,7 +538,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
     const Local = struct {
         read_calls: usize = 0,
 
-        fn provider(self: *@This()) managed_embedder.LocalTermiteProvider {
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
                 .embed_dense_texts = embedDense,
@@ -572,7 +572,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
     var local = Local{};
     var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
     defer client.deinit();
-    var runtime = Runtime.initWithOptions(alloc, &client, .{ .local_termite_provider = local.provider() });
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
     const producer = runtime.producer();
 
     const result = try producer.produce(alloc, .{
@@ -597,7 +597,7 @@ test "asset producer runtime routes antfly transcriber without url to local prov
     const Local = struct {
         transcribe_calls: usize = 0,
 
-        fn provider(self: *@This()) managed_embedder.LocalTermiteProvider {
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
                 .embed_dense_texts = embedDense,
@@ -630,7 +630,7 @@ test "asset producer runtime routes antfly transcriber without url to local prov
     var local = Local{};
     var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
     defer client.deinit();
-    var runtime = Runtime.initWithOptions(alloc, &client, .{ .local_termite_provider = local.provider() });
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
     const producer = runtime.producer();
 
     const result = try producer.produce(alloc, .{
@@ -654,7 +654,7 @@ test "asset producer runtime routes antfly extractor without url to local provid
     const Local = struct {
         extract_calls: usize = 0,
 
-        fn provider(self: *@This()) managed_embedder.LocalTermiteProvider {
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
                 .ptr = self,
                 .embed_dense_texts = embedDense,
@@ -688,7 +688,7 @@ test "asset producer runtime routes antfly extractor without url to local provid
     var local = Local{};
     var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
     defer client.deinit();
-    var runtime = Runtime.initWithOptions(alloc, &client, .{ .local_termite_provider = local.provider() });
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
     const producer = runtime.producer();
 
     const result = try producer.produce(alloc, .{

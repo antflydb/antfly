@@ -54,11 +54,6 @@ func NewEmbedderConfig(config any) (*EmbedderConfig, error) {
 		if err := modelConfig.FromAntflyEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from antfly embedder config: %w", err)
 		}
-	case TermiteEmbedderConfig:
-		provider = EmbedderProviderTermite
-		if err := modelConfig.FromTermiteEmbedderConfig(v); err != nil {
-			return nil, fmt.Errorf("from termite embedder config: %w", err)
-		}
 	default:
 		return nil, fmt.Errorf("unknown model config type: %T", v)
 	}
@@ -101,10 +96,10 @@ func NewGeneratorConfig(config any) (*GeneratorConfig, error) {
 		if err := modelConfig.FromAnthropicGeneratorConfig(v); err != nil {
 			return nil, fmt.Errorf("from anthropic generator config: %w", err)
 		}
-	case TermiteGeneratorConfig:
-		provider = GeneratorProviderTermite
-		if err := modelConfig.FromTermiteGeneratorConfig(v); err != nil {
-			return nil, fmt.Errorf("from termite generator config: %w", err)
+	case AntflyGeneratorConfig:
+		provider = GeneratorProviderAntfly
+		if err := modelConfig.FromAntflyGeneratorConfig(v); err != nil {
+			return nil, fmt.Errorf("from antfly generator config: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("unknown model config type: %T", v)
@@ -123,10 +118,10 @@ func NewRerankerConfig(config any) (*RerankerConfig, error) {
 		if err := rerankerConfig.FromOllamaRerankerConfig(v); err != nil {
 			return nil, fmt.Errorf("from ollama reranker config: %w", err)
 		}
-	case TermiteRerankerConfig:
-		provider = RerankerProviderTermite
-		if err := rerankerConfig.FromTermiteRerankerConfig(v); err != nil {
-			return nil, fmt.Errorf("from termite reranker config: %w", err)
+	case AntflyRerankerConfig:
+		provider = RerankerProviderAntfly
+		if err := rerankerConfig.FromAntflyRerankerConfig(v); err != nil {
+			return nil, fmt.Errorf("from antfly reranker config: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("unknown reranker config type: %T", v)

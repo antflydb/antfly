@@ -15,8 +15,8 @@
 const std = @import("std");
 const audio = @import("antfly_audio_openapi");
 const httpx = @import("httpx");
+const inference_api = @import("inference_api");
 const google_auth = @import("antfly_google").auth;
-const termite_api = @import("termite_api");
 const scraping = @import("antfly_scraping");
 
 const Allocator = std.mem.Allocator;
@@ -30,14 +30,12 @@ pub const Speaker = audio.Speaker;
 
 pub const Provider = enum {
     antfly,
-    termite,
     openai,
     vertex,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.write(switch (self) {
             .antfly => "antfly",
-            .termite => "termite",
             .openai => "openai",
             .vertex => "vertex",
         });
@@ -49,7 +47,6 @@ pub const Provider = enum {
             else => return error.UnexpectedToken,
         };
         if (std.mem.eql(u8, raw, "antfly")) return .antfly;
-        if (std.mem.eql(u8, raw, "termite")) return .termite;
         if (std.mem.eql(u8, raw, "openai")) return .openai;
         if (std.mem.eql(u8, raw, "vertex")) return .vertex;
         return error.UnexpectedToken;
@@ -304,7 +301,7 @@ fn deinitSpeaker(alloc: Allocator, speaker: *Speaker) void {
 
 fn initTranscriber(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
     return switch (cfg.provider) {
-        .antfly, .termite => try AntflyTranscriberState.init(alloc, http, cfg),
+        .antfly => try AntflyTranscriberState.init(alloc, http, cfg),
         .openai => try OpenAiTranscriberState.init(alloc, http, cfg),
         .vertex => try VertexTranscriberState.init(alloc, http, cfg),
     };
@@ -372,7 +369,7 @@ const AntflyTranscriberState = struct {
         const url = try std.fmt.allocPrint(alloc, "{s}/transcribe", .{self.api_url});
         defer alloc.free(url);
 
-        const body = try httpx.json.Json.stringify(alloc, termite_api.types.TranscribeRequest{
+        const body = try httpx.json.Json.stringify(alloc, inference_api.types.TranscribeRequest{
             .model = self.model,
             .audio = encoded,
             .language = req.language orelse self.language_code,
@@ -389,7 +386,7 @@ const AntflyTranscriberState = struct {
         if (!resp.ok()) return error.TranscribeRequestFailed;
 
         const payload = resp.body orelse return error.EmptyResponse;
-        var parsed = try std.json.parseFromSlice(termite_api.types.TranscribeResponse, alloc, payload, .{
+        var parsed = try std.json.parseFromSlice(inference_api.types.TranscribeResponse, alloc, payload, .{
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
@@ -820,7 +817,7 @@ test "transcribing registry preserves named providers and default" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
-        \\  "whisper-local": { "provider": "termite", "api_url": "http://127.0.0.1:8080", "model": "openai/whisper-base" },
+        \\  "whisper-local": { "provider": "antfly", "api_url": "http://127.0.0.1:8080", "model": "openai/whisper-base" },
         \\  "whisper-remote": { "provider": "openai", "model": "whisper-1" }
         \\}
     ;
@@ -832,7 +829,7 @@ test "transcribing registry preserves named providers and default" {
 
     try std.testing.expectEqualStrings("whisper-local", registry.defaultProviderName().?);
     const default_cfg = try registry.getConfig(null);
-    try std.testing.expectEqual(Provider.termite, default_cfg.provider);
+    try std.testing.expectEqual(Provider.antfly, default_cfg.provider);
     try std.testing.expectEqualStrings("openai/whisper-base", default_cfg.model.?);
 
     const explicit_cfg = try registry.getConfig("whisper-remote");
@@ -854,15 +851,15 @@ test "transcribing registry duplicate provider error does not double free config
     }));
 }
 
-test "transcribing runtime loads termite provider and transcribes data uri input" {
+test "transcribing runtime loads antfly provider and transcribes data uri input" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
     var server = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/transcribe", .assert_request = expectTermiteTranscriberBearer, .respond = .{
-            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"hello from termite\",\"language\":\"en\"}],\"model\":\"openai/whisper-base\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3,\"total_tokens\":3}}",
+        .{ .method = .POST, .path = "/transcribe", .assert_request = expectAntflyTranscriberBearer, .respond = .{
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"hello from antfly\",\"language\":\"en\"}],\"model\":\"openai/whisper-base\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3,\"total_tokens\":3}}",
         } },
     });
     defer server.deinit();
@@ -871,10 +868,10 @@ test "transcribing runtime loads termite provider and transcribes data uri input
     defer alloc.free(api_url);
     const raw =
         \\{
-        \\  "whisper-local": { "provider": "termite", "api_url": "
+        \\  "whisper-local": { "provider": "antfly", "api_url": "
     ;
     const suffix =
-        \\", "model": "openai/whisper-base", "api_key": "termite-secret" }
+        \\", "model": "openai/whisper-base", "api_key": "antfly-secret" }
         \\}
     ;
     const cfg_json = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ raw, api_url, suffix });
@@ -918,7 +915,7 @@ test "transcribing runtime loads termite provider and transcribes data uri input
     group.await(io) catch {};
     if (run_err) |err| return err;
 
-    try std.testing.expectEqualStrings("hello from termite", response.?.text.?);
+    try std.testing.expectEqualStrings("hello from antfly", response.?.text.?);
     try std.testing.expectEqualStrings("en", response.?.language.?);
 }
 
@@ -1089,9 +1086,9 @@ fn expectVertexBearer(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqualStrings("Bearer vertex-token", req.header("Authorization") orelse return error.MissingHeader);
 }
 
-fn expectTermiteTranscriberBearer(req: httpx.testing_mod.RequestInfo) !void {
+fn expectAntflyTranscriberBearer(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqual(httpx.Method.POST, req.method);
-    try std.testing.expectEqualStrings("Bearer termite-secret", req.header("Authorization") orelse return error.MissingHeader);
+    try std.testing.expectEqualStrings("Bearer antfly-secret", req.header("Authorization") orelse return error.MissingHeader);
 }
 
 fn expectOpenAiTranscriberBearer(req: httpx.testing_mod.RequestInfo) !void {

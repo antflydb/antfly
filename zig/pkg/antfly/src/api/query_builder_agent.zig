@@ -2490,14 +2490,12 @@ fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generatin
         .vertex => .vertex,
         .openai => .openai,
         .ollama => .ollama,
-        .termite => .termite,
         .antfly => .antfly,
         else => return error.UnsupportedQueryBuilderGeneration,
     };
     const model = cfg.model orelse return error.InvalidQueryBuilderGeneration;
     const url = switch (provider) {
-        .termite => cfg.api_url orelse "",
-        .antfly => "",
+        .antfly => cfg.api_url orelse "",
         .gemini, .vertex => cfg.url orelse "",
         .openai, .ollama => cfg.url orelse return error.InvalidQueryBuilderGeneration,
         else => return error.UnsupportedQueryBuilderGeneration,
@@ -5813,7 +5811,7 @@ test "query builder uses generated full text specialist when runner is provided"
         .mode = "full_text",
         .output = "query_request",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -5877,7 +5875,7 @@ test "query builder uses generated semantic specialist with embedding metadata p
         .mode = "semantic",
         .output = "query_request",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -6021,7 +6019,7 @@ test "query builder generated semantic path does not prompt with sparse preferre
         .output = "query_request",
         .constraints = constraints_tree.value,
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -6085,7 +6083,7 @@ test "query builder uses generated hybrid specialist with full text validation" 
         .mode = "hybrid",
         .output = "query_request",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -6825,7 +6823,7 @@ test "query builder rejects generated fields outside schema and falls back" {
         .schema_fields = &.{ "title", "body", "status" },
         .mode = "full_text",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -6874,7 +6872,7 @@ test "query builder generated full text honors allowed fields constraint" {
         .schema_fields = &.{ "title", "body", "status" },
         .constraints = constraints_tree.value,
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -6935,7 +6933,7 @@ test "query builder repairs invalid generated full text once" {
         .schema_fields = &.{ "title", "body", "status" },
         .mode = "full_text",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -7029,7 +7027,7 @@ test "query builder repairs generated full text from plan validator feedback" {
         .schema_fields = &.{ "title", "body", "status" },
         .mode = "full_text",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -7098,7 +7096,7 @@ test "query builder uses generated graph specialist when runner is provided" {
         .schema_fields = &.{ "title", "body" },
         .mode = "graph",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -7168,7 +7166,7 @@ test "query builder repairs invalid generated graph plan once" {
         .schema_fields = &.{"body"},
         .mode = "graph",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -7240,7 +7238,7 @@ test "query builder repairs generated graph plan with unavailable seed ref" {
         .schema_fields = &.{"body"},
         .mode = "graph",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -7288,7 +7286,7 @@ test "query builder accepts generated graph result dependencies" {
         .schema_fields = &.{"body"},
         .mode = "graph",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -7367,7 +7365,7 @@ test "query builder repairs generated graph plan from validator feedback" {
         .schema_fields = &.{"body"},
         .mode = "graph",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -7486,7 +7484,7 @@ test "query builder rejects generated graph missing result dependency" {
         .schema_fields = &.{"body"},
         .mode = "graph",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -7531,7 +7529,7 @@ test "query builder rejects generated graph cyclic result dependencies" {
         .schema_fields = &.{"body"},
         .mode = "graph",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -7576,7 +7574,7 @@ test "query builder rejects generated graph indexes outside context and falls ba
         .schema_fields = &.{"body"},
         .mode = "graph",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -7623,7 +7621,7 @@ test "query builder rejects generated graph unsupported result refs" {
         .schema_fields = &.{"body"},
         .mode = "graph",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },
@@ -7668,7 +7666,7 @@ test "query builder rejects generated graph malformed patterns" {
         .schema_fields = &.{"body"},
         .mode = "graph",
         .generator = .{
-            .provider = .termite,
+            .provider = .antfly,
             .model = "local-generator",
             .api_url = "http://127.0.0.1:8082",
         },

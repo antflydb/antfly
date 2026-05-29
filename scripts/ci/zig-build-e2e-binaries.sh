@@ -41,7 +41,7 @@ zig build \
   -Dtarget="$target" \
   -Dcpu="$cpu" \
   -Doptimize="$optimize" \
-  install-antfly
+  -Dedition=full \
+  install
 
-printf '%s\n' '#!/usr/bin/env sh' 'exec "$(dirname "$0")/antfly" termite "$@"' > zig-out/bin/termite
-chmod +x zig-out/bin/antfly zig-out/bin/termite
+chmod +x zig-out/bin/antfly

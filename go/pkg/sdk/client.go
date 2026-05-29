@@ -35,22 +35,22 @@ type Config struct {
 	// BaseURL is the Antfly server URL without a product prefix, for example
 	// http://localhost:8080.
 	BaseURL string
-	// TermiteBaseURL optionally points Termite operations at a different server.
-	// When empty, Termite uses BaseURL.
-	TermiteBaseURL string
-	// HTTPClient is shared by Antfly and Termite clients when provided.
+	// InferenceBaseURL optionally points inference operations at a different server.
+	// When empty, inference uses BaseURL.
+	InferenceBaseURL string
+	// HTTPClient is shared by Antfly and inference clients when provided.
 	HTTPClient *http.Client
 }
 
 // Client is the consolidated SDK entrypoint. Antfly operations are exposed via
-// Antfly and ML operations via Termite.
+// Antfly and ML operations via Inference.
 type Client struct {
-	antfly  *AntflyClient
-	termite *TermiteClient
+	antfly    *AntflyClient
+	inference *InferenceClient
 }
 
 // NewClient creates a consolidated SDK client. The generated client uses the
-// public contract rooted at /api/v1, /auth/v1, and /ml/v1.
+// public contract rooted at /db/v1, /auth/v1, and /ai/v1.
 func NewClient(config Config) (*Client, error) {
 	baseURL := strings.TrimRight(config.BaseURL, "/")
 	antfly, err := NewAntflyClient(baseURL, config.HTTPClient)
@@ -58,16 +58,16 @@ func NewClient(config Config) (*Client, error) {
 		return nil, fmt.Errorf("creating antfly client: %w", err)
 	}
 
-	termiteBaseURL := strings.TrimRight(config.TermiteBaseURL, "/")
-	if termiteBaseURL == "" {
-		termiteBaseURL = baseURL
+	inferenceBaseURL := strings.TrimRight(config.InferenceBaseURL, "/")
+	if inferenceBaseURL == "" {
+		inferenceBaseURL = baseURL
 	}
-	termite, err := NewTermiteClient(termiteBaseURL, config.HTTPClient)
+	inference, err := NewInferenceClient(inferenceBaseURL, config.HTTPClient)
 	if err != nil {
-		return nil, fmt.Errorf("creating termite client: %w", err)
+		return nil, fmt.Errorf("creating inference client: %w", err)
 	}
 
-	return &Client{antfly: antfly, termite: termite}, nil
+	return &Client{antfly: antfly, inference: inference}, nil
 }
 
 // Antfly returns the Antfly product API surface.
@@ -75,9 +75,9 @@ func (c *Client) Antfly() *AntflyClient {
 	return c.antfly
 }
 
-// Termite returns the Termite ML API surface.
-func (c *Client) Termite() *TermiteClient {
-	return c.termite
+// Inference returns the Antfly inference API surface.
+func (c *Client) Inference() *InferenceClient {
+	return c.inference
 }
 
 // AntflyClient is a client for interacting with the Antfly API

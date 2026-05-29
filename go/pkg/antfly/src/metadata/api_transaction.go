@@ -192,6 +192,99 @@ func (t *TableApi) CommitTransaction(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (t *TableApi) ListTransactionSessions(w http.ResponseWriter, r *http.Request) {
+	transactionSessionsNotImplemented(w)
+}
+
+func (t *TableApi) BeginTransaction(w http.ResponseWriter, r *http.Request) {
+	transactionSessionsNotImplemented(w)
+}
+
+func (t *TableApi) CleanupTransactionSessions(
+	w http.ResponseWriter,
+	r *http.Request,
+	params CleanupTransactionSessionsParams,
+) {
+	transactionSessionsNotImplemented(w)
+}
+
+func (t *TableApi) GetTransactionSession(
+	w http.ResponseWriter,
+	r *http.Request,
+	transactionId TransactionId,
+) {
+	transactionSessionsNotImplemented(w)
+}
+
+func (t *TableApi) AbortTransactionSession(
+	w http.ResponseWriter,
+	r *http.Request,
+	transactionId TransactionId,
+) {
+	transactionSessionsNotImplemented(w)
+}
+
+func (t *TableApi) CommitTransactionSession(
+	w http.ResponseWriter,
+	r *http.Request,
+	transactionId TransactionId,
+) {
+	transactionSessionsNotImplemented(w)
+}
+
+func (t *TableApi) StageTransactionDelete(
+	w http.ResponseWriter,
+	r *http.Request,
+	transactionId TransactionId,
+) {
+	transactionSessionsNotImplemented(w)
+}
+
+func (t *TableApi) StageTransactionRead(
+	w http.ResponseWriter,
+	r *http.Request,
+	transactionId TransactionId,
+) {
+	transactionSessionsNotImplemented(w)
+}
+
+func (t *TableApi) CreateTransactionSavepoint(
+	w http.ResponseWriter,
+	r *http.Request,
+	transactionId TransactionId,
+) {
+	transactionSessionsNotImplemented(w)
+}
+
+func (t *TableApi) RollbackTransactionSavepoint(
+	w http.ResponseWriter,
+	r *http.Request,
+	transactionId TransactionId,
+	savepointId string,
+) {
+	transactionSessionsNotImplemented(w)
+}
+
+func (t *TableApi) StageTransactionSession(
+	w http.ResponseWriter,
+	r *http.Request,
+	transactionId TransactionId,
+) {
+	transactionSessionsNotImplemented(w)
+}
+
+func (t *TableApi) StageTransactionWrite(
+	w http.ResponseWriter,
+	r *http.Request,
+	transactionId TransactionId,
+) {
+	transactionSessionsNotImplemented(w)
+}
+
+func transactionSessionsNotImplemented(w http.ResponseWriter) {
+	errorResponse(w, "transaction sessions are not implemented", http.StatusNotImplemented)
+}
+
 // validateReadSet checks that all keys in the read set still have the expected versions.
 func (t *TableApi) validateReadSet(ctx context.Context, readSet []TransactionReadItem) error {
 	eg, egCtx := errgroup.WithContext(ctx)

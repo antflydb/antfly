@@ -21,12 +21,10 @@ const Allocator = std.mem.Allocator;
 
 pub const Provider = enum {
     mock,
-    termite,
     antfly,
 
     pub fn fromSlice(raw: []const u8) !Provider {
         if (std.mem.eql(u8, raw, "mock")) return .mock;
-        if (std.mem.eql(u8, raw, "termite")) return .termite;
         if (std.mem.eql(u8, raw, "antfly")) return .antfly;
         return error.InvalidChunkerConfig;
     }
@@ -34,7 +32,6 @@ pub const Provider = enum {
     pub fn toSlice(self: Provider) []const u8 {
         return switch (self) {
             .mock => "mock",
-            .termite => "termite",
             .antfly => "antfly",
         };
     }
@@ -194,10 +191,7 @@ fn configFromOpenApi(
         cfg.full_text_index_json = try json.Stringify.valueAlloc(alloc, full_text_index, .{});
     }
 
-    switch (cfg.provider) {
-        .termite => if (cfg.model.len == 0) return error.InvalidChunkerConfig,
-        .antfly, .mock => {},
-    }
+    if (cfg.provider == .antfly and cfg.api_url.len > 0 and cfg.model.len == 0) return error.InvalidChunkerConfig;
     return cfg;
 }
 
@@ -243,7 +237,6 @@ const CombinedChunkerConfig = struct {
 
 fn openApiFromConfig(cfg: Config) CombinedChunkerConfig {
     const provider: provider_openapi.ChunkerProvider = switch (cfg.provider) {
-        .termite => .termite,
         .antfly => .antfly,
         .mock => .mock,
     };
@@ -259,8 +252,8 @@ fn openApiFromConfig(cfg: Config) CombinedChunkerConfig {
             .window_duration_ms = if (cfg.audio.window_duration_ms > 0) cfg.audio.window_duration_ms else null,
             .overlap_duration_ms = if (cfg.audio.overlap_duration_ms > 0) cfg.audio.overlap_duration_ms else null,
         } else null,
-        .api_url = if (cfg.provider == .termite and cfg.api_url.len > 0) cfg.api_url else null,
-        .url = if (cfg.provider == .antfly and cfg.api_url.len > 0) cfg.api_url else null,
+        .api_url = if (cfg.provider == .antfly and cfg.api_url.len > 0) cfg.api_url else null,
+        .url = null,
         .model = if (cfg.model.len > 0) cfg.model else null,
         .provider = provider,
         .store_chunks = if (cfg.store_chunks) true else null,
@@ -271,12 +264,12 @@ fn openApiFromConfig(cfg: Config) CombinedChunkerConfig {
 test "chunker config round trip" {
     const alloc = std.testing.allocator;
     const raw =
-        \\{"provider":"termite","api_url":"http://localhost:8080","model":"fixed","store_chunks":true,"max_chunks":7,"threshold":0.5,"text":{"target_tokens":128,"overlap_tokens":16,"separator":"\n\n"},"full_text_index":{}}
+        \\{"provider":"antfly","api_url":"http://localhost:8080","model":"fixed","store_chunks":true,"max_chunks":7,"threshold":0.5,"text":{"target_tokens":128,"overlap_tokens":16,"separator":"\n\n"},"full_text_index":{}}
     ;
     var cfg = try parseConfigFromSlice(alloc, raw);
     defer cfg.deinit(alloc);
 
-    try std.testing.expectEqual(.termite, cfg.provider);
+    try std.testing.expectEqual(.antfly, cfg.provider);
     try std.testing.expectEqualStrings("http://localhost:8080", cfg.api_url);
     try std.testing.expectEqualStrings("fixed", cfg.model);
     try std.testing.expect(cfg.store_chunks);
@@ -286,14 +279,17 @@ test "chunker config round trip" {
     defer alloc.free(encoded);
     var reparsed = try parseConfigFromSlice(alloc, encoded);
     defer reparsed.deinit(alloc);
-    try std.testing.expectEqual(.termite, reparsed.provider);
+    try std.testing.expectEqual(.antfly, reparsed.provider);
     try std.testing.expectEqualStrings("fixed", reparsed.model);
     try std.testing.expectEqual(@as(u32, 16), reparsed.text.overlap_tokens);
 }
 
-test "chunker config requires termite model" {
+test "chunker config requires model for remote antfly provider" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidChunkerConfig, parseConfigFromSlice(alloc, "{\"provider\":\"termite\"}"));
+    try std.testing.expectError(
+        error.InvalidChunkerConfig,
+        parseConfigFromSlice(alloc, "{\"provider\":\"antfly\",\"api_url\":\"http://localhost:8080\"}"),
+    );
 }
 
 test "chunker config detects full text indexing" {

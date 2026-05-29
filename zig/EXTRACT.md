@@ -6,7 +6,7 @@ Extraction is the canonical interface for NER, relation extraction, structured
 field extraction, text classification, document classification, token
 classification, and document-understanding outputs.
 
-Termite should expose one public extraction API instead of separate
+Antfly inference should expose one public extraction API instead of separate
 `recognize`, `classify`, `classify/document`, and `classify/document_tokens`
 APIs. Those names can remain internal model capabilities or CLI conveniences,
 but the HTTP/API contract should be schema-driven extraction.
@@ -21,7 +21,7 @@ of separate artifact producer roles.
   document extraction.
 - Reuse the same multimodal content-part grammar used by generators.
 - Keep extraction batch-oriented with one result per input.
-- Support local embedded Termite, remote Antfly/Termite-compatible services,
+- Support local embedded Antfly inference, remote Antfly inference-compatible services,
   and external providers such as Pioneer.
 - Store artifact rows as value-only payloads, usually `application/json`.
 
@@ -31,7 +31,7 @@ of separate artifact producer roles.
 - Do not keep separate long-term public APIs for recognition or classification.
 - Do not store extraction skip/provenance state inside artifact payload rows.
 
-## Public Termite API
+## Public Antfly Inference API
 
 Canonical route:
 
@@ -254,9 +254,8 @@ The canonical V1 path remains `inputs[].content`.
 
 Provider naming follows other Zig AI provider configs:
 
-- `provider: "antfly"` with no `url`: local embedded Termite.
-- `provider: "antfly"` with `url`: remote Antfly/Termite-compatible service.
-- `provider: "termite"`: compatibility alias during migration.
+- `provider: "antfly"` with no `url`: local embedded Antfly inference.
+- `provider: "antfly"` with `url`: remote Antfly inference-compatible service.
 - `provider: "pioneer"`: Pioneer native extraction inference API.
 - `provider: "openai"` or other LLM providers: future schema/tool-call backed
   extraction.
@@ -313,19 +312,19 @@ Artifact rows remain value-only. Extraction artifacts should normally use
 ## Implementation Plan
 
 1. Add shared extraction schemas under `specs/openapi/ai/extraction.yaml`.
-2. Update `specs/openapi/termite/api.yaml` to expose `/extract` as the canonical
+2. Update `specs/openapi/inference/api.yaml` to expose `/extract` as the canonical
    route and remove first-class recognize/classify routes.
 3. Generate Zig OpenAPI bindings for the shared extraction schemas.
 4. Add `zig/lib/extracting` with config parsing, registry, runtime, request, and
    response types.
 5. Implement providers:
-   - `antfly` / `termite`: call Termite-compatible `/extract`, or local embedded
+   - `antfly`: call Antfly inference-compatible `/extract`, or local embedded
      provider when `antfly` has no URL.
    - `pioneer`: call Pioneer native inference and normalize the response.
-6. Refactor Termite internals so existing recognizer/classifier/document
+6. Refactor Antfly inference internals so existing recognizer/classifier/document
    pipelines plug into one extraction runtime.
 7. Add `extractor` to Antfly asset producer config and runtime.
-8. Extend `LocalTermiteProvider` with an extraction callback.
+8. Extend the local Antfly inference provider with an extraction callback.
 9. Add tests:
    - entity-only extraction.
    - entity plus relation extraction in one response.
@@ -333,4 +332,4 @@ Artifact rows remain value-only. Extraction artifacts should normally use
    - document input with image and tokens.
    - Antfly asset producer stores value-only JSON.
    - `provider: "antfly"` without URL routes to local embedded extraction.
-   - remote Antfly/Termite and Pioneer fake-provider normalization.
+   - remote Antfly inference and Pioneer fake-provider normalization.

@@ -24,9 +24,9 @@ import (
 	"time"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/ai"
+	libinference "github.com/antflydb/antfly/go/pkg/antfly/lib/inference"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/schema"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/template"
-	libtermite "github.com/antflydb/antfly/go/pkg/antfly/lib/termite"
 	json "github.com/antflydb/antfly/go/pkg/libaf/json"
 	libscraping "github.com/antflydb/antfly/go/pkg/libaf/scraping"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -97,7 +97,7 @@ type Embedder interface {
 	Embed(ctx context.Context, contents [][]ai.ContentPart) ([][]float32, error)
 
 	// RateLimiter returns a rate limiter for pre-request throttling, or nil
-	// if the provider has no rate limit (e.g. local inference like Termite,
+	// if the provider has no rate limit (e.g. local Antfly inference,
 	// Ollama, or the built-in Antfly embedder). The enricher calls WaitN
 	// before each batch; remote providers return a limiter matching their
 	// API quota (e.g. OpenAI ~3000 RPM, Vertex ~600 RPM).
@@ -228,7 +228,7 @@ func init() {
 
 	RegisterEmbedder(EmbedderProviderBedrock, NewBedrockImpl)
 
-	RegisterEmbedder(EmbedderProviderTermite, NewTermiteEmbedderFromConfig)
+	RegisterEmbedder(EmbedderProviderAntfly, NewAntflyEmbedderFromConfig)
 }
 
 // Default rate limits for remote providers (requests per second).
@@ -804,9 +804,9 @@ func GetDefaultEmbedderConfig() *EmbedderConfig {
 	return defaultEmbedderConfig
 }
 
-// NewTermiteEmbedderFromConfig creates a Termite embedder from the unified config.
-func NewTermiteEmbedderFromConfig(config EmbedderConfig) (Embedder, error) {
-	c, err := config.AsTermiteEmbedderConfig()
+// NewAntflyEmbedderFromConfig creates an Antfly inference embedder from the unified config.
+func NewAntflyEmbedderFromConfig(config EmbedderConfig) (Embedder, error) {
+	c, err := config.AsAntflyEmbedderConfig()
 	if err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
@@ -816,10 +816,10 @@ func NewTermiteEmbedderFromConfig(config EmbedderConfig) (Embedder, error) {
 	if c.ApiUrl != nil {
 		configURL = *c.ApiUrl
 	}
-	url := libtermite.ResolveURL(configURL)
+	url := libinference.ResolveURL(configURL)
 	if url == "" {
-		return nil, fmt.Errorf("termite URL is required: set api_url in config or ANTFLY_TERMITE_URL environment variable")
+		return nil, fmt.Errorf("antfly inference URL is required: set api_url in config or ANTFLY_INFERENCE_URL environment variable")
 	}
 
-	return NewTermiteClient(url, c.Model, config.GetConfigCapabilities())
+	return NewAntflyClient(url, c.Model, config.GetConfigCapabilities())
 }

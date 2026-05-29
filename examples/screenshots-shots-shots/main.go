@@ -6,8 +6,8 @@
 // only the path is stored, and the server fetches files at enrichment time.
 //
 // Prerequisites:
-// - Antfly running with Termite and ONNX Runtime
-// - CLIP model: antfly termite pull openai/clip-vit-base-patch32
+// - Antfly running with inference and ONNX Runtime
+// - CLIP model: antfly inference pull openai/clip-vit-base-patch32
 //
 // Run: go run main.go [folder] [query...]
 
@@ -78,7 +78,7 @@ func main() {
 
 	antflyURL := os.Getenv("ANTFLY_URL")
 	if antflyURL == "" {
-		antflyURL = "http://localhost:8080/api/v1"
+		antflyURL = "http://localhost:8080/db/v1"
 	}
 
 	client, err := antfly.NewAntflyClient(antflyURL, http.DefaultClient)
@@ -93,8 +93,8 @@ func main() {
 	fmt.Println("\nCreating table 'screenshots' with CLIP embeddings index...")
 
 	var embedderConfig oapi.EmbedderConfig
-	embedderConfig.Provider = oapi.EmbedderProviderTermite
-	embedderConfig.FromTermiteEmbedderConfig(oapi.TermiteEmbedderConfig{
+	embedderConfig.Provider = oapi.EmbedderProviderAntfly
+	embedderConfig.FromAntflyEmbedderConfig(oapi.AntflyEmbedderConfig{
 		Model: "openai/clip-vit-base-patch32",
 	})
 

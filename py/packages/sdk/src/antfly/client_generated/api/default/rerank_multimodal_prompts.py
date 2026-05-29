@@ -5,21 +5,21 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.termite_error import TermiteError
-from ...models.termite_rerank_multimodal_request import TermiteRerankMultimodalRequest
-from ...models.termite_rerank_response import TermiteRerankResponse
+from ...models.inference_error import InferenceError
+from ...models.inference_rerank_multimodal_request import InferenceRerankMultimodalRequest
+from ...models.inference_rerank_response import InferenceRerankResponse
 from ...types import Response
 
 
 def _get_kwargs(
     *,
-    body: TermiteRerankMultimodalRequest,
+    body: InferenceRerankMultimodalRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/ml/v1/rerank_multimodal",
+        "url": "/ai/v1/rerank_multimodal",
     }
 
     _kwargs["json"] = body.to_dict()
@@ -32,24 +32,24 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> TermiteError | TermiteRerankResponse | None:
+) -> InferenceError | InferenceRerankResponse | None:
     if response.status_code == 200:
-        response_200 = TermiteRerankResponse.from_dict(response.json())
+        response_200 = InferenceRerankResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 400:
-        response_400 = TermiteError.from_dict(response.json())
+        response_400 = InferenceError.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 404:
-        response_404 = TermiteError.from_dict(response.json())
+        response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
     if response.status_code == 501:
-        response_501 = TermiteError.from_dict(response.json())
+        response_501 = InferenceError.from_dict(response.json())
 
         return response_501
 
@@ -61,7 +61,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[TermiteError | TermiteRerankResponse]:
+) -> Response[InferenceError | InferenceRerankResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -73,8 +73,8 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteRerankMultimodalRequest,
-) -> Response[TermiteError | TermiteRerankResponse]:
+    body: InferenceRerankMultimodalRequest,
+) -> Response[InferenceError | InferenceRerankResponse]:
     """Rerank multimodal documents by relevance
 
      Re-scores multimodal documents based on relevance to a text query.
@@ -85,14 +85,14 @@ def sync_detailed(
     Image-bearing requests already run native Zig image preprocessing and grid preparation.
 
     Args:
-        body (TermiteRerankMultimodalRequest):
+        body (InferenceRerankMultimodalRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteRerankResponse]
+        Response[InferenceError | InferenceRerankResponse]
     """
 
     kwargs = _get_kwargs(
@@ -109,8 +109,8 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteRerankMultimodalRequest,
-) -> TermiteError | TermiteRerankResponse | None:
+    body: InferenceRerankMultimodalRequest,
+) -> InferenceError | InferenceRerankResponse | None:
     """Rerank multimodal documents by relevance
 
      Re-scores multimodal documents based on relevance to a text query.
@@ -121,14 +121,14 @@ def sync(
     Image-bearing requests already run native Zig image preprocessing and grid preparation.
 
     Args:
-        body (TermiteRerankMultimodalRequest):
+        body (InferenceRerankMultimodalRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteRerankResponse
+        InferenceError | InferenceRerankResponse
     """
 
     return sync_detailed(
@@ -140,8 +140,8 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteRerankMultimodalRequest,
-) -> Response[TermiteError | TermiteRerankResponse]:
+    body: InferenceRerankMultimodalRequest,
+) -> Response[InferenceError | InferenceRerankResponse]:
     """Rerank multimodal documents by relevance
 
      Re-scores multimodal documents based on relevance to a text query.
@@ -152,14 +152,14 @@ async def asyncio_detailed(
     Image-bearing requests already run native Zig image preprocessing and grid preparation.
 
     Args:
-        body (TermiteRerankMultimodalRequest):
+        body (InferenceRerankMultimodalRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[TermiteError | TermiteRerankResponse]
+        Response[InferenceError | InferenceRerankResponse]
     """
 
     kwargs = _get_kwargs(
@@ -174,8 +174,8 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: TermiteRerankMultimodalRequest,
-) -> TermiteError | TermiteRerankResponse | None:
+    body: InferenceRerankMultimodalRequest,
+) -> InferenceError | InferenceRerankResponse | None:
     """Rerank multimodal documents by relevance
 
      Re-scores multimodal documents based on relevance to a text query.
@@ -186,14 +186,14 @@ async def asyncio(
     Image-bearing requests already run native Zig image preprocessing and grid preparation.
 
     Args:
-        body (TermiteRerankMultimodalRequest):
+        body (InferenceRerankMultimodalRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        TermiteError | TermiteRerankResponse
+        InferenceError | InferenceRerankResponse
     """
 
     return (

@@ -818,8 +818,13 @@ export default function FoundationsPage() {
               <Wordmark className="text-2xl">SearchAF</Wordmark>
             </Lockup>
             <Lockup>
-              <Logo src="/af-logo.svg" srcDark="/af-logo-dark.svg" alt="Termite" size="lg" />
-              <Wordmark className="text-2xl">Termite</Wordmark>
+              <Logo
+                src="/af-logo.svg"
+                srcDark="/af-logo-dark.svg"
+                alt="Antfly Inference"
+                size="lg"
+              />
+              <Wordmark className="text-2xl">Antfly Inference</Wordmark>
             </Lockup>
           </div>
         </div>

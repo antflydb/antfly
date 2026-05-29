@@ -139,7 +139,7 @@ function copyToClipboard(text: string) {
 // --- Component ---
 
 const ReaderPlaygroundPage: React.FC = () => {
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
 
   // Shared state
   const [isLoading, setIsLoading] = useState(false);
@@ -168,7 +168,7 @@ const ReaderPlaygroundPage: React.FC = () => {
   useEffect(() => {
     const fetchModels = async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/ml/v1/models`);
+        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`);
         if (response.ok) {
           const data: ModelsResponse = await response.json();
           const readers = Object.keys(data.readers || {});
@@ -182,7 +182,7 @@ const ReaderPlaygroundPage: React.FC = () => {
       }
     };
     fetchModels();
-  }, [termiteApiUrl]);
+  }, [inferenceApiUrl]);
 
   // Auto-set prompt based on selected model (only when prompt is empty or a known auto-value)
   useEffect(() => {
@@ -280,7 +280,7 @@ const ReaderPlaygroundPage: React.FC = () => {
       if (maxTokens && Number.parseInt(maxTokens, 10) > 0)
         body.max_tokens = Number.parseInt(maxTokens, 10);
 
-      const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/read`, {
+      const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/read`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -300,7 +300,9 @@ const ReaderPlaygroundPage: React.FC = () => {
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
       setError(
-        err instanceof Error ? err.message : `Failed to connect to Termite at ${termiteApiUrl}`
+        err instanceof Error
+          ? err.message
+          : `Failed to connect to Antfly inference at ${inferenceApiUrl}`
       );
     } finally {
       setIsLoading(false);

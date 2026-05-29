@@ -33,10 +33,12 @@ func TestNormalizeBaseURL(t *testing.T) {
 	}{
 		{name: "local root", in: "http://localhost:8080", want: "http://localhost:8080"},
 		{name: "local root trailing slash", in: "http://localhost:8080/", want: "http://localhost:8080"},
-		{name: "local api root", in: "http://localhost:8080/api/v1", want: "http://localhost:8080"},
-		{name: "local api root trailing slash", in: "http://localhost:8080/api/v1/", want: "http://localhost:8080"},
+		{name: "local api root", in: "http://localhost:8080/db/v1", want: "http://localhost:8080"},
+		{name: "local api root trailing slash", in: "http://localhost:8080/db/v1/", want: "http://localhost:8080"},
+		{name: "local auth root", in: "http://localhost:8080/auth/v1", want: "http://localhost:8080"},
+		{name: "local ai root", in: "http://localhost:8080/ai/v1", want: "http://localhost:8080"},
 		{name: "cloud proxy root", in: "https://platform.antfly.io/cloud/v1/instance", want: "https://platform.antfly.io/cloud/v1/instance"},
-		{name: "cloud proxy api root", in: "https://platform.antfly.io/cloud/v1/instance/api/v1", want: "https://platform.antfly.io/cloud/v1/instance"},
+		{name: "cloud proxy api root", in: "https://platform.antfly.io/cloud/v1/instance/db/v1", want: "https://platform.antfly.io/cloud/v1/instance"},
 	}
 
 	for _, tt := range tests {
@@ -55,9 +57,11 @@ func TestNormalizeServerURL(t *testing.T) {
 		want string
 	}{
 		{name: "local root", in: "http://localhost:8080", want: "http://localhost:8080"},
-		{name: "local api root", in: "http://localhost:8080/api/v1", want: "http://localhost:8080"},
+		{name: "local api root", in: "http://localhost:8080/db/v1", want: "http://localhost:8080"},
+		{name: "local auth root", in: "http://localhost:8080/auth/v1", want: "http://localhost:8080"},
+		{name: "local ai root", in: "http://localhost:8080/ai/v1", want: "http://localhost:8080"},
 		{name: "cloud proxy root", in: "https://platform.antfly.io/cloud/v1/instance", want: "https://platform.antfly.io/cloud/v1/instance"},
-		{name: "cloud proxy api root", in: "https://platform.antfly.io/cloud/v1/instance/api/v1", want: "https://platform.antfly.io/cloud/v1/instance"},
+		{name: "cloud proxy api root", in: "https://platform.antfly.io/cloud/v1/instance/db/v1", want: "https://platform.antfly.io/cloud/v1/instance"},
 	}
 
 	for _, tt := range tests {
@@ -91,8 +95,8 @@ func TestTokenAuthHeaderAndNormalizedPath(t *testing.T) {
 		t.Fatalf("ListTables: %v", err)
 	}
 
-	if gotPath != "/api/v1/tables" {
-		t.Fatalf("path = %q, want /api/v1/tables", gotPath)
+	if gotPath != "/db/v1/tables" {
+		t.Fatalf("path = %q, want /db/v1/tables", gotPath)
 	}
 	if gotAuth != "Bearer antflydb_test" {
 		t.Fatalf("Authorization = %q, want Bearer antflydb_test", gotAuth)

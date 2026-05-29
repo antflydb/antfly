@@ -31,7 +31,7 @@ const (
 )
 
 // setupFieldEdgeSwarm creates a swarm with a graph-indexed table that uses
-// field-based edges, tree topology, and a summarizer (via Termite).
+// field-based edges, tree topology, and a summarizer (via Antfly inference).
 func setupFieldEdgeSwarm(t *testing.T) *SwarmInstance {
 	t.Helper()
 

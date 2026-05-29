@@ -35,7 +35,7 @@ import (
 //
 //	HTTP API → metadata → shard routing → HBC index → response
 //
-// Uses the pre-computed wiki-articles 768d-10k dataset (no Termite needed) to
+// Uses the pre-computed wiki-articles 768d-10k dataset (no Antfly inference needed) to
 // isolate the database search path from embedding generation. Both inserts and
 // queries use the packed dense format (base64-encoded little-endian float32
 // bytes) which is ~4x more compact on the wire than JSON float arrays.
@@ -79,9 +79,9 @@ func TestE2E_VectorSearchLatency(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// Start single-node swarm without Termite.
-	t.Log("Starting Antfly swarm (no Termite)...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
+	// Start single-node swarm without Antfly inference.
+	t.Log("Starting Antfly swarm (no Antfly inference)...")
+	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
 	defer swarm.Cleanup()
 
 	// Create table with external embedding index (no embedder).

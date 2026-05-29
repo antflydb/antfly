@@ -7,7 +7,7 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.extraction_request import ExtractionRequest
 from ...models.extraction_response import ExtractionResponse
-from ...models.termite_error import TermiteError
+from ...models.inference_error import InferenceError
 from ...types import Response
 
 
@@ -19,7 +19,7 @@ def _get_kwargs(
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/ml/v1/extract",
+        "url": "/ai/v1/extract",
     }
 
     _kwargs["json"] = body.to_dict()
@@ -32,29 +32,29 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> ExtractionResponse | TermiteError | None:
+) -> ExtractionResponse | InferenceError | None:
     if response.status_code == 200:
         response_200 = ExtractionResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 400:
-        response_400 = TermiteError.from_dict(response.json())
+        response_400 = InferenceError.from_dict(response.json())
 
         return response_400
 
     if response.status_code == 404:
-        response_404 = TermiteError.from_dict(response.json())
+        response_404 = InferenceError.from_dict(response.json())
 
         return response_404
 
     if response.status_code == 500:
-        response_500 = TermiteError.from_dict(response.json())
+        response_500 = InferenceError.from_dict(response.json())
 
         return response_500
 
     if response.status_code == 503:
-        response_503 = TermiteError.from_dict(response.json())
+        response_503 = InferenceError.from_dict(response.json())
 
         return response_503
 
@@ -66,7 +66,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[ExtractionResponse | TermiteError]:
+) -> Response[ExtractionResponse | InferenceError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -79,7 +79,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: ExtractionRequest,
-) -> Response[ExtractionResponse | TermiteError]:
+) -> Response[ExtractionResponse | InferenceError]:
     """Extract entities, relations, classifications, and structures
 
      Schema-driven extraction over shared AI content parts. This is the
@@ -95,7 +95,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ExtractionResponse | TermiteError]
+        Response[ExtractionResponse | InferenceError]
     """
 
     kwargs = _get_kwargs(
@@ -113,7 +113,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: ExtractionRequest,
-) -> ExtractionResponse | TermiteError | None:
+) -> ExtractionResponse | InferenceError | None:
     """Extract entities, relations, classifications, and structures
 
      Schema-driven extraction over shared AI content parts. This is the
@@ -129,7 +129,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ExtractionResponse | TermiteError
+        ExtractionResponse | InferenceError
     """
 
     return sync_detailed(
@@ -142,7 +142,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: ExtractionRequest,
-) -> Response[ExtractionResponse | TermiteError]:
+) -> Response[ExtractionResponse | InferenceError]:
     """Extract entities, relations, classifications, and structures
 
      Schema-driven extraction over shared AI content parts. This is the
@@ -158,7 +158,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ExtractionResponse | TermiteError]
+        Response[ExtractionResponse | InferenceError]
     """
 
     kwargs = _get_kwargs(
@@ -174,7 +174,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: ExtractionRequest,
-) -> ExtractionResponse | TermiteError | None:
+) -> ExtractionResponse | InferenceError | None:
     """Extract entities, relations, classifications, and structures
 
      Schema-driven extraction over shared AI content parts. This is the
@@ -190,7 +190,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ExtractionResponse | TermiteError
+        ExtractionResponse | InferenceError
     """
 
     return (

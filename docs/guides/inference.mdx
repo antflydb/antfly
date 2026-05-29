@@ -1,0 +1,119 @@
+---
+title: Antfly inference
+description: Use Antfly inference for local ML inference — embeddings, chunking, and reranking
+prerequisites:
+  - Antfly installed and running
+difficulty: beginner
+estimatedTime: "10 min"
+tags: [inference, embeddings, reranking, models]
+---
+
+<Questions>
+- What is Antfly inference?
+- How do I download models for Antfly inference?
+- What models are available?
+- How do I use Antfly inference for embeddings, chunking, and reranking?
+</Questions>
+
+Antfly inference is Antfly's local ML inference service for embeddings, chunking, and reranking. It runs ONNX-optimized models for fast CPU inference without external API dependencies.
+
+## Features
+
+- **Embedding Generation** - Text and multimodal (CLIP) embedding models
+- **Text Chunking** - Semantic chunking with ONNX models or fixed-size fallback
+- **Reranking** - Relevance re-scoring for search results
+- **Privacy** - Data never leaves your infrastructure
+
+## Model Management
+
+### List Available Models
+
+View all available models in the registry:
+
+```bash
+antfly inference list --remote
+```
+
+### Download Models
+
+Download quantized ONNX models (INT8 optimized for fast CPU inference):
+
+```bash
+antfly inference pull --variants i8 bge-small-en-v1.5 chonky-mmbert-small-multilingual-1 mxbai-rerank-base-v1
+```
+
+Available model types:
+- **Embedders**: `bge-small-en-v1.5`, `mxbai-embed-large-v1`, `clip-vit-base-patch32`
+- **Chunkers**: `chonky-mmbert-small-multilingual-1`
+- **Rerankers**: `mxbai-rerank-base-v1`
+
+### List Local Models
+
+View models you've downloaded:
+
+```bash
+antfly inference list
+```
+
+### Model Variants
+
+Models support different quantization variants:
+
+| Variant | Description |
+|---------|-------------|
+| `f32` | Full precision (largest, most accurate) |
+| `i8` | INT8 quantized (smaller, faster, recommended) |
+
+Use `--variants` to specify which variant to download:
+
+```bash
+antfly inference pull --variants i8,f32 bge-small-en-v1.5
+```
+
+## Model Storage
+
+Models are stored in `~/.antfly/inference/models/` by default, organized by type:
+- `~/.antfly/inference/models/embedders/` - Embedding models
+- `~/.antfly/inference/models/chunkers/` - Chunking models
+- `~/.antfly/inference/models/rerankers/` - Reranking models
+- `~/.antfly/inference/models/generators/` - Generation models
+
+Antfly inference auto-discovers and loads models from these directories when Antfly starts in swarm mode. Use `--models-dir` to override the default location.
+
+## Configuration
+
+Antfly inference models can be used in index and query configurations:
+
+### Embedder Configuration
+
+```json
+{
+  "provider": "antfly",
+  "model": "bge-small-en-v1.5"
+}
+```
+
+### Chunker Configuration
+
+```json
+{
+  "provider": "antfly",
+  "model": "chonky-mmbert-small-multilingual-1",
+  "target_tokens": 512,
+  "overlap_tokens": 50
+}
+```
+
+### Reranker Configuration
+
+```json
+{
+  "provider": "antfly",
+  "model": "mxbai-rerank-base-v1",
+  "field": "body"
+}
+```
+
+## API Reference
+
+See the [Inference API documentation](/inference/api) for details on the HTTP endpoints.

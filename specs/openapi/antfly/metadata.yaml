@@ -23,7 +23,7 @@ info:
     ### AI-Native Features
     - **RAG**: Streaming retrieval-augmented generation with Server-Sent Events
     - **Retrieval Agent**: Intelligent query routing with automatic query generation
-    - **Document Chunking**: Semantic chunking service (Termite) with multi-tier caching
+    - **Document Chunking**: Antfly inference chunking service with multi-tier caching
     - **Async Enrichment**: Background embedding and summarization with leader-only processing
     - **Multimodal Remote Processing**: Automatic download, processing, and security controls for images, PDFs, and HTML from URLs (http/https/s3/file) with SSRF prevention and content validation
 
@@ -55,7 +55,7 @@ info:
     name: All Rights Reserved
     url: https://antfly.io/legal
 servers:
-  - url: /api/v1
+  - url: /db/v1
     description: Main API server
 tags:
   - name: getting_started
@@ -1432,11 +1432,11 @@ components:
         type: string
   schemas:
     Error:
-      $ref: "usermgr.yaml#/components/schemas/Error"
+      $ref: "../auth/api.yaml#/components/schemas/Error"
     SortDirection:
-      $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/SortDirection"
+      $ref: "indexes.yaml#/components/schemas/SortDirection"
     SortField:
-      $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/SortField"
+      $ref: "indexes.yaml#/components/schemas/SortField"
     ClusterHealth:
       type: string
       enum:
@@ -1810,7 +1810,7 @@ components:
 
             You can add multiple indexes to support different query patterns.
           additionalProperties:
-            $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/IndexConfig"
+            $ref: "indexes.yaml#/components/schemas/IndexConfig"
           example:
             search_index:
               type: full_text
@@ -1841,7 +1841,7 @@ components:
             ```
 
             See the Table Management documentation for comprehensive TTL configuration and use cases.
-          $ref: "../../../lib/schema/openapi.yaml#/components/schemas/TableSchema"
+          $ref: "schema.yaml#/components/schemas/TableSchema"
         replication_sources:
           type: array
           items:
@@ -1856,7 +1856,7 @@ components:
     AntflyType:
       rules:
         no-unused-components: off
-      $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/AntflyType"
+      $ref: "indexes.yaml#/components/schemas/AntflyType"
     Table: # Simplified representation of tablemgr.Table
       type: object
       required:
@@ -1875,13 +1875,13 @@ components:
           type: object
           additionalProperties:
             x-go-type-skip-optional-pointer: false
-            $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/IndexConfig"
+            $ref: "indexes.yaml#/components/schemas/IndexConfig"
         shards: # map[types.ID]*ShardInfo
           type: object
           additionalProperties:
             $ref: "#/components/schemas/ShardConfig"
         schema:
-          $ref: "../../../lib/schema/openapi.yaml#/components/schemas/TableSchema"
+          $ref: "schema.yaml#/components/schemas/TableSchema"
         migration:
           description: Present only when the table is migrating between schema versions. Absent means the table is stable.
           $ref: "#/components/schemas/TableMigration"
@@ -1904,7 +1904,7 @@ components:
           enum:
             - rebuilding
         read_schema:
-          $ref: "../../../lib/schema/openapi.yaml#/components/schemas/TableSchema"
+          $ref: "schema.yaml#/components/schemas/TableSchema"
     # Aggregation schemas
     AggregationType:
       type: string
@@ -2256,11 +2256,11 @@ components:
         shard_status:
           type: object
           additionalProperties:
-            $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/IndexStats"
+            $ref: "indexes.yaml#/components/schemas/IndexStats"
         config:
-          $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/IndexConfig"
+          $ref: "indexes.yaml#/components/schemas/IndexConfig"
         status:
-          $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/IndexStats"
+          $ref: "indexes.yaml#/components/schemas/IndexStats"
     StorageStatus: # common.StorageStats
       type: object
       properties:
@@ -3204,7 +3204,7 @@ components:
             require_executable: true
             prefer_indexes: ["body_embedding"]
         generator:
-          $ref: "../../../go/pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
     QueryBuilderResult:
       type: object
       required:
@@ -3634,34 +3634,34 @@ components:
         If a step is not configured, it is skipped (retrieval always runs).
       properties:
         tools:
-          $ref: "../../../lib/ai/openapi.yaml#/components/schemas/ChatToolsConfig"
+          $ref: "generating.yaml#/components/schemas/ChatToolsConfig"
           description: |
             Tool configuration for the retrieval agent. Controls which tools
             are available and their settings. If not specified, tools are
             automatically determined from the table's available indexes.
         classification:
-          $ref: "../../../lib/ai/openapi.yaml#/components/schemas/ClassificationStepConfig"
+          $ref: "generating.yaml#/components/schemas/ClassificationStepConfig"
           description: |
             Configuration for query classification and transformation.
             When set, runs classification before retrieval to select the optimal
             strategy (simple/decompose/step_back/hyde) and transform the query.
         generation:
-          $ref: "../../../lib/ai/openapi.yaml#/components/schemas/GenerationStepConfig"
+          $ref: "generating.yaml#/components/schemas/GenerationStepConfig"
           description: |
             Configuration for generation from retrieved documents.
             When set, generates a response with citations after retrieval completes.
         followup:
-          $ref: "../../../lib/ai/openapi.yaml#/components/schemas/FollowupStepConfig"
+          $ref: "generating.yaml#/components/schemas/FollowupStepConfig"
           description: |
             Configuration for generating follow-up questions.
             Requires steps.generation to be set.
         confidence:
-          $ref: "../../../lib/ai/openapi.yaml#/components/schemas/ConfidenceStepConfig"
+          $ref: "generating.yaml#/components/schemas/ConfidenceStepConfig"
           description: |
             Configuration for confidence assessment of the generated response.
             Requires steps.generation to be set.
         eval:
-          $ref: "../../../lib/ai/eval/openapi.yaml#/components/schemas/EvalConfig"
+          $ref: "eval.yaml#/components/schemas/EvalConfig"
           description: |
             Configuration for inline evaluation. Runs evaluators on retrieved
             documents and/or generated response. Requires steps.generation for
@@ -3704,7 +3704,7 @@ components:
         messages:
           type: array
           items:
-            $ref: "../../../lib/ai/openapi.yaml#/components/schemas/ChatMessage"
+            $ref: "../shared/generating.yaml#/components/schemas/ChatMessage"
           description: Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
         agent_knowledge:
           type: string
@@ -3715,7 +3715,7 @@ components:
         accumulated_filters:
           type: array
           items:
-            $ref: "../../../lib/ai/openapi.yaml#/components/schemas/FilterSpec"
+            $ref: "generating.yaml#/components/schemas/FilterSpec"
           description: |
             Pre-applied filters from prior interactions. These are applied to
             all search tool invocations.
@@ -3770,12 +3770,12 @@ components:
           default: true
           description: Enable SSE streaming vs JSON response
         generator:
-          $ref: "../../../go/pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
           description: Generator for the retrieval agent's LLM calls
         chain:
           type: array
           items:
-            $ref: "../../../go/pkg/generating/openapi.yaml#/components/schemas/ChainLink"
+            $ref: "../shared/generating.yaml#/components/schemas/ChainLink"
           description: Chain of generators
         steps:
           $ref: "#/components/schemas/RetrievalAgentSteps"
@@ -3852,7 +3852,7 @@ components:
         applied_filters:
           type: array
           items:
-            $ref: "../../../lib/ai/openapi.yaml#/components/schemas/FilterSpec"
+            $ref: "generating.yaml#/components/schemas/FilterSpec"
           description: Filters that were applied during retrieval
         tool_calls_made:
           type: integer
@@ -3860,12 +3860,12 @@ components:
         messages:
           type: array
           items:
-            $ref: "../../../lib/ai/openapi.yaml#/components/schemas/ChatMessage"
+            $ref: "../shared/generating.yaml#/components/schemas/ChatMessage"
           description: |
             Optional conversational context including tool calls and responses.
             Decisions remain the authoritative continuation input for bounded agent interactions.
         classification:
-          $ref: "../../../lib/ai/openapi.yaml#/components/schemas/ClassificationTransformationResult"
+          $ref: "generating.yaml#/components/schemas/ClassificationTransformationResult"
           description: |
             Query classification and transformation result. Present when
             steps.classification was configured. Includes strategy, semantic_query,
@@ -3893,7 +3893,7 @@ components:
             type: string
           description: Suggested follow-up questions (requires steps.followup)
         eval_result:
-          $ref: "../../../lib/ai/eval/openapi.yaml#/components/schemas/EvalResult"
+          $ref: "eval.yaml#/components/schemas/EvalResult"
           description: Evaluation results when steps.eval was configured
 
     # ==========================================
@@ -3908,18 +3908,18 @@ components:
         Configuration for the answer agent's pipeline steps.
       properties:
         classification:
-          $ref: "../../../lib/ai/openapi.yaml#/components/schemas/ClassificationStepConfig"
+          $ref: "generating.yaml#/components/schemas/ClassificationStepConfig"
           description: Configuration for query classification and transformation.
         answer:
-          $ref: "../../../lib/ai/openapi.yaml#/components/schemas/GenerationStepConfig"
+          $ref: "generating.yaml#/components/schemas/GenerationStepConfig"
           description: |
             DEPRECATED: Use steps.generation on RetrievalAgentRequest instead.
             Configuration for answer generation from retrieved documents.
         followup:
-          $ref: "../../../lib/ai/openapi.yaml#/components/schemas/FollowupStepConfig"
+          $ref: "generating.yaml#/components/schemas/FollowupStepConfig"
           description: Configuration for generating follow-up questions.
         confidence:
-          $ref: "../../../lib/ai/openapi.yaml#/components/schemas/ConfidenceStepConfig"
+          $ref: "generating.yaml#/components/schemas/ConfidenceStepConfig"
           description: Configuration for confidence assessment.
 
     AnswerAgentRequest:
@@ -3948,12 +3948,12 @@ components:
             DEPRECATED: Use stream on RetrievalAgentRequest instead.
             Enable SSE streaming vs JSON response.
         generator:
-          $ref: "../../../go/pkg/generating/openapi.yaml#/components/schemas/GeneratorConfig"
+          $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
           description: Generator for LLM calls
         chain:
           type: array
           items:
-            $ref: "../../../go/pkg/generating/openapi.yaml#/components/schemas/ChainLink"
+            $ref: "../shared/generating.yaml#/components/schemas/ChainLink"
           description: Chain of generators
         agent_knowledge:
           type: string
@@ -3969,7 +3969,7 @@ components:
           $ref: "#/components/schemas/AnswerAgentSteps"
           description: Step configuration
         eval:
-          $ref: "../../../lib/ai/eval/openapi.yaml#/components/schemas/EvalConfig"
+          $ref: "eval.yaml#/components/schemas/EvalConfig"
           description: |
             DEPRECATED: Use steps.eval on RetrievalAgentRequest instead.
             Evaluation configuration (moved to steps.eval in new API).
@@ -4007,7 +4007,7 @@ components:
           maximum: 1.0
           description: Relevance of retrieved documents to the query
         classification_transformation:
-          $ref: "../../../lib/ai/openapi.yaml#/components/schemas/ClassificationTransformationResult"
+          $ref: "generating.yaml#/components/schemas/ClassificationTransformationResult"
           description: |
             DEPRECATED: Use classification on RetrievalAgentResult instead.
             Query classification and transformation result.
@@ -4024,7 +4024,7 @@ components:
             type: string
           description: Suggested follow-up questions
         eval_result:
-          $ref: "../../../lib/ai/eval/openapi.yaml#/components/schemas/EvalResult"
+          $ref: "eval.yaml#/components/schemas/EvalResult"
           description: Evaluation results
 
     # ==========================================
@@ -4338,7 +4338,7 @@ components:
             Useful for excluding near-exact duplicates or finding dissimilar documents.
           example: 0.1
         merge_config:
-          $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/MergeConfig"
+          $ref: "indexes.yaml#/components/schemas/MergeConfig"
           description: |
             Configuration for merging full-text and semantic search results.
             Only applies when both `full_text_search` and `semantic_search` are specified.
@@ -4357,7 +4357,7 @@ components:
             Has minor performance overhead — not recommended for production traffic.
           example: false
         reranker:
-          $ref: "../../../lib/reranking/openapi.yaml#/components/schemas/RerankerConfig"
+          $ref: "reranking.yaml#/components/schemas/RerankerConfig"
           description: |
             Optional reranker configuration to improve result relevance.
 
@@ -4374,7 +4374,7 @@ components:
             Example:
             ```json
             {
-              "provider": "termite",
+              "provider": "antfly",
               "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
               "field": "content"
             }
@@ -4384,7 +4384,7 @@ components:
         graph_searches:
           type: object
           additionalProperties:
-            $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/GraphQuery"
+            $ref: "indexes.yaml#/components/schemas/GraphQuery"
           description: |
             Declarative graph queries to execute after full-text/vector searches.
             Results can reference search results using node selectors like $full_text_results.
@@ -4436,7 +4436,7 @@ components:
             - Go Implementation: https://github.com/alpkeskin/gotoon
           example: "{{encodeToon this.fields}}"
         pruner:
-          $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/Pruner"
+          $ref: "indexes.yaml#/components/schemas/Pruner"
           description: |
             Optional result pruning configuration to filter low-relevance results.
 
@@ -4761,7 +4761,7 @@ components:
       description: Result merge statistics for hybrid search.
       properties:
         strategy:
-          $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/MergeStrategy"
+          $ref: "indexes.yaml#/components/schemas/MergeStrategy"
           description: Merge strategy that was used.
         full_text_hits:
           type: integer
@@ -4917,7 +4917,7 @@ components:
         graph_results:
           type: object
           additionalProperties:
-            $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/GraphQueryResult"
+            $ref: "indexes.yaml#/components/schemas/GraphQueryResult"
           description: Results from declarative graph queries.
         profile:
           x-go-type-skip-optional-pointer: false
@@ -5083,13 +5083,13 @@ components:
           x-go-type: time.Duration
     # Graph API Schemas
     Edge:
-      $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/Edge"
+      $ref: "indexes.yaml#/components/schemas/Edge"
     EdgeDirection:
-      $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/EdgeDirection"
+      $ref: "indexes.yaml#/components/schemas/EdgeDirection"
     TraversalRules:
-      $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/TraversalRules"
+      $ref: "indexes.yaml#/components/schemas/TraversalRules"
     TraversalResult:
-      $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/TraversalResult"
+      $ref: "indexes.yaml#/components/schemas/TraversalResult"
     EdgesResponse:
       type: object
       properties:
@@ -5111,15 +5111,15 @@ components:
           type: integer
           description: Total number of results
     PathFindWeightMode:
-      $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/PathFindWeightMode"
+      $ref: "indexes.yaml#/components/schemas/PathFindWeightMode"
     PathFindRequest:
-      $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/PathFindRequest"
+      $ref: "indexes.yaml#/components/schemas/PathFindRequest"
     PathFindResult:
-      $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/PathFindResult"
+      $ref: "indexes.yaml#/components/schemas/PathFindResult"
     Path:
-      $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/Path"
+      $ref: "indexes.yaml#/components/schemas/Path"
     PathEdge:
-      $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/PathEdge"
+      $ref: "indexes.yaml#/components/schemas/PathEdge"
     ForeignSource:
       type: object
       required:
@@ -6196,14 +6196,14 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "../../../lib/ai/eval/openapi.yaml#/components/schemas/EvalRequest"
+              $ref: "eval.yaml#/components/schemas/EvalRequest"
       responses:
         "200":
           description: Evaluation completed successfully
           content:
             application/json:
               schema:
-                $ref: "../../../lib/ai/eval/openapi.yaml#/components/schemas/EvalResult"
+                $ref: "eval.yaml#/components/schemas/EvalResult"
         "400":
           description: Invalid evaluation request (e.g., missing required fields)
           content:
@@ -6755,7 +6755,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "../../../lib/schema/openapi.yaml#/components/schemas/TableSchema"
+              $ref: "schema.yaml#/components/schemas/TableSchema"
       responses:
         "200":
           description: Schema updated successfully
@@ -6916,7 +6916,7 @@ paths:
           application/json:
             schema:
               #$ref: "#/components/schemas/CreateIndexRequest"
-              $ref: "../../../src/store/db/indexes/openapi.yaml#/components/schemas/IndexConfig"
+              $ref: "indexes.yaml#/components/schemas/IndexConfig"
       responses:
         "201": # Corrected to 201 as per handler
           description: Index added successfully

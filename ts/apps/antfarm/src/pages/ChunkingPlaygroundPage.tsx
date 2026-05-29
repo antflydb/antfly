@@ -23,7 +23,7 @@ import {
   Skeleton,
   Textarea,
 } from "@antfly/design-system";
-import { type ChunkResponse, TermiteClient } from "@antfly/sdk";
+import { type ChunkResponse, InferenceClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { Clock, Database, Hash, RotateCcw, Scissors, Zap } from "lucide-react";
 import type React from "react";
@@ -124,7 +124,7 @@ The era of modern computing began with a flurry of development before and during
 };
 
 const ChunkingPlaygroundPage: React.FC = () => {
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -154,9 +154,9 @@ const ChunkingPlaygroundPage: React.FC = () => {
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: termiteApiUrl }),
-    [termiteApiUrl]
+  const inferenceClient = useMemo(
+    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
+    [inferenceApiUrl]
   );
 
   // Persist state to localStorage
@@ -169,7 +169,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/ml/v1/models`, {
+        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -185,7 +185,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
       }
     })();
     return () => controller.abort();
-  }, [termiteApiUrl]);
+  }, [inferenceApiUrl]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
@@ -222,7 +222,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     try {
       const actualSeparator = config.separator.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
 
-      const data = await termiteClient.chunk(
+      const data = await inferenceClient.chunk(
         inputText,
         {
           model: config.model,
@@ -246,12 +246,12 @@ const ChunkingPlaygroundPage: React.FC = () => {
       setError(
         err instanceof Error
           ? err.message
-          : "Failed to connect to Termite. Make sure Termite is running."
+          : "Failed to connect to Antfly inference. Make sure the runtime is running."
       );
     } finally {
       setIsLoading(false);
     }
-  }, [inputText, config, termiteClient]);
+  }, [inputText, config, inferenceClient]);
 
   // Cmd+Enter shortcut
   useEffect(() => {

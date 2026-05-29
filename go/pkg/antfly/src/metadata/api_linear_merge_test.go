@@ -334,7 +334,7 @@ func TestLinearMerge_JSONEncoding(t *testing.T) {
 
 func TestDecodeLinearMergeRequestWithLimit_PlainJSON(t *testing.T) {
 	reqBody := `{"records":{"doc1":{"name":"Alice"}},"last_merged_id":"","dry_run":false}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/test/merge", strings.NewReader(reqBody))
+	req := httptest.NewRequest(http.MethodPost, "/db/v1/tables/test/merge", strings.NewReader(reqBody))
 	rec := httptest.NewRecorder()
 
 	decoded, err := decodeLinearMergeRequestWithLimit(rec, req, 1024)
@@ -346,7 +346,7 @@ func TestDecodeLinearMergeRequestWithLimit_PlainJSON(t *testing.T) {
 
 func TestDecodeLinearMergeRequestWithLimit_GzipJSON(t *testing.T) {
 	payload := []byte(`{"records":{"doc1":{"name":"Alice"}},"last_merged_id":"","dry_run":true}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/test/merge", gzipTestPayload(t, payload))
+	req := httptest.NewRequest(http.MethodPost, "/db/v1/tables/test/merge", gzipTestPayload(t, payload))
 	req.Header.Set("Content-Encoding", "gzip")
 	rec := httptest.NewRecorder()
 
@@ -357,7 +357,7 @@ func TestDecodeLinearMergeRequestWithLimit_GzipJSON(t *testing.T) {
 }
 
 func TestDecodeLinearMergeRequestWithLimit_RejectsUnsupportedEncoding(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/test/merge", strings.NewReader(`{"records":{}}`))
+	req := httptest.NewRequest(http.MethodPost, "/db/v1/tables/test/merge", strings.NewReader(`{"records":{}}`))
 	req.Header.Set("Content-Encoding", "br")
 	rec := httptest.NewRecorder()
 
@@ -371,7 +371,7 @@ func TestDecodeLinearMergeRequestWithLimit_RejectsUnsupportedEncoding(t *testing
 }
 
 func TestDecodeLinearMergeRequestWithLimit_RejectsOversizedContentLength(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/test/merge", strings.NewReader(`{"records":{}}`))
+	req := httptest.NewRequest(http.MethodPost, "/db/v1/tables/test/merge", strings.NewReader(`{"records":{}}`))
 	req.ContentLength = 1025
 	rec := httptest.NewRecorder()
 
@@ -386,7 +386,7 @@ func TestDecodeLinearMergeRequestWithLimit_RejectsOversizedContentLength(t *test
 
 func TestDecodeLinearMergeRequestWithLimit_RejectsOversizedGzipPayload(t *testing.T) {
 	raw := []byte(strings.Repeat("a", 65))
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/test/merge", gzipTestPayload(t, raw))
+	req := httptest.NewRequest(http.MethodPost, "/db/v1/tables/test/merge", gzipTestPayload(t, raw))
 	req.Header.Set("Content-Encoding", "gzip")
 	rec := httptest.NewRecorder()
 
@@ -400,7 +400,7 @@ func TestDecodeLinearMergeRequestWithLimit_RejectsOversizedGzipPayload(t *testin
 }
 
 func TestDecodeLinearMergeRequestWithLimit_RejectsInvalidGzip(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/test/merge", bytes.NewBufferString("not-gzip"))
+	req := httptest.NewRequest(http.MethodPost, "/db/v1/tables/test/merge", bytes.NewBufferString("not-gzip"))
 	req.Header.Set("Content-Encoding", "gzip")
 	rec := httptest.NewRecorder()
 
