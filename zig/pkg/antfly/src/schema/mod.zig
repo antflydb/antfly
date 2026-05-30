@@ -63,6 +63,13 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     const full_text_documents = try deriveRuntimeFullTextDocuments(alloc, schema);
     errdefer freeRuntimeFullTextDocuments(alloc, full_text_documents);
 
+    const relational_columns = try deriveRuntimeRelationalColumns(alloc, schema);
+    errdefer freeRuntimeRelationalColumns(alloc, relational_columns);
+    const storage_mode: storage_schema.StorageMode = switch (schema.storage_mode) {
+        .document => .document,
+        .relational => .relational,
+    };
+
     for (schema.dynamic_templates, 0..) |template, i| {
         const field_type = parseRuntimeFieldType(template.field_type orelse "text");
         dynamic_templates[i] = .{
@@ -90,9 +97,95 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .ttl_duration_ns = schema.ttl_duration_ns,
         .ttl_field = try alloc.dupe(u8, schema.ttl_field),
         .enforce_types = schema.enforce_types,
+        .storage_mode = storage_mode,
         .dynamic_templates = dynamic_templates,
         .full_text_documents = full_text_documents,
+        .relational_columns = relational_columns,
     };
+}
+
+/// Derive the relational typed-column catalog from a parsed table schema. One
+/// column per declared top-level property; nested objects/arrays and json-typed
+/// fields become `json` columns (indexed as document subtrees); embeddings are
+/// skipped. Mirrors schema_capability.relationalColumnType, but emits runtime
+/// AntflyType values for the runtime schema consumed by document_mapper.
+fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.RelationalColumn {
+    var columns = std.ArrayListUnmanaged(storage_schema.RelationalColumn).empty;
+    errdefer {
+        for (columns.items) |column| {
+            alloc.free(column.name);
+            alloc.free(column.path);
+        }
+        columns.deinit(alloc);
+    }
+
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| {
+            const field_type = runtimeRelationalColumnType(property) orelse continue;
+            const nullable = !requiredFieldsContain(document_schema.required_fields, property.name);
+            const name = try alloc.dupe(u8, property.name);
+            errdefer alloc.free(name);
+            const path = try alloc.dupe(u8, property.name);
+            errdefer alloc.free(path);
+            try columns.append(alloc, .{
+                .name = name,
+                .path = path,
+                .field_type = field_type,
+                .nullable = nullable,
+            });
+        }
+    }
+
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn freeRuntimeRelationalColumns(alloc: std.mem.Allocator, columns: []storage_schema.RelationalColumn) void {
+    for (columns) |column| {
+        alloc.free(column.name);
+        alloc.free(column.path);
+    }
+    if (columns.len > 0) alloc.free(columns);
+}
+
+fn runtimeRelationalColumnType(property: anytype) ?storage_schema.AntflyType {
+    if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "keyword") or
+            std.mem.eql(u8, field_type, "link") or
+            std.mem.eql(u8, field_type, "string")) return .keyword;
+        if (std.mem.eql(u8, field_type, "text")) return .text;
+        if (std.mem.eql(u8, field_type, "html")) return .html;
+        if (std.mem.eql(u8, field_type, "search_as_you_type")) return .search_as_you_type;
+        if (std.mem.eql(u8, field_type, "boolean")) return .boolean;
+        if (std.mem.eql(u8, field_type, "datetime")) return .datetime;
+        if (std.mem.eql(u8, field_type, "integer") or
+            std.mem.eql(u8, field_type, "numeric") or
+            std.mem.eql(u8, field_type, "number")) return .numeric;
+        if (std.mem.eql(u8, field_type, "geopoint")) return .geopoint;
+        if (std.mem.eql(u8, field_type, "geoshape")) return .geoshape;
+        if (std.mem.eql(u8, field_type, "blob")) return .blob;
+        if (std.mem.eql(u8, field_type, "json") or
+            std.mem.eql(u8, field_type, "object") or
+            std.mem.eql(u8, field_type, "array")) return .json;
+        if (std.mem.eql(u8, field_type, "embedding")) return null;
+        if (property.integer_only) return .numeric;
+        return null;
+    }
+    if (property.integer_only) return .numeric;
+    if (property.properties.len > 0 or
+        property.item != null or
+        (property.additional_properties_allowed orelse false) or
+        property.additional_properties_schema != null or
+        property.pattern_properties.len > 0 or
+        property.dynamic_infer_types) return .json;
+    if (property.const_value != null or property.enum_values.len > 0) return .keyword;
+    return null;
+}
+
+fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) bool {
+    for (required_fields) |field_name| {
+        if (std.mem.eql(u8, field_name, name)) return true;
+    }
+    return false;
 }
 
 fn parseRuntimeFieldType(field_type: []const u8) storage_schema.AntflyType {
@@ -661,4 +754,51 @@ fn appendUniqueOwnedPath(
 fn fieldNameFromPath(path: []const u8) []const u8 {
     const idx = std.mem.lastIndexOfScalar(u8, path, '.') orelse return path;
     return path[idx + 1 ..];
+}
+
+fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?storage_schema.RelationalColumn {
+    for (schema.relational_columns) |column| {
+        if (std.mem.eql(u8, column.name, name)) return column;
+    }
+    return null;
+}
+
+test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 5), runtime.relational_columns.len);
+
+    const id = findRuntimeColumn(runtime, "id").?;
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, id.field_type);
+    try std.testing.expectEqualStrings("id", id.path);
+    try std.testing.expect(!id.nullable); // required
+    try std.testing.expectEqual(storage_schema.AntflyType.numeric, findRuntimeColumn(runtime, "amount").?.field_type);
+    try std.testing.expect(findRuntimeColumn(runtime, "amount").?.nullable);
+    try std.testing.expectEqual(storage_schema.AntflyType.datetime, findRuntimeColumn(runtime, "created_at").?.field_type);
+    // nested object and json field both become json columns
+    try std.testing.expectEqual(storage_schema.AntflyType.json, findRuntimeColumn(runtime, "attrs").?.field_type);
+    try std.testing.expectEqual(storage_schema.AntflyType.json, findRuntimeColumn(runtime, "payload").?.field_type);
+}
+
+test "deriveRuntimeTableSchema defaults to document mode with no relational columns" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"additionalProperties":true}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(storage_schema.StorageMode.document, runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), runtime.relational_columns.len);
+    try std.testing.expectEqual(storage_schema.AntflyType.text, findRuntimeColumn(runtime, "title").?.field_type);
 }

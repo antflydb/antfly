@@ -67,6 +67,7 @@ pub const AntflyType = enum(u8) {
     blob = 9,
     html = 10,
     search_as_you_type = 11,
+    json = 12,
 };
 
 pub const FieldMapping = struct {
@@ -116,14 +117,32 @@ pub const FullTextDocument = struct {
     infer_type_dynamic_paths: []const []const u8 = &.{},
 };
 
+/// Storage profile for a table. See zig/RELATIONAL.md.
+pub const StorageMode = enum(u8) {
+    document = 0,
+    relational = 1,
+};
+
+/// A declared typed column of a relational table. `json` columns
+/// (field_type == .json) are indexed as document subtrees rather than as a
+/// typed column.
+pub const RelationalColumn = struct {
+    name: []const u8,
+    path: []const u8,
+    field_type: AntflyType = .text,
+    nullable: bool = true,
+};
+
 pub const TableSchema = struct {
     version: u32 = 0,
     default_type: []const u8 = "_default",
     ttl_duration_ns: u64 = 0,
     ttl_field: []const u8 = "_timestamp",
     enforce_types: bool = false,
+    storage_mode: StorageMode = .document,
     dynamic_templates: []const DynamicTemplate = &.{},
     full_text_documents: []const FullTextDocument = &.{},
+    relational_columns: []const RelationalColumn = &.{},
 };
 
 // ============================================================================
@@ -144,7 +163,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 8); // format version
+    try appendU32(&buf, alloc, 9); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -196,6 +215,16 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         for (doc.infer_type_dynamic_paths) |path| try appendStr(&buf, alloc, path);
     }
 
+    // Storage mode + relational column catalog (format version 9+).
+    try buf.append(alloc, @intFromEnum(schema.storage_mode));
+    try appendU32(&buf, alloc, @intCast(schema.relational_columns.len));
+    for (schema.relational_columns) |column| {
+        try appendStr(&buf, alloc, column.name);
+        try appendStr(&buf, alloc, column.path);
+        try buf.append(alloc, @intFromEnum(column.field_type));
+        try buf.append(alloc, if (column.nullable) 1 else 0);
+    }
+
     const result = try alloc.dupe(u8, buf.items);
     buf.deinit(alloc);
     return result;
@@ -209,7 +238,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version != 1 and fmt_version != 2 and fmt_version != 3 and fmt_version != 4 and fmt_version != 5 and fmt_version != 6 and fmt_version != 7 and fmt_version != 8) return error.UnsupportedVersion;
+    if (fmt_version != 1 and fmt_version != 2 and fmt_version != 3 and fmt_version != 4 and fmt_version != 5 and fmt_version != 6 and fmt_version != 7 and fmt_version != 8 and fmt_version != 9) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -454,6 +483,39 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         }
         break :blk docs;
     } else &.{};
+    errdefer freeFullTextDocumentsSlice(alloc, full_text_documents);
+
+    const storage_mode: StorageMode = if (fmt_version >= 9) blk: {
+        const mode: StorageMode = @enumFromInt(data[pos]);
+        pos += 1;
+        break :blk mode;
+    } else .document;
+
+    const relational_columns: []RelationalColumn = if (fmt_version >= 9) blk: {
+        const column_count = readU32(data, &pos);
+        const columns = try alloc.alloc(RelationalColumn, column_count);
+        var columns_initialized: usize = 0;
+        errdefer {
+            for (columns[0..columns_initialized]) |column| {
+                alloc.free(column.name);
+                alloc.free(column.path);
+            }
+            alloc.free(columns);
+        }
+        for (columns) |*column| {
+            const name = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(name);
+            const path = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(path);
+            const field_type: AntflyType = @enumFromInt(data[pos]);
+            pos += 1;
+            const nullable = data[pos] == 1;
+            pos += 1;
+            column.* = .{ .name = name, .path = path, .field_type = field_type, .nullable = nullable };
+            columns_initialized += 1;
+        }
+        break :blk columns;
+    } else &.{};
 
     return .{
         .version = version,
@@ -461,8 +523,10 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .ttl_duration_ns = ttl_duration_ns,
         .ttl_field = ttl_field,
         .enforce_types = enforce_types,
+        .storage_mode = storage_mode,
         .dynamic_templates = templates,
         .full_text_documents = full_text_documents,
+        .relational_columns = relational_columns,
     };
 }
 
@@ -480,7 +544,16 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
         alloc.free(t.mapping.analyzer);
     }
     if (s.dynamic_templates.len > 0) alloc.free(s.dynamic_templates);
-    for (s.full_text_documents) |doc| {
+    freeFullTextDocumentsSlice(alloc, s.full_text_documents);
+    for (s.relational_columns) |column| {
+        alloc.free(column.name);
+        alloc.free(column.path);
+    }
+    if (s.relational_columns.len > 0) alloc.free(s.relational_columns);
+}
+
+fn freeFullTextDocumentsSlice(alloc: Allocator, docs: []const FullTextDocument) void {
+    for (docs) |doc| {
         alloc.free(doc.name);
         for (doc.fields) |field| {
             alloc.free(field.path);
@@ -504,7 +577,7 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
         for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
         if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
     }
-    if (s.full_text_documents.len > 0) alloc.free(s.full_text_documents);
+    if (docs.len > 0) alloc.free(docs);
 }
 
 /// Save a schema to DocStore.
@@ -967,6 +1040,44 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expectEqualStrings("meta", loaded.full_text_documents[0].open_dynamic_paths[1]);
     try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents[0].infer_type_dynamic_paths.len);
     try std.testing.expectEqualStrings("typed", loaded.full_text_documents[0].infer_type_dynamic_paths[0]);
+
+    // Default document mode round-trips with no relational columns.
+    try std.testing.expectEqual(StorageMode.document, loaded.storage_mode);
+    try std.testing.expectEqual(@as(usize, 0), loaded.relational_columns.len);
+}
+
+test "schema serialize/deserialize round-trips relational storage mode and columns" {
+    const alloc = std.testing.allocator;
+
+    const schema = TableSchema{
+        .version = 7,
+        .default_type = "row",
+        .enforce_types = true,
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+            .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true },
+            .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true },
+        },
+    };
+
+    const data = try serializeSchema(alloc, schema);
+    defer alloc.free(data);
+
+    const loaded = try deserializeSchema(alloc, data);
+    defer freeSchema(alloc, loaded);
+
+    try std.testing.expectEqual(StorageMode.relational, loaded.storage_mode);
+    try std.testing.expectEqual(@as(usize, 4), loaded.relational_columns.len);
+    try std.testing.expectEqualStrings("id", loaded.relational_columns[0].name);
+    try std.testing.expectEqualStrings("id", loaded.relational_columns[0].path);
+    try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[0].field_type);
+    try std.testing.expect(!loaded.relational_columns[0].nullable);
+    try std.testing.expectEqual(AntflyType.numeric, loaded.relational_columns[1].field_type);
+    try std.testing.expectEqual(AntflyType.datetime, loaded.relational_columns[2].field_type);
+    try std.testing.expect(loaded.relational_columns[2].nullable);
+    try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[3].field_type);
 }
 
 test "schema save/load via DocStore" {

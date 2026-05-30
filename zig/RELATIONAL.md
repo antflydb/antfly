@@ -172,13 +172,17 @@ The introducer also accepts **caller-supplied** typed columns directly:
 `TextDocument.typed_fields` bypasses value-based detection entirely
 (`introducer.zig:391`). This is the relational hand-off point.
 `schema_capability.relationalTypedColumnsAlloc` produces exactly that input from
-a relational document — one typed field per present, non-`json` declared column,
-carrying the schema-declared physical type — which gives, for free:
+a relational document — one typed field per present column that is *physically*
+a typed doc value, carrying the schema-declared type — which gives, for free:
 
 - **authoritative types** (types come from the schema, not from per-value
   detection, so a column never silently drops on a stray mistyped value);
-- **`json` columns excluded** from typed detection (a `json` subtree is indexed
-  as a document subtree, never exploded into typed columns).
+- **only the typed-doc-value kinds are emitted** — numeric/integer (`f64`),
+  datetime (`u64`), boolean, geopoint. `keyword`/`text` columns are *not* typed
+  doc values: they use the full-text/inverted index for term and range
+  predicates (the existing schema-aware text mapping handles them). `json`
+  columns are excluded too and indexed as document subtrees, never exploded into
+  typed columns.
 
 Both properties are verified at the introducer boundary: the
 `buildSegmentFromText indexes caller-supplied relational typed columns` test
@@ -192,14 +196,21 @@ The hand-off keeps layers separate: `schema_capability` emits
 orchestration layer renames `name` → `field_name` to get an
 `introducer.TypedFieldValue` (the other fields are identical).
 
+The *compiled* runtime schema now carries this contract:
+`runtime_schema.TableSchema` (`storage/schema.zig`) has `storage_mode` and a
+`relational_columns` catalog (`RelationalColumn{name, path, field_type,
+nullable}`), populated by `deriveRuntimeTableSchema` and round-tripped through
+the versioned binary format (format version 9). `document_mapper` already reads
+`runtime_schema.TableSchema`, so the catalog is now available where typed fields
+are produced.
+
 **Remaining wiring:** make `document_mapper` (the schema-aware producer that
-sets `TextDocument.typed_fields`) call `relationalTypedColumnsAlloc` for
-relational tables. That needs `storage_mode` and the column catalog threaded
-into the *compiled* runtime schema (`storage/schema.zig`, compiled in
-`schema/mod.zig`) — `document_mapper` reads `runtime_schema.TableSchema`, not the
-public-contract schema. Then the columnar scan operator + predicate routing
-(below). In Phase B this is also where the JSON blob write is dropped for
-non-`json` columns.
+sets `TextDocument.typed_fields`) branch on `schema.storage_mode == .relational`:
+build typed fields from `schema.relational_columns` (numeric/datetime/boolean/
+geopoint → typed; `NOT NULL` enforced; json/keyword/text routed to subtree /
+full-text) instead of value detection. Then the columnar scan operator +
+predicate routing (below). In Phase B this is also where the JSON blob write is
+dropped for non-`json` columns.
 
 ### Query path
 
@@ -232,13 +243,15 @@ number) is additive where the physical type is compatible.
   existing segment builder (`introducer.zig`) already materializes correct typed
   columns for type-enforced relational documents (see "How this meets the
   segment builder"). Remaining wiring is folded into Phase 3.
-- **Phase 3 — introducer hand-off (producer done) + scan/pushdown.**
-  `relationalTypedColumnsAlloc` produces authoritative, json-excluded typed
+- **Phase 3 — introducer hand-off + runtime-schema threading (done) + scan.**
+  `relationalTypedColumnsAlloc` produces authoritative, type-correct typed
   columns for the introducer's caller-supplied `typed_fields` path, verified at
-  the `buildSegmentFromText` boundary. Remaining: have `document_mapper` call it
-  for relational tables (needs `storage_mode` + the column catalog in the
-  compiled runtime schema), then add the columnar scan operator, route
-  typed-column predicates to it, and serve columnar projection on read.
+  the `buildSegmentFromText` boundary. The compiled runtime schema now carries
+  `storage_mode` + the `relational_columns` catalog (derived in `schema/mod.zig`,
+  round-tripped through the v9 binary format), so it is available in
+  `document_mapper`. Remaining: branch `document_mapper` on `storage_mode` to
+  build typed fields from the catalog, then add the columnar scan operator,
+  route typed-column predicates to it, and serve columnar projection on read.
 - **Phase 4 — authoritative columns (Phase B).** Drop the JSON blob for
   non-`json` columns; reconstruct documents from columns on read.
 

@@ -1259,11 +1259,12 @@ pub fn relationalTypedColumnsAlloc(alloc: Allocator, plan: RelationalPlan, root:
     errdefer fields.deinit(alloc);
 
     for (row.cells) |candidate| {
-        if (!candidate.present or candidate.is_json) continue;
+        if (!candidate.present) continue;
         const column = plan.columns[candidate.column];
+        const value_type = typedDocValueTypeForColumnType(column.column_type) orelse continue;
         try fields.append(alloc, .{
             .name = column.name,
-            .value_type = physicalEnumForColumnType(column.column_type),
+            .value_type = value_type,
             .value = typedValue(candidate.value),
         });
     }
@@ -1271,12 +1272,17 @@ pub fn relationalTypedColumnsAlloc(alloc: Allocator, plan: RelationalPlan, root:
     return .{ .row = row, .fields = try fields.toOwnedSlice(alloc) };
 }
 
-fn physicalEnumForColumnType(column_type: []const u8) typed_doc_values.ValueType {
+/// The typed_doc_values type for a column, or null when the column is not stored
+/// as a typed doc value. Only numeric/datetime/boolean/geopoint columns become
+/// typed columns; keyword/text columns use the full-text/inverted index for
+/// term and range predicates, and json columns are indexed as document
+/// subtrees -- so those return null and are not emitted as typed fields.
+fn typedDocValueTypeForColumnType(column_type: []const u8) ?typed_doc_values.ValueType {
     if (std.mem.eql(u8, column_type, "datetime")) return .u64_val;
     if (std.mem.eql(u8, column_type, "integer") or std.mem.eql(u8, column_type, "number")) return .f64_val;
     if (std.mem.eql(u8, column_type, "boolean")) return .bool_val;
     if (std.mem.eql(u8, column_type, "geopoint")) return .geo_point;
-    return .bytes_val;
+    return null;
 }
 
 fn relationalFieldByName(fields: []const RelationalTypedField, name: []const u8) ?RelationalTypedField {
@@ -1299,12 +1305,14 @@ test "relational typed columns exclude json and carry declared physical types" {
     var columns = try relationalTypedColumnsAlloc(alloc, plan, doc.value);
     defer columns.deinit(alloc);
 
-    // json columns (attrs, payload) are excluded; the five scalar columns remain.
+    // Only numeric/datetime/boolean columns become typed doc values. The
+    // keyword column (id) goes to the full-text index, and json columns (attrs,
+    // payload) are indexed as subtrees -- none are emitted as typed fields.
+    try std.testing.expect(relationalFieldByName(columns.fields, "id") == null);
     try std.testing.expect(relationalFieldByName(columns.fields, "attrs") == null);
     try std.testing.expect(relationalFieldByName(columns.fields, "payload") == null);
-    try std.testing.expectEqual(@as(usize, 5), columns.fields.len);
+    try std.testing.expectEqual(@as(usize, 4), columns.fields.len);
 
-    try std.testing.expectEqual(typed_doc_values.ValueType.bytes_val, relationalFieldByName(columns.fields, "id").?.value_type);
     try std.testing.expectEqual(typed_doc_values.ValueType.f64_val, relationalFieldByName(columns.fields, "amount").?.value_type);
     try std.testing.expectEqual(typed_doc_values.ValueType.f64_val, relationalFieldByName(columns.fields, "qty").?.value_type);
     try std.testing.expectEqual(typed_doc_values.ValueType.u64_val, relationalFieldByName(columns.fields, "ts").?.value_type);
