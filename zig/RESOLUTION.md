@@ -461,8 +461,11 @@ Open/index/enrichment validation should reject:
          and `notifySequence`d wherever enrichment is (incl. the enrichment
          derived-batch append where extraction artifacts land). Verified by
          `db-test` + `root-test`.
-   - [ ] Follow-up: a db-level integration test driving extraction -> resolution
-         end-to-end (needs an asset-producer harness), and candidate blocking.
+   - [~] Deferred (tabled): a db-level integration test driving extraction ->
+         resolution end-to-end (needs an asset-producer harness), and candidate
+         blocking over the entity table. The deterministic minting path is
+         complete and tested without either; candidate blocking is the gateway to
+         phase-2 model-backed resolution.
    - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
          per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
          / `listResolvers` through DB -> DBCore -> IndexManager (verified by a
