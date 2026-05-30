@@ -207,6 +207,7 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
         } else if (internal_keys.isAssetArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
+            try appendUniqueHintAlloc(alloc, &target_hints, .resolution);
         } else if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
             try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
@@ -1019,4 +1020,18 @@ test "change journal roundtrips the resolution target hint" {
     var borrowed = try decodeBinaryRecordBorrowed(alloc, payload);
     defer borrowed.deinit();
     try std.testing.expectEqual(TargetHint.resolution, borrowed.record.target_hints[0]);
+}
+
+test "change journal emits resolution and graph hints for changed asset artifacts" {
+    const alloc = std.testing.allocator;
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+
+    var record = try recordFromDerivedBatch(alloc, .{
+        .changed_artifact_keys = &.{asset_key},
+    }, 21);
+    defer deinitRecord(alloc, &record);
+
+    try std.testing.expect(recordHasHint(record, .graph));
+    try std.testing.expect(recordHasHint(record, .resolution));
 }
