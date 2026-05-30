@@ -29,6 +29,7 @@ const change_journal_mod = @import("../derived/change_journal.zig");
 const derived_types = @import("../derived/derived_types.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const enrichment_catalog = @import("enrichment_catalog.zig");
+const resolver_catalog = @import("resolver_catalog.zig");
 const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("../enrichment/artifact_codec.zig");
 const backfill_state_mod = @import("../backfill_state.zig");
@@ -71,6 +72,7 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
 
 const index_catalog_key = "\x00\x00__metadata__:indexes";
 const enrichment_catalog_key = "\x00\x00__metadata__:enrichments";
+const resolver_catalog_key = "\x00\x00__metadata__:resolvers";
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
 var bench_hbc_tree_counter: platform.atomic.Value(u64) = .init(0);
 var hbc_coalesce_bulk_writes_cache: std.atomic.Value(u8) = .init(0);
@@ -563,6 +565,7 @@ pub const IndexManager = struct {
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
     algebraic_indexes: std.ArrayListUnmanaged(AlgebraicIndex),
     enrichments: std.ArrayListUnmanaged(enrichment_catalog.EnrichmentConfig),
+    resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
     cached_has_generated_enrichment_targets: std.atomic.Value(bool),
     status_only_index_configs: []types.IndexConfig,
 
@@ -1343,12 +1346,14 @@ pub const IndexManager = struct {
         }
         self.clearStatusOnlyIndexConfigs();
         for (self.enrichments.items) |*entry| entry.deinit(self.alloc);
+        for (self.resolvers.items) |*entry| entry.deinit(self.alloc);
         self.text_indexes.deinit(self.alloc);
         self.dense_indexes.deinit(self.alloc);
         self.sparse_indexes.deinit(self.alloc);
         self.graph_indexes.deinit(self.alloc);
         self.algebraic_indexes.deinit(self.alloc);
         self.enrichments.deinit(self.alloc);
+        self.resolvers.deinit(self.alloc);
         self.alloc.free(self.base_path);
         self.* = undefined;
     }
@@ -1681,6 +1686,7 @@ pub const IndexManager = struct {
         self.bindPrimaryStore(store);
         self.clearStatusOnlyIndexConfigs();
         try self.loadEnrichmentCatalog(store);
+        try self.loadResolverCatalog(store);
 
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -1731,6 +1737,7 @@ pub const IndexManager = struct {
     pub fn loadCatalogOnly(self: *IndexManager, store: anytype) !void {
         self.bindPrimaryStore(store);
         try self.loadEnrichmentCatalog(store);
+        try self.loadResolverCatalog(store);
 
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -5238,6 +5245,37 @@ pub const IndexManager = struct {
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
         try txn.put(enrichment_catalog_key, data);
+        try txn.commit();
+    }
+
+    fn loadResolverCatalog(self: *IndexManager, store: anytype) !void {
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginRead();
+        defer txn.abort();
+        const data = txn.get(resolver_catalog_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+
+        const configs = try resolver_catalog.deserializeCatalog(self.alloc, data);
+        defer {
+            for (configs) |*cfg| cfg.deinit(self.alloc);
+            self.alloc.free(configs);
+        }
+        for (configs) |cfg| {
+            try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        }
+    }
+
+    fn persistResolverCatalog(self: *IndexManager, store: anytype) !void {
+        const data = try resolver_catalog.serializeCatalog(self.alloc, self.resolvers.items);
+        defer self.alloc.free(data);
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(resolver_catalog_key, data);
         try txn.commit();
     }
 
