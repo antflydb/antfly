@@ -16426,18 +16426,45 @@ pub const Index = struct {
         try txn.put(key, merged);
     }
 
+    // Whole-materialization dirty marker: forces a full rebuild. Used when the
+    // affected group cannot be derived from the available facts.
     fn hllCardinalityDirtyKeyAlloc(self: *Index, name: []const u8) ![]u8 {
         return try self.keyAlloc(&.{ "hllcard_dirty", name });
     }
 
+    // Per-group dirty marker: `hllcard_gdirty:<name>:<group_key>`. Lets
+    // maintenance rebuild only the affected group rather than rescanning every
+    // document fact in the index.
+    fn hllCardinalityGroupDirtyPrefixAlloc(self: *Index, name: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hllcard_gdirty", name });
+    }
+
+    fn hllCardinalityGroupDirtyKeyAlloc(self: *Index, name: []const u8, group_key: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hllcard_gdirty", name, group_key });
+    }
+
     // Marks every HLL materialization the removed document contributed to as
     // needing a rebuild. Sketches cannot subtract a value, so a delete/overwrite
-    // can only be reflected by recomputing the affected materialization.
+    // can only be reflected by recomputing the affected groups. The doc's own
+    // facts give the exact group key, so mark just that group; if the group key
+    // cannot be derived, fall back to the whole-materialization marker.
     fn markHllCardinalitiesDirtyForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact) !void {
         for (self.config().hll_cardinalities) |hcfg| {
             if (fact_mod.findScalar(facts, .group, hcfg.value_field) == null) continue;
-            try self.markHllCardinalityDirtyTxn(txn, hcfg);
+            try self.markHllCardinalityDirtyForFactsTxn(txn, hcfg, facts);
         }
+    }
+
+    fn markHllCardinalityDirtyForFactsTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig, facts: []const fact_mod.Fact) !void {
+        const group_key = fact_mod.axisTupleAlloc(self.alloc, facts, hcfg.group_by) catch |err| switch (err) {
+            // Group key not derivable from these facts → conservative full rebuild.
+            error.MissingField => return try self.markHllCardinalityDirtyTxn(txn, hcfg),
+            else => return err,
+        };
+        defer self.alloc.free(group_key);
+        const gkey = try self.hllCardinalityGroupDirtyKeyAlloc(hcfg.name, group_key);
+        defer self.alloc.free(gkey);
+        try txn.put(gkey, "1");
     }
 
     fn markHllCardinalityDirtyTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig) !void {
@@ -16481,7 +16508,12 @@ pub const Index = struct {
             // sketch; a pure add of the value is handled by the warm fold.
             if (fact_mod.findScalar(old_facts, .group, hcfg.value_field) == null) continue;
             if (!hllCardinalityFactsChanged(hcfg, old_facts, new_facts)) continue;
-            try self.markHllCardinalityDirtyTxn(txn, hcfg);
+            // The doc's old group must be recomputed (its value may be gone). If
+            // the update also moved the doc to a different group, that group's
+            // existing sketch is still correct (the warm fold adds the new value)
+            // — but a value moving *out* of the old group requires the old group's
+            // rebuild, which marking the old group below covers.
+            try self.markHllCardinalityDirtyForFactsTxn(txn, hcfg, old_facts);
         }
     }
 
@@ -16560,42 +16592,216 @@ pub const Index = struct {
             try txn.put(key, entry.value_ptr.*);
         }
 
+        // A full rebuild subsumes any pending per-group markers; clear both the
+        // whole-materialization marker and every per-group marker for it.
         const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
         defer self.alloc.free(dirty_key);
         txn.delete(dirty_key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
         };
+        try self.clearHllCardinalityGroupDirtyMarkersTxn(txn, hcfg.name);
+    }
+
+    fn clearHllCardinalityGroupDirtyMarkersTxn(self: *Index, txn: anytype, name: []const u8) !void {
+        const gprefix = try self.hllCardinalityGroupDirtyPrefixAlloc(name);
+        defer self.alloc.free(gprefix);
+        var stale = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (stale.items) |key| self.alloc.free(key);
+            stale.deinit(self.alloc);
+        }
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(gprefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, gprefix)) break;
+            try stale.append(self.alloc, try self.alloc.dupe(u8, entry.key));
+        }
+        for (stale.items) |key| txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    // Rebuilds a single group's sketch from the surviving documents in that
+    // group, resolving members by intersecting the per-axis docfact scalar
+    // postings rather than scanning every document fact in the index. This is
+    // the O(group members) path; the whole-materialization rebuild remains the
+    // O(all docs) fallback for markers without a derivable group key.
+    fn rebuildHllCardinalityGroupTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig, group_key: []const u8) !void {
+        const precision = hllCardinalityPrecision(hcfg);
+        const sketch_key = try self.hllCardinalityKeyAlloc(hcfg.name, group_key);
+        defer self.alloc.free(sketch_key);
+
+        // Decode the group key back into its per-axis scalar tokens so we can
+        // resolve the member document set from the secondary indexes.
+        const axes = token.decodeTupleAlloc(self.alloc, group_key) catch {
+            // Unparseable group key (shouldn't happen) → conservative full rebuild.
+            return try self.rebuildHllCardinalityTxn(txn, hcfg);
+        };
+        defer {
+            for (axes) |axis| self.alloc.free(axis);
+            if (axes.len > 0) self.alloc.free(axes);
+        }
+        if (axes.len != hcfg.group_by.len) return try self.rebuildHllCardinalityTxn(txn, hcfg);
+
+        // Member doc ids = intersection of {docs whose axis_i == group's value_i}.
+        var members: ?[][]u8 = null;
+        defer if (members) |ids| self.freeDocIds(ids);
+        for (hcfg.group_by, axes) |axis_field, axis_scalar| {
+            const resolved = self.resolveUniqueField(axis_field) orelse return try self.rebuildHllCardinalityTxn(txn, hcfg);
+            const ids = try self.docIdsForScalarFactPrefixTxn(txn, .group, resolved.name, axis_scalar);
+            if (members) |current| {
+                defer self.freeDocIds(current);
+                defer self.freeDocIds(ids);
+                members = try self.intersectDocIdsAlloc(current, ids);
+            } else {
+                members = ids;
+            }
+        }
+        const member_ids = members orelse &[_][]u8{};
+
+        // Recompute the group's sketch from the surviving members' value tokens.
+        var sketch: ?[]u8 = null;
+        defer if (sketch) |bytes| self.alloc.free(bytes);
+        for (member_ids) |doc_id| {
+            const fact_key = try self.docFactKey(doc_id);
+            defer self.alloc.free(fact_key);
+            const payload = txn.get(fact_key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            var facts = fact_mod.decodeListAlloc(self.alloc, payload) catch continue;
+            defer facts.deinit(self.alloc);
+            const value_scalar = fact_mod.findScalar(facts.facts, .group, hcfg.value_field) orelse continue;
+            const singleton = try hll.singletonEncodedAlloc(self.alloc, precision, value_scalar);
+            defer self.alloc.free(singleton);
+            const next = (try law_mod.combineAlloc(self.alloc, .hll, sketch, singleton)) orelse continue;
+            if (sketch) |bytes| self.alloc.free(bytes);
+            sketch = next;
+        }
+
+        if (sketch) |bytes| {
+            try txn.put(sketch_key, bytes);
+        } else {
+            // Group emptied by the delete/update: drop its sketch entirely.
+            txn.delete(sketch_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+
+        const gkey = try self.hllCardinalityGroupDirtyKeyAlloc(hcfg.name, group_key);
+        defer self.alloc.free(gkey);
+        txn.delete(gkey) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    // Doc ids whose (role, field) scalar token equals `scalar`, read within an
+    // existing txn (the scalar-posting secondary index keyed by doc id).
+    fn docIdsForScalarFactPrefixTxn(self: *Index, txn: anytype, role: fact_mod.Role, field: []const u8, scalar: []const u8) ![][]u8 {
+        const prefix = try self.docFactScalarPrefixAlloc(role, field, scalar);
+        defer self.alloc.free(prefix);
+        var out = std.ArrayListUnmanaged([]u8).empty;
+        errdefer self.freeDocIds(out.items);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const doc_component = token.componentAt(entry.key, prefix.len) catch continue;
+            if (doc_component.next != entry.key.len) continue;
+            try out.append(self.alloc, try self.alloc.dupe(u8, doc_component.payload));
+        }
+        return try out.toOwnedSlice(self.alloc);
     }
 
     fn anyHllCardinalityDirty(self: *Index, store: *docstore_mod.DocStore) !bool {
         var txn = try store.beginReadTxn();
         defer txn.abort();
         for (self.config().hll_cardinalities) |hcfg| {
-            const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
-            defer self.alloc.free(dirty_key);
-            _ = txn.get(dirty_key) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
-            return true;
+            if (try self.hllCardinalityDirtyTxn(&txn, hcfg.name)) return true;
         }
+        return false;
+    }
+
+    // A materialization is dirty if its whole-materialization marker is set or
+    // any per-group marker exists under its group-dirty prefix.
+    fn hllCardinalityDirtyTxn(self: *Index, txn: anytype, name: []const u8) !bool {
+        const dirty_key = try self.hllCardinalityDirtyKeyAlloc(name);
+        defer self.alloc.free(dirty_key);
+        if (txn.get(dirty_key)) |_| {
+            return true;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+        const gprefix = try self.hllCardinalityGroupDirtyPrefixAlloc(name);
+        defer self.alloc.free(gprefix);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const first = cursor.seekAtOrAfter(gprefix) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        if (first) |entry| return std.mem.startsWith(u8, entry.key, gprefix);
         return false;
     }
 
     fn runHllMaintenanceTxn(self: *Index, txn: anytype) !bool {
         var did_work = false;
         for (self.config().hll_cardinalities) |hcfg| {
+            // Whole-materialization marker → full rebuild (also clears per-group
+            // markers), so handle it first and skip the scoped pass.
             const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
             defer self.alloc.free(dirty_key);
-            _ = txn.get(dirty_key) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
+            const full = blk: {
+                _ = txn.get(dirty_key) catch |err| switch (err) {
+                    error.NotFound => break :blk false,
+                    else => return err,
+                };
+                break :blk true;
             };
-            try self.rebuildHllCardinalityTxn(txn, hcfg);
-            did_work = true;
+            if (full) {
+                try self.rebuildHllCardinalityTxn(txn, hcfg);
+                did_work = true;
+                continue;
+            }
+            // Otherwise rebuild only the groups with a pending per-group marker.
+            if (try self.rebuildDirtyHllCardinalityGroupsTxn(txn, hcfg)) did_work = true;
         }
         return did_work;
+    }
+
+    // Rebuilds each group flagged by a per-group dirty marker. Snapshots the
+    // marker keys first so the rebuild's writes/deletes don't disturb the scan.
+    fn rebuildDirtyHllCardinalityGroupsTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig) !bool {
+        const gprefix = try self.hllCardinalityGroupDirtyPrefixAlloc(hcfg.name);
+        defer self.alloc.free(gprefix);
+        var group_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (group_keys.items) |key| self.alloc.free(key);
+            group_keys.deinit(self.alloc);
+        }
+        {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(gprefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, gprefix)) break;
+                const group_component = token.componentAt(entry.key, gprefix.len) catch continue;
+                if (group_component.next != entry.key.len) continue;
+                try group_keys.append(self.alloc, try self.alloc.dupe(u8, group_component.payload));
+            }
+        }
+        if (group_keys.items.len == 0) return false;
+        for (group_keys.items) |group_key| {
+            try self.rebuildHllCardinalityGroupTxn(txn, hcfg, group_key);
+        }
+        return true;
     }
 
     /// Rebuilds any HLL cardinality materialization marked dirty by a delete or
@@ -16795,15 +17001,9 @@ pub const Index = struct {
     }
 
     fn hllCardinalityDirty(self: *Index, store: *docstore_mod.DocStore, name: []const u8) !bool {
-        const dirty_key = try self.hllCardinalityDirtyKeyAlloc(name);
-        defer self.alloc.free(dirty_key);
         var txn = try store.beginReadTxn();
         defer txn.abort();
-        _ = txn.get(dirty_key) catch |err| switch (err) {
-            error.NotFound => return false,
-            else => return err,
-        };
-        return true;
+        return try self.hllCardinalityDirtyTxn(&txn, name);
     }
 
     /// Total distinct-count estimate for `field_or_path` from a matching HLL
