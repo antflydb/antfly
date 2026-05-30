@@ -435,14 +435,21 @@ Open/index/enrichment validation should reject:
          `Resolver.initFromParts`, and produce the resolution artifact bytes.
          `antfly_matcher`/`antfly_resolver` threaded into the antfly module graph
          (build.zig). Verified by `db-test` + `root-test`.
-   - [ ] Store-I/O wrapper: read the extraction artifact and persist the
-         resolution artifact through a `DerivedBatch` (db-backed `ArtifactStore`
-         over the shard store; key via `resolutionArtifactKeyAlloc`).
-   - [ ] `ResolutionRuntime` worker: catch up on the `resolution` hint
-         (`applied_sequence`), submit on the shard `backend_runtime` durable
-         lane; wire init/start/shutdown in `db.zig`.
-   - [ ] Emit the `resolution` hint on extraction-artifact changes
+   - [x] Per-key processing (`resolution_runtime.processChangedExtraction`):
+         parse a changed asset key (`parseAssetArtifactKeyAlloc`), find the
+         consuming resolver, and run the tested `ResolutionStage` over an
+         `ArtifactStore` to idempotently persist the resolution artifact
+         (written/unchanged/cleared). End-to-end tested over an in-memory store.
+   - [x] Emit the `resolution` hint on extraction-artifact changes
          (`recordFromDerivedBatch` + the rafted thin-record path in `db.zig`).
+   - [ ] db-backed `ArtifactStore` over the shard primary store
+         (`beginRead/get`, `beginWrite/put`, `beginBatch/delete`) to back
+         `processChangedExtraction` in production.
+   - [ ] `ResolutionRuntime` worker: catch up on the `resolution` hint
+         (`applied_sequence`), call `processChangedExtraction` per changed asset
+         key, journal the resolution key via a `DerivedBatch`; submit on the
+         shard `backend_runtime` durable lane; wire init/start/shutdown in
+         `db.zig`.
    - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
          per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
          / `listResolvers` through DB -> DBCore -> IndexManager (verified by a
