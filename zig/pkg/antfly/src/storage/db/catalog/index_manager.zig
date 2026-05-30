@@ -30,6 +30,7 @@ const derived_types = @import("../derived/derived_types.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const enrichment_catalog = @import("enrichment_catalog.zig");
 const resolver_catalog = @import("resolver_catalog.zig");
+pub const ResolverConfig = resolver_catalog.ResolverConfig;
 const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("../enrichment/artifact_codec.zig");
 const backfill_state_mod = @import("../backfill_state.zig");

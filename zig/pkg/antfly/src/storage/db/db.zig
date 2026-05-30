@@ -5307,6 +5307,18 @@ pub const DB = struct {
         try self.core.addEnrichment(cfg);
     }
 
+    pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        try self.core.addResolver(cfg);
+    }
+
+    pub fn removeResolver(self: *DB, name: []const u8) !bool {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.removeResolver(name);
+    }
+
     pub fn hasIndex(self: *DB, name: []const u8) bool {
         return self.core.hasIndex(name);
     }
@@ -5614,6 +5626,12 @@ pub const DB = struct {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return try self.core.listEnrichments(alloc);
+    }
+
+    pub fn listResolvers(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.core.listResolvers(alloc);
     }
 
     fn resolveDocSetForIdsAlloc(self: *DB, alloc: Allocator, doc_ids: []const []const u8) !doc_set.ResolvedDocSet {
@@ -23404,6 +23422,52 @@ test "db graph artifact source lifecycle reuses and protects asset enrichments" 
         tmp.deinit(alloc);
     }
     try std.testing.expectEqualStrings("relations", still_present.field);
+}
+
+test "db resolver catalog persists across reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.addResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ lower _entity.label }}/{{ slug _entity.canonical_text }}",
+            .config_generation = 3,
+        });
+        try std.testing.expectError(error.ResolverAlreadyExists, db.addResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "x",
+        }));
+    }
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const resolvers = try db.listResolvers(alloc);
+    defer {
+        for (resolvers) |*r| r.deinit(alloc);
+        alloc.free(resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+    try std.testing.expectEqualStrings("knowledge_graph", resolvers[0].name);
+    try std.testing.expectEqualStrings("entities", resolvers[0].table);
+    try std.testing.expectEqual(@as(u64, 3), resolvers[0].config_generation);
+
+    try std.testing.expect(try db.removeResolver("knowledge_graph"));
+    const after = try db.listResolvers(alloc);
+    defer alloc.free(after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
 }
 
 test "db graph artifact source reuses user enrichment and rejects incompatible shorthand" {

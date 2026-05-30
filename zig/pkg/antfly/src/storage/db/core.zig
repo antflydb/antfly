@@ -492,6 +492,14 @@ pub const DBCore = struct {
         try self.index_manager.addEnrichment(self.store, cfg);
     }
 
+    pub fn addResolver(self: *DBCore, cfg: index_manager_mod.ResolverConfig) !void {
+        try self.index_manager.addResolver(self.store, cfg);
+    }
+
+    pub fn removeResolver(self: *DBCore, name: []const u8) !bool {
+        return try self.index_manager.removeResolver(self.store, name);
+    }
+
     pub fn hasIndex(self: *DBCore, name: []const u8) bool {
         return self.index_manager.has(name);
     }
@@ -538,6 +546,10 @@ pub const DBCore = struct {
 
     pub fn listEnrichments(self: *DBCore, alloc: Allocator) ![]types.EnrichmentConfig {
         return try self.index_manager.listEnrichmentsPublic(alloc);
+    }
+
+    pub fn listResolvers(self: *DBCore, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
+        return try self.index_manager.listResolvers(alloc);
     }
 
     pub fn deleteIndex(self: *DBCore, name: []const u8) !bool {
