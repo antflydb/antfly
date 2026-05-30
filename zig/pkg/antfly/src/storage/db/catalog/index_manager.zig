@@ -1991,6 +1991,58 @@ pub const IndexManager = struct {
         return false;
     }
 
+    pub fn getResolver(self: *const IndexManager, name: []const u8) ?*const resolver_catalog.ResolverConfig {
+        for (self.resolvers.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry;
+        }
+        return null;
+    }
+
+    pub fn addResolver(self: *IndexManager, store: anytype, cfg: resolver_catalog.ResolverConfig) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (self.getResolver(cfg.name) != null) return error.ResolverAlreadyExists;
+
+        const checkpoint = self.resolvers.items.len;
+        errdefer self.truncateResolvers(checkpoint);
+        try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        try self.persistResolverCatalog(store);
+    }
+
+    pub fn removeResolver(self: *IndexManager, store: anytype, name: []const u8) !bool {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        for (self.resolvers.items, 0..) |*entry, i| {
+            if (!std.mem.eql(u8, entry.name, name)) continue;
+            entry.deinit(self.alloc);
+            _ = self.resolvers.orderedRemove(i);
+            try self.persistResolverCatalog(store);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn listResolvers(self: *const IndexManager, alloc: Allocator) ![]resolver_catalog.ResolverConfig {
+        const out = try alloc.alloc(resolver_catalog.ResolverConfig, self.resolvers.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*cfg| cfg.deinit(alloc);
+            alloc.free(out);
+        }
+        for (self.resolvers.items, 0..) |cfg, i| {
+            out[i] = try resolver_catalog.ResolverConfig.clone(alloc, cfg);
+            initialized += 1;
+        }
+        return out;
+    }
+
+    fn truncateResolvers(self: *IndexManager, len: usize) void {
+        while (self.resolvers.items.len > len) {
+            self.resolvers.items[self.resolvers.items.len - 1].deinit(self.alloc);
+            _ = self.resolvers.pop();
+        }
+    }
+
     pub fn remove(self: *IndexManager, store: anytype, name: []const u8) !bool {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
