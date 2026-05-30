@@ -99,6 +99,7 @@ fn appendReplayArtifactsForHint(
         const keep = switch (hint) {
             .dense_vector, .sparse_vector => isEmbeddingReplayArtifactKey(key),
             .graph => internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key),
+            .resolution => internal_keys.isAssetArtifactKey(key),
             .enrichment, .full_text, .algebraic => false,
         };
         if (keep) try out.append(alloc, key);
@@ -141,6 +142,10 @@ fn encodeReplayPayloadForHint(
             filtered.changed_artifact_keys = artifact_keys.items;
         },
         .graph => {
+            filtered.deleted_doc_keys = record.deleted_doc_keys;
+            filtered.changed_artifact_keys = artifact_keys.items;
+        },
+        .resolution => {
             filtered.deleted_doc_keys = record.deleted_doc_keys;
             filtered.changed_artifact_keys = artifact_keys.items;
         },

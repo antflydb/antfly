@@ -423,9 +423,12 @@ Open/index/enrichment validation should reject:
    - [x] Resolution stage worker body: read extraction -> resolve -> idempotent
          persist (write/unchanged/cleared), behind `ArtifactStore` /
          `CandidateProvider` seams (`lib/resolver`).
-   - [ ] Wire the `resolution` `TargetHint` + managed worker into the storage
-         runtime, submitting the stage as a `backend_runtime` durable job (DB
-         adapter; see "Resolution Stage Runtime").
+   - [x] Reserve + plumb the `resolution` `TargetHint` through the change-journal
+         codec and replay-payload filtering (`change_journal.zig`,
+         `docstore.zig`).
+   - [ ] Managed resolution worker: drive `ResolutionStage` from the `resolution`
+         hint and submit it as a `backend_runtime` durable job (DB adapter; see
+         "Resolution Stage Runtime").
    - [ ] Live candidate blocking adapter: fetch candidates from the entity table
          (`ann`/`exact`/`prefix`) so the resolver runs against real entities.
    - [ ] Promoter: entity upsert via `DocumentTransform`, provenance as mention
