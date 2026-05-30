@@ -282,18 +282,26 @@ number) is additive where the physical type is compatible.
   matches the original. This is the complete authoritative-columns data path in
   isolation.
 
-  Remaining (deliberately not done — it is a hot-path-wide storage change):
-  wiring this into the live segment write/read. The authoritative document today
-  is the `stored_data` blob (`segment.addStoredDoc`), consumed as source of
-  truth in many read sites (`storage/db/aggregations.zig`, `db.zig`). Two pieces
-  remain: (1) at write time, feed `relationalStorageColumnsAlloc` into the
-  segment builder so string columns are persisted as `bytes_val` sections
-  alongside the scan columns (the projection, storage, and reader all now
-  exist); (2) at read time, read each column section back and call
+  Write-side wiring done (live): `document_mapper.buildRelationalTypedFields`
+  now emits **every** present relational column as a `TextDocument.typed_fields`
+  entry, persisting string/blob/geoshape/json columns as `bytes_val` sections
+  (via `relationalStorageValueType` / `coerceRelationalStorageValue`) in addition
+  to the numeric/datetime/boolean/geopoint scan columns. So a relational segment
+  written today already carries a complete, reconstructable column set —
+  numeric/datetime/boolean/geopoint sections double as predicate-scan columns,
+  string columns also keep their analyzed inverted-index entries for term
+  queries, and the `bytes_val` sections are the reconstruction source. Validated
+  by the full `zig build unit-test` suite (2688 tests, 0 failed, 0 leaked), so
+  every segment reader/merger/search path tolerates the added sections.
+
+  Remaining (the last step, deliberately not done — it changes the read source
+  of truth): drop the `stored_data` blob. Today the blob (`segment.addStoredDoc`)
+  is still written and remains the document source of truth, consumed in many
+  read sites (`storage/db/aggregations.zig`, `db.zig`). The final step is to make
+  the read path read each column section back and call
   `reconstructRelationalDocumentAlloc` to synthesize `stored_data` on demand,
-  after which the blob can be dropped for non-`json` columns.
-  Until both land, the blob remains the source of truth and reconstruction is an
-  additive, independently-tested capability.
+  then stop writing the blob for non-`json` columns. Until then the blob is
+  redundant-but-authoritative and the column persistence is additive.
 
 ## Related docs
 

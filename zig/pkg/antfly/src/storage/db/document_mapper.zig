@@ -1468,10 +1468,13 @@ fn extractTextFieldsFromValue(
 }
 
 /// Build the introducer's typed-field input for a relational document from the
-/// declared column catalog. Only columns physically stored as typed doc values
-/// are emitted (numeric -> f64, datetime -> u64 epoch ns, boolean, geopoint);
-/// keyword/text columns use the full-text index and json columns are subtrees,
-/// so they are skipped. Mirrors schema_capability.relationalTypedColumnsAlloc.
+/// declared column catalog. Every present column is emitted as a typed-doc-value
+/// so the segment is fully reconstructable (Phase 5, authoritative columns):
+/// numeric -> f64, datetime -> u64 epoch ns, boolean, geopoint, and
+/// string/blob/geoshape/json -> bytes_val. Numeric/datetime/boolean/geopoint
+/// sections double as predicate-scan columns; string columns additionally keep
+/// their analyzed inverted-index entries for term queries. NOT NULL is enforced
+/// upstream; missing nullable columns are skipped.
 fn buildRelationalTypedFields(
     alloc: Allocator,
     root: std.json.Value,
@@ -1481,10 +1484,10 @@ fn buildRelationalTypedFields(
     errdefer fields.deinit(alloc);
 
     for (columns) |column| {
-        const value_type = relationalTypedValueType(column.field_type) orelse continue;
+        const value_type = relationalStorageValueType(column.field_type);
         const found = valueAtJsonPath(root, column.path) orelse continue;
         if (found == .null) continue;
-        const value = coerceRelationalTypedValue(value_type, found) orelse continue;
+        const value = try coerceRelationalStorageValue(alloc, value_type, found) orelse continue;
         try fields.append(alloc, .{
             .field_name = column.name,
             .value_type = value_type,
@@ -1493,6 +1496,36 @@ fn buildRelationalTypedFields(
     }
 
     return try fields.toOwnedSlice(alloc);
+}
+
+/// typed_doc_values type used to persist a relational column for reconstruction.
+/// numeric/datetime/boolean/geopoint keep their scan-friendly encodings; every
+/// other declared type (keyword/text/link/html/search_as_you_type/blob/geoshape
+/// /json) is persisted as bytes_val.
+fn relationalStorageValueType(field_type: runtime_schema.AntflyType) typed_dv.ValueType {
+    return switch (field_type) {
+        .numeric => .f64_val,
+        .datetime => .u64_val,
+        .boolean => .bool_val,
+        .geopoint => .geo_point,
+        else => .bytes_val,
+    };
+}
+
+fn coerceRelationalStorageValue(alloc: Allocator, value_type: typed_dv.ValueType, json_value: std.json.Value) !?typed_dv.TypedValue {
+    if (value_type == .bytes_val) {
+        // Strings are stored verbatim; structured (object/array) and any other
+        // value is stored as its canonical JSON text. The writer dupes bytes,
+        // so a stringified buffer can be freed by the caller's arena.
+        switch (json_value) {
+            .string => |text| return .{ .bytes_val = text },
+            else => {
+                const encoded = try std.json.Stringify.valueAlloc(alloc, json_value, .{});
+                return .{ .bytes_val = encoded };
+            },
+        }
+    }
+    return coerceRelationalTypedValue(value_type, json_value);
 }
 
 fn relationalTypedValueType(field_type: runtime_schema.AntflyType) ?typed_dv.ValueType {
@@ -3437,8 +3470,13 @@ test "document mapper extracts packed sparse embeddings from _embeddings" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), extracted.sparse_embeddings[0].values[1], 0.0001);
 }
 
-test "buildRelationalTypedFields emits typed columns and skips keyword/json" {
-    const alloc = std.testing.allocator;
+test "buildRelationalTypedFields persists every column for reconstruction" {
+    // Use an arena: bytes_val for json/string columns are stringified into the
+    // passed allocator, matching the real projection arena's lifetime.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
     var doc = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"id":"abc","amount":12.5,"ts":1000,"active":true,"payload":{"k":1}}
     , .{});
@@ -3453,35 +3491,38 @@ test "buildRelationalTypedFields emits typed columns and skips keyword/json" {
     };
 
     const fields = try buildRelationalTypedFields(alloc, doc.value, &columns);
-    defer alloc.free(fields);
 
-    // keyword (id) and json (payload) columns are not typed doc values.
-    try std.testing.expectEqual(@as(usize, 3), fields.len);
-    var saw_amount = false;
-    var saw_ts = false;
-    var saw_active = false;
+    // All five columns are now persisted; string (id) and json (payload) as
+    // bytes_val, the rest with their scan-friendly encodings.
+    try std.testing.expectEqual(@as(usize, 5), fields.len);
     for (fields) |field| {
-        if (std.mem.eql(u8, field.field_name, "amount")) {
-            saw_amount = true;
+        if (std.mem.eql(u8, field.field_name, "id")) {
+            try std.testing.expectEqual(typed_dv.ValueType.bytes_val, field.value_type);
+            try std.testing.expectEqualStrings("abc", field.value.bytes_val);
+        } else if (std.mem.eql(u8, field.field_name, "amount")) {
             try std.testing.expectEqual(typed_dv.ValueType.f64_val, field.value_type);
             try std.testing.expectEqual(@as(f64, 12.5), field.value.f64_val);
         } else if (std.mem.eql(u8, field.field_name, "ts")) {
-            saw_ts = true;
             try std.testing.expectEqual(typed_dv.ValueType.u64_val, field.value_type);
             try std.testing.expectEqual(@as(u64, 1000), field.value.u64_val);
         } else if (std.mem.eql(u8, field.field_name, "active")) {
-            saw_active = true;
             try std.testing.expectEqual(typed_dv.ValueType.bool_val, field.value_type);
             try std.testing.expect(field.value.bool_val);
+        } else if (std.mem.eql(u8, field.field_name, "payload")) {
+            try std.testing.expectEqual(typed_dv.ValueType.bytes_val, field.value_type);
+            // json column persisted as its canonical text
+            try std.testing.expect(std.mem.indexOf(u8, field.value.bytes_val, "\"k\"") != null);
         } else {
             return error.UnexpectedColumn;
         }
     }
-    try std.testing.expect(saw_amount and saw_ts and saw_active);
 }
 
 test "extractTextFieldsFromValue attaches relational typed fields" {
-    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
     const columns = [_]runtime_schema.RelationalColumn{
         .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
         .{ .name = "ts", .path = "ts", .field_type = .datetime, .nullable = true },
@@ -3499,11 +3540,11 @@ test "extractTextFieldsFromValue attaches relational typed fields" {
     defer doc.deinit();
 
     const extracted = try extractTextFieldsFromValue(alloc, doc.value, .{}, schema, null);
-    defer if (extracted.typed_fields) |typed_fields| alloc.free(typed_fields);
-    defer if (extracted.fields.len > 0) alloc.free(extracted.fields);
 
+    // Every present column is now persisted (numeric/datetime/boolean + the
+    // json payload as bytes_val), so the segment can reconstruct the document.
     try std.testing.expect(extracted.typed_fields != null);
-    try std.testing.expectEqual(@as(usize, 3), extracted.typed_fields.?.len);
+    try std.testing.expectEqual(@as(usize, 4), extracted.typed_fields.?.len);
 }
 
 test "relational numeric column is range-scannable end to end" {
