@@ -371,6 +371,15 @@ fn computeAlgebraicAggregation(
     }
 
     if (std.mem.eql(u8, request.type, "cardinality")) {
+        if (try index.approxCardinalityTotalForFieldAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) |estimate| {
+            index.recordPlannerSelected(null, estimate);
+            return .{
+                .name = request.name,
+                .field = request.field,
+                .type = request.type,
+                .value_json = try std.fmt.allocPrint(alloc, "{{\"value\":{d}}}", .{estimate}),
+            };
+        }
         const count = (try index.exactCardinalityForFieldAtGenerationAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) orelse {
             index.recordPlannerFallback("cardinality_unsupported", null, null);
             return null;
@@ -2393,6 +2402,42 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
         for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
+    // For each cardinality child, prefer a matching per-group HLL materialization
+    // (group_key -> estimate, read once) over a per-bucket exact rescan. A null
+    // slot means no materialization matched and the child uses the exact scan.
+    const HllEstimateMap = std.StringHashMapUnmanaged(u64);
+    const child_hll_maps = try alloc.alloc(?HllEstimateMap, child_requests.len);
+    defer {
+        for (child_hll_maps) |*maybe_map| {
+            if (maybe_map.*) |*map| {
+                var it = map.keyIterator();
+                while (it.next()) |key| alloc.free(key.*);
+                map.deinit(alloc);
+            }
+        }
+        alloc.free(child_hll_maps);
+    }
+    for (child_requests, 0..) |child_request, ci| {
+        child_hll_maps[ci] = null;
+        const group_entries = (try index.approxCardinalityEntriesForGroupAlloc(store, &.{bucket_field}, child_request.field, constraints, generation)) orelse continue;
+        defer {
+            for (group_entries) |*entry| entry.deinit(index.alloc);
+            index.alloc.free(group_entries);
+        }
+        var map: HllEstimateMap = .empty;
+        errdefer {
+            var it = map.keyIterator();
+            while (it.next()) |key| alloc.free(key.*);
+            map.deinit(alloc);
+        }
+        for (group_entries) |group_entry| {
+            const gop = try map.getOrPut(alloc, group_entry.group_key);
+            if (!gop.found_existing) gop.key_ptr.* = try alloc.dupe(u8, group_entry.group_key);
+            gop.value_ptr.* = group_entry.estimate;
+        }
+        child_hll_maps[ci] = map;
+    }
+
     for (candidates[0..limit], 0..) |candidate, idx| {
         const key_text = try index.scalarTokenTextAlloc(alloc, candidate.key);
         defer alloc.free(key_text);
@@ -2408,7 +2453,11 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
             alloc.free(child_results);
         }
         for (child_requests, 0..) |child_request, child_idx| {
-            const value = (try index.exactCardinalityForFieldAtGenerationAlloc(store, child_request.field, child_constraints, generation)) orelse return null;
+            const value: u64 = if (child_hll_maps[child_idx]) |map| blk: {
+                const group_key = try index.approxCardinalityGroupKeyForScalarAlloc(candidate.key);
+                defer index.alloc.free(group_key);
+                break :blk map.get(group_key) orelse 0;
+            } else (try index.exactCardinalityForFieldAtGenerationAlloc(store, child_request.field, child_constraints, generation)) orelse return null;
             child_results[child_idx] = .{
                 .name = child_request.name,
                 .field = child_request.field,
@@ -13777,6 +13826,80 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
 
     const status_value = manager.algebraic_indexes.items[0].index.status();
     try std.testing.expect(status_value.planner_algebraic_selected >= 3);
+}
+
+test "algebraic aggregation planner answers cardinality from HLL materialization" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"customers_by_region","group_by":["region"],"value_field":"customer","precision":14}
+        \\  ]
+        \\}
+    ;
+
+    var manager = try index_manager_mod.IndexManager.init(alloc, ".");
+    defer manager.deinit();
+    const mutex = try alloc.create(std.atomic.Mutex);
+    mutex.* = .unlocked;
+    const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
+    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"b\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"c\"}" },
+        .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
+        .{ .key = "o5", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"a\"}" },
+    };
+    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const hits = try alloc.alloc(types.SearchHit, 0);
+    defer alloc.free(hits);
+    const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
+    const ctx = Context{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+    };
+
+    // Root cardinality is served by the merged HLL union: distinct {a,b,c} == 3.
+    const root_requests = [_]SearchAggregationRequest{.{ .name = "unique_customers", .type = "cardinality", .field = "customer" }};
+    const root_aggs = try computeSearchAggregations(alloc, &root_requests, result, ctx);
+    defer deinitResults(alloc, root_aggs);
+    try std.testing.expectEqual(@as(usize, 1), root_aggs.len);
+    try std.testing.expectEqualStrings("{\"value\":3}", root_aggs[0].value_json.?);
+
+    // terms(region) -> cardinality(customer) is served per bucket from the
+    // per-region sketches: west has 3 distinct customers, east has 1.
+    const terms_requests = [_]SearchAggregationRequest{.{
+        .name = "regions",
+        .type = "terms",
+        .field = "region",
+        .aggregations = &.{.{ .name = "unique_customers", .type = "cardinality", .field = "customer" }},
+    }};
+    const terms_aggs = try computeSearchAggregations(alloc, &terms_requests, result, ctx);
+    defer deinitResults(alloc, terms_aggs);
+    try std.testing.expectEqual(@as(usize, 1), terms_aggs.len);
+    try std.testing.expectEqual(@as(usize, 2), terms_aggs[0].buckets.len);
+    try std.testing.expectEqualStrings("\"west\"", terms_aggs[0].buckets[0].key_json);
+    try std.testing.expectEqualStrings("{\"value\":3}", terms_aggs[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("\"east\"", terms_aggs[0].buckets[1].key_json);
+    try std.testing.expectEqualStrings("{\"value\":1}", terms_aggs[0].buckets[1].aggregations[0].value_json.?);
 }
 
 test "algebraic bucket aggregations fall back when nested metrics are unsupported" {

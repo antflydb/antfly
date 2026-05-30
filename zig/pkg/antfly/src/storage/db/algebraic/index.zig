@@ -16402,6 +16402,77 @@ pub const Index = struct {
         return if (merged) |bytes| try hll.estimateEncoded(bytes) else 0;
     }
 
+    fn hllGroupByMatches(self: *const Index, mat_group: []const []const u8, query_group: []const []const u8) bool {
+        if (mat_group.len != query_group.len) return false;
+        for (mat_group, query_group) |mat_field, query_field| {
+            const mat_resolved = self.resolveUniqueField(mat_field) orelse return false;
+            const query_resolved = self.resolveUniqueField(query_field) orelse return false;
+            if (!std.mem.eql(u8, mat_resolved.name, query_resolved.name)) return false;
+        }
+        return true;
+    }
+
+    // Name of an HLL cardinality materialization that can answer a distinct count
+    // of `field_or_path` grouped exactly by `group_fields` (null = any grouping,
+    // used for the merged total). Returns null when constraints or an MVCC read
+    // generation are present, because the sketches are maintained unconstrained
+    // and without per-generation visibility.
+    fn hllCardinalityNameForField(
+        self: *const Index,
+        group_fields: ?[]const []const u8,
+        field_or_path: []const u8,
+        constraints: []const ir.Constraint,
+        generation: ?u64,
+    ) ?[]const u8 {
+        if (constraints.len != 0 or generation != null) return null;
+        const resolved = self.resolveUniqueField(field_or_path) orelse return null;
+        if (resolved.role != .group) return null;
+        for (self.config().hll_cardinalities) |hcfg| {
+            if (!std.mem.eql(u8, hcfg.value_field, resolved.name)) continue;
+            if (group_fields) |fields| {
+                if (!self.hllGroupByMatches(hcfg.group_by, fields)) continue;
+            }
+            return hcfg.name;
+        }
+        return null;
+    }
+
+    /// Total distinct-count estimate for `field_or_path` from a matching HLL
+    /// materialization (the union of every group's sketch), or null when none
+    /// applies. Used to answer a root `cardinality` aggregation.
+    pub fn approxCardinalityTotalForFieldAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        field_or_path: []const u8,
+        constraints: []const ir.Constraint,
+        generation: ?u64,
+    ) !?u64 {
+        const name = self.hllCardinalityNameForField(null, field_or_path, constraints, generation) orelse return null;
+        return try self.approxCardinalityTotalAlloc(store, name);
+    }
+
+    /// Per-group distinct-count estimates for a `terms(group_fields) ->
+    /// cardinality(field)` query, keyed by the materialized group key, or null
+    /// when no HLL materialization matches the group layout and value field.
+    pub fn approxCardinalityEntriesForGroupAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        group_fields: []const []const u8,
+        field_or_path: []const u8,
+        constraints: []const ir.Constraint,
+        generation: ?u64,
+    ) !?[]ApproxCardinalityEntry {
+        const name = self.hllCardinalityNameForField(group_fields, field_or_path, constraints, generation) orelse return null;
+        return try self.approxCardinalityEntriesAlloc(store, name);
+    }
+
+    /// The materialized group key for a single-field terms bucket whose value
+    /// scalar token is `scalar` — i.e. what groupKeyAlloc produces for that field
+    /// — so callers can look up the bucket's estimate in the entries above.
+    pub fn approxCardinalityGroupKeyForScalarAlloc(self: *Index, scalar: []const u8) ![]u8 {
+        return try token.canonicalTupleAlloc(self.alloc, &.{scalar});
+    }
+
     fn applyDirectMaterializationAppendOnlyPreaggregated(
         self: *Index,
         txn: anytype,
