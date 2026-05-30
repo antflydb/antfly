@@ -2341,14 +2341,41 @@ const SymbolCache = struct {
     }
 };
 
+// Running value for one group in a single-law fold. The additive group laws
+// (count/sum/sumsquares/avg) accumulate as native numbers and are formatted to
+// text exactly once in entriesAlloc, instead of round-tripping the running
+// total through decimal text on every contribution. Because encode/parse for
+// i64 and f64 ("{d}") round-trip exactly and contributions are applied in the
+// same order, the formatted result is byte-identical to the previous text
+// merge. The remaining laws (min/max, booleans, set/tuple, timestamps) keep the
+// text-merge path, where order/text identity matters.
+const FoldValue = union(enum) {
+    int: i64,
+    float: f64,
+    avg: algebra.AvgState,
+    text: ?[]u8,
+
+    fn initFor(law_id: law_mod.Id) FoldValue {
+        return switch (law_id) {
+            .count => .{ .int = 0 },
+            .sum, .sumsquares => .{ .float = 0 },
+            .avg => .{ .avg = .{} },
+            else => .{ .text = null },
+        };
+    }
+};
+
 const DerivedJoinFoldAccumulator = struct {
-    values: std.StringHashMapUnmanaged(?[]u8) = .empty,
+    values: std.StringHashMapUnmanaged(FoldValue) = .empty,
 
     fn deinit(self: *@This(), alloc: Allocator) void {
         var it = self.values.iterator();
         while (it.next()) |entry| {
             alloc.free(entry.key_ptr.*);
-            if (entry.value_ptr.*) |value| alloc.free(value);
+            switch (entry.value_ptr.*) {
+                .text => |value| if (value) |bytes| alloc.free(bytes),
+                else => {},
+            }
         }
         self.values.deinit(alloc);
         self.* = .{};
@@ -2368,18 +2395,34 @@ const DerivedJoinFoldAccumulator = struct {
         } else {
             errdefer _ = self.values.remove(group_key);
             gop.key_ptr.* = try alloc.dupe(u8, group_key);
-            gop.value_ptr.* = null;
+            gop.value_ptr.* = FoldValue.initFor(law_id);
         }
-        const next = try tensor_mod.mergeOneSlotValuesAlloc(alloc, law_id, gop.value_ptr.*, contribution);
-        if (gop.value_ptr.*) |old| alloc.free(old);
-        gop.value_ptr.* = next;
+        switch (gop.value_ptr.*) {
+            .int => |*running| running.* += try algebra.parseI64(contribution),
+            .float => |*running| running.* += try algebra.parseF64(contribution),
+            .avg => |*running| {
+                const delta = try algebra.parseAvg(contribution);
+                running.sum += delta.sum;
+                running.count += delta.count;
+            },
+            .text => |*running| {
+                const next = try tensor_mod.mergeOneSlotValuesAlloc(alloc, law_id, running.*, contribution);
+                if (running.*) |old| alloc.free(old);
+                running.* = next;
+            },
+        }
     }
 
     fn entriesAlloc(self: *@This(), alloc: Allocator) ![]FoldEntry {
         var count: usize = 0;
         var count_it = self.values.iterator();
         while (count_it.next()) |entry| {
-            if (entry.value_ptr.* != null) count += 1;
+            switch (entry.value_ptr.*) {
+                .text => |value| if (value != null) {
+                    count += 1;
+                },
+                else => count += 1,
+            }
         }
         const entries = try alloc.alloc(FoldEntry, count);
         var initialized: usize = 0;
@@ -2389,10 +2432,16 @@ const DerivedJoinFoldAccumulator = struct {
         }
         var it = self.values.iterator();
         while (it.next()) |entry| {
-            const value = entry.value_ptr.* orelse continue;
+            const value_bytes = switch (entry.value_ptr.*) {
+                .int => |running| try algebra.encodeI64Alloc(alloc, running),
+                .float => |running| try algebra.encodeF64Alloc(alloc, running),
+                .avg => |running| try algebra.encodeAvgAlloc(alloc, running),
+                .text => |running| try alloc.dupe(u8, running orelse continue),
+            };
+            errdefer alloc.free(value_bytes);
             entries[initialized] = .{
                 .group_key = try alloc.dupe(u8, entry.key_ptr.*),
-                .value = try alloc.dupe(u8, value),
+                .value = value_bytes,
             };
             initialized += 1;
         }
