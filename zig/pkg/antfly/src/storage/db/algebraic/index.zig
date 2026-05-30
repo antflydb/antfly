@@ -5585,14 +5585,6 @@ pub const Index = struct {
             std.mem.eql(u8, kind, "string");
     }
 
-    fn cardinalityDocMatchesConstraints(constraint_ids: []const []const u8, doc_id: []const u8) bool {
-        if (constraint_ids.len == 0) return true;
-        for (constraint_ids) |candidate| {
-            if (std.mem.eql(u8, candidate, doc_id)) return true;
-        }
-        return false;
-    }
-
     // Membership view over a doc-id constraint slice. The slice owns the keys;
     // this set only borrows them, so it must not outlive `constraint_ids`.
     //
