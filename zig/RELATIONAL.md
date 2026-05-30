@@ -265,14 +265,22 @@ number) is additive where the physical type is compatible.
   reconstruct round-trip test. This proves the typed columns carry enough to
   rebuild the document.
 
+  Read primitive done: `TypedDocValuesReader.getBytes` provides per-doc
+  random-access retrieval of `bytes_val` columns (variable-length entries walked
+  by offset), so string/blob/geoshape and `json` columns can be read back from a
+  persisted segment — the value-retrieval gap that previously only had
+  bulk chunk reads. Verified by a multi-value round-trip test.
+
   Remaining (deliberately not done — it is a hot-path-wide storage change):
   actually dropping the JSON blob. The authoritative document today is the
   `stored_data` blob (`segment.addStoredDoc`), consumed as source of truth in
   many read sites (`storage/db/aggregations.zig`, `db.zig`). Two further pieces
-  are needed before the blob can be dropped: (1) keyword/text columns are
-  currently only in the analyzed inverted index and are **not** retrievable, so
-  relational mode must also persist string columns as raw column values (e.g.
-  via `columnar.zig`) to reconstruct them; (2) the read path must call
+  are needed before the blob can be dropped: (1) string columns are currently
+  emitted only to the analyzed inverted index (relational typed-field projection
+  excludes them), so relational mode must *also* persist them as `bytes_val`
+  typed-doc-value columns at write time (the storage + reader now exist via
+  `getBytes`; the write-path emission is the missing wiring); (2) the read path
+  must read each column section back and call
   `reconstructRelationalDocumentAlloc` to synthesize `stored_data` on demand.
   Until both land, the blob remains the source of truth and reconstruction is an
   additive, independently-tested capability.
