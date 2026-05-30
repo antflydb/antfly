@@ -24,13 +24,10 @@ const build_options = @import("build_options");
 
 pub const link_libc = build_options.link_libc;
 
-pub const c = if (build_options.link_libc) @cImport({
-    @cInclude("fcntl.h");
-    @cInclude("unistd.h");
-    @cInclude("sys/stat.h");
-    @cInclude("sys/mman.h");
-    @cInclude("dirent.h");
-}) else struct {};
+// Zig 0.17 removed `@cImport`/`@cInclude`; the libc POSIX surface these helpers
+// use now comes from a hand-written `extern "c"` shim (`posix_c.zig`). The
+// no-libc paths below go through `std.posix` instead and never touch `c`.
+pub const c = if (build_options.link_libc) @import("posix_c.zig") else struct {};
 
 /// Memory-mapped file region. The mapped bytes are valid until `deinit()` is called.
 pub const MmapRegion = struct {

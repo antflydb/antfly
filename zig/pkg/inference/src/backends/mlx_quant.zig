@@ -131,7 +131,7 @@ pub fn monotonicNowNs() u64 {
 }
 
 pub fn enableRawMetalCompressedKeyScoresDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_RAW_METAL_COMPRESSED_KEY_SCORES") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -141,7 +141,7 @@ pub fn enableRawMetalCompressedKeyScoresDebug() bool {
 }
 
 pub fn enableMetalDecoderRuntimeDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_METAL_DECODER_RUNTIME") orelse
         c_std.getenv("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN") orelse return false;
     const slice = std.mem.span(value);
@@ -152,7 +152,7 @@ pub fn enableMetalDecoderRuntimeDebug() bool {
 }
 
 pub fn disableMetalDecoderRuntimeAttentionSpanDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_METAL_DECODER_RUNTIME_DISABLE_ATTENTION_SPAN") orelse
         c_std.getenv("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN_DISABLE_ATTENTION_SPAN") orelse return false;
     const slice = std.mem.span(value);

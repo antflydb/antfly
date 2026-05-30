@@ -79,7 +79,7 @@ fn residentWeightReservationBytes(budget: *const run_memory.RunBudget, estimate_
 }
 
 fn forceWeightHandleLinearDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_FORCE_WEIGHT_HANDLE_LINEAR") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -89,7 +89,7 @@ fn forceWeightHandleLinearDebug() bool {
 }
 
 fn forceCpuTiedLogitsDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_CPU_TIED_LOGITS") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -99,7 +99,7 @@ fn forceCpuTiedLogitsDebug() bool {
 }
 
 fn enableMetalLmHeadArgmaxDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_METAL_LM_HEAD_ARGMAX") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -109,7 +109,7 @@ fn enableMetalLmHeadArgmaxDebug() bool {
 }
 
 fn enableMetalCompressedAttentionBlockDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_METAL_COMPRESSED_ATTENTION_BLOCK") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -119,7 +119,7 @@ fn enableMetalCompressedAttentionBlockDebug() bool {
 }
 
 fn enableMetalCompressedAttentionSpanDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_METAL_COMPRESSED_ATTENTION_SPAN") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -129,7 +129,7 @@ fn enableMetalCompressedAttentionSpanDebug() bool {
 }
 
 fn disableFusedSdpaDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_DISABLE_FUSED_SDPA") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -139,7 +139,7 @@ fn disableFusedSdpaDebug() bool {
 }
 
 fn enableMetalDecoderRuntimeDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_METAL_DECODER_RUNTIME") orelse
         c_std.getenv("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN") orelse return false;
     const slice = std.mem.span(value);
@@ -150,7 +150,7 @@ fn enableMetalDecoderRuntimeDebug() bool {
 }
 
 fn disableMetalDecoderRuntimeAttentionSpanDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_METAL_DECODER_RUNTIME_DISABLE_ATTENTION_SPAN") orelse
         c_std.getenv("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN_DISABLE_ATTENTION_SPAN") orelse return false;
     const slice = std.mem.span(value);
@@ -187,7 +187,7 @@ test "resident weight reservation caps eager estimate to hot set" {
 }
 
 fn forceCpuRmsNormDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_CPU_RMSNORM") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -197,7 +197,7 @@ fn forceCpuRmsNormDebug() bool {
 }
 
 fn forceCpuGqaDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_CPU_GQA") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -207,7 +207,7 @@ fn forceCpuGqaDebug() bool {
 }
 
 fn forceCpuAllLinearDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_CPU_ALL_LINEAR") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -217,7 +217,7 @@ fn forceCpuAllLinearDebug() bool {
 }
 
 fn forceCpuEmbeddingDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_CPU_EMBEDDING") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -227,7 +227,7 @@ fn forceCpuEmbeddingDebug() bool {
 }
 
 fn forceCpuConv1dDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_CPU_CONV1D") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -237,7 +237,7 @@ fn forceCpuConv1dDebug() bool {
 }
 
 fn forceCpuGeluDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_CPU_GELU") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -247,7 +247,7 @@ fn forceCpuGeluDebug() bool {
 }
 
 fn forceCpuSiluDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_CPU_SILU") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -257,7 +257,7 @@ fn forceCpuSiluDebug() bool {
 }
 
 fn forceCpuRopeDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_CPU_ROPE") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -267,7 +267,7 @@ fn forceCpuRopeDebug() bool {
 }
 
 fn forceCpuAddDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_CPU_ADD") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -277,7 +277,7 @@ fn forceCpuAddDebug() bool {
 }
 
 fn forceCpuMultiplyDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_CPU_MULTIPLY") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -287,7 +287,7 @@ fn forceCpuMultiplyDebug() bool {
 }
 
 fn keepHostAfterBackendPromotionDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_KEEP_HOST_AFTER_PROMOTION") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -297,7 +297,7 @@ fn keepHostAfterBackendPromotionDebug() bool {
 }
 
 fn forceRowWiseToFloat32Debug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_TOFLOAT_ROW_WISE") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -329,7 +329,7 @@ pub fn resetQuantExecutionTimingStats() void {
 }
 
 fn forceFlatTiedLogitsDebug() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_MLX_FLAT_TIED_LOGITS") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -339,7 +339,7 @@ fn forceFlatTiedLogitsDebug() bool {
 }
 
 fn debugTiedLogitsShapeEnabled() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_DEBUG_TIED_LOGITS_SHAPE") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -349,7 +349,7 @@ fn debugTiedLogitsShapeEnabled() bool {
 }
 
 fn debugTiedLogitsInputRowsEnabled() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_DEBUG_TIED_LOGITS_INPUT_ROWS") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -359,7 +359,7 @@ fn debugTiedLogitsInputRowsEnabled() bool {
 }
 
 fn debugTiedLogitsOutputEnabled() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv("TERMITE_DEBUG_TIED_LOGITS_OUTPUT") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -2577,7 +2577,7 @@ fn mlxHasNativeQuantKernel(tensor_type: gguf_tensor_types.TensorType) bool {
 }
 
 fn forceQ1_0RepackDebug() bool {
-    const C = @cImport(@cInclude("stdlib.h"));
+    const C = @import("../util/c_env.zig");
     const value = C.getenv("TERMITE_FORCE_Q1_0_REPACK") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -10518,7 +10518,7 @@ fn mockNativeQuantProvider() mlx_quant.Provider {
 }
 
 fn metalShaderValidationEnabledForTest() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     return c_std.getenv("MTL_SHADER_VALIDATION") != null;
 }
 

@@ -20,9 +20,11 @@
 const std = @import("std");
 const c_file = @import("../util/c_file.zig");
 
-const c = @cImport({
-    @cInclude("ort_genai_c.h");
-});
+// Zig 0.17 removed `@cImport`. The `ortgenai_c` module (translate-c of
+// ort_genai_c.h) is provided by the build system, wired in only when
+// `-Donnx=true`; backends.zig imports this file under the same `enable_onnx`
+// gate.
+const c = @import("ortgenai_c");
 
 var overlay_package_nonce = std.atomic.Value(u64).init(0);
 

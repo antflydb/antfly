@@ -247,7 +247,7 @@ const OwnedFullKv = struct {
 
 fn getenvBool(comptime name: [*:0]const u8) bool {
     if (comptime @import("builtin").os.tag == .freestanding) return false;
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv(name) orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -258,7 +258,7 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
 
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = @import("../util/c_env.zig");
     const value = c_std.getenv(name) orelse return null;
     const slice = std.mem.span(value);
     if (slice.len == 0) return null;

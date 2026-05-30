@@ -16,12 +16,11 @@
 // Mirrors the legacy Go inference caching strategy.
 
 const std = @import("std");
-const libc = @cImport(@cInclude("time.h"));
 
+// Zig 0.17 removed `@cImport`; this only needed a nanosecond timestamp for cache
+// entry timing, which `std.time` provides directly.
 fn nowNs() i64 {
-    var ts: libc.struct_timespec = undefined;
-    if (libc.clock_gettime(libc.CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.tv_nsec));
+    return @as(i64, @truncate(std.time.nanoTimestamp()));
 }
 
 pub fn ResultCache(comptime V: type) type {

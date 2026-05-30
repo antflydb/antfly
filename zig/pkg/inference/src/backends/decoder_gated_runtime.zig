@@ -25,7 +25,7 @@ const metal_compute_mod = @import("../ops/metal_compute.zig");
 const ops = @import("../ops/ops.zig");
 const native_blas = @import("native.zig");
 
-const c_std = @cImport(@cInclude("stdlib.h"));
+const c_std = @import("../util/c_env.zig");
 
 pub const TimingStats = struct {
     prepare_calls: u64 = 0,

@@ -17,13 +17,10 @@ const build_options = @import("build_options");
 const linalg = @import("inference_linalg");
 
 // Optional system BLAS bindings — uses vecLib/cblas on macOS, OpenBLAS elsewhere.
-const c = if (build_options.enable_system_blas) @cImport({
-    if (@import("builtin").os.tag == .macos) {
-        @cInclude("vecLib/cblas.h");
-    } else {
-        @cInclude("cblas.h");
-    }
-}) else struct {};
+// Zig 0.17 removed `@cImport`; the build system provides `blas_c` as a
+// translate-c module (cblas.h / vecLib/cblas.h) when `-Dsystem-blas=true`, or an
+// empty struct otherwise.
+const c = @import("blas_c");
 
 pub const Io = std.Io;
 pub const Cancelable = std.Io.Cancelable;

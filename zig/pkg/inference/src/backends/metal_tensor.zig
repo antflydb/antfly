@@ -72,7 +72,7 @@ var to_host_trace_count: usize = 0;
 
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
-    const c = @cImport(@cInclude("stdlib.h"));
+    const c = @import("../util/c_env.zig");
     const value = c.getenv(name) orelse return null;
     const slice = std.mem.span(value);
     if (slice.len == 0) return null;

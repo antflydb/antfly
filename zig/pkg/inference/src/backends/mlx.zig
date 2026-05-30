@@ -21,9 +21,10 @@ const std = @import("std");
 const tensor_mod = @import("tensor.zig");
 const runtime = @import("../runtime/root.zig");
 
-pub const c = @cImport({
-    @cInclude("mlx/c/mlx.h");
-});
+// Zig 0.17 removed `@cImport`. The `mlx_c` module (translate-c of mlx/c/mlx.h)
+// is provided by the build system, wired in only when `-Dmlx=true`; backends.zig
+// imports this file under the same `enable_mlx` gate.
+pub const c = @import("mlx_c");
 
 extern fn termite_metal_device_available() c_int;
 extern "c" fn free(ptr: ?*anyopaque) void;
@@ -72,7 +73,7 @@ pub const ShardedMatrix = struct {
 };
 
 pub fn allowCpuStreamWithoutMetal() bool {
-    const libc = @cImport(@cInclude("stdlib.h"));
+    const libc = @import("../util/c_env.zig");
     const value = libc.getenv("TERMITE_MLX_ALLOW_CPU_STREAM_WITHOUT_METAL") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or

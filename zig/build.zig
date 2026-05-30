@@ -317,6 +317,32 @@ fn detectFfmpegPaths(b: *std.Build, target: std.Build.ResolvedTarget) ?FfmpegPat
     return null;
 }
 
+/// Provide the `spng_c` module imported by the lib/image bench & corpus tools.
+/// Zig 0.17 removed `@cImport`, so libspng bindings come from an `addTranslateC`
+/// of `spng_c.h` when libspng is detected, else the empty `c_empty.zig` struct.
+fn addSpngBinding(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    spng_paths: ?SpngPaths,
+) void {
+    if (spng_paths) |paths| {
+        const tc = b.addTranslateC(.{
+            .root_source_file = b.path("lib/image/src/spng_c.h"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+        });
+        tc.addIncludePath(.{ .cwd_relative = paths.include_dir });
+        mod.addImport("spng_c", tc.createModule());
+    } else {
+        mod.addImport("spng_c", b.createModule(.{
+            .root_source_file = b.path("lib/image/src/c_empty.zig"),
+            .target = target,
+        }));
+    }
+}
+
 fn detectSpngPaths(b: *std.Build, target: std.Build.ResolvedTarget) ?SpngPaths {
     const macos_candidates = [_]SpngPaths{
         .{ .include_dir = "/opt/homebrew/include", .lib_dir = "/opt/homebrew/lib" },
@@ -2247,6 +2273,7 @@ pub fn build(b: *std.Build) void {
     if (lib_image_spng_paths) |spng_paths| {
         lib_image_bench_mod.addIncludePath(.{ .cwd_relative = spng_paths.include_dir });
     }
+    addSpngBinding(b, lib_image_bench_mod, target, lib_image_spng_paths);
     const lib_image_bench = b.addExecutable(.{
         .name = "lib-image-bench",
         .root_module = lib_image_bench_mod,
@@ -2330,6 +2357,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lib_image_corpus_mod.addOptions("build_options", lib_image_corpus_build_options);
+    addSpngBinding(b, lib_image_corpus_mod, target, lib_image_spng_paths);
     if (lib_image_spng_paths) |spng_paths| {
         lib_image_corpus_mod.addIncludePath(.{ .cwd_relative = spng_paths.include_dir });
     }
