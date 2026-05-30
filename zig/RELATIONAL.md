@@ -168,22 +168,38 @@ feeds a per-field `TypedDocValuesWriter` (`introducer.zig:906`) across the whole
 batch; `segment.zig` / `merger.zig` persist and merge the sections, and
 `search/query.zig` reads them for range/equality predicates.
 
-Because relational mode **enforces types**, every declared scalar column is
-type-consistent across documents, so this existing detection path already
-produces a correct typed column per declared scalar column — and the physical
-mapping above is deliberately aligned with what `detectTypedValue` produces, so
-no parallel storage path is introduced. `projectRelationalRowAlloc` is the
-schema-authoritative counterpart: it validates/normalizes the same cells
-(`NOT NULL`, strict types, json capture) ahead of the detector.
+The introducer also accepts **caller-supplied** typed columns directly:
+`TextDocument.typed_fields` bypasses value-based detection entirely
+(`introducer.zig:391`). This is the relational hand-off point.
+`schema_capability.relationalTypedColumnsAlloc` produces exactly that input from
+a relational document — one typed field per present, non-`json` declared column,
+carrying the schema-declared physical type — which gives, for free:
 
-**Remaining wiring (Phase 3):** (1) exclude relational `json` columns from
-typed-field detection so a `json` subtree is indexed as a document rather than
-exploded into typed columns; (2) make declared column types authoritative over
-value-based detection (so a column never silently drops on a stray mistyped
-value); (3) the columnar scan operator + predicate routing. The natural seam is
-to pass the relational column catalog (and json-column paths) into the
-introducer alongside `TextAnalysisConfig`. In Phase B this is also where the
-JSON blob write is dropped for non-`json` columns.
+- **authoritative types** (types come from the schema, not from per-value
+  detection, so a column never silently drops on a stray mistyped value);
+- **`json` columns excluded** from typed detection (a `json` subtree is indexed
+  as a document subtree, never exploded into typed columns).
+
+Both properties are verified at the introducer boundary: the
+`buildSegmentFromText indexes caller-supplied relational typed columns` test
+feeds relational typed columns through `buildSegmentFromText` and asserts the
+declared columns become readable `typed_doc_values` sections while undeclared /
+`json` fields produce none. `projectRelationalRowAlloc` underneath also enforces
+`NOT NULL` and strict types and captures the `json` subtree bytes.
+
+The hand-off keeps layers separate: `schema_capability` emits
+`RelationalTypedField` using `typed_doc_values` types only, and the
+orchestration layer renames `name` → `field_name` to get an
+`introducer.TypedFieldValue` (the other fields are identical).
+
+**Remaining wiring:** make `document_mapper` (the schema-aware producer that
+sets `TextDocument.typed_fields`) call `relationalTypedColumnsAlloc` for
+relational tables. That needs `storage_mode` and the column catalog threaded
+into the *compiled* runtime schema (`storage/schema.zig`, compiled in
+`schema/mod.zig`) — `document_mapper` reads `runtime_schema.TableSchema`, not the
+public-contract schema. Then the columnar scan operator + predicate routing
+(below). In Phase B this is also where the JSON blob write is dropped for
+non-`json` columns.
 
 ### Query path
 
@@ -216,11 +232,13 @@ number) is additive where the physical type is compatible.
   existing segment builder (`introducer.zig`) already materializes correct typed
   columns for type-enforced relational documents (see "How this meets the
   segment builder"). Remaining wiring is folded into Phase 3.
-- **Phase 3 — introducer wiring + scan/pushdown.** Pass the relational column
-  catalog into the introducer: exclude `json` columns from typed-field
-  detection and make declared types authoritative; add the columnar scan
-  operator, route typed-column predicates to it, and serve columnar projection
-  on read.
+- **Phase 3 — introducer hand-off (producer done) + scan/pushdown.**
+  `relationalTypedColumnsAlloc` produces authoritative, json-excluded typed
+  columns for the introducer's caller-supplied `typed_fields` path, verified at
+  the `buildSegmentFromText` boundary. Remaining: have `document_mapper` call it
+  for relational tables (needs `storage_mode` + the column catalog in the
+  compiled runtime schema), then add the columnar scan operator, route
+  typed-column predicates to it, and serve columnar projection on read.
 - **Phase 4 — authoritative columns (Phase B).** Drop the JSON blob for
   non-`json` columns; reconstruct documents from columns on read.
 

@@ -1215,3 +1215,99 @@ fn expectTypedColumnRoundTrip(
         else => unreachable,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Introducer hand-off (Phase 3, see zig/RELATIONAL.md)
+//
+// The segment builder (introducer.zig) accepts caller-supplied typed columns
+// via TextDocument.typed_fields, which bypasses value-based type detection.
+// relationalTypedColumnsAlloc produces exactly that input from a relational
+// document: one typed field per present, non-json declared column, carrying the
+// schema-declared physical type. Because json columns are skipped, a json
+// subtree is never exploded into typed columns (it is indexed as a document
+// subtree instead), and because the types come from the schema rather than from
+// detection, they are authoritative.
+//
+// The fields use typed_doc_values types directly; the orchestration layer maps
+// each RelationalTypedField to an introducer.TypedFieldValue by renaming
+// `name` -> `field_name` (the other two fields are identical), keeping this
+// module independent of the introducer/segment layer.
+// ---------------------------------------------------------------------------
+
+pub const RelationalTypedField = struct {
+    name: []const u8,
+    value_type: typed_doc_values.ValueType,
+    value: typed_doc_values.TypedValue,
+};
+
+pub const RelationalTypedColumns = struct {
+    row: RelationalRow,
+    fields: []RelationalTypedField = &.{},
+
+    pub fn deinit(self: *RelationalTypedColumns, alloc: Allocator) void {
+        if (self.fields.len > 0) alloc.free(self.fields);
+        self.row.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub fn relationalTypedColumnsAlloc(alloc: Allocator, plan: RelationalPlan, root: std.json.Value) !RelationalTypedColumns {
+    var row = try projectRelationalRowAlloc(alloc, plan, root);
+    errdefer row.deinit(alloc);
+
+    var fields = std.ArrayListUnmanaged(RelationalTypedField).empty;
+    errdefer fields.deinit(alloc);
+
+    for (row.cells) |candidate| {
+        if (!candidate.present or candidate.is_json) continue;
+        const column = plan.columns[candidate.column];
+        try fields.append(alloc, .{
+            .name = column.name,
+            .value_type = physicalEnumForColumnType(column.column_type),
+            .value = typedValue(candidate.value),
+        });
+    }
+
+    return .{ .row = row, .fields = try fields.toOwnedSlice(alloc) };
+}
+
+fn physicalEnumForColumnType(column_type: []const u8) typed_doc_values.ValueType {
+    if (std.mem.eql(u8, column_type, "datetime")) return .u64_val;
+    if (std.mem.eql(u8, column_type, "integer") or std.mem.eql(u8, column_type, "number")) return .f64_val;
+    if (std.mem.eql(u8, column_type, "boolean")) return .bool_val;
+    if (std.mem.eql(u8, column_type, "geopoint")) return .geo_point;
+    return .bytes_val;
+}
+
+fn relationalFieldByName(fields: []const RelationalTypedField, name: []const u8) ?RelationalTypedField {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) return field;
+    }
+    return null;
+}
+
+test "relational typed columns exclude json and carry declared physical types" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"abc","amount":12.5,"qty":7,"ts":1000,"active":true,"attrs":{"k":"v"},"payload":[1,2,3]}
+    , .{});
+    defer doc.deinit();
+
+    var columns = try relationalTypedColumnsAlloc(alloc, plan, doc.value);
+    defer columns.deinit(alloc);
+
+    // json columns (attrs, payload) are excluded; the five scalar columns remain.
+    try std.testing.expect(relationalFieldByName(columns.fields, "attrs") == null);
+    try std.testing.expect(relationalFieldByName(columns.fields, "payload") == null);
+    try std.testing.expectEqual(@as(usize, 5), columns.fields.len);
+
+    try std.testing.expectEqual(typed_doc_values.ValueType.bytes_val, relationalFieldByName(columns.fields, "id").?.value_type);
+    try std.testing.expectEqual(typed_doc_values.ValueType.f64_val, relationalFieldByName(columns.fields, "amount").?.value_type);
+    try std.testing.expectEqual(typed_doc_values.ValueType.f64_val, relationalFieldByName(columns.fields, "qty").?.value_type);
+    try std.testing.expectEqual(typed_doc_values.ValueType.u64_val, relationalFieldByName(columns.fields, "ts").?.value_type);
+    try std.testing.expectEqual(typed_doc_values.ValueType.bool_val, relationalFieldByName(columns.fields, "active").?.value_type);
+    try std.testing.expectEqual(@as(f64, 12.5), relationalFieldByName(columns.fields, "amount").?.value.f64_val);
+}
