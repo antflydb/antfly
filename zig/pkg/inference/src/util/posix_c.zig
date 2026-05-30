@@ -68,6 +68,17 @@ pub const dirent = switch (builtin.os.tag) {
     },
 };
 
+comptime {
+    // Call sites read the entry name via `@ptrCast(&entry.*.d_name)` over the
+    // pointer libc's `readdir` returns, so `d_name`'s offset must match the real
+    // `struct dirent` ABI: 19 on glibc/musl Linux x86_64, 21 on Darwin. Turn any
+    // future drift in `std.c.ino_t`/`off_t` widths into a build error rather than
+    // a silent garbage read.
+    const expected: usize = if (builtin.os.tag == .macos) 21 else 19;
+    if (@offsetOf(dirent, "d_name") != expected)
+        @compileError("posix_c.dirent.d_name offset does not match the platform struct dirent ABI");
+}
+
 pub extern "c" fn open(path: [*:0]const u8, oflag: c_int, ...) c_int;
 pub extern "c" fn close(fd: c_int) c_int;
 pub extern "c" fn read(fd: c_int, buf: [*]u8, nbyte: usize) isize;

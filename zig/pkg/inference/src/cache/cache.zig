@@ -17,10 +17,14 @@
 
 const std = @import("std");
 
-// Zig 0.17 removed `@cImport`; this only needed a nanosecond timestamp for cache
-// entry timing, which `std.time` provides directly.
+// Monotonic nanosecond timestamp for cache entry TTL bookkeeping. The pre-0.17
+// code used clock_gettime(CLOCK_MONOTONIC) via @cImport; @cImport is gone, but
+// std.posix.clock_gettime gives the same monotonic source. Wall-clock
+// std.time.nanoTimestamp() is avoided here so an NTP/manual clock jump can't
+// corrupt expiry math.
 fn nowNs() i64 {
-    return @as(i64, @truncate(std.time.nanoTimestamp()));
+    const ts = std.posix.clock_gettime(std.posix.CLOCK.MONOTONIC) catch return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
 pub fn ResultCache(comptime V: type) type {
