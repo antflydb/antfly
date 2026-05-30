@@ -876,7 +876,7 @@ pub const SpanStartTargetStats = struct {
     positive_span_label_count: u64 = 0,
     ignored_span_count: u64 = 0,
     entity_type_count: usize = 0,
-    positive_counts_by_entity_type: [max_span_start_entity_types]u64 = [_]u64{0} ** max_span_start_entity_types,
+    positive_counts_by_entity_type: [max_span_start_entity_types]u64 = @as([max_span_start_entity_types]u64, @splat(0)),
 };
 
 pub const SpanStartTargetOptions = struct {
@@ -1096,9 +1096,9 @@ test "fillSpanStartTargetsFromEncodedBatch packs labels masks and token indices"
     var words_mask = [_]i32{ 0, 0, 1, 2, 3, 0, 0, 0 };
     var first_token_positions = [_]i32{ 2, 3, 4 };
     var word_lengths = [_]f32{ 5, 4, 6 };
-    var word_has_digit = [_]f32{0.0} ** 3;
-    var word_is_title = [_]f32{0.0} ** 3;
-    var word_is_all_caps = [_]f32{0.0} ** 3;
+    var word_has_digit = @as([3]f32, @splat(0.0));
+    var word_is_title = @as([3]f32, @splat(0.0));
+    var word_is_all_caps = @as([3]f32, @splat(0.0));
     var span_indices = [_]i32{
         0, 0,
         1, 2,
@@ -1138,7 +1138,7 @@ test "fillSpanStartTargetsFromEncodedBatch packs labels masks and token indices"
         .num_entity_types = 2,
     };
 
-    var targets = [_]f32{0.0} ** (3 * 6);
+    var targets = @as([(3 * 6)]f32, @splat(0.0));
     const stats = try fillSpanStartTargetsFromEncodedBatch(&batch, &targets);
     try testing.expectEqual(@as(u64, 2), stats.valid_span_count);
     try testing.expectEqual(@as(u64, 2), stats.positive_span_label_count);
@@ -1158,9 +1158,9 @@ test "fillWeightedSpanStartTargetsFromEncodedBatch packs per-label positive weig
     var words_mask = [_]i32{ 0, 0, 1, 2, 3, 0, 0, 0 };
     var first_token_positions = [_]i32{ 2, 3, 4 };
     var word_lengths = [_]f32{ 5, 4, 6 };
-    var word_has_digit = [_]f32{0.0} ** 3;
-    var word_is_title = [_]f32{0.0} ** 3;
-    var word_is_all_caps = [_]f32{0.0} ** 3;
+    var word_has_digit = @as([3]f32, @splat(0.0));
+    var word_is_title = @as([3]f32, @splat(0.0));
+    var word_is_all_caps = @as([3]f32, @splat(0.0));
     var span_indices = [_]i32{
         0, 0,
         1, 2,
@@ -1200,7 +1200,7 @@ test "fillWeightedSpanStartTargetsFromEncodedBatch packs per-label positive weig
         .num_entity_types = 2,
     };
 
-    var targets = [_]f32{0.0} ** (3 * 8);
+    var targets = @as([(3 * 8)]f32, @splat(0.0));
     const weights = [_]f32{ 32.0, 96.0 };
     const stats = try fillWeightedSpanStartTargetsFromEncodedBatch(&batch, &weights, &targets);
     try testing.expectEqual(@as(u64, 2), stats.valid_span_count);
@@ -1216,9 +1216,9 @@ test "fillSpanStartTargetsFromEncodedBatchWithOptions weights overlapping hard n
     var words_mask = [_]i32{ 0, 0, 1, 2, 3, 0, 0, 0 };
     var first_token_positions = [_]i32{ 2, 3, 4 };
     var word_lengths = [_]f32{ 5, 4, 6 };
-    var word_has_digit = [_]f32{0.0} ** 3;
-    var word_is_title = [_]f32{0.0} ** 3;
-    var word_is_all_caps = [_]f32{0.0} ** 3;
+    var word_has_digit = @as([3]f32, @splat(0.0));
+    var word_is_title = @as([3]f32, @splat(0.0));
+    var word_is_all_caps = @as([3]f32, @splat(0.0));
     var span_indices = [_]i32{
         0, 1,
         1, 1,
@@ -1258,7 +1258,7 @@ test "fillSpanStartTargetsFromEncodedBatchWithOptions weights overlapping hard n
         .num_entity_types = 2,
     };
 
-    var targets = [_]f32{0.0} ** (3 * 6);
+    var targets = @as([(3 * 6)]f32, @splat(0.0));
     _ = try fillSpanStartTargetsFromEncodedBatchWithOptions(&batch, .{ .hard_negative_weight = 4.0 }, &targets);
 
     try testing.expectEqualSlices(f32, &.{ 1.0, 0.0, 1.0, 4.0, 2.0, 3.0 }, targets[0..6]);
@@ -1277,8 +1277,8 @@ test "makeTrainerInput populates the expected fields for token classification" {
     const num_classes: u32 = 4;
 
     var input_ids = [_]i64{ 1, 2, 3, 4, 5, 6 };
-    var mask = [_]f32{1.0} ** (2 * 3);
-    var targets = [_]f32{0.0} ** (2 * 3 * 4);
+    var mask = @as([(2 * 3)]f32, @splat(1.0));
+    var targets = @as([(2 * 3 * 4)]f32, @splat(0.0));
     // Give each non-ignored token a class; leave one row all-zero to
     // exercise the "ignored via zero row" convention.
     targets[0 * 4 + 1] = 1.0;

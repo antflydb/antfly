@@ -376,7 +376,7 @@ pub const Builder = struct {
             return self.broadcast(scalar, &.{}, larger);
         }
         var dims: [8]i64 = undefined;
-        var used: [8]bool = .{false} ** 8;
+        var used: [8]bool = @splat(false);
         const offset = larger.dimensions.len - smaller.dimensions.len;
         for (0..smaller.dimensions.len) |i| {
             const smaller_dim = smaller.dimensions[i];

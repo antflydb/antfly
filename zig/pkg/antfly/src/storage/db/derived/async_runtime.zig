@@ -912,7 +912,7 @@ test "async dense publish NotFound retries without failing runtime" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-dense-publish-retry-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -961,7 +961,7 @@ test "async dense catch-up NotFound retries without failing runtime" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-dense-catch-up-retry-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1010,7 +1010,7 @@ test "async full-text catch-up uses generic publish lifecycle" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-full-text-generic-catch-up-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1060,7 +1060,7 @@ test "async dense publishes applied window before target tail is visible" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-dense-bounded-publish-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());

@@ -176,11 +176,9 @@ fn addDelegatedPackageStep(
     };
 }
 
-fn forwardBuildArgs(b: *std.Build, run: *std.Build.Step.Run) void {
-    if (b.args) |args| {
-        run.addArg("--");
-        run.addArgs(args);
-    }
+fn forwardBuildArgs(run: *std.Build.Step.Run) void {
+    run.addArg("--");
+    run.addPassthruArgs();
 }
 
 fn addDelegatedInferenceOptions(
@@ -240,7 +238,7 @@ fn addDelegatedInferenceBuildSteps(
         const delegated = addDelegatedPackageStep(b, "inference", "pkg/inference", step_name, "pkg/inference");
         const run = delegated.run;
         addDelegatedInferenceOptions(b, run, enable_mlx, mlx_root, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
-        forwardBuildArgs(b, run);
+        forwardBuildArgs(run);
         if (std.mem.eql(u8, step_name, "test")) {
             test_step = delegated.step;
         }
@@ -317,6 +315,32 @@ fn detectFfmpegPaths(b: *std.Build, target: std.Build.ResolvedTarget) ?FfmpegPat
         if (pathExists(b, header) and (pathExists(b, dylib) or pathExists(b, so))) return candidate;
     }
     return null;
+}
+
+/// Provide the `spng_c` module imported by the lib/image bench & corpus tools.
+/// Zig 0.17 removed `@cImport`, so libspng bindings come from an `addTranslateC`
+/// of `spng_c.h` when libspng is detected, else the empty `c_empty.zig` struct.
+fn addSpngBinding(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    spng_paths: ?SpngPaths,
+) void {
+    if (spng_paths) |paths| {
+        const tc = b.addTranslateC(.{
+            .root_source_file = b.path("lib/image/src/spng_c.h"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+        });
+        tc.addIncludePath(.{ .cwd_relative = paths.include_dir });
+        mod.addImport("spng_c", tc.createModule());
+    } else {
+        mod.addImport("spng_c", b.createModule(.{
+            .root_source_file = b.path("lib/image/src/c_empty.zig"),
+            .target = target,
+        }));
+    }
 }
 
 fn detectSpngPaths(b: *std.Build, target: std.Build.ResolvedTarget) ?SpngPaths {
@@ -417,6 +441,10 @@ fn addLocalHttpxModule(
 
 const AntflyRootImports = struct {
     build_options: *std.Build.Step.Options,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    lmdb_backend: LmdbBackend,
+    link_libc: bool,
     lmdb_engine: *std.Build.Module,
     raft_engine: *std.Build.Module,
     public_openapi: *std.Build.Module,
@@ -552,6 +580,7 @@ const AntflyRootImports = struct {
             });
         }
         mod.link_libc = link_libc;
+        antfly_storage_build.addLmdbCBindingsImport(b, mod, self.target, self.optimize, self.lmdb_backend, link_libc);
         addSnowballModule(b, mod);
     }
 };
@@ -1056,6 +1085,11 @@ fn addOpenApiRegenStep(
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const test_filter_override = b.option(
+        []const []const u8,
+        "test-filter",
+        "Compile-time unit test name filter (repeatable)",
+    );
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -1588,6 +1622,10 @@ pub fn build(b: *std.Build) void {
 
     const antfly_imports = AntflyRootImports{
         .build_options = build_options,
+        .target = target,
+        .optimize = optimize,
+        .lmdb_backend = lmdb_backend,
+        .link_libc = link_libc,
         .lmdb_engine = lmdb_engine_mod,
         .raft_engine = raft_engine_mod,
         .public_openapi = public_openapi_mod,
@@ -1993,10 +2031,8 @@ pub fn build(b: *std.Build) void {
         install_wasm_step.dependOn(step);
     }
 
-    const run_antfly_wasm_smoke = b.addSystemCommand(&.{
-        "node",
-        b.getInstallPath(.prefix, "antfly-wasm/run.mjs"),
-    });
+    const run_antfly_wasm_smoke = b.addSystemCommand(&.{"node"});
+    run_antfly_wasm_smoke.addFileArg(b.graph.path(.install_prefix, "antfly-wasm/run.mjs"));
     run_antfly_wasm_smoke.step.dependOn(&install_antfly_wasm.step);
     run_antfly_wasm_smoke.step.dependOn(&install_antfly_wasm_smoke_run.step);
     run_antfly_wasm_smoke.step.dependOn(&install_antfly_wasm_client.step);
@@ -2040,7 +2076,7 @@ pub fn build(b: *std.Build) void {
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_mod,
-        .filters = selectTestFilters(b, &capi_default_filters),
+        .filters = selectTestFilters(test_filter_override, &capi_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -2237,6 +2273,7 @@ pub fn build(b: *std.Build) void {
     if (lib_image_spng_paths) |spng_paths| {
         lib_image_bench_mod.addIncludePath(.{ .cwd_relative = spng_paths.include_dir });
     }
+    addSpngBinding(b, lib_image_bench_mod, target, lib_image_spng_paths);
     const lib_image_bench = b.addExecutable(.{
         .name = "lib-image-bench",
         .root_module = lib_image_bench_mod,
@@ -2248,14 +2285,11 @@ pub fn build(b: *std.Build) void {
         lib_image_bench.root_module.link_libc = true;
     }
     const run_lib_image_bench = b.addRunArtifact(lib_image_bench);
-    if (b.args) |args| {
-        run_lib_image_bench.addArgs(args);
-    } else {
-        run_lib_image_bench.addArgs(&.{
-            "image-decode-suite",
-            "25",
-        });
-    }
+    run_lib_image_bench.addArgs(&.{
+        "image-decode-suite",
+        "25",
+    });
+    run_lib_image_bench.addPassthruArgs();
     const lib_image_bench_step = b.step("lib-image-bench", "Run lib/image decode benchmarks");
     lib_image_bench_step.dependOn(&run_lib_image_bench.step);
 
@@ -2290,15 +2324,12 @@ pub fn build(b: *std.Build) void {
         .root_module = pdf_bench_mod,
     });
     const run_lib_pdf_bench = b.addRunArtifact(lib_pdf_bench);
-    if (b.args) |args| {
-        run_lib_pdf_bench.addArgs(args);
-    } else {
-        run_lib_pdf_bench.addArgs(&.{
-            "suite",
-            "lib/pdf/testdata/simple_text_fixture.pdf",
-            "25",
-        });
-    }
+    run_lib_pdf_bench.addArgs(&.{
+        "suite",
+        "lib/pdf/testdata/simple_text_fixture.pdf",
+        "25",
+    });
+    run_lib_pdf_bench.addPassthruArgs();
     const lib_pdf_bench_step = b.step("lib-pdf-bench", "Run lib/pdf benchmarks");
     lib_pdf_bench_step.dependOn(&run_lib_pdf_bench.step);
 
@@ -2326,6 +2357,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lib_image_corpus_mod.addOptions("build_options", lib_image_corpus_build_options);
+    addSpngBinding(b, lib_image_corpus_mod, target, lib_image_spng_paths);
     if (lib_image_spng_paths) |spng_paths| {
         lib_image_corpus_mod.addIncludePath(.{ .cwd_relative = spng_paths.include_dir });
     }
@@ -2568,7 +2600,7 @@ pub fn build(b: *std.Build) void {
     };
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_unit_default_filters),
+        .filters = selectTestFilters(test_filter_override, &lib_unit_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -2586,7 +2618,7 @@ pub fn build(b: *std.Build) void {
     };
     const lib_recall_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_recall_default_filters),
+        .filters = selectTestFilters(test_filter_override, &lib_recall_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -2598,7 +2630,7 @@ pub fn build(b: *std.Build) void {
 
     const raft_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"raft."}),
+        .filters = selectTestFilters(test_filter_override, &.{"raft."}),
     });
     const run_raft_unit_tests = b.addRunArtifact(raft_unit_tests);
 
@@ -2703,7 +2735,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_db_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"storage.db.db.test."}),
+        .filters = selectTestFilters(test_filter_override, &.{"storage.db.db.test."}),
     });
     const run_lib_db_tests = b.addRunArtifact(lib_db_tests);
     const lib_db_test_step = b.step("lib-db-test", "Run root-module DB tests only");
@@ -2738,7 +2770,7 @@ pub fn build(b: *std.Build) void {
     };
     const lib_data_runtime_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
-        .filters = selectTestFilters(b, &lib_data_runtime_default_filters),
+        .filters = selectTestFilters(test_filter_override, &lib_data_runtime_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -2757,7 +2789,7 @@ pub fn build(b: *std.Build) void {
     };
     const lib_data_storage_tests = b.addTest(.{
         .root_module = data_storage_test_mod,
-        .filters = selectTestFilters(b, &lib_data_storage_default_filters),
+        .filters = selectTestFilters(test_filter_override, &lib_data_storage_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -2959,7 +2991,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_metadata_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"metadata."}),
+        .filters = selectTestFilters(test_filter_override, &.{"metadata."}),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -2987,7 +3019,7 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_sim_default_filters = [_][]const u8{"metadata http cluster simulation"};
     const lib_metadata_sim_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_sim_default_filters),
+        .filters = selectTestFilters(test_filter_override, &lib_metadata_sim_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3013,7 +3045,7 @@ pub fn build(b: *std.Build) void {
     };
     const lib_metadata_sim_core_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_sim_core_default_filters),
+        .filters = selectTestFilters(test_filter_override, &lib_metadata_sim_core_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3031,7 +3063,7 @@ pub fn build(b: *std.Build) void {
     };
     const lib_metadata_sim_smoke_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_sim_smoke_default_filters),
+        .filters = selectTestFilters(test_filter_override, &lib_metadata_sim_smoke_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3046,7 +3078,7 @@ pub fn build(b: *std.Build) void {
     };
     const lib_metadata_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_vopr_default_filters),
+        .filters = selectTestFilters(test_filter_override, &lib_metadata_vopr_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3061,7 +3093,7 @@ pub fn build(b: *std.Build) void {
     };
     const lib_metadata_vopr_chaos_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_vopr_chaos_default_filters),
+        .filters = selectTestFilters(test_filter_override, &lib_metadata_vopr_chaos_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3104,9 +3136,9 @@ pub fn build(b: *std.Build) void {
         "metadata http cluster simulation survives metadata leader restart during placement reconcile",
         "metadata http cluster simulation drops table topology across leader restart",
     };
-    const lib_metadata_transition_chaos_filters = selectTestFilters(b, &lib_metadata_transition_chaos_default_filters);
-    const lib_metadata_public_chaos_filters = selectTestFilters(b, &lib_metadata_public_chaos_default_filters);
-    const lib_metadata_placement_chaos_filters = selectTestFilters(b, &lib_metadata_placement_chaos_default_filters);
+    const lib_metadata_transition_chaos_filters = selectTestFilters(test_filter_override, &lib_metadata_transition_chaos_default_filters);
+    const lib_metadata_public_chaos_filters = selectTestFilters(test_filter_override, &lib_metadata_public_chaos_default_filters);
+    const lib_metadata_placement_chaos_filters = selectTestFilters(test_filter_override, &lib_metadata_placement_chaos_default_filters);
 
     const lib_metadata_transition_chaos_test_step = b.step("lib-metadata-transition-chaos-test", "Run metadata split/merge transition restart and partition chaos simulations");
     var metadata_transition_chaos_progress_tail: ?*std.Build.Step = null;
@@ -3211,7 +3243,7 @@ pub fn build(b: *std.Build) void {
     };
     const public_api_parity_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &public_api_parity_default_filters),
+        .filters = selectTestFilters(test_filter_override, &public_api_parity_default_filters),
     });
     const run_public_api_parity_tests = b.addRunArtifact(public_api_parity_tests);
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
@@ -3656,7 +3688,7 @@ pub fn build(b: *std.Build) void {
     };
     const lib_storage_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_storage_default_filters),
+        .filters = selectTestFilters(test_filter_override, &lib_storage_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3668,7 +3700,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_storage_progress_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_storage_default_filters),
+        .filters = selectTestFilters(test_filter_override, &lib_storage_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3955,7 +3987,7 @@ pub fn build(b: *std.Build) void {
     const lmdb_test_step = b.step("lmdb-test", "Run Zig LMDB port unit tests");
     lmdb_test_step.dependOn(&run_lmdb_unit_tests.step);
 
-    const storage_lmdb_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const storage_lmdb_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, lmdb_backend);
     const storage_lmdb_unit_tests = b.addTest(.{
         .root_module = storage_lmdb_test_mod,
     });
@@ -3986,7 +4018,7 @@ pub fn build(b: *std.Build) void {
 
     const storage_lmdb_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const storage_lmdb_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, storage_lmdb_soak_build_options);
-    const storage_lmdb_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod);
+    const storage_lmdb_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod, lmdb_backend);
     const storage_lmdb_soak_tests = b.addTest(.{
         .root_module = storage_lmdb_soak_test_mod,
         .filters = &.{"LMDB sim soak stays green"},
@@ -3995,7 +4027,7 @@ pub fn build(b: *std.Build) void {
     const storage_lmdb_soak_step = b.step("lmdb-sim-soak", "Run only the LMDB simulation soak test");
     storage_lmdb_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
 
-    const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, lmdb_backend);
     docstore_test_mod.addImport("bloom", bloom_mod);
     const docstore_unit_tests = b.addTest(.{
         .root_module = docstore_test_mod,
@@ -4005,7 +4037,7 @@ pub fn build(b: *std.Build) void {
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
 
-    const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, lmdb_backend);
     shard_test_mod.addImport("bloom", bloom_mod);
     const shard_unit_tests = b.addTest(.{
         .root_module = shard_test_mod,
@@ -4015,7 +4047,7 @@ pub fn build(b: *std.Build) void {
     const shard_test_step = b.step("shard-test", "Run storage/shard unit tests");
     shard_test_step.dependOn(&run_shard_unit_tests.step);
 
-    const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, lmdb_backend);
     wal_test_mod.addImport("bloom", bloom_mod);
     const wal_unit_tests = b.addTest(.{
         .root_module = wal_test_mod,
@@ -4062,7 +4094,7 @@ pub fn build(b: *std.Build) void {
 
     const wal_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const wal_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_soak_build_options);
-    const wal_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, wal_soak_build_options, wal_soak_engine_mod, platform_mod);
+    const wal_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, wal_soak_build_options, wal_soak_engine_mod, platform_mod, lmdb_backend);
     wal_soak_test_mod.addImport("bloom", bloom_mod);
     const wal_soak_tests = b.addTest(.{
         .root_module = wal_soak_test_mod,
@@ -4077,7 +4109,7 @@ pub fn build(b: *std.Build) void {
     storage_sim_soak_step.dependOn(&run_wal_soak_tests.step);
     soak_test_step.dependOn(storage_sim_soak_step);
 
-    const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, lmdb_backend);
     persistent_test_mod.addImport("bloom", bloom_mod);
     persistent_test_mod.addImport("antfly_vellum", vellum_mod);
     persistent_test_mod.addImport("antfly_regex", regex_mod);
@@ -4122,7 +4154,7 @@ pub fn build(b: *std.Build) void {
 
     const persistent_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const persistent_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, persistent_soak_build_options);
-    const persistent_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, persistent_soak_build_options, persistent_soak_engine_mod, platform_mod);
+    const persistent_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, persistent_soak_build_options, persistent_soak_engine_mod, platform_mod, lmdb_backend);
     persistent_soak_test_mod.addImport("bloom", bloom_mod);
     persistent_soak_test_mod.addImport("antfly_vellum", vellum_mod);
     persistent_soak_test_mod.addImport("antfly_regex", regex_mod);
@@ -4139,7 +4171,7 @@ pub fn build(b: *std.Build) void {
 
     storage_sim_soak_step.dependOn(&run_persistent_soak_tests.step);
 
-    const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, lmdb_backend);
     addSnowballModule(b, index_manager_test_mod);
     index_manager_test_mod.addImport("bloom", bloom_mod);
     index_manager_test_mod.addImport("antfly_vellum", vellum_mod);
@@ -4149,7 +4181,7 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     const index_manager_unit_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
-        .filters = selectTestFilters(b, &.{}),
+        .filters = selectTestFilters(test_filter_override, &.{}),
     });
     const run_index_manager_unit_tests = b.addRunArtifact(index_manager_unit_tests);
 
@@ -4191,7 +4223,7 @@ pub fn build(b: *std.Build) void {
     const index_manager_vopr_step = b.step("index-manager-vopr-test", "Run index manager modeled-storage VOPR smoke tests");
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
-    const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, lmdb_backend);
     const transcribing_db_test_stub_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/testing/transcribing_stub.zig"),
         .target = target,
@@ -4223,7 +4255,7 @@ pub fn build(b: *std.Build) void {
     };
     const db_split_sim_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_split_sim_default_filters),
+        .filters = selectTestFilters(test_filter_override, &db_split_sim_default_filters),
     });
     const run_db_split_sim_tests = b.addRunArtifact(db_split_sim_tests);
     const db_split_sim_step = b.step("db-split-sim-test", "Run only the DB split simulation workload tests");
@@ -4359,7 +4391,7 @@ pub fn build(b: *std.Build) void {
     const db_split_replay_step = b.step("db-split-replay-fixtures", "Run only the DB split replay fixture tests");
     db_split_replay_step.dependOn(&run_db_split_replay_tests.step);
 
-    const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, lmdb_backend);
     sparse_test_mod.addImport("bloom", bloom_mod);
     const sparse_unit_tests = b.addTest(.{
         .root_module = sparse_test_mod,
@@ -4369,7 +4401,7 @@ pub fn build(b: *std.Build) void {
     const sparse_test_step = b.step("sparse-test", "Run sparse index unit tests");
     sparse_test_step.dependOn(&run_sparse_unit_tests.step);
 
-    const derived_log_test_mod = makeLmdbModule(b, "pkg/antfly/src/derived_log_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const derived_log_test_mod = makeLmdbModule(b, "pkg/antfly/src/derived_log_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, lmdb_backend);
     derived_log_test_mod.addImport("bloom", bloom_mod);
     const derived_log_unit_tests = b.addTest(.{
         .root_module = derived_log_test_mod,
@@ -4409,7 +4441,7 @@ pub fn build(b: *std.Build) void {
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
     const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, antfly_version);
     const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_c);
-    const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod);
+    const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod, .c);
     const lmdb_bench_mod_c = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
         .target = target,
@@ -4426,7 +4458,7 @@ pub fn build(b: *std.Build) void {
     const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
     const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, antfly_version);
     const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_zig);
-    const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod);
+    const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod, .zig);
     const lmdb_bench_mod_zig = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
         .target = target,
@@ -4484,7 +4516,7 @@ pub fn build(b: *std.Build) void {
     const split_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, antfly_version);
     const split_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, split_bench_engine_options);
-    const split_bench_root_mod = makeLmdbModule(b, antfly_benches_build.split_bench_root, target, .ReleaseFast, split_bench_build_options, split_bench_engine_mod, platform_mod);
+    const split_bench_root_mod = makeLmdbModule(b, antfly_benches_build.split_bench_root, target, .ReleaseFast, split_bench_build_options, split_bench_engine_mod, platform_mod, lmdb_backend);
     const split_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/split_bench.zig"),
         .target = target,
@@ -4545,11 +4577,8 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_docid_doc_set_bench = b.addRunArtifact(docid_doc_set_bench);
-    if (b.args) |args| {
-        run_docid_doc_set_bench.addArgs(args);
-    } else {
-        run_docid_doc_set_bench.addArgs(&.{ "--samples", "1", "--repeats", "16", "--small", "32", "--medium", "1024", "--large", "16384" });
-    }
+    run_docid_doc_set_bench.addArgs(&.{ "--samples", "1", "--repeats", "16", "--small", "32", "--medium", "1024", "--large", "16384" });
+    run_docid_doc_set_bench.addPassthruArgs();
     const docid_doc_set_bench_step = b.step("docid-doc-set-bench", "Benchmark DOCID doc-set representations against sparse id baselines");
     docid_doc_set_bench_step.dependOn(&run_docid_doc_set_bench.step);
 
@@ -4565,11 +4594,8 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_backend_bench = b.addRunArtifact(backend_bench);
-    if (b.args) |args| {
-        run_backend_bench.addArgs(args);
-    } else {
-        run_backend_bench.addArgs(&.{ "--samples", "3", "--keys", "20000", "--value-size", "128", "--hit-repeats", "3", "--miss-repeats", "3", "--scan-repeats", "5" });
-    }
+    run_backend_bench.addArgs(&.{ "--samples", "3", "--keys", "20000", "--value-size", "128", "--hit-repeats", "3", "--miss-repeats", "3", "--scan-repeats", "5" });
+    run_backend_bench.addPassthruArgs();
     const backend_bench_step = b.step("backend-bench", "Benchmark shared backend workloads across LMDB and LSM backends");
     backend_bench_step.dependOn(&run_backend_bench.step);
 
@@ -4585,24 +4611,21 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_lsm_backend_bench = b.addRunArtifact(lsm_backend_bench);
-    if (b.args) |args| {
-        run_lsm_backend_bench.addArgs(args);
-    } else {
-        run_lsm_backend_bench.addArgs(&.{
-            "--samples",            "3",
-            "--keys",               "20000",
-            "--value-size",         "128",
-            "--hit-repeats",        "5",
-            "--miss-repeats",       "5",
-            "--short-scan-len",     "64",
-            "--short-scan-repeats", "16",
-            "--full-scan-repeats",  "5",
-            "--reopen-repeats",     "5",
-            "--mixed-repeats",      "3",
-            "--storage",            "host",
-            "--cache",              "both",
-        });
-    }
+    run_lsm_backend_bench.addArgs(&.{
+        "--samples",            "3",
+        "--keys",               "20000",
+        "--value-size",         "128",
+        "--hit-repeats",        "5",
+        "--miss-repeats",       "5",
+        "--short-scan-len",     "64",
+        "--short-scan-repeats", "16",
+        "--full-scan-repeats",  "5",
+        "--reopen-repeats",     "5",
+        "--mixed-repeats",      "3",
+        "--storage",            "host",
+        "--cache",              "both",
+    });
+    run_lsm_backend_bench.addPassthruArgs();
     const lsm_backend_bench_step = b.step("lsm-backend-bench", "Benchmark LSM read and scan paths with optional cache and storage instrumentation");
     lsm_backend_bench_step.dependOn(&run_lsm_backend_bench.step);
 
@@ -4618,16 +4641,13 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_hbc_storage_read_bench = b.addRunArtifact(hbc_storage_read_bench);
-    if (b.args) |args| {
-        run_hbc_storage_read_bench.addArgs(args);
-    } else {
-        run_hbc_storage_read_bench.addArgs(&.{
-            "--docs",       "75000",
-            "--dims",       "512",
-            "--queries",    "1000",
-            "--candidates", "800",
-        });
-    }
+    run_hbc_storage_read_bench.addArgs(&.{
+        "--docs",       "75000",
+        "--dims",       "512",
+        "--queries",    "1000",
+        "--candidates", "800",
+    });
+    run_hbc_storage_read_bench.addPassthruArgs();
     const hbc_storage_read_bench_build_step = b.step("hbc-storage-read-bench-build", "Build the HBC-shaped LSM hot-read benchmark");
     hbc_storage_read_bench_build_step.dependOn(&hbc_storage_read_bench.step);
     const hbc_storage_read_bench_step = b.step("hbc-storage-read-bench", "Benchmark HBC-shaped metadata/vector artifact reads through the LSM");
@@ -4652,20 +4672,17 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_lsm_write_bench = b.addRunArtifact(lsm_write_bench);
-    if (b.args) |args| {
-        run_lsm_write_bench.addArgs(args);
-    } else {
-        run_lsm_write_bench.addArgs(&.{
-            "--samples",          "3",
-            "--keys",             "20000",
-            "--hot-keys",         "1000",
-            "--overwrite-rounds", "20",
-            "--value-size",       "128",
-            "--batch-size",       "1000",
-            "--storage",          "host",
-            "--mode",             "both",
-        });
-    }
+    run_lsm_write_bench.addArgs(&.{
+        "--samples",          "3",
+        "--keys",             "20000",
+        "--hot-keys",         "1000",
+        "--overwrite-rounds", "20",
+        "--value-size",       "128",
+        "--batch-size",       "1000",
+        "--storage",          "host",
+        "--mode",             "both",
+    });
+    run_lsm_write_bench.addPassthruArgs();
     const lsm_write_bench_step = b.step("lsm-write-bench", "Benchmark LSM write amplification across sorted, random, overwrite, and delete workloads");
     lsm_write_bench_step.dependOn(&run_lsm_write_bench.step);
 
@@ -4680,16 +4697,13 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_lsm_write_bench_compare = b.addRunArtifact(lsm_write_bench_compare);
-    if (b.args) |args| {
-        run_lsm_write_bench_compare.addArgs(args);
-    } else {
-        run_lsm_write_bench_compare.addArgs(&.{
-            "--before",
-            "/tmp/lsm-write-before.jsonl",
-            "--after",
-            "/tmp/lsm-write-after.jsonl",
-        });
-    }
+    run_lsm_write_bench_compare.addArgs(&.{
+        "--before",
+        "/tmp/lsm-write-before.jsonl",
+        "--after",
+        "/tmp/lsm-write-after.jsonl",
+    });
+    run_lsm_write_bench_compare.addPassthruArgs();
     const lsm_write_bench_compare_step = b.step("lsm-write-bench-compare", "Compare two LSM write bench JSONL outputs by scenario and workload");
     lsm_write_bench_compare_step.dependOn(&run_lsm_write_bench_compare.step);
 
@@ -4713,18 +4727,15 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_text_segment_write_bench = b.addRunArtifact(text_segment_write_bench);
-    if (b.args) |args| {
-        run_text_segment_write_bench.addArgs(args);
-    } else {
-        run_text_segment_write_bench.addArgs(&.{
-            "--samples",       "3",
-            "--docs",          "20000",
-            "--batch-size",    "1000",
-            "--terms-per-doc", "12",
-            "--merge-width",   "8",
-            "--storage",       "host",
-        });
-    }
+    run_text_segment_write_bench.addArgs(&.{
+        "--samples",       "3",
+        "--docs",          "20000",
+        "--batch-size",    "1000",
+        "--terms-per-doc", "12",
+        "--merge-width",   "8",
+        "--storage",       "host",
+    });
+    run_text_segment_write_bench.addPassthruArgs();
     const text_segment_write_bench_step = b.step("text-segment-write-bench", "Benchmark full-text segment build, on-disk publish, merge, and force-merge");
     text_segment_write_bench_step.dependOn(&run_text_segment_write_bench.step);
 
@@ -4739,16 +4750,13 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_lsm_backend_bench_compare = b.addRunArtifact(lsm_backend_bench_compare);
-    if (b.args) |args| {
-        run_lsm_backend_bench_compare.addArgs(args);
-    } else {
-        run_lsm_backend_bench_compare.addArgs(&.{
-            "--before",
-            "/tmp/lsm-before.jsonl",
-            "--after",
-            "/tmp/lsm-after.jsonl",
-        });
-    }
+    run_lsm_backend_bench_compare.addArgs(&.{
+        "--before",
+        "/tmp/lsm-before.jsonl",
+        "--after",
+        "/tmp/lsm-after.jsonl",
+    });
+    run_lsm_backend_bench_compare.addPassthruArgs();
     const lsm_backend_bench_compare_step = b.step("lsm-backend-bench-compare", "Compare two LSM backend bench JSONL outputs by scenario and workload");
     lsm_backend_bench_compare_step.dependOn(&run_lsm_backend_bench_compare.step);
 
@@ -4765,16 +4773,14 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_regex_bench = b.addRunArtifact(regex_bench);
-    if (b.args) |args| {
-        run_regex_bench.addArgs(args);
-    }
+    run_regex_bench.addPassthruArgs();
     const regex_bench_step = b.step("regex-bench", "Benchmark regex haystack matching and vellum automaton traversal");
     regex_bench_step.dependOn(&run_regex_bench.step);
 
     const wal_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, antfly_version);
     const wal_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, wal_bench_engine_options);
-    const wal_bench_wal_mod = makeLmdbModule(b, antfly_benches_build.wal_bench_root, target, .ReleaseFast, wal_bench_build_options, wal_bench_engine_mod, platform_mod);
+    const wal_bench_wal_mod = makeLmdbModule(b, antfly_benches_build.wal_bench_root, target, .ReleaseFast, wal_bench_build_options, wal_bench_engine_mod, platform_mod, lmdb_backend);
     const wal_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/wal_bench.zig"),
         .target = target,
@@ -4974,9 +4980,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_json_bench = b.addRunArtifact(json_bench);
-    if (b.args) |args| {
-        run_json_bench.addArgs(args);
-    }
+    run_json_bench.addPassthruArgs();
     const json_bench_step = b.step("json-bench", "Benchmark std.json vs antfly-json parsing");
     json_bench_step.dependOn(&run_json_bench.step);
 
@@ -5025,9 +5029,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_quickstart_bench = b.addRunArtifact(quickstart_bench);
-    if (b.args) |args| {
-        run_quickstart_bench.addArgs(args);
-    }
+    run_quickstart_bench.addPassthruArgs();
     const quickstart_bench_step = b.step("quickstart-bench", "Run the quickstart-shaped end-to-end benchmark");
     quickstart_bench_step.dependOn(&run_quickstart_bench.step);
 
@@ -5085,9 +5087,7 @@ pub fn build(b: *std.Build) void {
     const install_search_benchmark_codec_bench = b.addInstallArtifact(search_benchmark_codec_bench, .{});
 
     const run_search_benchmark_codec_bench = b.addRunArtifact(search_benchmark_codec_bench);
-    if (b.args) |args| {
-        run_search_benchmark_codec_bench.addArgs(args);
-    }
+    run_search_benchmark_codec_bench.addPassthruArgs();
     const search_bench_codec_step = b.step("search-bench-codec-bench", "Benchmark StreamVByte codec used by search postings");
     search_bench_codec_step.dependOn(&run_search_benchmark_codec_bench.step);
 
@@ -5102,9 +5102,7 @@ pub fn build(b: *std.Build) void {
         .root_module = wand_skip_bench_mod,
     });
     const run_wand_skip_bench = b.addRunArtifact(wand_skip_bench);
-    if (b.args) |args| {
-        run_wand_skip_bench.addArgs(args);
-    }
+    run_wand_skip_bench.addPassthruArgs();
     const wand_skip_bench_step = b.step("wand-skip-bench", "Profile WAND advance vs score iter.next() ratio across query shapes");
     wand_skip_bench_step.dependOn(&run_wand_skip_bench.step);
 
@@ -5124,9 +5122,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_storage_fixture_promote = b.addRunArtifact(storage_fixture_promote);
-    if (b.args) |args| {
-        run_storage_fixture_promote.addArgs(args);
-    }
+    run_storage_fixture_promote.addPassthruArgs();
     const storage_fixture_promote_step = b.step("storage-fixture-promote", "Promote a storage sim fixture into the checked-in replay corpus");
     storage_fixture_promote_step.dependOn(&run_storage_fixture_promote.step);
 
@@ -5194,9 +5190,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_hbc_bench = b.addRunArtifact(hbc_bench);
-    if (b.args) |args| {
-        run_hbc_bench.addArgs(args);
-    }
+    run_hbc_bench.addPassthruArgs();
     const hbc_bench_step = b.step("hbc-bench", "Benchmark HBC kmeans vs hilbert split algorithms");
     hbc_bench_step.dependOn(&run_hbc_bench.step);
 
@@ -5213,34 +5207,28 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_hbc_write_bench = b.addRunArtifact(hbc_write_bench);
-    if (b.args) |args| {
-        run_hbc_write_bench.addArgs(args);
-    } else {
-        run_hbc_write_bench.addArgs(&.{
-            "--samples",    "3",
-            "--vectors",    "10000",
-            "--dims",       "128",
-            "--batch-size", "1000",
-            "--leaf-size",  "128",
-            "--storage",    "host",
-        });
-    }
+    run_hbc_write_bench.addArgs(&.{
+        "--samples",    "3",
+        "--vectors",    "10000",
+        "--dims",       "128",
+        "--batch-size", "1000",
+        "--leaf-size",  "128",
+        "--storage",    "host",
+    });
+    run_hbc_write_bench.addPassthruArgs();
     const hbc_write_bench_step = b.step("hbc-write-bench", "Benchmark HBC bulk build and online batched write amplification");
     hbc_write_bench_step.dependOn(&run_hbc_write_bench.step);
 
     const run_hbc_write_guardrail = b.addRunArtifact(hbc_write_bench);
-    if (b.args) |args| {
-        run_hbc_write_guardrail.addArgs(args);
-    } else {
-        run_hbc_write_guardrail.addArgs(&.{
-            "--samples",    "1",
-            "--vectors",    "5000",
-            "--dims",       "1536",
-            "--batch-size", "500",
-            "--leaf-size",  "168",
-            "--storage",    "host",
-        });
-    }
+    run_hbc_write_guardrail.addArgs(&.{
+        "--samples",    "1",
+        "--vectors",    "5000",
+        "--dims",       "1536",
+        "--batch-size", "500",
+        "--leaf-size",  "168",
+        "--storage",    "host",
+    });
+    run_hbc_write_guardrail.addPassthruArgs();
     const hbc_write_guardrail_step = b.step("hbc-write-guardrail", "Run a VectorDBBench-shaped HBC write-amplification smoke guardrail");
     hbc_write_guardrail_step.dependOn(&run_hbc_write_guardrail.step);
 
@@ -5257,21 +5245,18 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_hbc_read_bench = b.addRunArtifact(hbc_read_bench);
-    if (b.args) |args| {
-        run_hbc_read_bench.addArgs(args);
-    } else {
-        run_hbc_read_bench.addArgs(&.{
-            "--samples",    "3",
-            "--vectors",    "10000",
-            "--dims",       "128",
-            "--queries",    "200",
-            "--k",          "10",
-            "--batch-size", "1000",
-            "--leaf-size",  "128",
-            "--storage",    "host",
-            "--build",      "both",
-        });
-    }
+    run_hbc_read_bench.addArgs(&.{
+        "--samples",    "3",
+        "--vectors",    "10000",
+        "--dims",       "128",
+        "--queries",    "200",
+        "--k",          "10",
+        "--batch-size", "1000",
+        "--leaf-size",  "128",
+        "--storage",    "host",
+        "--build",      "both",
+    });
+    run_hbc_read_bench.addPassthruArgs();
     const hbc_read_bench_step = b.step("hbc-read-bench", "Benchmark HBC query read paths with storage and search-profile counters");
     hbc_read_bench_step.dependOn(&run_hbc_read_bench.step);
 
@@ -5298,9 +5283,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_hbc_isolate = b.addRunArtifact(hbc_isolate);
-    if (b.args) |args| {
-        run_hbc_isolate.addArgs(args);
-    }
+    run_hbc_isolate.addPassthruArgs();
     const hbc_isolate_step = b.step("hbc-isolate", "Run the deterministic raw Zig HBC isolate benchmark");
     hbc_isolate_step.dependOn(&run_hbc_isolate.step);
 
@@ -5324,9 +5307,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_dense_stack_bench = b.addRunArtifact(dense_stack_bench);
-    if (b.args) |args| {
-        run_dense_stack_bench.addArgs(args);
-    }
+    run_dense_stack_bench.addPassthruArgs();
     const build_dense_stack_bench_step = b.step("dense-stack-bench-build", "Build dense_stack_bench without running it");
     build_dense_stack_bench_step.dependOn(&dense_stack_bench.step);
     const dense_stack_bench_step = b.step("dense-stack-bench", "Benchmark dense DB search vs dense CAPI layers");
@@ -5371,9 +5352,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_replay_bench = b.addRunArtifact(replay_bench);
-    if (b.args) |args| {
-        run_replay_bench.addArgs(args);
-    }
+    run_replay_bench.addPassthruArgs();
     const replay_bench_step = b.step("replay-bench", "Benchmark replay stream write and catch-up paths");
     replay_bench_step.dependOn(&run_replay_bench.step);
 
@@ -5391,28 +5370,25 @@ pub fn build(b: *std.Build) void {
     const install_dense_ingest_guardrail = b.addInstallArtifact(dense_ingest_guardrail, .{});
 
     const run_dense_ingest_guardrail = b.addRunArtifact(dense_ingest_guardrail);
-    if (b.args) |args| {
-        run_dense_ingest_guardrail.addArgs(args);
-    } else {
-        run_dense_ingest_guardrail.addArgs(&.{
-            "--docs",
-            "5000",
-            "--dims",
-            "1536",
-            "--batch-size",
-            "500",
-            "--sync-level",
-            "write",
-            "--status-probe-every",
-            "1",
-            "--max-dense-lsm-run-bytes",
-            "1073741824",
-            "--max-dense-l0-runs",
-            "64",
-            "--max-status-probe-ns",
-            "500000000",
-        });
-    }
+    run_dense_ingest_guardrail.addArgs(&.{
+        "--docs",
+        "5000",
+        "--dims",
+        "1536",
+        "--batch-size",
+        "500",
+        "--sync-level",
+        "write",
+        "--status-probe-every",
+        "1",
+        "--max-dense-lsm-run-bytes",
+        "1073741824",
+        "--max-dense-l0-runs",
+        "64",
+        "--max-status-probe-ns",
+        "500000000",
+    });
+    run_dense_ingest_guardrail.addPassthruArgs();
     const build_dense_ingest_guardrail_step = b.step("dense-ingest-guardrail-build", "Build the dedicated dense ingest guardrail without running it");
     build_dense_ingest_guardrail_step.dependOn(&dense_ingest_guardrail.step);
     const install_dense_ingest_guardrail_step = b.step("dense-ingest-guardrail-install", "Build and install the dedicated dense ingest guardrail");
@@ -5431,9 +5407,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_batch_bench = b.addRunArtifact(batch_bench);
-    if (b.args) |args| {
-        run_batch_bench.addArgs(args);
-    }
+    run_batch_bench.addPassthruArgs();
     const batch_bench_step = b.step("batch-bench", "Benchmark overwrite-heavy batch writes and bulk-session coalescing");
     batch_bench_step.dependOn(&run_batch_bench.step);
 
@@ -5450,11 +5424,8 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_docid_write_bench = b.addRunArtifact(docid_write_bench);
-    if (b.args) |args| {
-        run_docid_write_bench.addArgs(args);
-    } else {
-        run_docid_write_bench.addArgs(&.{ "--docs", "512", "--batch-size", "128", "--body-repeat", "1" });
-    }
+    run_docid_write_bench.addArgs(&.{ "--docs", "512", "--batch-size", "128", "--body-repeat", "1" });
+    run_docid_write_bench.addPassthruArgs();
     const docid_write_bench_step = b.step("docid-write-bench", "Benchmark DOCID write-path identity metadata overhead across sync levels");
     docid_write_bench_step.dependOn(&run_docid_write_bench.step);
 
@@ -5471,11 +5442,8 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_docid_query_bench = b.addRunArtifact(docid_query_bench);
-    if (b.args) |args| {
-        run_docid_query_bench.addArgs(args);
-    } else {
-        run_docid_query_bench.addArgs(&.{ "--docs", "4096", "--queries", "16", "--repeats", "8", "--filter-size", "256", "--limit", "32" });
-    }
+    run_docid_query_bench.addArgs(&.{ "--docs", "4096", "--queries", "16", "--repeats", "8", "--filter-size", "256", "--limit", "32" });
+    run_docid_query_bench.addPassthruArgs();
     const docid_query_bench_step = b.step("docid-query-bench", "Benchmark real DB query shapes with public IDs, ordinal doc sets, and sparse-ID projection");
     docid_query_bench_step.dependOn(&run_docid_query_bench.step);
     const build_docid_query_bench_step = b.step("docid-query-bench-build", "Build docid_query_bench without running it");
@@ -5510,18 +5478,15 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_algebraic_bench = b.addRunArtifact(algebraic_bench);
-    if (b.args) |args| {
-        run_algebraic_bench.addArgs(args);
-    } else {
-        run_algebraic_bench.addArgs(&.{
-            "--docs",
-            "20000",
-            "--repeats",
-            "25",
-            "--batch-size",
-            "500",
-        });
-    }
+    run_algebraic_bench.addArgs(&.{
+        "--docs",
+        "20000",
+        "--repeats",
+        "25",
+        "--batch-size",
+        "500",
+    });
+    run_algebraic_bench.addPassthruArgs();
     const algebraic_bench_step = b.step("algebraic-bench", "Benchmark algebraic aggregations against document-scan aggregations");
     algebraic_bench_step.dependOn(&run_algebraic_bench.step);
 
@@ -5535,84 +5500,79 @@ pub fn build(b: *std.Build) void {
         .root_module = algebraic_summary_mod,
     });
     const run_algebraic_summary = b.addRunArtifact(algebraic_summary);
-    if (b.args) |args| {
-        run_algebraic_summary.addArgs(args);
-    }
+    run_algebraic_summary.addPassthruArgs();
     const algebraic_summary_step = b.step("algebraic-summary", "Summarize algebraic benchmark JSONL output");
     algebraic_summary_step.dependOn(&run_algebraic_summary.step);
 
     const run_algebraic_performance_guardrail = b.addRunArtifact(algebraic_summary);
-    if (b.args) |args| {
-        run_algebraic_performance_guardrail.addArgs(args);
-    } else {
-        run_algebraic_performance_guardrail.addArgs(&.{
-            "--input",
-            "bench/storage/algebraic_performance_guardrail_fixture.jsonl",
-            "--baseline",
-            "bench/storage/algebraic_performance_guardrail_baseline.jsonl",
-            "--require-performance-evidence",
-            "--min-lsm-dataset-cases",
-            "1",
-            "--min-lsm-query-records",
-            "3",
-            "--min-cold-query-records",
-            "2",
-            "--min-warm-query-records",
-            "2",
-            "--min-constrained-query-records",
-            "3",
-            "--min-wide-query-records",
-            "3",
-            "--min-stats-query-records",
-            "3",
-            "--min-cardinality-query-records",
-            "3",
-            "--min-range-query-records",
-            "3",
-            "--min-histogram-query-records",
-            "3",
-            "--min-fanout-dataset-cases",
-            "1",
-            "--min-public-query-comparison-pairs",
-            "2",
-            "--min-lsm-sorted-ingest-runs",
-            "1",
-            "--max-lsm-flushes",
-            "0",
-            "--max-lsm-write-pressure-compactions",
-            "0",
-            "--max-correctness-failures",
-            "0",
-            "--max-algebraic-query-ms",
-            "2",
-            "--max-public-query-http-us",
-            "100",
-            "--max-algebraic-bytes-per-doc",
-            "10",
-            "--max-symbol-bytes-per-doc",
-            "0",
-            "--max-support-bytes-per-doc",
-            "0",
-            "--max-accumulator-flush-count",
-            "0",
-            "--max-path-dictionary-fst-rebuild-count",
-            "1",
-            "--max-public-query-load-rss-peak-bytes",
-            "0",
-            "--max-public-query-search-rss-peak-bytes",
-            "0",
-            "--max-churn-algebraic-update-ms",
-            "2",
-            "--max-algebraic-query-ms-ratio-vs-baseline",
-            "1.0",
-            "--max-public-query-http-us-ratio-vs-baseline",
-            "1.0",
-            "--max-algebraic-bytes-per-doc-ratio-vs-baseline",
-            "1.0",
-            "--max-churn-algebraic-update-ms-ratio-vs-baseline",
-            "1.0",
-        });
-    }
+    run_algebraic_performance_guardrail.addArgs(&.{
+        "--input",
+        "bench/storage/algebraic_performance_guardrail_fixture.jsonl",
+        "--baseline",
+        "bench/storage/algebraic_performance_guardrail_baseline.jsonl",
+        "--require-performance-evidence",
+        "--min-lsm-dataset-cases",
+        "1",
+        "--min-lsm-query-records",
+        "3",
+        "--min-cold-query-records",
+        "2",
+        "--min-warm-query-records",
+        "2",
+        "--min-constrained-query-records",
+        "3",
+        "--min-wide-query-records",
+        "3",
+        "--min-stats-query-records",
+        "3",
+        "--min-cardinality-query-records",
+        "3",
+        "--min-range-query-records",
+        "3",
+        "--min-histogram-query-records",
+        "3",
+        "--min-fanout-dataset-cases",
+        "1",
+        "--min-public-query-comparison-pairs",
+        "2",
+        "--min-lsm-sorted-ingest-runs",
+        "1",
+        "--max-lsm-flushes",
+        "0",
+        "--max-lsm-write-pressure-compactions",
+        "0",
+        "--max-correctness-failures",
+        "0",
+        "--max-algebraic-query-ms",
+        "2",
+        "--max-public-query-http-us",
+        "100",
+        "--max-algebraic-bytes-per-doc",
+        "10",
+        "--max-symbol-bytes-per-doc",
+        "0",
+        "--max-support-bytes-per-doc",
+        "0",
+        "--max-accumulator-flush-count",
+        "0",
+        "--max-path-dictionary-fst-rebuild-count",
+        "1",
+        "--max-public-query-load-rss-peak-bytes",
+        "0",
+        "--max-public-query-search-rss-peak-bytes",
+        "0",
+        "--max-churn-algebraic-update-ms",
+        "2",
+        "--max-algebraic-query-ms-ratio-vs-baseline",
+        "1.0",
+        "--max-public-query-http-us-ratio-vs-baseline",
+        "1.0",
+        "--max-algebraic-bytes-per-doc-ratio-vs-baseline",
+        "1.0",
+        "--max-churn-algebraic-update-ms-ratio-vs-baseline",
+        "1.0",
+    });
+    run_algebraic_performance_guardrail.addPassthruArgs();
     const algebraic_performance_guardrail_step = b.step("algebraic-performance-guardrail", "Run the algebraic benchmark summary coverage and baseline-ratio guardrail fixture");
     algebraic_performance_guardrail_step.dependOn(&run_algebraic_performance_guardrail.step);
 
@@ -5626,9 +5586,7 @@ pub fn build(b: *std.Build) void {
         .root_module = algebraic_planner_ownership_guardrail_mod,
     });
     const run_algebraic_planner_ownership_guardrail = b.addRunArtifact(algebraic_planner_ownership_guardrail);
-    if (b.args) |args| {
-        run_algebraic_planner_ownership_guardrail.addArgs(args);
-    }
+    run_algebraic_planner_ownership_guardrail.addPassthruArgs();
     const algebraic_planner_ownership_guardrail_step = b.step("algebraic-planner-ownership-guardrail", "Verify algebraic tensor programs are built by the planner layer outside tests");
     algebraic_planner_ownership_guardrail_step.dependOn(&run_algebraic_planner_ownership_guardrail.step);
 
@@ -5642,27 +5600,24 @@ pub fn build(b: *std.Build) void {
         .root_module = algebraic_archive_guardrail_mod,
     });
     const run_algebraic_archive_guardrail = b.addRunArtifact(algebraic_archive_guardrail);
-    if (b.args) |args| {
-        run_algebraic_archive_guardrail.addArgs(args);
-    } else {
-        run_algebraic_archive_guardrail.addArgs(&.{
-            "--archive",
-            "bench/storage/algebraic_production_archive_fixture",
-            "--require-thresholds",
-            "--require-baseline",
-            "--require-non-smoke",
-            "--min-docs",
-            "100",
-            "--min-repeats",
-            "1",
-            "--min-churn-ops",
-            "1",
-            "--min-public-docs",
-            "100",
-            "--min-graph-docs",
-            "100",
-        });
-    }
+    run_algebraic_archive_guardrail.addArgs(&.{
+        "--archive",
+        "bench/storage/algebraic_production_archive_fixture",
+        "--require-thresholds",
+        "--require-baseline",
+        "--require-non-smoke",
+        "--min-docs",
+        "100",
+        "--min-repeats",
+        "1",
+        "--min-churn-ops",
+        "1",
+        "--min-public-docs",
+        "100",
+        "--min-graph-docs",
+        "100",
+    });
+    run_algebraic_archive_guardrail.addPassthruArgs();
     const algebraic_archive_guardrail_step = b.step("algebraic-archive-guardrail", "Verify archived algebraic production-hardening run evidence");
     algebraic_archive_guardrail_step.dependOn(&run_algebraic_archive_guardrail.step);
 
@@ -5684,9 +5639,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_rw_lock_bench = b.addRunArtifact(rw_lock_bench);
-    if (b.args) |args| {
-        run_rw_lock_bench.addArgs(args);
-    }
+    run_rw_lock_bench.addPassthruArgs();
     const rw_lock_bench_step = b.step("rw-lock-bench", "Benchmark mixed search/write load against the DB RW apply lock");
     rw_lock_bench_step.dependOn(&run_rw_lock_bench.step);
 
@@ -5703,9 +5656,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_open_bench = b.addRunArtifact(open_bench);
-    if (b.args) |args| {
-        run_open_bench.addArgs(args);
-    }
+    run_open_bench.addPassthruArgs();
     const open_bench_step = b.step("open-bench", "Benchmark DB.open for configurable index mixes and replay backlog");
     open_bench_step.dependOn(&run_open_bench.step);
 
@@ -5722,9 +5673,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_artifact_rebuild_bench = b.addRunArtifact(artifact_rebuild_bench);
-    if (b.args) |args| {
-        run_artifact_rebuild_bench.addArgs(args);
-    }
+    run_artifact_rebuild_bench.addPassthruArgs();
     const build_artifact_rebuild_bench_step = b.step("artifact-rebuild-bench-build", "Build artifact_rebuild_bench without running it");
     build_artifact_rebuild_bench_step.dependOn(&artifact_rebuild_bench.step);
     const artifact_rebuild_bench_step = b.step("artifact-rebuild-bench", "Benchmark loaded-root startup artifact rebuild progress and reopen cost");
@@ -5743,9 +5692,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_provisioned_warmup_bench = b.addRunArtifact(provisioned_warmup_bench);
-    if (b.args) |args| {
-        run_provisioned_warmup_bench.addArgs(args);
-    }
+    run_provisioned_warmup_bench.addPassthruArgs();
     const provisioned_warmup_bench_step = b.step("provisioned-warmup-bench", "Benchmark provisioned cache warmup against first read/write latency");
     provisioned_warmup_bench_step.dependOn(&run_provisioned_warmup_bench.step);
 
@@ -5763,20 +5710,17 @@ pub fn build(b: *std.Build) void {
     const install_provisioned_dense_ingest_guardrail = b.addInstallArtifact(provisioned_dense_ingest_guardrail, .{});
 
     const run_provisioned_dense_ingest_guardrail = b.addRunArtifact(provisioned_dense_ingest_guardrail);
-    if (b.args) |args| {
-        run_provisioned_dense_ingest_guardrail.addArgs(args);
-    } else {
-        run_provisioned_dense_ingest_guardrail.addArgs(&.{
-            "--docs",
-            "50000",
-            "--dims",
-            "1536",
-            "--batch-size",
-            "100",
-            "--sync-level",
-            "write",
-        });
-    }
+    run_provisioned_dense_ingest_guardrail.addArgs(&.{
+        "--docs",
+        "50000",
+        "--dims",
+        "1536",
+        "--batch-size",
+        "100",
+        "--sync-level",
+        "write",
+    });
+    run_provisioned_dense_ingest_guardrail.addPassthruArgs();
     const build_provisioned_dense_ingest_guardrail_step = b.step("provisioned-dense-ingest-guardrail-build", "Build the provisioned table dense ingest guardrail without running it");
     build_provisioned_dense_ingest_guardrail_step.dependOn(&provisioned_dense_ingest_guardrail.step);
     const install_provisioned_dense_ingest_guardrail_step = b.step("provisioned-dense-ingest-guardrail-install", "Build and install the provisioned table dense ingest guardrail");
@@ -5797,28 +5741,25 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_public_query_guardrail = b.addRunArtifact(public_query_guardrail);
-    if (b.args) |args| {
-        run_public_query_guardrail.addArgs(args);
-    } else {
-        run_public_query_guardrail.addArgs(&.{
-            "--docs",
-            "5000",
-            "--dims",
-            "384",
-            "--queries",
-            "25",
-            "--repeats",
-            "10",
-            "--k",
-            "100",
-            "--batch-size",
-            "250",
-            "--search-threads",
-            "5",
-            "--sync-level",
-            "write",
-        });
-    }
+    run_public_query_guardrail.addArgs(&.{
+        "--docs",
+        "5000",
+        "--dims",
+        "384",
+        "--queries",
+        "25",
+        "--repeats",
+        "10",
+        "--k",
+        "100",
+        "--batch-size",
+        "250",
+        "--search-threads",
+        "5",
+        "--sync-level",
+        "write",
+    });
+    run_public_query_guardrail.addPassthruArgs();
     const build_public_query_guardrail_step = b.step("public-query-guardrail-build", "Build the dedicated public query guardrail without running it");
     build_public_query_guardrail_step.dependOn(&public_query_guardrail.step);
     const public_query_guardrail_step = b.step("public-query-guardrail", "Benchmark the public /db/v1/tables/<table>/query path against direct DB search and health responsiveness");
@@ -5838,9 +5779,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_raft_apply_bench = b.addRunArtifact(raft_apply_bench);
-    if (b.args) |args| {
-        run_raft_apply_bench.addArgs(args);
-    }
+    run_raft_apply_bench.addPassthruArgs();
     const raft_apply_bench_step = b.step("raft-apply-bench", "Benchmark committed-entry encoding and data raft apply store persistence");
     raft_apply_bench_step.dependOn(&run_raft_apply_bench.step);
 
@@ -5858,9 +5797,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_managed_host_wal_bench = b.addRunArtifact(managed_host_wal_bench);
-    if (b.args) |args| {
-        run_managed_host_wal_bench.addArgs(args);
-    }
+    run_managed_host_wal_bench.addPassthruArgs();
     const managed_host_wal_bench_step = b.step("managed-host-wal-bench", "Benchmark ManagedHost proposal persistence with WAL-backed raft state and restart");
     managed_host_wal_bench_step.dependOn(&run_managed_host_wal_bench.step);
 
@@ -5881,9 +5818,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_dense_profile_summary = b.addRunArtifact(dense_profile_summary);
-    if (b.args) |args| {
-        run_dense_profile_summary.addArgs(args);
-    }
+    run_dense_profile_summary.addPassthruArgs();
     const dense_profile_summary_step = b.step("dense-profile-summary", "Summarize dense-stack-bench profile JSONL output");
     dense_profile_summary_step.dependOn(&run_dense_profile_summary.step);
 
@@ -5900,9 +5835,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_lmdb_commit_compare = b.addRunArtifact(lmdb_commit_compare);
-    if (b.args) |args| {
-        run_lmdb_commit_compare.addArgs(args);
-    }
+    run_lmdb_commit_compare.addPassthruArgs();
     const lmdb_commit_compare_step = b.step("lmdb-commit-compare", "Benchmark LMDB commit cost in isolation");
     lmdb_commit_compare_step.dependOn(&run_lmdb_commit_compare.step);
 
@@ -5919,9 +5852,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_hbc_split_bench = b.addRunArtifact(hbc_split_bench);
-    if (b.args) |args| {
-        run_hbc_split_bench.addArgs(args);
-    }
+    run_hbc_split_bench.addPassthruArgs();
     const hbc_split_bench_step = b.step("hbc-split-bench", "Benchmark dense-only HBC split child rebuild");
     hbc_split_bench_step.dependOn(&run_hbc_split_bench.step);
 
@@ -5938,9 +5869,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_sparse_split_bench = b.addRunArtifact(sparse_split_bench);
-    if (b.args) |args| {
-        run_sparse_split_bench.addArgs(args);
-    }
+    run_sparse_split_bench.addPassthruArgs();
     const sparse_split_bench_step = b.step("sparse-split-bench", "Benchmark sparse-only split handoff");
     sparse_split_bench_step.dependOn(&run_sparse_split_bench.step);
 
@@ -5958,9 +5887,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_rabitq_bench = b.addRunArtifact(rabitq_bench);
-    if (b.args) |args| {
-        run_rabitq_bench.addArgs(args);
-    }
+    run_rabitq_bench.addPassthruArgs();
     const rabitq_bench_step = b.step("rabitq-bench", "Benchmark RaBitQ primitives and estimator");
     rabitq_bench_step.dependOn(&run_rabitq_bench.step);
 
@@ -5977,9 +5904,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_recall_harness = b.addRunArtifact(recall_harness);
-    if (b.args) |args| {
-        run_recall_harness.addArgs(args);
-    }
+    run_recall_harness.addPassthruArgs();
     const recall_harness_step = b.step("recall-harness", "Run Zig recall suites against exported vector datasets");
     recall_harness_step.dependOn(&run_recall_harness.step);
 
@@ -6037,9 +5962,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const run_antfly = b.addRunArtifact(antfly_main);
-    if (b.args) |args| {
-        run_antfly.addArgs(args);
-    }
+    run_antfly.addPassthruArgs();
     const antfly_step = b.step("antfly", "Run the top-level Antfly CLI");
     antfly_step.dependOn(&run_antfly.step);
 
@@ -6082,9 +6005,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_hbc_trace = b.addRunArtifact(hbc_trace);
-    if (b.args) |args| {
-        run_hbc_trace.addArgs(args);
-    }
+    run_hbc_trace.addPassthruArgs();
     const hbc_trace_step = b.step("hbc-trace", "Trace one Zig HBC query against an exported vector dataset");
     hbc_trace_step.dependOn(&run_hbc_trace.step);
 
@@ -6102,9 +6023,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_hbc_leaf_debug = b.addRunArtifact(hbc_leaf_debug);
-    if (b.args) |args| {
-        run_hbc_leaf_debug.addArgs(args);
-    }
+    run_hbc_leaf_debug.addPassthruArgs();
     const hbc_leaf_debug_step = b.step("hbc-leaf-debug", "Inspect cached versus fresh quantized HBC leaf scoring");
     hbc_leaf_debug_step.dependOn(&run_hbc_leaf_debug.step);
 }

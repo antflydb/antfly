@@ -626,11 +626,11 @@ pub const GraphIndex = struct {
         const root = std.mem.span(reverse_path);
         const outgoing_raw = try std.fmt.allocPrint(alloc, "{s}/forward", .{root});
         defer alloc.free(outgoing_raw);
-        const outgoing_path = try alloc.dupeZ(u8, outgoing_raw);
+        const outgoing_path = try alloc.dupeSentinel(u8, outgoing_raw, 0);
         defer alloc.free(outgoing_path);
         const reverse_raw = try std.fmt.allocPrint(alloc, "{s}/reverse", .{root});
         defer alloc.free(reverse_raw);
-        const private_reverse_path = try alloc.dupeZ(u8, reverse_raw);
+        const private_reverse_path = try alloc.dupeSentinel(u8, reverse_raw, 0);
         defer alloc.free(private_reverse_path);
         return try openWithPrivateStores(alloc, outgoing_path, private_reverse_path, index_name, opts);
     }

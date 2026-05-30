@@ -541,7 +541,7 @@ pub const Client = struct {
     pub fn initFromEnv(allocator: std.mem.Allocator) !Client {
         const plugin_path = try resolvePjrtPluginPath(allocator);
         defer allocator.free(plugin_path);
-        const plugin_path_z = try allocator.dupeZ(u8, plugin_path);
+        const plugin_path_z = try allocator.dupeSentinel(u8, plugin_path, 0);
         defer allocator.free(plugin_path_z);
         return Client.init(plugin_path_z);
     }
@@ -591,7 +591,7 @@ fn getEnvVarOwned(allocator: std.mem.Allocator, comptime name: [:0]const u8) !?[
 }
 
 fn pathExists(allocator: std.mem.Allocator, path: []const u8) !bool {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     return std.c.access(path_z.ptr, std.c.F_OK) == 0;
 }

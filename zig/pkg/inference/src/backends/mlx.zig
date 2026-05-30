@@ -21,9 +21,10 @@ const std = @import("std");
 const tensor_mod = @import("tensor.zig");
 const runtime = @import("../runtime/root.zig");
 
-pub const c = @cImport({
-    @cInclude("mlx/c/mlx.h");
-});
+// Zig 0.17 removed `@cImport`. The `mlx_c` module (translate-c of mlx/c/mlx.h)
+// is provided by the build system, wired in only when `-Dmlx=true`; backends.zig
+// imports this file under the same `enable_mlx` gate.
+pub const c = @import("mlx_c");
 
 extern fn termite_metal_device_available() c_int;
 extern "c" fn free(ptr: ?*anyopaque) void;
@@ -72,7 +73,7 @@ pub const ShardedMatrix = struct {
 };
 
 pub fn allowCpuStreamWithoutMetal() bool {
-    const libc = @cImport(@cInclude("stdlib.h"));
+    const libc = @import("../util/c_env.zig");
     const value = libc.getenv("TERMITE_MLX_ALLOW_CPU_STREAM_WITHOUT_METAL") orelse return false;
     const slice = std.mem.span(value);
     return std.mem.eql(u8, slice, "1") or
@@ -97,7 +98,7 @@ pub fn distributedEnabled() bool {
 
 pub fn distributedAvailable(backend_name: ?[]const u8) bool {
     const name_z = if (backend_name) |name|
-        std.heap.page_allocator.dupeZ(u8, name) catch return false
+        std.heap.page_allocator.dupeSentinel(u8, name, 0) catch return false
     else
         null;
     defer if (name_z) |buf| std.heap.page_allocator.free(buf);
@@ -112,7 +113,7 @@ pub fn initDistributed(strict: bool, backend_name: ?[]const u8) !DistributedCont
     if (!distributedEnabled()) return error.MlxDistributedDisabled;
     if (!distributedAvailable(backend_name)) return error.MlxDistributedUnavailable;
 
-    const name_z = if (backend_name) |name| try std.heap.page_allocator.dupeZ(u8, name) else null;
+    const name_z = if (backend_name) |name| try std.heap.page_allocator.dupeSentinel(u8, name, 0) else null;
     defer if (name_z) |buf| std.heap.page_allocator.free(buf);
 
     var group = c.mlx_distributed_group{ .ctx = null };
@@ -259,7 +260,7 @@ pub fn arrayFromInt32(data: []const i32, shape: []const i32) c.mlx_array {
 /// Load all tensors from a SafeTensors file into an MLX map.
 pub fn loadSafetensors(path: []const u8, allocator: std.mem.Allocator, stream: c.mlx_stream) !c.mlx_map_string_to_array {
     _ = stream;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     var weights = c.mlx_map_string_to_array_new();
@@ -274,7 +275,7 @@ pub fn loadSafetensors(path: []const u8, allocator: std.mem.Allocator, stream: c
 }
 
 pub fn insertWeight(weights: c.mlx_map_string_to_array, allocator: std.mem.Allocator, name: []const u8, arr: c.mlx_array) !void {
-    const name_z = try allocator.dupeZ(u8, name);
+    const name_z = try allocator.dupeSentinel(u8, name, 0);
     defer allocator.free(name_z);
     if (c.mlx_map_string_to_array_insert(weights, name_z.ptr, arr) != 0) {
         return error.MlxMapInsertFailed;

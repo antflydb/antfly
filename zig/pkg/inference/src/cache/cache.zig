@@ -16,12 +16,15 @@
 // Mirrors the legacy Go inference caching strategy.
 
 const std = @import("std");
-const libc = @cImport(@cInclude("time.h"));
 
+// Monotonic nanosecond timestamp for cache entry TTL bookkeeping. The pre-0.17
+// code used clock_gettime(CLOCK_MONOTONIC) via @cImport; @cImport is gone, but
+// std.posix.clock_gettime gives the same monotonic source. Wall-clock
+// std.time.nanoTimestamp() is avoided here so an NTP/manual clock jump can't
+// corrupt expiry math.
 fn nowNs() i64 {
-    var ts: libc.struct_timespec = undefined;
-    if (libc.clock_gettime(libc.CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.tv_nsec));
+    const ts = std.posix.clock_gettime(std.posix.CLOCK.MONOTONIC) catch return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
 pub fn ResultCache(comptime V: type) type {

@@ -138,7 +138,7 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) void {
     if (spec.link_libc) exe.root_module.link_libc = true;
 
     const run = b.addRunArtifact(exe);
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     const step = b.step(spec.name, spec.description);
     step.dependOn(&run.step);
 }

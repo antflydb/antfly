@@ -2151,7 +2151,7 @@ fn makeLsmBackgroundExecutor(runtime: *background_runtime_mod.BackendRuntime, ow
 }
 
 fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpenOptions) !db_core.OpenedPrimaryStore {
-    const zpath = try alloc.dupeZ(u8, path);
+    const zpath = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(zpath);
 
     return switch (primaryStoreOpenPlan(opts)) {
@@ -16744,7 +16744,7 @@ const OpenedSplitDestinationStore = struct {
 };
 
 fn openSplitDestinationStore(self: *DB, dest_dir: []const u8) !OpenedSplitDestinationStore {
-    const dest_path_z = try self.alloc.dupeZ(u8, dest_dir);
+    const dest_path_z = try self.alloc.dupeSentinel(u8, dest_dir, 0);
     defer self.alloc.free(dest_path_z);
 
     return switch (splitDestinationStorePlan(self)) {

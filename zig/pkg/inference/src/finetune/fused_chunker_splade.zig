@@ -553,7 +553,7 @@ test "computeSpladeFlopsLoss — basic" {
     // values: [1, -2, 0,  3, 0, -1]
     // sum |v| = 1+2+0+3+0+1 = 7; mean over 2 chunks = 3.5; loss = 1e-3 * 3.5 = 3.5e-3
     const vecs = [_]f32{ 1, -2, 0, 3, 0, -1 };
-    var grad = [_]f32{0} ** 6;
+    var grad = @as([6]f32, @splat(0));
     const loss = computeSpladeFlopsLoss(&vecs, &grad, 2, 3, 1e-3);
 
     const expected_loss: f32 = 1e-3 * 3.5;
@@ -574,7 +574,7 @@ test "computeSpladeContrastiveLoss — trivial V<2 returns zero" {
 
     const N = 3;
     const V = 4;
-    const vecs = [_]f32{0} ** (N * V);
+    const vecs = @as([(N * V)]f32, @splat(0));
     const mask = [_]f32{ 0, 0, 1 }; // only 1 valid → zero loss
     const doc_ids = [_]u32{ 0, 0, 0 };
 

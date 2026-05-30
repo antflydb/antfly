@@ -24,13 +24,10 @@ const build_options = @import("build_options");
 
 pub const link_libc = build_options.link_libc;
 
-pub const c = if (build_options.link_libc) @cImport({
-    @cInclude("fcntl.h");
-    @cInclude("unistd.h");
-    @cInclude("sys/stat.h");
-    @cInclude("sys/mman.h");
-    @cInclude("dirent.h");
-}) else struct {};
+// Zig 0.17 removed `@cImport`/`@cInclude`; the libc POSIX surface these helpers
+// use now comes from a hand-written `extern "c"` shim (`posix_c.zig`). The
+// no-libc paths below go through `std.posix` instead and never touch `c`.
+pub const c = if (build_options.link_libc) @import("posix_c.zig") else struct {};
 
 /// Memory-mapped file region. The mapped bytes are valid until `deinit()` is called.
 pub const MmapRegion = struct {
@@ -39,7 +36,7 @@ pub const MmapRegion = struct {
 
     /// Memory-map an entire file read-only. Returns borrowed bytes backed by the OS page cache.
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !MmapRegion {
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
 
         const fd = try openReadOnlyZ(path_z);
@@ -89,7 +86,7 @@ pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
 /// Read an entire file with a custom max size limit.
 pub fn readFileMax(allocator: std.mem.Allocator, path: []const u8, max_size: usize) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -114,7 +111,7 @@ pub fn readFileMax(allocator: std.mem.Allocator, path: []const u8, max_size: usi
 
 /// Return the byte size of a file.
 pub fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -125,7 +122,7 @@ pub fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
 
 /// Read a byte range from a file using pread.
 pub fn readRegion(allocator: std.mem.Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -152,7 +149,7 @@ pub fn readRegion(allocator: std.mem.Allocator, path: []const u8, offset: u64, l
 
 /// Check if a file exists at the given path.
 pub fn fileExists(allocator: std.mem.Allocator, path: []const u8) bool {
-    const path_z = allocator.dupeZ(u8, path) catch return false;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return false;
     defer allocator.free(path_z);
     return fileExistsZ(path_z);
 }
@@ -181,7 +178,10 @@ fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
     } else if (comptime build_options.link_libc) {
         var stat_buf: c.struct_stat = undefined;
         if (c.fstat(fd, &stat_buf) != 0) return error.StatFailed;
-        return @intCast(stat_buf.st_size);
+        // std.c.Stat names the size field `.size` (the old @cImport of <sys/stat.h>
+        // exposed the C name `st_size`). This branch is live on macOS and
+        // comptime-dead on Linux, where the statx path above is used.
+        return @intCast(stat_buf.size);
     } else {
         const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
         const stat = try file.stat(std.Options.debug_io);

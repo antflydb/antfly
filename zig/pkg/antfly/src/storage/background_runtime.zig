@@ -450,7 +450,7 @@ test "backend runtime threaded durable lane sees initialized jobs" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
-    var ctxs: [64]Ctx = [_]Ctx{.{}} ** 64;
+    var ctxs: [64]Ctx = @as([64]Ctx, @splat(.{}));
     for (&ctxs) |*ctx| {
         try handle.ptr().durable_jobs.submit(.{
             .owner_id = 77,

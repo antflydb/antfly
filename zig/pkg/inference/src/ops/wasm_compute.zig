@@ -579,7 +579,7 @@ fn isGpuReduceCompatible(axes: []const u8, input_shape: []const i64) bool {
     for (input_shape) |dim| {
         if (dim <= 0) return false;
     }
-    var seen = [_]bool{false} ** 8;
+    var seen = @as([8]bool, @splat(false));
     for (axes) |ax| {
         if (ax >= rank or seen[ax]) return false;
         seen[ax] = true;
@@ -595,7 +595,7 @@ fn isGpuBroadcastInDimCompatible(target_shape: []const i64, broadcast_axes: []co
     const out_rank = target_shape.len;
     const in_rank = input_shape.len;
     if (out_rank == 0 or out_rank > 8 or in_rank > 8 or broadcast_axes.len != in_rank) return false;
-    var seen = [_]bool{false} ** 8;
+    var seen = @as([8]bool, @splat(false));
     for (target_shape) |dim| {
         if (dim <= 0) return false;
     }
@@ -3785,13 +3785,13 @@ pub const WasmCompute = struct {
     ) GpuTensor {
         if (!build_options.enable_webgpu) unreachable;
 
-        var input_u32 = [_]u32{1} ** 8;
-        var output_u32 = [_]u32{1} ** 8;
-        var reduced = [_]u32{0} ** 8;
-        var in_strides = [_]u32{1} ** 8;
-        var out_strides = [_]u32{1} ** 8;
-        var kept_axes = [_]u32{0} ** 8;
-        var reduced_axes = [_]u32{0} ** 8;
+        var input_u32 = @as([8]u32, @splat(1));
+        var output_u32 = @as([8]u32, @splat(1));
+        var reduced = @as([8]u32, @splat(0));
+        var in_strides = @as([8]u32, @splat(1));
+        var out_strides = @as([8]u32, @splat(1));
+        var kept_axes = @as([8]u32, @splat(0));
+        var reduced_axes = @as([8]u32, @splat(0));
 
         for (input_shape, 0..) |dim, i| input_u32[i] = @intCast(dim);
         for (out_shape, 0..) |dim, i| output_u32[i] = @intCast(dim);
@@ -3836,11 +3836,11 @@ pub const WasmCompute = struct {
     ) GpuTensor {
         if (!build_options.enable_webgpu) unreachable;
 
-        var target_u32 = [_]u32{1} ** 8;
-        var input_u32 = [_]u32{1} ** 8;
-        var axes_u32 = [_]u32{0} ** 8;
-        var out_strides = [_]u32{1} ** 8;
-        var in_strides = [_]u32{1} ** 8;
+        var target_u32 = @as([8]u32, @splat(1));
+        var input_u32 = @as([8]u32, @splat(1));
+        var axes_u32 = @as([8]u32, @splat(0));
+        var out_strides = @as([8]u32, @splat(1));
+        var in_strides = @as([8]u32, @splat(1));
 
         for (target_shape, 0..) |dim, i| target_u32[i] = @intCast(dim);
         for (input_shape, 0..) |dim, i| input_u32[i] = @intCast(dim);
@@ -4326,7 +4326,7 @@ pub const WasmCompute = struct {
         // Compute output shape (remove reduced axes).
         var out_shape_buf: [8]i64 = undefined;
         var out_rank: usize = 0;
-        var is_reduced = [_]bool{false} ** 8;
+        var is_reduced = @as([8]bool, @splat(false));
         for (axes) |ax| is_reduced[ax] = true;
         for (0..rank) |d| {
             if (!is_reduced[d]) {

@@ -122,7 +122,7 @@ pub fn pjrtPluginPathFromEnv(allocator: std.mem.Allocator) !?[:0]u8 {
         platform.env.getenv("PJRT_PLUGIN_PATH") orelse
         platform.env.getenv("PJRT_PLUGIN") orelse
         return null;
-    return try allocator.dupeZ(u8, raw);
+    return try allocator.dupeSentinel(u8, raw, 0);
 }
 
 test "parse accepts explicit compiled backends" {

@@ -46,7 +46,7 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
         nonce,
     });
     defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 const Handle = struct {
@@ -5960,7 +5960,7 @@ test "capi request paths trigger readable lease hook" {
     cleanupTestDir(path);
 
     const Recorder = struct {
-        contexts: [9][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 9,
+        contexts: [9][32]u8 = @as([9][32]u8, @splat(@as([32]u8, @splat(0)))),
         context_lens: [9]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         group_ids: [9]u64 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         count: usize = 0,

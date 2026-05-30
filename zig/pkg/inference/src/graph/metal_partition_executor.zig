@@ -6065,11 +6065,11 @@ test "metal partition executor command path handles linear and norms" {
     @memset(value_device, 0);
 
     var x_data: [hidden]f32 = undefined;
-    var w_data: [hidden * hidden]f32 = .{0} ** (hidden * hidden);
-    var bias_data: [hidden]f32 = .{0} ** hidden;
-    var gamma_data: [hidden]f32 = .{1} ** hidden;
-    var beta_data: [hidden]f32 = .{0} ** hidden;
-    var rms_weight_data: [hidden]f32 = .{1} ** hidden;
+    var w_data: [hidden * hidden]f32 = @splat(0);
+    var bias_data: [hidden]f32 = @splat(0);
+    var gamma_data: [hidden]f32 = @splat(1);
+    var beta_data: [hidden]f32 = @splat(0);
+    var rms_weight_data: [hidden]f32 = @splat(1);
     for (&x_data, 0..) |*value, i| value.* = @floatFromInt(i + 1);
     for (0..hidden) |i| w_data[i * hidden + i] = 1.0;
 
@@ -6173,11 +6173,11 @@ test "metal partition executor command path runs linear and norms on metal backe
     @memset(value_device, 0);
 
     var x_data: [hidden]f32 = undefined;
-    var w_data: [hidden * hidden]f32 = .{0} ** (hidden * hidden);
-    var bias_data: [hidden]f32 = .{0} ** hidden;
-    var gamma_data: [hidden]f32 = .{1} ** hidden;
-    var beta_data: [hidden]f32 = .{0} ** hidden;
-    var rms_weight_data: [hidden]f32 = .{1} ** hidden;
+    var w_data: [hidden * hidden]f32 = @splat(0);
+    var bias_data: [hidden]f32 = @splat(0);
+    var gamma_data: [hidden]f32 = @splat(1);
+    var beta_data: [hidden]f32 = @splat(0);
+    var rms_weight_data: [hidden]f32 = @splat(1);
     for (&x_data, 0..) |*value, i| value.* = @floatFromInt(i + 1);
     for (0..hidden) |i| w_data[i * hidden + i] = 1.0;
 
@@ -6292,7 +6292,7 @@ test "metal partition executor resident multi op chain matches host" {
     @memset(value_device, 0);
 
     const x_data = [_]f32{ -4.0, -2.0, -1.0, -0.25, 0.25, 1.0, 2.0, 4.0 };
-    var w_data: [dim * dim]f32 = .{0} ** (dim * dim);
+    var w_data: [dim * dim]f32 = @splat(0);
     const bias_data = [_]f32{ 0.5, -0.25, 0.125, -0.5, 0.25, 0.75, -0.125, 0.0 };
     for (0..dim) |i| w_data[i * dim + i] = 1.0;
 

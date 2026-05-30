@@ -316,10 +316,10 @@ const ProgressiveDecodeContext = struct {
             .mcu_cols = 0,
             .mcu_rows = 0,
             .component_states = std.mem.zeroes([max_components][]ProgressiveBlockState),
-            .component_blocks_x = [_]usize{0} ** max_components,
-            .component_blocks_y = [_]usize{0} ** max_components,
-            .component_actual_blocks_x = [_]usize{0} ** max_components,
-            .component_actual_blocks_y = [_]usize{0} ** max_components,
+            .component_blocks_x = @as([max_components]usize, @splat(0)),
+            .component_blocks_y = @as([max_components]usize, @splat(0)),
+            .component_actual_blocks_x = @as([max_components]usize, @splat(0)),
+            .component_actual_blocks_y = @as([max_components]usize, @splat(0)),
             .component_quant_tables = undefined,
             .allocated_components = 0,
         };
@@ -385,9 +385,9 @@ pub fn parseStructure(jpeg_bytes: []const u8) !Structure {
         .quant_tables = std.mem.zeroes([max_quant_tables]QuantTableInfo),
         .huffman_dc_tables = std.mem.zeroes([max_huffman_tables]HuffmanTableInfo),
         .huffman_ac_tables = std.mem.zeroes([max_huffman_tables]HuffmanTableInfo),
-        .arithmetic_dc_l = [_]u8{0} ** max_arithmetic_tables,
-        .arithmetic_dc_u = [_]u8{1} ** max_arithmetic_tables,
-        .arithmetic_ac_k = [_]u8{5} ** max_arithmetic_tables,
+        .arithmetic_dc_l = @as([max_arithmetic_tables]u8, @splat(0)),
+        .arithmetic_dc_u = @as([max_arithmetic_tables]u8, @splat(1)),
+        .arithmetic_ac_k = @as([max_arithmetic_tables]u8, @splat(5)),
         .adobe_transform = null,
         .restart_interval = null,
         .scan_count = 0,
@@ -958,7 +958,7 @@ fn decodeProgressiveDcInterleavedScan(
             if (restart_interval != 0 and mcus_decoded < total_mcus and mcus_decoded % restart_interval == 0) {
                 try reader.consumeExpectedRestartMarker(0xd0 + restart_index);
                 restart_index = (restart_index + 1) & 0x7;
-                dc_predictors.* = [_]i16{0} ** max_components;
+                dc_predictors.* = @as([max_components]i16, @splat(0));
             }
         }
     }
@@ -1133,7 +1133,7 @@ fn applyProgressiveScan(
     const restart_interval = structure.restart_interval orelse 0;
 
     if (scan.spectral_start == 0) {
-        var scan_frame_indices = [_]usize{0} ** max_components;
+        var scan_frame_indices = @as([max_components]usize, @splat(0));
         var scan_dc_tables: [max_components]CanonicalHuffmanTable = undefined;
         for (0..scan.component_count) |i| {
             const scan_component = scan.components[i];
@@ -1143,7 +1143,7 @@ fn applyProgressiveScan(
         }
 
         if (scan.component_count > 1) {
-            var progressive_components = [_]ProgressiveDcScanComponent{undefined} ** max_components;
+            var progressive_components = @as([max_components]ProgressiveDcScanComponent, @splat(undefined));
             for (0..scan.component_count) |scan_component_index| {
                 const frame_index = scan_frame_indices[scan_component_index];
                 progressive_components[scan_component_index] = .{
@@ -1350,8 +1350,8 @@ pub fn supportsPlannedProgressiveDecode(structure: Structure) bool {
         if (colorEncodingForStructure(structure) == null) return false;
     }
 
-    var saw_dc_first = [_]bool{false} ** max_components;
-    var saw_ac_first = [_]bool{false} ** max_components;
+    var saw_dc_first = @as([max_components]bool, @splat(false));
+    var saw_ac_first = @as([max_components]bool, @splat(false));
 
     for (0..structure.info.component_count) |i| {
         const component = structure.info.components[i];
@@ -1443,8 +1443,8 @@ pub fn supportsPlannedArithmeticProgressiveDecode(structure: Structure) bool {
         if (colorEncodingForStructure(structure) == null) return false;
     }
 
-    var saw_dc_first = [_]bool{false} ** max_components;
-    var saw_ac_first = [_]bool{false} ** max_components;
+    var saw_dc_first = @as([max_components]bool, @splat(false));
+    var saw_ac_first = @as([max_components]bool, @splat(false));
 
     for (0..structure.info.component_count) |i| {
         const component = structure.info.components[i];
@@ -1545,10 +1545,10 @@ fn decodeRgbaPureZigArithmeticProgressive(
 
     var dc_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_dc_stat_bins]u8);
     var ac_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_ac_stat_bins]u8);
-    var fixed_bin = [_]u8{0} ** 4;
+    var fixed_bin = @as([4]u8, @splat(0));
     fixed_bin[0] = 113;
-    var last_dc_values = [_]i32{0} ** max_components;
-    var dc_contexts = [_]u8{0} ** max_components;
+    var last_dc_values = @as([max_components]i32, @splat(0));
+    var dc_contexts = @as([max_components]u8, @splat(0));
 
     for (0..structure.scan_count) |scan_index| {
         try applyArithmeticProgressiveScan(
@@ -1647,7 +1647,7 @@ fn applyArithmeticProgressiveScan(
 
     if (scan.spectral_start == 0) {
         if (scan.component_count > 1) {
-            var scan_components = [_]ArithmeticProgressiveDcScanComponent{undefined} ** max_components;
+            var scan_components = @as([max_components]ArithmeticProgressiveDcScanComponent, @splat(undefined));
             for (0..scan.component_count) |scan_component_index| {
                 const scan_component = scan.components[scan_component_index];
                 const frame_index = frameComponentIndex(structure.info, scan_component.component_selector) orelse return error.JpegDecodeFailed;
@@ -2020,8 +2020,8 @@ fn decodeArithmeticProgressiveAcScanMapped(
     var processed_blocks: usize = 0;
     const total_blocks = actual_blocks_x * actual_blocks_y;
     var dc_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_dc_stat_bins]u8);
-    var last_dc_values = [_]i32{0} ** max_components;
-    var dc_contexts = [_]u8{0} ** max_components;
+    var last_dc_values = @as([max_components]i32, @splat(0));
+    var dc_contexts = @as([max_components]u8, @splat(0));
 
     for (0..actual_blocks_y) |block_y| {
         for (0..actual_blocks_x) |block_x| {
@@ -2075,8 +2075,8 @@ fn refineArithmeticProgressiveAcScanMapped(
     var processed_blocks: usize = 0;
     const total_blocks = actual_blocks_x * actual_blocks_y;
     var dc_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_dc_stat_bins]u8);
-    var last_dc_values = [_]i32{0} ** max_components;
-    var dc_contexts = [_]u8{0} ** max_components;
+    var last_dc_values = @as([max_components]i32, @splat(0));
+    var dc_contexts = @as([max_components]u8, @splat(0));
 
     for (0..actual_blocks_y) |block_y| {
         for (0..actual_blocks_x) |block_x| {
@@ -2127,10 +2127,10 @@ fn decodeRgbaPureZigArithmeticSequential(
     var decoder = ArithmeticDecoder.init(entropy_bytes);
     var dc_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_dc_stat_bins]u8);
     var ac_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_ac_stat_bins]u8);
-    var fixed_bin = [_]u8{0} ** 4;
+    var fixed_bin = @as([4]u8, @splat(0));
     fixed_bin[0] = 113;
-    var last_dc_values = [_]i32{0} ** max_components;
-    var dc_contexts = [_]u8{0} ** max_components;
+    var last_dc_values = @as([max_components]i32, @splat(0));
+    var dc_contexts = @as([max_components]u8, @splat(0));
     const restart_interval = structure.restart_interval orelse 0;
     var restart_index: u8 = 0;
 
@@ -2166,10 +2166,10 @@ fn decodeRgbaPureZigArithmeticSequential(
                     restart_index = (restart_index + 1) & 0x7;
                     dc_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_dc_stat_bins]u8);
                     ac_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_ac_stat_bins]u8);
-                    fixed_bin = [_]u8{0} ** 4;
+                    fixed_bin = @as([4]u8, @splat(0));
                     fixed_bin[0] = 113;
-                    last_dc_values = [_]i32{0} ** max_components;
-                    dc_contexts = [_]u8{0} ** max_components;
+                    last_dc_values = @as([max_components]i32, @splat(0));
+                    dc_contexts = @as([max_components]u8, @splat(0));
                 }
             }
         }
@@ -2238,10 +2238,10 @@ fn decodeRgbaPureZigArithmeticSequential(
                     restart_index = (restart_index + 1) & 0x7;
                     dc_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_dc_stat_bins]u8);
                     ac_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_ac_stat_bins]u8);
-                    fixed_bin = [_]u8{0} ** 4;
+                    fixed_bin = @as([4]u8, @splat(0));
                     fixed_bin[0] = 113;
-                    last_dc_values = [_]i32{0} ** max_components;
-                    dc_contexts = [_]u8{0} ** max_components;
+                    last_dc_values = @as([max_components]i32, @splat(0));
+                    dc_contexts = @as([max_components]u8, @splat(0));
                 }
             }
         }
@@ -2522,7 +2522,7 @@ fn decodeRgbaPureZigColorBaseline(
     const scan = structure.scans[0];
     const entropy_bytes = try scanEntropyBytes(structure, jpeg_bytes, 0);
     var reader = EntropyBitReader.init(entropy_bytes);
-    var dc_predictors = [_]i64{0} ** max_components;
+    var dc_predictors = @as([max_components]i64, @splat(0));
     const restart_interval = structure.restart_interval orelse 0;
     var restart_index: u8 = 0;
 
@@ -2588,7 +2588,7 @@ fn decodeRgbaPureZigColorBaseline(
             if (restart_interval != 0 and mcus_decoded < total_mcus and mcus_decoded % restart_interval == 0) {
                 try reader.consumeExpectedRestartMarker(0xd0 + restart_index);
                 restart_index = (restart_index + 1) & 0x7;
-                dc_predictors = [_]i64{0} ** max_components;
+                dc_predictors = @as([max_components]i64, @splat(0));
             }
         }
     }
@@ -2733,7 +2733,7 @@ fn decodeRgbaPureZigProgressive(
     var progressive = try ProgressiveDecodeContext.init(alloc, structure);
     defer progressive.deinit(alloc);
 
-    var dc_predictors = [_]i16{0} ** max_components;
+    var dc_predictors = @as([max_components]i16, @splat(0));
 
     for (0..structure.scan_count) |scan_index| {
         try applyProgressiveScan(jpeg_bytes, structure, scan_index, &progressive, &dc_predictors);
@@ -4360,7 +4360,7 @@ test "pure zig baseline color decode matches libjpeg coefficients on 444 fixture
     const scan = structure.scans[0];
     const entropy_bytes = fixture_bytes[scan.entropy_start..];
     var reader = EntropyBitReader.init(entropy_bytes);
-    var dc_predictors = [_]i64{0} ** max_components;
+    var dc_predictors = @as([max_components]i64, @splat(0));
     var component_dc_tables: [max_components]CanonicalHuffmanTable = undefined;
     var component_ac_tables: [max_components]CanonicalHuffmanTable = undefined;
     for (0..structure.info.component_count) |frame_index| {
@@ -4470,7 +4470,7 @@ test "pure zig baseline color decode matches libjpeg coefficients on 422 fixture
     const scan = structure.scans[0];
     const entropy_bytes = fixture_bytes[scan.entropy_start..];
     var reader = EntropyBitReader.init(entropy_bytes);
-    var dc_predictors = [_]i64{0} ** max_components;
+    var dc_predictors = @as([max_components]i64, @splat(0));
     var component_dc_tables: [max_components]CanonicalHuffmanTable = undefined;
     var component_ac_tables: [max_components]CanonicalHuffmanTable = undefined;
     for (0..structure.info.component_count) |frame_index| {
@@ -5860,7 +5860,7 @@ test "apply progressive scans populates manifest-backed progressive jpeg state" 
     var progressive = try ProgressiveDecodeContext.init(alloc, structure);
     defer progressive.deinit(alloc);
 
-    var dc_predictors = [_]i16{0} ** max_components;
+    var dc_predictors = @as([max_components]i16, @splat(0));
     for (0..structure.scan_count) |scan_index| {
         try applyProgressiveScan(fixture_bytes, structure, scan_index, &progressive, &dc_predictors);
     }
@@ -5886,7 +5886,7 @@ test "apply progressive scans matches libjpeg coefficient reference for manifest
     var progressive = try ProgressiveDecodeContext.init(alloc, structure);
     defer progressive.deinit(alloc);
 
-    var dc_predictors = [_]i16{0} ** max_components;
+    var dc_predictors = @as([max_components]i16, @splat(0));
     for (0..structure.scan_count) |scan_index| {
         try applyProgressiveScan(fixture_bytes, structure, scan_index, &progressive, &dc_predictors);
     }
@@ -6076,7 +6076,7 @@ test "embedded 444 progressive fixture coefficient state matches libjpeg referen
     var progressive = try ProgressiveDecodeContext.init(alloc, structure);
     defer progressive.deinit(alloc);
 
-    var dc_predictors = [_]i16{0} ** max_components;
+    var dc_predictors = @as([max_components]i16, @splat(0));
     for (0..structure.scan_count) |scan_index| {
         try applyProgressiveScan(fixture_bytes, structure, scan_index, &progressive, &dc_predictors);
     }
@@ -6856,10 +6856,10 @@ test "arithmetic sequential block decode matches libjpeg coefficient reference" 
     var decoder = ArithmeticDecoder.init(entropy_bytes);
     var dc_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_dc_stat_bins]u8);
     var ac_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_ac_stat_bins]u8);
-    var fixed_bin = [_]u8{0} ** 4;
+    var fixed_bin = @as([4]u8, @splat(0));
     fixed_bin[0] = 113;
-    var last_dc_values = [_]i32{0} ** max_components;
-    var dc_contexts = [_]u8{0} ** max_components;
+    var last_dc_values = @as([max_components]i32, @splat(0));
+    var dc_contexts = @as([max_components]u8, @splat(0));
 
     var y = std.mem.zeroes([64]i16);
     for (0..4) |block_index| {
@@ -6975,18 +6975,18 @@ test "libjpeg arithmetic coefficient reference reconstructs expected rgba" {
 
     const y_coeffs = [_]i16{
         -291, 96, 69, 23, 0, -6, -6, -3,
-    } ++ ([_]i16{0} ** 56);
+    } ++ (@as([56]i16, @splat(0)));
     const cb_coeffs = [_]i16{
         -14, -15, -11, -6, -2, -2, -1, -1,
-    } ++ ([_]i16{0} ** 56);
+    } ++ (@as([56]i16, @splat(0)));
     const cr_coeffs = [_]i16{
         42, 44, 33, 16, 6, 5, 3, 2,
-    } ++ ([_]i16{0} ** 56);
+    } ++ (@as([56]i16, @splat(0)));
 
     writeSpatialBlockToPlane(component_planes[0], 0, 0, dequantizeAndInverseDct(y_coeffs, component_quant_tables[0]));
-    writeSpatialBlockToPlane(component_planes[0], 1, 0, dequantizeAndInverseDct([_]i16{0} ** 64, component_quant_tables[0]));
-    writeSpatialBlockToPlane(component_planes[0], 0, 1, dequantizeAndInverseDct([_]i16{0} ** 64, component_quant_tables[0]));
-    writeSpatialBlockToPlane(component_planes[0], 1, 1, dequantizeAndInverseDct([_]i16{0} ** 64, component_quant_tables[0]));
+    writeSpatialBlockToPlane(component_planes[0], 1, 0, dequantizeAndInverseDct(@as([64]i16, @splat(0)), component_quant_tables[0]));
+    writeSpatialBlockToPlane(component_planes[0], 0, 1, dequantizeAndInverseDct(@as([64]i16, @splat(0)), component_quant_tables[0]));
+    writeSpatialBlockToPlane(component_planes[0], 1, 1, dequantizeAndInverseDct(@as([64]i16, @splat(0)), component_quant_tables[0]));
     writeSpatialBlockToPlane(component_planes[1], 0, 0, dequantizeAndInverseDct(cb_coeffs, component_quant_tables[1]));
     writeSpatialBlockToPlane(component_planes[2], 0, 0, dequantizeAndInverseDct(cr_coeffs, component_quant_tables[2]));
 
@@ -7145,9 +7145,9 @@ test "decode progressive dc interleaved scan carries per-component predictors" {
     const dc_table = try buildCanonicalHuffmanTable(dc_info);
     var reader = EntropyBitReader.init(&.{ 0x68, 0xb4, 0x40 });
 
-    var y_states = [_]ProgressiveBlockState{.{}} ** 4;
-    var cb_states = [_]ProgressiveBlockState{.{}} ** 1;
-    var cr_states = [_]ProgressiveBlockState{.{}} ** 1;
+    var y_states = @as([4]ProgressiveBlockState, @splat(.{}));
+    var cb_states = @as([1]ProgressiveBlockState, @splat(.{}));
+    var cr_states = @as([1]ProgressiveBlockState, @splat(.{}));
     const scan_components = [_]ProgressiveDcScanComponent{
         .{
             .frame_index = 0,
@@ -7174,7 +7174,7 @@ test "decode progressive dc interleaved scan carries per-component predictors" {
             .blocks_y = 1,
         },
     };
-    var dc_predictors = [_]i16{0} ** max_components;
+    var dc_predictors = @as([max_components]i16, @splat(0));
 
     try decodeProgressiveDcInterleavedScan(&reader, &scan_components, &dc_predictors, 1, 1, 0, 1, 0);
 
@@ -7191,9 +7191,9 @@ test "decode progressive dc interleaved scan carries per-component predictors" {
 
 test "refine progressive dc interleaved scan updates only marked blocks" {
     var reader = EntropyBitReader.init(&.{0b1010_1000});
-    var y_states = [_]ProgressiveBlockState{.{}} ** 4;
-    var cb_states = [_]ProgressiveBlockState{.{}} ** 1;
-    var cr_states = [_]ProgressiveBlockState{.{}} ** 1;
+    var y_states = @as([4]ProgressiveBlockState, @splat(.{}));
+    var cb_states = @as([1]ProgressiveBlockState, @splat(.{}));
+    var cr_states = @as([1]ProgressiveBlockState, @splat(.{}));
     y_states[0].coefficients[0] = 6;
     y_states[1].coefficients[0] = 10;
     y_states[2].coefficients[0] = 6;

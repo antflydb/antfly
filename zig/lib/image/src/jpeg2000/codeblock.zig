@@ -511,7 +511,7 @@ const MqSymbolSource = struct {
 const TracingMqSymbolSource = struct {
     decoder: *arithmetic.MqDecoder,
     symbol_count: usize = 0,
-    preview: [16]u8 = [_]u8{0} ** 16,
+    preview: [16]u8 = @as([16]u8, @splat(0)),
     mq_events: ?*std.ArrayListUnmanaged(MqEvent) = null,
     allocator: ?std.mem.Allocator = null,
 
@@ -1187,9 +1187,9 @@ fn capturePassSnapshot(grid: *const CoefficientGrid, pass: CodingPass) PassSnaps
         .kind = pass.kind,
         .bitplane = pass.bitplane,
         .mq_symbol_count = 0,
-        .magnitudes = [_]i32{0} ** 4,
-        .signs = [_]u8{0} ** 4,
-        .significant = [_]u8{0} ** 4,
+        .magnitudes = @as([4]i32, @splat(0)),
+        .signs = @as([4]u8, @splat(0)),
+        .significant = @as([4]u8, @splat(0)),
     };
     const limit = @min(snapshot.magnitudes.len, grid.cells.len);
     var i: usize = 0;

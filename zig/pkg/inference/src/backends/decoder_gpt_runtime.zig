@@ -23,7 +23,7 @@ const mlx_compute = if (build_options.enable_mlx) @import("../ops/mlx_compute.zi
 const metal_compute = @import("../ops/metal_compute.zig");
 const ops = @import("../ops/ops.zig");
 
-const c_std = @cImport(@cInclude("stdlib.h"));
+const c_std = @import("../util/c_env.zig");
 
 fn dequantizeTensorToFloat32Generic(
     cb: *const ops.ComputeBackend,

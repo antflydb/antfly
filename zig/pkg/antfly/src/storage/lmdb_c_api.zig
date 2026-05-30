@@ -12,9 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const zig_lmdb = @import("lmdb_engine");
-
-pub const Bindings = if (zig_lmdb.is_zig_backend)
-    @import("lmdb_c_stub.zig")
-else
-    @cImport(@cInclude("lmdb.h"));
+// Zig 0.17 removed `@cImport`. The `lmdb_c_bindings` module is provided by the
+// build system: an `addTranslateC` of `lmdb.h` for the C backend, or
+// `lmdb_c_stub.zig` for the Zig backend / no-libc builds.
+pub const Bindings = @import("lmdb_c_bindings");

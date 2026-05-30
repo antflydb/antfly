@@ -20,9 +20,9 @@ const jpeg2000_decode = @import("jpeg2000/decode.zig");
 const png = @import("png.zig");
 const processing = @import("processing.zig");
 const test_support = @import("test_support.zig");
-const c = if (build_options.enable_spng) @cImport({
-    @cInclude("spng.h");
-}) else struct {};
+// Zig 0.17 removed @cImport; the build provides `spng_c` as a translate-c
+// module of spng.h when libspng is available, else an empty struct.
+const c = @import("spng_c");
 
 const BenchError = error{
     InvalidArguments,

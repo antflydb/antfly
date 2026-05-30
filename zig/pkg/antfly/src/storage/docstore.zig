@@ -228,13 +228,13 @@ fn lmdbUserDbName(kind: LmdbUserDbKind) ?[]const u8 {
 }
 
 fn openLmdbUserDbTxn(alloc: Allocator, txn: *LmdbTransaction, create: bool) !LmdbDbi {
-    const name_z = try alloc.dupeZ(u8, lmdb_user_db_name);
+    const name_z = try alloc.dupeSentinel(u8, lmdb_user_db_name, 0);
     defer alloc.free(name_z);
     return try txn.openDb(name_z, .{ .create = create });
 }
 
 fn openLmdbUserDbBatch(alloc: Allocator, batch: *LmdbBatch, create: bool) !LmdbDbi {
-    const name_z = try alloc.dupeZ(u8, lmdb_user_db_name);
+    const name_z = try alloc.dupeSentinel(u8, lmdb_user_db_name, 0);
     defer alloc.free(name_z);
     return try batch.openDb(name_z, .{ .create = create });
 }
@@ -789,7 +789,7 @@ pub const DocStore = struct {
         if (!rewritten) return false;
 
         const opts = self.env.opts;
-        const reopen_path = try self.alloc.dupeZ(u8, base_path);
+        const reopen_path = try self.alloc.dupeSentinel(u8, base_path, 0);
         defer self.alloc.free(reopen_path);
         self.env.close();
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -2270,7 +2270,7 @@ test "docstore rewriteLeftInPlace keeps metadata and drops right range" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try DocStore.open(alloc, path_z, .{});
@@ -2301,7 +2301,7 @@ test "docstore splitRightToDir opens child image from split main db" {
 
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try std.fmt.bufPrint(&src_path_buf, ".zig-cache/tmp/{s}/src", .{tmp.sub_path});
-    const src_path_z = try alloc.dupeZ(u8, src_path);
+    const src_path_z = try alloc.dupeSentinel(u8, src_path, 0);
     defer alloc.free(src_path_z);
 
     var child_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -2321,7 +2321,7 @@ test "docstore splitRightToDir opens child image from split main db" {
 
     if (!(try store.splitRightToDir("doc:m", child_dir))) return;
 
-    const child_path_z = try alloc.dupeZ(u8, child_dir);
+    const child_path_z = try alloc.dupeSentinel(u8, child_dir, 0);
     defer alloc.free(child_path_z);
     var child = try DocStore.open(alloc, child_path_z, .{});
     defer child.close();
@@ -2345,7 +2345,7 @@ test "docstore rewriteLeftInPlace keeps all left docs across reopen" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try DocStore.open(alloc, path_z, .{});

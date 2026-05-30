@@ -103,12 +103,12 @@ pub const ShapeConstraint = union(enum) {
 /// (symbolic) dimensions that are resolved at execution time.
 pub const Shape = struct {
     dtype: DType = .f32,
-    dims: [max_rank]i64 = .{0} ** max_rank,
+    dims: [max_rank]i64 = @splat(0),
     rank_: u8 = 0,
     /// Optional upper bounds for dynamic dimensions. When bounds[i] > 0
     /// and dims[i] < 0, the dynamic dimension is guaranteed <= bounds[i].
     /// Enables memory planning even for variable-length inputs.
-    bounds: [max_rank]i64 = .{0} ** max_rank,
+    bounds: [max_rank]i64 = @splat(0),
 
     pub fn init(dtype: DType, dims: []const i64) Shape {
         std.debug.assert(dims.len <= max_rank);

@@ -43,7 +43,7 @@ const CodeSpaceRange = struct {
 const FontDecoder = struct {
     code_bytes: usize = 1,
     base_encoding: text_encoding.NamedEncoding = .pdf_doc,
-    differences: [256]?u21 = [_]?u21{null} ** 256,
+    differences: [256]?u21 = @as([256]?u21, @splat(null)),
     to_unicode: []ToUnicodeEntry = &.{},
     codespace_ranges: []CodeSpaceRange = &.{},
 
@@ -3344,7 +3344,7 @@ pub const Reader = struct {
         defer resolved_charprocs.deinit(self.alloc);
         if (resolved_charprocs != .dict) return font;
 
-        var code_to_name = [_]?[]const u8{null} ** 256;
+        var code_to_name = @as([256]?[]const u8, @splat(null));
         if (font_obj.get("Encoding")) |encoding_obj| {
             var resolved_encoding = try self.resolveValue(encoding_obj);
             defer resolved_encoding.deinit(self.alloc);
@@ -3452,7 +3452,7 @@ pub const Reader = struct {
             if (local_subrs.len > 0) self.alloc.free(local_subrs);
         }
 
-        var code_to_name = [_]?[]const u8{null} ** 256;
+        var code_to_name = @as([256]?[]const u8, @splat(null));
         if (font_obj.get("Encoding")) |encoding_obj| {
             var resolved_encoding = try self.resolveValue(encoding_obj);
             defer resolved_encoding.deinit(self.alloc);

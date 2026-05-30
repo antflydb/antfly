@@ -368,7 +368,7 @@ test "encodeInto reuses output buffer across calls" {
 
 test "round-trip all zeros" {
     const alloc = std.testing.allocator;
-    const input = [_]u8{0} ** 4096;
+    const input = @as([4096]u8, @splat(0));
     const compressed = try encode(alloc, &input);
     defer alloc.free(compressed);
     // Should compress significantly (4096 -> under 300 bytes)

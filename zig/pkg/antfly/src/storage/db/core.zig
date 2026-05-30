@@ -1345,7 +1345,7 @@ pub fn openCoreResourcesFromPrimaryStore(
 
     const change_journal_path = try std.fmt.allocPrint(alloc, "{s}/change_journal", .{path});
     defer alloc.free(change_journal_path);
-    const change_journal_path_z = try alloc.dupeZ(u8, change_journal_path);
+    const change_journal_path_z = try alloc.dupeSentinel(u8, change_journal_path, 0);
     defer alloc.free(change_journal_path_z);
     change_journal.* = try change_journal_mod.Journal.open(
         change_journal_path_z,

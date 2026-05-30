@@ -11059,7 +11059,7 @@ test "api http server enforces session adoption timeout when configured" {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
 
-    const session_path_z = try alloc.dupeZ(u8, session_path);
+    const session_path_z = try alloc.dupeSentinel(u8, session_path, 0);
     defer alloc.free(session_path_z);
     var session_store = try docstore_mod.DocStore.open(alloc, session_path_z, .{});
     defer session_store.close();
@@ -18468,7 +18468,11 @@ test "api http server executes foreign right join query through registry" {
 
 test "api http server executes direct foreign table query through registry" {
     const alloc = std.testing.allocator;
-    const c = @cImport(@cInclude("stdlib.h"));
+    // Zig 0.17 removed @cImport; declare the two libc calls this test needs.
+    const c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
     try std.testing.expectEqual(@as(c_int, 0), c.setenv("PG_DSN", "postgres://resolved", 1));
     defer _ = c.unsetenv("PG_DSN");
 

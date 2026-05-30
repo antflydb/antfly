@@ -1,5 +1,193 @@
 # Zig Notes
 
+## 2026-05-30: Zig 0.17.0 nightly bring-up (full build GREEN)
+
+Summary: the whole repo builds and the full `antfly` binary runs on the official
+nightly `0.17.0-dev.607`. This covers the devlog's build-system split plus several
+undocumented 0.17 removals — the `**` repeat operator, `@cImport`/`@cInclude`,
+`Allocator.dupeZ`, `std.heap.stackFallback`, `std.ascii.indexOfIgnoreCase`,
+`std.meta.Int`, and the `std.bit_set` static-init methods. Details below.
+
+Tracking the 0.17.0 pre-release announced in the
+[2026-05-26 devlog](https://ziglang.org/devlog/2026/#2026-05-26). 0.17.0 is not
+released yet; this is against the official nightly `0.17.0-dev.607+456b2ec07`.
+
+### Installing the nightly via pip
+
+The official `ziglang` PyPI package only publishes stable releases (max `0.16.0`),
+so `pip install ziglang` cannot get a 0.17 dev build. The canonical "pip install
+nightly" path is the [zig-pypi](https://github.com/ziglang/zig-pypi)
+`make_wheels.py`, which repackages any `ziglang.org/builds` tarball as a wheel:
+
+```sh
+git clone --depth 1 https://github.com/ziglang/zig-pypi.git
+cd zig-pypi
+# One-time patch: the nightly archive ships lib/libtsan/LICENSE.TXT, which the
+# builder's strict license allowlist rejects. Add it to required_license_paths.
+uv run --with wheel python make_wheels.py --version master --platform x86_64-linux --outdir dist
+pip install --force-reinstall dist/ziglang-0.17.0.dev*.whl
+python3 -m ziglang version   # -> 0.17.0-dev.607+456b2ec07
+```
+
+The wheel exposes the compiler as `python3 -m ziglang`; wrap it in a `zig` shim on
+PATH for the Makefile (`ZIG ?= zig`).
+
+### What the devlog change requires (build-system split — DONE)
+
+The devlog's headline change is the configurer/maker split. The user-visible API
+break is that `b.args` is gone (the build graph can no longer observe the post-`--`
+passthru args at configure time). Migrations applied across all `build.zig` /
+build-helper files:
+
+- `if (b.args) |a| run.addArgs(a);`  → `run.addPassthruArgs();`
+- `if (b.args) |a| run.addArgs(a) else run.addArgs(&defaults);`
+  → `run.addArgs(&defaults); run.addPassthruArgs();`
+  (defaults are now *always* added and user args are appended after; for the
+  last-wins flag parsers in our benches this preserves override intent, but it is a
+  behavioral change — defaults are no longer suppressed when args are passed.)
+- `forwardBuildArgs` lost its now-unused `*std.Build` parameter.
+- `b.getInstallPath(.prefix, "…")` was removed →
+  `run.addFileArg(b.graph.path(.install_prefix, "…"))` (a cache-correct LazyPath).
+- `selectTestFilters` read `b.args` at configure time to set compile-time test
+  `.filters`. That capability is gone; it now reads a repeatable `-Dtest-filter=…`
+  option. The option must be declared exactly once (`b.option` panics on a second
+  declaration), so the top-level `build.zig` declares it up front and threads the
+  resolved value into the (now pure) helper.
+
+After these edits both `zig build --help` (top-level) and the delegated
+`pkg/inference` build configure cleanly under the nightly. **These build files now
+require Zig 0.17+ and will not compile under 0.16** (no `addPassthruArgs`,
+`b.graph.path`, etc.), so CI cannot be flipped to nightly until the items below are
+resolved.
+
+### Undocumented removals hit while compiling (NOT in the devlog)
+
+This nightly **also removed the `**` array/string repeat operator** (undocumented
+in the devlog as of 2026-05-30). The tokenizer no longer has an `asterisk_asterisk`
+token, so:
+
+- `"ab" ** 3` → error: *binary operator '*' has whitespace on one side, but not the
+  other* (the new symmetric-whitespace lint, since `**` is now two `*` tokens).
+- `"ab"**3` → parses as `"ab" * *3` (multiply by a pointer type) → type error.
+
+`std` itself contains zero real `**` uses (already migrated), confirming this is
+deliberate. Replacements:
+
+- `++` (concat) is unchanged.
+- Scalar fill `[_]u8{0} ** 16` → `@splat(0)` **with an explicit result type**
+  (`const a: [16]u8 = @splat(0);`) — the bare `[_]…` length-inferred form has no
+  result type for `@splat` to use, so each site needs a type annotation.
+- Sequence repeat like `"0123456789" ** 32` has no one-liner replacement (needs a
+  comptime loop / generated constant).
+
+Scope in this repo: ~1,716 real `**` repeat sites across 119 files.
+
+#### `**` migration — DONE
+
+Migrated mechanically with two deterministic rules applied innermost-first to a
+fixpoint (so nested repeats resolve automatically):
+
+- `.{X} ** N` → `@splat(X)` (relies on the result-type context that `.{…}` already
+  required).
+- `[_]T{X} ** N` → `@as([N]T, @splat(X))` (self-typed; works in any context, and a
+  nested inner result becomes the scalar `X` for the outer rule).
+
+1,716 sites were rewritten by script; 16 were handled by hand:
+
+- string repeats `"x" ** N` → `&@as([N]u8, @splat('x'))` (single char) or a
+  `comptime` `++` concat constant (multi-char, e.g. the json `digits_repeated_32`
+  fixture);
+- one multi-element array repeat `[_]f32{…} ** 5` →
+  `@as([15]f32, @bitCast(@as([5][3]f32, @splat(…))))`;
+- a few element types my scanner skips (parens/spaces, e.g.
+  `std.ArrayListUnmanaged(Route)`, `?[]const u8`) done directly as `@as(…, @splat(…))`.
+
+Validated: `lib-json-test`, `lib-httpx-test`, `lib-toon-test` compile and pass under
+the nightly.
+
+### General std/builtin churn beyond `**`
+
+Compiling the whole tree on this nightly surfaces *unrelated* 0.17 std/builtin
+changes, independent of `**`.
+
+Fixed (small, mechanical, validated on hermetic tests):
+
+- `std.meta.Int(.unsigned, n)` removed → `@Int(.unsigned, n)` (2 sites). The
+  `@Type` builtin has been split into targeted builtins (`@Int`, `@Pointer`,
+  `@FieldType`, …); the repo doesn't call `@Type` directly, so only the `meta.Int`
+  shim was affected.
+- `std.bit_set` static bitsets replaced the `initEmpty()` / `initFull()` *methods*
+  with `empty` / `full` *constants* (dynamic bitsets keep `initEmpty(allocator,
+  len)`): 9 static call sites updated. `lib-regex-test` passes.
+
+- `@prefetch(ptr, .{...})` anonymous options literal now errors with "multiple
+  identical instances of this type exist"; qualify it as
+  `std.builtin.PrefetchOptions{ ... }` (1 site, `pkg/inference/src/ops/cpu_gemm.zig`).
+- `std.heap.StackFallbackAllocator` / `std.heap.stackFallback` removed →
+  reimplemented in `pkg/inference/src/finetune/compat.zig` (a
+  `FixedBufferAllocator` with libc-vtable fallback, same `.get()` API).
+- `std.ascii.indexOfIgnoreCase` / `indexOfIgnoreCasePos` removed → reimplemented
+  in `finetune/compat.zig` and `pkg/antfly/src/common/ascii_compat.zig`.
+- `Allocator.dupeZ` removed → `dupeSentinel(u8, x, 0)` (~204 call sites; drop-in
+  `[:0]u8` return that preserves the inline `try alloc.dupeZ(...)` form).
+
+Notably the ~3k `std.Io` references compile unchanged — that surface was already
+stable from 0.16.
+
+### `@cImport` removal — migrated to `addTranslateC` (DONE)
+
+`@cImport` / `@cInclude` / `@cDefine` were removed from the language (`invalid
+builtin function: '@cImport'`), and std itself now contains zero `@cImport` uses.
+C interop moves to the build-system `b.addTranslateC` step (a generated module you
+`@import`). All ~50 call sites were migrated; no `@cImport` remains in the
+codebase. Two shapes were used:
+
+1. **External libraries → translate-c modules**, wired by the build only when the
+   feature is enabled (else an empty-struct module the gated source never
+   dereferences):
+   - LMDB: `lmdb/env.zig` → `lmdb_pthread` (translate-c of `pthread.h`, else
+     `pthread_stub.zig`); `storage/lmdb_c_api.zig` + `lmdb_sim_test.zig` →
+     `lmdb_c_bindings` (translate-c of `lmdb.h` for the C backend, else
+     `lmdb_c_stub.zig`). Helpers `addLmdbPthreadImport` / `addLmdbCBindingsImport`
+     in `pkg/antfly/build/storage.zig`, threaded through `makeLmdbEngineModule`,
+     `makeLmdbModule` (new `backend` param), and `AntflyRootImports.configure`.
+   - Inference: `backends/onnx.zig` → `onnx_c`, `backends/ortgenai.zig` →
+     `ortgenai_c`, `backends/mlx.zig` → `mlx_c`, `backends/native.zig` → `blas_c`.
+     Wired by `configureCImportBindings` in `pkg/inference/build/runtime.zig`
+     (gated on `enable_onnx` / `enable_mlx` / `enable_system_blas`), sharing one
+     empty `c_empty.zig` module when off.
+   - lib/image bench+corpus tools: `spng_c` (translate-c of `spng.h` when libspng
+     is detected, else empty) via `addSpngBinding` in `build.zig`.
+
+2. **Small libc pulls → hand-written shims / std** (no per-consumer build wiring):
+   - 42 `@cImport(@cInclude("stdlib.h"))` getenv sites → `util/c_env.zig`
+     (`std.c.getenv`).
+   - `util/c_file.zig` fcntl/unistd/stat/mman/dirent surface → `util/posix_c.zig`,
+     a hand-written `extern "c"` shim (chosen over translate-c because `c_file` is
+     imported across both the inference and antfly module graphs, so per-module
+     wiring would be fragile).
+   - `cache.zig` `time.h` clock_gettime → `std.time.nanoTimestamp`.
+   - `http_server.zig` test setenv/unsetenv → inline `extern "c"`.
+
+### Full build status on nightly 0.17.0-dev.607 — GREEN
+
+All of the following pass with the pip-installed nightly (`python3 -m ziglang`,
+via a `zig` PATH shim):
+
+- `zig build --help` configures (top-level and delegated `pkg/inference`).
+- Hermetic lib tests: `lib-json-test`, `lib-httpx-test`, `lib-toon-test`,
+  `lib-regex-test`, `lmdb-test` (80/80), `storage-lmdb-test -Dlmdb_backend=c`
+  (exercises translate-c of `lmdb.h` + `pthread.h`).
+- `pkg/inference` builds clean (9/9; produces `antfly-inference`).
+- **Full edition binary builds and runs:**
+  `zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=Debug install -Dedition=full`
+  → 13/13 steps, `zig-out/bin/antfly`, and `antfly version` exits 0.
+
+Prerequisite: `make download-onnx` (the full edition links ONNX Runtime). CI still
+pins `mlugg/setup-zig@v2` to `0.16.0`; these source changes now require Zig 0.17+
+(no `@cImport`, `addPassthruArgs`, `dupeSentinel`, …) and will not compile under
+0.16, so flipping CI to the nightly is a follow-up once 0.17.0 is tagged stable.
+
 ## 2026-04-20: freestanding wasm stdlib breakage in Zig 0.16
 
 This repo's embedded Antfly inference wasm build currently targets `wasm32-freestanding`.

@@ -283,9 +283,17 @@ test "parseFromSliceLeaky supports Value callers" {
     try std.testing.expectEqual(@as(i64, 1), parsed.object.get("n").?.integer);
 }
 
+// 320-byte fixture ("0123456789" repeated 32 times). Replaces the removed
+// `digits_repeated_32` array-repeat operator (Zig 0.17) with a comptime concat.
+const digits_repeated_32: []const u8 = blk: {
+    var s: []const u8 = "";
+    for (0..32) |_| s = s ++ "0123456789";
+    break :blk s;
+};
+
 test "explicit simd requests select the stage1 backend path" {
     const selection = backendSelectionForSlice(
-        "0123456789" ** 32,
+        digits_repeated_32,
         .{ .preferred_backend = .simd, .simd_min_input_len = 32 },
     );
 
@@ -304,7 +312,7 @@ test "small inputs stay on stdlib path in auto mode" {
 }
 
 test "auto mode selects partial simd backend for large inputs" {
-    const selection = backendSelectionForSlice("0123456789" ** 32, .{ .simd_min_input_len = 32 });
+    const selection = backendSelectionForSlice(digits_repeated_32, .{ .simd_min_input_len = 32 });
 
     try std.testing.expectEqual(.auto, selection.requested);
     try std.testing.expectEqual(.simd, selection.selected);
@@ -352,7 +360,7 @@ test "auto typed selection stays on stdlib for custom jsonParse subtrees" {
         },
     };
 
-    const selection = backendSelectionForTypedSlice(T, "0123456789" ** 32, .{ .simd_min_input_len = 32 });
+    const selection = backendSelectionForTypedSlice(T, digits_repeated_32, .{ .simd_min_input_len = 32 });
 
     try std.testing.expectEqual(.auto, selection.requested);
     try std.testing.expectEqual(.stdlib, selection.selected);
@@ -364,7 +372,7 @@ test "auto typed selection stays on stdlib when ignoring unknown fields" {
         count: u32,
     };
 
-    const selection = backendSelectionForTypedSliceWithOptions(T, "0123456789" ** 32, .{
+    const selection = backendSelectionForTypedSliceWithOptions(T, digits_repeated_32, .{
         .ignore_unknown_fields = true,
     }, .{ .simd_min_input_len = 32 });
 

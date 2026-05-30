@@ -49,7 +49,7 @@ fn base32Decode(c: u8) ?u5 {
 
 /// Encode a geographic point as a geohash string at the given precision (1-12).
 pub fn encode(point: GeoPoint, precision: u8) [12]u8 {
-    var result: [12]u8 = .{0} ** 12;
+    var result: [12]u8 = @splat(0);
     const prec = @min(precision, 12);
     if (prec == 0) return result;
 

@@ -12,7 +12,9 @@ env:
   GAR_REGISTRY: us-central1-docker.pkg.dev
   CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
   ZIG_ARTIFACT_BUCKET: antfly-image-artifacts-zig-build-artifacts
-  ZIG_VERSION: 0.16.0
+  # Pinned to the validated Zig 0.17 nightly. Bump to a stable "0.17.0" (and
+  # switch the download base back to /download/<ver>/ below) once it is tagged.
+  ZIG_VERSION: 0.17.0-dev.607+456b2ec07
 
 jobs:
   build-artifact:
@@ -69,7 +71,14 @@ jobs:
 
       - name: Install Zig
         run: |
-          curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_arch }}-linux-${ZIG_VERSION}.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          # Nightly (-dev) builds live under /builds/; tagged releases live
+          # under /download/<version>/. Pick the right base for the pin above.
+          if [[ "${ZIG_VERSION}" == *-dev.* ]]; then
+            ZIG_BASE_URL="https://ziglang.org/builds"
+          else
+            ZIG_BASE_URL="https://ziglang.org/download/${ZIG_VERSION}"
+          fi
+          curl -L "${ZIG_BASE_URL}/zig-${{ matrix.zig_arch }}-linux-${ZIG_VERSION}.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"

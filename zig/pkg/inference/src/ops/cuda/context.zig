@@ -24,7 +24,7 @@ pub const DeviceInfo = struct {
     driver_version: i32 = 0,
     device_count: i32 = 0,
     selected_device: i32 = 0,
-    name: [256]u8 = .{0} ** 256,
+    name: [256]u8 = @splat(0),
     name_len: usize = 0,
     compute_major: i32 = 0,
     compute_minor: i32 = 0,
@@ -56,7 +56,7 @@ pub const CudaContext = struct {
         try driver.check(driver.fns.cuDeviceGet(&device, 0));
         info.selected_device = device;
 
-        var name_buf: [256]u8 = .{0} ** 256;
+        var name_buf: [256]u8 = @splat(0);
         try driver.check(driver.fns.cuDeviceGetName(&name_buf, name_buf.len, device));
         info.name = name_buf;
         info.name_len = std.mem.indexOfScalar(u8, &info.name, 0) orelse info.name.len;

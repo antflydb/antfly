@@ -104,7 +104,7 @@ pub const WalReplicaState = struct {
         const wal_dir = try std.fmt.allocPrint(alloc, "{s}/state-wal", .{layout.log_dir});
         errdefer alloc.free(wal_dir);
         try fs_paths.createDirPathPortable(io_impl.io(), wal_dir);
-        const wal_dir_z = try alloc.dupeZ(u8, wal_dir);
+        const wal_dir_z = try alloc.dupeSentinel(u8, wal_dir, 0);
         errdefer alloc.free(wal_dir_z);
         const applied_watermark_path = try std.fmt.allocPrint(alloc, "{s}/applied-watermark.bin", .{layout.log_dir});
         errdefer alloc.free(applied_watermark_path);

@@ -84,7 +84,7 @@ pub const Hex = struct {
 pub const PercentEncoding = struct {
     /// Comptime lookup table: true if byte is unreserved (RFC 3986 §2.3).
     const unreserved_table: [256]bool = blk: {
-        var table = [_]bool{false} ** 256;
+        var table = @as([256]bool, @splat(false));
         for ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~") |c| {
             table[c] = true;
         }

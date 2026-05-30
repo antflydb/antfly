@@ -158,7 +158,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: "0.17.0-dev.607+456b2ec07"
           use-cache: false
 
       - name: Prepare ARC cache dirs
@@ -195,7 +195,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: "0.17.0-dev.607+456b2ec07"
           use-cache: false
 
       - name: Prepare ARC cache dirs
@@ -227,7 +227,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: "0.17.0-dev.607+456b2ec07"
           use-cache: false
 
       - name: Prepare ARC cache dirs
@@ -287,7 +287,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: "0.17.0-dev.607+456b2ec07"
           use-cache: false
 
       - name: Prepare ARC cache dirs
@@ -342,7 +342,7 @@ jobs:
         if: needs.changes.outputs.trace_validate == 'true'
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: "0.17.0-dev.607+456b2ec07"
           use-cache: false
 
       - name: Prepare ARC cache dirs
@@ -414,7 +414,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: "0.17.0-dev.607+456b2ec07"
           use-cache: false
 
       - name: Prepare ARC cache dirs
@@ -446,7 +446,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: "0.17.0-dev.607+456b2ec07"
           use-cache: false
 
       - name: Prepare ARC cache dirs
@@ -487,7 +487,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: "0.17.0-dev.607+456b2ec07"
           use-cache: false
 
       - name: Prepare ARC cache dirs

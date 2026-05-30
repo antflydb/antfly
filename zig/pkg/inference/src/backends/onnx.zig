@@ -25,10 +25,11 @@ const TensorInfo = @import("tensor.zig").TensorInfo;
 const DType = @import("tensor.zig").DType;
 const BackendType = @import("backends.zig").BackendType;
 
-const c = @cImport({
-    @cInclude("onnxruntime_c_api.h");
-    @cInclude("onnxruntime_session_options_config_keys.h");
-});
+// Zig 0.17 removed `@cImport`. The `onnx_c` module (translate-c of
+// onnxruntime_c_api.h + the session-options config keys header) is provided by
+// the build system, wired in only when `-Donnx=true`; backends.zig imports this
+// file under the same `enable_onnx` gate.
+const c = @import("onnx_c");
 
 const OrtApi = c.OrtApi;
 
@@ -338,7 +339,7 @@ pub fn createSessionWithOptions(
 
     // Ensure the model path is null-terminated for the C API.
     // model_path comes from Zig so may not have a sentinel.
-    const path_z = try allocator.dupeZ(u8, model_path);
+    const path_z = try allocator.dupeSentinel(u8, model_path, 0);
     defer allocator.free(path_z);
 
     // Create session from model file

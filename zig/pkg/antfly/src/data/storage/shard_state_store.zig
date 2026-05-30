@@ -898,7 +898,7 @@ test "shard state store persists ranges and document state" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
@@ -950,7 +950,7 @@ test "shard state store persists split lifecycle and ownership" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-split", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
@@ -1032,7 +1032,7 @@ test "shard state store finalize split reclaims right-hand document range" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-finalize", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
@@ -1086,14 +1086,14 @@ test "shard state store records and replays split deltas" {
 
     const src_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-deltas-src", .{tmp.sub_path});
     defer std.testing.allocator.free(src_path);
-    const src_path_z = try std.testing.allocator.dupeZ(u8, src_path);
+    const src_path_z = try std.testing.allocator.dupeSentinel(u8, src_path, 0);
     defer std.testing.allocator.free(src_path_z);
     var src = try docstore.DocStore.open(std.testing.allocator, src_path_z.ptr, .{});
     defer src.close();
 
     const dst_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-deltas-dst", .{tmp.sub_path});
     defer std.testing.allocator.free(dst_path);
-    const dst_path_z = try std.testing.allocator.dupeZ(u8, dst_path);
+    const dst_path_z = try std.testing.allocator.dupeSentinel(u8, dst_path, 0);
     defer std.testing.allocator.free(dst_path_z);
     var dst = try docstore.DocStore.open(std.testing.allocator, dst_path_z.ptr, .{});
     defer dst.close();
@@ -1159,14 +1159,14 @@ test "shard state store captures right-hand split handoff and filters delta catc
 
     const src_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-handoff-src", .{tmp.sub_path});
     defer std.testing.allocator.free(src_path);
-    const src_path_z = try std.testing.allocator.dupeZ(u8, src_path);
+    const src_path_z = try std.testing.allocator.dupeSentinel(u8, src_path, 0);
     defer std.testing.allocator.free(src_path_z);
     var src = try docstore.DocStore.open(std.testing.allocator, src_path_z.ptr, .{});
     defer src.close();
 
     const dst_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-handoff-dst", .{tmp.sub_path});
     defer std.testing.allocator.free(dst_path);
-    const dst_path_z = try std.testing.allocator.dupeZ(u8, dst_path);
+    const dst_path_z = try std.testing.allocator.dupeSentinel(u8, dst_path, 0);
     defer std.testing.allocator.free(dst_path_z);
     var dst = try docstore.DocStore.open(std.testing.allocator, dst_path_z.ptr, .{});
     defer dst.close();

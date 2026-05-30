@@ -314,10 +314,10 @@ fn runCommand(init: std.process.Init, argv0: []const u8, main_fn: CommandMain, a
     var vector = try allocator.alloc([*:0]const u8, args.len + 1);
     defer allocator.free(vector);
 
-    owned[0] = try allocator.dupeZ(u8, argv0);
+    owned[0] = try allocator.dupeSentinel(u8, argv0, 0);
     vector[0] = owned[0].ptr;
     for (args, 0..) |arg, idx| {
-        owned[idx + 1] = try allocator.dupeZ(u8, arg);
+        owned[idx + 1] = try allocator.dupeSentinel(u8, arg, 0);
         vector[idx + 1] = owned[idx + 1].ptr;
     }
 

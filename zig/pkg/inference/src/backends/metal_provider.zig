@@ -166,22 +166,22 @@ pub const MetalProvider = if (build_options.enable_mlx) struct {
     raw_absolute_embeddings_vocab_size: usize = 0,
     raw_absolute_embeddings_position_count: usize = 0,
     raw_absolute_embeddings_hidden_size: usize = 0,
-    raw_layer_norm_slots_prepared: [decoder_runtime_layer_norm_slot_capacity]bool = [_]bool{false} ** decoder_runtime_layer_norm_slot_capacity,
-    raw_layer_norm_slot_hidden_sizes: [decoder_runtime_layer_norm_slot_capacity]usize = [_]usize{0} ** decoder_runtime_layer_norm_slot_capacity,
-    raw_layer_norm_slot_weights: [decoder_runtime_layer_norm_slot_capacity]?MetalTensor = [_]?MetalTensor{null} ** decoder_runtime_layer_norm_slot_capacity,
-    raw_layer_norm_slot_biases: [decoder_runtime_layer_norm_slot_capacity]?MetalTensor = [_]?MetalTensor{null} ** decoder_runtime_layer_norm_slot_capacity,
-    raw_rms_norm_slots_prepared: [decoder_runtime_rms_norm_slot_capacity]bool = [_]bool{false} ** decoder_runtime_rms_norm_slot_capacity,
-    raw_rms_norm_slot_hidden_sizes: [decoder_runtime_rms_norm_slot_capacity]usize = [_]usize{0} ** decoder_runtime_rms_norm_slot_capacity,
-    raw_rms_norm_slot_weights: [decoder_runtime_rms_norm_slot_capacity]?MetalTensor = [_]?MetalTensor{null} ** decoder_runtime_rms_norm_slot_capacity,
-    raw_linear_slots_prepared: [decoder_runtime_linear_slot_capacity]bool = [_]bool{false} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_kinds: [decoder_runtime_linear_slot_capacity]RawLinearSlotKind = [_]RawLinearSlotKind{.none} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_in_dims: [decoder_runtime_linear_slot_capacity]usize = [_]usize{0} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_out_dims: [decoder_runtime_linear_slot_capacity]usize = [_]usize{0} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_quantized_storage: [decoder_runtime_linear_slot_capacity]?*QuantizedStorage = [_]?*QuantizedStorage{null} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_dense_weights: [decoder_runtime_linear_slot_capacity]?MetalTensor = [_]?MetalTensor{null} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_dense_biases: [decoder_runtime_linear_slot_capacity]?MetalTensor = [_]?MetalTensor{null} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_runtime_prepared_kind: [decoder_runtime_linear_slot_capacity]RawQuantizedRuntimeLinearKind = [_]RawQuantizedRuntimeLinearKind{.none} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_runtime_prepared_modes: [decoder_runtime_linear_slot_capacity]RawQuantizedRuntimeLinearStorageMode = [_]RawQuantizedRuntimeLinearStorageMode{.none} ** decoder_runtime_linear_slot_capacity,
+    raw_layer_norm_slots_prepared: [decoder_runtime_layer_norm_slot_capacity]bool = @as([decoder_runtime_layer_norm_slot_capacity]bool, @splat(false)),
+    raw_layer_norm_slot_hidden_sizes: [decoder_runtime_layer_norm_slot_capacity]usize = @as([decoder_runtime_layer_norm_slot_capacity]usize, @splat(0)),
+    raw_layer_norm_slot_weights: [decoder_runtime_layer_norm_slot_capacity]?MetalTensor = @as([decoder_runtime_layer_norm_slot_capacity]?MetalTensor, @splat(null)),
+    raw_layer_norm_slot_biases: [decoder_runtime_layer_norm_slot_capacity]?MetalTensor = @as([decoder_runtime_layer_norm_slot_capacity]?MetalTensor, @splat(null)),
+    raw_rms_norm_slots_prepared: [decoder_runtime_rms_norm_slot_capacity]bool = @as([decoder_runtime_rms_norm_slot_capacity]bool, @splat(false)),
+    raw_rms_norm_slot_hidden_sizes: [decoder_runtime_rms_norm_slot_capacity]usize = @as([decoder_runtime_rms_norm_slot_capacity]usize, @splat(0)),
+    raw_rms_norm_slot_weights: [decoder_runtime_rms_norm_slot_capacity]?MetalTensor = @as([decoder_runtime_rms_norm_slot_capacity]?MetalTensor, @splat(null)),
+    raw_linear_slots_prepared: [decoder_runtime_linear_slot_capacity]bool = @as([decoder_runtime_linear_slot_capacity]bool, @splat(false)),
+    raw_linear_slot_kinds: [decoder_runtime_linear_slot_capacity]RawLinearSlotKind = @as([decoder_runtime_linear_slot_capacity]RawLinearSlotKind, @splat(.none)),
+    raw_linear_slot_in_dims: [decoder_runtime_linear_slot_capacity]usize = @as([decoder_runtime_linear_slot_capacity]usize, @splat(0)),
+    raw_linear_slot_out_dims: [decoder_runtime_linear_slot_capacity]usize = @as([decoder_runtime_linear_slot_capacity]usize, @splat(0)),
+    raw_linear_slot_quantized_storage: [decoder_runtime_linear_slot_capacity]?*QuantizedStorage = @as([decoder_runtime_linear_slot_capacity]?*QuantizedStorage, @splat(null)),
+    raw_linear_slot_dense_weights: [decoder_runtime_linear_slot_capacity]?MetalTensor = @as([decoder_runtime_linear_slot_capacity]?MetalTensor, @splat(null)),
+    raw_linear_slot_dense_biases: [decoder_runtime_linear_slot_capacity]?MetalTensor = @as([decoder_runtime_linear_slot_capacity]?MetalTensor, @splat(null)),
+    raw_linear_slot_runtime_prepared_kind: [decoder_runtime_linear_slot_capacity]RawQuantizedRuntimeLinearKind = @as([decoder_runtime_linear_slot_capacity]RawQuantizedRuntimeLinearKind, @splat(.none)),
+    raw_linear_slot_runtime_prepared_modes: [decoder_runtime_linear_slot_capacity]RawQuantizedRuntimeLinearStorageMode = @as([decoder_runtime_linear_slot_capacity]RawQuantizedRuntimeLinearStorageMode, @splat(.none)),
     raw_quant_runtime_private_prepare_nanos: u128 = 0,
     raw_quant_runtime_mapped_prepare_nanos: u128 = 0,
     raw_quant_runtime_mapped_attempts: u64 = 0,
@@ -2138,7 +2138,7 @@ pub const MetalProvider = if (build_options.enable_mlx) struct {
         const vec = c.mlx_vector_string_new();
         errdefer _ = c.mlx_vector_string_free(vec);
         for (values) |value| {
-            const value_z = try std.heap.c_allocator.dupeZ(u8, value);
+            const value_z = try std.heap.c_allocator.dupeSentinel(u8, value, 0);
             defer std.heap.c_allocator.free(value_z);
             try mlx.check(c.mlx_vector_string_append_value(vec, value_z.ptr));
         }
@@ -2155,11 +2155,11 @@ pub const MetalProvider = if (build_options.enable_mlx) struct {
         defer _ = c.mlx_vector_string_free(inputs);
         const outputs = try makeStringVector(outputs_layout);
         defer _ = c.mlx_vector_string_free(outputs);
-        const name_z = try std.heap.c_allocator.dupeZ(u8, name);
+        const name_z = try std.heap.c_allocator.dupeSentinel(u8, name, 0);
         defer std.heap.c_allocator.free(name_z);
-        const source_z = try std.heap.c_allocator.dupeZ(u8, source);
+        const source_z = try std.heap.c_allocator.dupeSentinel(u8, source, 0);
         defer std.heap.c_allocator.free(source_z);
-        const header_z = try std.heap.c_allocator.dupeZ(u8, "");
+        const header_z = try std.heap.c_allocator.dupeSentinel(u8, "", 0);
         defer std.heap.c_allocator.free(header_z);
 
         const kernel = c.mlx_fast_metal_kernel_new(
@@ -2180,7 +2180,7 @@ pub const MetalProvider = if (build_options.enable_mlx) struct {
     }
 
     fn addTemplateInt(cfg: c.mlx_fast_metal_kernel_config, name: []const u8, value: usize) !void {
-        const name_z = try std.heap.c_allocator.dupeZ(u8, name);
+        const name_z = try std.heap.c_allocator.dupeSentinel(u8, name, 0);
         defer std.heap.c_allocator.free(name_z);
         try mlx.check(c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, name_z.ptr, @intCast(value)));
     }
@@ -2197,22 +2197,22 @@ pub const MetalProvider = if (build_options.enable_mlx) struct {
         kernels.raw_absolute_embeddings_vocab_size = 0;
         kernels.raw_absolute_embeddings_position_count = 0;
         kernels.raw_absolute_embeddings_hidden_size = 0;
-        kernels.raw_layer_norm_slots_prepared = [_]bool{false} ** decoder_runtime_layer_norm_slot_capacity;
-        kernels.raw_layer_norm_slot_hidden_sizes = [_]usize{0} ** decoder_runtime_layer_norm_slot_capacity;
-        kernels.raw_layer_norm_slot_weights = [_]?MetalTensor{null} ** decoder_runtime_layer_norm_slot_capacity;
-        kernels.raw_layer_norm_slot_biases = [_]?MetalTensor{null} ** decoder_runtime_layer_norm_slot_capacity;
-        kernels.raw_rms_norm_slots_prepared = [_]bool{false} ** decoder_runtime_rms_norm_slot_capacity;
-        kernels.raw_rms_norm_slot_hidden_sizes = [_]usize{0} ** decoder_runtime_rms_norm_slot_capacity;
-        kernels.raw_rms_norm_slot_weights = [_]?MetalTensor{null} ** decoder_runtime_rms_norm_slot_capacity;
-        kernels.raw_linear_slots_prepared = [_]bool{false} ** decoder_runtime_linear_slot_capacity;
-        kernels.raw_linear_slot_kinds = [_]RawLinearSlotKind{.none} ** decoder_runtime_linear_slot_capacity;
-        kernels.raw_linear_slot_in_dims = [_]usize{0} ** decoder_runtime_linear_slot_capacity;
-        kernels.raw_linear_slot_out_dims = [_]usize{0} ** decoder_runtime_linear_slot_capacity;
-        kernels.raw_linear_slot_quantized_storage = [_]?*QuantizedStorage{null} ** decoder_runtime_linear_slot_capacity;
-        kernels.raw_linear_slot_dense_weights = [_]?MetalTensor{null} ** decoder_runtime_linear_slot_capacity;
-        kernels.raw_linear_slot_dense_biases = [_]?MetalTensor{null} ** decoder_runtime_linear_slot_capacity;
-        kernels.raw_linear_slot_runtime_prepared_kind = [_]RawQuantizedRuntimeLinearKind{.none} ** decoder_runtime_linear_slot_capacity;
-        kernels.raw_linear_slot_runtime_prepared_modes = [_]RawQuantizedRuntimeLinearStorageMode{.none} ** decoder_runtime_linear_slot_capacity;
+        kernels.raw_layer_norm_slots_prepared = @as([decoder_runtime_layer_norm_slot_capacity]bool, @splat(false));
+        kernels.raw_layer_norm_slot_hidden_sizes = @as([decoder_runtime_layer_norm_slot_capacity]usize, @splat(0));
+        kernels.raw_layer_norm_slot_weights = @as([decoder_runtime_layer_norm_slot_capacity]?MetalTensor, @splat(null));
+        kernels.raw_layer_norm_slot_biases = @as([decoder_runtime_layer_norm_slot_capacity]?MetalTensor, @splat(null));
+        kernels.raw_rms_norm_slots_prepared = @as([decoder_runtime_rms_norm_slot_capacity]bool, @splat(false));
+        kernels.raw_rms_norm_slot_hidden_sizes = @as([decoder_runtime_rms_norm_slot_capacity]usize, @splat(0));
+        kernels.raw_rms_norm_slot_weights = @as([decoder_runtime_rms_norm_slot_capacity]?MetalTensor, @splat(null));
+        kernels.raw_linear_slots_prepared = @as([decoder_runtime_linear_slot_capacity]bool, @splat(false));
+        kernels.raw_linear_slot_kinds = @as([decoder_runtime_linear_slot_capacity]RawLinearSlotKind, @splat(.none));
+        kernels.raw_linear_slot_in_dims = @as([decoder_runtime_linear_slot_capacity]usize, @splat(0));
+        kernels.raw_linear_slot_out_dims = @as([decoder_runtime_linear_slot_capacity]usize, @splat(0));
+        kernels.raw_linear_slot_quantized_storage = @as([decoder_runtime_linear_slot_capacity]?*QuantizedStorage, @splat(null));
+        kernels.raw_linear_slot_dense_weights = @as([decoder_runtime_linear_slot_capacity]?MetalTensor, @splat(null));
+        kernels.raw_linear_slot_dense_biases = @as([decoder_runtime_linear_slot_capacity]?MetalTensor, @splat(null));
+        kernels.raw_linear_slot_runtime_prepared_kind = @as([decoder_runtime_linear_slot_capacity]RawQuantizedRuntimeLinearKind, @splat(.none));
+        kernels.raw_linear_slot_runtime_prepared_modes = @as([decoder_runtime_linear_slot_capacity]RawQuantizedRuntimeLinearStorageMode, @splat(.none));
         kernels.raw_quant_runtime_private_prepare_nanos = 0;
         kernels.raw_quant_runtime_mapped_prepare_nanos = 0;
         kernels.raw_quant_runtime_mapped_attempts = 0;

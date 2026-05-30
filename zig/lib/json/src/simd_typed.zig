@@ -251,7 +251,7 @@ const Parser = struct {
         self.skipWhitespace();
 
         var result: T = undefined;
-        var seen = [_]bool{false} ** info.fields.len;
+        var seen = @as([info.fields.len]bool, @splat(false));
 
         if (!self.atEnd() and self.input[self.pos] == '}') {
             self.pos += 1;

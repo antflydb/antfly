@@ -423,7 +423,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             }
             const name = std.mem.span(key);
             const stripped = stripEncoderPrefix(name);
-            const stripped_z = try allocator.dupeZ(u8, stripped);
+            const stripped_z = try allocator.dupeSentinel(u8, stripped, 0);
             defer allocator.free(stripped_z);
             _ = mlx_c.mlx_map_string_to_array_insert(stripped_weights, stripped_z.ptr, val);
             _ = mlx_c.mlx_array_free(val);
@@ -1156,7 +1156,7 @@ const BatchTargetStats = struct {
     entity_token_count: u64 = 0,
     ignored_token_count: u64 = 0,
     entity_type_count: usize = 0,
-    positive_counts_by_entity_type: [gliner2_autodiff.max_span_start_entity_types]u64 = [_]u64{0} ** gliner2_autodiff.max_span_start_entity_types,
+    positive_counts_by_entity_type: [gliner2_autodiff.max_span_start_entity_types]u64 = @as([gliner2_autodiff.max_span_start_entity_types]u64, @splat(0)),
 
     fn entityTokenRate(self: BatchTargetStats) f64 {
         if (self.supervised_token_count == 0) return 0.0;

@@ -64,7 +64,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.16.0"
+          version: "0.17.0-dev.607+456b2ec07"
 
       # Cache ONNX Runtime libraries (versions from scripts/download-onnxruntime.sh)
       - name: Cache ONNX Runtime libraries

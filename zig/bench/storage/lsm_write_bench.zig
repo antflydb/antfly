@@ -144,7 +144,7 @@ const ReadStats = struct {
     errors: u64 = 0,
     total_ns: u64 = 0,
     max_ns: u64 = 0,
-    buckets: [read_latency_bucket_count]u64 = [_]u64{0} ** read_latency_bucket_count,
+    buckets: [read_latency_bucket_count]u64 = @as([read_latency_bucket_count]u64, @splat(0)),
 
     fn record(self: *ReadStats, ns: u64, result: ReadResult) void {
         self.ops += 1;

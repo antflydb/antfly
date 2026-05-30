@@ -1943,8 +1943,8 @@ test "joint stereo mono output helper averages stereo pcm" {
 }
 
 test "lsf intensity stereo long-band helper applies scalefac-compress table 0" {
-    var left = [_]f32{0} ** 576;
-    var right = [_]f32{0} ** 576;
+    var left = @as([576]f32, @splat(0));
+    var right = @as([576]f32, @splat(0));
     left[550] = 2.0;
 
     var scalefactors = requantize.BandScalefactors{
@@ -1990,8 +1990,8 @@ test "lsf intensity stereo long-band helper applies scalefac-compress table 0" {
 }
 
 test "lsf intensity stereo long-band helper applies scalefac-compress table 1" {
-    var left = [_]f32{0} ** 576;
-    var right = [_]f32{0} ** 576;
+    var left = @as([576]f32, @splat(0));
+    var right = @as([576]f32, @splat(0));
     left[550] = 2.0;
 
     var scalefactors = requantize.BandScalefactors{

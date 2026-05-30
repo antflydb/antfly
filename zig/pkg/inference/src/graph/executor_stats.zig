@@ -232,7 +232,7 @@ pub fn printPartitionFallbackOps(
 ) void {
     if (!enabled()) return;
 
-    var counts = [_]OpCount{.{}} ** 32;
+    var counts = @as([32]OpCount, @splat(.{}));
     var used: usize = 0;
     var fallback_nodes: usize = 0;
     var target_nodes: usize = 0;

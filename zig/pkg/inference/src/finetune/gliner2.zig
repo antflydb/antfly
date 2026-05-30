@@ -2848,17 +2848,17 @@ test "gliner2 checkpoint inspection reads config and tensor summary" {
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &[_]f32{0} ** (4 * 128) },
-        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &[_]f32{0} ** (32 * 32) },
-        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &[_]f32{0} ** 128 },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.1.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.1.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.1.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .shape = &.{ 32, 128 }, .data = &[_]f32{0} ** (32 * 128) },
-        .{ .name = "count_embed.pos_embedding.weight", .shape = &.{ 8, 128 }, .data = &[_]f32{0} ** (8 * 128) },
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &@as([(4 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &@as([(32 * 32)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &@as([128]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.1.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.1.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.1.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .shape = &.{ 32, 128 }, .data = &@as([(32 * 128)]f32, @splat(0)) },
+        .{ .name = "count_embed.pos_embedding.weight", .shape = &.{ 8, 128 }, .data = &@as([(8 * 128)]f32, @splat(0)) },
     });
 
     var summary = try inspectCheckpoint(allocator, root, null);
@@ -2895,11 +2895,11 @@ test "gliner2 bootstrap and inspect lora bundle" {
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &[_]f32{0} ** (4 * 128) },
-        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &[_]f32{0} ** (32 * 32) },
-        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &[_]f32{0} ** 128 },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &@as([(4 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &@as([(32 * 32)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &@as([128]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
     });
 
     const out_dir = try std.fs.path.join(allocator, &.{ root, "lora" });
@@ -2919,7 +2919,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
     try saveLoRABundle(&bundle, out_dir);
     const task_head_path = try std.fs.path.join(allocator, &.{ out_dir, task_head_checkpoint_file_name });
     defer allocator.free(task_head_path);
-    const classifier_weight = [_]f32{0.25} ** (3 * 128);
+    const classifier_weight = @as([(3 * 128)]f32, @splat(0.25));
     const classifier_bias = [_]f32{ 0.5, -0.25, 0.75 };
     try writeHeaderAndTensorsF32(allocator, task_head_path, &.{
         .{ .name = "classifier.weight", .shape = &.{ 3, 128 }, .data = &classifier_weight },
@@ -2973,7 +2973,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
     try std.testing.expectEqualSlices(f32, adapter_head.weight, materialized_head.weight);
     try std.testing.expectEqualSlices(f32, adapter_head.bias, materialized_head.bias);
 
-    const hidden_rows = [_]f32{0.5} ** (2 * 128);
+    const hidden_rows = @as([(2 * 128)]f32, @splat(0.5));
     const adapter_logits = try adapter_head.scoreRowsAlloc(allocator, &hidden_rows);
     defer allocator.free(adapter_logits);
     const materialized_logits = try materialized_head.scoreRowsAlloc(allocator, &hidden_rows);
@@ -3009,18 +3009,18 @@ test "gliner2 exports autodiff adapter params as inspectable PEFT bundle" {
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &[_]f32{0} ** (4 * 128) },
-        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &[_]f32{0} ** (32 * 32) },
-        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &[_]f32{0} ** 128 },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &@as([(4 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &@as([(32 * 32)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &@as([128]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
     });
 
     const out_dir = try std.fs.path.join(allocator, &.{ root, "autodiff_lora" });
     defer allocator.free(out_dir);
-    const a_data = [_]f32{0.01} ** (2 * 128);
-    const b_data = [_]f32{0.02} ** (128 * 2);
+    const a_data = @as([(2 * 128)]f32, @splat(0.01));
+    const b_data = @as([(128 * 2)]f32, @splat(0.02));
     const params = [_]AutodiffAdapterParam{
         .{
             .name = "encoder.layer.0.attention.self.query_proj.weight.lora_A",

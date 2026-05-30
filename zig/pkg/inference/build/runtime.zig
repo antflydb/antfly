@@ -642,6 +642,7 @@ fn configureRuntimeLinks(
     configureOnnxRuntime(b, module, backend.enable_onnx, backend.onnx_root);
     configureMetal(b, module, target, backend.enable_metal, paths);
     configureMlx(b, module, target, backend.enable_mlx, backend.mlx_root);
+    configureCImportBindings(b, module, target, backend, paths);
     if (backend.ffmpeg_paths) |ffmpeg_paths| {
         module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
         module.addLibraryPath(.{ .cwd_relative = ffmpeg_paths.lib_dir });
@@ -651,6 +652,67 @@ fn configureRuntimeLinks(
         module.linkSystemLibrary("avutil", .{});
         module.linkSystemLibrary("swresample", .{});
     }
+}
+
+/// Provide the optional C-binding modules imported by the inference backends.
+/// Zig 0.17 removed `@cImport`, so `onnx.zig` / `ortgenai.zig` / `mlx.zig` /
+/// `native.zig` import named modules (`onnx_c`, `ortgenai_c`, `mlx_c`,
+/// `blas_c`). Each resolves to an `addTranslateC` of the matching shim header
+/// (with the right include dir) when the feature is enabled, or to the empty
+/// `c_empty.zig` struct otherwise — the source only dereferences these under
+/// the same `build_options.enable_*` gate.
+fn configureCImportBindings(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    backend: BackendOptions,
+    paths: Paths,
+) void {
+    // A single shared empty module backs every disabled binding. Zig forbids the
+    // same source file rooting two different modules, so the bindings that are
+    // off must alias one module rather than each create their own from
+    // `c_empty.zig`.
+    const empty_mod = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/c_empty.zig")),
+        .target = target,
+    });
+
+    const addBinding = struct {
+        fn call(
+            bb: *std.Build,
+            mod: *std.Build.Module,
+            tgt: std.Build.ResolvedTarget,
+            name: []const u8,
+            enabled: bool,
+            header_rel: []const u8,
+            include_dir: ?[]const u8,
+            inference_root: []const u8,
+            empty: *std.Build.Module,
+        ) void {
+            if (enabled) {
+                const tc = bb.addTranslateC(.{
+                    .root_source_file = bb.path(pathJoin(bb, inference_root, header_rel)),
+                    .target = tgt,
+                    .optimize = .Debug,
+                    .link_libc = true,
+                });
+                if (include_dir) |dir| tc.addIncludePath(.{ .cwd_relative = dir });
+                mod.addImport(name, tc.createModule());
+            } else {
+                mod.addImport(name, empty);
+            }
+        }
+    }.call;
+
+    const onnx_include = b.fmt("{s}/include", .{backend.onnx_root});
+    addBinding(b, module, target, "onnx_c", backend.enable_onnx, "src/backends/onnx_c.h", onnx_include, paths.inference_root, empty_mod);
+    addBinding(b, module, target, "ortgenai_c", backend.enable_onnx, "src/backends/ortgenai_c.h", onnx_include, paths.inference_root, empty_mod);
+
+    const mlx_include: ?[]const u8 = if (backend.mlx_root) |root| b.fmt("{s}/include", .{root}) else null;
+    addBinding(b, module, target, "mlx_c", backend.enable_mlx, "src/backends/mlx_c.h", mlx_include, paths.inference_root, empty_mod);
+
+    const blas_include: ?[]const u8 = if (backend.blas_root) |root| b.fmt("{s}/include", .{root}) else null;
+    addBinding(b, module, target, "blas_c", backend.enable_system_blas, "src/backends/blas_c.h", blas_include, paths.inference_root, empty_mod);
 }
 
 pub fn configureSystemBlas(

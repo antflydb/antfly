@@ -110,8 +110,8 @@ pub const MetalKvStorage = struct {
     /// physical token range. Raw f32 device gathers can then expose a borrowed
     /// view at `slot_physical_base_tokens[slot]`; non-contiguous tables must
     /// use the paged attention operator or a gathered-span fallback.
-    slot_logical_contiguous: [metal_runtime.attention_span_slot_capacity]bool = [_]bool{false} ** metal_runtime.attention_span_slot_capacity,
-    slot_physical_base_tokens: [metal_runtime.attention_span_slot_capacity]usize = [_]usize{0} ** metal_runtime.attention_span_slot_capacity,
+    slot_logical_contiguous: [metal_runtime.attention_span_slot_capacity]bool = @as([metal_runtime.attention_span_slot_capacity]bool, @splat(false)),
+    slot_physical_base_tokens: [metal_runtime.attention_span_slot_capacity]usize = @as([metal_runtime.attention_span_slot_capacity]usize, @splat(0)),
 
     /// Allocate a MetalKvStorage keyed to `runtime`. The storage does not own
     /// the runtime — callers are responsible for its lifetime. `dtype` must

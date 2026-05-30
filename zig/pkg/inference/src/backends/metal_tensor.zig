@@ -72,7 +72,7 @@ var to_host_trace_count: usize = 0;
 
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
-    const c = @cImport(@cInclude("stdlib.h"));
+    const c = @import("../util/c_env.zig");
     const value = c.getenv(name) orelse return null;
     const slice = std.mem.span(value);
     if (slice.len == 0) return null;
@@ -165,7 +165,7 @@ extern fn termite_metal_buffer_copy(
 ) c_int;
 
 pub const MetalTensor = struct {
-    shape_buf: [max_dims]i32 = [_]i32{0} ** max_dims,
+    shape_buf: [max_dims]i32 = @as([max_dims]i32, @splat(0)),
     shape_len: u8 = 0,
     dtype: DType = .f32,
 
