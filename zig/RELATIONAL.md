@@ -117,16 +117,19 @@ property — it is the column catalog.
 
 First-cut physical mapping:
 
-| `column_type` | `physical`  | notes                                 |
-| ------------- | ----------- | ------------------------------------- |
-| string        | `bytes_val` | keyword / link / text-as-keyword      |
-| integer       | `u64_val`   | zigzag for signed (Phase B detail)    |
-| number        | `f64_val`   |                                       |
-| boolean       | `bool_val`  |                                       |
-| datetime      | `u64_val`   | epoch nanoseconds                     |
-| geopoint      | `geo_point` | packed lat/lon                        |
-| geoshape      | `bytes_val` | encoded shape                         |
-| json          | `bytes_val` | indexed as a document subtree         |
+Physical mapping (chosen to match the engine's existing doc values, so the
+columns are read by the existing `search/query.zig` predicate readers):
+
+| `column_type` | `physical`  | notes                                      |
+| ------------- | ----------- | ------------------------------------------ |
+| string        | `bytes_val` | keyword / link / text-as-keyword           |
+| integer       | `f64_val`   | numeric range path (`getF64`), like number |
+| number        | `f64_val`   |                                            |
+| boolean       | `bool_val`  |                                            |
+| datetime      | `u64_val`   | raw epoch ns, like timestamp doc values    |
+| geopoint      | `geo_point` | packed lat/lon                             |
+| geoshape      | `bytes_val` | encoded shape                              |
+| json          | `bytes_val` | indexed as a document subtree              |
 
 ### Write path
 
@@ -143,28 +146,43 @@ ready to hand to `section/typed_doc_values.zig` at segment-build time:
 - `json` columns are stringified to bytes and flagged `is_json` so the write
   path can additionally project the subtree via `pathfact` + dynamic templates.
 
-Numeric physical encoding matches `typed_doc_values` and is order-preserving so
-range scans work directly on the packed column:
+Numeric physical encoding is chosen to match the engine's existing doc values
+(`introducer.detectTypedValue` + the `search/query.zig` readers) so range scans
+reuse the existing readers rather than needing new ones:
 
-- `number` → `f64` (native);
-- `integer` → `u64` via `orderedU64FromI64` (sign-bit flip, so unsigned range
-  scans yield signed order); round-trips through `orderedI64FromU64`;
-- `datetime` → `u64` from an epoch integer (or integer-string). RFC3339 string
-  parsing to epoch is a follow-up; epoch integers are accepted today;
+- `number` / `integer` → `f64` (native), read via `getF64` / `readF64Chunk`;
+- `datetime` → raw `u64` epoch ns, read via `getU64` (RFC3339 string parsing to
+  epoch is a follow-up; epoch integers / integer-strings are accepted today);
 - `boolean` → `bool`, `geopoint` → packed lat/lon, `string`/`blob`/`geoshape`
   → `bytes`.
 
 Round-trip through the real `TypedDocValuesWriter`/`TypedDocValuesReader` is
 covered by unit tests.
 
-**Remaining integration seam:** `TypedDocValuesWriter` is a segment-level
-accumulator (all docs in a segment → one `build()`), not a per-document store,
-so populating columns belongs in the segment builder that owns the write batch,
-not in the per-document `writeDocFacts`. The seam is: add
-`relational_columns: []const FieldConfig` to the index `Config`
-(`storage/db/algebraic/index.zig`), and at segment build collect, per column, a
-`TypedDocValuesWriter` fed by `projectRelationalRowAlloc` for each document in
-the batch, then persist each built section. In Phase B this is also where the
+### How this meets the segment builder
+
+The engine already accumulates per-field typed columns at segment-build time:
+`introducer.collectTypedFieldValuesRecursiveScoped` walks each document,
+`detectTypedValue` infers a `ValueType` per field, and `appendTypedFieldValue`
+feeds a per-field `TypedDocValuesWriter` (`introducer.zig:906`) across the whole
+batch; `segment.zig` / `merger.zig` persist and merge the sections, and
+`search/query.zig` reads them for range/equality predicates.
+
+Because relational mode **enforces types**, every declared scalar column is
+type-consistent across documents, so this existing detection path already
+produces a correct typed column per declared scalar column — and the physical
+mapping above is deliberately aligned with what `detectTypedValue` produces, so
+no parallel storage path is introduced. `projectRelationalRowAlloc` is the
+schema-authoritative counterpart: it validates/normalizes the same cells
+(`NOT NULL`, strict types, json capture) ahead of the detector.
+
+**Remaining wiring (Phase 3):** (1) exclude relational `json` columns from
+typed-field detection so a `json` subtree is indexed as a document rather than
+exploded into typed columns; (2) make declared column types authoritative over
+value-based detection (so a column never silently drops on a stray mistyped
+value); (3) the columnar scan operator + predicate routing. The natural seam is
+to pass the relational column catalog (and json-column paths) into the
+introducer alongside `TextAnalysisConfig`. In Phase B this is also where the
 JSON blob write is dropped for non-`json` columns.
 
 ### Query path
@@ -190,14 +208,18 @@ number) is additive where the physical type is compatible.
   `storage_mode` on `TableSchema` (spec + Go + Zig), `json` `AntflyType`, and
   `relationalColumnPlanAlloc` producing the typed-column catalog with tests.
   No behaviour change for document-mode tables.
-- **Phase 2 — write path (projection done).** `projectRelationalRowAlloc`
-  produces order-preserving typed cells per column, enforces `NOT NULL`, and
-  captures `json` subtrees, verified end-to-end against the real
-  `typed_doc_values` writer/reader. Remaining: wire per-column
-  `TypedDocValuesWriter` accumulation into the segment builder and persist the
-  sections (see "Remaining integration seam" above).
-- **Phase 3 — columnar scan + predicate pushdown.** Table-scan operator over
-  `typed_doc_values`; route typed-column predicates to it; columnar projection
+- **Phase 2 — write path (projection done, encoding aligned).**
+  `projectRelationalRowAlloc` produces typed cells per column, enforces
+  `NOT NULL`, and captures `json` subtrees, verified end-to-end against the real
+  `typed_doc_values` writer/reader. The physical encoding is aligned with the
+  engine's existing doc values (`detectTypedValue` + `search/query.zig`), so the
+  existing segment builder (`introducer.zig`) already materializes correct typed
+  columns for type-enforced relational documents (see "How this meets the
+  segment builder"). Remaining wiring is folded into Phase 3.
+- **Phase 3 — introducer wiring + scan/pushdown.** Pass the relational column
+  catalog into the introducer: exclude `json` columns from typed-field
+  detection and make declared types authoritative; add the columnar scan
+  operator, route typed-column predicates to it, and serve columnar projection
   on read.
 - **Phase 4 — authoritative columns (Phase B).** Drop the JSON blob for
   non-`json` columns; reconstruct documents from columns on read.
