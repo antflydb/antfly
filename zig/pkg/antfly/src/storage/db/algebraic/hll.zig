@@ -161,6 +161,9 @@ pub fn encodeAlloc(alloc: Allocator, sketch: Sketch) ![]u8 {
     return out;
 }
 
+// Structural validation: magic, precision, and register-array length. This is
+// all that register-wise operations (merge = max) need, and it is O(1) in the
+// register count, so it stays cheap on the per-document ingest fold.
 fn registersView(bytes: []const u8) Error![]const u8 {
     if (bytes.len < magic.len + 1) return Error.InvalidHllSketch;
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return Error.InvalidHllSketch;
@@ -168,10 +171,17 @@ fn registersView(bytes: []const u8) Error![]const u8 {
     try validatePrecision(precision);
     const registers = bytes[magic.len + 1 ..];
     if (registers.len != registerCount(precision)) return Error.InvalidHllSketch;
-    // Reject out-of-range register values up front: `estimate` shifts by the
-    // register, so a corrupt byte >= 64 would otherwise be an out-of-range shift
-    // (panic in safe builds, UB in release) rather than a graceful error.
-    const max_register = maxRegisterValue(precision);
+    return registers;
+}
+
+// Structural validation plus a per-register bounds check. Used at the estimate /
+// decode boundary, where `estimate` shifts by the register value: a corrupt byte
+// >= 64 would otherwise be an out-of-range shift (panic in safe builds, UB in
+// release). Merges (register-wise max) never shift, so they use registersView
+// and tolerate a stray byte rather than failing an ingest on stored corruption.
+fn validatedRegistersView(bytes: []const u8) Error![]const u8 {
+    const registers = try registersView(bytes);
+    const max_register = maxRegisterValue(@intCast(bytes[magic.len]));
     for (registers) |register| {
         if (register > max_register) return Error.InvalidHllSketch;
     }
@@ -179,7 +189,7 @@ fn registersView(bytes: []const u8) Error![]const u8 {
 }
 
 pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !Sketch {
-    const registers = try registersView(bytes);
+    const registers = try validatedRegistersView(bytes);
     const precision: u6 = @intCast(bytes[magic.len]);
     return .{ .precision = precision, .registers = try alloc.dupe(u8, registers) };
 }
@@ -216,7 +226,7 @@ pub fn mergeEncodedAlloc(alloc: Allocator, left: ?[]const u8, right: ?[]const u8
 pub fn estimateEncoded(bytes: []const u8) !u64 {
     // An empty payload is the lattice identity (an absent sketch).
     if (bytes.len == 0) return 0;
-    const registers = try registersView(bytes);
+    const registers = try validatedRegistersView(bytes);
     const precision: u6 = @intCast(bytes[magic.len]);
     const sketch = Sketch{ .precision = precision, .registers = @constCast(registers) };
     return sketch.estimateRounded();

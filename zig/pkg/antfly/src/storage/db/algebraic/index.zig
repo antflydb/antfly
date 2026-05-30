@@ -2840,7 +2840,7 @@ pub const Index = struct {
             const txn = write_batch.asTxn();
             try self.applyBatchMutationsWithTxn(txn, batch, options);
             try write_batch.commit();
-            try self.scheduleHllMaintenanceIfDirty(store);
+            self.scheduleHllMaintenanceIfDirty(store);
             return;
         }
 
@@ -2848,7 +2848,7 @@ pub const Index = struct {
         errdefer txn.abort();
         try self.applyBatchMutationsWithTxn(&txn, batch, options);
         try txn.commit();
-        try self.scheduleHllMaintenanceIfDirty(store);
+        self.scheduleHllMaintenanceIfDirty(store);
     }
 
     fn applyBatchMutationsWithTxn(
@@ -15052,10 +15052,11 @@ pub const Index = struct {
         }
         if (doc_facts_changed) {
             try self.applyDocFactDelta(txn, doc_key, old_facts.facts, -1);
-            // The old value cannot be subtracted from an HLL sketch, so mark any
-            // materialization the old facts fed as dirty; the maintenance pass
-            // rebuilds it exactly from the surviving facts.
-            try self.markHllCardinalitiesDirtyForFactsTxn(txn, old_facts.facts);
+            // The old value cannot be subtracted from an HLL sketch, so mark a
+            // materialization dirty when this update changed a field it reads;
+            // the maintenance pass then rebuilds it exactly from surviving facts.
+            // Unrelated field changes (e.g. a measure) leave the sketch alone.
+            try self.markHllCardinalitiesDirtyForUpdateTxn(txn, old_facts.facts, new_facts.facts);
             try self.applyAdaptiveDocFactDelta(txn, old_facts.facts, -1, maintenance_context);
         }
         if (self.config().joins.len > 0) {
@@ -15071,9 +15072,12 @@ pub const Index = struct {
         if (doc_facts_changed) {
             try self.applyAdaptiveDocFactDelta(txn, new_facts.facts, 1, maintenance_context);
             try self.applyDocFactDelta(txn, doc_key, new_facts.facts, 1);
-            // Fold the new value into the sketch so warm reads stay close until
-            // the dirty rebuild lands; the rebuild then recomputes from scratch.
-            try self.applyHllCardinalitiesForFactsTxn(txn, new_facts.facts);
+            // Fold the new value into the sketches so warm reads stay close until
+            // the dirty rebuild lands. Only materializations whose group/value
+            // changed were marked dirty above; folding the others is harmless
+            // (idempotent re-union of a value already present) but we skip it for
+            // the unchanged ones via the same change check.
+            try self.applyHllCardinalitiesForUpdatedFactsTxn(txn, old_facts.facts, new_facts.facts);
         }
         if (self.config().joins.len > 0) {
             try self.applyDocJoinDelta(txn, doc_key, parsed.value, 1, maintenance_context);
@@ -16349,6 +16353,21 @@ pub const Index = struct {
         }
     }
 
+    // Warm-folds the new value of an in-place update into only the sketches
+    // whose group/value actually changed (the ones markHllCardinalitiesDirty-
+    // ForUpdateTxn flagged), keeping the read estimate close until the rebuild.
+    fn applyHllCardinalitiesForUpdatedFactsTxn(
+        self: *Index,
+        txn: anytype,
+        old_facts: []const fact_mod.Fact,
+        new_facts: []const fact_mod.Fact,
+    ) !void {
+        for (self.config().hll_cardinalities) |hcfg| {
+            if (!hllCardinalityFactsChanged(hcfg, old_facts, new_facts)) continue;
+            try self.applyHllCardinalityForFactsTxn(txn, new_facts, hcfg);
+        }
+    }
+
     fn applyHllCardinalityForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact, hcfg: HllCardinalityConfig) !void {
         const group_key = fact_mod.axisTupleAlloc(self.alloc, facts, hcfg.group_by) catch |err| switch (err) {
             error.MissingField => return,
@@ -16384,9 +16403,52 @@ pub const Index = struct {
     fn markHllCardinalitiesDirtyForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact) !void {
         for (self.config().hll_cardinalities) |hcfg| {
             if (fact_mod.findScalar(facts, .group, hcfg.value_field) == null) continue;
-            const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
-            defer self.alloc.free(dirty_key);
-            try txn.put(dirty_key, "1");
+            try self.markHllCardinalityDirtyTxn(txn, hcfg);
+        }
+    }
+
+    fn markHllCardinalityDirtyTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig) !void {
+        const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
+        defer self.alloc.free(dirty_key);
+        try txn.put(dirty_key, "1");
+    }
+
+    // True when `old_facts` and `new_facts` differ in any field the
+    // materialization reads (its group_by axes or its value_field). Used by the
+    // coalesced in-place update path to avoid forcing a full rebuild when a
+    // re-upsert only touched fields the sketch does not depend on.
+    fn hllCardinalityFactsChanged(
+        hcfg: HllCardinalityConfig,
+        old_facts: []const fact_mod.Fact,
+        new_facts: []const fact_mod.Fact,
+    ) bool {
+        if (!scalarEqual(fact_mod.findScalar(old_facts, .group, hcfg.value_field), fact_mod.findScalar(new_facts, .group, hcfg.value_field))) return true;
+        for (hcfg.group_by) |axis| {
+            if (!scalarEqual(fact_mod.findScalar(old_facts, .group, axis), fact_mod.findScalar(new_facts, .group, axis))) return true;
+        }
+        return false;
+    }
+
+    fn scalarEqual(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null and b == null) return true;
+        if (a == null or b == null) return false;
+        return std.mem.eql(u8, a.?, b.?);
+    }
+
+    // Marks dirty only the materializations whose group_by/value_field actually
+    // changed between the old and new facts of an in-place update.
+    fn markHllCardinalitiesDirtyForUpdateTxn(
+        self: *Index,
+        txn: anytype,
+        old_facts: []const fact_mod.Fact,
+        new_facts: []const fact_mod.Fact,
+    ) !void {
+        for (self.config().hll_cardinalities) |hcfg| {
+            // Only relevant if the old doc actually contributed a value to this
+            // sketch; a pure add of the value is handled by the warm fold.
+            if (fact_mod.findScalar(old_facts, .group, hcfg.value_field) == null) continue;
+            if (!hllCardinalityFactsChanged(hcfg, old_facts, new_facts)) continue;
+            try self.markHllCardinalityDirtyTxn(txn, hcfg);
         }
     }
 
@@ -16553,10 +16615,18 @@ pub const Index = struct {
     // dirty. Keyed on the persisted dirty markers rather than the batch shape, so
     // it also catches in-place coalesced updates (which mark dirty without
     // appearing in deleted_keys/overwritten_doc_keys).
-    fn scheduleHllMaintenanceIfDirty(self: *Index, store: *docstore_mod.DocStore) !void {
+    //
+    // Best-effort and infallible: it runs *after* the batch has durably
+    // committed, so it must not turn a transient read-txn error into a failed
+    // apply (a caller retrying would double-apply). If the dirtiness probe fails,
+    // the persisted marker remains set and the next batch — or an explicit
+    // runHllMaintenance — picks it up; meanwhile the dirty-aware read gate keeps
+    // queries correct by falling back to the exact scan.
+    fn scheduleHllMaintenanceIfDirty(self: *Index, store: *docstore_mod.DocStore) void {
         if (self.hll_maintenance_lane == null) return;
         if (self.config().hll_cardinalities.len == 0) return;
-        if (!try self.anyHllCardinalityDirty(store)) return;
+        const dirty = self.anyHllCardinalityDirty(store) catch return;
+        if (!dirty) return;
         self.scheduleHllMaintenance(store);
     }
 
@@ -16677,6 +16747,12 @@ pub const Index = struct {
             return hcfg.name;
         }
         return null;
+    }
+
+    // Test helper: whether the (single) configured HLL cardinality is currently
+    // marked dirty (i.e. a maintenance rebuild is pending).
+    fn hllCardinalityDirtyTest(self: *Index, store: *docstore_mod.DocStore) !bool {
+        return try self.hllCardinalityDirty(store, self.config().hll_cardinalities[0].name);
     }
 
     fn hllCardinalityDirty(self: *Index, store: *docstore_mod.DocStore, name: []const u8) !bool {
@@ -19249,6 +19325,59 @@ test "algebraic HLL cardinality is corrected after an in-place value change" {
     };
     try idx.applyBatch(&store, .{ .documents = collapsed[0..] });
     try std.testing.expectEqual(@as(?u64, 1), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
+}
+
+test "algebraic HLL cardinality is not dirtied by an unrelated field update" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    var runtime = try background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    // The cardinality groups by region on distinct customer; `amount` is an
+    // unrelated measure the sketch does not read.
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "hll_cardinalities": [
+        \\    {"name":"customers_by_region","group_by":["region"],"value_field":"customer","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, runtime.allocOwnerId());
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\",\"amount\":10}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"b\",\"amount\":20}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
+    try std.testing.expect(!try idx.hllCardinalityDirtyTest(&store));
+
+    // Re-upsert o1 changing only `amount` (region/customer unchanged): the sketch
+    // does not depend on amount, so it must not be marked dirty (no rebuild).
+    const amount_only = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\",\"amount\":99}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = amount_only[0..] });
+    try std.testing.expect(!try idx.hllCardinalityDirtyTest(&store));
+    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
 }
 
 test "algebraic HLL cardinality tokenizes bytes fields identically on ingest and rebuild" {
