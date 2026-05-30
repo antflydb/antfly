@@ -257,8 +257,25 @@ number) is additive where the physical type is compatible.
   name; `.range` queries already route there. Verified by the end-to-end
   range-scan test. Remaining enhancement: schema-aware auto-routing of
   predicates on typed columns (use the runtime `relational_columns` catalog).
-- **Phase 5 — authoritative columns (Phase B).** Drop the JSON blob for
-  non-`json` columns; reconstruct documents from columns on read.
+- **Phase 5 — authoritative columns (Phase B).** Foundation done:
+  `reconstructRelationalDocumentAlloc` rebuilds a JSON document from a projected
+  `RelationalRow` (string/blob/geoshape → string, numeric/integer → number,
+  datetime → epoch number, boolean, geopoint → `{lat,lon}`, json → embedded
+  subtree; absent nullable columns omitted), verified by a doc → project →
+  reconstruct round-trip test. This proves the typed columns carry enough to
+  rebuild the document.
+
+  Remaining (deliberately not done — it is a hot-path-wide storage change):
+  actually dropping the JSON blob. The authoritative document today is the
+  `stored_data` blob (`segment.addStoredDoc`), consumed as source of truth in
+  many read sites (`storage/db/aggregations.zig`, `db.zig`). Two further pieces
+  are needed before the blob can be dropped: (1) keyword/text columns are
+  currently only in the analyzed inverted index and are **not** retrievable, so
+  relational mode must also persist string columns as raw column values (e.g.
+  via `columnar.zig`) to reconstruct them; (2) the read path must call
+  `reconstructRelationalDocumentAlloc` to synthesize `stored_data` on demand.
+  Until both land, the blob remains the source of truth and reconstruction is an
+  additive, independently-tested capability.
 
 ## Related docs
 

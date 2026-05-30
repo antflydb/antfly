@@ -1083,6 +1083,83 @@ fn stringifyJsonValueAlloc(alloc: Allocator, json_value: std.json.Value) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(json_value, .{})});
 }
 
+// ---------------------------------------------------------------------------
+// Document reconstruction (Phase 5 foundation, see zig/RELATIONAL.md)
+//
+// reconstructRelationalDocumentAlloc rebuilds a JSON document from a projected
+// RelationalRow. This proves the typed columns carry enough information to
+// reconstruct the document, which is the prerequisite for making columns the
+// authoritative store (dropping the JSON blob for non-json columns). It does
+// not yet flip the storage switch -- the read path still uses the stored blob.
+//
+// Emitted by column type:
+//   string/blob/geoshape -> JSON string      (bytes preserved verbatim)
+//   numeric/integer       -> JSON number      (from f64)
+//   datetime              -> JSON number      (epoch ns from u64)
+//   boolean               -> JSON true/false
+//   geopoint              -> {"lat":..,"lon":..}
+//   json                  -> the stored subtree bytes, embedded verbatim
+// Absent (nullable, omitted) columns are skipped, matching how they were
+// projected. Columns are emitted by their declared path (top-level today).
+// ---------------------------------------------------------------------------
+
+pub fn reconstructRelationalDocumentAlloc(alloc: Allocator, plan: RelationalPlan, row: RelationalRow) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try out.append(alloc, '{');
+    var emitted: usize = 0;
+    for (plan.columns, 0..) |column, i| {
+        const candidate = row.cell(i) orelse continue;
+        if (emitted > 0) try out.append(alloc, ',');
+        emitted += 1;
+        try appendJsonString(alloc, &out, column.path);
+        try out.append(alloc, ':');
+        if (column.is_json) {
+            // Stored bytes are already valid JSON; embed verbatim.
+            try out.appendSlice(alloc, candidate.value.bytes_val);
+        } else {
+            try appendReconstructedScalar(alloc, &out, column.column_type, candidate.value);
+        }
+    }
+    try out.append(alloc, '}');
+
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendReconstructedScalar(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    column_type: []const u8,
+    value: ColumnValue,
+) !void {
+    if (std.mem.eql(u8, column_type, "string") or
+        std.mem.eql(u8, column_type, "blob") or
+        std.mem.eql(u8, column_type, "geoshape"))
+    {
+        try appendJsonString(alloc, out, value.bytes_val);
+        return;
+    }
+    if (std.mem.eql(u8, column_type, "boolean")) {
+        try out.appendSlice(alloc, if (value.bool_val) "true" else "false");
+        return;
+    }
+    if (std.mem.eql(u8, column_type, "number") or std.mem.eql(u8, column_type, "integer")) {
+        try appendFmt(alloc, out, "{d}", .{value.f64_val});
+        return;
+    }
+    if (std.mem.eql(u8, column_type, "datetime")) {
+        try appendFmt(alloc, out, "{d}", .{value.u64_val});
+        return;
+    }
+    if (std.mem.eql(u8, column_type, "geopoint")) {
+        try appendFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ value.geo_point.lat, value.geo_point.lon });
+        return;
+    }
+    // Unknown scalar kind: emit JSON null rather than corrupt the document.
+    try out.appendSlice(alloc, "null");
+}
+
 fn valueAtJsonPath(root: std.json.Value, path: []const u8) ?std.json.Value {
     var current = root;
     var it = std.mem.splitScalar(u8, path, '.');
@@ -1108,6 +1185,65 @@ fn relationalColumnIndex(plan: RelationalPlan, name: []const u8) ?usize {
         if (std.mem.eql(u8, column.name, name)) return i;
     }
     return null;
+}
+
+test "relational document reconstructs from typed cells round-trip" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"abc","amount":12.5,"qty":7,"ts":1000,"active":true,"attrs":{"k":"v"},"payload":[1,2,3]}
+    , .{});
+    defer doc.deinit();
+
+    var row = try projectRelationalRowAlloc(alloc, plan, doc.value);
+    defer row.deinit(alloc);
+
+    const rebuilt_json = try reconstructRelationalDocumentAlloc(alloc, plan, row);
+    defer alloc.free(rebuilt_json);
+
+    var rebuilt = try std.json.parseFromSlice(std.json.Value, alloc, rebuilt_json, .{});
+    defer rebuilt.deinit();
+    const obj = rebuilt.value.object;
+
+    try std.testing.expectEqualStrings("abc", obj.get("id").?.string);
+    try std.testing.expectEqual(@as(f64, 12.5), obj.get("amount").?.float);
+    // integer column reconstructs as a JSON number (7 parses as integer)
+    try std.testing.expectEqual(@as(i64, 7), obj.get("qty").?.integer);
+    try std.testing.expectEqual(@as(i64, 1000), obj.get("ts").?.integer);
+    try std.testing.expect(obj.get("active").?.bool);
+    // json columns reconstruct as their original subtrees
+    try std.testing.expectEqualStrings("v", obj.get("attrs").?.object.get("k").?.string);
+    try std.testing.expectEqual(@as(usize, 3), obj.get("payload").?.array.items.len);
+}
+
+test "relational reconstruction omits absent nullable columns" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+
+    // Only the required columns are present; nullable columns are omitted.
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"x","amount":0.0}
+    , .{});
+    defer doc.deinit();
+
+    var row = try projectRelationalRowAlloc(alloc, plan, doc.value);
+    defer row.deinit(alloc);
+
+    const rebuilt_json = try reconstructRelationalDocumentAlloc(alloc, plan, row);
+    defer alloc.free(rebuilt_json);
+
+    var rebuilt = try std.json.parseFromSlice(std.json.Value, alloc, rebuilt_json, .{});
+    defer rebuilt.deinit();
+    const obj = rebuilt.value.object;
+
+    try std.testing.expectEqual(@as(usize, 2), obj.count());
+    try std.testing.expectEqualStrings("x", obj.get("id").?.string);
+    try std.testing.expectEqual(@as(f64, 0.0), obj.get("amount").?.float);
+    try std.testing.expect(obj.get("qty") == null);
+    try std.testing.expect(obj.get("payload") == null);
 }
 
 test "relational projection enforces required columns and types" {
