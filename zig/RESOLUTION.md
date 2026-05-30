@@ -429,10 +429,18 @@ Open/index/enrichment validation should reject:
    - [x] Resolution artifact key scheme: `internal_keys.resolutionArtifactKeyAlloc`
          / `isResolutionArtifactKey` / `parseResolutionArtifactKeyAlloc` (an
          asset-style artifact under the distinct `"resolution"` type).
-   - [ ] `ResolutionRuntime`: managed worker mirroring `EnrichmentRuntime` --
-         catch up on the `resolution` hint, run `ResolutionStage` per changed
-         extraction artifact, persist via a `DerivedBatch`; submit on the shard
-         `backend_runtime` durable lane. Wire init/start/shutdown in `db.zig`.
+   - [x] Resolution stage core (`storage/db/resolution_runtime.zig`
+         `resolveExtraction`): given the shard's resolvers + a changed
+         extraction artifact, pick the consuming resolver, build its engine via
+         `Resolver.initFromParts`, and produce the resolution artifact bytes.
+         `antfly_matcher`/`antfly_resolver` threaded into the antfly module graph
+         (build.zig). Verified by `db-test` + `root-test`.
+   - [ ] Store-I/O wrapper: read the extraction artifact and persist the
+         resolution artifact through a `DerivedBatch` (db-backed `ArtifactStore`
+         over the shard store; key via `resolutionArtifactKeyAlloc`).
+   - [ ] `ResolutionRuntime` worker: catch up on the `resolution` hint
+         (`applied_sequence`), submit on the shard `backend_runtime` durable
+         lane; wire init/start/shutdown in `db.zig`.
    - [ ] Emit the `resolution` hint on extraction-artifact changes
          (`recordFromDerivedBatch` + the rafted thin-record path in `db.zig`).
    - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
