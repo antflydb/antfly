@@ -291,17 +291,31 @@ number) is additive where the physical type is compatible.
   numeric/datetime/boolean/geopoint sections double as predicate-scan columns,
   string columns also keep their analyzed inverted-index entries for term
   queries, and the `bytes_val` sections are the reconstruction source. Validated
-  by the full `zig build unit-test` suite (2688 tests, 0 failed, 0 leaked), so
-  every segment reader/merger/search path tolerates the added sections.
+  by the full `zig build unit-test` suite (0 failed, 0 leaked), so every segment
+  reader/merger/search path tolerates the added sections.
+
+  Read-side reconstruction done (segment-level):
+  `document_mapper.reconstructRelationalDocumentFromSegmentAlloc` rebuilds a
+  document's JSON from the persisted column sections of a real
+  `SegmentReader` — for each declared column it reads the `typed_doc_values`
+  section by name and pulls the value at the doc ordinal
+  (`getBytes`/`getU64`/`getF64`/`getBool`/`getGeoPoint`), emitting JSON keyed by
+  column path; absent (sectionless) nullable columns are omitted; `json` bytes
+  are embedded verbatim, strings are JSON-escaped. The complete
+  write → persist → read → reconstruct cycle is verified on a real
+  introducer-built segment by the "relational document reconstructs from a
+  persisted segment" test (plus an absent-nullable-column case).
 
   Remaining (the last step, deliberately not done — it changes the read source
   of truth): drop the `stored_data` blob. Today the blob (`segment.addStoredDoc`)
   is still written and remains the document source of truth, consumed in many
-  read sites (`storage/db/aggregations.zig`, `db.zig`). The final step is to make
-  the read path read each column section back and call
-  `reconstructRelationalDocumentAlloc` to synthesize `stored_data` on demand,
-  then stop writing the blob for non-`json` columns. Until then the blob is
-  redundant-but-authoritative and the column persistence is additive.
+  read sites (`storage/db/aggregations.zig`, `db.zig`). The final step is to
+  route those reads through `reconstructRelationalDocumentFromSegmentAlloc`
+  (synthesizing `stored_data` on demand) and then stop writing the blob for
+  non-`json` columns. The full reconstruction path now exists and is segment-
+  verified; what remains is swapping the read source and removing the blob
+  write, validated against the whole suite. Until then the blob is
+  redundant-but-authoritative and the column work is additive.
 
 ## Related docs
 

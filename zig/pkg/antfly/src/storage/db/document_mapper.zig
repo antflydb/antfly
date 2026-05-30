@@ -1587,6 +1587,107 @@ fn valueAtJsonPath(root: std.json.Value, path: []const u8) ?std.json.Value {
     return current;
 }
 
+/// Reconstruct a relational document's JSON from the persisted column sections
+/// of a segment (Phase 5, authoritative columns -- the read counterpart of the
+/// write-path column persistence). For each declared column it reads the
+/// `typed_doc_values` section by name and pulls the value at `doc_ordinal`,
+/// emitting JSON keyed by the column path. Columns with no section (absent
+/// nullable values) are omitted. `json` and string columns are stored as
+/// `bytes_val`; `json` bytes are already valid JSON and embedded verbatim,
+/// strings are JSON-escaped. Returns the JSON document; caller owns the bytes.
+///
+/// This does not yet replace the stored_data blob on the read path; it proves
+/// the round trip (write columns -> persist segment -> reconstruct) works on a
+/// real segment, which is the prerequisite for dropping the blob.
+pub fn reconstructRelationalDocumentFromSegmentAlloc(
+    alloc: Allocator,
+    reader: anytype,
+    columns: []const runtime_schema.RelationalColumn,
+    doc_ordinal: u32,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try out.append(alloc, '{');
+    var emitted: usize = 0;
+    for (columns) |column| {
+        const section = reader.getSection(column.name, .typed_doc_values) orelse continue;
+        const dv = typed_dv.TypedDocValuesReader.init(alloc, section) catch continue;
+        if (try appendReconstructedColumn(alloc, &out, column, dv, doc_ordinal, emitted > 0)) {
+            emitted += 1;
+        }
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Append one column's `path: value` to `out`. Returns true if a value was
+/// emitted (the doc had a value in this column's section), false otherwise.
+fn appendReconstructedColumn(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    column: runtime_schema.RelationalColumn,
+    dv: typed_dv.TypedDocValuesReader,
+    doc_ordinal: u32,
+    needs_comma: bool,
+) !bool {
+    const value_type = relationalStorageValueType(column.field_type);
+    const is_json = column.field_type == .json;
+
+    switch (value_type) {
+        .f64_val => {
+            const v = (try dv.getF64(doc_ordinal)) orelse return false;
+            try appendColumnKey(alloc, out, column.path, needs_comma);
+            try appendJsonFmt(alloc, out, "{d}", .{v});
+        },
+        .u64_val => {
+            const v = (try dv.getU64(doc_ordinal)) orelse return false;
+            try appendColumnKey(alloc, out, column.path, needs_comma);
+            try appendJsonFmt(alloc, out, "{d}", .{v});
+        },
+        .bool_val => {
+            const v = (try dv.getBool(doc_ordinal)) orelse return false;
+            try appendColumnKey(alloc, out, column.path, needs_comma);
+            try out.appendSlice(alloc, if (v) "true" else "false");
+        },
+        .geo_point => {
+            const gp = (try dv.getGeoPoint(doc_ordinal)) orelse return false;
+            try appendColumnKey(alloc, out, column.path, needs_comma);
+            try appendJsonFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ gp.lat, gp.lon });
+        },
+        .bytes_val => {
+            const bytes = (try dv.getBytes(doc_ordinal)) orelse return false;
+            defer alloc.free(bytes);
+            try appendColumnKey(alloc, out, column.path, needs_comma);
+            if (is_json) {
+                // Stored bytes are already canonical JSON.
+                try out.appendSlice(alloc, bytes);
+            } else {
+                try appendJsonString(alloc, out, bytes);
+            }
+        },
+    }
+    return true;
+}
+
+fn appendColumnKey(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), path: []const u8, needs_comma: bool) !void {
+    if (needs_comma) try out.append(alloc, ',');
+    try appendJsonString(alloc, out, path);
+    try out.append(alloc, ':');
+}
+
+fn appendJsonFmt(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(text);
+    try out.appendSlice(alloc, text);
+}
+
+fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
 fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
     if (schema.dynamic_templates.len > 0) return true;
     for (schema.full_text_documents) |doc| {
@@ -3605,4 +3706,103 @@ test "relational numeric column is range-scannable end to end" {
     }
     try std.testing.expectEqual(@as(usize, 1), matches);
     try std.testing.expectEqual(@as(f64, 25.0), (try dv.getF64(matched_doc.?)).?);
+}
+
+test "relational document reconstructs from a persisted segment" {
+    // Full write -> persist -> read -> reconstruct cycle on a real segment.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const segment_mod = @import("../../segment.zig");
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+        .{ .name = "ts", .path = "ts", .field_type = .datetime, .nullable = true },
+        .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
+        .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true },
+    };
+
+    const doc_json =
+        \\{"id":"abc","amount":12.5,"ts":1000,"active":true,"payload":{"k":1}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{});
+    defer parsed.deinit();
+
+    // Write path: project all columns and build a segment via the introducer.
+    const typed = try buildRelationalTypedFields(alloc, parsed.value, &columns);
+    const text_docs = [_]introducer_mod.TextDocument{.{
+        .id = "abc",
+        .stored_data = doc_json,
+        .text_fields = &.{},
+        .typed_fields = typed,
+    }};
+    const seg_bytes = try introducer_mod.buildSegmentFromText(alloc, &text_docs, &analysis_mod.default_analyzer, null);
+    defer alloc.free(seg_bytes);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
+    defer reader.deinit();
+
+    // Read path: reconstruct the document from the persisted column sections.
+    const rebuilt_json = try reconstructRelationalDocumentFromSegmentAlloc(alloc, &reader, &columns, 0);
+    defer alloc.free(rebuilt_json);
+
+    var rebuilt = try std.json.parseFromSlice(std.json.Value, alloc, rebuilt_json, .{});
+    defer rebuilt.deinit();
+    const obj = rebuilt.value.object;
+
+    try std.testing.expectEqual(@as(usize, 5), obj.count());
+    try std.testing.expectEqualStrings("abc", obj.get("id").?.string);
+    const amount = obj.get("amount").?;
+    const amount_num: f64 = switch (amount) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => unreachable,
+    };
+    try std.testing.expectEqual(@as(f64, 12.5), amount_num);
+    try std.testing.expectEqual(@as(i64, 1000), obj.get("ts").?.integer);
+    try std.testing.expect(obj.get("active").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), obj.get("payload").?.object.get("k").?.integer);
+}
+
+test "relational segment reconstruction omits absent nullable columns" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const segment_mod = @import("../../segment.zig");
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+        .{ .name = "note", .path = "note", .field_type = .keyword, .nullable = true },
+    };
+
+    // "note" is absent -> no section -> omitted from reconstruction.
+    const doc_json = "{\"id\":\"x\",\"amount\":7.0}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{});
+    defer parsed.deinit();
+
+    const typed = try buildRelationalTypedFields(alloc, parsed.value, &columns);
+    const text_docs = [_]introducer_mod.TextDocument{.{
+        .id = "x",
+        .stored_data = doc_json,
+        .text_fields = &.{},
+        .typed_fields = typed,
+    }};
+    const seg_bytes = try introducer_mod.buildSegmentFromText(alloc, &text_docs, &analysis_mod.default_analyzer, null);
+    defer alloc.free(seg_bytes);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
+    defer reader.deinit();
+
+    const rebuilt_json = try reconstructRelationalDocumentFromSegmentAlloc(alloc, &reader, &columns, 0);
+    defer alloc.free(rebuilt_json);
+
+    var rebuilt = try std.json.parseFromSlice(std.json.Value, alloc, rebuilt_json, .{});
+    defer rebuilt.deinit();
+    const obj = rebuilt.value.object;
+
+    try std.testing.expectEqual(@as(usize, 2), obj.count());
+    try std.testing.expectEqualStrings("x", obj.get("id").?.string);
+    try std.testing.expect(obj.get("note") == null);
 }
