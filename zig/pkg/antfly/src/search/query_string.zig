@@ -47,6 +47,21 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
+/// Physical kind of a declared relational typed column, used to auto-route
+/// query-string predicates on that column to the matching typed-doc-values
+/// filter (instead of an inverted-index term/term_range filter that would not
+/// match a typed column). See zig/RELATIONAL.md.
+pub const TypedColumnKind = enum {
+    numeric,
+    datetime,
+    boolean,
+};
+
+pub const TypedColumn = struct {
+    name: []const u8,
+    kind: TypedColumnKind,
+};
+
 pub const QueryStringParser = struct {
     pub const DefaultOperator = enum {
         and_,
@@ -55,6 +70,10 @@ pub const QueryStringParser = struct {
 
     default_field: []const u8 = "_all",
     default_operator: DefaultOperator = .and_,
+    /// Declared relational typed columns. When a field predicate targets one of
+    /// these, it is routed to the typed-doc-values filter. Empty for document
+    /// (schemaless) tables, leaving behaviour unchanged.
+    typed_columns: []const TypedColumn = &.{},
 
     /// Parse a query string into a Filter. Caller must manage the allocator
     /// for any allocated filter data (phrase terms, bool sub-filters).
@@ -65,6 +84,7 @@ pub const QueryStringParser = struct {
             .pos = 0,
             .default_field = self.default_field,
             .default_operator = self.default_operator,
+            .typed_columns = self.typed_columns,
         };
         const result = try parser.parseQuery();
 
@@ -79,6 +99,90 @@ const Parser = struct {
     pos: usize,
     default_field: []const u8,
     default_operator: QueryStringParser.DefaultOperator,
+    typed_columns: []const TypedColumn = &.{},
+
+    /// Return the declared typed-column kind for `field`, if any.
+    fn typedColumnKind(self: *const Parser, field: []const u8) ?TypedColumnKind {
+        for (self.typed_columns) |column| {
+            if (std.mem.eql(u8, column.name, field)) return column.kind;
+        }
+        return null;
+    }
+
+    /// Build a typed-doc-values equality filter for a declared typed column.
+    /// Returns null if the value does not parse as the column's type, so the
+    /// caller can fall back to a normal term filter.
+    fn typedEqualityFilter(kind: TypedColumnKind, field: []const u8, value: []const u8) ?Filter {
+        switch (kind) {
+            .numeric => {
+                const number = std.fmt.parseFloat(f64, value) catch return null;
+                return .{ .range = .{
+                    .field = field,
+                    .min_val = number,
+                    .max_val = number,
+                    .inclusive_min = true,
+                    .inclusive_max = true,
+                } };
+            },
+            .datetime => {
+                const ns = std.fmt.parseInt(u64, value, 10) catch return null;
+                return .{ .date_range = .{
+                    .field = field,
+                    .start_ns = ns,
+                    .end_ns = ns,
+                    .inclusive_start = true,
+                    .inclusive_end = true,
+                } };
+            },
+            .boolean => {
+                const flag = if (std.mem.eql(u8, value, "true"))
+                    true
+                else if (std.mem.eql(u8, value, "false"))
+                    false
+                else
+                    return null;
+                return .{ .bool_field = .{ .field = field, .value = flag } };
+            },
+        }
+    }
+
+    /// Build a typed-doc-values range filter for a declared numeric/datetime
+    /// column from string bounds. Returns null on parse failure or for boolean
+    /// columns (ranges are meaningless), so the caller can fall back.
+    fn typedRangeFilter(
+        kind: TypedColumnKind,
+        field: []const u8,
+        min_word: ?[]const u8,
+        max_word: ?[]const u8,
+        inclusive_min: bool,
+        inclusive_max: bool,
+    ) ?Filter {
+        switch (kind) {
+            .numeric => {
+                const min_val: f64 = if (min_word) |w| (std.fmt.parseFloat(f64, w) catch return null) else -std.math.inf(f64);
+                const max_val: f64 = if (max_word) |w| (std.fmt.parseFloat(f64, w) catch return null) else std.math.inf(f64);
+                return .{ .range = .{
+                    .field = field,
+                    .min_val = min_val,
+                    .max_val = max_val,
+                    .inclusive_min = inclusive_min,
+                    .inclusive_max = inclusive_max,
+                } };
+            },
+            .datetime => {
+                const start_ns: ?u64 = if (min_word) |w| (std.fmt.parseInt(u64, w, 10) catch return null) else null;
+                const end_ns: ?u64 = if (max_word) |w| (std.fmt.parseInt(u64, w, 10) catch return null) else null;
+                return .{ .date_range = .{
+                    .field = field,
+                    .start_ns = start_ns,
+                    .end_ns = end_ns,
+                    .inclusive_start = inclusive_min,
+                    .inclusive_end = inclusive_max,
+                } };
+            },
+            .boolean => return null,
+        }
+    }
 
     fn parseQuery(self: *Parser) ParseError!?Filter {
         self.skipWhitespace();
@@ -250,6 +354,13 @@ const Parser = struct {
             if (val.len > 0 and self.pos < self.input.len and self.input[self.pos] == '*') {
                 self.pos += 1;
                 return try self.applyOptionalBoost(.{ .prefix = .{ .field = word, .prefix = val } });
+            }
+
+            // Route equality on a declared typed column to its typed filter.
+            if (self.typedColumnKind(word)) |kind| {
+                if (typedEqualityFilter(kind, word, val)) |typed_filter| {
+                    return try self.applyOptionalBoost(typed_filter);
+                }
             }
 
             return try self.applyOptionalBoost(.{ .term = .{ .field = word, .term = val } });
@@ -794,4 +905,71 @@ test "query string: term range" {
     try testing.expectEqualStrings("title", filter.term_range.field);
     try testing.expectEqualStrings("alpha", filter.term_range.min.?);
     try testing.expectEqualStrings("omega", filter.term_range.max.?);
+}
+
+test "typed column routes equality to typed filters" {
+    const alloc = testing.allocator;
+    const parser = QueryStringParser{ .typed_columns = &.{
+        .{ .name = "amount", .kind = .numeric },
+        .{ .name = "active", .kind = .boolean },
+        .{ .name = "ts", .kind = .datetime },
+    } };
+
+    var numeric = try parser.parse(alloc, "amount:25");
+    defer numeric.deinit(alloc);
+    try testing.expect(numeric == .range);
+    try testing.expectEqualStrings("amount", numeric.range.field);
+    try testing.expectEqual(@as(f64, 25.0), numeric.range.min_val);
+    try testing.expectEqual(@as(f64, 25.0), numeric.range.max_val);
+
+    var boolean = try parser.parse(alloc, "active:true");
+    defer boolean.deinit(alloc);
+    try testing.expect(boolean == .bool_field);
+    try testing.expectEqualStrings("active", boolean.bool_field.field);
+    try testing.expect(boolean.bool_field.value);
+
+    var datetime = try parser.parse(alloc, "ts:1000");
+    defer datetime.deinit(alloc);
+    try testing.expect(datetime == .date_range);
+    try testing.expectEqual(@as(?u64, 1000), datetime.date_range.start_ns);
+    try testing.expectEqual(@as(?u64, 1000), datetime.date_range.end_ns);
+}
+
+test "typed numeric column routes range to typed range filter" {
+    const alloc = testing.allocator;
+    const parser = QueryStringParser{ .typed_columns = &.{
+        .{ .name = "amount", .kind = .numeric },
+    } };
+
+    var filter = try parser.parse(alloc, "amount:[10 TO 40}");
+    defer filter.deinit(alloc);
+    try testing.expect(filter == .range);
+    try testing.expectEqualStrings("amount", filter.range.field);
+    try testing.expectEqual(@as(f64, 10.0), filter.range.min_val);
+    try testing.expectEqual(@as(f64, 40.0), filter.range.max_val);
+    try testing.expect(filter.range.inclusive_min);
+    try testing.expect(!filter.range.inclusive_max);
+}
+
+test "undeclared and non-typed columns keep term behaviour" {
+    const alloc = testing.allocator;
+    const parser = QueryStringParser{ .typed_columns = &.{
+        .{ .name = "amount", .kind = .numeric },
+    } };
+
+    // Undeclared field stays a term filter.
+    var term = try parser.parse(alloc, "title:hello");
+    defer term.deinit(alloc);
+    try testing.expect(term == .term);
+
+    // Declared numeric column with a non-numeric value falls back to a term.
+    var fallback = try parser.parse(alloc, "amount:abc");
+    defer fallback.deinit(alloc);
+    try testing.expect(fallback == .term);
+
+    // No catalog at all: behaviour unchanged.
+    const plain = QueryStringParser{};
+    var plain_range = try plain.parse(alloc, "amount:[10 TO 40]");
+    defer plain_range.deinit(alloc);
+    try testing.expect(plain_range == .term_range);
 }
