@@ -435,8 +435,12 @@ Open/index/enrichment validation should reject:
          `backend_runtime` durable lane. Wire init/start/shutdown in `db.zig`.
    - [ ] Emit the `resolution` hint on extraction-artifact changes
          (`recordFromDerivedBatch` + the rafted thin-record path in `db.zig`).
-   - [ ] Resolver catalog config + `table_provisioner` parsing + `addResolver`
-         / `listResolvers` DB API.
+   - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
+         per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
+         / `listResolvers` through DB -> DBCore -> IndexManager (verified by a
+         reopen persistence test).
+   - [ ] `table_provisioner` parsing: ingest a `resolvers` section from table
+         config so resolvers are declarable, not just API-driven.
    - [ ] Live candidate blocking adapter: fetch candidates from the entity table
          (`ann`/`exact`/`prefix`) so the resolver runs against real entities.
    - [ ] Promoter: entity upsert via `DocumentTransform`, provenance as mention
