@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const adaptive_mod = @import("adaptive.zig");
 const algebra = @import("algebra.zig");
@@ -2732,6 +2733,12 @@ pub const Index = struct {
     // fold back). When unset, callers drive rebuilds via runHllMaintenance.
     hll_maintenance_lane: ?background_runtime.DurableJobLane = null,
     hll_maintenance_owner_id: u64 = 0,
+    // Serializes index write transactions. The store contract is single-writer,
+    // but background HLL maintenance (runHllMaintenance) opens its own write txn
+    // on a separate thread concurrently with foreground applyBatch calls. Both
+    // acquire this so at most one write txn against the index's store is open at
+    // a time; readers are unaffected (they use the store's snapshots).
+    write_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn open(alloc: Allocator, name: []const u8, config_json: []const u8) !Index {
         var parsed = try std.json.parseFromSlice(Config, alloc, config_json, .{ .allocate = .alloc_always });
@@ -2754,6 +2761,17 @@ pub const Index = struct {
     pub fn attachHllMaintenanceLane(self: *Index, lane: background_runtime.DurableJobLane, owner_id: u64) void {
         self.hll_maintenance_lane = lane;
         self.hll_maintenance_owner_id = owner_id;
+    }
+
+    // Acquires the index write lock, spinning/yielding (the codebase's pattern
+    // for std.atomic.Mutex, which has no blocking lock()). Held only around a
+    // write transaction, so contention is brief.
+    fn lockWrites(self: *Index) void {
+        while (!self.write_mutex.tryLock()) std.Thread.yield() catch {};
+    }
+
+    fn unlockWrites(self: *Index) void {
+        self.write_mutex.unlock();
     }
 
     pub fn close(self: *Index) void {
@@ -2830,6 +2848,23 @@ pub const Index = struct {
         batch: derived_types.DerivedBatch,
         options: ApplyOptions,
     ) !void {
+        // Serialize against concurrent background HLL maintenance (which opens
+        // its own write txn on another thread); the store is single-writer.
+        // Scheduling runs after the lock is released — it only opens a read txn
+        // and submits a job, and must not be held while doing so.
+        try self.applyBatchWritesLocked(store, batch, options);
+        self.scheduleHllMaintenanceIfDirty(store);
+    }
+
+    fn applyBatchWritesLocked(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        batch: derived_types.DerivedBatch,
+        options: ApplyOptions,
+    ) !void {
+        self.lockWrites();
+        defer self.unlockWrites();
+
         if (self.canUseAppendOnlyBulkPath(batch, options) and try self.appendOnlyDocFactsAreMissing(store, batch)) {
             return try self.applyAppendOnlyBatchWithOptions(store, batch, options);
         }
@@ -2840,7 +2875,6 @@ pub const Index = struct {
             const txn = write_batch.asTxn();
             try self.applyBatchMutationsWithTxn(txn, batch, options);
             try write_batch.commit();
-            self.scheduleHllMaintenanceIfDirty(store);
             return;
         }
 
@@ -2848,7 +2882,6 @@ pub const Index = struct {
         errdefer txn.abort();
         try self.applyBatchMutationsWithTxn(&txn, batch, options);
         try txn.commit();
-        self.scheduleHllMaintenanceIfDirty(store);
     }
 
     fn applyBatchMutationsWithTxn(
@@ -16571,6 +16604,12 @@ pub const Index = struct {
     pub fn runHllMaintenance(self: *Index, store: *docstore_mod.DocStore) !bool {
         if (self.config().hll_cardinalities.len == 0) return false;
         if (!try self.anyHllCardinalityDirty(store)) return false;
+        // Runs on a background thread; take the index write lock so the rebuild's
+        // write txn never overlaps a foreground applyBatch write (single-writer
+        // store). The dirty re-check inside the lock collapses redundant jobs.
+        self.lockWrites();
+        defer self.unlockWrites();
+        if (!try self.anyHllCardinalityDirty(store)) return false;
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
         const did_work = try self.runHllMaintenanceTxn(&txn);
@@ -19272,6 +19311,88 @@ test "algebraic HLL cardinality rebuilds after deletes via maintenance lane" {
     const deletes = [_][]const u8{ "o2", "o3" };
     try idx.applyBatch(&store, .{ .deleted_keys = deletes[0..] });
     try std.testing.expectEqual(@as(?u64, 1), try westEstimate(&idx, &store, west_group, alloc));
+}
+
+test "algebraic HLL cardinality stays correct under a concurrent threaded maintenance lane" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    // Real threaded lane: maintenance rebuilds run on a background thread,
+    // concurrently with the foreground applyBatch writes below. The index write
+    // lock must serialize them so neither a lost update nor a torn read occurs.
+    var runtime = try background_runtime.BackendRuntime.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"customers_by_region","group_by":["region"],"value_field":"customer","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, runtime.allocOwnerId());
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+
+    // Insert 200 distinct west customers across many small batches, deleting the
+    // previous batch's docs each round. Every delete schedules a background
+    // rebuild that races the next round's insert.
+    var round: usize = 0;
+    while (round < 40) : (round += 1) {
+        var docs: [5]derived_types.DerivedDocument = undefined;
+        var bufs: [5][64]u8 = undefined;
+        for (0..5) |i| {
+            const n = round * 5 + i;
+            const key = try std.fmt.bufPrint(&bufs[i], "k{d}", .{n});
+            // Reuse the buffer tail for the value via a second format into a dup.
+            const value = try std.fmt.allocPrint(alloc, "{{\"region\":\"west\",\"customer\":\"c{d}\"}}", .{n});
+            docs[i] = .{ .key = try alloc.dupe(u8, key), .action = .upsert, .cleaned_value = value };
+        }
+        defer for (docs) |d| {
+            alloc.free(@constCast(d.key));
+            if (d.cleaned_value) |v| alloc.free(@constCast(v));
+        };
+        try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    }
+
+    // Drain all background rebuilds, then run one final maintenance pass so any
+    // outstanding dirty marker is resolved deterministically before asserting.
+    runtime.durable_jobs.drainOwner(idx.hll_maintenance_owner_id);
+    _ = try idx.runHllMaintenance(&store);
+
+    // All 200 customers are distinct and all in west; the estimate must be close
+    // to 200 (HLL error), and must not be corrupted by a lost update or a torn
+    // read from the concurrent rebuilds.
+    const entries = try idx.approxCardinalityEntriesAlloc(&store, "customers_by_region");
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    var west_estimate: ?u64 = null;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.group_key, west_group)) west_estimate = entry.estimate;
+    }
+    try std.testing.expect(west_estimate != null);
+    const est = west_estimate.?;
+    // Generous bound: p=14 standard error is ~0.8%, allow well beyond that. The
+    // point is to catch corruption (estimate near 0, or far off), not precision.
+    try std.testing.expect(est >= 180 and est <= 220);
 }
 
 test "algebraic HLL cardinality is corrected after an in-place value change" {
