@@ -439,7 +439,7 @@ Open/index/enrichment validation should reject:
          per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
          / `listResolvers` through DB -> DBCore -> IndexManager (verified by a
          reopen persistence test).
-   - [ ] `table_provisioner` parsing: ingest a `resolvers` section from table
+   - [x] `table_provisioner` parsing: ingest a `resolvers` section from table
          config so resolvers are declarable, not just API-driven.
    - [ ] Live candidate blocking adapter: fetch candidates from the entity table
          (`ann`/`exact`/`prefix`) so the resolver runs against real entities.
