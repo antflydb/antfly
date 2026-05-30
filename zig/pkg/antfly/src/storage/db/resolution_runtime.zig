@@ -27,8 +27,13 @@ const std = @import("std");
 const resolver_lib = @import("antfly_resolver");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
 const internal_keys = @import("../internal_keys.zig");
+const derived_types = @import("derived/derived_types.zig");
 
 pub const ResolverConfig = resolver_catalog.ResolverConfig;
+
+/// Appends a derived batch to the replay log, returning its sequence. Matches
+/// the enrichment runtime's writer so the db wires the same callback.
+pub const DerivedRecordWriter = *const fn (ptr: *anyopaque, batch: derived_types.DerivedBatch) anyerror!u64;
 
 pub const ResolutionOutput = struct {
     /// Name of the resolution artifact to write (borrows the matched config).
@@ -81,22 +86,26 @@ pub fn resolveExtraction(
     return .{ .resolution_artifact = cfg.resolution_artifact, .bytes = bytes };
 }
 
+pub const ProcessOutcome = struct {
+    result: resolver_lib.RunResult,
+    /// The resolution artifact key the stage acted on; owned by the caller.
+    resolution_key: []u8,
+};
+
 /// Process a changed extraction (asset) artifact key: look up the resolver that
 /// consumes it and run the resolution stage to idempotently (re)persist the
 /// resolution artifact through `store`. Returns null when `changed_key` is not
 /// an asset artifact or no configured resolver consumes it. `provider` supplies
-/// blocking candidates (null = deterministic minting only).
-///
-/// The db worker supplies a `store` backed by the shard primary store and,
-/// based on the `RunResult`, journals the resolution artifact key via a
-/// `DerivedBatch` so downstream stages (graph materializer) wake.
+/// blocking candidates (null = deterministic minting only). The returned
+/// `resolution_key` is owned by the caller, which journals it (on written /
+/// cleared) via a `DerivedBatch` so downstream stages (graph materializer) wake.
 pub fn processChangedExtraction(
     gpa: std.mem.Allocator,
     resolvers: []const ResolverConfig,
     store: resolver_lib.ArtifactStore,
     provider: ?resolver_lib.CandidateProvider,
     changed_key: []const u8,
-) !?resolver_lib.RunResult {
+) !?ProcessOutcome {
     const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(gpa, changed_key)) orelse return null;
     defer gpa.free(parsed.doc_key);
     defer gpa.free(parsed.artifact_name);
@@ -113,10 +122,42 @@ pub fn processChangedExtraction(
     defer resolver.deinit();
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, parsed.doc_key, cfg.resolution_artifact);
-    defer gpa.free(resolution_key);
+    errdefer gpa.free(resolution_key);
 
     const stage = resolver_lib.ResolutionStage{ .resolver = &resolver, .config_generation = cfg.config_generation };
-    return try stage.run(gpa, store, provider, changed_key, resolution_key);
+    const result = try stage.run(gpa, store, provider, changed_key, resolution_key);
+    return .{ .result = result, .resolution_key = resolution_key };
+}
+
+/// Process every changed artifact key in a replay record: resolve each
+/// extraction artifact and journal the resolution keys that actually changed
+/// (written/cleared) in a single `DerivedBatch`, so downstream stages wake.
+pub fn processRecordKeys(
+    gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
+    store: resolver_lib.ArtifactStore,
+    provider: ?resolver_lib.CandidateProvider,
+    changed_artifact_keys: []const []const u8,
+    write_ctx: *anyopaque,
+    write_fn: DerivedRecordWriter,
+) !void {
+    var journal_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (journal_keys.items) |k| gpa.free(@constCast(k));
+        journal_keys.deinit(gpa);
+    }
+
+    for (changed_artifact_keys) |key| {
+        const outcome = (try processChangedExtraction(gpa, resolvers, store, provider, key)) orelse continue;
+        switch (outcome.result) {
+            .written, .cleared => try journal_keys.append(gpa, outcome.resolution_key),
+            else => gpa.free(outcome.resolution_key),
+        }
+    }
+
+    if (journal_keys.items.len > 0) {
+        _ = try write_fn(write_ctx, .{ .changed_artifact_keys = journal_keys.items });
+    }
 }
 
 const testing = std.testing;
@@ -270,14 +311,17 @@ test "processChangedExtraction resolves and persists the resolution artifact" {
     defer alloc.free(extraction_key);
     try map.store().put(extraction_key, test_extraction);
 
-    const result = (try processChangedExtraction(alloc, &resolvers, map.store(), null, extraction_key)).?;
-    try testing.expectEqual(resolver_lib.RunResult.written, result);
-
+    {
+        const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, extraction_key)).?;
+        defer alloc.free(outcome.resolution_key);
+        try testing.expectEqual(resolver_lib.RunResult.written, outcome.result);
+    }
     // Replay is idempotent.
-    try testing.expectEqual(
-        resolver_lib.RunResult.unchanged,
-        (try processChangedExtraction(alloc, &resolvers, map.store(), null, extraction_key)).?,
-    );
+    {
+        const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, extraction_key)).?;
+        defer alloc.free(outcome.resolution_key);
+        try testing.expectEqual(resolver_lib.RunResult.unchanged, outcome.result);
+    }
 
     // The resolution artifact landed at the expected key with the resolved entities.
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a1", "resolution_v1");
@@ -413,14 +457,76 @@ test "processChangedExtraction runs over a DbArtifactStore" {
     defer alloc.free(extraction_key);
     try store.put(extraction_key, test_extraction);
 
-    try testing.expectEqual(
-        resolver_lib.RunResult.written,
-        (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key)).?,
-    );
+    {
+        const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key)).?;
+        defer alloc.free(outcome.resolution_key);
+        try testing.expectEqual(resolver_lib.RunResult.written, outcome.result);
+    }
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:z", "resolution_v1");
     defer alloc.free(resolution_key);
     const stored = (try store.get(alloc, resolution_key)).?;
     defer alloc.free(stored);
     try testing.expect(std.mem.indexOf(u8, stored, "ada_lovelace") != null);
+}
+
+/// Capturing DerivedRecordWriter for tests.
+const CaptureWriter = struct {
+    alloc: std.mem.Allocator,
+    keys: std.ArrayListUnmanaged([]u8) = .empty,
+    calls: u64 = 0,
+
+    fn deinit(self: *CaptureWriter) void {
+        for (self.keys.items) |k| self.alloc.free(k);
+        self.keys.deinit(self.alloc);
+    }
+
+    fn writeFn(ptr: *anyopaque, batch: derived_types.DerivedBatch) anyerror!u64 {
+        const self: *CaptureWriter = @ptrCast(@alignCast(ptr));
+        for (batch.changed_artifact_keys) |k| {
+            try self.keys.append(self.alloc, try self.alloc.dupe(u8, k));
+        }
+        self.calls += 1;
+        return self.calls;
+    }
+};
+
+test "processRecordKeys resolves changed asset keys and journals resolution keys" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ slug _entity.text }}",
+        .config_generation = 1,
+    }};
+
+    var fake = FakeStore{ .alloc = alloc };
+    defer fake.deinit();
+    var das = DbArtifactStore(FakeStore){ .store = &fake };
+    const store = das.artifactStore();
+
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:r", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key, test_extraction);
+
+    var writer = CaptureWriter{ .alloc = alloc };
+    defer writer.deinit();
+
+    // A record carrying the extraction key plus a non-asset key (ignored).
+    const changed = [_][]const u8{ extraction_key, "not-an-artifact" };
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:r", "resolution_v1");
+    defer alloc.free(resolution_key);
+    try testing.expectEqual(@as(usize, 1), writer.keys.items.len);
+    try testing.expectEqualSlices(u8, resolution_key, writer.keys.items[0]);
+    try testing.expectEqual(@as(u64, 1), writer.calls);
+
+    // Idempotent replay: recomputed bytes match, so nothing is journaled.
+    writer.calls = 0;
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn);
+    try testing.expectEqual(@as(usize, 1), writer.keys.items.len);
+    try testing.expectEqual(@as(u64, 0), writer.calls);
 }
