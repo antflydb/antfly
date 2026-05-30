@@ -226,134 +226,162 @@ pub fn catchUpWindow(
     return ctx.max_seen;
 }
 
+const RuntimeStoreHandle = struct {
+    store: backend_erased.Store,
+    owned: bool,
+
+    fn deinit(self: *RuntimeStoreHandle) void {
+        if (self.owned) self.store.deinit();
+    }
+};
+
+fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
+    const T = @TypeOf(store);
+    if (T == backend_erased.Store) return .{ .store = store, .owned = false };
+    if (T == *backend_erased.Store) return .{ .store = store.*, .owned = false };
+    switch (@typeInfo(T)) {
+        .pointer => |ptr| {
+            if (@hasDecl(ptr.child, "backendStore")) {
+                return .{ .store = try backend_erased.storeFrom(alloc, store.backendStore()), .owned = true };
+            }
+        },
+        else => {
+            if (@hasDecl(T, "backendStore")) {
+                return .{ .store = try backend_erased.storeFrom(alloc, store.backendStore()), .owned = true };
+            }
+        },
+    }
+    return .{ .store = try backend_erased.storeFrom(alloc, store), .owned = true };
+}
+
 /// Managed worker that catches the resolution stage up on changed extraction
-/// artifacts. Generic over the shard store type (binds the erased store in
-/// production, a fake in tests). Mirrors `EnrichmentRuntime`'s lifecycle: a
-/// background loop on the `backend_runtime` io that drains applied -> target.
-/// Crash recovery is ordinary replay -- `applied_sequence` is persisted only
-/// after a window's resolution writes are durable, and the stage is idempotent.
-pub fn ResolutionRuntime(comptime Store: type) type {
-    return struct {
+/// artifacts. Mirrors `EnrichmentRuntime`'s lifecycle: it wraps the shard store
+/// into the erased store and runs a background loop on the `backend_runtime` io
+/// that drains applied -> target. Crash recovery is ordinary replay --
+/// `applied_sequence` is persisted only after a window's resolution writes are
+/// durable, and the stage is idempotent.
+pub const ResolutionRuntime = struct {
+    alloc: Allocator,
+    store_handle: RuntimeStoreHandle,
+    replay_source: replay_source_mod.Source,
+    index_manager: *index_manager_mod.IndexManager,
+    write_ctx: *anyopaque,
+    write_fn: DerivedRecordWriter,
+    io_impl: ?*background_runtime_mod.IoImpl,
+    applied_sequence: u64,
+    target_sequence: std.atomic.Value(u64),
+    shutdown_flag: std.atomic.Value(bool),
+    future: ?Io.Future(void),
+
+    const scope_name = "resolution";
+
+    pub fn init(
         alloc: Allocator,
-        store: *Store,
+        store: anytype,
         replay_source: replay_source_mod.Source,
         index_manager: *index_manager_mod.IndexManager,
         write_ctx: *anyopaque,
         write_fn: DerivedRecordWriter,
-        io_impl: ?*background_runtime_mod.IoImpl,
-        applied_sequence: u64,
-        target_sequence: std.atomic.Value(u64),
-        shutdown_flag: std.atomic.Value(bool),
-        future: ?Io.Future(void),
+        backend_runtime: *background_runtime_mod.BackendRuntime,
+    ) !ResolutionRuntime {
+        var store_handle = try initRuntimeStore(alloc, store);
+        errdefer store_handle.deinit();
+        const applied = try enrichment_state.loadAppliedSequence(alloc, store_handle.store, scope_name);
+        return .{
+            .alloc = alloc,
+            .store_handle = store_handle,
+            .replay_source = replay_source,
+            .index_manager = index_manager,
+            .write_ctx = write_ctx,
+            .write_fn = write_fn,
+            .io_impl = backend_runtime.io_impl,
+            .applied_sequence = applied,
+            .target_sequence = .init(applied),
+            .shutdown_flag = .init(false),
+            .future = null,
+        };
+    }
 
-        const Self = @This();
-        const scope_name = "resolution";
+    pub fn deinit(self: *ResolutionRuntime) void {
+        self.stop();
+        self.store_handle.deinit();
+        self.* = undefined;
+    }
 
-        pub fn init(
-            alloc: Allocator,
-            store: *Store,
-            replay_source: replay_source_mod.Source,
-            index_manager: *index_manager_mod.IndexManager,
-            write_ctx: *anyopaque,
-            write_fn: DerivedRecordWriter,
-            backend_runtime: *background_runtime_mod.BackendRuntime,
-        ) !Self {
-            const applied = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
-            return .{
-                .alloc = alloc,
-                .store = store,
-                .replay_source = replay_source,
-                .index_manager = index_manager,
-                .write_ctx = write_ctx,
-                .write_fn = write_fn,
-                .io_impl = backend_runtime.io_impl,
-                .applied_sequence = applied,
-                .target_sequence = .init(applied),
-                .shutdown_flag = .init(false),
-                .future = null,
-            };
+    /// Raise the catch-up target; the worker loop drains toward it.
+    pub fn notifySequence(self: *ResolutionRuntime, sequence: u64) void {
+        var cur = self.target_sequence.load(.monotonic);
+        while (sequence > cur) {
+            cur = self.target_sequence.cmpxchgWeak(cur, sequence, .monotonic, .monotonic) orelse break;
         }
+    }
 
-        pub fn deinit(self: *Self) void {
-            self.stop();
-            self.* = undefined;
-        }
+    pub fn start(self: *ResolutionRuntime) !void {
+        const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
+        self.future = try io_impl.io().concurrent(workerMain, .{self});
+    }
 
-        /// Raise the catch-up target; the worker loop drains toward it.
-        pub fn notifySequence(self: *Self, sequence: u64) void {
-            var cur = self.target_sequence.load(.monotonic);
-            while (sequence > cur) {
-                cur = self.target_sequence.cmpxchgWeak(cur, sequence, .monotonic, .monotonic) orelse break;
+    pub fn stop(self: *ResolutionRuntime) void {
+        self.shutdown_flag.store(true, .release);
+        if (self.future) |*future| {
+            if (self.io_impl) |io_impl| {
+                _ = future.await(io_impl.io());
             }
+            self.future = null;
+        }
+    }
+
+    /// One catch-up pass: drain applied -> target. Idempotent and safe to retry
+    /// (the stage skips unchanged resolutions).
+    pub fn catchUp(self: *ResolutionRuntime) !void {
+        const target = self.target_sequence.load(.acquire);
+        if (self.applied_sequence >= target) return;
+
+        const resolvers = try self.index_manager.listResolvers(self.alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(self.alloc);
+            self.alloc.free(resolvers);
+        }
+        if (resolvers.len == 0) {
+            // No resolver configured; advance so the hint does not rescan.
+            try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
+            self.applied_sequence = target;
+            return;
         }
 
-        pub fn start(self: *Self) !void {
-            const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
-            self.future = try io_impl.io().concurrent(workerMain, .{self});
+        var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
+        const max_seen = try catchUpWindow(
+            self.alloc,
+            self.replay_source,
+            resolvers,
+            das.artifactStore(),
+            null,
+            self.applied_sequence + 1,
+            default_max_records_per_window,
+            self.write_ctx,
+            self.write_fn,
+        );
+        if (max_seen > self.applied_sequence) {
+            try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, max_seen);
+            self.applied_sequence = max_seen;
         }
+    }
 
-        pub fn stop(self: *Self) void {
-            self.shutdown_flag.store(true, .release);
-            if (self.future) |*future| {
-                if (self.io_impl) |io_impl| {
-                    _ = future.await(io_impl.io());
-                }
-                self.future = null;
-            }
-        }
-
-        /// One catch-up pass: drain applied -> target. Idempotent and safe to
-        /// retry (the stage skips unchanged resolutions).
-        pub fn catchUp(self: *Self) !void {
-            const target = self.target_sequence.load(.acquire);
-            if (self.applied_sequence >= target) return;
-
-            const resolvers = try self.index_manager.listResolvers(self.alloc);
-            defer {
-                for (resolvers) |*cfg| cfg.deinit(self.alloc);
-                self.alloc.free(resolvers);
-            }
-            if (resolvers.len == 0) {
-                // No resolver configured; advance so the hint does not rescan.
-                try enrichment_state.saveAppliedSequence(self.store, scope_name, target);
-                self.applied_sequence = target;
-                return;
-            }
-
-            var das = DbArtifactStore(Store){ .store = self.store };
-            const max_seen = try catchUpWindow(
-                self.alloc,
-                self.replay_source,
-                resolvers,
-                das.artifactStore(),
-                null,
-                self.applied_sequence + 1,
-                default_max_records_per_window,
-                self.write_ctx,
-                self.write_fn,
-            );
-            if (max_seen > self.applied_sequence) {
-                try enrichment_state.saveAppliedSequence(self.store, scope_name, max_seen);
-                self.applied_sequence = max_seen;
-            }
-        }
-
-        fn workerMain(self: *Self) void {
-            const io = (self.io_impl orelse return).io();
-            while (!self.shutdown_flag.load(.acquire)) {
-                if (self.applied_sequence < self.target_sequence.load(.acquire)) {
-                    self.catchUp() catch |err| {
-                        std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
-                        io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
-                    };
-                } else {
+    fn workerMain(self: *ResolutionRuntime) void {
+        const io = (self.io_impl orelse return).io();
+        while (!self.shutdown_flag.load(.acquire)) {
+            if (self.applied_sequence < self.target_sequence.load(.acquire)) {
+                self.catchUp() catch |err| {
+                    std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
                     io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
-                }
+                };
+            } else {
+                io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
             }
-            self.catchUp() catch {};
         }
-    };
-}
+        self.catchUp() catch {};
+    }
+};
 
 const testing = std.testing;
 
@@ -847,6 +875,6 @@ test "catchUpWindow with no matching records returns from-1" {
     try testing.expectEqual(@as(u64, 0), writer.calls);
 }
 
-test "ResolutionRuntime over the erased store compiles" {
-    testing.refAllDecls(ResolutionRuntime(backend_erased.Store));
+test "ResolutionRuntime compiles end-to-end" {
+    testing.refAllDecls(ResolutionRuntime);
 }
