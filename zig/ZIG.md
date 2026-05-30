@@ -1,5 +1,83 @@
 # Zig Notes
 
+## 2026-05-30: Zig 0.17.0 nightly bring-up (build-system split + `**` removal)
+
+Tracking the 0.17.0 pre-release announced in the
+[2026-05-26 devlog](https://ziglang.org/devlog/2026/#2026-05-26). 0.17.0 is not
+released yet; this is against the official nightly `0.17.0-dev.607+456b2ec07`.
+
+### Installing the nightly via pip
+
+The official `ziglang` PyPI package only publishes stable releases (max `0.16.0`),
+so `pip install ziglang` cannot get a 0.17 dev build. The canonical "pip install
+nightly" path is the [zig-pypi](https://github.com/ziglang/zig-pypi)
+`make_wheels.py`, which repackages any `ziglang.org/builds` tarball as a wheel:
+
+```sh
+git clone --depth 1 https://github.com/ziglang/zig-pypi.git
+cd zig-pypi
+# One-time patch: the nightly archive ships lib/libtsan/LICENSE.TXT, which the
+# builder's strict license allowlist rejects. Add it to required_license_paths.
+uv run --with wheel python make_wheels.py --version master --platform x86_64-linux --outdir dist
+pip install --force-reinstall dist/ziglang-0.17.0.dev*.whl
+python3 -m ziglang version   # -> 0.17.0-dev.607+456b2ec07
+```
+
+The wheel exposes the compiler as `python3 -m ziglang`; wrap it in a `zig` shim on
+PATH for the Makefile (`ZIG ?= zig`).
+
+### What the devlog change requires (build-system split — DONE)
+
+The devlog's headline change is the configurer/maker split. The user-visible API
+break is that `b.args` is gone (the build graph can no longer observe the post-`--`
+passthru args at configure time). Migrations applied across all `build.zig` /
+build-helper files:
+
+- `if (b.args) |a| run.addArgs(a);`  → `run.addPassthruArgs();`
+- `if (b.args) |a| run.addArgs(a) else run.addArgs(&defaults);`
+  → `run.addArgs(&defaults); run.addPassthruArgs();`
+  (defaults are now *always* added and user args are appended after; for the
+  last-wins flag parsers in our benches this preserves override intent, but it is a
+  behavioral change — defaults are no longer suppressed when args are passed.)
+- `forwardBuildArgs` lost its now-unused `*std.Build` parameter.
+- `b.getInstallPath(.prefix, "…")` was removed →
+  `run.addFileArg(b.graph.path(.install_prefix, "…"))` (a cache-correct LazyPath).
+- `selectTestFilters` read `b.args` at configure time to set compile-time test
+  `.filters`. That capability is gone; it now reads a repeatable `-Dtest-filter=…`
+  option. The option must be declared exactly once (`b.option` panics on a second
+  declaration), so the top-level `build.zig` declares it up front and threads the
+  resolved value into the (now pure) helper.
+
+After these edits both `zig build --help` (top-level) and the delegated
+`pkg/inference` build configure cleanly under the nightly. **These build files now
+require Zig 0.17+ and will not compile under 0.16** (no `addPassthruArgs`,
+`b.graph.path`, etc.), so CI cannot be flipped to nightly until the items below are
+resolved.
+
+### What blocks actually compiling the codebase (NOT in the devlog)
+
+This nightly **also removed the `**` array/string repeat operator** (undocumented
+in the devlog as of 2026-05-30). The tokenizer no longer has an `asterisk_asterisk`
+token, so:
+
+- `"ab" ** 3` → error: *binary operator '*' has whitespace on one side, but not the
+  other* (the new symmetric-whitespace lint, since `**` is now two `*` tokens).
+- `"ab"**3` → parses as `"ab" * *3` (multiply by a pointer type) → type error.
+
+`std` itself contains zero real `**` uses (already migrated), confirming this is
+deliberate. Replacements:
+
+- `++` (concat) is unchanged.
+- Scalar fill `[_]u8{0} ** 16` → `@splat(0)` **with an explicit result type**
+  (`const a: [16]u8 = @splat(0);`) — the bare `[_]…` length-inferred form has no
+  result type for `@splat` to use, so each site needs a type annotation.
+- Sequence repeat like `"0123456789" ** 32` has no one-liner replacement (needs a
+  comptime loop / generated constant).
+
+Scope in this repo: ~1,646 real `**` repeat sites across ~124 files. This is a
+large, semantically-sensitive migration unrelated to the build-system article, and
+is the gating blocker for a green `zig build` on nightly. Not attempted here.
+
 ## 2026-04-20: freestanding wasm stdlib breakage in Zig 0.16
 
 This repo's embedded Antfly inference wasm build currently targets `wasm32-freestanding`.
