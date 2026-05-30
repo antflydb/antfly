@@ -454,6 +454,8 @@ const AntflyRootImports = struct {
     bloom: *std.Build.Module,
     vector: *std.Build.Module,
     vectorindex: *std.Build.Module,
+    matcher: *std.Build.Module,
+    resolver: *std.Build.Module,
     casbin: *std.Build.Module,
     vellum: *std.Build.Module,
     regex: *std.Build.Module,
@@ -515,6 +517,8 @@ const AntflyRootImports = struct {
         .{ .name = "bloom", .field = "bloom" },
         .{ .name = "antfly_vector", .field = "vector" },
         .{ .name = "antfly_vectorindex", .field = "vectorindex" },
+        .{ .name = "antfly_matcher", .field = "matcher" },
+        .{ .name = "antfly_resolver", .field = "resolver" },
         .{ .name = "antfly_casbin", .field = "casbin" },
         .{ .name = "antfly_vellum", .field = "vellum" },
         .{ .name = "antfly_regex", .field = "regex" },
@@ -1636,6 +1640,8 @@ pub fn build(b: *std.Build) void {
         .bloom = bloom_mod,
         .vector = vector_mod,
         .vectorindex = vectorindex_mod,
+        .matcher = matcher_mod,
+        .resolver = resolver_mod,
         .casbin = casbin_mod,
         .vellum = vellum_mod,
         .regex = regex_mod,
@@ -4170,6 +4176,8 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_vellum", vellum_mod);
     index_manager_test_mod.addImport("antfly_vector", vector_mod);
     index_manager_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    index_manager_test_mod.addImport("antfly_matcher", matcher_mod);
+    index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     const index_manager_unit_tests = b.addTest(.{
@@ -4229,6 +4237,8 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("antfly_vellum", vellum_mod);
     db_test_mod.addImport("antfly_vector", vector_mod);
     db_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    db_test_mod.addImport("antfly_matcher", matcher_mod);
+    db_test_mod.addImport("antfly_resolver", resolver_mod);
     db_test_mod.addImport("antfly_chunking", chunking_mod);
     db_test_mod.addImport("antfly_regex", regex_mod);
     db_test_mod.addImport("raft_engine", raft_engine_mod);

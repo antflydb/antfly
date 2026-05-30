@@ -31,6 +31,7 @@ const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
 const shard_mod = @import("../shard.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
+pub const resolution_runtime = @import("resolution_runtime.zig");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
 const types = @import("types.zig");

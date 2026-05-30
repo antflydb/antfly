@@ -161,6 +161,37 @@ pub const Resolver = struct {
         };
     }
 
+    /// Build a resolver directly from its parts (the durable catalog config),
+    /// parsing `scorer_json` if present. An empty `scorer_json` means a purely
+    /// deterministic resolver that mints canonical keys from `key_template`.
+    pub fn initFromParts(
+        gpa: std.mem.Allocator,
+        table: []const u8,
+        key_template: []const u8,
+        type_must_match: bool,
+        scorer_json: []const u8,
+    ) !Resolver {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const owned_table = try a.dupe(u8, table);
+        const owned_template = try a.dupe(u8, key_template);
+
+        var scorer: ?matcher.Scorer = null;
+        errdefer if (scorer) |*s| s.deinit();
+        if (scorer_json.len > 0) {
+            scorer = try matcher.Scorer.parse(gpa, scorer_json);
+        }
+
+        return .{
+            .arena = arena,
+            .table = owned_table,
+            .key_template = owned_template,
+            .type_must_match = type_must_match,
+            .scorer = scorer,
+        };
+    }
+
     pub fn deinit(self: *Resolver) void {
         if (self.scorer) |*s| s.deinit();
         self.arena.deinit();
@@ -578,6 +609,31 @@ pub const ResolutionStage = struct {
 // --- Tests ------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "initFromParts builds a deterministic resolver and one with a scorer" {
+    var deterministic = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", true, "");
+    defer deterministic.deinit();
+    try testing.expectEqualStrings("entities", deterministic.table);
+    try testing.expect(deterministic.scorer == null);
+
+    var scored = try Resolver.initFromParts(
+        testing.allocator,
+        "entities",
+        "{{ slug _entity.text }}",
+        false,
+        \\{ "comparisons": [ { "name": "n", "left": "canonical_text", "right": "canonical_name",
+        \\  "levels": [ { "when": "exact", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+    );
+    defer scored.deinit();
+    try testing.expect(!scored.type_must_match);
+    try testing.expect(scored.scorer != null);
+
+    const entities = [_]ExtractedEntity{.{ .local_id = "e0", .label = "person", .text = "Ada Lovelace" }};
+    var res = try scored.resolve(testing.allocator, 1, &entities, &[_][]const Candidate{});
+    defer res.deinit();
+    try testing.expectEqualStrings("ada_lovelace", res.entities[0].doc_ref.key);
+}
 
 test "deterministic resolver mints a canonical key for each entity" {
     var resolver = try Resolver.parse(testing.allocator,
