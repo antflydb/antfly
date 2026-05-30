@@ -141,7 +141,7 @@ pub const RegexAutomaton = struct {
     }
 
     fn epsilonClosure(self: *const RegexAutomaton, initial: StateBitSet) StateBitSet {
-        var result = StateBitSet.initEmpty();
+        var result = StateBitSet.empty;
         var it = initial.iterator(.{});
         while (it.next()) |idx| {
             result.setUnion(self.epsilon_closures[idx]);
@@ -150,7 +150,7 @@ pub const RegexAutomaton = struct {
     }
 
     fn stepNFA(self: *const RegexAutomaton, state_set: StateBitSet, b: u8) StateBitSet {
-        var next = StateBitSet.initEmpty();
+        var next = StateBitSet.empty;
         var it = state_set.iterator(.{});
         while (it.next()) |idx| {
             const s = self.states[idx];
@@ -196,7 +196,7 @@ pub const RegexAutomaton = struct {
         // Build start state from epsilon closure of NFA start
         if (self.dfa_cache_keys.items.len > 0) return 0;
 
-        var initial = StateBitSet.initEmpty();
+        var initial = StateBitSet.empty;
         initial.set(self.start_state);
         const start_set = self.epsilonClosure(initial);
         _ = self.lookupOrInsert(start_set) catch return dead_state;
@@ -355,7 +355,7 @@ fn precomputeEpsilonClosures(alloc: Allocator, states: []const NFAState) ![]Stat
 }
 
 fn computeSingleStateEpsilonClosure(states: []const NFAState, start_idx: usize) StateBitSet {
-    var closure = StateBitSet.initEmpty();
+    var closure = StateBitSet.empty;
     var stack: [max_nfa_states]u16 = undefined;
     var stack_len: usize = 0;
 
