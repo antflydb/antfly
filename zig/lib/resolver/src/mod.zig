@@ -396,6 +396,185 @@ fn writeJsonString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8
     try out.append(allocator, '"');
 }
 
+// --- Extraction parsing -----------------------------------------------------
+
+/// Parsed entities from an extraction artifact, owning their backing memory.
+pub const ParsedEntities = struct {
+    arena: std.heap.ArenaAllocator,
+    entities: []const ExtractedEntity,
+
+    pub fn deinit(self: *ParsedEntities) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Parse the `entities` array of an extraction artifact (the shape produced by
+/// the extractor and documented in RESOLUTION.md / GRAPH.md). Relations are not
+/// needed here -- they are consumed by the graph materializer, which reads the
+/// extraction artifact plus this resolver's resolution artifact.
+pub fn parseExtractionEntities(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedEntities {
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json_bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidExtraction;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    const entities_v = parsed.value.object.get("entities") orelse return error.InvalidExtraction;
+    if (entities_v != .array) return error.InvalidExtraction;
+
+    const out = try a.alloc(ExtractedEntity, entities_v.array.items.len);
+    for (entities_v.array.items, 0..) |ev, i| {
+        if (ev != .object) return error.InvalidExtraction;
+        const o = ev.object;
+        out[i] = .{
+            .local_id = try a.dupe(u8, jsonString(o.get("id") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
+            .label = try a.dupe(u8, jsonString(o.get("label") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
+            .text = try a.dupe(u8, jsonString(o.get("text") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
+        };
+    }
+    return .{ .arena = arena, .entities = out };
+}
+
+// --- Resolution replay stage ------------------------------------------------
+
+/// Storage seam for the resolution stage. The DB adapter implements this over
+/// the shard's primary store (artifact get/put/delete); tests use an in-memory
+/// map. Kept as a vtable so the stage logic stays pure and unit-testable.
+pub const ArtifactStore = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Returns owned bytes (caller frees with the passed allocator) or null.
+        get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?[]u8,
+        put: *const fn (ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
+        delete: *const fn (ptr: *anyopaque, key: []const u8) anyerror!void,
+    };
+
+    pub fn get(self: ArtifactStore, allocator: std.mem.Allocator, key: []const u8) anyerror!?[]u8 {
+        return self.vtable.get(self.ptr, allocator, key);
+    }
+    pub fn put(self: ArtifactStore, key: []const u8, value: []const u8) anyerror!void {
+        return self.vtable.put(self.ptr, key, value);
+    }
+    pub fn delete(self: ArtifactStore, key: []const u8) anyerror!void {
+        return self.vtable.delete(self.ptr, key);
+    }
+};
+
+/// Blocking seam: fetch the ~k candidate entities to score a mention against.
+/// The DB adapter implements this over the entity table's indexes
+/// (ann/exact/prefix); a null provider means deterministic minting only.
+pub const CandidateProvider = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Append candidates for `entity` into `out`, allocating any candidate
+        /// memory with `allocator` (valid until the stage finishes one mention).
+        candidates_for: *const fn (
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            entity: ExtractedEntity,
+            out: *std.ArrayListUnmanaged(Candidate),
+        ) anyerror!void,
+    };
+
+    pub fn candidatesFor(
+        self: CandidateProvider,
+        allocator: std.mem.Allocator,
+        entity: ExtractedEntity,
+        out: *std.ArrayListUnmanaged(Candidate),
+    ) anyerror!void {
+        return self.vtable.candidates_for(self.ptr, allocator, entity, out);
+    }
+};
+
+pub const RunResult = enum {
+    /// Resolution artifact was (re)written.
+    written,
+    /// Recomputed bytes matched the stored artifact; nothing written (the
+    /// enrichment-style skip that keeps replay idempotent and cheap).
+    unchanged,
+    /// Source extraction artifact is gone; the stale resolution artifact was
+    /// deleted.
+    cleared,
+    /// Source extraction artifact is gone and there was nothing to clear.
+    source_missing,
+};
+
+/// One resolution replay stage: read a changed extraction artifact, resolve its
+/// mentions, and persist the resolution artifact idempotently. This is the body
+/// the managed worker runs per changed extraction artifact key.
+///
+/// In the DB, the adapter wraps `run` in a `background_runtime.Job`
+/// (class `.maintenance`, keyed by the shard's owner id) and submits it on the
+/// shard's `BackendRuntime.durable_jobs` lane; crash recovery is the normal
+/// replay path (the change journal re-emits the extraction artifact key).
+pub const ResolutionStage = struct {
+    resolver: *const Resolver,
+    config_generation: u64,
+
+    /// `extraction_key` / `resolution_key` are the primary-store artifact keys
+    /// (encoded by the DB adapter). Returns what happened, for status/metrics.
+    pub fn run(
+        self: ResolutionStage,
+        gpa: std.mem.Allocator,
+        store: ArtifactStore,
+        provider: ?CandidateProvider,
+        extraction_key: []const u8,
+        resolution_key: []const u8,
+    ) !RunResult {
+        const extraction = try store.get(gpa, extraction_key);
+        defer if (extraction) |e| gpa.free(e);
+
+        if (extraction == null) {
+            const existing = try store.get(gpa, resolution_key);
+            defer if (existing) |e| gpa.free(e);
+            if (existing != null) {
+                try store.delete(resolution_key);
+                return .cleared;
+            }
+            return .source_missing;
+        }
+
+        var parsed = try parseExtractionEntities(gpa, extraction.?);
+        defer parsed.deinit();
+
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+
+        const lists = try a.alloc([]const Candidate, parsed.entities.len);
+        if (provider) |p| {
+            for (parsed.entities, 0..) |entity, i| {
+                var candidates = std.ArrayListUnmanaged(Candidate).empty;
+                try p.candidatesFor(a, entity, &candidates);
+                lists[i] = candidates.items;
+            }
+        } else {
+            for (lists) |*l| l.* = &.{};
+        }
+
+        var resolution = try self.resolver.resolve(gpa, self.config_generation, parsed.entities, lists);
+        defer resolution.deinit();
+
+        const bytes = try resolution.toJson(gpa);
+        defer gpa.free(bytes);
+
+        const existing = try store.get(gpa, resolution_key);
+        defer if (existing) |e| gpa.free(e);
+        if (existing) |e| {
+            if (std.mem.eql(u8, e, bytes)) return .unchanged;
+        }
+        try store.put(resolution_key, bytes);
+        return .written;
+    }
+};
+
 // --- Tests ------------------------------------------------------------------
 
 const testing = std.testing;
@@ -520,4 +699,181 @@ test "unknown template variables and helpers fail closed" {
     defer resolver.deinit();
     const entities = [_]ExtractedEntity{.{ .local_id = "e0", .label = "Person", .text = "Ada" }};
     try testing.expectError(error.InvalidTemplate, resolver.resolve(testing.allocator, 1, &entities, &[_][]const Candidate{}));
+}
+
+const extraction_json =
+    \\{ "entities": [
+    \\    { "id": "e0", "label": "person", "text": "Ada Lovelace", "spans": [{ "start": 0, "end": 12 }] },
+    \\    { "id": "e1", "label": "org", "text": "Antfly" }
+    \\  ],
+    \\  "relations": [ { "type": "works_at", "source": { "entity_id": "e0" }, "target": { "entity_id": "e1" } } ]
+    \\}
+;
+
+test "parseExtractionEntities reads the documented extraction shape" {
+    var parsed = try parseExtractionEntities(testing.allocator, extraction_json);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.entities.len);
+    try testing.expectEqualStrings("e0", parsed.entities[0].local_id);
+    try testing.expectEqualStrings("person", parsed.entities[0].label);
+    try testing.expectEqualStrings("Ada Lovelace", parsed.entities[0].text);
+    try testing.expectEqualStrings("Antfly", parsed.entities[1].text);
+}
+
+/// Minimal in-memory ArtifactStore for tests.
+const MapStore = struct {
+    alloc: std.mem.Allocator,
+    map: std.StringHashMapUnmanaged([]u8) = .empty,
+
+    fn deinit(self: *MapStore) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            self.alloc.free(e.key_ptr.*);
+            self.alloc.free(e.value_ptr.*);
+        }
+        self.map.deinit(self.alloc);
+    }
+
+    fn store(self: *MapStore) ArtifactStore {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = ArtifactStore.VTable{ .get = get, .put = put, .delete = delete };
+
+    fn get(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?[]u8 {
+        const self: *MapStore = @ptrCast(@alignCast(ptr));
+        const v = self.map.get(key) orelse return null;
+        return try allocator.dupe(u8, v);
+    }
+
+    fn put(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+        const self: *MapStore = @ptrCast(@alignCast(ptr));
+        const owned_value = try self.alloc.dupe(u8, value);
+        errdefer self.alloc.free(owned_value);
+        const gop = try self.map.getOrPut(self.alloc, key);
+        if (gop.found_existing) {
+            self.alloc.free(gop.value_ptr.*);
+        } else {
+            gop.key_ptr.* = try self.alloc.dupe(u8, key);
+        }
+        gop.value_ptr.* = owned_value;
+    }
+
+    fn delete(ptr: *anyopaque, key: []const u8) anyerror!void {
+        const self: *MapStore = @ptrCast(@alignCast(ptr));
+        if (self.map.fetchRemove(key)) |kv| {
+            self.alloc.free(kv.key);
+            self.alloc.free(kv.value);
+        }
+    }
+};
+
+test "resolution stage writes, then skips when unchanged" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "entities", "key_template": "{{ lower _entity.label }}/{{ slug _entity.text }}" }
+    );
+    defer resolver.deinit();
+
+    var map = MapStore{ .alloc = testing.allocator };
+    defer map.deinit();
+    try map.store().put("ext:doc1", extraction_json);
+
+    const stage = ResolutionStage{ .resolver = &resolver, .config_generation = 3 };
+
+    try testing.expectEqual(RunResult.written, try stage.run(testing.allocator, map.store(), null, "ext:doc1", "res:doc1"));
+    // Idempotent replay: same input -> no rewrite.
+    try testing.expectEqual(RunResult.unchanged, try stage.run(testing.allocator, map.store(), null, "ext:doc1", "res:doc1"));
+
+    const stored = (try map.store().get(testing.allocator, "res:doc1")).?;
+    defer testing.allocator.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, stored, .{});
+    defer parsed.deinit();
+    const ents = parsed.value.object.get("entities").?.array.items;
+    try testing.expectEqual(@as(usize, 2), ents.len);
+    try testing.expectEqualStrings("person/ada_lovelace", ents[0].object.get("doc_ref").?.object.get("key").?.string);
+    try testing.expectEqualStrings("new", ents[0].object.get("decision").?.string);
+}
+
+test "resolution stage clears the artifact when the source is gone" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "entities", "key_template": "{{ slug _entity.text }}" }
+    );
+    defer resolver.deinit();
+
+    var map = MapStore{ .alloc = testing.allocator };
+    defer map.deinit();
+    try map.store().put("ext:doc1", extraction_json);
+
+    const stage = ResolutionStage{ .resolver = &resolver, .config_generation = 1 };
+    _ = try stage.run(testing.allocator, map.store(), null, "ext:doc1", "res:doc1");
+    try testing.expect(map.map.contains("res:doc1"));
+
+    // Source deleted -> resolution cleared.
+    try map.store().delete("ext:doc1");
+    try testing.expectEqual(RunResult.cleared, try stage.run(testing.allocator, map.store(), null, "ext:doc1", "res:doc1"));
+    try testing.expect(!map.map.contains("res:doc1"));
+    // Nothing left to clear.
+    try testing.expectEqual(RunResult.source_missing, try stage.run(testing.allocator, map.store(), null, "ext:doc1", "res:doc1"));
+}
+
+/// Test candidate provider that offers one fixed entity for a given label.
+const FixedCandidate = struct {
+    doc_ref: DocRef,
+    label: []const u8,
+    name: []const u8,
+
+    fn provider(self: *FixedCandidate) CandidateProvider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = CandidateProvider.VTable{ .candidates_for = candidatesFor };
+
+    fn candidatesFor(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        entity: ExtractedEntity,
+        out: *std.ArrayListUnmanaged(Candidate),
+    ) anyerror!void {
+        const self: *FixedCandidate = @ptrCast(@alignCast(ptr));
+        _ = entity;
+        const fields = try allocator.alloc(matcher.Field, 1);
+        fields[0] = .{ .name = "canonical_name", .value = .{ .text = try allocator.dupe(u8, self.name) } };
+        try out.append(allocator, .{ .doc_ref = self.doc_ref, .label = self.label, .record = .{ .fields = fields } });
+    }
+};
+
+test "resolution stage links to a candidate supplied by the provider" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "entities", "key_template": "{{ slug _entity.text }}",
+        \\  "scorer": {
+        \\    "comparisons": [
+        \\      { "name": "name", "left": "canonical_text", "right": "canonical_name",
+        \\        "levels": [ { "when": "exact", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] }
+        \\    ],
+        \\    "combine": { "bias": -3.0 }, "decision": { "match": 0.9 }
+        \\  } }
+    );
+    defer resolver.deinit();
+
+    var map = MapStore{ .alloc = testing.allocator };
+    defer map.deinit();
+    try map.store().put("ext:doc1",
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+
+    var candidate = FixedCandidate{
+        .doc_ref = .{ .table = "entities", .key = "person/ada_lovelace" },
+        .label = "person",
+        .name = "Ada Lovelace",
+    };
+    const stage = ResolutionStage{ .resolver = &resolver, .config_generation = 1 };
+    try testing.expectEqual(RunResult.written, try stage.run(testing.allocator, map.store(), candidate.provider(), "ext:doc1", "res:doc1"));
+
+    const stored = (try map.store().get(testing.allocator, "res:doc1")).?;
+    defer testing.allocator.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, stored, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 }

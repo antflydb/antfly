@@ -223,6 +223,53 @@ not embedded Lua/Starlark, because it must be:
 
 Generality lives in the comparator + level space, not in arbitrary code.
 
+## Resolution Stage Runtime (backend_runtime)
+
+The resolution stage worker body is implemented in `lib/resolver` as
+`ResolutionStage`, behind two vtable seams so it stays pure and unit-testable:
+
+- `ArtifactStore` -- `get`/`put`/`delete` of artifact bytes by primary-store key.
+- `CandidateProvider` -- append the ~k blocking candidates for a mention (a null
+  provider means deterministic minting only).
+
+`ResolutionStage.run` performs the full worker step: read the changed extraction
+artifact, parse its entities, resolve, serialize, and persist **idempotently** --
+if the recomputed resolution bytes equal the stored artifact it writes nothing
+(`RunResult.unchanged`), and if the source extraction artifact is gone it clears
+the stale resolution artifact (`RunResult.cleared`). This is the same
+read/recompute/skip shape the embedding and graph stages already use, which is
+what keeps replay cheap and crash-safe.
+
+Driving it in the DB (the integration adapter, not yet landed):
+
+1. **TargetHint.** Add `resolution` to `change_journal.zig`'s `TargetHint`
+   (bit 6; the `u3`/`u8` hint mask already has room). In
+   `recordFromDerivedBatch`, emit the `resolution` hint when a changed asset
+   artifact key is an extraction source (today asset-artifact changes emit
+   `.graph`; the resolution stage subscribes to the same keys). Update the hint
+   codec sites: `decodeHintMask`, `decodeHintMaskBorrowed`, the static singleton
+   slices, and `recordMatchesHintMaskFast`'s hint list.
+2. **Worker.** Register a managed worker for the `resolution` hint alongside the
+   existing derived workers (the `applied_sequence -> target_sequence` catch-up
+   in the io-threaded runtime). On each changed extraction artifact key it builds
+   a `ResolutionStage` and calls `run`.
+3. **backend_runtime.** The actual resolve+persist is submitted as a
+   `background_runtime.Job` (class `.maintenance`, owner = the shard's owner id
+   from `BackendRuntime.allocOwnerId`) on the shard's
+   `BackendRuntime.durable_jobs` lane, so it runs off the apply path and is
+   drained on shard handoff via `drainOwner`. The worker advances and checkpoints
+   `applied_sequence` only after the job's durable write completes.
+4. **ArtifactStore adapter.** Implement the `ArtifactStore` vtable over the
+   shard primary store, encoding extraction/resolution artifact keys with
+   `internal_keys` (mirroring the asset-artifact key helpers).
+5. **CandidateProvider adapter.** Implement blocking over the entity table's
+   indexes (`ann`/`exact`/`prefix`), returning `matcher.Record`s whose field
+   names match the scorer's `right` accessors.
+
+No new recovery protocol: a crash before the durable write leaves the extraction
+artifact key replayable; the worker re-runs `ResolutionStage.run`, which is
+idempotent.
+
 ## Promoter
 
 The promoter turns resolution decisions into durable entity state.
@@ -373,10 +420,14 @@ Open/index/enrichment validation should reject:
    - [x] `DocRef {table, key}` type introduced (`lib/resolver`).
    - [x] Deterministic `key_template` resolver core: mint canonical keys, or
          link to a supplied candidate via the scorer (`lib/resolver`).
-   - [ ] Live candidate blocking: fetch candidates from the entity table
+   - [x] Resolution stage worker body: read extraction -> resolve -> idempotent
+         persist (write/unchanged/cleared), behind `ArtifactStore` /
+         `CandidateProvider` seams (`lib/resolver`).
+   - [ ] Wire the `resolution` `TargetHint` + managed worker into the storage
+         runtime, submitting the stage as a `backend_runtime` durable job (DB
+         adapter; see "Resolution Stage Runtime").
+   - [ ] Live candidate blocking adapter: fetch candidates from the entity table
          (`ann`/`exact`/`prefix`) so the resolver runs against real entities.
-   - [ ] `resolution` replay stage: drive the resolver from changed extraction
-         artifacts and persist the resolution artifact.
    - [ ] Promoter: entity upsert via `DocumentTransform`, provenance as mention
          edges, decoupled cross-shard write, fail-closed hydration.
    - [ ] `DocRef` endpoints threaded through graph edge artifacts.
@@ -410,10 +461,19 @@ Resolver core (done, `lib/resolver`):
 - [x] Resolution artifact serializes to / round-trips the documented schema.
 - [x] Unknown template variables/helpers and invalid configs fail closed.
 
+Resolution stage (done, `lib/resolver`):
+
+- [x] Reads an extraction artifact, resolves, and persists the resolution
+      artifact.
+- [x] Idempotent replay: re-running unchanged input writes nothing.
+- [x] Deleted source extraction artifact clears the resolution artifact.
+- [x] Links to a provider-supplied candidate on a MATCH.
+
 Resolver / promoter integration (to come):
 
+- The `resolution` worker advances `applied_sequence` only after the durable
+  job's write; a crash before the write replays the same extraction key.
 - Live candidate blocking returns the right ~k entities from the entity table.
-- Replay re-applies recorded decisions without recomputation.
 - Promoter upsert is idempotent under replay; concurrent promotions union
   aliases.
 - Provenance mention edges appear/disappear with source documents.
