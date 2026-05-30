@@ -59,6 +59,34 @@ pub fn makeRootBuildOptions(
     return options;
 }
 
+/// Provide the `lmdb_pthread` module imported by `pkg/antfly/src/lmdb/env.zig`.
+/// Zig 0.17 removed `@cImport`, so the libc-backed pthread surface comes from an
+/// `addTranslateC` of `pthread_c.h`; freestanding/no-libc builds get the Zig
+/// `pthread_stub.zig` fallback instead.
+pub fn addLmdbPthreadImport(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    link_libc: bool,
+) void {
+    if (link_libc and target.result.os.tag != .freestanding) {
+        const tc = b.addTranslateC(.{
+            .root_source_file = b.path("pkg/antfly/src/lmdb/pthread_c.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        mod.addImport("lmdb_pthread", tc.createModule());
+    } else {
+        mod.addImport("lmdb_pthread", b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/lmdb/pthread_stub.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+    }
+}
+
 pub fn makeLmdbEngineModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -75,7 +103,39 @@ pub fn makeLmdbEngineModule(
     if (link_libc and target.result.os.tag != .freestanding) {
         mod.link_libc = true;
     }
+    addLmdbPthreadImport(b, mod, target, optimize, link_libc);
     return mod;
+}
+
+/// Provide the `lmdb_c_bindings` module imported by
+/// `pkg/antfly/src/storage/lmdb_c_api.zig`. Zig 0.17 removed `@cImport`, so the
+/// C-backend bindings come from an `addTranslateC` of `lmdb.h` (with lib/lmdb on
+/// the include path); the Zig backend and no-libc builds get the hand-written
+/// `lmdb_c_stub.zig` instead.
+pub fn addLmdbCBindingsImport(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    backend: LmdbBackend,
+    link_libc: bool,
+) void {
+    if (backend == .c and link_libc and target.result.os.tag != .freestanding) {
+        const tc = b.addTranslateC(.{
+            .root_source_file = b.path("pkg/antfly/src/storage/lmdb_c.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        tc.addIncludePath(b.path("lib/lmdb"));
+        mod.addImport("lmdb_c_bindings", tc.createModule());
+    } else {
+        mod.addImport("lmdb_c_bindings", b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/storage/lmdb_c_stub.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+    }
 }
 
 pub fn makeLmdbModule(
@@ -86,6 +146,7 @@ pub fn makeLmdbModule(
     build_options: *std.Build.Step.Options,
     lmdb_engine_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
+    backend: LmdbBackend,
 ) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path(root_path),
@@ -101,5 +162,8 @@ pub fn makeLmdbModule(
     });
     mod.addIncludePath(b.path("lib/lmdb"));
     mod.link_libc = true;
+    // These modules always link libc and compile the C LMDB sources, so the
+    // binding selection follows the requested backend (translate-c for `.c`).
+    addLmdbCBindingsImport(b, mod, target, optimize, backend, true);
     return mod;
 }

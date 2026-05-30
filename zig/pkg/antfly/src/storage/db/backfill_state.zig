@@ -126,9 +126,9 @@ fn ensureParentDir(io: std.Io, path: []const u8) !void {
 
 fn renameAbsolutePortable(old_path: []const u8, new_path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const old_path_z = try allocator.dupeZ(u8, old_path);
+    const old_path_z = try allocator.dupeSentinel(u8, old_path, 0);
     defer allocator.free(old_path_z);
-    const new_path_z = try allocator.dupeZ(u8, new_path);
+    const new_path_z = try allocator.dupeSentinel(u8, new_path, 0);
     defer allocator.free(new_path_z);
 
     while (true) {

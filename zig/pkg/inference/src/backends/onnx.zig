@@ -338,7 +338,7 @@ pub fn createSessionWithOptions(
 
     // Ensure the model path is null-terminated for the C API.
     // model_path comes from Zig so may not have a sentinel.
-    const path_z = try allocator.dupeZ(u8, model_path);
+    const path_z = try allocator.dupeSentinel(u8, model_path, 0);
     defer allocator.free(path_z);
 
     // Create session from model file

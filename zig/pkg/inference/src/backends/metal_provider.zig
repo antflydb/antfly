@@ -2138,7 +2138,7 @@ pub const MetalProvider = if (build_options.enable_mlx) struct {
         const vec = c.mlx_vector_string_new();
         errdefer _ = c.mlx_vector_string_free(vec);
         for (values) |value| {
-            const value_z = try std.heap.c_allocator.dupeZ(u8, value);
+            const value_z = try std.heap.c_allocator.dupeSentinel(u8, value, 0);
             defer std.heap.c_allocator.free(value_z);
             try mlx.check(c.mlx_vector_string_append_value(vec, value_z.ptr));
         }
@@ -2155,11 +2155,11 @@ pub const MetalProvider = if (build_options.enable_mlx) struct {
         defer _ = c.mlx_vector_string_free(inputs);
         const outputs = try makeStringVector(outputs_layout);
         defer _ = c.mlx_vector_string_free(outputs);
-        const name_z = try std.heap.c_allocator.dupeZ(u8, name);
+        const name_z = try std.heap.c_allocator.dupeSentinel(u8, name, 0);
         defer std.heap.c_allocator.free(name_z);
-        const source_z = try std.heap.c_allocator.dupeZ(u8, source);
+        const source_z = try std.heap.c_allocator.dupeSentinel(u8, source, 0);
         defer std.heap.c_allocator.free(source_z);
-        const header_z = try std.heap.c_allocator.dupeZ(u8, "");
+        const header_z = try std.heap.c_allocator.dupeSentinel(u8, "", 0);
         defer std.heap.c_allocator.free(header_z);
 
         const kernel = c.mlx_fast_metal_kernel_new(
@@ -2180,7 +2180,7 @@ pub const MetalProvider = if (build_options.enable_mlx) struct {
     }
 
     fn addTemplateInt(cfg: c.mlx_fast_metal_kernel_config, name: []const u8, value: usize) !void {
-        const name_z = try std.heap.c_allocator.dupeZ(u8, name);
+        const name_z = try std.heap.c_allocator.dupeSentinel(u8, name, 0);
         defer std.heap.c_allocator.free(name_z);
         try mlx.check(c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, name_z.ptr, @intCast(value)));
     }

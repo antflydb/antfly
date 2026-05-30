@@ -39,7 +39,7 @@ pub const MmapRegion = struct {
 
     /// Memory-map an entire file read-only. Returns borrowed bytes backed by the OS page cache.
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !MmapRegion {
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
 
         const fd = try openReadOnlyZ(path_z);
@@ -89,7 +89,7 @@ pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
 /// Read an entire file with a custom max size limit.
 pub fn readFileMax(allocator: std.mem.Allocator, path: []const u8, max_size: usize) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -114,7 +114,7 @@ pub fn readFileMax(allocator: std.mem.Allocator, path: []const u8, max_size: usi
 
 /// Return the byte size of a file.
 pub fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -125,7 +125,7 @@ pub fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
 
 /// Read a byte range from a file using pread.
 pub fn readRegion(allocator: std.mem.Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -152,7 +152,7 @@ pub fn readRegion(allocator: std.mem.Allocator, path: []const u8, offset: u64, l
 
 /// Check if a file exists at the given path.
 pub fn fileExists(allocator: std.mem.Allocator, path: []const u8) bool {
-    const path_z = allocator.dupeZ(u8, path) catch return false;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return false;
     defer allocator.free(path_z);
     return fileExistsZ(path_z);
 }

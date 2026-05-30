@@ -14633,7 +14633,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!self.data.prefetch_initialized) return;
         if (build_options.enable_mlx) {
-            const name_z = self.allocator.dupeZ(u8, name) catch return;
+            const name_z = self.allocator.dupeSentinel(u8, name, 0) catch return;
             defer self.allocator.free(name_z);
             if (mlx.getWeight(self.data.resident_weights, name_z)) |arr| {
                 defer _ = mlx.c.mlx_array_free(arr);

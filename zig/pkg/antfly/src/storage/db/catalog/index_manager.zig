@@ -1215,7 +1215,7 @@ pub const IndexManager = struct {
     }
 
     fn reopenDenseIndexStorage(self: *IndexManager, entry: *DenseIndex, path: []const u8) !void {
-        const zpath = try self.alloc.dupeZ(u8, path);
+        const zpath = try self.alloc.dupeSentinel(u8, path, 0);
         defer self.alloc.free(zpath);
 
         const dense_cfg = try parseDenseConfig(self.alloc, entry.config.config_json);
@@ -4751,7 +4751,7 @@ pub const IndexManager = struct {
                 const path = try self.indexPath(cfg.name);
                 defer self.alloc.free(path);
 
-                const zpath = try self.alloc.dupeZ(u8, path);
+                const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
 
                 const persistent_opts = persistent_mod.PersistentIndexOptions{
@@ -4895,7 +4895,7 @@ pub const IndexManager = struct {
                 const path = try self.indexPath(cfg.name);
                 defer self.alloc.free(path);
 
-                const zpath = try self.alloc.dupeZ(u8, path);
+                const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
 
                 var index = try hbc_mod.HBCIndex.openWithLsmOptions(self.alloc, zpath, .{
@@ -5009,7 +5009,7 @@ pub const IndexManager = struct {
                 const path = try self.indexPath(cfg.name);
                 defer self.alloc.free(path);
 
-                const zpath = try self.alloc.dupeZ(u8, path);
+                const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
 
                 var index = try sparse_mod.SparseIndex.open(self.alloc, zpath, .{
@@ -5103,9 +5103,9 @@ pub const IndexManager = struct {
                     reverse_dir.close(io_impl.io());
                     break :blk false;
                 };
-                const zforward = try self.alloc.dupeZ(u8, forward_path);
+                const zforward = try self.alloc.dupeSentinel(u8, forward_path, 0);
                 defer self.alloc.free(zforward);
-                const zreverse = try self.alloc.dupeZ(u8, reverse_path);
+                const zreverse = try self.alloc.dupeSentinel(u8, reverse_path, 0);
                 defer self.alloc.free(zreverse);
 
                 var cloned_cfg = try types.IndexConfig.clone(self.alloc, cfg);
@@ -11223,7 +11223,7 @@ test "dense metadata lookups read legacy textual rows" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -12968,7 +12968,7 @@ test "dense vector id uses deterministic key hash with legacy mapping fallback" 
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -13010,7 +13010,7 @@ test "dense vector id ignores ordinal metadata for a different doc" {
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -13101,7 +13101,7 @@ test "dense metadata prefetch includes legacy ordinal vector ids" {
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -13219,7 +13219,7 @@ test "dense index manager accepts explicit embedding writes after addAllNoBackfi
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -13268,7 +13268,7 @@ test "index manager advertises typed tensor access paths for vector and graph in
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -13458,7 +13458,7 @@ test "full text dictionary publication rejects duplicate semantic owners" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -13507,7 +13507,7 @@ test "observed full text analyzers publish shared dictionary ownership" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -13569,7 +13569,7 @@ test "dense bulk-ingest uses recursive bulk build for large empty index batch" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -13633,7 +13633,7 @@ test "dense bulk-ingest populates primary ordinal vector cache before first look
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -13728,7 +13728,7 @@ test "dense embedding writes prefer inline vectors over artifact reloads" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -13785,7 +13785,7 @@ test "loadConfiguredIndexesParallel returns worker errors without double-joining
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -13822,7 +13822,7 @@ test "dense apply resource manager accounts working bytes and releases them" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -13875,7 +13875,7 @@ test "dense replay-shaped bulk apply skips identical already indexed vector" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -14292,7 +14292,7 @@ test "dense artifact preload session reuses cached raw values across calls" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -14389,7 +14389,7 @@ test "dense mapping commit failure rolls back inserted HBC vectors" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -14541,7 +14541,7 @@ test "dense index manager accepts external embedding indexes without enrichments
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -14590,7 +14590,7 @@ test "external dense embedding writes persist deterministic vector mappings" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -14646,7 +14646,7 @@ test "external dense embedding writes use stable vector ids and ordinal member r
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -14744,7 +14744,7 @@ test "primary dense stable vector ids survive identity namespace reassignment" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -14837,7 +14837,7 @@ test "external dense embedding writes keep search working after incremental repl
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15061,7 +15061,7 @@ test "dense index manager stress applies explicit embedding writes on lsm backen
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15167,7 +15167,7 @@ test "dense HBC batchInsertWithMetadata works after addAllNoBackfill" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15205,7 +15205,7 @@ test "dense HBC batchInsertWithMetadata works after text batch setup" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15292,7 +15292,7 @@ test "text merge task skips stale source after concurrent delete" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15368,7 +15368,7 @@ test "text delete clears handed-off stale docs outside current range" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15410,7 +15410,7 @@ test "text merge failure quarantines source segments" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15487,7 +15487,7 @@ test "text merge resource manager accounts pending bytes and active buffers" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15556,7 +15556,7 @@ test "text merge resource pressure defers background merges" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15614,7 +15614,7 @@ test "force compact skips clean text indexes" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15679,7 +15679,7 @@ test "force compact accounts text merge buffers via resource manager" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15749,7 +15749,7 @@ test "best effort force compact defers under text merge pressure" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15814,7 +15814,7 @@ test "best effort force compact stops on resource budget rejection" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -15896,7 +15896,7 @@ test "best effort force compact resumes after modeled reopen under relaxed press
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     {

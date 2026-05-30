@@ -908,7 +908,7 @@ fn findFirstExtensionInDir(allocator: std.mem.Allocator, base_dir: []const u8, e
         return null;
     }
 
-    const base_dir_z = try allocator.dupeZ(u8, base_dir);
+    const base_dir_z = try allocator.dupeSentinel(u8, base_dir, 0);
     defer allocator.free(base_dir_z);
 
     const dir = c_file.c.opendir(base_dir_z.ptr);
@@ -952,7 +952,7 @@ fn findFirstGgufInDir(allocator: std.mem.Allocator, base_dir: []const u8, want_p
         return null;
     }
 
-    const base_dir_z = try allocator.dupeZ(u8, base_dir);
+    const base_dir_z = try allocator.dupeSentinel(u8, base_dir, 0);
     defer allocator.free(base_dir_z);
 
     const dir = c_file.c.opendir(base_dir_z.ptr);

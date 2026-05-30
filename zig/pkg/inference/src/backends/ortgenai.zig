@@ -46,7 +46,7 @@ fn fileExists(path: []const u8) bool {
 }
 
 fn pathExistsNoFollow(path: []const u8) bool {
-    const path_z = std.heap.page_allocator.dupeZ(u8, path) catch return false;
+    const path_z = std.heap.page_allocator.dupeSentinel(u8, path, 0) catch return false;
     defer std.heap.page_allocator.free(path_z);
     var stat_buf: c_file.c.struct_stat = undefined;
     return c_file.c.lstat(path_z.ptr, &stat_buf) == 0;
@@ -59,7 +59,7 @@ fn modelJoinExists(allocator: std.mem.Allocator, model_dir: []const u8, relative
 }
 
 fn mkdirIfMissing(path: []const u8) !void {
-    const path_z = try std.heap.page_allocator.dupeZ(u8, path);
+    const path_z = try std.heap.page_allocator.dupeSentinel(u8, path, 0);
     defer std.heap.page_allocator.free(path_z);
     if (c_file.c.mkdir(path_z.ptr, @as(c_file.c.mode_t, 0o755)) != 0 and !fileExists(path)) {
         return error.CreateDirectoryFailed;
@@ -68,9 +68,9 @@ fn mkdirIfMissing(path: []const u8) !void {
 
 fn symlinkIfMissing(target: []const u8, link_path: []const u8) !void {
     if (pathExistsNoFollow(link_path)) return;
-    const target_z = try std.heap.page_allocator.dupeZ(u8, target);
+    const target_z = try std.heap.page_allocator.dupeSentinel(u8, target, 0);
     defer std.heap.page_allocator.free(target_z);
-    const link_z = try std.heap.page_allocator.dupeZ(u8, link_path);
+    const link_z = try std.heap.page_allocator.dupeSentinel(u8, link_path, 0);
     defer std.heap.page_allocator.free(link_z);
     if (c_file.c.symlink(target_z.ptr, link_z.ptr) != 0 and !pathExistsNoFollow(link_path)) {
         return error.CreateSymlinkFailed;
@@ -79,7 +79,7 @@ fn symlinkIfMissing(target: []const u8, link_path: []const u8) !void {
 
 fn removePathIfExists(path: []const u8) !void {
     if (!pathExistsNoFollow(path)) return;
-    const path_z = try std.heap.page_allocator.dupeZ(u8, path);
+    const path_z = try std.heap.page_allocator.dupeSentinel(u8, path, 0);
     defer std.heap.page_allocator.free(path_z);
     if (c_file.c.unlink(path_z.ptr) != 0 and pathExistsNoFollow(path)) {
         return error.RemovePathFailed;
@@ -88,9 +88,9 @@ fn removePathIfExists(path: []const u8) !void {
 
 fn hardLinkOrSymlink(target: []const u8, link_path: []const u8) !void {
     try removePathIfExists(link_path);
-    const target_z = try std.heap.page_allocator.dupeZ(u8, target);
+    const target_z = try std.heap.page_allocator.dupeSentinel(u8, target, 0);
     defer std.heap.page_allocator.free(target_z);
-    const link_z = try std.heap.page_allocator.dupeZ(u8, link_path);
+    const link_z = try std.heap.page_allocator.dupeSentinel(u8, link_path, 0);
     defer std.heap.page_allocator.free(link_z);
     if (c_file.c.link(target_z.ptr, link_z.ptr) == 0) return;
     if (c_file.c.symlink(target_z.ptr, link_z.ptr) == 0) return;
@@ -347,7 +347,7 @@ fn writeGeneratedGenAiConfig(
 
     const genai_path = try std.fs.path.join(allocator, &.{ model_dir, "genai_config.json" });
     defer allocator.free(genai_path);
-    const genai_path_z = try allocator.dupeZ(u8, genai_path);
+    const genai_path_z = try allocator.dupeSentinel(u8, genai_path, 0);
     defer allocator.free(genai_path_z);
     const fd = c_file.c.open(genai_path_z.ptr, c_file.c.O_WRONLY | c_file.c.O_CREAT | c_file.c.O_TRUNC, @as(c_file.c.mode_t, 0o644));
     if (fd < 0) return error.GenAiConfigWriteFailed;
@@ -453,7 +453,7 @@ fn writeGeneratedHuggingFaceConfigFromGenAi(allocator: std.mem.Allocator, model_
 
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
-    const config_path_z = try allocator.dupeZ(u8, config_path);
+    const config_path_z = try allocator.dupeSentinel(u8, config_path, 0);
     defer allocator.free(config_path_z);
     if (pathExistsNoFollow(config_path)) {
         _ = c_file.c.unlink(config_path_z.ptr);
@@ -590,7 +590,7 @@ fn createOverlayPackage(allocator: std.mem.Allocator, model_dir: []const u8) ![]
         const overlay_onnx_dir = try std.fs.path.join(allocator, &.{ base_dir, "onnx" });
         defer allocator.free(overlay_onnx_dir);
         try mkdirIfMissing(overlay_onnx_dir);
-        const onnx_dir_z = try allocator.dupeZ(u8, onnx_dir);
+        const onnx_dir_z = try allocator.dupeSentinel(u8, onnx_dir, 0);
         defer allocator.free(onnx_dir_z);
         const dir = c_file.c.opendir(onnx_dir_z.ptr) orelse return error.OpenDirectoryFailed;
         defer _ = c_file.c.closedir(dir);
@@ -620,7 +620,7 @@ fn createOverlayPackage(allocator: std.mem.Allocator, model_dir: []const u8) ![]
     const genai_path = try std.fs.path.join(allocator, &.{ base_dir, "genai_config.json" });
     defer allocator.free(genai_path);
     if (pathExistsNoFollow(genai_path)) {
-        const genai_path_z = try allocator.dupeZ(u8, genai_path);
+        const genai_path_z = try allocator.dupeSentinel(u8, genai_path, 0);
         defer allocator.free(genai_path_z);
         _ = c_file.c.unlink(genai_path_z.ptr);
     }
@@ -662,7 +662,7 @@ pub const GenAiModel = struct {
     context_length: i32,
 
     pub fn load(allocator: std.mem.Allocator, model_dir: []const u8) !GenAiModel {
-        const path_z = try allocator.dupeZ(u8, model_dir);
+        const path_z = try allocator.dupeSentinel(u8, model_dir, 0);
         defer allocator.free(path_z);
 
         var model: ?*c.OgaModel = null;
@@ -718,7 +718,7 @@ pub const FirstTokenDebug = struct {
 /// Generate text from a prompt using ortgenai.
 pub fn generate(allocator: std.mem.Allocator, model: *const GenAiModel, prompt: []const u8, opts: GenerateOptions) !GenerateResult {
     // Encode prompt to token sequences
-    const prompt_z = try allocator.dupeZ(u8, prompt);
+    const prompt_z = try allocator.dupeSentinel(u8, prompt, 0);
     defer allocator.free(prompt_z);
 
     var sequences: ?*c.OgaSequences = null;
@@ -812,7 +812,7 @@ pub fn generateFirstTokenDebug(
     prompt: []const u8,
     opts: GenerateOptions,
 ) !FirstTokenDebug {
-    const prompt_z = try allocator.dupeZ(u8, prompt);
+    const prompt_z = try allocator.dupeSentinel(u8, prompt, 0);
     defer allocator.free(prompt_z);
 
     var sequences: ?*c.OgaSequences = null;
@@ -891,7 +891,7 @@ pub fn generateWithImages(
     defer c.OgaDestroyMultiModalProcessor(processor.?);
 
     // Process prompt + images → named tensors
-    const prompt_z = try allocator.dupeZ(u8, prompt);
+    const prompt_z = try allocator.dupeSentinel(u8, prompt, 0);
     defer allocator.free(prompt_z);
 
     var named_tensors: ?*c.OgaNamedTensors = null;
@@ -984,7 +984,7 @@ pub fn generateStreaming(
     on_token_ctx: *anyopaque,
     on_token: TokenCallback,
 ) !GenerateResult {
-    const prompt_z = try allocator.dupeZ(u8, prompt);
+    const prompt_z = try allocator.dupeSentinel(u8, prompt, 0);
     defer allocator.free(prompt_z);
 
     var sequences: ?*c.OgaSequences = null;

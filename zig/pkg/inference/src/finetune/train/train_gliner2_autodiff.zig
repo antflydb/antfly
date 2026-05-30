@@ -423,7 +423,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             }
             const name = std.mem.span(key);
             const stripped = stripEncoderPrefix(name);
-            const stripped_z = try allocator.dupeZ(u8, stripped);
+            const stripped_z = try allocator.dupeSentinel(u8, stripped, 0);
             defer allocator.free(stripped_z);
             _ = mlx_c.mlx_map_string_to_array_insert(stripped_weights, stripped_z.ptr, val);
             _ = mlx_c.mlx_array_free(val);

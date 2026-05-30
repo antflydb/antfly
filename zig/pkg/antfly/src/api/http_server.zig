@@ -11059,7 +11059,7 @@ test "api http server enforces session adoption timeout when configured" {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
 
-    const session_path_z = try alloc.dupeZ(u8, session_path);
+    const session_path_z = try alloc.dupeSentinel(u8, session_path, 0);
     defer alloc.free(session_path_z);
     var session_store = try docstore_mod.DocStore.open(alloc, session_path_z, .{});
     defer session_store.close();

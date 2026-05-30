@@ -3721,7 +3721,7 @@ fn transposeGpt2Conv1dResidentMlxWeights(
         }
 
         const name = std.mem.span(key);
-        const name_z = try allocator.dupeZ(u8, name);
+        const name_z = try allocator.dupeSentinel(u8, name, 0);
         defer allocator.free(name_z);
 
         if (isGpt2Conv1dWeight(name) and

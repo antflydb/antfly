@@ -262,7 +262,7 @@ pub const Environment = struct {
         if (use_zig_backend and opts.map_async and !opts.write_map) return Error.Incompatible;
 
         const alloc = heapAllocator();
-        const path_owned = alloc.dupeZ(u8, std.mem.span(path)) catch return Error.LmdbUnexpected;
+        const path_owned = alloc.dupeSentinel(u8, std.mem.span(path), 0) catch return Error.LmdbUnexpected;
         errdefer alloc.free(path_owned);
 
         var zig_env: ?zig_lmdb.env.Environment = null;

@@ -322,7 +322,7 @@ fn findModelFile(allocator: std.mem.Allocator, model_dir: []const u8, candidates
 
         for (candidates) |name| {
             const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, name });
-            const path_z = try allocator.dupeZ(u8, path);
+            const path_z = try allocator.dupeSentinel(u8, path, 0);
             defer allocator.free(path_z);
             if (c_file.fileExistsZ(path_z)) {
                 return path;

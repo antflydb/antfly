@@ -2785,7 +2785,7 @@ fn tryGetVisualHfWeight(self: *MlxCompute, name: []const u8) !?c.mlx_array {
     if (!std.mem.startsWith(u8, name, "visual.")) return null;
     const hf_name = try std.fmt.allocPrint(self.allocator, "vlm.model.{s}", .{name});
     defer self.allocator.free(hf_name);
-    const hf_name_z = try self.allocator.dupeZ(u8, hf_name);
+    const hf_name_z = try self.allocator.dupeSentinel(u8, hf_name, 0);
     defer self.allocator.free(hf_name_z);
     return mlx.getWeight(self.data.resident_weights, hf_name_z);
 }
@@ -2794,7 +2794,7 @@ fn tryGetVisualHfWeightNoErr(self: *MlxCompute, name: []const u8) ?c.mlx_array {
     if (!std.mem.startsWith(u8, name, "visual.")) return null;
     const hf_name = std.fmt.allocPrint(self.allocator, "vlm.model.{s}", .{name}) catch return null;
     defer self.allocator.free(hf_name);
-    const hf_name_z = self.allocator.dupeZ(u8, hf_name) catch return null;
+    const hf_name_z = self.allocator.dupeSentinel(u8, hf_name, 0) catch return null;
     defer self.allocator.free(hf_name_z);
     return mlx.getWeight(self.data.resident_weights, hf_name_z);
 }
@@ -2804,11 +2804,11 @@ fn prefetchWeightHint(ctx: *anyopaque, name: []const u8, hint: u32) void {
     if (self.data.prefix.len > 0) {
         const full_name = std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ self.data.prefix, name }) catch return;
         defer self.allocator.free(full_name);
-        const name_z = self.allocator.dupeZ(u8, full_name) catch return;
+        const name_z = self.allocator.dupeSentinel(u8, full_name, 0) catch return;
         defer self.allocator.free(name_z);
         if (mlx.getWeight(self.data.resident_weights, name_z)) |_| return;
     }
-    const raw_z = self.allocator.dupeZ(u8, name) catch return;
+    const raw_z = self.allocator.dupeSentinel(u8, name, 0) catch return;
     defer self.allocator.free(raw_z);
     if (mlx.getWeight(self.data.resident_weights, raw_z)) |_| return;
     if (tryGetVisualHfWeightNoErr(self, name)) |_| return;

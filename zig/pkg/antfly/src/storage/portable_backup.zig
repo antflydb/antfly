@@ -713,7 +713,7 @@ fn decodeEdgeBatch(alloc: Allocator, data: []const u8) !struct {
 fn openTestStore(alloc: Allocator, tmp: *std.testing.TmpDir) !DocStore {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     return DocStore.open(alloc, path_z, .{});
 }

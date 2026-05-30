@@ -1095,7 +1095,7 @@ pub const Node = struct {
             return null;
         }
 
-        const dir_z = self.allocator.dupeZ(u8, dir_path) catch return null;
+        const dir_z = self.allocator.dupeSentinel(u8, dir_path, 0) catch return null;
         defer self.allocator.free(dir_z);
 
         const cc = c_file.c;
@@ -1140,7 +1140,7 @@ pub const Node = struct {
             return null;
         }
 
-        const dir_z = self.allocator.dupeZ(u8, self.config.models_dir) catch return null;
+        const dir_z = self.allocator.dupeSentinel(u8, self.config.models_dir, 0) catch return null;
         defer self.allocator.free(dir_z);
 
         const cc = c_file.c;
@@ -6238,7 +6238,7 @@ fn dirContainsModel(path: []const u8) bool {
         return false;
     }
 
-    const path_z = std.heap.page_allocator.dupeZ(u8, path) catch return false;
+    const path_z = std.heap.page_allocator.dupeSentinel(u8, path, 0) catch return false;
     defer std.heap.page_allocator.free(path_z);
     const dir = c_file.c.opendir(path_z.ptr);
     if (dir == null) return false;

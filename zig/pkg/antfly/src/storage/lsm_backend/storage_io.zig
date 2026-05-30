@@ -526,7 +526,7 @@ else
                 }
             }
 
-            const owned_path = try self.allocator.dupeZ(u8, path);
+            const owned_path = try self.allocator.dupeSentinel(u8, path, 0);
             errdefer self.allocator.free(owned_path);
 
             const fd = try std.posix.openatZ(std.posix.AT.FDCWD, owned_path, .{
@@ -1322,9 +1322,9 @@ fn renameAbsolutePosix(old_path: []const u8, new_path: []const u8) !void {
     defer closeFd(new_parent_fd);
 
     const allocator = std.heap.page_allocator;
-    const old_base_name_z = try allocator.dupeZ(u8, old_base_name);
+    const old_base_name_z = try allocator.dupeSentinel(u8, old_base_name, 0);
     defer allocator.free(old_base_name_z);
-    const new_base_name_z = try allocator.dupeZ(u8, new_base_name);
+    const new_base_name_z = try allocator.dupeSentinel(u8, new_base_name, 0);
     defer allocator.free(new_base_name_z);
 
     while (true) {
@@ -1353,9 +1353,9 @@ fn renameAbsolutePosix(old_path: []const u8, new_path: []const u8) !void {
 
 fn renameAbsoluteDirectPosix(old_path: []const u8, new_path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const old_path_z = try allocator.dupeZ(u8, old_path);
+    const old_path_z = try allocator.dupeSentinel(u8, old_path, 0);
     defer allocator.free(old_path_z);
-    const new_path_z = try allocator.dupeZ(u8, new_path);
+    const new_path_z = try allocator.dupeSentinel(u8, new_path, 0);
     defer allocator.free(new_path_z);
 
     while (true) {
@@ -1409,7 +1409,7 @@ fn createAtomicWriteFdPosix(path: []const u8) !std.posix.fd_t {
 
 fn deleteFilePathPosix(path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     while (true) {
