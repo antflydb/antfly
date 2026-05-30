@@ -453,20 +453,16 @@ Open/index/enrichment validation should reject:
          `notifySequence`/`start`/`stop`. `catchUpWindow` unit-tested with a fake
          replay `Source`; the runtime compile-verified end-to-end via
          `refAllDecls`.
-   - [ ] `db.zig` lifecycle attachment (mechanical wiring; the worker above is
-         done + tested). Mirror the enrichment runtime's touchpoints:
-         - add `resolution_runtime: ?*ResolutionRuntime` + `resolution_append_context`
-           fields to `DB` (and null them in the two struct literals);
-         - `initResolutionRuntime` mirroring `initOptionalEnrichmentRuntime`
-           (reuse `EnrichmentAppendContext` + `appendDerivedBatchFromEnrichment`
-           as `write_ctx`/`write_fn`), called from `initOptionalRuntimes`;
-         - start in `startOptionalRuntimes`, deinit in `deinitWrapperState`;
-         - add a `resolution_runtime` field to `BatchExecutionContext` and call
-           `notifySequence` at the same sites enrichment is notified
-           (`self.enrichment_runtime`/`ctx.enrichment_runtime` `notifySequence`).
-         - then a `db.zig` integration test (open DB, add resolver, write a doc
-           with an extraction asset artifact, await, assert the resolution
-           artifact appears) like "db resolver catalog persists across reopen".
+   - [x] `db.zig` lifecycle attachment: `DB` / `BatchExecutionContext` /
+         `EnrichmentAppendContext` carry a `resolution_runtime`;
+         `initResolutionRuntime` (created before enrichment) constructs the
+         worker reusing an append context + `appendDerivedBatchFromEnrichment`;
+         started in `startOptionalRuntimes`, torn down in `deinitWrapperState`,
+         and `notifySequence`d wherever enrichment is (incl. the enrichment
+         derived-batch append where extraction artifacts land). Verified by
+         `db-test` + `root-test`.
+   - [ ] Follow-up: a db-level integration test driving extraction -> resolution
+         end-to-end (needs an asset-producer harness), and candidate blocking.
    - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
          per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
          / `listResolvers` through DB -> DBCore -> IndexManager (verified by a
