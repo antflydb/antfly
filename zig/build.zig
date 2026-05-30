@@ -1379,6 +1379,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const matcher_mod = b.addModule("antfly_matcher", .{
+        .root_source_file = b.path("lib/matcher/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     httpx_mod.addImport("antfly-json", json_mod);
     jsonschema_mod.addImport("antfly_regex", regex_mod);
     jsonschema_mod.addImport("antfly-json", json_mod);
@@ -2092,6 +2097,13 @@ pub fn build(b: *std.Build) void {
     const run_lib_a2a_tests = b.addRunArtifact(lib_a2a_tests);
     const lib_a2a_test_step = b.step("lib-a2a-test", "Run standalone lib/a2a tests");
     lib_a2a_test_step.dependOn(&run_lib_a2a_tests.step);
+
+    const lib_matcher_tests = b.addTest(.{
+        .root_module = matcher_mod,
+    });
+    const run_lib_matcher_tests = b.addRunArtifact(lib_matcher_tests);
+    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone lib/matcher tests");
+    lib_matcher_test_step.dependOn(&run_lib_matcher_tests.step);
 
     const lib_toon_conformance = b.addExecutable(.{
         .name = "lib-toon-conformance",
