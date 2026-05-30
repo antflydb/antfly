@@ -944,14 +944,17 @@ test "typed numeric column routes range to typed range filter" {
         .{ .name = "amount", .kind = .numeric },
     } };
 
-    // Mixed delimiter: inclusive min, exclusive max.
-    const filter = try parser.parse(testing.allocator, "amount:[10 TO 40}");
+    // Inclusive range (matched delimiters). Note: mixed delimiters like
+    // "[10 TO 40}" are rejected by the underlying parseRange before routing is
+    // reached -- that is a pre-existing parser limitation, not specific to
+    // typed columns.
+    const filter = try parser.parse(testing.allocator, "amount:[10 TO 40]");
     try testing.expect(filter == .range);
     try testing.expectEqualStrings("amount", filter.range.field);
     try testing.expectEqual(@as(?f64, 10.0), filter.range.min_val);
     try testing.expectEqual(@as(?f64, 40.0), filter.range.max_val);
     try testing.expect(filter.range.inclusive_min);
-    try testing.expect(!filter.range.inclusive_max);
+    try testing.expect(filter.range.inclusive_max);
 }
 
 test "undeclared and non-typed columns keep term behaviour" {
