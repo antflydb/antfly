@@ -1208,7 +1208,7 @@ test "relational document reconstructs from typed cells round-trip" {
     const obj = rebuilt.value.object;
 
     try std.testing.expectEqualStrings("abc", obj.get("id").?.string);
-    try std.testing.expectEqual(@as(f64, 12.5), obj.get("amount").?.float);
+    try std.testing.expectEqual(@as(f64, 12.5), jsonNumberOf(obj.get("amount").?));
     // integer column reconstructs as a JSON number (7 parses as integer)
     try std.testing.expectEqual(@as(i64, 7), obj.get("qty").?.integer);
     try std.testing.expectEqual(@as(i64, 1000), obj.get("ts").?.integer);
@@ -1241,9 +1241,19 @@ test "relational reconstruction omits absent nullable columns" {
 
     try std.testing.expectEqual(@as(usize, 2), obj.count());
     try std.testing.expectEqualStrings("x", obj.get("id").?.string);
-    try std.testing.expectEqual(@as(f64, 0.0), obj.get("amount").?.float);
+    try std.testing.expectEqual(@as(f64, 0.0), jsonNumberOf(obj.get("amount").?));
     try std.testing.expect(obj.get("qty") == null);
     try std.testing.expect(obj.get("payload") == null);
+}
+
+/// Read a JSON number regardless of whether it parsed as integer or float
+/// (reconstruction formats f64 0.0 as "0", which re-parses as .integer).
+fn jsonNumberOf(value: std.json.Value) f64 {
+    return switch (value) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => std.math.nan(f64),
+    };
 }
 
 test "relational projection enforces required columns and types" {
