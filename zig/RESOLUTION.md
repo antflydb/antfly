@@ -445,11 +445,28 @@ Open/index/enrichment validation should reject:
    - [x] db-backed `ArtifactStore` over the shard primary store
          (`resolution_runtime.DbArtifactStore`): generic over the store type,
          binds the production erased store and is fake-store tested.
-   - [ ] `ResolutionRuntime` worker: catch up on the `resolution` hint
-         (`applied_sequence`), call `processChangedExtraction` per changed asset
-         key over a `DbArtifactStore`, journal the resolution key via a
-         `DerivedBatch`; submit on the shard `backend_runtime` durable lane; wire
-         init/start/shutdown in `db.zig`.
+   - [x] `ResolutionRuntime` worker (`resolution_runtime.ResolutionRuntime`):
+         wraps the shard store, loads/persists `applied_sequence` (scope
+         "resolution"), runs a `backend_runtime` io loop draining applied ->
+         target via `catchUp` (snapshots resolvers, `catchUpWindow` over a
+         `DbArtifactStore`, persists applied only after durable writes), with
+         `notifySequence`/`start`/`stop`. `catchUpWindow` unit-tested with a fake
+         replay `Source`; the runtime compile-verified end-to-end via
+         `refAllDecls`.
+   - [ ] `db.zig` lifecycle attachment (mechanical wiring; the worker above is
+         done + tested). Mirror the enrichment runtime's touchpoints:
+         - add `resolution_runtime: ?*ResolutionRuntime` + `resolution_append_context`
+           fields to `DB` (and null them in the two struct literals);
+         - `initResolutionRuntime` mirroring `initOptionalEnrichmentRuntime`
+           (reuse `EnrichmentAppendContext` + `appendDerivedBatchFromEnrichment`
+           as `write_ctx`/`write_fn`), called from `initOptionalRuntimes`;
+         - start in `startOptionalRuntimes`, deinit in `deinitWrapperState`;
+         - add a `resolution_runtime` field to `BatchExecutionContext` and call
+           `notifySequence` at the same sites enrichment is notified
+           (`self.enrichment_runtime`/`ctx.enrichment_runtime` `notifySequence`).
+         - then a `db.zig` integration test (open DB, add resolver, write a doc
+           with an extraction asset artifact, await, assert the resolution
+           artifact appears) like "db resolver catalog persists across reopen".
    - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
          per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
          / `listResolvers` through DB -> DBCore -> IndexManager (verified by a
