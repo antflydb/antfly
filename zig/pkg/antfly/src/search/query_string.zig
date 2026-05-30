@@ -908,68 +908,59 @@ test "query string: term range" {
 }
 
 test "typed column routes equality to typed filters" {
-    const alloc = testing.allocator;
+    // range / bool_field / date_range filters allocate nothing, so no cleanup.
     const parser = QueryStringParser{ .typed_columns = &.{
         .{ .name = "amount", .kind = .numeric },
         .{ .name = "active", .kind = .boolean },
         .{ .name = "ts", .kind = .datetime },
     } };
 
-    var numeric = try parser.parse(alloc, "amount:25");
-    defer numeric.deinit(alloc);
+    const numeric = try parser.parse(testing.allocator, "amount:25");
     try testing.expect(numeric == .range);
     try testing.expectEqualStrings("amount", numeric.range.field);
-    try testing.expectEqual(@as(f64, 25.0), numeric.range.min_val);
-    try testing.expectEqual(@as(f64, 25.0), numeric.range.max_val);
+    try testing.expectEqual(@as(?f64, 25.0), numeric.range.min_val);
+    try testing.expectEqual(@as(?f64, 25.0), numeric.range.max_val);
 
-    var boolean = try parser.parse(alloc, "active:true");
-    defer boolean.deinit(alloc);
+    const boolean = try parser.parse(testing.allocator, "active:true");
     try testing.expect(boolean == .bool_field);
     try testing.expectEqualStrings("active", boolean.bool_field.field);
     try testing.expect(boolean.bool_field.value);
 
-    var datetime = try parser.parse(alloc, "ts:1000");
-    defer datetime.deinit(alloc);
+    const datetime = try parser.parse(testing.allocator, "ts:1000");
     try testing.expect(datetime == .date_range);
     try testing.expectEqual(@as(?u64, 1000), datetime.date_range.start_ns);
     try testing.expectEqual(@as(?u64, 1000), datetime.date_range.end_ns);
 }
 
 test "typed numeric column routes range to typed range filter" {
-    const alloc = testing.allocator;
     const parser = QueryStringParser{ .typed_columns = &.{
         .{ .name = "amount", .kind = .numeric },
     } };
 
-    var filter = try parser.parse(alloc, "amount:[10 TO 40}");
-    defer filter.deinit(alloc);
+    const filter = try parser.parse(testing.allocator, "amount:[10 TO 40}");
     try testing.expect(filter == .range);
     try testing.expectEqualStrings("amount", filter.range.field);
-    try testing.expectEqual(@as(f64, 10.0), filter.range.min_val);
-    try testing.expectEqual(@as(f64, 40.0), filter.range.max_val);
+    try testing.expectEqual(@as(?f64, 10.0), filter.range.min_val);
+    try testing.expectEqual(@as(?f64, 40.0), filter.range.max_val);
     try testing.expect(filter.range.inclusive_min);
     try testing.expect(!filter.range.inclusive_max);
 }
 
 test "undeclared and non-typed columns keep term behaviour" {
-    const alloc = testing.allocator;
     const parser = QueryStringParser{ .typed_columns = &.{
         .{ .name = "amount", .kind = .numeric },
     } };
 
     // Undeclared field stays a term filter.
-    var term = try parser.parse(alloc, "title:hello");
-    defer term.deinit(alloc);
+    const term = try parser.parse(testing.allocator, "title:hello");
     try testing.expect(term == .term);
 
     // Declared numeric column with a non-numeric value falls back to a term.
-    var fallback = try parser.parse(alloc, "amount:abc");
-    defer fallback.deinit(alloc);
+    const fallback = try parser.parse(testing.allocator, "amount:abc");
     try testing.expect(fallback == .term);
 
     // No catalog at all: behaviour unchanged.
     const plain = QueryStringParser{};
-    var plain_range = try plain.parse(alloc, "amount:[10 TO 40]");
-    defer plain_range.deinit(alloc);
+    const plain_range = try plain.parse(testing.allocator, "amount:[10 TO 40]");
     try testing.expect(plain_range == .term_range);
 }
