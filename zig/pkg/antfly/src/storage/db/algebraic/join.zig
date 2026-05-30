@@ -232,6 +232,8 @@ pub fn lawPreservesDerivedJoinFold(law_id: law.Id) bool {
         .provenance_semiring,
         .avg,
         => true,
+        // HLL sketches are not wired into derived join folds yet.
+        .hll => false,
     };
 }
 

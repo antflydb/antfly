@@ -22,6 +22,7 @@ const fact_mod = @import("fact.zig");
 const ir = @import("ir.zig");
 const join_mod = @import("join.zig");
 const law_mod = @import("law.zig");
+const hll = @import("hll.zig");
 const lexical_mod = @import("lexical.zig");
 const pathfact_mod = @import("pathfact.zig");
 const tensor_mod = @import("tensor.zig");
@@ -133,6 +134,20 @@ pub const LawConfig = struct {
     invertible: bool = false,
 };
 
+// A materialized approximate distinct-count. Per group key, a HyperLogLog
+// sketch over the canonical tokens of `value_field` is maintained incrementally
+// on ingest, so a cardinality query reads one sketch per group instead of
+// rescanning and deduplicating every document's value. `precision` of 0 selects
+// the default; larger precision trades memory (2^precision bytes/sketch) for a
+// smaller standard error. Maintenance is append-only: deletes require a rebuild
+// and are not folded back into the sketch.
+pub const HllCardinalityConfig = struct {
+    name: []const u8,
+    group_by: []const []const u8 = &.{},
+    value_field: []const u8,
+    precision: u8 = 0,
+};
+
 pub const AdaptiveConfig = struct {
     observe: bool = true,
     lazy_materialization: bool = false,
@@ -186,6 +201,7 @@ pub const Config = struct {
     laws: []const LawConfig = &.{},
     joins: []const JoinConfig = &.{},
     materializations: []const MaterializationConfig = &.{},
+    hll_cardinalities: []const HllCardinalityConfig = &.{},
     adaptive: AdaptiveConfig = .{},
     pathfact_policy: PathFactPolicyConfig = .{},
     max_result_buckets: ?usize = null,
@@ -15849,6 +15865,7 @@ pub const Index = struct {
                 };
             }
         }
+        try self.applyHllCardinalitiesTxn(txn, parsed.value, sign);
         try self.applyDocJoinDelta(txn, doc_key, parsed.value, sign, maintenance_context);
     }
 
@@ -16271,6 +16288,118 @@ pub const Index = struct {
                 try self.applyConfiguredExpressionMutationTxn(txn, mat, op, group_key, measure_value, sign, .cylinder, bucket_start);
             }
         }
+    }
+
+    const hll_default_precision: u6 = 12;
+
+    fn hllCardinalityPrecision(hcfg: HllCardinalityConfig) u6 {
+        if (hcfg.precision == 0) return hll_default_precision;
+        return @intCast(std.math.clamp(hcfg.precision, @as(u8, hll.min_precision), @as(u8, hll.max_precision)));
+    }
+
+    fn hllCardinalityPrefixAlloc(self: *Index, name: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hllcard", name });
+    }
+
+    fn hllCardinalityKeyAlloc(self: *Index, name: []const u8, group_key: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hllcard", name, group_key });
+    }
+
+    fn applyHllCardinalitiesTxn(self: *Index, txn: anytype, root: std.json.Value, sign: i8) !void {
+        // Append-only: HLL sketches cannot subtract a value, so deletes would
+        // require rebuilding the affected group's sketch from scratch.
+        if (sign <= 0) return;
+        for (self.config().hll_cardinalities) |hcfg| {
+            try self.applyHllCardinalityTxn(txn, root, hcfg);
+        }
+    }
+
+    fn applyHllCardinalityTxn(self: *Index, txn: anytype, root: std.json.Value, hcfg: HllCardinalityConfig) !void {
+        const group_key = self.groupKeyAlloc(root, hcfg.group_by) catch |err| switch (err) {
+            error.MissingField => return,
+            else => return err,
+        };
+        defer self.alloc.free(group_key);
+        const value_token = (try self.fieldScalarTokenAlloc(root, hcfg.value_field)) orelse return;
+        defer self.alloc.free(value_token);
+
+        const singleton = try hll.singletonEncodedAlloc(self.alloc, hllCardinalityPrecision(hcfg), value_token);
+        defer self.alloc.free(singleton);
+
+        const key = try self.hllCardinalityKeyAlloc(hcfg.name, group_key);
+        defer self.alloc.free(key);
+
+        // `current` borrows txn-owned bytes (valid until the next txn write);
+        // the union allocates a fresh buffer before we write it back.
+        const current = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const merged = (try law_mod.combineAlloc(self.alloc, .hll, current, singleton)) orelse return;
+        defer self.alloc.free(merged);
+        try txn.put(key, merged);
+    }
+
+    pub const ApproxCardinalityEntry = struct {
+        group_key: []u8,
+        estimate: u64,
+
+        pub fn deinit(self: *ApproxCardinalityEntry, alloc: Allocator) void {
+            alloc.free(self.group_key);
+            self.* = undefined;
+        }
+    };
+
+    /// Reads one materialized HLL sketch per group and returns its estimated
+    /// distinct count. O(groups) cursor reads with no per-document rescan.
+    pub fn approxCardinalityEntriesAlloc(self: *Index, store: *docstore_mod.DocStore, name: []const u8) ![]ApproxCardinalityEntry {
+        const prefix = try self.hllCardinalityPrefixAlloc(name);
+        defer self.alloc.free(prefix);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var out = std.ArrayListUnmanaged(ApproxCardinalityEntry).empty;
+        errdefer {
+            for (out.items) |*entry| entry.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const group_component = token.componentAt(entry.key, prefix.len) catch continue;
+            if (group_component.next != entry.key.len) continue;
+            const estimate = hll.estimateEncoded(entry.value) catch continue;
+            try out.append(self.alloc, .{
+                .group_key = try self.alloc.dupe(u8, group_component.payload),
+                .estimate = estimate,
+            });
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    /// Total distinct count across all groups of a materialized HLL cardinality,
+    /// computed by merging the per-group sketches (an exact union, not a sum of
+    /// per-group estimates).
+    pub fn approxCardinalityTotalAlloc(self: *Index, store: *docstore_mod.DocStore, name: []const u8) !u64 {
+        const prefix = try self.hllCardinalityPrefixAlloc(name);
+        defer self.alloc.free(prefix);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var merged: ?[]u8 = null;
+        defer if (merged) |bytes| self.alloc.free(bytes);
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const group_component = token.componentAt(entry.key, prefix.len) catch continue;
+            if (group_component.next != entry.key.len) continue;
+            const next = (try law_mod.combineAlloc(self.alloc, .hll, merged, entry.value)) orelse continue;
+            if (merged) |bytes| self.alloc.free(bytes);
+            merged = next;
+        }
+        return if (merged) |bytes| try hll.estimateEncoded(bytes) else 0;
     }
 
     fn applyDirectMaterializationAppendOnlyPreaggregated(
@@ -18615,6 +18744,68 @@ test "algebraic index maintains direct count sum avg min max" {
     try std.testing.expect((try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "sum_by_customer", group, null)) == null);
     try std.testing.expect((try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "min_by_customer", group, null)) == null);
     try std.testing.expect((try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "max_by_customer", group, null)) == null);
+}
+
+test "algebraic index materializes approximate per-group cardinality" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [{"name":"region","path":"region","type":"string"},{"name":"customer","path":"customer","type":"string"}],
+        \\  "hll_cardinalities": [{"name":"customers_by_region","group_by":["region"],"value_field":"customer"}]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+
+    // west has 3 distinct customers (a1 repeated), east has 2.
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a1\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a2\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a3\"}" },
+        .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a1\"}" },
+        .{ .key = "o5", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"b1\"}" },
+        .{ .key = "o6", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"b2\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const entries = try idx.approxCardinalityEntriesAlloc(&store, "customers_by_region");
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+    const east_token = try idx.constraintTokenAlloc(alloc, "region", "east");
+    defer alloc.free(east_token);
+    const east_group = try token.canonicalTupleAlloc(alloc, &.{east_token});
+    defer alloc.free(east_group);
+
+    var west_estimate: ?u64 = null;
+    var east_estimate: ?u64 = null;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.group_key, west_group)) west_estimate = entry.estimate;
+        if (std.mem.eql(u8, entry.group_key, east_group)) east_estimate = entry.estimate;
+    }
+    // Small cardinalities land within one of the truth (linear counting regime).
+    try std.testing.expect(west_estimate != null and east_estimate != null);
+    try std.testing.expect(@max(west_estimate.?, 3) - @min(west_estimate.?, 3) <= 1);
+    try std.testing.expect(@max(east_estimate.?, 2) - @min(east_estimate.?, 2) <= 1);
+
+    // The grand total is the union of the per-group sketches: 5 distinct customers.
+    const total = try idx.approxCardinalityTotalAlloc(&store, "customers_by_region");
+    try std.testing.expect(@max(total, 5) - @min(total, 5) <= 1);
 }
 
 test "algebraic raw metric doc id reads canonicalize measure path aliases" {
