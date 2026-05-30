@@ -62,7 +62,7 @@ const NFAState = struct {
 /// Character class definition.
 const CharClass = struct {
     /// Bitmap of which bytes match.
-    bytes: [256]bool = [_]bool{false} ** 256,
+    bytes: [256]bool = @as([256]bool, @splat(false)),
     negated: bool = false,
 
     fn matches(self: *const CharClass, b: u8) bool {
@@ -308,7 +308,7 @@ const ByteClassInfo = struct {
 
 fn buildByteClasses(states: []const NFAState, char_classes: []const CharClass) ByteClassInfo {
     var classes: [256]u8 = undefined;
-    var representatives = [_]u8{0} ** 256;
+    var representatives = @as([256]u8, @splat(0));
     var count: u16 = 0;
 
     for (0..256) |byte_idx| {

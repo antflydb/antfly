@@ -1269,7 +1269,7 @@ pub const HBCIndex = struct {
     deferred_node_key_value_bytes: u64 = 0,
     deferred_oversized_leaves_peak: u64 = 0,
     bulk_split_vector_workspace: SplitVectorWorkspace = .{},
-    hbc_cache_kind_stats: [hbc_cache_kind_count]HbcCacheKindStats = .{HbcCacheKindStats{}} ** hbc_cache_kind_count,
+    hbc_cache_kind_stats: [hbc_cache_kind_count]HbcCacheKindStats = @splat(HbcCacheKindStats{}),
     deferred_quantized_nodes: std.AutoHashMapUnmanaged(u64, void),
     deferred_node_keys: std.AutoHashMapUnmanaged(u128, DeferredNodeValue),
     deferred_oversized_leaves: std.AutoHashMapUnmanaged(u64, void),
@@ -1799,7 +1799,7 @@ pub const HBCIndex = struct {
             .deferred_node_key_value_bytes = 0,
             .deferred_oversized_leaves_peak = 0,
             .bulk_split_vector_workspace = .{},
-            .hbc_cache_kind_stats = .{HbcCacheKindStats{}} ** hbc_cache_kind_count,
+            .hbc_cache_kind_stats = @splat(HbcCacheKindStats{}),
             .deferred_quantized_nodes = .empty,
             .deferred_node_keys = .empty,
             .deferred_oversized_leaves = .empty,
@@ -2111,7 +2111,7 @@ pub const HBCIndex = struct {
     }
 
     fn refreshHbcCacheKindBytes(self: *HBCIndex) u64 {
-        var bytes: [hbc_cache_kind_count]u64 = .{0} ** hbc_cache_kind_count;
+        var bytes: [hbc_cache_kind_count]u64 = @splat(0);
         var node_it = self.node_cache.iterator();
         while (node_it.next()) |entry| bytes[@intFromEnum(HbcCacheKind.node)] +|= estimateNodeCacheBytes(&entry.value_ptr.*.node);
         var quantized_it = self.quantized_cache.iterator();
@@ -6432,7 +6432,7 @@ test "searchWithRequest tolerates concurrent readers with runtime caches enabled
     };
 
     var failed = std.atomic.Value(u8).init(0);
-    var workers = [_]Worker{.{ .idx = &idx, .failed = &failed }} ** 8;
+    var workers = @as([8]Worker, @splat(.{ .idx = &idx, .failed = &failed }));
     var threads: [workers.len]std.Thread = undefined;
     for (&threads, &workers, 0..) |*thread, *worker, worker_index| {
         thread.* = try std.Thread.spawn(.{}, Worker.run, .{ worker, worker_index });
@@ -9963,8 +9963,8 @@ test "bulk split workspace reuses transformed external vectors and reports apply
 
     const ids = [_]u64{ 1, 2, 3 };
     const positions = [_]usize{ 0, 1, 2 };
-    var matrix: [6]f32 = .{0} ** 6;
-    var matrix_again: [6]f32 = .{0} ** 6;
+    var matrix: [6]f32 = @splat(0);
+    var matrix_again: [6]f32 = @splat(0);
     var lookups: [ids.len]FixedKeyLookup = undefined;
     var key_views: [ids.len][]const u8 = undefined;
     var values: [ids.len]?[]const u8 = undefined;

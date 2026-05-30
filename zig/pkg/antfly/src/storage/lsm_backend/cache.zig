@@ -136,8 +136,8 @@ pub const Cache = struct {
     const Shard = struct {
         mutex: std.atomic.Mutex = .unlocked,
         entries: EntryMap = .empty,
-        lru_heads: [priority_count]?*Entry = [_]?*Entry{null} ** priority_count,
-        lru_tails: [priority_count]?*Entry = [_]?*Entry{null} ** priority_count,
+        lru_heads: [priority_count]?*Entry = @as([priority_count]?*Entry, @splat(null)),
+        lru_tails: [priority_count]?*Entry = @as([priority_count]?*Entry, @splat(null)),
         pending_sync: PendingSync = .{},
         pending_loads: PendingMap = .empty,
     };

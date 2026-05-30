@@ -633,9 +633,9 @@ test "makeTrainerInput populates the expected fields for sequence classification
     const batch: u32 = 2;
     const seq_len: u32 = 8;
 
-    var input_ids = [_]i64{0} ** (2 * 8);
-    var mask = [_]f32{1.0} ** (2 * 8);
-    var targets = [_]f32{0.0} ** (2 * 4);
+    var input_ids = @as([(2 * 8)]i64, @splat(0));
+    var mask = @as([(2 * 8)]f32, @splat(1.0));
+    var targets = @as([(2 * 4)]f32, @splat(0.0));
     // Mark each example's class.
     targets[0 * 4 + 0] = 1.0; // example 0 → class 0
     targets[1 * 4 + 2] = 1.0; // example 1 → class 2
@@ -686,7 +686,7 @@ test "makeTrainerInput populates the expected fields for token classification" {
 
     var input_ids = [_]i64{ 1, 2, 3, 4 };
     var mask = [_]f32{ 1.0, 1.0, 1.0, 0.0 };
-    var targets = [_]f32{0.0} ** (1 * 4 * 7);
+    var targets = @as([(1 * 4 * 7)]f32, @splat(0.0));
     // Set a valid class for each non-padded token.
     targets[0 * 7 + 3] = 1.0;
     targets[1 * 7 + 0] = 1.0;

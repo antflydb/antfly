@@ -162,7 +162,7 @@ test "antfly trace writer emits valid ndjson" {
     const keys = [_][]const u8{ "key1", "key2" };
     const event = AntflyTracingEvent{
         .name = "WriteIntentOnShard",
-        .txn_id = [_]u8{0x55} ** 16,
+        .txn_id = @as([16]u8, @splat(0x55)),
         .shard_id = "42",
         .write_keys = keys[0..],
         .timestamp = 100,

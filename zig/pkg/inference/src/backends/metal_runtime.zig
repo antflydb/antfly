@@ -3717,11 +3717,11 @@ pub fn decoderRuntimeTransposeF32Device(
     if (!input.isDevice()) return null;
     const rank = input_shape.len;
     if (rank == 0 or rank > 8 or perm_u8.len != rank or output_shape.len != rank) return null;
-    var dims: [8]u32 = [_]u32{1} ** 8;
-    var in_strides: [8]u32 = [_]u32{0} ** 8;
-    var out_strides: [8]u32 = [_]u32{0} ** 8;
-    var perm: [8]u32 = [_]u32{0} ** 8;
-    var seen: [8]bool = [_]bool{false} ** 8;
+    var dims: [8]u32 = @as([8]u32, @splat(1));
+    var in_strides: [8]u32 = @as([8]u32, @splat(0));
+    var out_strides: [8]u32 = @as([8]u32, @splat(0));
+    var perm: [8]u32 = @as([8]u32, @splat(0));
+    var seen: [8]bool = @as([8]bool, @splat(false));
 
     var total: usize = 1;
     for (input_shape, 0..) |dim_i64, idx| {
@@ -5296,9 +5296,9 @@ pub const RawRuntimeMemoryStats = extern struct {
     last_frame_compute_region_layer_count: u64 = 0,
     last_frame_compute_region_other_count: u64 = 0,
     last_frame_planned_command_op_count: u64 = 0,
-    last_frame_planned_command_op_kind_counts: [32]u64 = [_]u64{0} ** 32,
-    last_frame_planned_command_operator_counts: [16]u64 = [_]u64{0} ** 16,
-    last_frame_planned_command_quant_dispatch_counts: [4]u64 = [_]u64{0} ** 4,
+    last_frame_planned_command_op_kind_counts: [32]u64 = @as([32]u64, @splat(0)),
+    last_frame_planned_command_operator_counts: [16]u64 = @as([16]u64, @splat(0)),
+    last_frame_planned_command_quant_dispatch_counts: [4]u64 = @as([4]u64, @splat(0)),
     last_frame_blit_buffer_upload_count: u64 = 0,
     last_frame_blit_buffer_copy_count: u64 = 0,
     last_frame_blit_buffer_slice_count: u64 = 0,
@@ -5318,7 +5318,7 @@ pub const RawRuntimeMemoryStats = extern struct {
     q8_0_linear_mm_f16_input: u64 = 0,
     q8_0_pair_activation_rms_scale_mmv_f16_output: u64 = 0,
     q8_0_linear_mmv_f16_input: u64 = 0,
-    q8_0_linear_family_dispatch_counts: [12][4]u64 = [_][4]u64{[_]u64{0} ** 4} ** 12,
+    q8_0_linear_family_dispatch_counts: [12][4]u64 = @as([12][4]u64, @splat(@as([4]u64, @splat(0)))),
 };
 
 pub extern fn termite_metal_device_available() c_int;
@@ -16212,7 +16212,7 @@ test "metal native decoderRuntimeApplyLinear q8_0 matches trivial reference" {
 
     const in_dim: usize = 32;
     const out_dim: usize = 2;
-    var weight_raw: [68]u8 = [_]u8{0} ** 68;
+    var weight_raw: [68]u8 = @as([68]u8, @splat(0));
 
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C;
@@ -16247,7 +16247,7 @@ test "metal native decoderRuntimeApplyLinear q8_0 matches trivial reference" {
         .retain_dense_fallback = false,
     }, &stats));
 
-    const input_data = [_]f32{1.0} ** in_dim;
+    const input_data = @as([in_dim]f32, @splat(1.0));
     var input = try MetalTensor.ownedCloneFrom(&input_data, &[_]i32{ 1, @intCast(in_dim) });
     defer input.deinit();
 
@@ -16277,7 +16277,7 @@ test "metal native decoderRuntimeApplyLinear nvfp4 matches trivial reference" {
 
     const in_dim: usize = 64;
     const out_dim: usize = 1;
-    var weight_raw: [36]u8 = [_]u8{0} ** 36;
+    var weight_raw: [36]u8 = @as([36]u8, @splat(0));
     for (0..4) |i| weight_raw[i] = 0x40;
     for (4..36) |i| weight_raw[i] = 0x11;
 
@@ -16306,7 +16306,7 @@ test "metal native decoderRuntimeApplyLinear nvfp4 matches trivial reference" {
         .retain_dense_fallback = false,
     }, &stats));
 
-    const input_data = [_]f32{1.0} ** in_dim;
+    const input_data = @as([in_dim]f32, @splat(1.0));
     var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ 1, @intCast(in_dim) });
     defer input.deinit();
     var output = (try decoderRuntimeApplyLinear(&provider, .{
@@ -16334,7 +16334,7 @@ test "metal native decoderRuntimeApplyLinear iq2_xs matches trivial reference" {
 
     const in_dim: usize = 256;
     const out_dim: usize = 1;
-    var weight_raw: [74]u8 = [_]u8{0} ** 74;
+    var weight_raw: [74]u8 = @as([74]u8, @splat(0));
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C;
 
@@ -16363,7 +16363,7 @@ test "metal native decoderRuntimeApplyLinear iq2_xs matches trivial reference" {
         .retain_dense_fallback = false,
     }, &stats));
 
-    const input_data = [_]f32{1.0} ** in_dim;
+    const input_data = @as([in_dim]f32, @splat(1.0));
     var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ 1, @intCast(in_dim) });
     defer input.deinit();
     var output = (try decoderRuntimeApplyLinear(&provider, .{
@@ -16406,7 +16406,7 @@ test "metal native decoderRuntimeApplyLinear tl1 matches trivial reference" {
         .allocator = std.testing.allocator,
     };
 
-    var bias_data = [_]f32{0.0} ** out_dim;
+    var bias_data = @as([out_dim]f32, @splat(0.0));
     var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
     defer bias.deinit();
     var dummy_weight_value = [_]f32{0.0};
@@ -16422,7 +16422,7 @@ test "metal native decoderRuntimeApplyLinear tl1 matches trivial reference" {
         .retain_dense_fallback = false,
     }, &stats));
 
-    var input_data = [_]f32{1.0} ** in_dim;
+    var input_data = @as([in_dim]f32, @splat(1.0));
     var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ 1, @intCast(in_dim) });
     defer input.deinit();
     var output = (try decoderRuntimeApplyLinear(&provider, .{
@@ -16469,7 +16469,7 @@ test "metal native decoderRuntimeApplyLinear tl2 matches trivial reference" {
         .allocator = std.testing.allocator,
     };
 
-    var bias_data = [_]f32{0.0} ** out_dim;
+    var bias_data = @as([out_dim]f32, @splat(0.0));
     var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
     defer bias.deinit();
     var dummy_weight_value = [_]f32{0.0};
@@ -16485,7 +16485,7 @@ test "metal native decoderRuntimeApplyLinear tl2 matches trivial reference" {
         .retain_dense_fallback = false,
     }, &stats));
 
-    var input_data = [_]f32{1.0} ** in_dim;
+    var input_data = @as([in_dim]f32, @splat(1.0));
     var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ 1, @intCast(in_dim) });
     defer input.deinit();
     var output = (try decoderRuntimeApplyLinear(&provider, .{
@@ -16516,7 +16516,7 @@ test "metal native quant row ops q8_0 linear slot match reference" {
     const dim: usize = 32;
     const source_rows: usize = 3;
     const row_bytes: usize = 34;
-    var weight_raw: [source_rows * row_bytes]u8 = [_]u8{0} ** (source_rows * row_bytes);
+    var weight_raw: [source_rows * row_bytes]u8 = @as([(source_rows * row_bytes)]u8, @splat(0));
     for (0..source_rows) |row| {
         const base = row * row_bytes;
         weight_raw[base + 0] = 0x00;
@@ -16536,7 +16536,7 @@ test "metal native quant row ops q8_0 linear slot match reference" {
         .allocator = std.testing.allocator,
     };
 
-    const bias_data = [_]f32{0.0} ** source_rows;
+    const bias_data = @as([source_rows]f32, @splat(0.0));
     var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(source_rows)});
     defer bias.deinit();
     var dummy_weight_value = [_]f32{0.0};
@@ -16685,7 +16685,7 @@ test "metal native quant row ops q4_0 writeback linear slot match reference" {
     const dim: usize = 32;
     const source_rows: usize = 3;
     const row_bytes: usize = 18;
-    var weight_raw: [source_rows * row_bytes]u8 = [_]u8{0} ** (source_rows * row_bytes);
+    var weight_raw: [source_rows * row_bytes]u8 = @as([(source_rows * row_bytes)]u8, @splat(0));
     var seed_dense: [dim]f32 = undefined;
     for (0..source_rows) |row| {
         for (&seed_dense, 0..) |*value, col| {
@@ -16704,7 +16704,7 @@ test "metal native quant row ops q4_0 writeback linear slot match reference" {
         .allocator = std.testing.allocator,
     };
 
-    const bias_data = [_]f32{0.0} ** source_rows;
+    const bias_data = @as([source_rows]f32, @splat(0.0));
     var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(source_rows)});
     defer bias.deinit();
     var dummy_weight_value = [_]f32{0.0};
@@ -16815,7 +16815,7 @@ test "metal native quant row ops q5_0 writeback linear slot match reference" {
     const dim: usize = 32;
     const source_rows: usize = 3;
     const row_bytes: usize = 22;
-    var weight_raw: [source_rows * row_bytes]u8 = [_]u8{0} ** (source_rows * row_bytes);
+    var weight_raw: [source_rows * row_bytes]u8 = @as([(source_rows * row_bytes)]u8, @splat(0));
     var seed_dense: [dim]f32 = undefined;
     for (0..source_rows) |row| {
         for (&seed_dense, 0..) |*value, col| {
@@ -16834,7 +16834,7 @@ test "metal native quant row ops q5_0 writeback linear slot match reference" {
         .allocator = std.testing.allocator,
     };
 
-    const bias_data = [_]f32{0.0} ** source_rows;
+    const bias_data = @as([source_rows]f32, @splat(0.0));
     var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(source_rows)});
     defer bias.deinit();
     var dummy_weight_value = [_]f32{0.0};
@@ -16945,7 +16945,7 @@ test "metal native quant row ops q4_1 writeback linear slot match reference" {
     const dim: usize = 32;
     const source_rows: usize = 3;
     const row_bytes: usize = 20;
-    var weight_raw: [source_rows * row_bytes]u8 = [_]u8{0} ** (source_rows * row_bytes);
+    var weight_raw: [source_rows * row_bytes]u8 = @as([(source_rows * row_bytes)]u8, @splat(0));
     var seed_dense: [dim]f32 = undefined;
     for (0..source_rows) |row| {
         for (&seed_dense, 0..) |*value, col| {
@@ -16964,7 +16964,7 @@ test "metal native quant row ops q4_1 writeback linear slot match reference" {
         .allocator = std.testing.allocator,
     };
 
-    const bias_data = [_]f32{0.0} ** source_rows;
+    const bias_data = @as([source_rows]f32, @splat(0.0));
     var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(source_rows)});
     defer bias.deinit();
     var dummy_weight_value = [_]f32{0.0};
@@ -17061,7 +17061,7 @@ test "metal native quant row ops q5_1 writeback linear slot match reference" {
     const dim: usize = 32;
     const source_rows: usize = 3;
     const row_bytes: usize = 24;
-    var weight_raw: [source_rows * row_bytes]u8 = [_]u8{0} ** (source_rows * row_bytes);
+    var weight_raw: [source_rows * row_bytes]u8 = @as([(source_rows * row_bytes)]u8, @splat(0));
     var seed_dense: [dim]f32 = undefined;
     for (0..source_rows) |row| {
         for (&seed_dense, 0..) |*value, col| {
@@ -17080,7 +17080,7 @@ test "metal native quant row ops q5_1 writeback linear slot match reference" {
         .allocator = std.testing.allocator,
     };
 
-    const bias_data = [_]f32{0.0} ** source_rows;
+    const bias_data = @as([source_rows]f32, @splat(0.0));
     var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(source_rows)});
     defer bias.deinit();
     var dummy_weight_value = [_]f32{0.0};
@@ -17177,7 +17177,7 @@ test "metal native quant row ops q8_1 writeback linear slot match reference" {
     const dim: usize = 32;
     const source_rows: usize = 3;
     const row_bytes: usize = 36;
-    var weight_raw: [source_rows * row_bytes]u8 = [_]u8{0} ** (source_rows * row_bytes);
+    var weight_raw: [source_rows * row_bytes]u8 = @as([(source_rows * row_bytes)]u8, @splat(0));
     var seed_dense: [dim]f32 = undefined;
     for (0..source_rows) |row| {
         for (&seed_dense, 0..) |*value, col| {
@@ -17196,7 +17196,7 @@ test "metal native quant row ops q8_1 writeback linear slot match reference" {
         .allocator = std.testing.allocator,
     };
 
-    const bias_data = [_]f32{0.0} ** source_rows;
+    const bias_data = @as([source_rows]f32, @splat(0.0));
     var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(source_rows)});
     defer bias.deinit();
     var dummy_weight_value = [_]f32{0.0};
@@ -17293,7 +17293,7 @@ test "metal native quant row ops q6_k writeback linear slot match reference" {
     const dim: usize = 256;
     const source_rows: usize = 3;
     const row_bytes: usize = 210;
-    var weight_raw: [source_rows * row_bytes]u8 = [_]u8{0} ** (source_rows * row_bytes);
+    var weight_raw: [source_rows * row_bytes]u8 = @as([(source_rows * row_bytes)]u8, @splat(0));
     var seed_dense: [dim]f32 = undefined;
     for (0..source_rows) |row| {
         for (&seed_dense, 0..) |*value, col| {
@@ -17312,7 +17312,7 @@ test "metal native quant row ops q6_k writeback linear slot match reference" {
         .allocator = std.testing.allocator,
     };
 
-    const bias_data = [_]f32{0.0} ** source_rows;
+    const bias_data = @as([source_rows]f32, @splat(0.0));
     var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(source_rows)});
     defer bias.deinit();
     var dummy_weight_value = [_]f32{0.0};
@@ -17409,7 +17409,7 @@ test "metal native quant row ops q4_k writeback linear slot match reference" {
     const dim: usize = 256;
     const source_rows: usize = 3;
     const row_bytes: usize = 144;
-    var weight_raw: [source_rows * row_bytes]u8 = [_]u8{0} ** (source_rows * row_bytes);
+    var weight_raw: [source_rows * row_bytes]u8 = @as([(source_rows * row_bytes)]u8, @splat(0));
     var seed_dense: [dim]f32 = undefined;
     for (0..source_rows) |row| {
         for (&seed_dense, 0..) |*value, col| {
@@ -17428,7 +17428,7 @@ test "metal native quant row ops q4_k writeback linear slot match reference" {
         .allocator = std.testing.allocator,
     };
 
-    const bias_data = [_]f32{0.0} ** source_rows;
+    const bias_data = @as([source_rows]f32, @splat(0.0));
     var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(source_rows)});
     defer bias.deinit();
     var dummy_weight_value = [_]f32{0.0};
@@ -17525,7 +17525,7 @@ test "metal native quant row ops q5_k writeback linear slot match reference" {
     const dim: usize = 256;
     const source_rows: usize = 3;
     const row_bytes: usize = 176;
-    var weight_raw: [source_rows * row_bytes]u8 = [_]u8{0} ** (source_rows * row_bytes);
+    var weight_raw: [source_rows * row_bytes]u8 = @as([(source_rows * row_bytes)]u8, @splat(0));
     var seed_dense: [dim]f32 = undefined;
     for (0..source_rows) |row| {
         for (&seed_dense, 0..) |*value, col| {
@@ -17544,7 +17544,7 @@ test "metal native quant row ops q5_k writeback linear slot match reference" {
         .allocator = std.testing.allocator,
     };
 
-    const bias_data = [_]f32{0.0} ** source_rows;
+    const bias_data = @as([source_rows]f32, @splat(0.0));
     var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(source_rows)});
     defer bias.deinit();
     var dummy_weight_value = [_]f32{0.0};
@@ -17641,7 +17641,7 @@ test "metal native quant embedding lookup q4_0 uses generic row kernel" {
     const dim: usize = 32;
     const source_rows: usize = 2;
     const row_bytes: usize = 18;
-    var weight_raw: [source_rows * row_bytes]u8 = [_]u8{0} ** (source_rows * row_bytes);
+    var weight_raw: [source_rows * row_bytes]u8 = @as([(source_rows * row_bytes)]u8, @splat(0));
     for (0..source_rows) |row| {
         const base = row * row_bytes;
         weight_raw[base + 0] = 0x00;
@@ -17730,7 +17730,7 @@ test "metal native decoderRuntimeApplyLinear q8_0 device rows match reference" {
     const out_dim: usize = 257;
     const row_blocks = in_dim / 32;
     const block_bytes = 34;
-    var weight_raw: [out_dim * row_blocks * block_bytes]u8 = [_]u8{0} ** (out_dim * row_blocks * block_bytes);
+    var weight_raw: [out_dim * row_blocks * block_bytes]u8 = @as([(out_dim * row_blocks * block_bytes)]u8, @splat(0));
 
     for (0..out_dim) |o| {
         for (0..row_blocks) |b| {
@@ -17838,8 +17838,8 @@ test "metal native decoderRuntimeApplyLinear q4_k device rows match reference" {
     const q4k_values_per_block: usize = 256;
     const q4k_bytes_per_block: usize = 144;
     const row_bytes: usize = (in_dim / q4k_values_per_block) * q4k_bytes_per_block;
-    var weight_raw: [out_dim * row_bytes]u8 = [_]u8{0} ** (out_dim * row_bytes);
-    var prepared_poison: [out_dim * row_bytes]u8 = [_]u8{0xA5} ** (out_dim * row_bytes);
+    var weight_raw: [out_dim * row_bytes]u8 = @as([(out_dim * row_bytes)]u8, @splat(0));
+    var prepared_poison: [out_dim * row_bytes]u8 = @as([(out_dim * row_bytes)]u8, @splat(0xA5));
     var seed_dense: [in_dim]f32 = undefined;
     for (0..out_dim) |row| {
         for (&seed_dense, 0..) |*value, col| {
@@ -17866,7 +17866,7 @@ test "metal native decoderRuntimeApplyLinear q4_k device rows match reference" {
     storage.setPreparedBytes(.row_major_blocks, prepared_poison_owned, 0, 0);
     defer storage.prepared.deinit(std.testing.allocator);
 
-    const bias_data = [_]f32{0.0} ** out_dim;
+    const bias_data = @as([out_dim]f32, @splat(0.0));
     var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
     defer bias.deinit();
     var dummy_weight_value = [_]f32{0.0};
@@ -18129,8 +18129,8 @@ test "metal native decoderRuntimeApplyLinearPair q8_0 device rows use mm dispatc
     const out_dim: usize = 17;
     const row_blocks = in_dim / 32;
     const block_bytes = 34;
-    var weight_a_raw: [out_dim * row_blocks * block_bytes]u8 = [_]u8{0} ** (out_dim * row_blocks * block_bytes);
-    var weight_b_raw: [out_dim * row_blocks * block_bytes]u8 = [_]u8{0} ** (out_dim * row_blocks * block_bytes);
+    var weight_a_raw: [out_dim * row_blocks * block_bytes]u8 = @as([(out_dim * row_blocks * block_bytes)]u8, @splat(0));
+    var weight_b_raw: [out_dim * row_blocks * block_bytes]u8 = @as([(out_dim * row_blocks * block_bytes)]u8, @splat(0));
 
     const fillQ80 = struct {
         fn run(bytes: []u8, seed: usize, out: usize, blocks: usize) void {
@@ -18167,7 +18167,7 @@ test "metal native decoderRuntimeApplyLinearPair q8_0 device rows use mm dispatc
         .allocator = std.testing.allocator,
     };
 
-    const bias_data = [_]f32{0.0} ** out_dim;
+    const bias_data = @as([out_dim]f32, @splat(0.0));
     var bias_a = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
     defer bias_a.deinit();
     var bias_b = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
@@ -18542,7 +18542,7 @@ test "metal native activation host ABI copies fallback output buffer" {
     }
 
     for (kinds) |kind| {
-        var output_backing: [dim + 1]f32 = [_]f32{std.math.nan(f32)} ** (dim + 1);
+        var output_backing: [dim + 1]f32 = @as([(dim + 1)]f32, @splat(std.math.nan(f32)));
         const output = output_backing[1..][0..dim];
         const rc = termite_metal_decode_runtime_apply_activation(
             runtime,
@@ -18700,8 +18700,8 @@ test "metal native PLE residual q8_0 single row matches decomposed device path" 
         .allocator = std.testing.allocator,
     };
 
-    var gate_bias_data = [_]f32{0.0} ** ple_hidden_size;
-    var proj_bias_data = [_]f32{0.0} ** hidden_size;
+    var gate_bias_data = @as([ple_hidden_size]f32, @splat(0.0));
+    var proj_bias_data = @as([hidden_size]f32, @splat(0.0));
     var gate_bias = try MetalTensor.ownedCloneFrom(&gate_bias_data, &[_]i32{@intCast(ple_hidden_size)});
     defer gate_bias.deinit();
     var proj_bias = try MetalTensor.ownedCloneFrom(&proj_bias_data, &[_]i32{@intCast(hidden_size)});
@@ -18728,7 +18728,7 @@ test "metal native PLE residual q8_0 single row matches decomposed device path" 
         .retain_dense_fallback = false,
     }, &prep_stats));
 
-    var norm_weight_data = [_]f32{1.0} ** hidden_size;
+    var norm_weight_data = @as([hidden_size]f32, @splat(1.0));
     for (&norm_weight_data, 0..) |*value, i| {
         value.* = 0.75 + @as(f32, @floatFromInt(i % 7)) * 0.05;
     }
@@ -18890,8 +18890,8 @@ test "metal native PLE residual q4_0 uses generic device descriptor path" {
         .allocator = std.testing.allocator,
     };
 
-    var gate_bias_data = [_]f32{0.0} ** ple_hidden_size;
-    var proj_bias_data = [_]f32{0.0} ** hidden_size;
+    var gate_bias_data = @as([ple_hidden_size]f32, @splat(0.0));
+    var proj_bias_data = @as([hidden_size]f32, @splat(0.0));
     var gate_bias = try MetalTensor.ownedCloneFrom(&gate_bias_data, &[_]i32{@intCast(ple_hidden_size)});
     defer gate_bias.deinit();
     var proj_bias = try MetalTensor.ownedCloneFrom(&proj_bias_data, &[_]i32{@intCast(hidden_size)});
@@ -18918,7 +18918,7 @@ test "metal native PLE residual q4_0 uses generic device descriptor path" {
         .retain_dense_fallback = false,
     }, &prep_stats));
 
-    var norm_weight_data = [_]f32{1.0} ** hidden_size;
+    var norm_weight_data = @as([hidden_size]f32, @splat(1.0));
     for (&norm_weight_data, 0..) |*value, i| value.* = 0.8 + @as(f32, @floatFromInt(i % 5)) * 0.03;
     var norm_weight = try MetalTensor.ownedCloneFrom(&norm_weight_data, &[_]i32{@intCast(hidden_size)});
     defer norm_weight.deinit();
@@ -19018,7 +19018,7 @@ test "metal native decoderRuntimeApplyRmsNorm plus q8_0 linear matches reference
 
     const hidden_size: usize = 32;
     const out_dim: usize = 2;
-    var weight_raw: [68]u8 = [_]u8{0} ** 68;
+    var weight_raw: [68]u8 = @as([68]u8, @splat(0));
 
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C;
@@ -19037,7 +19037,7 @@ test "metal native decoderRuntimeApplyRmsNorm plus q8_0 linear matches reference
         .allocator = std.testing.allocator,
     };
 
-    const rms_weight_data = [_]f32{1.0} ** hidden_size;
+    const rms_weight_data = @as([hidden_size]f32, @splat(1.0));
     var rms_weight = try MetalTensor.ownedCloneFrom(&rms_weight_data, &[_]i32{@intCast(hidden_size)});
     defer rms_weight.deinit();
     try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{
@@ -19165,10 +19165,10 @@ test "metal native q8_0 qkv scratch supports batched rows" {
     var v_weight = try makePatternQ80Weight(std.testing.allocator, kv_out_dim, hidden_size, 11);
     defer std.testing.allocator.free(v_weight.bytes);
 
-    const zero_q_bias_data = [_]f32{0.0} ** q_out_dim;
+    const zero_q_bias_data = @as([q_out_dim]f32, @splat(0.0));
     var q_bias = try MetalTensor.ownedCloneFrom(&zero_q_bias_data, &[_]i32{@intCast(q_out_dim)});
     defer q_bias.deinit();
-    const zero_kv_bias_data = [_]f32{0.0} ** kv_out_dim;
+    const zero_kv_bias_data = @as([kv_out_dim]f32, @splat(0.0));
     var k_bias = try MetalTensor.ownedCloneFrom(&zero_kv_bias_data, &[_]i32{@intCast(kv_out_dim)});
     defer k_bias.deinit();
     var v_bias = try MetalTensor.ownedCloneFrom(&zero_kv_bias_data, &[_]i32{@intCast(kv_out_dim)});
@@ -19308,16 +19308,16 @@ test "metal native q8_0 gated ffn batched matches rowwise" {
     var down_weight = try makeUniformQ80Weight(std.testing.allocator, hidden_size, intermediate_size, 1);
     defer std.testing.allocator.free(down_weight.bytes);
 
-    const zero_intermediate_bias_data = [_]f32{0.0} ** intermediate_size;
+    const zero_intermediate_bias_data = @as([intermediate_size]f32, @splat(0.0));
     var gate_bias = try MetalTensor.ownedCloneFrom(&zero_intermediate_bias_data, &[_]i32{@intCast(intermediate_size)});
     defer gate_bias.deinit();
     var up_bias = try MetalTensor.ownedCloneFrom(&zero_intermediate_bias_data, &[_]i32{@intCast(intermediate_size)});
     defer up_bias.deinit();
-    const zero_hidden_bias_data = [_]f32{0.0} ** hidden_size;
+    const zero_hidden_bias_data = @as([hidden_size]f32, @splat(0.0));
     var down_bias = try MetalTensor.ownedCloneFrom(&zero_hidden_bias_data, &[_]i32{@intCast(hidden_size)});
     defer down_bias.deinit();
 
-    const rms_weight_data = [_]f32{1.0} ** hidden_size;
+    const rms_weight_data = @as([hidden_size]f32, @splat(1.0));
     var post_down_rms_weight = try MetalTensor.ownedCloneFrom(&rms_weight_data, &[_]i32{@intCast(hidden_size)});
     defer post_down_rms_weight.deinit();
     try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{
@@ -19373,7 +19373,7 @@ test "metal native q8_0 gated ffn batched matches rowwise" {
     for (&input_data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i % hidden_size) + 1)))) * 0.125;
     for (&residual_data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i % hidden_size) + 3)))) * 0.0625;
 
-    var batched_output = [_]f32{0.0} ** (rows * hidden_size);
+    var batched_output = @as([(rows * hidden_size)]f32, @splat(0.0));
     var stats: ops.NativeQuantTimingStats = .{};
     var logged_unsupported_type = false;
     try std.testing.expect(try tryRawQuantizedGatedFfnResidualHost(&provider, .{
@@ -19391,7 +19391,7 @@ test "metal native q8_0 gated ffn batched matches rowwise" {
         .output = &batched_output,
     }, &stats, &logged_unsupported_type));
 
-    var rowwise_output = [_]f32{0.0} ** (rows * hidden_size);
+    var rowwise_output = @as([(rows * hidden_size)]f32, @splat(0.0));
     for (0..rows) |row| {
         const row_offset = row * hidden_size;
         try std.testing.expect(try tryRawQuantizedGatedFfnResidualHost(&provider, .{
@@ -19472,12 +19472,12 @@ test "metal native q8_0 gated ffn device frame matches decomposed" {
     var down_weight = try makePatternQ80Weight(std.testing.allocator, hidden_size, intermediate_size, 13);
     defer std.testing.allocator.free(down_weight.bytes);
 
-    const zero_intermediate_bias_data = [_]f32{0.0} ** intermediate_size;
+    const zero_intermediate_bias_data = @as([intermediate_size]f32, @splat(0.0));
     var gate_bias = try MetalTensor.ownedCloneFrom(&zero_intermediate_bias_data, &[_]i32{@intCast(intermediate_size)});
     defer gate_bias.deinit();
     var up_bias = try MetalTensor.ownedCloneFrom(&zero_intermediate_bias_data, &[_]i32{@intCast(intermediate_size)});
     defer up_bias.deinit();
-    const zero_hidden_bias_data = [_]f32{0.0} ** hidden_size;
+    const zero_hidden_bias_data = @as([hidden_size]f32, @splat(0.0));
     var down_bias = try MetalTensor.ownedCloneFrom(&zero_hidden_bias_data, &[_]i32{@intCast(hidden_size)});
     defer down_bias.deinit();
 
@@ -19889,10 +19889,10 @@ test "metal native planned q8_0 attention ffn ple block matches decomposed" {
         .intermediate_size = intermediate_size,
         .ple_hidden_size = ple_hidden_size,
     });
-    var planned_ops = [_]u16{0} ** 16;
-    var planned_barriers = [_]u8{0} ** 16;
-    var planned_dispatches = [_]u8{255} ** 16;
-    var planned_command_ops = [_]ops.PlannedCommandOp{.{}} ** 16;
+    var planned_ops = @as([16]u16, @splat(0));
+    var planned_barriers = @as([16]u8, @splat(0));
+    var planned_dispatches = @as([16]u8, @splat(255));
+    var planned_command_ops = @as([16]ops.PlannedCommandOp, @splat(.{}));
     const planned_contract = plannedContractFromCommandPlan(layer_plan.commandView(), &planned_ops, &planned_barriers, &planned_dispatches, &planned_command_ops, 3);
 
     try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(
@@ -20024,10 +20024,10 @@ test "metal native planned q8_0 attention ffn ple block matches decomposed" {
         .intermediate_size = intermediate_size,
         .ple_hidden_size = ple_hidden_size,
     });
-    var paged_planned_ops = [_]u16{0} ** 16;
-    var paged_planned_barriers = [_]u8{0} ** 16;
-    var paged_planned_dispatches = [_]u8{255} ** 16;
-    var paged_planned_command_ops = [_]ops.PlannedCommandOp{.{}} ** 16;
+    var paged_planned_ops = @as([16]u16, @splat(0));
+    var paged_planned_barriers = @as([16]u8, @splat(0));
+    var paged_planned_dispatches = @as([16]u8, @splat(255));
+    var paged_planned_command_ops = @as([16]ops.PlannedCommandOp, @splat(.{}));
     const paged_planned_contract = plannedContractFromCommandPlan(
         paged_layer_plan.commandView(),
         &paged_planned_ops,
@@ -20343,7 +20343,7 @@ test "metal native decoder runtime prepares rms norm from device weight without 
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
 
     const hidden_size: usize = 32;
-    const weight_data = [_]f32{1.0} ** hidden_size;
+    const weight_data = @as([hidden_size]f32, @splat(1.0));
     var weight = try testDeviceTensorFromSlice(runtime, &weight_data, &[_]i32{@intCast(hidden_size)});
     defer weight.deinit();
 
@@ -21000,7 +21000,7 @@ test "metal native decoder runtime activation scratch pool and hidden state" {
 
     // Scratch pool acquisition returns distinct handles until exhausted.
     const capacity = 16; // TERMITE_METAL_SCRATCH_POOL_CAPACITY
-    var handles: [capacity]?*anyopaque = [_]?*anyopaque{null} ** capacity;
+    var handles: [capacity]?*anyopaque = @as([capacity]?*anyopaque, @splat(null));
     var acquired: usize = 0;
     errdefer for (handles[0..acquired]) |h| {
         if (h) |ptr| releaseScratch(runtime, ptr);
@@ -21033,7 +21033,7 @@ test "metal native decoder runtime activation scratch pool and hidden state" {
     for (handles[0..capacity]) |h| {
         if (h) |ptr| releaseScratch(runtime, ptr);
     }
-    handles = [_]?*anyopaque{null} ** capacity;
+    handles = @as([capacity]?*anyopaque, @splat(null));
     acquired = 0;
 
     // Inside an active/submitted frame, release retires the slot until the
@@ -21375,8 +21375,8 @@ test "planned compute sequence exports active typed contract" {
         .next_planned_op = 1,
         .active_scope_index = 0,
     };
-    var op_storage = [_]u16{0} ** 3;
-    var barrier_storage = [_]u8{0} ** 3;
+    var op_storage = @as([3]u16, @splat(0));
+    var barrier_storage = @as([3]u8, @splat(0));
     const contract = sequence.exportActiveContract(&op_storage, &barrier_storage);
 
     try std.testing.expectEqual(@as(usize, 1), contract.start_index);
@@ -21410,10 +21410,10 @@ test "planned compute sequence exports active command contract" {
         .next_planned_op = 1,
         .active_scope_index = 0,
     };
-    var op_storage = [_]u16{0} ** 3;
-    var barrier_storage = [_]u8{0} ** 3;
-    var quant_dispatch_storage = [_]u8{0} ** 3;
-    var command_op_storage = [_]ops.PlannedCommandOp{.{}} ** 3;
+    var op_storage = @as([3]u16, @splat(0));
+    var barrier_storage = @as([3]u8, @splat(0));
+    var quant_dispatch_storage = @as([3]u8, @splat(0));
+    var command_op_storage = @as([3]ops.PlannedCommandOp, @splat(.{}));
     const contract = sequence.exportActiveCommandContract(
         &op_storage,
         &barrier_storage,
@@ -21471,8 +21471,8 @@ test "planned contract exports whole plan without active sequence state" {
             .barrier_count = 2,
         },
     };
-    var op_storage = [_]u16{0} ** 3;
-    var barrier_storage = [_]u8{0} ** 3;
+    var op_storage = @as([3]u16, @splat(0));
+    var barrier_storage = @as([3]u8, @splat(0));
     const contract = plannedContractFromPlan(
         .{
             .planned_ops = &planned_ops,
@@ -21503,10 +21503,10 @@ test "planned command contract exports quant matmul dispatches" {
         .vocab_size = 262144,
     });
 
-    var op_storage = [_]u16{0} ** 3;
-    var barrier_storage = [_]u8{0} ** 3;
-    var quant_dispatch_storage = [_]u8{0} ** 3;
-    var command_op_storage = [_]ops.PlannedCommandOp{.{}} ** 3;
+    var op_storage = @as([3]u16, @splat(0));
+    var barrier_storage = @as([3]u8, @splat(0));
+    var quant_dispatch_storage = @as([3]u8, @splat(0));
+    var command_op_storage = @as([3]ops.PlannedCommandOp, @splat(.{}));
     const contract = plannedContractFromCommandPlan(
         tail_plan.commandView(),
         &op_storage,
@@ -21564,10 +21564,10 @@ test "planned command contract exports activation dtypes" {
         .ple_hidden_size = 1024,
     });
 
-    var op_storage = [_]u16{0} ** 32;
-    var barrier_storage = [_]u8{0} ** 32;
-    var quant_dispatch_storage = [_]u8{0} ** 32;
-    var command_op_storage = [_]ops.PlannedCommandOp{.{}} ** 32;
+    var op_storage = @as([32]u16, @splat(0));
+    var barrier_storage = @as([32]u8, @splat(0));
+    var quant_dispatch_storage = @as([32]u8, @splat(0));
+    var command_op_storage = @as([32]ops.PlannedCommandOp, @splat(.{}));
     const contract = plannedContractFromCommandPlan(
         layer_plan.commandView(),
         &op_storage,
@@ -21606,10 +21606,10 @@ test "planned command contract storage exports global windows" {
         .vocab_size = 262144,
     });
 
-    var op_storage = [_]u16{0} ** 3;
-    var barrier_storage = [_]u8{0} ** 3;
-    var quant_dispatch_storage = [_]u8{0} ** 3;
-    var command_op_storage = [_]ops.PlannedCommandOp{.{}} ** 3;
+    var op_storage = @as([3]u16, @splat(0));
+    var barrier_storage = @as([3]u8, @splat(0));
+    var quant_dispatch_storage = @as([3]u8, @splat(0));
+    var command_op_storage = @as([3]ops.PlannedCommandOp, @splat(.{}));
     const ok = populatePlannedCommandContractStorage(tail_plan.commandView(), .{
         .ops = &op_storage,
         .barriers = &barrier_storage,

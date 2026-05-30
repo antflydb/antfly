@@ -711,7 +711,7 @@ fn initFromPieceSpecs(allocator: std.mem.Allocator, pieces_init: []const PieceIn
     var special_tokens = std.StringHashMap(void).init(allocator);
     defer special_tokens.deinit();
     var id_to_byte = std.AutoHashMap(i32, u8).init(allocator);
-    var byte_to_token: [256]?Token = .{null} ** 256;
+    var byte_to_token: [256]?Token = @splat(null);
     var unk_id: i32 = -1;
     var max_piece_length: usize = 0;
 
@@ -937,7 +937,7 @@ test "modelInfo discovers gemma bos eos control tokens" {
         .byte_fallback = false,
         .unk_surface = try allocator.dupe(u8, "<unk>"),
         .special_matcher = try PrefixMatcher.initFromMap(allocator, &special_tokens),
-        .byte_to_token = .{null} ** 256,
+        .byte_to_token = @splat(null),
         .id_to_byte = std.AutoHashMap(i32, u8).init(allocator),
         .extra_id_to_text = std.AutoHashMap(i32, []const u8).init(allocator),
         .max_vocab_id = 3,
@@ -992,7 +992,7 @@ test "external special token is encoded decoded and expands vocab" {
         .byte_fallback = false,
         .unk_surface = try allocator.dupe(u8, "<unk>"),
         .special_matcher = try PrefixMatcher.initFromMap(allocator, &special_tokens),
-        .byte_to_token = .{null} ** 256,
+        .byte_to_token = @splat(null),
         .id_to_byte = std.AutoHashMap(i32, u8).init(allocator),
         .extra_id_to_text = std.AutoHashMap(i32, []const u8).init(allocator),
         .max_vocab_id = 3,
@@ -1055,7 +1055,7 @@ test "external special token matches inline before trailing text" {
         .byte_fallback = false,
         .unk_surface = try allocator.dupe(u8, "<unk>"),
         .special_matcher = try PrefixMatcher.initFromMap(allocator, &special_tokens),
-        .byte_to_token = .{null} ** 256,
+        .byte_to_token = @splat(null),
         .id_to_byte = std.AutoHashMap(i32, u8).init(allocator),
         .extra_id_to_text = std.AutoHashMap(i32, []const u8).init(allocator),
         .max_vocab_id = 4,
@@ -1106,7 +1106,7 @@ test "normal angle-bracket piece matches inline as special" {
         .byte_fallback = false,
         .unk_surface = try allocator.dupe(u8, "<unk>"),
         .special_matcher = try PrefixMatcher.initFromMap(allocator, &special_tokens),
-        .byte_to_token = .{null} ** 256,
+        .byte_to_token = @splat(null),
         .id_to_byte = std.AutoHashMap(i32, u8).init(allocator),
         .extra_id_to_text = std.AutoHashMap(i32, []const u8).init(allocator),
         .max_vocab_id = 105,
@@ -1159,7 +1159,7 @@ test "encodeGeneration preserves inline specials after literal bos prefix" {
         .byte_fallback = false,
         .unk_surface = try allocator.dupe(u8, "<unk>"),
         .special_matcher = try PrefixMatcher.initFromMap(allocator, &special_tokens),
-        .byte_to_token = .{null} ** 256,
+        .byte_to_token = @splat(null),
         .id_to_byte = std.AutoHashMap(i32, u8).init(allocator),
         .extra_id_to_text = std.AutoHashMap(i32, []const u8).init(allocator),
         .max_vocab_id = 105,
@@ -1217,7 +1217,7 @@ test "encodeGeneration default mode does not preserve external specials after li
         .byte_fallback = false,
         .unk_surface = try allocator.dupe(u8, "<unk>"),
         .special_matcher = try PrefixMatcher.initFromMap(allocator, &special_tokens),
-        .byte_to_token = .{null} ** 256,
+        .byte_to_token = @splat(null),
         .id_to_byte = std.AutoHashMap(i32, u8).init(allocator),
         .extra_id_to_text = std.AutoHashMap(i32, []const u8).init(allocator),
         .max_vocab_id = 7,

@@ -640,7 +640,7 @@ test "compactDataBuf shifts remaining data to front" {
     defer s.deinit(allocator);
 
     // Append 128KB of data.
-    const chunk = "A" ** 1024;
+    const chunk = &@as([1024]u8, @splat('A'));
     for (0..128) |_| {
         try s.data_buf.appendSlice(allocator, chunk);
     }

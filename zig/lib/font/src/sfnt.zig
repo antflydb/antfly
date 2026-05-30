@@ -865,7 +865,7 @@ test "sfnt reader parses head maxp hhea and glyph range" {
 }
 
 test "sfnt reader rejects invalid scaler type" {
-    const bytes = [_]u8{ 0, 0, 0, 0 } ++ [_]u8{0} ** 8;
+    const bytes = [_]u8{ 0, 0, 0, 0 } ++ @as([8]u8, @splat(0));
     try std.testing.expectError(error.InvalidSfnt, Font.init(std.testing.allocator, &bytes));
 }
 

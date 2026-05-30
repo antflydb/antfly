@@ -3023,7 +3023,7 @@ test "boundary rerank uses explicit rerank boundary below candidate window" {
         .{ .vector_id = 3, .distance = 0.205, .error_bound = 0.02 },
         .{ .vector_id = 4, .distance = 0.50, .error_bound = 0.01 },
     };
-    var flags = [_]bool{false} ** ranked_items.len;
+    var flags = @as([ranked_items.len]bool, @splat(false));
     const selected = selectRerankCandidatesInto(flags[0..], ranked_items[0..], rerankBoundaryK(req), req, .boundary);
     try std.testing.expectEqual(@as(usize, 2), selected.top_k_count);
     try std.testing.expect(!selected.flags[0]);

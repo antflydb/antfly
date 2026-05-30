@@ -165,7 +165,7 @@ extern fn termite_metal_buffer_copy(
 ) c_int;
 
 pub const MetalTensor = struct {
-    shape_buf: [max_dims]i32 = [_]i32{0} ** max_dims,
+    shape_buf: [max_dims]i32 = @as([max_dims]i32, @splat(0)),
     shape_len: u8 = 0,
     dtype: DType = .f32,
 

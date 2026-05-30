@@ -3319,9 +3319,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .byte_offset = if (buf.metal_tensor) |*metal_tensor| metal_tensor.deviceByteOffset() else 0,
             .byte_len = if (buf.metal_tensor) |*metal_tensor| metal_tensor.deviceByteLen() else bufElemCount(buf) * @sizeOf(f32),
             .rank = in_shape.len,
-            .in_shape = [_]i64{0} ** metal_tensor_mod.max_dims,
-            .perm = [_]u8{0} ** metal_tensor_mod.max_dims,
-            .out_shape = [_]i64{0} ** metal_tensor_mod.max_dims,
+            .in_shape = @as([metal_tensor_mod.max_dims]i64, @splat(0)),
+            .perm = @as([metal_tensor_mod.max_dims]u8, @splat(0)),
+            .out_shape = @as([metal_tensor_mod.max_dims]i64, @splat(0)),
         };
         for (0..in_shape.len) |i| {
             key.in_shape[i] = in_shape[i];
@@ -4368,9 +4368,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const out_rank = @max(result_shape.len, @max(lhs_shape_i64.len, rhs_shape_i64.len));
         if (out_rank > metal_tensor_mod.max_dims) return error.UnsupportedShape;
 
-        var out_shape: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
-        var a_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
-        var b_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
+        var out_shape: [metal_tensor_mod.max_dims]i64 = @as([metal_tensor_mod.max_dims]i64, @splat(1));
+        var a_aligned: [metal_tensor_mod.max_dims]i64 = @as([metal_tensor_mod.max_dims]i64, @splat(1));
+        var b_aligned: [metal_tensor_mod.max_dims]i64 = @as([metal_tensor_mod.max_dims]i64, @splat(1));
         for (0..result_shape.len) |i| out_shape[out_rank - result_shape.len + i] = result_shape[i];
         for (0..lhs_shape_i64.len) |i| a_aligned[out_rank - lhs_shape_i64.len + i] = lhs_shape_i64[i];
         for (0..rhs_shape_i64.len) |i| b_aligned[out_rank - rhs_shape_i64.len + i] = rhs_shape_i64[i];
@@ -4627,9 +4627,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (out_rank > metal_tensor_mod.max_dims) return error.UnsupportedShape;
 
         var out_shape: [metal_tensor_mod.max_dims]i64 = undefined;
-        var cond_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
-        var true_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
-        var false_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
+        var cond_aligned: [metal_tensor_mod.max_dims]i64 = @as([metal_tensor_mod.max_dims]i64, @splat(1));
+        var true_aligned: [metal_tensor_mod.max_dims]i64 = @as([metal_tensor_mod.max_dims]i64, @splat(1));
+        var false_aligned: [metal_tensor_mod.max_dims]i64 = @as([metal_tensor_mod.max_dims]i64, @splat(1));
 
         for (0..cond_shape.len) |i| cond_aligned[out_rank - cond_shape.len + i] = cond_shape[i];
         for (0..true_shape.len) |i| true_aligned[out_rank - true_shape.len + i] = true_shape[i];
@@ -4904,8 +4904,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (output_elems > std.math.maxInt(u32) or input_strides_usize[axis] > std.math.maxInt(u32)) return null;
         computeStrides(output_shape_i64, output_strides_usize[0..output_shape_i64.len]);
 
-        var out_strides = [_]u32{0} ** metal_tensor_mod.max_dims;
-        var input_strides_for_out = [_]u32{0} ** metal_tensor_mod.max_dims;
+        var out_strides = @as([metal_tensor_mod.max_dims]u32, @splat(0));
+        var input_strides_for_out = @as([metal_tensor_mod.max_dims]u32, @splat(0));
         for (output_shape_i64, 0..) |_, i| {
             if (output_strides_usize[i] > std.math.maxInt(u32) or input_strides_usize[i] > std.math.maxInt(u32)) return null;
             out_strides[i] = @intCast(output_strides_usize[i]);
@@ -5045,9 +5045,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         computeStrides(in_shape, in_strides_usize[0..in_shape.len]);
         computeStrides(out_shape, out_strides_usize[0..out_shape.len]);
 
-        var mapped_out_axes = [_]bool{false} ** metal_tensor_mod.max_dims;
-        var out_strides = [_]u32{0} ** metal_tensor_mod.max_dims;
-        var input_strides_for_out = [_]u32{0} ** metal_tensor_mod.max_dims;
+        var mapped_out_axes = @as([metal_tensor_mod.max_dims]bool, @splat(false));
+        var out_strides = @as([metal_tensor_mod.max_dims]u32, @splat(0));
+        var input_strides_for_out = @as([metal_tensor_mod.max_dims]u32, @splat(0));
         for (out_shape, 0..) |_, axis| {
             if (out_strides_usize[axis] > std.math.maxInt(u32)) return null;
             out_strides[axis] = @intCast(out_strides_usize[axis]);
@@ -12038,14 +12038,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.planned_frame_layer_window != null;
         const using_frame_layer_contract = plannedContractIsActive(request.planned_setup_contract) and
             plannedContractIsActive(request.planned_layer_contract);
-        var planned_setup_ops = [_]u16{0} ** 16;
-        var planned_setup_barriers = [_]u8{0} ** 16;
-        var planned_setup_quant_dispatches = [_]u8{255} ** 16;
-        var planned_setup_command_ops = [_]ops.PlannedCommandOp{.{}} ** 16;
-        var planned_block_ops = [_]u16{0} ** 16;
-        var planned_block_barriers = [_]u8{0} ** 16;
-        var planned_block_quant_dispatches = [_]u8{255} ** 16;
-        var planned_block_command_ops = [_]ops.PlannedCommandOp{.{}} ** 16;
+        var planned_setup_ops = @as([16]u16, @splat(0));
+        var planned_setup_barriers = @as([16]u8, @splat(0));
+        var planned_setup_quant_dispatches = @as([16]u8, @splat(255));
+        var planned_setup_command_ops = @as([16]ops.PlannedCommandOp, @splat(.{}));
+        var planned_block_ops = @as([16]u16, @splat(0));
+        var planned_block_barriers = @as([16]u8, @splat(0));
+        var planned_block_quant_dispatches = @as([16]u8, @splat(255));
+        var planned_block_command_ops = @as([16]ops.PlannedCommandOp, @splat(.{}));
         var planned_setup_contract: ops.PlannedLayerContract = .{};
         var planned_block_contract: ops.PlannedLayerContract = .{};
         var planned_frame_contract: ops.PlannedLayerContract = .{};
@@ -16243,10 +16243,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
 
-        var planned_layer_op_storage = [_]u16{0} ** 16;
-        var planned_layer_barrier_storage = [_]u8{0} ** 16;
-        var planned_layer_quant_dispatch_storage = [_]u8{255} ** 16;
-        var planned_layer_command_op_storage = [_]ops.PlannedCommandOp{.{}} ** 16;
+        var planned_layer_op_storage = @as([16]u16, @splat(0));
+        var planned_layer_barrier_storage = @as([16]u8, @splat(0));
+        var planned_layer_quant_dispatch_storage = @as([16]u8, @splat(255));
+        var planned_layer_command_op_storage = @as([16]ops.PlannedCommandOp, @splat(.{}));
         const planned_layer_contract = attention_setup_plan.exportActiveCommandContract(
             &planned_layer_op_storage,
             &planned_layer_barrier_storage,
@@ -16769,10 +16769,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .hidden_size = request.hidden_size,
                 .vocab_size = request.vocab_size,
             }) catch {};
-            var planned_tail_op_storage = [_]u16{0} ** 3;
-            var planned_tail_barrier_storage = [_]u8{0} ** 3;
-            var planned_tail_quant_dispatch_storage = [_]u8{255} ** 3;
-            var planned_tail_command_op_storage = [_]ops.PlannedCommandOp{.{}} ** 3;
+            var planned_tail_op_storage = @as([3]u16, @splat(0));
+            var planned_tail_barrier_storage = @as([3]u8, @splat(0));
+            var planned_tail_quant_dispatch_storage = @as([3]u8, @splat(255));
+            var planned_tail_command_op_storage = @as([3]ops.PlannedCommandOp, @splat(.{}));
             const planned_tail_contract = metal_runtime.plannedContractFromCommandPlan(
                 tail_plan_storage.commandView(),
                 &planned_tail_op_storage,
@@ -20940,8 +20940,8 @@ test "metal_compute: multiply rejects incompatible non-broadcast shapes" {
 
     const lhs_shape = [_]i32{ 1, 2, 3, 4 };
     const rhs_shape = [_]i32{ 1, 6, 4, 3 };
-    const lhs_data = [_]f32{1} ** (1 * 2 * 3 * 4);
-    const rhs_data = [_]f32{1} ** (1 * 6 * 4 * 3);
+    const lhs_data = @as([(1 * 2 * 3 * 4)]f32, @splat(1));
+    const rhs_data = @as([(1 * 6 * 4 * 3)]f32, @splat(1));
 
     const lhs = try metal_cb.fromFloat32Shape(&lhs_data, &lhs_shape);
     defer metal_cb.free(lhs);
@@ -20985,7 +20985,7 @@ test "metal_compute: transpose resolves symbolic reshape target from buffer leng
     defer metal_compute.deinit();
     var metal_cb = metal_compute.computeBackend();
 
-    const base = try metal_cb.fromFloat32Shape(&([_]f32{1} ** (1 * 77 * 512)), &.{ 1, 77, 512 });
+    const base = try metal_cb.fromFloat32Shape(&(@as([(1 * 77 * 512)]f32, @splat(1))), &.{ 1, 77, 512 });
     defer metal_cb.free(base);
     const symbolic = try metal_compute.withLogicalShape(base, &.{ -1, -1, 512 });
 
@@ -22321,8 +22321,8 @@ test "metal_compute: training AdamW updates device-resident weights" {
     var expected_sumsq: f32 = 0.0;
     for (expected_grad) |value| expected_sumsq += value * value;
     try std.testing.expectApproxEqAbs(expected_sumsq, sumsq, 1e-6);
-    var expected_m = [_]f32{0.0} ** initial.len;
-    var expected_v = [_]f32{0.0} ** initial.len;
+    var expected_m = @as([initial.len]f32, @splat(0.0));
+    var expected_v = @as([initial.len]f32, @splat(0.0));
     ml.graph.optimizers.stepSlices(.{ .adamw = cfg }, 1, 0.001, &expected, &expected_grad, &expected_m, &expected_v);
 
     const actual = try metal_cb.toFloat32(weight, allocator);

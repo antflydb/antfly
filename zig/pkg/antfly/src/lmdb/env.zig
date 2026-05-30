@@ -844,7 +844,7 @@ test "environment rejects files without valid meta pages" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const bytes = [_]u8{0} ** 4096;
+    const bytes = @as([4096]u8, @splat(0));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "broken.mdb", .data = &bytes });
 
     var path_buf: [256]u8 = undefined;

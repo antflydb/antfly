@@ -192,7 +192,7 @@ fn allocCompletionId(allocator: std.mem.Allocator) ![]u8 {
     const value = std.mem.readInt(u64, &bytes, .little);
     var scratch: [16]u8 = undefined;
     const rendered = try std.fmt.bufPrint(&scratch, "{x}", .{value});
-    var padded = [_]u8{'0'} ** 16;
+    var padded = @as([16]u8, @splat('0'));
     @memcpy(padded[padded.len - rendered.len ..], rendered);
     return std.fmt.allocPrint(allocator, "chatcmpl-{s}", .{padded[0..]});
 }

@@ -74,9 +74,46 @@ deliberate. Replacements:
 - Sequence repeat like `"0123456789" ** 32` has no one-liner replacement (needs a
   comptime loop / generated constant).
 
-Scope in this repo: ~1,646 real `**` repeat sites across ~124 files. This is a
-large, semantically-sensitive migration unrelated to the build-system article, and
-is the gating blocker for a green `zig build` on nightly. Not attempted here.
+Scope in this repo: ~1,716 real `**` repeat sites across 119 files.
+
+#### `**` migration — DONE
+
+Migrated mechanically with two deterministic rules applied innermost-first to a
+fixpoint (so nested repeats resolve automatically):
+
+- `.{X} ** N` → `@splat(X)` (relies on the result-type context that `.{…}` already
+  required).
+- `[_]T{X} ** N` → `@as([N]T, @splat(X))` (self-typed; works in any context, and a
+  nested inner result becomes the scalar `X` for the outer rule).
+
+1,716 sites were rewritten by script; 16 were handled by hand:
+
+- string repeats `"x" ** N` → `&@as([N]u8, @splat('x'))` (single char) or a
+  `comptime` `++` concat constant (multi-char, e.g. the json `digits_repeated_32`
+  fixture);
+- one multi-element array repeat `[_]f32{…} ** 5` →
+  `@as([15]f32, @bitCast(@as([5][3]f32, @splat(…))))`;
+- a few element types my scanner skips (parens/spaces, e.g.
+  `std.ArrayListUnmanaged(Route)`, `?[]const u8`) done directly as `@as(…, @splat(…))`.
+
+Validated: `lib-json-test`, `lib-httpx-test`, `lib-toon-test` compile and pass under
+the nightly.
+
+### Remaining: general std/builtin churn (separate, open-ended)
+
+Compiling the whole tree on this nightly surfaces *unrelated* 0.17 std/builtin
+changes, independent of `**`. Found so far:
+
+- `std.meta.Int(.unsigned, n)` removed → `@Int(.unsigned, n)` (2 sites, FIXED). The
+  `@Type` builtin has been split into targeted builtins (`@Int`, `@Pointer`,
+  `@FieldType`, …); the repo doesn't call `@Type` directly so only the `meta.Int`
+  shim was affected.
+- `std.bit_set` static bitsets lost `.initEmpty()` (e.g. `lib/regex`); not yet
+  migrated.
+- ~3k `std.Io` references not yet probed for behavioral/API drift.
+
+This general port is large and open-ended; it is tracked separately from the `**`
+work above.
 
 ## 2026-04-20: freestanding wasm stdlib breakage in Zig 0.16
 

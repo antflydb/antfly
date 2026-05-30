@@ -670,8 +670,8 @@ test "custom MCT N=1 passthrough with offset" {
 
 test "custom MCT rejects too-many components" {
     const over: usize = @as(usize, custom_mct_max_components) + 1;
-    const forward = [_]f32{0} ** (17 * 17);
-    const offsets = [_]f32{0} ** 17;
+    const forward = @as([(17 * 17)]f32, @splat(0));
+    const offsets = @as([17]f32, @splat(0));
     const matrix = CustomMctMatrix{
         .num_components = @intCast(over),
         .forward = forward[0..],

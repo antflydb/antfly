@@ -775,7 +775,7 @@ fn broadcastToShape(
 
     // Use broadcast_in_dim for shape expansion, mapping adjoint axes onto
     // the unreduced target axes.
-    var reduced_mask: [shape_mod.max_rank]bool = .{false} ** shape_mod.max_rank;
+    var reduced_mask: [shape_mod.max_rank]bool = @splat(false);
     for (reduced_axes) |axis| reduced_mask[axis] = true;
 
     var broadcast_axes: [shape_mod.max_rank]u8 = undefined;

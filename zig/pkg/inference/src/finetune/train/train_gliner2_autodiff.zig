@@ -1156,7 +1156,7 @@ const BatchTargetStats = struct {
     entity_token_count: u64 = 0,
     ignored_token_count: u64 = 0,
     entity_type_count: usize = 0,
-    positive_counts_by_entity_type: [gliner2_autodiff.max_span_start_entity_types]u64 = [_]u64{0} ** gliner2_autodiff.max_span_start_entity_types,
+    positive_counts_by_entity_type: [gliner2_autodiff.max_span_start_entity_types]u64 = @as([gliner2_autodiff.max_span_start_entity_types]u64, @splat(0)),
 
     fn entityTokenRate(self: BatchTargetStats) f64 {
         if (self.supervised_token_count == 0) return 0.0;

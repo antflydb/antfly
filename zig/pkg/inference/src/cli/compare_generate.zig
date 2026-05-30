@@ -41,7 +41,7 @@ const Options = struct {
     native_model_dir: []const u8,
     reference_model_dir: []const u8,
     prompt: []const u8,
-    image_paths: [8][]const u8 = .{""} ** 8,
+    image_paths: [8][]const u8 = @splat(""),
     image_count: usize = 0,
     backend: BackendChoice = .auto,
     top_k: usize = 8,

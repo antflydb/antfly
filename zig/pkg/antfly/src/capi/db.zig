@@ -5960,7 +5960,7 @@ test "capi request paths trigger readable lease hook" {
     cleanupTestDir(path);
 
     const Recorder = struct {
-        contexts: [9][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 9,
+        contexts: [9][32]u8 = @as([9][32]u8, @splat(@as([32]u8, @splat(0)))),
         context_lens: [9]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         group_ids: [9]u64 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         count: usize = 0,

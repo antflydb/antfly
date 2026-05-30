@@ -40,7 +40,7 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     defer DocStore.freeResults(alloc, pairs);
 
     // Write file header
-    const backup_id = [_]u8{0} ** 16; // zero UUID for now
+    const backup_id = @as([16]u8, @splat(0)); // zero UUID for now
     try backup_codec.writeHeader(out, alloc, .{
         .format_version = backup_codec.format_version,
         .flags = 0,

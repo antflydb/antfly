@@ -96,7 +96,7 @@ pub const H2Connection = struct {
     /// Opaque data from the last sent PING. handlePing only signals
     /// ping_ack_event when the ACK payload matches, preventing stale or
     /// server-initiated PING ACKs from falsely satisfying the health check.
-    ping_expected_data: [8]u8 = .{0} ** 8,
+    ping_expected_data: [8]u8 = @splat(0),
 
     /// Send WINDOW_UPDATE when accumulated consumed bytes exceed this threshold.
     /// Defaults to half the initial window size. Adjusted when peer SETTINGS
@@ -2062,9 +2062,9 @@ test "batched WINDOW_UPDATE: small DATA frames don't trigger immediate updates" 
     var client = H2Connection.initClient(allocator, std.testing.io);
     defer client.deinit();
     _ = try client.stream_manager.createStream();
-    try client.writeData(c2s_w, 1, "A" ** 100, false);
-    try client.writeData(c2s_w, 1, "B" ** 100, false);
-    try client.writeData(c2s_w, 1, "C" ** 100, false);
+    try client.writeData(c2s_w, 1, &@as([100]u8, @splat('A')), false);
+    try client.writeData(c2s_w, 1, &@as([100]u8, @splat('B')), false);
+    try client.writeData(c2s_w, 1, &@as([100]u8, @splat('C')), false);
 
     // Server processes the frames, writing responses to reply buffer.
     var reply = std.ArrayListUnmanaged(u8).empty;
@@ -2103,9 +2103,9 @@ test "batched WINDOW_UPDATE: threshold triggers flush" {
     var client = H2Connection.initClient(allocator, std.testing.io);
     defer client.deinit();
     _ = try client.stream_manager.createStream();
-    try client.writeData(c2s_w, 1, "X" ** 16000, false);
-    try client.writeData(c2s_w, 1, "Y" ** 16000, false);
-    try client.writeData(c2s_w, 1, "Z" ** 1000, false);
+    try client.writeData(c2s_w, 1, &@as([16000]u8, @splat('X')), false);
+    try client.writeData(c2s_w, 1, &@as([16000]u8, @splat('Y')), false);
+    try client.writeData(c2s_w, 1, &@as([1000]u8, @splat('Z')), false);
 
     var reply = std.ArrayListUnmanaged(u8).empty;
     defer reply.deinit(allocator);
@@ -2178,7 +2178,7 @@ test "deliverToMailbox rejects DATA exceeding max_stream_data_size" {
     // Deliver a DATA frame within limits.
     var small_frame = Frame{
         .header = .{ .length = 50, .frame_type = .data, .flags = 0, .stream_id = 1 },
-        .payload = @constCast(&([_]u8{0x41} ** 50)),
+        .payload = @constCast(&(@as([50]u8, @splat(0x41)))),
     };
     try server.deliverToMailbox(&small_frame);
     try std.testing.expectEqual(@as(usize, 50), stream.data_buf.items.len);
@@ -2187,7 +2187,7 @@ test "deliverToMailbox rejects DATA exceeding max_stream_data_size" {
     // Deliver a DATA frame that exceeds the limit.
     var big_frame = Frame{
         .header = .{ .length = 60, .frame_type = .data, .flags = 0, .stream_id = 1 },
-        .payload = @constCast(&([_]u8{0x42} ** 60)),
+        .payload = @constCast(&(@as([60]u8, @splat(0x42)))),
     };
     try server.deliverToMailbox(&big_frame);
 
@@ -2208,7 +2208,7 @@ test "deliverToMailbox allows unlimited DATA when max_stream_data_size is 0" {
 
     var frame = Frame{
         .header = .{ .length = 200, .frame_type = .data, .flags = 0, .stream_id = 1 },
-        .payload = @constCast(&([_]u8{0x41} ** 200)),
+        .payload = @constCast(&(@as([200]u8, @splat(0x41)))),
     };
     try server.deliverToMailbox(&frame);
     try std.testing.expectEqual(@as(usize, 200), stream.data_buf.items.len);
@@ -2418,7 +2418,7 @@ test "receive window decremented on incoming DATA" {
 
     var frame = Frame{
         .header = .{ .length = 100, .frame_type = .data, .flags = 0, .stream_id = 1 },
-        .payload = @constCast(&([_]u8{0x41} ** 100)),
+        .payload = @constCast(&(@as([100]u8, @splat(0x41)))),
     };
     try server.deliverToMailbox(&frame);
 

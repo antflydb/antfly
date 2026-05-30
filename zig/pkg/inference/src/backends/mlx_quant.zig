@@ -1237,7 +1237,7 @@ fn packedExpertRowBlockBase(
 }
 
 test "slice packed q8_0 weight bytes preserves selected expert rows" {
-    var weight_raw: [136]u8 = [_]u8{0} ** 136;
+    var weight_raw: [136]u8 = @as([136]u8, @splat(0));
 
     weight_raw[34] = 0x00;
     weight_raw[35] = 0x3C;
@@ -1609,8 +1609,8 @@ fn setTL2TwoPair(raw_bytes: []u8, rows: usize, cols: usize, row: usize, pair_col
 }
 
 test "mlx metal q5_k kernel matches expected output" {
-    var input: [256]f32 = [_]f32{1.0} ** 256;
-    var weight_raw: [352]u8 = [_]u8{0} ** 352;
+    var input: [256]f32 = @as([256]f32, @splat(1.0));
+    var weight_raw: [352]u8 = @as([352]u8, @splat(0));
 
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C;
@@ -2126,8 +2126,8 @@ test "mlx metal whole-token linear slot accepts quantized i2_s" {
 
     const input_shape = [_]i32{ 1, 128 };
     const bias_shape = [_]i32{1};
-    var input: [128]f32 = [_]f32{1.0} ** 128;
-    var weight_raw: [32]u8 = [_]u8{0} ** 32;
+    var input: [128]f32 = @as([128]f32, @splat(1.0));
+    var weight_raw: [32]u8 = @as([32]u8, @splat(0));
     for (0..32) |i| weight_raw[i] = 0b10_10_10_10;
     const bias = [_]f32{0.0};
 
@@ -2506,13 +2506,13 @@ test "mlx metal whole-token gated linear residual matches split path" {
 }
 
 test "mlx metal q4_0 kernel uses low-half then high-half nibble order" {
-    var input: [32]f32 = [_]f32{0.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(0.0));
     input[0] = 1.0;
     input[1] = 1.0;
     input[16] = 1.0;
     input[17] = 1.0;
 
-    var weight_raw: [18]u8 = [_]u8{0x88} ** 18;
+    var weight_raw: [18]u8 = @as([18]u8, @splat(0x88));
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C;
     weight_raw[2] = 0x10;
@@ -2522,13 +2522,13 @@ test "mlx metal q4_0 kernel uses low-half then high-half nibble order" {
 }
 
 test "mlx metal q4_1 kernel uses low-half then high-half nibble order" {
-    var input: [32]f32 = [_]f32{0.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(0.0));
     input[0] = 1.0;
     input[1] = 1.0;
     input[16] = 1.0;
     input[17] = 1.0;
 
-    var weight_raw: [20]u8 = [_]u8{0x11} ** 20;
+    var weight_raw: [20]u8 = @as([20]u8, @splat(0x11));
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C; // d = 1.0
     weight_raw[2] = 0x00;
@@ -2540,13 +2540,13 @@ test "mlx metal q4_1 kernel uses low-half then high-half nibble order" {
 }
 
 test "mlx metal q5_1 kernel applies high bits scale and minimum" {
-    var input: [32]f32 = [_]f32{0.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(0.0));
     input[0] = 1.0;
     input[1] = 1.0;
     input[16] = 1.0;
     input[17] = 1.0;
 
-    var weight_raw: [24]u8 = [_]u8{0} ** 24;
+    var weight_raw: [24]u8 = @as([24]u8, @splat(0));
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C; // d = 1.0
     weight_raw[2] = 0x00;
@@ -2560,13 +2560,13 @@ test "mlx metal q5_1 kernel applies high bits scale and minimum" {
 }
 
 test "mlx metal q8_1 kernel uses signed values after block sum" {
-    var input: [32]f32 = [_]f32{0.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(0.0));
     input[0] = 1.0;
     input[1] = 1.0;
     input[2] = 1.0;
     input[3] = 1.0;
 
-    var weight_raw: [36]u8 = [_]u8{0} ** 36;
+    var weight_raw: [36]u8 = @as([36]u8, @splat(0));
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C; // d = 1.0
     weight_raw[4] = 1;
@@ -2594,11 +2594,11 @@ test "mlx metal i8_s kernel uses signed int8 weights directly" {
 }
 
 test "mlx metal i2_s kernel uses per-row int8 activation quantization" {
-    var input: [128]f32 = [_]f32{0.0} ** 128;
+    var input: [128]f32 = @as([128]f32, @splat(0.0));
     input[0] = 0.51;
     input[1] = 1.0;
 
-    var weight_raw: [32]u8 = [_]u8{0} ** 32;
+    var weight_raw: [32]u8 = @as([32]u8, @splat(0));
     weight_raw[0] = 0b10_00_00_00;
     weight_raw[1] = 0b10_00_00_00;
 
@@ -2606,9 +2606,9 @@ test "mlx metal i2_s kernel uses per-row int8 activation quantization" {
 }
 
 test "mlx metal i2_s pair kernel computes sibling matmuls" {
-    var input: [128]f32 = [_]f32{1.0} ** 128;
-    var weight_raw_a: [32]u8 = [_]u8{0} ** 32;
-    var weight_raw_b: [32]u8 = [_]u8{0} ** 32;
+    var input: [128]f32 = @as([128]f32, @splat(1.0));
+    var weight_raw_a: [32]u8 = @as([32]u8, @splat(0));
+    var weight_raw_b: [32]u8 = @as([32]u8, @splat(0));
 
     for (0..32) |i| {
         weight_raw_a[i] = 0b10_10_10_10;
@@ -2788,13 +2788,13 @@ test "mlx metal tl2 kernel matches multi-row reference including tail pairs" {
 }
 
 test "mlx metal iq4_nl kernel uses nonlinear lookup table" {
-    var input: [32]f32 = [_]f32{0.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(0.0));
     input[0] = 1.0;
     input[1] = 1.0;
     input[16] = 1.0;
     input[17] = 1.0;
 
-    var weight_raw: [18]u8 = [_]u8{0} ** 18;
+    var weight_raw: [18]u8 = @as([18]u8, @splat(0));
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C; // d = 1.0
     weight_raw[2] = 0x10; // low nibbles 0, 1
@@ -2804,12 +2804,12 @@ test "mlx metal iq4_nl kernel uses nonlinear lookup table" {
 }
 
 test "mlx metal iq4_xs kernel applies high and low packed scales" {
-    var input: [256]f32 = [_]f32{0.0} ** 256;
+    var input: [256]f32 = @as([256]f32, @splat(0.0));
     input[0] = 1.0;
     input[16] = 1.0;
     input[32] = 1.0;
 
-    var weight_raw: [136]u8 = [_]u8{0} ** 136;
+    var weight_raw: [136]u8 = @as([136]u8, @splat(0));
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C; // d = 1.0
     weight_raw[2] = 0x01; // scale high bits: sub-block 0 => +32
@@ -2821,8 +2821,8 @@ test "mlx metal iq4_xs kernel applies high and low packed scales" {
 }
 
 test "mlx metal q6_k kernel matches expected output" {
-    var input: [256]f32 = [_]f32{1.0} ** 256;
-    var weight_raw: [420]u8 = [_]u8{0} ** 420;
+    var input: [256]f32 = @as([256]f32, @splat(1.0));
+    var weight_raw: [420]u8 = @as([420]u8, @splat(0));
 
     for (192..208) |i| weight_raw[i] = 1;
     weight_raw[208] = 0x00;

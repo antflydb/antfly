@@ -131,9 +131,9 @@ pub const CeltHeader = struct {
 };
 
 pub const SilkChannelHeader = struct {
-    vad_flags: [3]bool = [_]bool{false} ** 3,
+    vad_flags: [3]bool = @as([3]bool, @splat(false)),
     lbrr_flag: bool = false,
-    lbrr_flags: [3]bool = [_]bool{false} ** 3,
+    lbrr_flags: [3]bool = @as([3]bool, @splat(false)),
 };
 
 pub const SilkPacketHeader = struct {
@@ -162,44 +162,44 @@ const SilkCondCoding = enum {
 pub const SilkIndices = struct {
     signal_type: SilkSignalType = .no_voice_activity,
     quant_offset_type: u1 = 0,
-    gains_indices: [4]u8 = [_]u8{0} ** 4,
-    nlsf_indices: [17]i8 = [_]i8{0} ** 17,
+    gains_indices: [4]u8 = @as([4]u8, @splat(0)),
+    nlsf_indices: [17]i8 = @as([17]i8, @splat(0)),
     nlsf_interp_coef_q2: u8 = 4,
     lag_index: i16 = 0,
     contour_index: u8 = 0,
     per_index: u8 = 0,
-    ltp_index: [4]u8 = [_]u8{0} ** 4,
+    ltp_index: [4]u8 = @as([4]u8, @splat(0)),
     ltp_scale_index: u8 = 0,
     seed: u8 = 0,
 };
 
 pub const SilkFrameFront = struct {
     indices: SilkIndices = .{},
-    pulses: [320]i16 = [_]i16{0} ** 320,
+    pulses: [320]i16 = @as([320]i16, @splat(0)),
     pulse_len: usize = 0,
 };
 
 pub const SilkPacketFront = struct {
     header: SilkPacketHeader,
-    stereo_pred_q13: [SilkMaxInternalFrames][2]i32 = [_][2]i32{.{ 0, 0 }} ** SilkMaxInternalFrames,
-    decode_only_middle: [SilkMaxInternalFrames]bool = [_]bool{false} ** SilkMaxInternalFrames,
-    frame_present: [2][SilkMaxInternalFrames]bool = [_][SilkMaxInternalFrames]bool{[_]bool{false} ** SilkMaxInternalFrames} ** 2,
+    stereo_pred_q13: [SilkMaxInternalFrames][2]i32 = @as([SilkMaxInternalFrames][2]i32, @splat(.{ 0, 0 })),
+    decode_only_middle: [SilkMaxInternalFrames]bool = @as([SilkMaxInternalFrames]bool, @splat(false)),
+    frame_present: [2][SilkMaxInternalFrames]bool = @as([2][SilkMaxInternalFrames]bool, @splat(@as([SilkMaxInternalFrames]bool, @splat(false)))),
     frames: [2][SilkMaxInternalFrames]SilkFrameFront =
-        [_][SilkMaxInternalFrames]SilkFrameFront{[_]SilkFrameFront{.{}} ** SilkMaxInternalFrames} ** 2,
+        @as([2][SilkMaxInternalFrames]SilkFrameFront, @splat(@as([SilkMaxInternalFrames]SilkFrameFront, @splat(.{})))),
 };
 
 pub const SilkFrameParameters = struct {
     signal_type: SilkSignalType = .no_voice_activity,
     fs_khz: u8 = 0,
     subframe_count: u8 = 0,
-    gains_q16: [4]i32 = [_]i32{0} ** 4,
-    nlsf_q15: [16]i16 = [_]i16{0} ** 16,
-    pred_coef_q12: [2][16]i16 = [_][16]i16{[_]i16{0} ** 16} ** 2,
-    pitch_l: [4]i16 = [_]i16{0} ** 4,
-    ltp_coef_q14: [20]i16 = [_]i16{0} ** 20,
+    gains_q16: [4]i32 = @as([4]i32, @splat(0)),
+    nlsf_q15: [16]i16 = @as([16]i16, @splat(0)),
+    pred_coef_q12: [2][16]i16 = @as([2][16]i16, @splat(@as([16]i16, @splat(0)))),
+    pitch_l: [4]i16 = @as([4]i16, @splat(0)),
+    ltp_coef_q14: [20]i16 = @as([20]i16, @splat(0)),
     ltp_scale_q14: i16 = 0,
     quant_offset_q10: i16 = 0,
-    excitation_q14: [320]i32 = [_]i32{0} ** 320,
+    excitation_q14: [320]i32 = @as([320]i32, @splat(0)),
     excitation_len: usize = 0,
 };
 
@@ -207,7 +207,7 @@ pub const SilkPacketParameters = struct {
     sample_rate: u32 = 0,
     front: SilkPacketFront,
     frames: [2][SilkMaxInternalFrames]SilkFrameParameters =
-        [_][SilkMaxInternalFrames]SilkFrameParameters{[_]SilkFrameParameters{.{}} ** SilkMaxInternalFrames} ** 2,
+        @as([2][SilkMaxInternalFrames]SilkFrameParameters, @splat(@as([SilkMaxInternalFrames]SilkFrameParameters, @splat(.{})))),
 };
 
 const SilkSynthesizedPacket = struct {
@@ -217,14 +217,14 @@ const SilkSynthesizedPacket = struct {
 
 const SilkChannelState = struct {
     prev_gain_index: i32 = 10,
-    prev_nlsf_q15: [16]i16 = [_]i16{0} ** 16,
+    prev_nlsf_q15: [16]i16 = @as([16]i16, @splat(0)),
     first_frame_after_reset: bool = true,
 };
 
 const SilkSynthChannelState = struct {
     prev_gain_q16: i32 = 65_536,
-    s_lpc_q14_buf: [16]i32 = [_]i32{0} ** 16,
-    history_q15: [320]i32 = [_]i32{0} ** 320,
+    s_lpc_q14_buf: [16]i32 = @as([16]i32, @splat(0)),
+    history_q15: [320]i32 = @as([320]i32, @splat(0)),
 };
 
 const SilkStereoState = struct {
@@ -249,24 +249,24 @@ pub const CeltCoarseEnergyFrame = struct {
 
 pub const CeltEnergyState = struct {
     channels: u8,
-    old_band_energies: [2][21]f32 = [_][21]f32{[_]f32{0} ** 21} ** 2,
+    old_band_energies: [2][21]f32 = @as([2][21]f32, @splat(@as([21]f32, @splat(0)))),
 };
 
 pub const CeltResidualPlan = struct {
-    tf_res: [21]i8 = [_]i8{0} ** 21,
+    tf_res: [21]i8 = @as([21]i8, @splat(0)),
     spread_decision: u8,
     alloc_trim: u8,
     coded_bands: usize,
     intensity: u8 = 0,
     dual_stereo: bool = false,
-    band_bits: [21]i32 = [_]i32{0} ** 21,
-    pulses: [21]i16 = [_]i16{0} ** 21,
-    fine_quant: [21]u8 = [_]u8{0} ** 21,
-    fine_priority: [21]bool = [_]bool{false} ** 21,
+    band_bits: [21]i32 = @as([21]i32, @splat(0)),
+    pulses: [21]i16 = @as([21]i16, @splat(0)),
+    fine_quant: [21]u8 = @as([21]u8, @splat(0)),
+    fine_priority: [21]bool = @as([21]bool, @splat(false)),
 };
 
 pub const CeltResidualBand = struct {
-    coefficients: [176]f32 = [_]f32{0} ** 176,
+    coefficients: [176]f32 = @as([176]f32, @splat(0)),
     len: usize,
 };
 
@@ -911,7 +911,7 @@ fn buildPulseCache() PulseCache {
             while (k < StandardCeltMode.max_pseudo and fitsIn32(@intCast(n), getPulses(@intCast(k + 1)))) : (k += 1) {}
             cache.counts[lm_plus_one][band] = @intCast(k);
             if (k > 0) {
-                var required: [129]u8 = [_]u8{0} ** 129;
+                var required: [129]u8 = @as([129]u8, @splat(0));
                 getRequiredBits(&required, @intCast(n), getPulses(@intCast(k)), StandardCeltMode.bitres);
                 for (1..k + 1) |entry| {
                     const required_bits = required[getPulses(@intCast(entry))];
@@ -1048,7 +1048,7 @@ fn decodeCeltResidualFrameFromDecoder(
                 .alloc_trim = 0,
                 .coded_bands = start_band,
             },
-            .bands = [_][21]CeltResidualBand{[_]CeltResidualBand{.{ .len = 0 }} ** 21} ** 2,
+            .bands = @as([2][21]CeltResidualBand, @splat(@as([21]CeltResidualBand, @splat(.{ .len = 0 })))),
             .band_energies = state.old_band_energies,
         };
     }
@@ -1057,7 +1057,7 @@ fn decodeCeltResidualFrameFromDecoder(
 
     var plan = try decodeCeltResidualPlan(decoder, total_bits, lm, start_band, end_band, state.channels);
     try unquantFineEnergy(decoder, &state.old_band_energies, start_band, end_band, state.channels, &plan);
-    var bands = [_][21]CeltResidualBand{[_]CeltResidualBand{.{ .len = 0 }} ** 21} ** 2;
+    var bands = @as([2][21]CeltResidualBand, @splat(@as([21]CeltResidualBand, @splat(.{ .len = 0 }))));
     try decodeCeltResidualBands(allocator, decoder, lm, start_band, end_band, state.channels, &plan, &bands);
     try unquantEnergyFinalise(
         decoder,
@@ -1465,7 +1465,7 @@ pub fn parseHead(packet: []const u8) !Head {
         .stream_count = 0,
         .coupled_count = 0,
         .channel_mapping_len = channels,
-        .channel_mapping = [_]u8{0} ** 8,
+        .channel_mapping = @as([8]u8, @splat(0)),
     };
 
     if (header.mapping_family == 0) {
@@ -1691,7 +1691,7 @@ fn silkFrameLengthSamples(toc: Toc, fs_khz: u8) !usize {
 
 fn silkDecodeStereoPred(decoder: *RangeDecoder) ![2]i32 {
     const joint = try decoder.decodeIcdf(&silk_tables.stereo_pred_joint_icdf);
-    var ix = [2][3]i32{ [_]i32{0} ** 3, [_]i32{0} ** 3 };
+    var ix = [2][3]i32{ @as([3]i32, @splat(0)), @as([3]i32, @splat(0)) };
     ix[0][2] = @divTrunc(joint, 5);
     ix[1][2] = joint - 5 * ix[0][2];
     for (0..2) |n| {
@@ -1763,8 +1763,8 @@ fn silkDecodeIndices(
     const cb1_base: usize = (@as(usize, @intFromEnum(out.signal_type)) >> 1) * cb.n_vectors;
     out.nlsf_indices[0] = @intCast(try decoder.decodeIcdf(cb.cb1_icdf[cb1_base .. cb1_base + cb.n_vectors]));
 
-    var ec_ix = [_]i16{0} ** 16;
-    var pred_q8 = [_]u8{0} ** 16;
+    var ec_ix = @as([16]i16, @splat(0));
+    var pred_q8 = @as([16]u8, @splat(0));
     silkNlsfUnpack(&ec_ix, &pred_q8, cb, @intCast(out.nlsf_indices[0]));
     for (0..cb.order) |i| {
         const ec_base: usize = @intCast(ec_ix[i]);
@@ -1823,9 +1823,9 @@ fn silkDecodeSplit(decoder: *RangeDecoder, p: u16, table: []const u8) !struct { 
 fn silkShellDecoder(decoder: *RangeDecoder, out: []i16, pulses4: u16) !void {
     if (out.len != 16) return error.UnsupportedAudioFormat;
 
-    var pulses3 = [_]i16{0} ** 2;
-    var pulses2 = [_]i16{0} ** 4;
-    var pulses1 = [_]i16{0} ** 8;
+    var pulses3 = @as([2]i16, @splat(0));
+    var pulses2 = @as([4]i16, @splat(0));
+    var pulses1 = @as([8]i16, @splat(0));
 
     const s30, const s31 = try silkDecodeSplit(decoder, pulses4, &silk_tables.shell_code_table3);
     pulses3[0] = s30;
@@ -1879,8 +1879,8 @@ fn silkDecodePulses(
     const rate_level_index = try decoder.decodeIcdf(&silk_tables.rate_levels_icdf[signal_class]);
 
     const iter = @divTrunc(pulses.len + 15, 16);
-    var sum_pulses = [_]i32{0} ** 20;
-    var n_lshifts = [_]u8{0} ** 20;
+    var sum_pulses = @as([20]i32, @splat(0));
+    var n_lshifts = @as([20]u8, @splat(0));
     if (iter > sum_pulses.len) return error.UnsupportedAudioFormat;
 
     for (0..iter) |i| {
@@ -1897,7 +1897,7 @@ fn silkDecodePulses(
         const end = @min(start + 16, pulses.len);
         @memset(pulses[start..end], 0);
         if (sum_pulses[i] > 0) {
-            var block = [_]i16{0} ** 16;
+            var block = @as([16]i16, @splat(0));
             try silkShellDecoder(decoder, &block, @intCast(sum_pulses[i]));
             @memcpy(pulses[start..end], block[0 .. end - start]);
         }
@@ -1943,7 +1943,7 @@ fn silkNlsfResidualDequant(out: *[16]i16, indices: []const i8, pred_q8: []const 
 }
 
 fn silkNlsfStabilize(nlsf_q15: *[16]i16, delta_min_q15: []const i16, order: usize) void {
-    var values = [_]i32{0} ** 16;
+    var values = @as([16]i32, @splat(0));
     for (0..order) |i| values[i] = nlsf_q15[i];
 
     var iter: usize = 0;
@@ -1963,11 +1963,11 @@ fn silkNlsfStabilize(nlsf_q15: *[16]i16, delta_min_q15: []const i16, order: usiz
 }
 
 fn silkNlsfDecode(out: *[16]i16, cb: silk_tables.Codebook, indices: *const [17]i8) void {
-    var ec_ix = [_]i16{0} ** 16;
-    var pred_q8 = [_]u8{0} ** 16;
+    var ec_ix = @as([16]i16, @splat(0));
+    var pred_q8 = @as([16]u8, @splat(0));
     silkNlsfUnpack(&ec_ix, &pred_q8, cb, @intCast(indices[0]));
 
-    var residual_q10 = [_]i16{0} ** 16;
+    var residual_q10 = @as([16]i16, @splat(0));
     silkNlsfResidualDequant(&residual_q10, indices[1 .. cb.order + 1], pred_q8[0..cb.order], cb.quant_step_size_q16, cb.order);
 
     const base = @as(usize, @intCast(indices[0])) * cb.order;
@@ -2005,15 +2005,15 @@ fn silkNlsfFindPoly(out: []f64, c_lsf: []const f64, dd: usize) void {
 
 fn silkNlsfToLpcQ12(out: *[16]i16, nlsf_q15: *const [16]i16, order: usize) void {
     const ordering = silkOrderOrdering(order);
-    var cos_lsf = [_]f64{0.0} ** 16;
+    var cos_lsf = @as([16]f64, @splat(0.0));
     for (0..order) |k| {
         const phase = (@as(f64, @floatFromInt(nlsf_q15[k])) / 32768.0) * std.math.pi;
         cos_lsf[ordering[k]] = 2.0 * @cos(phase);
     }
 
     const dd = order / 2;
-    var p = [_]f64{0.0} ** 9;
-    var q = [_]f64{0.0} ** 9;
+    var p = @as([9]f64, @splat(0.0));
+    var q = @as([9]f64, @splat(0.0));
     silkNlsfFindPoly(p[0 .. dd + 1], cos_lsf[0..order], dd);
     silkNlsfFindPoly(q[0 .. dd + 1], cos_lsf[1..order], dd);
 
@@ -2121,7 +2121,7 @@ fn silkDecodeFrameParameters(
 
     const interp_coef_q2: u8 = if (state.first_frame_after_reset) 4 else front.indices.nlsf_interp_coef_q2;
     if (interp_coef_q2 < 4) {
-        var interp_q15 = [_]i16{0} ** 16;
+        var interp_q15 = @as([16]i16, @splat(0));
         for (0..16) |i| {
             const delta = @as(i32, out.nlsf_q15[i]) - state.prev_nlsf_q15[i];
             interp_q15[i] = @intCast(state.prev_nlsf_q15[i] + @divTrunc(@as(i32, interp_coef_q2) * delta, 4));
@@ -2304,9 +2304,9 @@ fn silkSynthesizeChannelInto(
         return error.UnsupportedAudioFormat;
     }
 
-    var s_lpc_q14 = [_]i32{0} ** (16 + 80);
+    var s_lpc_q14 = @as([(16 + 80)]i32, @splat(0));
     @memcpy(s_lpc_q14[0..16], &state.s_lpc_q14_buf);
-    var s_ltp_q15 = [_]i32{0} ** 640;
+    var s_ltp_q15 = @as([640]i32, @splat(0));
     @memcpy(s_ltp_q15[0..320], &state.history_q15);
 
     const subframe_count: usize = params.subframe_count;
@@ -2642,7 +2642,7 @@ fn parseCode3FramesAlloc(allocator: std.mem.Allocator, toc: Toc, payload: []cons
         return .{ .toc = toc, .frames = frames, .allocator = allocator };
     }
 
-    var frame_lengths = [_]usize{0} ** 48;
+    var frame_lengths = @as([48]usize, @splat(0));
     var bytes_remaining = packet_end - cursor;
     for (0..frame_count - 1) |i| {
         const frame_len, const header_len = try parseCode2FrameLength(payload[cursor..packet_end]);
@@ -2866,13 +2866,13 @@ fn decodePmf(decoder: *RangeDecoder, weights: []const u16) !u16 {
 }
 
 fn decodeCeltResidualPlan(decoder: *RangeDecoder, total_bits: usize, lm: u2, start_band: usize, end_band: usize, channels: u8) !CeltResidualPlan {
-    var tf_res = [_]i8{0} ** 21;
+    var tf_res = @as([21]i8, @splat(0));
     tfDecode(decoder, start_band, end_band, false, &tf_res, lm, total_bits);
 
     var spread_decision: u8 = 2;
     if (decoder.tell() + 4 <= total_bits) spread_decision = try decoder.decodeIcdf(&CeltSpreadIcdf);
 
-    var offsets = [_]i16{0} ** 21;
+    var offsets = @as([21]i16, @splat(0));
     var total_bits_frac: i32 = @intCast(total_bits << StandardCeltMode.bitres);
     var tell_frac: i32 = @intCast(decoder.tellFrac());
     var dynalloc_logp: u5 = 6;
@@ -3389,10 +3389,10 @@ fn computeAllocation(
         }
     }
 
-    var bits1 = [_]i32{0} ** 21;
-    var bits2 = [_]i32{0} ** 21;
-    var thresh = [_]i32{0} ** 21;
-    var trim_offset = [_]i32{0} ** 21;
+    var bits1 = @as([21]i32, @splat(0));
+    var bits2 = @as([21]i32, @splat(0));
+    var thresh = @as([21]i32, @splat(0));
+    var trim_offset = @as([21]i32, @splat(0));
     var skip_start: usize = start_band;
 
     for (start_band..end_band) |band| {
@@ -3653,8 +3653,8 @@ fn computeAllocation(
 }
 
 fn computeAllocationMono(lm: u2, end_band: usize, offsets: []const i16, alloc_trim: u8, total: i32, plan: *CeltResidualPlan) void {
-    var thresh = [_]i32{0} ** 21;
-    var trim_offset = [_]i32{0} ** 21;
+    var thresh = @as([21]i32, @splat(0));
+    var trim_offset = @as([21]i32, @splat(0));
     for (0..end_band) |band| {
         const width = StandardCeltMode.e_bands[band + 1] - StandardCeltMode.e_bands[band];
         thresh[band] = @max(1 << StandardCeltMode.bitres, (3 * @as(i32, @intCast(width)) << @intCast(lm) << StandardCeltMode.bitres) >> 4);
@@ -3662,8 +3662,8 @@ fn computeAllocationMono(lm: u2, end_band: usize, offsets: []const i16, alloc_tr
         if ((width << @intCast(lm)) == 1) trim_offset[band] -= 1 << StandardCeltMode.bitres;
     }
 
-    var bits1 = [_]i32{0} ** 21;
-    var bits2 = [_]i32{0} ** 21;
+    var bits1 = @as([21]i32, @splat(0));
+    var bits2 = @as([21]i32, @splat(0));
     var lo: i32 = 1;
     var hi: i32 = StandardCeltMode.nb_alloc_vectors - 1;
     while (lo <= hi) {
@@ -3798,7 +3798,7 @@ fn getRequiredBits(bits: *[129]u8, n: i32, max_k: u16, frac: u8) void {
         for (1..max_k + 1) |k| bits[k] = 1 << @intCast(frac);
         return;
     }
-    var vals = [_]u32{0} ** 131;
+    var vals = @as([131]u32, @splat(0));
     _ = ncwrsUrow(@intCast(n), max_k, vals[0 .. max_k + 2]);
     for (1..max_k + 1) |k| bits[k] = celtLog2Frac(@intCast(vals[k] + vals[k + 1]), frac);
 }
@@ -3819,7 +3819,7 @@ fn algUnquant(out: []f32, pulse_count: u16, spread: u8, decoder: *RangeDecoder) 
     if (out.len == 0) return error.UnsupportedAudioFormat;
     const effective_pulse_count: u16 = @min(pulse_count, @as(u16, @intCast(out.len)));
     if (out.len > 176) return error.UnsupportedAudioFormat;
-    var iy_buf = [_]i32{0} ** 176;
+    var iy_buf = @as([176]i32, @splat(0));
     const iy = iy_buf[0..out.len];
     const ryy = try decodePulses(iy, effective_pulse_count, decoder);
     normalizeResidual(iy, out, ryy);
@@ -3839,7 +3839,7 @@ fn expRotation(out: []f32, spread: u8, pulse_count: u16) void {
 
 fn decodePulses(out: []i32, pulse_count: u16, decoder: *RangeDecoder) !i32 {
     if (pulse_count > 1022) return error.UnsupportedAudioFormat;
-    var u_buf = [_]u32{0} ** 1024;
+    var u_buf = @as([1024]u32, @splat(0));
     const u = u_buf[0 .. pulse_count + 2];
     const total = ncwrsUrow(@intCast(out.len), pulse_count, u);
     const index = try decoder.decodeUint(total);
@@ -4331,8 +4331,8 @@ test "celt basic window is symmetric and power complementary" {
 }
 
 test "celt imdct of zero coefficients stays zero" {
-    var out = [_]f32{0} ** 960;
-    const coeffs = [_]f32{0} ** 480;
+    var out = @as([960]f32, @splat(0));
+    const coeffs = @as([480]f32, @splat(0));
     try celtImdctInto(&out, &coeffs);
     for (out) |sample| {
         try std.testing.expectApproxEqAbs(@as(f32, 0.0), sample, 1e-6);
@@ -4340,7 +4340,7 @@ test "celt imdct of zero coefficients stays zero" {
 }
 
 test "celt window leaves center unchanged and tapers overlap edges" {
-    var samples = [_]f32{1.0} ** 960;
+    var samples = @as([960]f32, @splat(1.0));
     try applyCeltWindowInPlace(std.testing.allocator, &samples, 120);
 
     try std.testing.expect(samples[0] < 0.1);
@@ -4676,8 +4676,8 @@ test "synthesize stereo celt frame handles intensity-shared tail bands" {
             .intensity = 2,
             .dual_stereo = true,
         },
-        .bands = [_][21]CeltResidualBand{[_]CeltResidualBand{.{ .len = 0 }} ** 21} ** 2,
-        .band_energies = [_][21]f32{[_]f32{0} ** 21} ** 2,
+        .bands = @as([2][21]CeltResidualBand, @splat(@as([21]CeltResidualBand, @splat(.{ .len = 0 })))),
+        .band_energies = @as([2][21]f32, @splat(@as([21]f32, @splat(0)))),
     };
     frame.bands[0][0].len = 1;
     frame.bands[0][0].coefficients[0] = 0.8;
@@ -4720,11 +4720,11 @@ test "synthesize stereo celt frame handles intensity-shared tail bands" {
 }
 
 test "decode coupled stereo celt band keeps coefficients finite" {
-    var bands = [_][21]CeltResidualBand{[_]CeltResidualBand{.{ .len = 0 }} ** 21} ** 2;
+    var bands = @as([2][21]CeltResidualBand, @splat(@as([21]CeltResidualBand, @splat(.{ .len = 0 }))));
     bands[0][13].len = 4;
     bands[1][13].len = 4;
 
-    const zero_bytes = [_]u8{0} ** 32;
+    const zero_bytes = @as([32]u8, @splat(0));
     var decoder = RangeDecoder.init(&zero_bytes);
     try decodeCoupledStereoBand(&decoder, 0, 13, 24, 2, &bands, 4);
 
@@ -4739,8 +4739,8 @@ test "decode coupled stereo celt band keeps coefficients finite" {
 }
 
 test "decode and synthesize coupled stereo celt low bands below intensity" {
-    var bands = [_][21]CeltResidualBand{[_]CeltResidualBand{.{ .len = 0 }} ** 21} ** 2;
-    const zero_bytes = [_]u8{0} ** 64;
+    var bands = @as([2][21]CeltResidualBand, @splat(@as([21]CeltResidualBand, @splat(.{ .len = 0 }))));
+    const zero_bytes = @as([64]u8, @splat(0));
     var decoder = RangeDecoder.init(&zero_bytes);
 
     var plan = CeltResidualPlan{
@@ -4779,7 +4779,7 @@ test "decode and synthesize coupled stereo celt low bands below intensity" {
         .channels = 2,
         .plan = plan,
         .bands = bands,
-        .band_energies = [_][21]f32{[_]f32{0} ** 21} ** 2,
+        .band_energies = @as([2][21]f32, @splat(@as([21]f32, @splat(0)))),
     };
     frame.band_energies[0][13] = 0.35;
     frame.band_energies[1][13] = -0.15;
@@ -5170,7 +5170,7 @@ test "decode generated hybrid packet parameters expose stereo silk decode state"
 }
 
 test "silk gain dequant saturates instead of overflowing i32" {
-    var gains = [_]i32{0} ** 4;
+    var gains = @as([4]i32, @splat(0));
     var prev_index: i32 = 63;
     silkDequantGains(&gains, .{ 63, 63, 63, 63 }, &prev_index, false);
 

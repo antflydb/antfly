@@ -400,7 +400,7 @@ fn compareOneWithDjpeg(alloc: Allocator, root_dir: []const u8, relative_path: []
     const compare_len = @min(decoded_rgba.len, djpeg_rgba.len);
     var diff_count: usize = 0;
     var first_diff: ?usize = null;
-    var channel_diff_counts = [_]usize{0} ** 4;
+    var channel_diff_counts = @as([4]usize, @splat(0));
     var bbox: ?DiffBoundingBox = null;
     const block_cols = divCeil(metadata.width, 8);
     const block_rows = divCeil(metadata.height, 8);

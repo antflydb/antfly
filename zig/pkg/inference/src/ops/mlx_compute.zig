@@ -369,8 +369,8 @@ fn debugTiedLogitsOutputEnabled() bool {
 }
 
 fn debugTopValues(label: []const u8, row: []const f32) void {
-    var top_ids = [_]usize{0} ** 8;
-    var top_vals = [_]f32{-std.math.inf(f32)} ** 8;
+    var top_ids = @as([8]usize, @splat(0));
+    var top_vals = @as([8]f32, @splat(-std.math.inf(f32)));
     for (row, 0..) |logit, idx| {
         var insert_at: ?usize = null;
         for (top_vals, 0..) |current, slot| {

@@ -6040,11 +6040,11 @@ test "deepseek v4 required tensors use canonical hf names" {
         names.deinit(allocator);
     }
 
-    var attention_schedule = [_]gpt_mod.DeepseekV4AttentionKind{.sliding_attention} ** gpt_mod.deepseek_v4_max_layers;
+    var attention_schedule = @as([gpt_mod.deepseek_v4_max_layers]gpt_mod.DeepseekV4AttentionKind, @splat(.sliding_attention));
     attention_schedule[1] = .compressed_sparse_attention;
     attention_schedule[2] = .heavily_compressed_attention;
 
-    var mlp_schedule = [_]gpt_mod.DeepseekV4MlpKind{.moe} ** gpt_mod.deepseek_v4_max_layers;
+    var mlp_schedule = @as([gpt_mod.deepseek_v4_max_layers]gpt_mod.DeepseekV4MlpKind, @splat(.moe));
     mlp_schedule[0] = .hash_moe;
 
     var missing = std.ArrayListUnmanaged([]const u8).empty;

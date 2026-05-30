@@ -2294,7 +2294,7 @@ pub const ProvisionedTableWriteSource = struct {
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
     dirty_write_table_count: std.atomic.Value(u32) = .init(0),
     startup_catch_up_active: std.atomic.Value(bool) = .init(false),
-    dirty_write_table_hashes: [max_cached_write_tables]u64 = [_]u64{0} ** max_cached_write_tables,
+    dirty_write_table_hashes: [max_cached_write_tables]u64 = @as([max_cached_write_tables]u64, @splat(0)),
     dirty_write_table_hashes_len: usize = 0,
     active_table_activities: std.ArrayListUnmanaged(TableActivity) = .empty,
 
