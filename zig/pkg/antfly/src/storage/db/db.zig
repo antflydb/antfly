@@ -31,7 +31,7 @@ const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
 const shard_mod = @import("../shard.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
-pub const resolution_runtime = @import("resolution_runtime.zig");
+const resolution_runtime_mod = @import("resolution_runtime.zig");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
 const types = @import("types.zig");
@@ -617,6 +617,7 @@ const EnrichmentAppendContext = struct {
     executor: *derived_executor_mod.Executor,
     async_context: ?*AsyncContext,
     log_mutex: *std.atomic.Mutex,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
 
     fn batchContext(self: *const EnrichmentAppendContext) BatchExecutionContext {
         return .{
@@ -635,6 +636,7 @@ const EnrichmentAppendContext = struct {
             .io = if (self.async_context) |ctx| ctx.io else null,
             .async_context = self.async_context,
             .enrichment_runtime = null,
+            .resolution_runtime = self.resolution_runtime,
         };
     }
 };
@@ -654,6 +656,7 @@ const BatchExecutionContext = struct {
     artifact_cleanup_maybe: ?*std.atomic.Value(bool) = null,
     executor: *derived_executor_mod.Executor,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     async_context: ?*AsyncContext = null,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
 };
@@ -2235,6 +2238,8 @@ pub const DB = struct {
     remote_content: ?*const scraping.RemoteContentConfig,
     enrichment_append_context: ?*EnrichmentAppendContext,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
+    resolution_append_context: ?*EnrichmentAppendContext = null,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
@@ -2277,6 +2282,7 @@ pub const DB = struct {
             .executor = self.executor,
             .io = self.backend_runtime.io(),
             .enrichment_runtime = self.enrichment_runtime,
+            .resolution_runtime = self.resolution_runtime,
             .async_context = self.async_context,
         };
     }
@@ -2588,6 +2594,7 @@ pub const DB = struct {
             .executor = self.executor,
             .async_context = self.async_context,
             .log_mutex = resources.log_mutex,
+            .resolution_runtime = self.resolution_runtime,
         };
 
         const runtime = try self.runtime_alloc.create(enrichment_runtime_mod.EnrichmentRuntime);
@@ -2610,6 +2617,44 @@ pub const DB = struct {
         self.enrichment_runtime = runtime;
     }
 
+    fn initResolutionRuntime(self: *DB) !void {
+        // The worker runs on the backend_runtime io loop; without io there is no
+        // way to drive catch-up, so resolution stays inert (replay still durable).
+        if (self.backend_runtime.io_impl == null) return;
+
+        const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
+        errdefer self.runtime_alloc.destroy(append_ctx);
+        const resources = self.core.batchExecutionResources();
+        append_ctx.* = .{
+            .alloc = self.runtime_alloc,
+            .store = resources.store,
+            .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
+            .shard_manager = resources.shard_manager,
+            .index_manager = resources.index_manager,
+            .apply_mutex = resources.apply_mutex,
+            .change_journal = resources.change_journal,
+            .replay_source = resources.replay_source,
+            .executor = self.executor,
+            .async_context = self.async_context,
+            .log_mutex = resources.log_mutex,
+        };
+
+        const runtime = try self.runtime_alloc.create(resolution_runtime_mod.ResolutionRuntime);
+        errdefer self.runtime_alloc.destroy(runtime);
+        runtime.* = try resolution_runtime_mod.ResolutionRuntime.init(
+            self.runtime_alloc,
+            self.core.batchExecutionResources().store,
+            self.core.replaySource(),
+            self.core.batchExecutionResources().index_manager,
+            append_ctx,
+            appendDerivedBatchFromEnrichment,
+            self.backend_runtime,
+        );
+        errdefer runtime.deinit();
+        self.resolution_append_context = append_ctx;
+        self.resolution_runtime = runtime;
+    }
+
     fn initOptionalTtlRuntime(self: *DB, cfg: ttl_runtime_mod.Config) !void {
         const ttl_ctx = try self.runtime_alloc.create(TtlCleanupContext);
         errdefer self.runtime_alloc.destroy(ttl_ctx);
@@ -2628,6 +2673,7 @@ pub const DB = struct {
                 .identity_namespace = batch_resources.identity_namespace,
                 .executor = self.executor,
                 .enrichment_runtime = self.enrichment_runtime,
+                .resolution_runtime = self.resolution_runtime,
             },
             .grace_period_ns = cfg.grace_period_ns,
         };
@@ -2709,6 +2755,9 @@ pub const DB = struct {
     }
 
     fn initOptionalRuntimes(self: *DB, opts: OpenOptions) !void {
+        // Created before enrichment so the enrichment append context can notify
+        // it when extraction artifacts land.
+        try self.initResolutionRuntime();
         if (opts.enrichment) |raw_enrichment_cfg| {
             var enrichment_cfg = raw_enrichment_cfg;
             if (enrichment_cfg.secret_store == null) enrichment_cfg.secret_store = opts.secret_store;
@@ -2726,6 +2775,7 @@ pub const DB = struct {
     }
 
     fn startOptionalRuntimes(self: *DB) !void {
+        if (self.resolution_runtime) |runtime| try runtime.start();
         if (self.enrichment_runtime) |runtime| try runtime.start();
         if (self.ttl_runtime) |runtime| try runtime.start();
         if (self.transaction_runtime) |runtime| try runtime.start();
@@ -2757,6 +2807,11 @@ pub const DB = struct {
             self.runtime_alloc.destroy(runtime);
         }
         if (self.enrichment_append_context) |ctx| self.runtime_alloc.destroy(ctx);
+        if (self.resolution_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+        }
+        if (self.resolution_append_context) |ctx| self.runtime_alloc.destroy(ctx);
         if (executor_ready) self.executor.deinit(self.runtime_alloc);
         self.runtime_alloc.destroy(self.executor);
         if (self.text_merge_runtime) |runtime| {
@@ -3709,6 +3764,7 @@ pub const DB = struct {
             runtime.notifySequence(sequence);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
         }
+        if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
     }
 
     fn failIfIdentityOrdinalExhaustedForNewUpserts(self: *DB, doc_ids: []const []const u8) !void {
@@ -6909,6 +6965,7 @@ pub const DB = struct {
             const sequence = try appendDerivedBatchRecord(self, pending_batch);
             self.executor.notifySequence(sequence);
             if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+            if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
         }
         return generated_ref_count;
     }
@@ -13594,6 +13651,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         try waitForSyncLevelContext(ctx, sync_level, sequence, sync_targets);
     }
     if (ctx.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+    if (ctx.resolution_runtime) |runtime| runtime.notifySequence(sequence);
 }
 
 fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const ttl_runtime_mod.DeleteCandidate) !u32 {
@@ -14236,6 +14294,7 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     var batch_ctx = ctx.batchContext();
     const sequence = try appendDerivedBatchRecordContext(&batch_ctx, batch);
+    if (ctx.resolution_runtime) |runtime| runtime.notifySequence(sequence);
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
         return sequence;
