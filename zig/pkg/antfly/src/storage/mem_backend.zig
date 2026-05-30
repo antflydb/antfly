@@ -163,11 +163,43 @@ pub const Options = struct {
     backend: backend_types.OpenOptions = .{},
 };
 
+// Reference-counted, immutable-while-shared snapshot of the store. Read
+// transactions retain the current snapshot in O(1) instead of cloning the whole
+// entry list; a writer clones into a fresh snapshot and publishes it on commit,
+// so readers opened beforehand keep observing the snapshot they retained until
+// they release it. This keeps snapshot isolation while making reads cheap.
+const RcState = struct {
+    refs: usize,
+    state: State,
+};
+
+fn retainState(rc: *RcState) void {
+    rc.refs += 1;
+}
+
+fn releaseState(allocator: Allocator, rc: *RcState) void {
+    rc.refs -= 1;
+    if (rc.refs == 0) {
+        rc.state.deinit(allocator);
+        allocator.destroy(rc);
+    }
+}
+
 pub const Backend = struct {
     allocator: Allocator,
     open_options: backend_types.OpenOptions,
-    state: State = .{},
+    state: ?*RcState = null,
     mutex: std.atomic.Mutex = .unlocked,
+
+    // Returns the current snapshot, creating an empty one on first use. Must be
+    // called with the backend mutex held.
+    fn ensureStateLocked(self: *Backend) !*RcState {
+        if (self.state) |rc| return rc;
+        const rc = try self.allocator.create(RcState);
+        rc.* = .{ .refs = 1, .state = .{} };
+        self.state = rc;
+        return rc;
+    }
 
     const BoundStore = struct {
         backend: *Backend,
@@ -296,54 +328,70 @@ pub const Backend = struct {
 
     const BoundTxn = struct {
         allocator: Allocator,
-        backend: ?*Backend,
+        backend: *Backend,
         namespace: backend_types.Namespace,
-        state: State,
+        read_only: bool,
+        rc: ?*RcState,
 
         fn open(backend: *Backend, namespace: backend_types.Namespace, read_only: bool) !BoundTxn {
             lockBackend(backend);
             defer backend.mutex.unlock();
+            const current = try backend.ensureStateLocked();
+            const rc: *RcState = if (read_only) blk: {
+                retainState(current);
+                break :blk current;
+            } else blk: {
+                var cloned = try current.state.clone(backend.allocator);
+                errdefer cloned.deinit(backend.allocator);
+                const new_rc = try backend.allocator.create(RcState);
+                new_rc.* = .{ .refs = 1, .state = cloned };
+                break :blk new_rc;
+            };
             return .{
                 .allocator = backend.allocator,
-                .backend = if (read_only) null else backend,
+                .backend = backend,
                 .namespace = namespace,
-                .state = try backend.state.clone(backend.allocator),
+                .read_only = read_only,
+                .rc = rc,
             };
         }
 
         pub fn abort(self: *@This()) void {
-            self.state.deinit(self.allocator);
-            self.* = undefined;
+            const rc = self.rc orelse return;
+            lockBackend(self.backend);
+            releaseState(self.allocator, rc);
+            self.backend.mutex.unlock();
+            self.rc = null;
         }
 
         pub fn commit(self: *@This()) !void {
-            const backend = self.backend orelse return error.ReadOnly;
-            lockBackend(backend);
-            defer backend.mutex.unlock();
-            var old_state = backend.state;
-            backend.state = self.state;
-            self.state = .{};
-            old_state.deinit(self.allocator);
-            self.backend = null;
+            if (self.read_only) return error.ReadOnly;
+            const rc = self.rc orelse return error.ReadOnly;
+            lockBackend(self.backend);
+            defer self.backend.mutex.unlock();
+            const old = self.backend.state.?;
+            self.backend.state = rc;
+            releaseState(self.allocator, old);
+            self.rc = null;
         }
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
-            return try self.state.get(self.namespace, key);
+            return try self.rc.?.state.get(self.namespace, key);
         }
 
         pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
-            if (self.backend == null) return error.ReadOnly;
-            try self.state.put(self.allocator, self.namespace, key, value);
+            if (self.read_only) return error.ReadOnly;
+            try self.rc.?.state.put(self.allocator, self.namespace, key, value);
         }
 
         pub fn delete(self: *@This(), key: []const u8) !void {
-            if (self.backend == null) return error.ReadOnly;
-            try self.state.delete(self.allocator, self.namespace, key);
+            if (self.read_only) return error.ReadOnly;
+            try self.rc.?.state.delete(self.allocator, self.namespace, key);
         }
 
         pub fn openCursor(self: *@This()) !BoundCursor {
             return .{
-                .state = &self.state,
+                .state = &self.rc.?.state,
                 .namespace = self.namespace,
             };
         }
@@ -351,47 +399,63 @@ pub const Backend = struct {
 
     const NamespaceTxn = struct {
         allocator: Allocator,
-        backend: ?*Backend,
-        state: State,
+        backend: *Backend,
+        read_only: bool,
+        rc: ?*RcState,
 
         fn open(backend: *Backend, read_only: bool) !NamespaceTxn {
             lockBackend(backend);
             defer backend.mutex.unlock();
+            const current = try backend.ensureStateLocked();
+            const rc: *RcState = if (read_only) blk: {
+                retainState(current);
+                break :blk current;
+            } else blk: {
+                var cloned = try current.state.clone(backend.allocator);
+                errdefer cloned.deinit(backend.allocator);
+                const new_rc = try backend.allocator.create(RcState);
+                new_rc.* = .{ .refs = 1, .state = cloned };
+                break :blk new_rc;
+            };
             return .{
                 .allocator = backend.allocator,
-                .backend = if (read_only) null else backend,
-                .state = try backend.state.clone(backend.allocator),
+                .backend = backend,
+                .read_only = read_only,
+                .rc = rc,
             };
         }
 
         pub fn abort(self: *@This()) void {
-            self.state.deinit(self.allocator);
-            self.* = undefined;
+            const rc = self.rc orelse return;
+            lockBackend(self.backend);
+            releaseState(self.allocator, rc);
+            self.backend.mutex.unlock();
+            self.rc = null;
         }
 
         pub fn commit(self: *@This()) !void {
-            const backend = self.backend orelse return error.ReadOnly;
-            lockBackend(backend);
-            defer backend.mutex.unlock();
-            var old_state = backend.state;
-            backend.state = self.state;
-            self.state = .{};
-            old_state.deinit(self.allocator);
-            self.backend = null;
+            if (self.read_only) return error.ReadOnly;
+            const rc = self.rc orelse return error.ReadOnly;
+            lockBackend(self.backend);
+            defer self.backend.mutex.unlock();
+            const old = self.backend.state.?;
+            self.backend.state = rc;
+            releaseState(self.allocator, old);
+            self.rc = null;
         }
 
         pub fn get(self: *@This(), namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
-            return try self.state.get(namespace, key);
+            return try self.rc.?.state.get(namespace, key);
         }
 
         pub fn put(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
-            if (self.backend == null) return error.ReadOnly;
-            try self.state.put(self.allocator, namespace, key, value);
+            if (self.read_only) return error.ReadOnly;
+            try self.rc.?.state.put(self.allocator, namespace, key, value);
         }
 
         pub fn delete(self: *@This(), namespace: backend_types.Namespace, key: []const u8) !void {
-            if (self.backend == null) return error.ReadOnly;
-            try self.state.delete(self.allocator, namespace, key);
+            if (self.read_only) return error.ReadOnly;
+            try self.rc.?.state.delete(self.allocator, namespace, key);
         }
     };
 
@@ -404,7 +468,7 @@ pub const Backend = struct {
 
     pub fn close(self: *Backend) void {
         lockBackend(self);
-        self.state.deinit(self.allocator);
+        if (self.state) |rc| releaseState(self.allocator, rc);
         self.mutex.unlock();
         self.* = undefined;
     }
