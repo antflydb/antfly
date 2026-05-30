@@ -35,6 +35,7 @@ const internal_keys = @import("../../internal_keys.zig");
 const lsm_backend = @import("../../lsm_backend.zig");
 const lsm_storage_io = @import("../../lsm_backend/storage_io.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
+const background_runtime = @import("../../background_runtime.zig");
 const doc_identity = @import("../doc_identity.zig");
 const doc_set = @import("../doc_set.zig");
 const derived_types = @import("../derived/derived_types.zig");
@@ -2726,6 +2727,11 @@ pub const Index = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     append_only_accumulator_resource_bytes: u64 = 0,
     maintenance_accumulator_resource_bytes: u64 = 0,
+    // Optional durable-job lane used to rebuild HLL cardinality sketches in the
+    // background after deletes/overwrites (which the append-only sketches cannot
+    // fold back). When unset, callers drive rebuilds via runHllMaintenance.
+    hll_maintenance_lane: ?background_runtime.DurableJobLane = null,
+    hll_maintenance_owner_id: u64 = 0,
 
     pub fn open(alloc: Allocator, name: []const u8, config_json: []const u8) !Index {
         var parsed = try std.json.parseFromSlice(Config, alloc, config_json, .{ .allocate = .alloc_always });
@@ -2742,7 +2748,16 @@ pub const Index = struct {
         self.resource_manager = manager;
     }
 
+    /// Attaches a durable-job lane so HLL cardinality rebuilds (after deletes or
+    /// overwrites) run as background maintenance work rather than on a read.
+    /// `owner_id` is used to drain pending rebuilds when the index closes.
+    pub fn attachHllMaintenanceLane(self: *Index, lane: background_runtime.DurableJobLane, owner_id: u64) void {
+        self.hll_maintenance_lane = lane;
+        self.hll_maintenance_owner_id = owner_id;
+    }
+
     pub fn close(self: *Index) void {
+        if (self.hll_maintenance_lane) |lane| lane.drainOwner(self.hll_maintenance_owner_id);
         self.clearAccumulatorResourceUsage(&self.append_only_accumulator_resource_bytes);
         self.clearAccumulatorResourceUsage(&self.maintenance_accumulator_resource_bytes);
         self.alloc.free(self.name);
@@ -2819,12 +2834,15 @@ pub const Index = struct {
             return try self.applyAppendOnlyBatchWithOptions(store, batch, options);
         }
 
+        const removes_documents = batch.deleted_keys.len != 0 or batch.overwritten_doc_keys.len != 0;
+
         if (options.batch_options.mode == .bulk_ingest) {
             var write_batch = try store.beginWriteBatchWithOptions(options.batch_options);
             errdefer write_batch.abort();
             const txn = write_batch.asTxn();
             try self.applyBatchMutationsWithTxn(txn, batch, options);
             try write_batch.commit();
+            if (removes_documents) self.scheduleHllMaintenance(store);
             return;
         }
 
@@ -2832,6 +2850,7 @@ pub const Index = struct {
         errdefer txn.abort();
         try self.applyBatchMutationsWithTxn(&txn, batch, options);
         try txn.commit();
+        if (removes_documents) self.scheduleHllMaintenance(store);
     }
 
     fn applyBatchMutationsWithTxn(
@@ -14964,6 +14983,7 @@ pub const Index = struct {
         defer facts.deinit(self.alloc);
 
         try self.applyDocFactDelta(txn, doc_key, facts.facts, -1);
+        try self.markHllCardinalitiesDirtyForFactsTxn(txn, facts.facts);
         try self.applyAdaptiveDocFactDelta(txn, facts.facts, -1, maintenance_context);
         if (self.config().joins.len > 0) {
             try self.applyStoredJoinFactsForDocDelta(txn, doc_key, -1, maintenance_context);
@@ -16338,6 +16358,181 @@ pub const Index = struct {
         const merged = (try law_mod.combineAlloc(self.alloc, .hll, current, singleton)) orelse return;
         defer self.alloc.free(merged);
         try txn.put(key, merged);
+    }
+
+    fn hllCardinalityDirtyKeyAlloc(self: *Index, name: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hllcard_dirty", name });
+    }
+
+    // Marks every HLL materialization the removed document contributed to as
+    // needing a rebuild. Sketches cannot subtract a value, so a delete/overwrite
+    // can only be reflected by recomputing the affected materialization.
+    fn markHllCardinalitiesDirtyForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact) !void {
+        for (self.config().hll_cardinalities) |hcfg| {
+            if (fact_mod.findScalar(facts, .group, hcfg.value_field) == null) continue;
+            const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
+            defer self.alloc.free(dirty_key);
+            try txn.put(dirty_key, "1");
+        }
+    }
+
+    // Recomputes every per-group sketch for one materialization from the current
+    // document facts, replacing any stale sketches and clearing the dirty marker.
+    fn rebuildHllCardinalityTxn(self: *Index, txn: anytype, hcfg: HllCardinalityConfig) !void {
+        const precision = hllCardinalityPrecision(hcfg);
+
+        // Drop the existing sketches (a group emptied by deletes must disappear).
+        {
+            const prefix = try self.hllCardinalityPrefixAlloc(hcfg.name);
+            defer self.alloc.free(prefix);
+            var stale = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (stale.items) |key| self.alloc.free(key);
+                stale.deinit(self.alloc);
+            }
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(prefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                try stale.append(self.alloc, try self.alloc.dupe(u8, entry.key));
+            }
+            for (stale.items) |key| txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+
+        // Rebuild per-group sketches from the surviving document facts.
+        var sketches = std.StringHashMapUnmanaged([]u8).empty;
+        defer {
+            var it = sketches.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            sketches.deinit(self.alloc);
+        }
+        {
+            const docfact_prefix = try self.keyAlloc(&.{"docfact"});
+            defer self.alloc.free(docfact_prefix);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(docfact_prefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, docfact_prefix)) break;
+                var facts = fact_mod.decodeListAlloc(self.alloc, entry.value) catch continue;
+                defer facts.deinit(self.alloc);
+                const group_key = fact_mod.axisTupleAlloc(self.alloc, facts.facts, hcfg.group_by) catch |err| switch (err) {
+                    error.MissingField => continue,
+                    else => return err,
+                };
+                defer self.alloc.free(group_key);
+                const value_scalar = fact_mod.findScalar(facts.facts, .group, hcfg.value_field) orelse continue;
+                const singleton = try hll.singletonEncodedAlloc(self.alloc, precision, value_scalar);
+                defer self.alloc.free(singleton);
+                const gop = try sketches.getOrPut(self.alloc, group_key);
+                if (!gop.found_existing) {
+                    errdefer _ = sketches.remove(group_key);
+                    gop.key_ptr.* = try self.alloc.dupe(u8, group_key);
+                    gop.value_ptr.* = try self.alloc.dupe(u8, singleton);
+                } else {
+                    const merged = (try law_mod.combineAlloc(self.alloc, .hll, gop.value_ptr.*, singleton)) orelse continue;
+                    self.alloc.free(gop.value_ptr.*);
+                    gop.value_ptr.* = merged;
+                }
+            }
+        }
+
+        var write_it = sketches.iterator();
+        while (write_it.next()) |entry| {
+            const key = try self.hllCardinalityKeyAlloc(hcfg.name, entry.key_ptr.*);
+            defer self.alloc.free(key);
+            try txn.put(key, entry.value_ptr.*);
+        }
+
+        const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
+        defer self.alloc.free(dirty_key);
+        txn.delete(dirty_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    fn anyHllCardinalityDirty(self: *Index, store: *docstore_mod.DocStore) !bool {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        for (self.config().hll_cardinalities) |hcfg| {
+            const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
+            defer self.alloc.free(dirty_key);
+            _ = txn.get(dirty_key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            return true;
+        }
+        return false;
+    }
+
+    fn runHllMaintenanceTxn(self: *Index, txn: anytype) !bool {
+        var did_work = false;
+        for (self.config().hll_cardinalities) |hcfg| {
+            const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
+            defer self.alloc.free(dirty_key);
+            _ = txn.get(dirty_key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            try self.rebuildHllCardinalityTxn(txn, hcfg);
+            did_work = true;
+        }
+        return did_work;
+    }
+
+    /// Rebuilds any HLL cardinality materialization marked dirty by a delete or
+    /// overwrite. Safe to call repeatedly; a no-op when nothing is dirty. This is
+    /// the unit of work the durable-job lane runs in the background.
+    pub fn runHllMaintenance(self: *Index, store: *docstore_mod.DocStore) !bool {
+        if (self.config().hll_cardinalities.len == 0) return false;
+        if (!try self.anyHllCardinalityDirty(store)) return false;
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const did_work = try self.runHllMaintenanceTxn(&txn);
+        try txn.commit();
+        return did_work;
+    }
+
+    const HllMaintenanceJob = struct {
+        index: *Index,
+        store: *docstore_mod.DocStore,
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *HllMaintenanceJob = @ptrCast(@alignCast(ptr));
+            _ = self.index.runHllMaintenance(self.store) catch {};
+        }
+
+        fn deinitFn(ptr: *anyopaque) void {
+            const self: *HllMaintenanceJob = @ptrCast(@alignCast(ptr));
+            self.index.alloc.destroy(self);
+        }
+    };
+
+    // Submits a background rebuild after a batch that may have invalidated
+    // sketches. With the inline lane this runs synchronously once the batch txn
+    // has committed; with a threaded lane it runs off the write path. When no
+    // lane is attached, callers drive runHllMaintenance themselves.
+    fn scheduleHllMaintenance(self: *Index, store: *docstore_mod.DocStore) void {
+        const lane = self.hll_maintenance_lane orelse return;
+        if (self.config().hll_cardinalities.len == 0) return;
+        const job_ctx = self.alloc.create(HllMaintenanceJob) catch return;
+        job_ctx.* = .{ .index = self, .store = store };
+        lane.submit(.{
+            .owner_id = self.hll_maintenance_owner_id,
+            .class = .maintenance,
+            .ptr = job_ctx,
+            .run = HllMaintenanceJob.run,
+            .deinit = HllMaintenanceJob.deinitFn,
+        }) catch self.alloc.destroy(job_ctx);
     }
 
     pub const ApproxCardinalityEntry = struct {
@@ -18877,6 +19072,71 @@ test "algebraic index materializes approximate per-group cardinality" {
     // The grand total is the union of the per-group sketches: 5 distinct customers.
     const total = try idx.approxCardinalityTotalAlloc(&store, "customers_by_region");
     try std.testing.expect(@max(total, 5) - @min(total, 5) <= 1);
+}
+
+test "algebraic HLL cardinality rebuilds after deletes via maintenance lane" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    // A manual-backend runtime runs durable jobs inline (synchronously on submit),
+    // so the post-batch maintenance rebuild completes before applyBatch returns.
+    var runtime = try background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"customers_by_region","group_by":["region"],"value_field":"customer","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, runtime.allocOwnerId());
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+
+    const westEstimate = struct {
+        fn read(index: *Index, doc_store: *docstore_mod.DocStore, group: []const u8, allocator: Allocator) !?u64 {
+            const entries = try index.approxCardinalityEntriesAlloc(doc_store, "customers_by_region");
+            defer {
+                for (entries) |*entry| entry.deinit(allocator);
+                allocator.free(entries);
+            }
+            for (entries) |entry| {
+                if (std.mem.eql(u8, entry.group_key, group)) return entry.estimate;
+            }
+            return null;
+        }
+    }.read;
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"b\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"c\"}" },
+        .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"a\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try std.testing.expectEqual(@as(?u64, 3), try westEstimate(&idx, &store, west_group, alloc));
+
+    // Delete customers b and c from west; the inline lane rebuilds the sketch so
+    // west collapses to a single distinct customer (a).
+    const deletes = [_][]const u8{ "o2", "o3" };
+    try idx.applyBatch(&store, .{ .deleted_keys = deletes[0..] });
+    try std.testing.expectEqual(@as(?u64, 1), try westEstimate(&idx, &store, west_group, alloc));
 }
 
 test "algebraic raw metric doc id reads canonicalize measure path aliases" {
