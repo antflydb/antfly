@@ -4502,8 +4502,10 @@ pub const Index = struct {
             buckets.deinit(self.alloc);
         }
 
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         for (entries) |entry| {
-            if (!cardinalityDocMatchesConstraints(constraint_ids, entry.doc_id)) continue;
+            if (!constraint_set.matches(entry.doc_id)) continue;
             if (live_txn) |*txn| {
                 if (!try self.docVisibleAtGenerationTxn(txn, entry.doc_id, generation)) continue;
             }
@@ -4685,6 +4687,8 @@ pub const Index = struct {
         if (kind == .date and !allow_datetime_string) return null;
         const prefix = try self.keyAlloc(&.{"pathfact"});
         defer self.alloc.free(prefix);
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         var cursor = try txn.openCursor();
         defer cursor.close();
         var entry_opt = try cursor.seekAtOrAfter(prefix);
@@ -4692,7 +4696,7 @@ pub const Index = struct {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             const doc_component = token.componentAt(entry.key, prefix.len) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!constraint_set.matches(doc_component.payload)) continue;
             if (generation != null and !try self.docVisibleAtGenerationTxn(&txn, doc_component.payload, generation)) continue;
             var projection = pathfact_mod.decodeProjectionAlloc(self.alloc, entry.value) catch |err| switch (err) {
                 error.InvalidPathFactList => continue,
@@ -4800,8 +4804,10 @@ pub const Index = struct {
         if (generation != null) live_txn = try store.beginReadTxn();
         defer if (live_txn) |*txn| txn.abort();
 
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         for (bucket_entries) |entry| {
-            if (!cardinalityDocMatchesConstraints(constraint_ids, entry.doc_id)) continue;
+            if (!constraint_set.matches(entry.doc_id)) continue;
             if (live_txn) |*txn| {
                 if (!try self.docVisibleAtGenerationTxn(txn, entry.doc_id, generation)) continue;
             }
@@ -4879,6 +4885,8 @@ pub const Index = struct {
         defer self.alloc.free(prefix);
         var txn = try store.beginReadTxn();
         defer txn.abort();
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         var cursor = try txn.openCursor();
         defer cursor.close();
         var entry_opt = try cursor.seekAtOrAfter(prefix);
@@ -4886,7 +4894,7 @@ pub const Index = struct {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             const doc_component = token.componentAt(entry.key, prefix.len) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!constraint_set.matches(doc_component.payload)) continue;
             if (generation != null and !try self.docVisibleAtGenerationTxn(&txn, doc_component.payload, generation)) continue;
             var projection = pathfact_mod.decodeProjectionAlloc(self.alloc, entry.value) catch |err| switch (err) {
                 error.InvalidPathFactList => continue,
@@ -5079,13 +5087,15 @@ pub const Index = struct {
         defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         var entry_opt = try cursor.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             const scalar_component = token.componentAt(entry.key, prefix.len) catch continue;
             const doc_component = token.componentAt(entry.key, scalar_component.next) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!constraint_set.matches(doc_component.payload)) continue;
             const gop = try values.getOrPut(self.alloc, scalar_component.payload);
             if (!gop.found_existing) gop.key_ptr.* = try self.alloc.dupe(u8, scalar_component.payload);
         }
@@ -5105,13 +5115,15 @@ pub const Index = struct {
         defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         var entry_opt = try cursor.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             const scalar_component = token.componentAt(entry.key, prefix.len) catch continue;
             const doc_component = token.componentAt(entry.key, scalar_component.next) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!constraint_set.matches(doc_component.payload)) continue;
             if (!try self.docVisibleAtGenerationTxn(&txn, doc_component.payload, generation)) continue;
             const gop = try values.getOrPut(self.alloc, scalar_component.payload);
             if (!gop.found_existing) gop.key_ptr.* = try self.alloc.dupe(u8, scalar_component.payload);
@@ -5164,6 +5176,8 @@ pub const Index = struct {
         defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         var entry_opt = try cursor.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
@@ -5172,7 +5186,7 @@ pub const Index = struct {
             const value_component = token.componentAt(entry.key, kind_component.next) catch continue;
             const doc_component = token.componentAt(entry.key, value_component.next) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!constraint_set.matches(doc_component.payload)) continue;
             const value_key = try token.canonicalTupleAlloc(self.alloc, &.{ kind_component.payload, value_component.payload });
             const gop = try values.getOrPut(self.alloc, value_key);
             if (gop.found_existing) {
@@ -5197,6 +5211,8 @@ pub const Index = struct {
         defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
+        var constraint_set = try DocIdConstraintSet.init(self.alloc, constraint_ids);
+        defer constraint_set.deinit(self.alloc);
         var entry_opt = try cursor.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
@@ -5205,7 +5221,7 @@ pub const Index = struct {
             const value_component = token.componentAt(entry.key, kind_component.next) catch continue;
             const doc_component = token.componentAt(entry.key, value_component.next) catch continue;
             if (doc_component.next != entry.key.len) continue;
-            if (!cardinalityDocMatchesConstraints(constraint_ids, doc_component.payload)) continue;
+            if (!constraint_set.matches(doc_component.payload)) continue;
             if (!try self.docVisibleAtGenerationTxn(&txn, doc_component.payload, generation)) continue;
             const value_key = try token.canonicalTupleAlloc(self.alloc, &.{ kind_component.payload, value_component.payload });
             const gop = try values.getOrPut(self.alloc, value_key);
@@ -5370,6 +5386,39 @@ pub const Index = struct {
         }
         return false;
     }
+
+    // Membership view over a doc-id constraint slice. The slice owns the keys;
+    // this set only borrows them, so it must not outlive `constraint_ids`.
+    //
+    // The cardinality scans below walk the full doc-fact/path-fact prefix for a
+    // field and test each entry against the active constraint set. When that
+    // set is a bucket's doc-id list (histogram/range children) or a constraint
+    // result set (root cardinality), a linear membership test makes the scan
+    // O(entries * constraints), which is quadratic in the document count. A hash
+    // set turns each test into O(1) and the scan back into a single linear pass.
+    const DocIdConstraintSet = struct {
+        set: std.StringHashMapUnmanaged(void) = .empty,
+        active: bool = false,
+
+        fn init(alloc: Allocator, constraint_ids: []const []const u8) !DocIdConstraintSet {
+            if (constraint_ids.len == 0) return .{};
+            var set = std.StringHashMapUnmanaged(void).empty;
+            errdefer set.deinit(alloc);
+            try set.ensureTotalCapacity(alloc, @intCast(constraint_ids.len));
+            for (constraint_ids) |id| set.putAssumeCapacity(id, {});
+            return .{ .set = set, .active = true };
+        }
+
+        fn deinit(self: *DocIdConstraintSet, alloc: Allocator) void {
+            self.set.deinit(alloc);
+            self.* = .{};
+        }
+
+        fn matches(self: *const DocIdConstraintSet, doc_id: []const u8) bool {
+            if (!self.active) return true;
+            return self.set.contains(doc_id);
+        }
+    };
 
     pub fn rawMetricForResolvedDocIdsAlloc(self: *Index, store: *docstore_mod.DocStore, op: algebra.Op, resolved: ResolvedMeasureField, doc_ids: []const []const u8) !?[]u8 {
         if (op == .count) {
