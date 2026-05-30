@@ -4391,6 +4391,9 @@ pub const Index = struct {
             partials.deinit(self.alloc);
         }
 
+        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer self.freeChildCardinalityIndexes(child_indexes);
+
         for (ranges) |range| {
             const filter_json = try self.rangeCardinalityFilterJsonAlloc(field_or_path, kind, range);
             defer self.alloc.free(filter_json);
@@ -4410,12 +4413,8 @@ pub const Index = struct {
             const axis = try rangeCardinalityAxisAlloc(self.alloc, kind, range);
             defer self.alloc.free(axis);
             try self.appendDistributedCountPartial(&partials, axis, aggregation_name, @intCast(bucket_ids.len));
-            for (child_requests) |child| {
-                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, bucket_ids)) orelse return null;
-                defer distributed_mod.freePartials(self.alloc, child_partials);
-                for (child_partials) |partial| {
-                    try self.appendDistributedPartialForAxis(&partials, axis, partial.metric, partial.law_id, partial.value);
-                }
+            for (child_requests, child_indexes) |child, *child_index| {
+                try self.appendBucketChildCardinalityPartials(&partials, axis, .raw, child.name, child_index, bucket_ids);
             }
         }
 
@@ -4547,14 +4546,12 @@ pub const Index = struct {
             partials.deinit(self.alloc);
         }
 
+        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer self.freeChildCardinalityIndexes(child_indexes);
         for (buckets.items) |bucket| {
             try self.appendDistributedCountPartial(&partials, bucket.axis, aggregation_name, @intCast(bucket.doc_ids.items.len));
-            for (child_requests) |child| {
-                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, bucket.doc_ids.items)) orelse return null;
-                defer distributed_mod.freePartials(self.alloc, child_partials);
-                for (child_partials) |partial| {
-                    try self.appendDistributedPartialForAxis(&partials, bucket.axis, partial.metric, partial.law_id, partial.value);
-                }
+            for (child_requests, child_indexes) |child, *child_index| {
+                try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .raw, child.name, child_index, bucket.doc_ids.items);
             }
         }
 
@@ -4740,14 +4737,12 @@ pub const Index = struct {
             }
             partials.deinit(self.alloc);
         }
+        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer self.freeChildCardinalityIndexes(child_indexes);
         for (buckets.items) |bucket| {
             try self.appendDistributedCountPartial(&partials, bucket.axis, aggregation_name, @intCast(bucket.doc_ids.items.len));
-            for (child_requests) |child| {
-                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, bucket.doc_ids.items)) orelse return null;
-                defer distributed_mod.freePartials(self.alloc, child_partials);
-                for (child_partials) |partial| {
-                    try self.appendDistributedPartialForAxis(&partials, bucket.axis, partial.metric, partial.law_id, partial.value);
-                }
+            for (child_requests, child_indexes) |child, *child_index| {
+                try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .raw, child.name, child_index, bucket.doc_ids.items);
             }
         }
         return try partials.toOwnedSlice(self.alloc);
@@ -4831,14 +4826,12 @@ pub const Index = struct {
             partials.deinit(self.alloc);
         }
 
+        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer self.freeChildCardinalityIndexes(child_indexes);
         for (buckets.items) |bucket| {
             try self.appendDistributedCountPartial(&partials, bucket.axis, terms_aggregation_name, @intCast(bucket.doc_ids.items.len));
-            for (child_requests) |child| {
-                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, bucket.doc_ids.items)) orelse return null;
-                defer distributed_mod.freePartials(self.alloc, child_partials);
-                for (child_partials) |partial| {
-                    try self.appendDistributedPartialForAxis(&partials, bucket.axis, partial.metric, partial.law_id, partial.value);
-                }
+            for (child_requests, child_indexes) |child, *child_index| {
+                try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .raw, child.name, child_index, bucket.doc_ids.items);
             }
         }
 
@@ -4927,20 +4920,184 @@ pub const Index = struct {
             }
             partials.deinit(self.alloc);
         }
+        const child_indexes = (try self.buildChildCardinalityIndexesAlloc(store, child_requests)) orelse return null;
+        defer self.freeChildCardinalityIndexes(child_indexes);
         for (buckets.items) |bucket| {
             const count_value = try algebra.encodeI64Alloc(self.alloc, @intCast(bucket.doc_ids.items.len));
             defer self.alloc.free(count_value);
             try self.appendDistributedPartialForCanonicalAxis(&partials, bucket.axis, terms_aggregation_name, .count, count_value);
-            for (child_requests) |child| {
-                const child_partials = (try self.scanDistributedCardinalityPartialsForDocIds(store, child.name, child.field, bucket.doc_ids.items)) orelse return null;
-                defer distributed_mod.freePartials(self.alloc, child_partials);
-                for (child_partials) |partial| {
-                    try self.appendDistributedPartialForCanonicalAxis(&partials, bucket.axis, partial.metric, partial.law_id, partial.value);
-                }
+            for (child_requests, child_indexes) |child, *child_index| {
+                try self.appendBucketChildCardinalityPartials(&partials, bucket.axis, .canonical, child.name, child_index, bucket.doc_ids.items);
             }
         }
 
         return try partials.toOwnedSlice(self.alloc);
+    }
+
+    // Per-document index of distinct cardinality value-keys for one child
+    // field, populated with a single cursor scan over that field. Bucketed
+    // cardinality (histogram / range / terms children) used to re-scan the
+    // entire child field once per bucket; with this index we scan once and look
+    // up each bucket's documents, turning O(buckets * field_entries) into
+    // O(field_entries + total_bucket_members).
+    const ChildCardinalityIndex = struct {
+        by_doc: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]u8)) = .empty,
+
+        fn deinit(self: *ChildCardinalityIndex, alloc: Allocator) void {
+            var it = self.by_doc.iterator();
+            while (it.next()) |entry| {
+                for (entry.value_ptr.items) |value_key| alloc.free(value_key);
+                entry.value_ptr.deinit(alloc);
+                alloc.free(entry.key_ptr.*);
+            }
+            self.by_doc.deinit(alloc);
+            self.* = .{};
+        }
+
+        fn add(self: *ChildCardinalityIndex, alloc: Allocator, doc_id: []const u8, value_key: []const u8) !void {
+            const gop = try self.by_doc.getOrPut(alloc, doc_id);
+            if (!gop.found_existing) {
+                errdefer _ = self.by_doc.remove(doc_id);
+                gop.key_ptr.* = try alloc.dupe(u8, doc_id);
+                gop.value_ptr.* = .empty;
+            }
+            for (gop.value_ptr.items) |existing| {
+                if (std.mem.eql(u8, existing, value_key)) return;
+            }
+            try gop.value_ptr.append(alloc, try alloc.dupe(u8, value_key));
+        }
+
+        fn valuesFor(self: *const ChildCardinalityIndex, doc_id: []const u8) []const []u8 {
+            const entry = self.by_doc.getPtr(doc_id) orelse return &.{};
+            return entry.items;
+        }
+    };
+
+    fn buildChildCardinalityIndexAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        field_or_path: []const u8,
+    ) !?ChildCardinalityIndex {
+        var index = ChildCardinalityIndex{};
+        errdefer index.deinit(self.alloc);
+        if (isExplicitJsonPointerPath(field_or_path)) {
+            try self.collectPathCardinalityValuesByDoc(store, field_or_path, &index);
+        } else {
+            const field = self.uniqueExistingFactField(field_or_path) orelse return null;
+            try self.collectDocFactCardinalityValuesByDoc(store, field, &index);
+        }
+        return index;
+    }
+
+    // Builds one ChildCardinalityIndex per child request. Returns null (so the
+    // caller falls back to a document scan) if any child field is unsupported,
+    // mirroring the per-bucket scanDistributedCardinalityPartialsForDocIds path.
+    fn buildChildCardinalityIndexesAlloc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        child_requests: []const CardinalityChildRequest,
+    ) !?[]ChildCardinalityIndex {
+        const indexes = try self.alloc.alloc(ChildCardinalityIndex, child_requests.len);
+        var built: usize = 0;
+        errdefer {
+            for (indexes[0..built]) |*index| index.deinit(self.alloc);
+            self.alloc.free(indexes);
+        }
+        for (child_requests, 0..) |child, i| {
+            indexes[i] = (try self.buildChildCardinalityIndexAlloc(store, child.field)) orelse return null;
+            built = i + 1;
+        }
+        return indexes;
+    }
+
+    fn freeChildCardinalityIndexes(self: *Index, indexes: []ChildCardinalityIndex) void {
+        for (indexes) |*index| index.deinit(self.alloc);
+        self.alloc.free(indexes);
+    }
+
+    fn collectDocFactCardinalityValuesByDoc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        field: ExistsFieldSpec,
+        index: *ChildCardinalityIndex,
+    ) !void {
+        const prefix = try self.docFactScalarFieldPrefixAlloc(field.role, field.field);
+        defer self.alloc.free(prefix);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const scalar_component = token.componentAt(entry.key, prefix.len) catch continue;
+            const doc_component = token.componentAt(entry.key, scalar_component.next) catch continue;
+            if (doc_component.next != entry.key.len) continue;
+            try index.add(self.alloc, doc_component.payload, scalar_component.payload);
+        }
+    }
+
+    fn collectPathCardinalityValuesByDoc(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        path: []const u8,
+        index: *ChildCardinalityIndex,
+    ) !void {
+        const prefix = try self.pathLookupPathPrefixAlloc(path);
+        defer self.alloc.free(prefix);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const kind_component = token.componentAt(entry.key, prefix.len) catch continue;
+            if (!pathLookupKindIsScalarValue(kind_component.payload)) continue;
+            const value_component = token.componentAt(entry.key, kind_component.next) catch continue;
+            const doc_component = token.componentAt(entry.key, value_component.next) catch continue;
+            if (doc_component.next != entry.key.len) continue;
+            const value_key = try token.canonicalTupleAlloc(self.alloc, &.{ kind_component.payload, value_component.payload });
+            defer self.alloc.free(value_key);
+            try index.add(self.alloc, doc_component.payload, value_key);
+        }
+    }
+
+    const BucketAxisKind = enum { raw, canonical };
+
+    // Emits the distinct-value cardinality partials for one bucket and child,
+    // reproducing scanDistributedCardinalityPartialsForDocIds + the parent's
+    // re-wrap of each child partial, but sourced from a prebuilt
+    // ChildCardinalityIndex instead of a fresh per-bucket field scan. The
+    // `axis_kind` selects whether the bucket axis still needs canonical-tuple
+    // wrapping (raw) or is already canonical (path-terms buckets).
+    fn appendBucketChildCardinalityPartials(
+        self: *Index,
+        partials: *std.ArrayListUnmanaged(distributed_mod.Partial),
+        axis: []const u8,
+        axis_kind: BucketAxisKind,
+        child_name: []const u8,
+        child_index: *const ChildCardinalityIndex,
+        bucket_doc_ids: []const []const u8,
+    ) !void {
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+        for (bucket_doc_ids) |doc_id| {
+            for (child_index.valuesFor(doc_id)) |value_key| {
+                const gop = try seen.getOrPut(self.alloc, value_key);
+                if (gop.found_existing) continue;
+                // `value_key` is owned by child_index, which outlives `seen`.
+                gop.key_ptr.* = value_key;
+                const metric = try token.canonicalTupleAlloc(self.alloc, &.{ "cardinality:v1", child_name, value_key });
+                defer self.alloc.free(metric);
+                const value = try algebra.encodeI64Alloc(self.alloc, 1);
+                defer self.alloc.free(value);
+                switch (axis_kind) {
+                    .raw => try self.appendDistributedPartialForAxis(partials, axis, metric, .count, value),
+                    .canonical => try self.appendDistributedPartialForCanonicalAxis(partials, axis, metric, .count, value),
+                }
+            }
+        }
     }
 
     pub fn scanDistributedCardinalityPartialsForDocIds(
