@@ -178,7 +178,10 @@ fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
     } else if (comptime build_options.link_libc) {
         var stat_buf: c.struct_stat = undefined;
         if (c.fstat(fd, &stat_buf) != 0) return error.StatFailed;
-        return @intCast(stat_buf.st_size);
+        // std.c.Stat names the size field `.size` (the old @cImport of <sys/stat.h>
+        // exposed the C name `st_size`). This branch is live on macOS and
+        // comptime-dead on Linux, where the statx path above is used.
+        return @intCast(stat_buf.size);
     } else {
         const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
         const stat = try file.stat(std.Options.debug_io);
