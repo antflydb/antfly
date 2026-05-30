@@ -1384,6 +1384,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const resolver_mod = b.addModule("antfly_resolver", .{
+        .root_source_file = b.path("lib/resolver/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    resolver_mod.addImport("antfly_matcher", matcher_mod);
     httpx_mod.addImport("antfly-json", json_mod);
     jsonschema_mod.addImport("antfly_regex", regex_mod);
     jsonschema_mod.addImport("antfly-json", json_mod);
@@ -2104,6 +2110,13 @@ pub fn build(b: *std.Build) void {
     const run_lib_matcher_tests = b.addRunArtifact(lib_matcher_tests);
     const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone lib/matcher tests");
     lib_matcher_test_step.dependOn(&run_lib_matcher_tests.step);
+
+    const lib_resolver_tests = b.addTest(.{
+        .root_module = resolver_mod,
+    });
+    const run_lib_resolver_tests = b.addRunArtifact(lib_resolver_tests);
+    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone lib/resolver tests");
+    lib_resolver_test_step.dependOn(&run_lib_resolver_tests.step);
 
     const lib_toon_conformance = b.addExecutable(.{
         .name = "lib-toon-conformance",

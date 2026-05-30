@@ -369,11 +369,17 @@ Open/index/enrichment validation should reject:
 
 1. **Deterministic + decoupled (phase 1, in progress).**
    - [x] Comparison-levels scorer + comparators (`lib/matcher`).
-   - [ ] Resolution artifact schema + `resolution` replay stage.
-   - [ ] Deterministic `key_template` resolver wired to candidate blocking.
+   - [x] Resolution artifact schema + serialization (`lib/resolver`).
+   - [x] `DocRef {table, key}` type introduced (`lib/resolver`).
+   - [x] Deterministic `key_template` resolver core: mint canonical keys, or
+         link to a supplied candidate via the scorer (`lib/resolver`).
+   - [ ] Live candidate blocking: fetch candidates from the entity table
+         (`ann`/`exact`/`prefix`) so the resolver runs against real entities.
+   - [ ] `resolution` replay stage: drive the resolver from changed extraction
+         artifacts and persist the resolution artifact.
    - [ ] Promoter: entity upsert via `DocumentTransform`, provenance as mention
          edges, decoupled cross-shard write, fail-closed hydration.
-   - [ ] `DocRef` endpoints threaded through resolution + graph edges.
+   - [ ] `DocRef` endpoints threaded through graph edge artifacts.
 2. **Learned + reviewed (phase 2).**
    - Learned weights (EM / logistic regression) over the same levels.
    - REVIEW band workflow: review queue, human curation, label capture; resolver
@@ -395,10 +401,19 @@ Scorer (done, `lib/matcher`):
 - [x] Invalid configs are rejected.
 - [x] `explain` reports the matched level per comparison.
 
-Resolver / promoter (to come):
+Resolver core (done, `lib/resolver`):
 
-- Deterministic resolver renders stable keys; replay re-applies recorded
-  decisions without recomputation.
+- [x] Deterministic resolver renders stable canonical keys per mention.
+- [x] Mention links to a supplied candidate on a MATCH; falls back to minting on
+      review/no_match.
+- [x] `type_must_match` blocks cross-type links.
+- [x] Resolution artifact serializes to / round-trips the documented schema.
+- [x] Unknown template variables/helpers and invalid configs fail closed.
+
+Resolver / promoter integration (to come):
+
+- Live candidate blocking returns the right ~k entities from the entity table.
+- Replay re-applies recorded decisions without recomputation.
 - Promoter upsert is idempotent under replay; concurrent promotions union
   aliases.
 - Provenance mention edges appear/disappear with source documents.
