@@ -426,9 +426,17 @@ Open/index/enrichment validation should reject:
    - [x] Reserve + plumb the `resolution` `TargetHint` through the change-journal
          codec and replay-payload filtering (`change_journal.zig`,
          `docstore.zig`).
-   - [ ] Managed resolution worker: drive `ResolutionStage` from the `resolution`
-         hint and submit it as a `backend_runtime` durable job (DB adapter; see
-         "Resolution Stage Runtime").
+   - [x] Resolution artifact key scheme: `internal_keys.resolutionArtifactKeyAlloc`
+         / `isResolutionArtifactKey` / `parseResolutionArtifactKeyAlloc` (an
+         asset-style artifact under the distinct `"resolution"` type).
+   - [ ] `ResolutionRuntime`: managed worker mirroring `EnrichmentRuntime` --
+         catch up on the `resolution` hint, run `ResolutionStage` per changed
+         extraction artifact, persist via a `DerivedBatch`; submit on the shard
+         `backend_runtime` durable lane. Wire init/start/shutdown in `db.zig`.
+   - [ ] Emit the `resolution` hint on extraction-artifact changes
+         (`recordFromDerivedBatch` + the rafted thin-record path in `db.zig`).
+   - [ ] Resolver catalog config + `table_provisioner` parsing + `addResolver`
+         / `listResolvers` DB API.
    - [ ] Live candidate blocking adapter: fetch candidates from the entity table
          (`ann`/`exact`/`prefix`) so the resolver runs against real entities.
    - [ ] Promoter: entity upsert via `DocumentTransform`, provenance as mention
