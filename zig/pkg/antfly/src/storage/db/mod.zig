@@ -66,6 +66,7 @@ pub const IndexManager = @import("catalog/index_manager.zig").IndexManager;
 pub const DenseSplitHandoff = @import("catalog/index_manager.zig").DenseSplitHandoff;
 pub const TextSplitHandoff = @import("catalog/index_manager.zig").TextSplitHandoff;
 pub const SparseSplitHandoff = @import("catalog/index_manager.zig").SparseSplitHandoff;
+pub const ResolverConfig = @import("catalog/index_manager.zig").ResolverConfig;
 pub const DB = @import("db.zig").DB;
 pub const OpenOptions = @import("db.zig").OpenOptions;
 pub const OpenMode = @import("db.zig").OpenMode;

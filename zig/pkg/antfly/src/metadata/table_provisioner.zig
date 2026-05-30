@@ -189,8 +189,9 @@ pub fn reconcileDbIndexes(
 ) !ProvisionSummary {
     const removed = try removeMissingIndexes(alloc, db, indexes_json);
     const enrichments_added = try ensureEnrichments(alloc, db, indexes_json);
+    const resolvers_added = try ensureResolvers(alloc, db, indexes_json);
     const added = try ensureIndexes(alloc, db, indexes_json);
-    if (added > 0 or removed > 0 or enrichments_added > 0) {
+    if (added > 0 or removed > 0 or enrichments_added > 0 or resolvers_added > 0) {
         const pending = db.pendingWorkStats();
         if (pending.enrichment.error_count == 0) {
             try db.core.index_manager.syncAll(false);
@@ -534,6 +535,74 @@ fn collectDesiredEnrichments(
 fn enrichmentExists(existing: []const db_mod.types.EnrichmentConfig, kind: db_mod.types.EnrichmentKind, name: []const u8) bool {
     for (existing) |cfg| {
         if (cfg.kind == kind and std.mem.eql(u8, cfg.name, name)) return true;
+    }
+    return false;
+}
+
+fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !usize {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+
+    var desired = std.ArrayListUnmanaged(db_mod.ResolverConfig).empty;
+    defer {
+        for (desired.items) |*cfg| cfg.deinit(alloc);
+        desired.deinit(alloc);
+    }
+    try collectDesiredResolvers(alloc, parsed.value, &desired);
+
+    if (desired.items.len == 0) return 0;
+
+    const existing = try db.listResolvers(alloc);
+    defer {
+        for (existing) |*cfg| cfg.deinit(alloc);
+        alloc.free(existing);
+    }
+
+    var added: usize = 0;
+    for (desired.items) |cfg| {
+        if (resolverExists(existing, cfg.name)) continue;
+        try db.addResolver(cfg);
+        added += 1;
+    }
+    return added;
+}
+
+fn collectDesiredResolvers(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    out: *std.ArrayListUnmanaged(db_mod.ResolverConfig),
+) !void {
+    switch (value) {
+        .object => |object| {
+            if (object.get("resolvers")) |resolvers| {
+                if (resolvers == .array) {
+                    for (resolvers.array.items) |item| {
+                        if (item != .object) continue;
+                        const parsed = try std.json.parseFromValue(db_mod.ResolverConfig, alloc, item, .{
+                            .allocate = .alloc_always,
+                            .ignore_unknown_fields = true,
+                        });
+                        errdefer parsed.deinit();
+                        try out.append(alloc, parsed.value);
+                    }
+                }
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                try collectDesiredResolvers(alloc, entry.value_ptr.*, out);
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| try collectDesiredResolvers(alloc, item, out);
+        },
+        else => {},
+    }
+}
+
+fn resolverExists(existing: []const db_mod.ResolverConfig, name: []const u8) bool {
+    for (existing) |cfg| {
+        if (std.mem.eql(u8, cfg.name, name)) return true;
     }
     return false;
 }
