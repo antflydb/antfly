@@ -1418,6 +1418,39 @@ pub fn relationalTypedColumnsAlloc(alloc: Allocator, plan: RelationalPlan, root:
     return .{ .row = row, .fields = try fields.toOwnedSlice(alloc) };
 }
 
+/// Phase 5 (authoritative columns): project the *full reconstructable* column
+/// set. Unlike relationalTypedColumnsAlloc (which emits only the columns routed
+/// to typed-doc-value predicate scans), this emits every present column as a
+/// typed-doc-value field, including string/blob/geoshape and json columns as
+/// `bytes_val`. Persisting this set lets the document be rebuilt from columns
+/// alone (via reconstructRelationalDocumentAlloc) -- the prerequisite for
+/// dropping the JSON blob. Field order matches the plan's column order.
+pub fn relationalStorageColumnsAlloc(alloc: Allocator, plan: RelationalPlan, root: std.json.Value) !RelationalTypedColumns {
+    var row = try projectRelationalRowAlloc(alloc, plan, root);
+    errdefer row.deinit(alloc);
+
+    var fields = std.ArrayListUnmanaged(RelationalTypedField).empty;
+    errdefer fields.deinit(alloc);
+
+    for (plan.columns, 0..) |column, i| {
+        const candidate = row.cell(i) orelse continue;
+        try fields.append(alloc, .{
+            .name = column.name,
+            .value_type = storageValueTypeForColumnType(column.column_type),
+            .value = typedValue(candidate.value),
+        });
+    }
+
+    return .{ .row = row, .fields = try fields.toOwnedSlice(alloc) };
+}
+
+/// The typed_doc_values type used to *persist* a column for reconstruction.
+/// Same numeric/datetime/boolean/geopoint mapping as the scan path, but
+/// everything else (string/blob/geoshape/json) is stored as `bytes_val`.
+fn storageValueTypeForColumnType(column_type: []const u8) typed_doc_values.ValueType {
+    return typedDocValueTypeForColumnType(column_type) orelse .bytes_val;
+}
+
 /// The typed_doc_values type for a column, or null when the column is not stored
 /// as a typed doc value. Only numeric/datetime/boolean/geopoint columns become
 /// typed columns; keyword/text columns use the full-text/inverted index for
@@ -1464,4 +1497,81 @@ test "relational typed columns exclude json and carry declared physical types" {
     try std.testing.expectEqual(typed_doc_values.ValueType.u64_val, relationalFieldByName(columns.fields, "ts").?.value_type);
     try std.testing.expectEqual(typed_doc_values.ValueType.bool_val, relationalFieldByName(columns.fields, "active").?.value_type);
     try std.testing.expectEqual(@as(f64, 12.5), relationalFieldByName(columns.fields, "amount").?.value.f64_val);
+}
+
+test "relational storage columns persist and reconstruct the document" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"abc","amount":12.5,"qty":7,"ts":1000,"active":true,"attrs":{"k":"v"},"payload":[1,2,3]}
+    , .{});
+    defer doc.deinit();
+
+    // Storage projection emits ALL present columns (strings + json as bytes).
+    var columns = try relationalStorageColumnsAlloc(alloc, plan, doc.value);
+    defer columns.deinit(alloc);
+    // All 7 declared columns are present in this document.
+    try std.testing.expectEqual(@as(usize, 7), columns.fields.len);
+    try std.testing.expectEqual(typed_doc_values.ValueType.bytes_val, relationalFieldByName(columns.fields, "id").?.value_type);
+    try std.testing.expectEqual(typed_doc_values.ValueType.bytes_val, relationalFieldByName(columns.fields, "payload").?.value_type);
+
+    // Persist each field through the real typed_doc_values writer at doc_id 0,
+    // then read every value back from its own section -- proving the columns
+    // survive a full serialize/deserialize round-trip.
+    var rebuilt_cells = std.ArrayListUnmanaged(RelationalCell).empty;
+    defer rebuilt_cells.deinit(alloc);
+    var byte_bufs = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (byte_bufs.items) |b| alloc.free(b);
+        byte_bufs.deinit(alloc);
+    }
+
+    for (columns.fields) |field| {
+        const column_index = relationalColumnIndex(plan, field.name).?;
+        var writer = typed_doc_values.TypedDocValuesWriter.init(alloc, field.value_type, typed_doc_values.default_chunk_size);
+        defer writer.deinit();
+        try writer.add(0, field.value);
+        const section = try writer.build();
+        defer alloc.free(section);
+
+        const reader = try typed_doc_values.TypedDocValuesReader.init(alloc, section);
+        const value: ColumnValue = switch (field.value_type) {
+            .u64_val => .{ .u64_val = (try reader.getU64(0)).? },
+            .f64_val => .{ .f64_val = (try reader.getF64(0)).? },
+            .bool_val => .{ .bool_val = (try reader.getBool(0)).? },
+            .geo_point => blk: {
+                const gp = (try reader.getGeoPoint(0)).?;
+                break :blk .{ .geo_point = .{ .lat = gp.lat, .lon = gp.lon } };
+            },
+            .bytes_val => blk: {
+                const bytes = (try reader.getBytes(0)).?;
+                try byte_bufs.append(alloc, bytes);
+                break :blk .{ .bytes_val = bytes };
+            },
+        };
+        try rebuilt_cells.append(alloc, .{
+            .column = column_index,
+            .present = true,
+            .is_json = plan.columns[column_index].is_json,
+            .value = value,
+        });
+    }
+
+    const rebuilt_row = RelationalRow{ .cells = rebuilt_cells.items, .bytes_pool = &.{} };
+    const rebuilt_json = try reconstructRelationalDocumentAlloc(alloc, plan, rebuilt_row);
+    defer alloc.free(rebuilt_json);
+
+    var rebuilt = try std.json.parseFromSlice(std.json.Value, alloc, rebuilt_json, .{});
+    defer rebuilt.deinit();
+    const obj = rebuilt.value.object;
+
+    try std.testing.expectEqualStrings("abc", obj.get("id").?.string);
+    try std.testing.expectEqual(@as(f64, 12.5), jsonNumberOf(obj.get("amount").?));
+    try std.testing.expectEqual(@as(i64, 7), obj.get("qty").?.integer);
+    try std.testing.expectEqual(@as(i64, 1000), obj.get("ts").?.integer);
+    try std.testing.expect(obj.get("active").?.bool);
+    try std.testing.expectEqualStrings("v", obj.get("attrs").?.object.get("k").?.string);
+    try std.testing.expectEqual(@as(usize, 3), obj.get("payload").?.array.items.len);
 }

@@ -271,17 +271,27 @@ number) is additive where the physical type is compatible.
   persisted segment — the value-retrieval gap that previously only had
   bulk chunk reads. Verified by a multi-value round-trip test.
 
+  Storage projection done: `relationalStorageColumnsAlloc` emits the *full
+  reconstructable* column set — unlike `relationalTypedColumnsAlloc` (scan/index
+  routing only), it includes string/blob/geoshape and `json` columns as
+  `bytes_val`. The full storage cycle is verified end-to-end by the "relational
+  storage columns persist and reconstruct the document" test: project → persist
+  each column through the real `TypedDocValuesWriter` → read every value back
+  (`getBytes`/`getU64`/`getF64`/`getBool`/`getGeoPoint`) → rebuild a
+  `RelationalRow` → `reconstructRelationalDocumentAlloc` → assert the document
+  matches the original. This is the complete authoritative-columns data path in
+  isolation.
+
   Remaining (deliberately not done — it is a hot-path-wide storage change):
-  actually dropping the JSON blob. The authoritative document today is the
-  `stored_data` blob (`segment.addStoredDoc`), consumed as source of truth in
-  many read sites (`storage/db/aggregations.zig`, `db.zig`). Two further pieces
-  are needed before the blob can be dropped: (1) string columns are currently
-  emitted only to the analyzed inverted index (relational typed-field projection
-  excludes them), so relational mode must *also* persist them as `bytes_val`
-  typed-doc-value columns at write time (the storage + reader now exist via
-  `getBytes`; the write-path emission is the missing wiring); (2) the read path
-  must read each column section back and call
-  `reconstructRelationalDocumentAlloc` to synthesize `stored_data` on demand.
+  wiring this into the live segment write/read. The authoritative document today
+  is the `stored_data` blob (`segment.addStoredDoc`), consumed as source of
+  truth in many read sites (`storage/db/aggregations.zig`, `db.zig`). Two pieces
+  remain: (1) at write time, feed `relationalStorageColumnsAlloc` into the
+  segment builder so string columns are persisted as `bytes_val` sections
+  alongside the scan columns (the projection, storage, and reader all now
+  exist); (2) at read time, read each column section back and call
+  `reconstructRelationalDocumentAlloc` to synthesize `stored_data` on demand,
+  after which the blob can be dropped for non-`json` columns.
   Until both land, the blob remains the source of truth and reconstruction is an
   additive, independently-tested capability.
 
