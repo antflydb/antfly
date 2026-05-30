@@ -446,18 +446,22 @@ const Parser = struct {
     }
 
     fn parseRange(self: *Parser, field: []const u8) ParseError!Filter {
+        // Lucene range delimiters are independent: '[' / ']' are inclusive,
+        // '{' / '}' are exclusive, and the closing bracket need not match the
+        // opening one (e.g. "[10 TO 20}" is min-inclusive, max-exclusive).
         const start_delim = self.input[self.pos];
         const inclusive_min = start_delim == '[';
-        const end_delim: u8 = if (inclusive_min) ']' else '}';
         self.pos += 1;
         self.skipWhitespace();
-        const min_raw = self.readRangeBound(end_delim);
+        const min_raw = self.readRangeBound();
         self.skipWhitespace();
         if (!self.matchKeyword("TO")) return ParseError.InvalidSyntax;
         self.skipWhitespace();
-        const max_raw = self.readRangeBound(end_delim);
+        const max_raw = self.readRangeBound();
         self.skipWhitespace();
-        if (self.pos >= self.input.len or self.input[self.pos] != end_delim) return ParseError.InvalidSyntax;
+        if (self.pos >= self.input.len) return ParseError.InvalidSyntax;
+        const end_delim = self.input[self.pos];
+        if (end_delim != ']' and end_delim != '}') return ParseError.InvalidSyntax;
         self.pos += 1;
         const inclusive_max = end_delim == ']';
 
@@ -500,10 +504,14 @@ const Parser = struct {
         } };
     }
 
-    fn readRangeBound(self: *Parser, end_delim: u8) []const u8 {
+    fn readRangeBound(self: *Parser) []const u8 {
         const start = self.pos;
         while (self.pos < self.input.len) {
-            if (self.input[self.pos] == end_delim) break;
+            // Stop at either closing delimiter (']' or '}') so mixed-delimiter
+            // ranges parse; the upper bound's inclusivity is decided by which
+            // bracket actually closes the range.
+            const c = self.input[self.pos];
+            if (c == ']' or c == '}') break;
             if (std.mem.startsWith(u8, self.input[self.pos..], " TO")) break;
             self.pos += 1;
         }
@@ -974,4 +982,29 @@ test "undeclared and non-typed columns keep term behaviour" {
     const plain = QueryStringParser{};
     const plain_range = try plain.parse(testing.allocator, "title:[alpha TO omega]");
     try testing.expect(plain_range == .term_range);
+}
+
+test "query string: range delimiters are independent (Lucene)" {
+    const parser = QueryStringParser{};
+
+    // [ / ] inclusive, { / } exclusive; bounds independent, mixing allowed.
+    const incl_incl = try parser.parse(testing.allocator, "age:[10 TO 20]");
+    try testing.expect(incl_incl == .range);
+    try testing.expect(incl_incl.range.inclusive_min);
+    try testing.expect(incl_incl.range.inclusive_max);
+
+    const incl_excl = try parser.parse(testing.allocator, "age:[10 TO 20}");
+    try testing.expect(incl_excl == .range);
+    try testing.expect(incl_excl.range.inclusive_min);
+    try testing.expect(!incl_excl.range.inclusive_max);
+
+    const excl_incl = try parser.parse(testing.allocator, "age:{10 TO 20]");
+    try testing.expect(excl_incl == .range);
+    try testing.expect(!excl_incl.range.inclusive_min);
+    try testing.expect(excl_incl.range.inclusive_max);
+
+    const excl_excl = try parser.parse(testing.allocator, "age:{10 TO 20}");
+    try testing.expect(excl_excl == .range);
+    try testing.expect(!excl_excl.range.inclusive_min);
+    try testing.expect(!excl_excl.range.inclusive_max);
 }
