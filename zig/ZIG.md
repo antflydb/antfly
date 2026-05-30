@@ -1,6 +1,12 @@
 # Zig Notes
 
-## 2026-05-30: Zig 0.17.0 nightly bring-up (build-system split + `**` removal)
+## 2026-05-30: Zig 0.17.0 nightly bring-up (full build GREEN)
+
+Summary: the whole repo builds and the full `antfly` binary runs on the official
+nightly `0.17.0-dev.607`. This covers the devlog's build-system split plus several
+undocumented 0.17 removals — the `**` repeat operator, `@cImport`/`@cInclude`,
+`Allocator.dupeZ`, `std.heap.stackFallback`, `std.ascii.indexOfIgnoreCase`,
+`std.meta.Int`, and the `std.bit_set` static-init methods. Details below.
 
 Tracking the 0.17.0 pre-release announced in the
 [2026-05-26 devlog](https://ziglang.org/devlog/2026/#2026-05-26). 0.17.0 is not
@@ -54,7 +60,7 @@ require Zig 0.17+ and will not compile under 0.16** (no `addPassthruArgs`,
 `b.graph.path`, etc.), so CI cannot be flipped to nightly until the items below are
 resolved.
 
-### What blocks actually compiling the codebase (NOT in the devlog)
+### Undocumented removals hit while compiling (NOT in the devlog)
 
 This nightly **also removed the `**` array/string repeat operator** (undocumented
 in the devlog as of 2026-05-30). The tokenizer no longer has an `asterisk_asterisk`
@@ -114,52 +120,73 @@ Fixed (small, mechanical, validated on hermetic tests):
   with `empty` / `full` *constants* (dynamic bitsets keep `initEmpty(allocator,
   len)`): 9 static call sites updated. `lib-regex-test` passes.
 
-Confirmed-but-not-applied (also surfaced; only relevant to the full binary, which
-is blocked below): the anonymous `@prefetch(ptr, .{...})` options literal now
-errors with "multiple identical instances of this type exist"; qualify it as
-`std.builtin.PrefetchOptions{ ... }` (1 site, `pkg/inference/src/ops/cpu_gemm.zig`).
+- `@prefetch(ptr, .{...})` anonymous options literal now errors with "multiple
+  identical instances of this type exist"; qualify it as
+  `std.builtin.PrefetchOptions{ ... }` (1 site, `pkg/inference/src/ops/cpu_gemm.zig`).
+- `std.heap.StackFallbackAllocator` / `std.heap.stackFallback` removed →
+  reimplemented in `pkg/inference/src/finetune/compat.zig` (a
+  `FixedBufferAllocator` with libc-vtable fallback, same `.get()` API).
+- `std.ascii.indexOfIgnoreCase` / `indexOfIgnoreCasePos` removed → reimplemented
+  in `finetune/compat.zig` and `pkg/antfly/src/common/ascii_compat.zig`.
+- `Allocator.dupeZ` removed → `dupeSentinel(u8, x, 0)` (~204 call sites; drop-in
+  `[:0]u8` return that preserves the inline `try alloc.dupeZ(...)` form).
 
 Notably the ~3k `std.Io` references compile unchanged — that surface was already
 stable from 0.16.
 
-### Hard blockers for a full binary build (NOT attempted)
+### `@cImport` removal — migrated to `addTranslateC` (DONE)
 
-Pushing past the hermetic lib tests toward `zig build install -Dedition=full`
-hits two *language/standard-library removals* that are an order of magnitude
-larger than the operator/bitset work and are **not** safe to do blind in this
-environment:
+`@cImport` / `@cInclude` / `@cDefine` were removed from the language (`invalid
+builtin function: '@cImport'`), and std itself now contains zero `@cImport` uses.
+C interop moves to the build-system `b.addTranslateC` step (a generated module you
+`@import`). All ~50 call sites were migrated; no `@cImport` remains in the
+codebase. Two shapes were used:
 
-1. **`@cImport` / `@cInclude` / `@cDefine` removed from the language.** The error
-   is `invalid builtin function: '@cImport'`, and std itself now contains zero
-   `@cImport` uses — C interop must go through the build-system
-   `b.addTranslateC` step (`std.Build.addTranslateC` → a module you `@import`).
-   Antfly's entire C boundary is built on `@cImport` (~48 call sites): LMDB (the
-   storage engine core — `storage/lmdb_c_api.zig`, `lmdb/env.zig`,
-   `storage/lmdb_backend.zig`, …), ONNX Runtime + ORT-GenAI
-   (`backends/onnx.zig`, `backends/ortgenai.zig`,
-   `backends/imported_onnx_session.zig`), MLX/Metal (`ops/mlx_compute.zig` ~30
-   sites, `ops/metal_compute.zig`, `backends/metal_*`), libpq
-   (`foreign/postgres_libpq.zig`), plus assorted `stdlib.h`/`time.h` pulls. This
-   is a rearchitecture, not a find-replace: each header group becomes an
-   `addTranslateC` module wired into the (very large) `build.zig` module graph,
-   then `@import`ed, with translated type names threaded through every consumer.
-   It cannot be validated without the native libs/headers wired through the new
-   path (LMDB headers, the downloaded ONNX runtime, etc.).
+1. **External libraries → translate-c modules**, wired by the build only when the
+   feature is enabled (else an empty-struct module the gated source never
+   dereferences):
+   - LMDB: `lmdb/env.zig` → `lmdb_pthread` (translate-c of `pthread.h`, else
+     `pthread_stub.zig`); `storage/lmdb_c_api.zig` + `lmdb_sim_test.zig` →
+     `lmdb_c_bindings` (translate-c of `lmdb.h` for the C backend, else
+     `lmdb_c_stub.zig`). Helpers `addLmdbPthreadImport` / `addLmdbCBindingsImport`
+     in `pkg/antfly/build/storage.zig`, threaded through `makeLmdbEngineModule`,
+     `makeLmdbModule` (new `backend` param), and `AntflyRootImports.configure`.
+   - Inference: `backends/onnx.zig` → `onnx_c`, `backends/ortgenai.zig` →
+     `ortgenai_c`, `backends/mlx.zig` → `mlx_c`, `backends/native.zig` → `blas_c`.
+     Wired by `configureCImportBindings` in `pkg/inference/build/runtime.zig`
+     (gated on `enable_onnx` / `enable_mlx` / `enable_system_blas`), sharing one
+     empty `c_empty.zig` module when off.
+   - lib/image bench+corpus tools: `spng_c` (translate-c of `spng.h` when libspng
+     is detected, else empty) via `addSpngBinding` in `build.zig`.
 
-2. **`Allocator.dupeZ` removed** (only `dupe` + `allocSentinel` remain): ~200
-   call sites. Mechanical but pervasive — the replacement
-   (`allocSentinel(u8, len, 0)` + copy, or a shared helper) does not preserve the
-   inline `try alloc.dupeZ(u8, x)` expression form, so each site needs care.
-   These sites also live in the same compilation units blocked by `@cImport`
-   (storage, inference), so migrating `dupeZ` alone unblocks nothing testable.
+2. **Small libc pulls → hand-written shims / std** (no per-consumer build wiring):
+   - 42 `@cImport(@cInclude("stdlib.h"))` getenv sites → `util/c_env.zig`
+     (`std.c.getenv`).
+   - `util/c_file.zig` fcntl/unistd/stat/mman/dirent surface → `util/posix_c.zig`,
+     a hand-written `extern "c"` shim (chosen over translate-c because `c_file` is
+     imported across both the inference and antfly module graphs, so per-module
+     wiring would be fragile).
+   - `cache.zig` `time.h` clock_gettime → `std.time.nanoTimestamp`.
+   - `http_server.zig` test setenv/unsetenv → inline `extern "c"`.
 
-Status: the build-system migration, `**`→`@splat`, `bit_set`, and `meta.Int`
-changes are committed and validated on hermetic lib tests
-(`lib-json/httpx/toon/regex-test`). A *full* binary build is gated on the
-language-level `@cImport` removal, which warrants its own dedicated, verifiable
-effort (with native deps wired) rather than a blind in-session rewrite. CI still
-pins `mlugg/setup-zig@v2` to `0.16.0`; flipping it to nightly must wait until the
-above is resolved and 0.17.0 is tagged stable.
+### Full build status on nightly 0.17.0-dev.607 — GREEN
+
+All of the following pass with the pip-installed nightly (`python3 -m ziglang`,
+via a `zig` PATH shim):
+
+- `zig build --help` configures (top-level and delegated `pkg/inference`).
+- Hermetic lib tests: `lib-json-test`, `lib-httpx-test`, `lib-toon-test`,
+  `lib-regex-test`, `lmdb-test` (80/80), `storage-lmdb-test -Dlmdb_backend=c`
+  (exercises translate-c of `lmdb.h` + `pthread.h`).
+- `pkg/inference` builds clean (9/9; produces `antfly-inference`).
+- **Full edition binary builds and runs:**
+  `zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=Debug install -Dedition=full`
+  → 13/13 steps, `zig-out/bin/antfly`, and `antfly version` exits 0.
+
+Prerequisite: `make download-onnx` (the full edition links ONNX Runtime). CI still
+pins `mlugg/setup-zig@v2` to `0.16.0`; these source changes now require Zig 0.17+
+(no `@cImport`, `addPassthruArgs`, `dupeSentinel`, …) and will not compile under
+0.16, so flipping CI to the nightly is a follow-up once 0.17.0 is tagged stable.
 
 ## 2026-04-20: freestanding wasm stdlib breakage in Zig 0.16
 
