@@ -99,21 +99,67 @@ fixpoint (so nested repeats resolve automatically):
 Validated: `lib-json-test`, `lib-httpx-test`, `lib-toon-test` compile and pass under
 the nightly.
 
-### Remaining: general std/builtin churn (separate, open-ended)
+### General std/builtin churn beyond `**`
 
 Compiling the whole tree on this nightly surfaces *unrelated* 0.17 std/builtin
-changes, independent of `**`. Found so far:
+changes, independent of `**`.
 
-- `std.meta.Int(.unsigned, n)` removed → `@Int(.unsigned, n)` (2 sites, FIXED). The
+Fixed (small, mechanical, validated on hermetic tests):
+
+- `std.meta.Int(.unsigned, n)` removed → `@Int(.unsigned, n)` (2 sites). The
   `@Type` builtin has been split into targeted builtins (`@Int`, `@Pointer`,
-  `@FieldType`, …); the repo doesn't call `@Type` directly so only the `meta.Int`
+  `@FieldType`, …); the repo doesn't call `@Type` directly, so only the `meta.Int`
   shim was affected.
-- `std.bit_set` static bitsets lost `.initEmpty()` (e.g. `lib/regex`); not yet
-  migrated.
-- ~3k `std.Io` references not yet probed for behavioral/API drift.
+- `std.bit_set` static bitsets replaced the `initEmpty()` / `initFull()` *methods*
+  with `empty` / `full` *constants* (dynamic bitsets keep `initEmpty(allocator,
+  len)`): 9 static call sites updated. `lib-regex-test` passes.
 
-This general port is large and open-ended; it is tracked separately from the `**`
-work above.
+Confirmed-but-not-applied (also surfaced; only relevant to the full binary, which
+is blocked below): the anonymous `@prefetch(ptr, .{...})` options literal now
+errors with "multiple identical instances of this type exist"; qualify it as
+`std.builtin.PrefetchOptions{ ... }` (1 site, `pkg/inference/src/ops/cpu_gemm.zig`).
+
+Notably the ~3k `std.Io` references compile unchanged — that surface was already
+stable from 0.16.
+
+### Hard blockers for a full binary build (NOT attempted)
+
+Pushing past the hermetic lib tests toward `zig build install -Dedition=full`
+hits two *language/standard-library removals* that are an order of magnitude
+larger than the operator/bitset work and are **not** safe to do blind in this
+environment:
+
+1. **`@cImport` / `@cInclude` / `@cDefine` removed from the language.** The error
+   is `invalid builtin function: '@cImport'`, and std itself now contains zero
+   `@cImport` uses — C interop must go through the build-system
+   `b.addTranslateC` step (`std.Build.addTranslateC` → a module you `@import`).
+   Antfly's entire C boundary is built on `@cImport` (~48 call sites): LMDB (the
+   storage engine core — `storage/lmdb_c_api.zig`, `lmdb/env.zig`,
+   `storage/lmdb_backend.zig`, …), ONNX Runtime + ORT-GenAI
+   (`backends/onnx.zig`, `backends/ortgenai.zig`,
+   `backends/imported_onnx_session.zig`), MLX/Metal (`ops/mlx_compute.zig` ~30
+   sites, `ops/metal_compute.zig`, `backends/metal_*`), libpq
+   (`foreign/postgres_libpq.zig`), plus assorted `stdlib.h`/`time.h` pulls. This
+   is a rearchitecture, not a find-replace: each header group becomes an
+   `addTranslateC` module wired into the (very large) `build.zig` module graph,
+   then `@import`ed, with translated type names threaded through every consumer.
+   It cannot be validated without the native libs/headers wired through the new
+   path (LMDB headers, the downloaded ONNX runtime, etc.).
+
+2. **`Allocator.dupeZ` removed** (only `dupe` + `allocSentinel` remain): ~200
+   call sites. Mechanical but pervasive — the replacement
+   (`allocSentinel(u8, len, 0)` + copy, or a shared helper) does not preserve the
+   inline `try alloc.dupeZ(u8, x)` expression form, so each site needs care.
+   These sites also live in the same compilation units blocked by `@cImport`
+   (storage, inference), so migrating `dupeZ` alone unblocks nothing testable.
+
+Status: the build-system migration, `**`→`@splat`, `bit_set`, and `meta.Int`
+changes are committed and validated on hermetic lib tests
+(`lib-json/httpx/toon/regex-test`). A *full* binary build is gated on the
+language-level `@cImport` removal, which warrants its own dedicated, verifiable
+effort (with native deps wired) rather than a blind in-session rewrite. CI still
+pins `mlugg/setup-zig@v2` to `0.16.0`; flipping it to nightly must wait until the
+above is resolved and 0.17.0 is tagged stable.
 
 ## 2026-04-20: freestanding wasm stdlib breakage in Zig 0.16
 
