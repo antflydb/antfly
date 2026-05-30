@@ -617,6 +617,24 @@ pub fn parseResolutionArtifactKeyAlloc(alloc: Allocator, key: []const u8) !?stru
     return .{ .doc_key = doc_key, .artifact_name = artifact_name };
 }
 
+/// Parse an asset artifact key, returning (doc_key, artifact_name).
+/// Returns null if the key is not an asset artifact key.
+pub fn parseAssetArtifactKeyAlloc(alloc: Allocator, key: []const u8) !?struct { doc_key: []u8, artifact_name: []u8 } {
+    if (!isAssetArtifactKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1).?;
+    const doc_key = try decodeBodyAlloc(alloc, key[1..doc_term]);
+    errdefer alloc.free(doc_key);
+
+    var pos = doc_term + 2 + 1; // past artifact_kind byte
+    const type_term = findComponentTerminator(key, pos).?;
+    pos = type_term + 2;
+
+    const name_term = findComponentTerminator(key, pos).?;
+    const artifact_name = try decodeBodyAlloc(alloc, key[pos..name_term]);
+
+    return .{ .doc_key = doc_key, .artifact_name = artifact_name };
+}
+
 /// Parse an embedding artifact key, returning (doc_key, artifact_name).
 /// Returns null if the key is not an embedding artifact key.
 pub fn parseEmbeddingArtifactKeyAlloc(alloc: Allocator, key: []const u8) !?struct { doc_key: []u8, artifact_name: []u8 } {
@@ -1099,4 +1117,19 @@ test "resolution artifact key round-trips and is distinct from asset" {
     defer alloc.free(parsed.artifact_name);
     try std.testing.expectEqualStrings("doc:article-123", parsed.doc_key);
     try std.testing.expectEqualStrings("resolution_v1", parsed.artifact_name);
+}
+
+test "parseAssetArtifactKeyAlloc returns doc key and artifact name" {
+    const alloc = std.testing.allocator;
+    const key = try artifactNamedPrefixAlloc(alloc, "doc:article-123", "asset", "relations_v1");
+    defer alloc.free(key);
+    const parsed = (try parseAssetArtifactKeyAlloc(alloc, key)).?;
+    defer alloc.free(parsed.doc_key);
+    defer alloc.free(parsed.artifact_name);
+    try std.testing.expectEqualStrings("doc:article-123", parsed.doc_key);
+    try std.testing.expectEqualStrings("relations_v1", parsed.artifact_name);
+
+    const res = try resolutionArtifactKeyAlloc(alloc, "doc:article-123", "resolution_v1");
+    defer alloc.free(res);
+    try std.testing.expect((try parseAssetArtifactKeyAlloc(alloc, res)) == null);
 }
