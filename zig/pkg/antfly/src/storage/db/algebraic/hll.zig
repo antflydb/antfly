@@ -53,6 +53,12 @@ fn registerCount(precision: u6) usize {
     return @as(usize, 1) << precision;
 }
 
+// Largest rho a well-formed sketch at `precision` can hold: one plus the
+// (64 - precision) suffix bits.
+fn maxRegisterValue(precision: u6) u8 {
+    return @intCast(64 - @as(u32, precision) + 1);
+}
+
 /// rho for a hash: register index is the top `precision` bits, the value is one
 /// plus the number of leading zeros in the remaining suffix bits.
 fn indexAndRho(precision: u6, hash: u64) struct { index: usize, rho: u8 } {
@@ -162,6 +168,13 @@ fn registersView(bytes: []const u8) Error![]const u8 {
     try validatePrecision(precision);
     const registers = bytes[magic.len + 1 ..];
     if (registers.len != registerCount(precision)) return Error.InvalidHllSketch;
+    // Reject out-of-range register values up front: `estimate` shifts by the
+    // register, so a corrupt byte >= 64 would otherwise be an out-of-range shift
+    // (panic in safe builds, UB in release) rather than a graceful error.
+    const max_register = maxRegisterValue(precision);
+    for (registers) |register| {
+        if (register > max_register) return Error.InvalidHllSketch;
+    }
     return registers;
 }
 
@@ -315,4 +328,17 @@ test "incompatible precisions cannot merge" {
     var large = try Sketch.init(alloc, default_precision);
     defer large.deinit(alloc);
     try testing.expectError(Error.IncompatibleHllSketch, small.merge(large));
+}
+
+test "corrupt register byte is rejected rather than crashing the estimator" {
+    const alloc = testing.allocator;
+    var sketch = try Sketch.init(alloc, min_precision);
+    defer sketch.deinit(alloc);
+    sketch.add("x");
+    const encoded = try encodeAlloc(alloc, sketch);
+    defer alloc.free(encoded);
+    // A register value >= 64 would be an out-of-range shift in estimate().
+    encoded[encoded.len - 1] = 200;
+    try testing.expectError(Error.InvalidHllSketch, estimateEncoded(encoded));
+    try testing.expectError(Error.InvalidHllSketch, decodeAlloc(alloc, encoded));
 }

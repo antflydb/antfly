@@ -2834,15 +2834,13 @@ pub const Index = struct {
             return try self.applyAppendOnlyBatchWithOptions(store, batch, options);
         }
 
-        const removes_documents = batch.deleted_keys.len != 0 or batch.overwritten_doc_keys.len != 0;
-
         if (options.batch_options.mode == .bulk_ingest) {
             var write_batch = try store.beginWriteBatchWithOptions(options.batch_options);
             errdefer write_batch.abort();
             const txn = write_batch.asTxn();
             try self.applyBatchMutationsWithTxn(txn, batch, options);
             try write_batch.commit();
-            if (removes_documents) self.scheduleHllMaintenance(store);
+            try self.scheduleHllMaintenanceIfDirty(store);
             return;
         }
 
@@ -2850,7 +2848,7 @@ pub const Index = struct {
         errdefer txn.abort();
         try self.applyBatchMutationsWithTxn(&txn, batch, options);
         try txn.commit();
-        if (removes_documents) self.scheduleHllMaintenance(store);
+        try self.scheduleHllMaintenanceIfDirty(store);
     }
 
     fn applyBatchMutationsWithTxn(
@@ -15054,6 +15052,10 @@ pub const Index = struct {
         }
         if (doc_facts_changed) {
             try self.applyDocFactDelta(txn, doc_key, old_facts.facts, -1);
+            // The old value cannot be subtracted from an HLL sketch, so mark any
+            // materialization the old facts fed as dirty; the maintenance pass
+            // rebuilds it exactly from the surviving facts.
+            try self.markHllCardinalitiesDirtyForFactsTxn(txn, old_facts.facts);
             try self.applyAdaptiveDocFactDelta(txn, old_facts.facts, -1, maintenance_context);
         }
         if (self.config().joins.len > 0) {
@@ -15069,6 +15071,9 @@ pub const Index = struct {
         if (doc_facts_changed) {
             try self.applyAdaptiveDocFactDelta(txn, new_facts.facts, 1, maintenance_context);
             try self.applyDocFactDelta(txn, doc_key, new_facts.facts, 1);
+            // Fold the new value into the sketch so warm reads stay close until
+            // the dirty rebuild lands; the rebuild then recomputes from scratch.
+            try self.applyHllCardinalitiesForFactsTxn(txn, new_facts.facts);
         }
         if (self.config().joins.len > 0) {
             try self.applyDocJoinDelta(txn, doc_key, parsed.value, 1, maintenance_context);
@@ -15096,6 +15101,12 @@ pub const Index = struct {
         try txn.put(fact_key, encoded);
         try self.writeDocFactLookupRows(txn, doc_key, facts.facts);
         try self.writePathFacts(txn, doc_key, parsed.value, maintenance_context);
+        // Fold the new document into the HLL cardinality sketches from its facts
+        // (rather than the raw JSON), so this add path, the coalesced-update path,
+        // and the delete-triggered rebuild all tokenize values identically. This
+        // is the single add hook for every fresh-document path (plain ingest and
+        // the append-only bulk path both route through writeDocFacts).
+        try self.applyHllCardinalitiesForFactsTxn(txn, facts.facts);
         self.doc_fact_write_count += 1;
     }
 
@@ -15885,7 +15896,9 @@ pub const Index = struct {
                 };
             }
         }
-        try self.applyHllCardinalitiesTxn(txn, parsed.value, sign);
+        // HLL cardinality sketches are maintained from the written facts in
+        // writeDocFacts (add) / updateDocFactRowsCoalesced (update), not here, so
+        // the incremental and rebuild tokenizations stay identical.
         try self.applyDocJoinDelta(txn, doc_key, parsed.value, sign, maintenance_context);
     }
 
@@ -16325,25 +16338,26 @@ pub const Index = struct {
         return try self.keyAlloc(&.{ "hllcard", name, group_key });
     }
 
-    fn applyHllCardinalitiesTxn(self: *Index, txn: anytype, root: std.json.Value, sign: i8) !void {
-        // Append-only: HLL sketches cannot subtract a value, so deletes would
-        // require rebuilding the affected group's sketch from scratch.
-        if (sign <= 0) return;
+    // Folds a freshly-added document's value into the matching per-group HLL
+    // sketches. Driven from the document facts (not the raw JSON) so the group
+    // key and value token are byte-identical to what `rebuildHllCardinalityTxn`
+    // derives from the stored facts — otherwise an incremental estimate and a
+    // post-delete rebuilt estimate could disagree for the same data.
+    fn applyHllCardinalitiesForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact) !void {
         for (self.config().hll_cardinalities) |hcfg| {
-            try self.applyHllCardinalityTxn(txn, root, hcfg);
+            try self.applyHllCardinalityForFactsTxn(txn, facts, hcfg);
         }
     }
 
-    fn applyHllCardinalityTxn(self: *Index, txn: anytype, root: std.json.Value, hcfg: HllCardinalityConfig) !void {
-        const group_key = self.groupKeyAlloc(root, hcfg.group_by) catch |err| switch (err) {
+    fn applyHllCardinalityForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact, hcfg: HllCardinalityConfig) !void {
+        const group_key = fact_mod.axisTupleAlloc(self.alloc, facts, hcfg.group_by) catch |err| switch (err) {
             error.MissingField => return,
             else => return err,
         };
         defer self.alloc.free(group_key);
-        const value_token = (try self.fieldScalarTokenAlloc(root, hcfg.value_field)) orelse return;
-        defer self.alloc.free(value_token);
+        const value_scalar = fact_mod.findScalar(facts, .group, hcfg.value_field) orelse return;
 
-        const singleton = try hll.singletonEncodedAlloc(self.alloc, hllCardinalityPrecision(hcfg), value_token);
+        const singleton = try hll.singletonEncodedAlloc(self.alloc, hllCardinalityPrecision(hcfg), value_scalar);
         defer self.alloc.free(singleton);
 
         const key = try self.hllCardinalityKeyAlloc(hcfg.name, group_key);
@@ -16535,6 +16549,17 @@ pub const Index = struct {
         }) catch self.alloc.destroy(job_ctx);
     }
 
+    // Schedules a rebuild iff the just-committed batch left a materialization
+    // dirty. Keyed on the persisted dirty markers rather than the batch shape, so
+    // it also catches in-place coalesced updates (which mark dirty without
+    // appearing in deleted_keys/overwritten_doc_keys).
+    fn scheduleHllMaintenanceIfDirty(self: *Index, store: *docstore_mod.DocStore) !void {
+        if (self.hll_maintenance_lane == null) return;
+        if (self.config().hll_cardinalities.len == 0) return;
+        if (!try self.anyHllCardinalityDirty(store)) return;
+        self.scheduleHllMaintenance(store);
+    }
+
     pub const ApproxCardinalityEntry = struct {
         group_key: []u8,
         estimate: u64,
@@ -16573,6 +16598,22 @@ pub const Index = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    // Test helper: the estimate for one group of the (single) configured HLL
+    // cardinality, or null if that group has no sketch. Keeps the regression
+    // tests terse without duplicating entry iteration/cleanup.
+    fn approxCardinalityEntriesForGroupTestEstimate(self: *Index, store: *docstore_mod.DocStore, group_key: []const u8) !?u64 {
+        const name = self.config().hll_cardinalities[0].name;
+        const entries = try self.approxCardinalityEntriesAlloc(store, name);
+        defer {
+            for (entries) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(entries);
+        }
+        for (entries) |entry| {
+            if (std.mem.eql(u8, entry.group_key, group_key)) return entry.estimate;
+        }
+        return null;
+    }
+
     /// Total distinct count across all groups of a materialized HLL cardinality,
     /// computed by merging the per-group sketches (an exact union, not a sum of
     /// per-group estimates).
@@ -16609,16 +16650,21 @@ pub const Index = struct {
 
     // Name of an HLL cardinality materialization that can answer a distinct count
     // of `field_or_path` grouped exactly by `group_fields` (null = any grouping,
-    // used for the merged total). Returns null when constraints or an MVCC read
-    // generation are present, because the sketches are maintained unconstrained
-    // and without per-generation visibility.
+    // used for the merged total). Returns null when:
+    //   - constraints or an MVCC read generation are present (sketches are
+    //     maintained unconstrained and without per-generation visibility), or
+    //   - the matching materialization is currently dirty (a delete/overwrite
+    //     marked it stale and its background rebuild has not yet run) — the
+    //     caller then falls back to the exact scan rather than reading a stale,
+    //     over-counted sketch.
     fn hllCardinalityNameForField(
-        self: *const Index,
+        self: *Index,
+        store: *docstore_mod.DocStore,
         group_fields: ?[]const []const u8,
         field_or_path: []const u8,
         constraints: []const ir.Constraint,
         generation: ?u64,
-    ) ?[]const u8 {
+    ) !?[]const u8 {
         if (constraints.len != 0 or generation != null) return null;
         const resolved = self.resolveUniqueField(field_or_path) orelse return null;
         if (resolved.role != .group) return null;
@@ -16627,9 +16673,22 @@ pub const Index = struct {
             if (group_fields) |fields| {
                 if (!self.hllGroupByMatches(hcfg.group_by, fields)) continue;
             }
+            if (try self.hllCardinalityDirty(store, hcfg.name)) return null;
             return hcfg.name;
         }
         return null;
+    }
+
+    fn hllCardinalityDirty(self: *Index, store: *docstore_mod.DocStore, name: []const u8) !bool {
+        const dirty_key = try self.hllCardinalityDirtyKeyAlloc(name);
+        defer self.alloc.free(dirty_key);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        _ = txn.get(dirty_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
     }
 
     /// Total distinct-count estimate for `field_or_path` from a matching HLL
@@ -16642,7 +16701,7 @@ pub const Index = struct {
         constraints: []const ir.Constraint,
         generation: ?u64,
     ) !?u64 {
-        const name = self.hllCardinalityNameForField(null, field_or_path, constraints, generation) orelse return null;
+        const name = (try self.hllCardinalityNameForField(store, null, field_or_path, constraints, generation)) orelse return null;
         return try self.approxCardinalityTotalAlloc(store, name);
     }
 
@@ -16657,7 +16716,7 @@ pub const Index = struct {
         constraints: []const ir.Constraint,
         generation: ?u64,
     ) !?[]ApproxCardinalityEntry {
-        const name = self.hllCardinalityNameForField(group_fields, field_or_path, constraints, generation) orelse return null;
+        const name = (try self.hllCardinalityNameForField(store, group_fields, field_or_path, constraints, generation)) orelse return null;
         return try self.approxCardinalityEntriesAlloc(store, name);
     }
 
@@ -19137,6 +19196,109 @@ test "algebraic HLL cardinality rebuilds after deletes via maintenance lane" {
     const deletes = [_][]const u8{ "o2", "o3" };
     try idx.applyBatch(&store, .{ .deleted_keys = deletes[0..] });
     try std.testing.expectEqual(@as(?u64, 1), try westEstimate(&idx, &store, west_group, alloc));
+}
+
+test "algebraic HLL cardinality is corrected after an in-place value change" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    var runtime = try background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"customers_by_region","group_by":["region"],"value_field":"customer","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, runtime.allocOwnerId());
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+
+    // Three distinct customers in west.
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"b\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"c\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try std.testing.expectEqual(@as(?u64, 3), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
+
+    // Re-upsert o1/o2/o3 so every west document shares one customer. This goes
+    // through the in-place coalesced update path (no deleted/overwritten keys);
+    // the rebuild must collapse west to a single distinct customer.
+    const collapsed = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"z\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"z\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"z\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = collapsed[0..] });
+    try std.testing.expectEqual(@as(?u64, 1), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
+}
+
+test "algebraic HLL cardinality tokenizes bytes fields identically on ingest and rebuild" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    var runtime = try background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    // value_field is a bytes-typed field, where the JSON-token and stored-fact
+    // token paths historically tagged scalars differently ("s" vs "x").
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "events",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"token","path":"token","type":"bytes"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"tokens_by_region","group_by":["region"],"value_field":"token","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, runtime.allocOwnerId());
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"token\":\"aa\"}" },
+        .{ .key = "e2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"token\":\"bb\"}" },
+        .{ .key = "e3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"token\":\"cc\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    const incremental = try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group);
+    try std.testing.expectEqual(@as(?u64, 3), incremental);
+
+    // Delete one document to trigger a rebuild from stored facts. If the ingest
+    // and rebuild token tags diverged, the surviving estimate would shift off 2.
+    const deletes = [_][]const u8{"e3"};
+    try idx.applyBatch(&store, .{ .deleted_keys = deletes[0..] });
+    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
 }
 
 test "algebraic raw metric doc id reads canonicalize measure path aliases" {

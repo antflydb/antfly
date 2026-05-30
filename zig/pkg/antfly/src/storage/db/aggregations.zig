@@ -2436,6 +2436,10 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
             gop.value_ptr.* = group_entry.estimate;
         }
         child_hll_maps[ci] = map;
+        // Record that this nested cardinality child is served from a
+        // materialized HLL sketch, mirroring the root cardinality path, so
+        // planner accounting/observability reflects the HLL routing.
+        index.recordPlannerSelected(null, null);
     }
 
     for (candidates[0..limit], 0..) |candidate, idx| {
