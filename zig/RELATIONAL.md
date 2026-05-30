@@ -251,8 +251,12 @@ number) is additive where the physical type is compatible.
   catalog via `buildRelationalTypedFields`; the introducer materializes the
   typed columns. Covered by runtime-schema, `document_mapper`, and introducer
   tests.
-- **Phase 4 — read side.** Columnar scan operator over `typed_doc_values`, route
-  typed-column predicates to it, columnar projection on read.
+- **Phase 4 — read path (works; verified end-to-end).** Relational typed
+  columns are scanned by the engine's existing typed filters (`RangeFilter`,
+  `DateRangeFilter`, `BoolFieldFilter`, geo) via `typed_doc_values` by column
+  name; `.range` queries already route there. Verified by the end-to-end
+  range-scan test. Remaining enhancement: schema-aware auto-routing of
+  predicates on typed columns (use the runtime `relational_columns` catalog).
 - **Phase 5 — authoritative columns (Phase B).** Drop the JSON blob for
   non-`json` columns; reconstruct documents from columns on read.
 

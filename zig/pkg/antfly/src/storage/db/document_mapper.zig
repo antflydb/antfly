@@ -3505,3 +3505,63 @@ test "extractTextFieldsFromValue attaches relational typed fields" {
     try std.testing.expect(extracted.typed_fields != null);
     try std.testing.expectEqual(@as(usize, 3), extracted.typed_fields.?.len);
 }
+
+test "relational numeric column is range-scannable end to end" {
+    const alloc = std.testing.allocator;
+    const segment_mod = @import("../../segment.zig");
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+
+    const doc_json = [_][]const u8{
+        "{\"amount\":10.0}",
+        "{\"amount\":25.0}",
+        "{\"amount\":50.0}",
+    };
+    const ids = [_][]const u8{ "a", "b", "c" };
+
+    var parsed: [3]std.json.Parsed(std.json.Value) = undefined;
+    var typed: [3][]const introducer_mod.TypedFieldValue = undefined;
+    var text_docs: [3]introducer_mod.TextDocument = undefined;
+    var built: usize = 0;
+    defer for (0..built) |i| {
+        alloc.free(typed[i]);
+        parsed[i].deinit();
+    };
+
+    for (doc_json, 0..) |json, i| {
+        parsed[i] = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        typed[i] = try buildRelationalTypedFields(alloc, parsed[i].value, &columns);
+        text_docs[i] = .{
+            .id = ids[i],
+            .stored_data = json,
+            .text_fields = &.{},
+            .typed_fields = typed[i],
+        };
+        built += 1;
+    }
+
+    const seg_bytes = try introducer_mod.buildSegmentFromText(alloc, &text_docs, &analysis_mod.default_analyzer, null);
+    defer alloc.free(seg_bytes);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
+    defer reader.deinit();
+
+    const section = reader.getSection("amount", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const dv = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.f64_val, dv.value_type);
+
+    // Range scan [15, 40): only the amount=25 document matches.
+    var matches: usize = 0;
+    var matched_doc: ?u32 = null;
+    for (0..3) |doc_id| {
+        const value = (try dv.getF64(@intCast(doc_id))) orelse continue;
+        if (value >= 15.0 and value < 40.0) {
+            matches += 1;
+            matched_doc = @intCast(doc_id);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), matches);
+    try std.testing.expectEqual(@as(f64, 25.0), (try dv.getF64(matched_doc.?)).?);
+}
