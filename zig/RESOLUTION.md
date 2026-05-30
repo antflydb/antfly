@@ -442,14 +442,14 @@ Open/index/enrichment validation should reject:
          (written/unchanged/cleared). End-to-end tested over an in-memory store.
    - [x] Emit the `resolution` hint on extraction-artifact changes
          (`recordFromDerivedBatch` + the rafted thin-record path in `db.zig`).
-   - [ ] db-backed `ArtifactStore` over the shard primary store
-         (`beginRead/get`, `beginWrite/put`, `beginBatch/delete`) to back
-         `processChangedExtraction` in production.
+   - [x] db-backed `ArtifactStore` over the shard primary store
+         (`resolution_runtime.DbArtifactStore`): generic over the store type,
+         binds the production erased store and is fake-store tested.
    - [ ] `ResolutionRuntime` worker: catch up on the `resolution` hint
          (`applied_sequence`), call `processChangedExtraction` per changed asset
-         key, journal the resolution key via a `DerivedBatch`; submit on the
-         shard `backend_runtime` durable lane; wire init/start/shutdown in
-         `db.zig`.
+         key over a `DbArtifactStore`, journal the resolution key via a
+         `DerivedBatch`; submit on the shard `backend_runtime` durable lane; wire
+         init/start/shutdown in `db.zig`.
    - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
          per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
          / `listResolvers` through DB -> DBCore -> IndexManager (verified by a
