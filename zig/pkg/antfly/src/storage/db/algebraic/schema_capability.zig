@@ -613,3 +613,291 @@ fn expectCapability(
     }
     return error.MissingCapability;
 }
+
+// ---------------------------------------------------------------------------
+// Relational column catalog (see zig/RELATIONAL.md)
+//
+// The algebraic Plan above projects a schema into group/measure/time *fact*
+// roles (a field may appear under several roles). A relational table instead
+// needs a flat physical column catalog: exactly one typed column per declared
+// property. relationalColumnPlanAlloc compiles a closed TableSchema into that
+// catalog. Nested objects, arrays, and `json`-typed fields collapse to a single
+// `json` column at their path (stored as bytes, indexed like a document
+// subtree) rather than recursing.
+// ---------------------------------------------------------------------------
+
+pub const RelationalColumn = struct {
+    document_type: []u8,
+    name: []u8,
+    path: []u8,
+    column_type: []u8,
+    physical: []u8,
+    nullable: bool = true,
+    indexed: bool = true,
+    is_json: bool = false,
+
+    pub fn deinit(self: *RelationalColumn, alloc: Allocator) void {
+        alloc.free(self.document_type);
+        alloc.free(self.name);
+        alloc.free(self.path);
+        alloc.free(self.column_type);
+        alloc.free(self.physical);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalPlan = struct {
+    schema_version: u32 = 0,
+    relational: bool = false,
+    columns: []RelationalColumn = &.{},
+    skipped_complex_fields: u32 = 0,
+    skipped_dynamic_fields: u32 = 0,
+
+    pub fn deinit(self: *RelationalPlan, alloc: Allocator) void {
+        for (self.columns) |*column| column.deinit(alloc);
+        if (self.columns.len > 0) alloc.free(self.columns);
+        self.* = undefined;
+    }
+};
+
+pub fn relationalColumnPlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) !RelationalPlan {
+    var columns = std.ArrayListUnmanaged(RelationalColumn).empty;
+    errdefer {
+        for (columns.items) |*column| column.deinit(alloc);
+        columns.deinit(alloc);
+    }
+    var skipped_complex_fields: u32 = 0;
+    var skipped_dynamic_fields: u32 = 0;
+
+    for (schema.document_schemas) |document_schema| {
+        if (document_schema.additional_properties_allowed orelse false) skipped_dynamic_fields += 1;
+        if (document_schema.additional_properties_schema != null or document_schema.pattern_properties.len > 0 or document_schema.dynamic_infer_types) skipped_dynamic_fields += 1;
+        for (document_schema.properties) |property| {
+            const required = isRequiredField(document_schema.required_fields, property.name);
+            try collectRelationalColumn(
+                alloc,
+                document_schema.name,
+                property,
+                required,
+                &columns,
+                &skipped_complex_fields,
+            );
+        }
+    }
+
+    return .{
+        .schema_version = schema.version,
+        .relational = schema.storage_mode == .relational,
+        .columns = try columns.toOwnedSlice(alloc),
+        .skipped_complex_fields = skipped_complex_fields,
+        .skipped_dynamic_fields = skipped_dynamic_fields,
+    };
+}
+
+pub fn relationalColumnsJsonAlloc(alloc: Allocator, table_name: []const u8, plan: RelationalPlan) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try out.append(alloc, '{');
+    try appendJsonString(alloc, &out, "table");
+    try out.append(alloc, ':');
+    try appendJsonString(alloc, &out, table_name);
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, &out, "schema_version");
+    try appendFmt(alloc, &out, ":{d}", .{plan.schema_version});
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, &out, "relational");
+    try out.appendSlice(alloc, if (plan.relational) ":true," else ":false,");
+    try appendJsonString(alloc, &out, "columns");
+    try out.appendSlice(alloc, ":[");
+    for (plan.columns, 0..) |column, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try appendJsonString(alloc, &out, "document_type");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, column.document_type);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "name");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, column.name);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "path");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, column.path);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "type");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, column.column_type);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "physical");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, column.physical);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "nullable");
+        try out.appendSlice(alloc, if (column.nullable) ":true," else ":false,");
+        try appendJsonString(alloc, &out, "indexed");
+        try out.appendSlice(alloc, if (column.indexed) ":true," else ":false,");
+        try appendJsonString(alloc, &out, "is_json");
+        try out.appendSlice(alloc, if (column.is_json) ":true" else ":false");
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "]}");
+
+    return try out.toOwnedSlice(alloc);
+}
+
+fn collectRelationalColumn(
+    alloc: Allocator,
+    document_type: []const u8,
+    property: anytype,
+    required: bool,
+    columns: *std.ArrayListUnmanaged(RelationalColumn),
+    skipped_complex_fields: *u32,
+) !void {
+    const column_type = relationalColumnType(property) orelse {
+        skipped_complex_fields.* += 1;
+        return;
+    };
+    const indexed = if (property.antfly_index) |value| value else true;
+    const is_json = std.mem.eql(u8, column_type, "json");
+    try columns.append(alloc, .{
+        .document_type = try alloc.dupe(u8, document_type),
+        .name = try alloc.dupe(u8, property.name),
+        .path = try alloc.dupe(u8, property.name),
+        .column_type = try alloc.dupe(u8, column_type),
+        .physical = try alloc.dupe(u8, physicalForColumnType(column_type)),
+        .nullable = !required,
+        .indexed = indexed,
+        .is_json = is_json,
+    });
+}
+
+fn relationalColumnType(property: anytype) ?[]const u8 {
+    if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "keyword") or
+            std.mem.eql(u8, field_type, "link") or
+            std.mem.eql(u8, field_type, "string") or
+            std.mem.eql(u8, field_type, "text") or
+            std.mem.eql(u8, field_type, "html") or
+            std.mem.eql(u8, field_type, "search_as_you_type")) return "string";
+        if (std.mem.eql(u8, field_type, "blob")) return "blob";
+        if (std.mem.eql(u8, field_type, "boolean")) return "boolean";
+        if (std.mem.eql(u8, field_type, "datetime")) return "datetime";
+        if (std.mem.eql(u8, field_type, "integer")) return "integer";
+        if (std.mem.eql(u8, field_type, "numeric") or std.mem.eql(u8, field_type, "number")) return "number";
+        if (std.mem.eql(u8, field_type, "geopoint")) return "geopoint";
+        if (std.mem.eql(u8, field_type, "geoshape")) return "geoshape";
+        if (std.mem.eql(u8, field_type, "json") or
+            std.mem.eql(u8, field_type, "object") or
+            std.mem.eql(u8, field_type, "array")) return "json";
+        if (property.integer_only) return "integer";
+        return null;
+    }
+    if (property.integer_only) return "integer";
+    if (property.properties.len > 0 or
+        property.item != null or
+        (property.additional_properties_allowed orelse false) or
+        property.additional_properties_schema != null or
+        property.pattern_properties.len > 0 or
+        property.dynamic_infer_types) return "json";
+    if (property.const_value != null or property.enum_values.len > 0) return "string";
+    return null;
+}
+
+fn physicalForColumnType(column_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, column_type, "integer") or std.mem.eql(u8, column_type, "datetime")) return "u64_val";
+    if (std.mem.eql(u8, column_type, "number")) return "f64_val";
+    if (std.mem.eql(u8, column_type, "boolean")) return "bool_val";
+    if (std.mem.eql(u8, column_type, "geopoint")) return "geo_point";
+    return "bytes_val";
+}
+
+fn isRequiredField(required_fields: []const []const u8, name: []const u8) bool {
+    for (required_fields) |field_name| {
+        if (std.mem.eql(u8, field_name, name)) return true;
+    }
+    return false;
+}
+
+test "relational column plan emits one typed column per declared property" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"},"active":{"type":"boolean"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"tags":{"type":"array","items":{"type":"keyword"}},"payload":{"type":"json"}},"required":["id","amount"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    try std.testing.expect(plan.relational);
+    try std.testing.expectEqual(@as(u32, 4), plan.schema_version);
+    try std.testing.expectEqual(@as(usize, 7), plan.columns.len);
+    try std.testing.expectEqual(@as(u32, 0), plan.skipped_complex_fields);
+    try std.testing.expectEqual(@as(u32, 0), plan.skipped_dynamic_fields);
+
+    try expectRelationalColumn(plan, "row", "id", "string", "bytes_val", false, false);
+    try expectRelationalColumn(plan, "row", "amount", "number", "f64_val", false, false);
+    try expectRelationalColumn(plan, "row", "created_at", "datetime", "u64_val", true, false);
+    try expectRelationalColumn(plan, "row", "active", "boolean", "bool_val", true, false);
+    try expectRelationalColumn(plan, "row", "attrs", "json", "bytes_val", true, true);
+    try expectRelationalColumn(plan, "row", "tags", "json", "bytes_val", true, true);
+    try expectRelationalColumn(plan, "row", "payload", "json", "bytes_val", true, true);
+}
+
+test "relational column plan defaults to document storage mode" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    try std.testing.expect(!plan.relational);
+    try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+    try expectRelationalColumn(plan, "doc", "id", "string", "bytes_val", true, false);
+}
+
+test "relational column plan serializes a column catalog" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":9,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const catalog_json = try relationalColumnsJsonAlloc(alloc, "rows", plan);
+    defer alloc.free(catalog_json);
+
+    var parsed_catalog = try std.json.parseFromSlice(std.json.Value, alloc, catalog_json, .{});
+    defer parsed_catalog.deinit();
+    const root = parsed_catalog.value.object;
+    try std.testing.expectEqualStrings("rows", root.get("table").?.string);
+    try std.testing.expectEqual(@as(i64, 9), root.get("schema_version").?.integer);
+    try std.testing.expect(root.get("relational").?.bool);
+    try std.testing.expectEqual(@as(usize, 2), root.get("columns").?.array.items.len);
+}
+
+fn expectRelationalColumn(
+    plan: RelationalPlan,
+    document_type: []const u8,
+    name: []const u8,
+    column_type: []const u8,
+    physical: []const u8,
+    nullable: bool,
+    is_json: bool,
+) !void {
+    for (plan.columns) |column| {
+        if (!std.mem.eql(u8, column.document_type, document_type)) continue;
+        if (!std.mem.eql(u8, column.name, name)) continue;
+        if (!std.mem.eql(u8, column.column_type, column_type)) continue;
+        if (!std.mem.eql(u8, column.physical, physical)) continue;
+        if (column.nullable != nullable) continue;
+        if (column.is_json != is_json) continue;
+        return;
+    }
+    return error.MissingColumn;
+}
