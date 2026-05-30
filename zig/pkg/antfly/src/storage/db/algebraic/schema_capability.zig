@@ -901,3 +901,341 @@ fn expectRelationalColumn(
     }
     return error.MissingColumn;
 }
+
+// ---------------------------------------------------------------------------
+// Relational write-path projection (Phase 2, see zig/RELATIONAL.md)
+//
+// projectRelationalRowAlloc turns a document into one typed cell per declared
+// column, ready to hand to section/typed_doc_values.zig at segment-build time:
+//   - missing/null value on a non-nullable column -> error.MissingRequiredColumn
+//   - value that does not match the declared column type -> error.InvalidColumnValue
+//   - json columns are stringified to bytes (and flagged is_json so the caller
+//     can additionally index the subtree like a document)
+//
+// Numeric physical encoding matches typed_doc_values:
+//   - number   -> f64 (native)
+//   - integer  -> u64 via an order-preserving map of i64 (so unsigned range
+//                 scans over the column produce signed order)
+//   - datetime -> u64 from an epoch integer (RFC3339 string parsing is a
+//                 follow-up; epoch integers/integer-strings are accepted today)
+//   - boolean  -> bool, geopoint -> packed lat/lon, string/blob/geoshape -> bytes
+// ---------------------------------------------------------------------------
+
+const typed_doc_values = @import("../../../section/typed_doc_values.zig");
+
+pub const PhysicalType = enum { u64_val, f64_val, bytes_val, bool_val, geo_point };
+
+pub const GeoPoint = struct { lat: f64, lon: f64 };
+
+pub const ColumnValue = union(PhysicalType) {
+    u64_val: u64,
+    f64_val: f64,
+    bytes_val: []const u8,
+    bool_val: bool,
+    geo_point: GeoPoint,
+};
+
+pub const RelationalCell = struct {
+    column: usize,
+    present: bool = false,
+    is_json: bool = false,
+    value: ColumnValue = .{ .bool_val = false },
+};
+
+pub const RelationalRow = struct {
+    cells: []RelationalCell = &.{},
+    bytes_pool: [][]u8 = &.{},
+
+    pub fn deinit(self: *RelationalRow, alloc: Allocator) void {
+        for (self.bytes_pool) |buffer| alloc.free(buffer);
+        if (self.bytes_pool.len > 0) alloc.free(self.bytes_pool);
+        if (self.cells.len > 0) alloc.free(self.cells);
+        self.* = undefined;
+    }
+
+    pub fn cell(self: RelationalRow, column_index: usize) ?RelationalCell {
+        for (self.cells) |candidate| {
+            if (candidate.column == column_index and candidate.present) return candidate;
+        }
+        return null;
+    }
+};
+
+/// Order-preserving map from i64 to u64: flips the sign bit so that signed
+/// ordering becomes unsigned ordering (i64 min -> 0, i64 max -> u64 max).
+pub fn orderedU64FromI64(value: i64) u64 {
+    return @as(u64, @bitCast(value)) ^ (@as(u64, 1) << 63);
+}
+
+/// Inverse of orderedU64FromI64.
+pub fn orderedI64FromU64(value: u64) i64 {
+    return @bitCast(value ^ (@as(u64, 1) << 63));
+}
+
+pub fn typedValue(value: ColumnValue) typed_doc_values.TypedValue {
+    return switch (value) {
+        .u64_val => |v| .{ .u64_val = v },
+        .f64_val => |v| .{ .f64_val = v },
+        .bytes_val => |v| .{ .bytes_val = v },
+        .bool_val => |v| .{ .bool_val = v },
+        .geo_point => |v| .{ .geo_point = .{ .lat = v.lat, .lon = v.lon } },
+    };
+}
+
+pub fn projectRelationalRowAlloc(alloc: Allocator, plan: RelationalPlan, root: std.json.Value) !RelationalRow {
+    if (root != .object) return error.NotAnObject;
+
+    const cells = try alloc.alloc(RelationalCell, plan.columns.len);
+    errdefer alloc.free(cells);
+    var pool = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (pool.items) |buffer| alloc.free(buffer);
+        pool.deinit(alloc);
+    }
+
+    for (plan.columns, 0..) |column, i| {
+        cells[i] = .{ .column = i, .present = false, .is_json = column.is_json };
+        const found = valueAtJsonPath(root, column.path);
+        if (found == null or found.? == .null) {
+            if (!column.nullable) return error.MissingRequiredColumn;
+            continue;
+        }
+        const coerced = (try coerceColumnValue(alloc, column.column_type, found.?)) orelse return error.InvalidColumnValue;
+        if (coerced.owned) |buffer| try pool.append(alloc, buffer);
+        cells[i] = .{ .column = i, .present = true, .is_json = column.is_json, .value = coerced.value };
+    }
+
+    return .{ .cells = cells, .bytes_pool = try pool.toOwnedSlice(alloc) };
+}
+
+const Coerced = struct { value: ColumnValue, owned: ?[]u8 = null };
+
+fn coerceColumnValue(alloc: Allocator, column_type: []const u8, json_value: std.json.Value) !?Coerced {
+    if (std.mem.eql(u8, column_type, "json")) {
+        const bytes = try stringifyJsonValueAlloc(alloc, json_value);
+        return Coerced{ .value = .{ .bytes_val = bytes }, .owned = bytes };
+    }
+    if (std.mem.eql(u8, column_type, "string") or
+        std.mem.eql(u8, column_type, "blob") or
+        std.mem.eql(u8, column_type, "geoshape"))
+    {
+        switch (json_value) {
+            .string => |text| {
+                const bytes = try alloc.dupe(u8, text);
+                return Coerced{ .value = .{ .bytes_val = bytes }, .owned = bytes };
+            },
+            else => return null,
+        }
+    }
+    if (std.mem.eql(u8, column_type, "boolean")) {
+        switch (json_value) {
+            .bool => |flag| return Coerced{ .value = .{ .bool_val = flag } },
+            else => return null,
+        }
+    }
+    if (std.mem.eql(u8, column_type, "number")) {
+        switch (json_value) {
+            .float => |number| return Coerced{ .value = .{ .f64_val = number } },
+            .integer => |number| return Coerced{ .value = .{ .f64_val = @floatFromInt(number) } },
+            else => return null,
+        }
+    }
+    if (std.mem.eql(u8, column_type, "integer") or std.mem.eql(u8, column_type, "datetime")) {
+        const number = integerFromJson(json_value) orelse return null;
+        return Coerced{ .value = .{ .u64_val = orderedU64FromI64(number) } };
+    }
+    if (std.mem.eql(u8, column_type, "geopoint")) {
+        const point = geoPointFromJson(json_value) orelse return null;
+        return Coerced{ .value = .{ .geo_point = point } };
+    }
+    return null;
+}
+
+fn integerFromJson(json_value: std.json.Value) ?i64 {
+    switch (json_value) {
+        .integer => |number| return number,
+        .string => |text| return std.fmt.parseInt(i64, text, 10) catch null,
+        else => return null,
+    }
+}
+
+fn geoPointFromJson(json_value: std.json.Value) ?GeoPoint {
+    switch (json_value) {
+        .object => |object| {
+            const lat = jsonNumber(object.get("lat") orelse return null) orelse return null;
+            const lon = jsonNumber(object.get("lon") orelse return null) orelse return null;
+            return GeoPoint{ .lat = lat, .lon = lon };
+        },
+        else => return null,
+    }
+}
+
+fn jsonNumber(json_value: std.json.Value) ?f64 {
+    switch (json_value) {
+        .float => |number| return number,
+        .integer => |number| return @floatFromInt(number),
+        else => return null,
+    }
+}
+
+fn stringifyJsonValueAlloc(alloc: Allocator, json_value: std.json.Value) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(json_value, .{})});
+}
+
+fn valueAtJsonPath(root: std.json.Value, path: []const u8) ?std.json.Value {
+    var current = root;
+    var it = std.mem.splitScalar(u8, path, '.');
+    while (it.next()) |segment| {
+        switch (current) {
+            .object => |object| current = object.get(segment) orelse return null,
+            else => return null,
+        }
+    }
+    return current;
+}
+
+fn relationalTestPlanAlloc(alloc: Allocator) !RelationalPlan {
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"qty":{"type":"integer"},"ts":{"type":"datetime"},"active":{"type":"boolean"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","amount"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    return try relationalColumnPlanAlloc(alloc, parsed);
+}
+
+fn relationalColumnIndex(plan: RelationalPlan, name: []const u8) ?usize {
+    for (plan.columns, 0..) |column, i| {
+        if (std.mem.eql(u8, column.name, name)) return i;
+    }
+    return null;
+}
+
+test "relational projection enforces required columns and types" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+
+    // Missing a required column.
+    var missing = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"a"}
+    , .{});
+    defer missing.deinit();
+    try std.testing.expectError(error.MissingRequiredColumn, projectRelationalRowAlloc(alloc, plan, missing.value));
+
+    // Required column present but wrong type (string column given a number).
+    var wrong = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":5,"amount":1.0}
+    , .{});
+    defer wrong.deinit();
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, wrong.value));
+}
+
+test "relational projection yields typed cells" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"abc","amount":12.5,"qty":7,"ts":1000,"active":true,"attrs":{"k":"v"},"payload":[1,2,3]}
+    , .{});
+    defer doc.deinit();
+
+    var row = try projectRelationalRowAlloc(alloc, plan, doc.value);
+    defer row.deinit(alloc);
+
+    const id = row.cell(relationalColumnIndex(plan, "id").?).?;
+    try std.testing.expectEqualStrings("abc", id.value.bytes_val);
+    const amount = row.cell(relationalColumnIndex(plan, "amount").?).?;
+    try std.testing.expectEqual(@as(f64, 12.5), amount.value.f64_val);
+    const qty = row.cell(relationalColumnIndex(plan, "qty").?).?;
+    try std.testing.expectEqual(@as(i64, 7), orderedI64FromU64(qty.value.u64_val));
+    const ts = row.cell(relationalColumnIndex(plan, "ts").?).?;
+    try std.testing.expectEqual(@as(i64, 1000), orderedI64FromU64(ts.value.u64_val));
+    const active = row.cell(relationalColumnIndex(plan, "active").?).?;
+    try std.testing.expect(active.value.bool_val);
+
+    // A nullable column omitted from the document yields no cell.
+    var sparse = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"x","amount":0.0}
+    , .{});
+    defer sparse.deinit();
+    var sparse_row = try projectRelationalRowAlloc(alloc, plan, sparse.value);
+    defer sparse_row.deinit(alloc);
+    try std.testing.expect(sparse_row.cell(relationalColumnIndex(plan, "qty").?) == null);
+
+    // json columns are stringified and flagged.
+    const attrs = row.cell(relationalColumnIndex(plan, "attrs").?).?;
+    try std.testing.expect(attrs.is_json);
+    var attrs_parsed = try std.json.parseFromSlice(std.json.Value, alloc, attrs.value.bytes_val, .{});
+    defer attrs_parsed.deinit();
+    try std.testing.expectEqualStrings("v", attrs_parsed.value.object.get("k").?.string);
+    const payload = row.cell(relationalColumnIndex(plan, "payload").?).?;
+    try std.testing.expect(payload.is_json);
+    var payload_parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload.value.bytes_val, .{});
+    defer payload_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), payload_parsed.value.array.items.len);
+}
+
+test "relational integer column preserves signed order under unsigned compare" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+    const qty_index = relationalColumnIndex(plan, "qty").?;
+
+    var negative = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"a","amount":0.0,"qty":-5}
+    , .{});
+    defer negative.deinit();
+    var positive = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"b","amount":0.0,"qty":5}
+    , .{});
+    defer positive.deinit();
+
+    var negative_row = try projectRelationalRowAlloc(alloc, plan, negative.value);
+    defer negative_row.deinit(alloc);
+    var positive_row = try projectRelationalRowAlloc(alloc, plan, positive.value);
+    defer positive_row.deinit(alloc);
+
+    const negative_encoded = negative_row.cell(qty_index).?.value.u64_val;
+    const positive_encoded = positive_row.cell(qty_index).?.value.u64_val;
+    try std.testing.expect(negative_encoded < positive_encoded);
+    try std.testing.expectEqual(@as(i64, -5), orderedI64FromU64(negative_encoded));
+}
+
+test "relational cells round-trip through typed_doc_values storage" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"abc","amount":2.5,"qty":42,"ts":1000,"active":true,"payload":1}
+    , .{});
+    defer doc.deinit();
+
+    var row = try projectRelationalRowAlloc(alloc, plan, doc.value);
+    defer row.deinit(alloc);
+
+    // Drive the real typed_doc_values writer/reader for each typed-scan column.
+    try expectTypedColumnRoundTrip(alloc, .u64_val, typedValue(row.cell(relationalColumnIndex(plan, "qty").?).?.value));
+    try expectTypedColumnRoundTrip(alloc, .f64_val, typedValue(row.cell(relationalColumnIndex(plan, "amount").?).?.value));
+    try expectTypedColumnRoundTrip(alloc, .bool_val, typedValue(row.cell(relationalColumnIndex(plan, "active").?).?.value));
+}
+
+fn expectTypedColumnRoundTrip(
+    alloc: Allocator,
+    value_type: typed_doc_values.ValueType,
+    value: typed_doc_values.TypedValue,
+) !void {
+    var writer = typed_doc_values.TypedDocValuesWriter.init(alloc, value_type, typed_doc_values.default_chunk_size);
+    defer writer.deinit();
+    try writer.add(0, value);
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+
+    const reader = try typed_doc_values.TypedDocValuesReader.init(alloc, bytes);
+    switch (value_type) {
+        .u64_val => try std.testing.expectEqual(value.u64_val, (try reader.getU64(0)).?),
+        .f64_val => try std.testing.expectEqual(value.f64_val, (try reader.getF64(0)).?),
+        .bool_val => try std.testing.expectEqual(value.bool_val, (try reader.getBool(0)).?),
+        else => unreachable,
+    }
+}
