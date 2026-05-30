@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const vector_codec = @import("antfly_vector").codec;
 const regex_mod = @import("antfly_regex");
 const introducer_mod = @import("../../introducer.zig");
+const typed_dv = @import("../../section/typed_doc_values.zig");
 const analysis_mod = @import("../../search/analysis.zig");
 const schema_api = @import("../../schema/mod.zig");
 const runtime_schema = @import("../schema.zig");
@@ -1425,9 +1426,22 @@ fn extractTextFieldsFromValue(
     if (root != .object) return .{ .fields = &.{} };
 
     if (schema) |runtime| {
+        // Relational tables drive typed columns from the declared catalog rather
+        // than value detection (authoritative types). NOT NULL is enforced
+        // upstream by JSON-schema `required` validation, so missing nullable
+        // columns are simply skipped here. keyword/text columns flow through the
+        // text path below; json columns are indexed as subtrees.
+        const relational_typed_fields: ?[]const introducer_mod.TypedFieldValue =
+            if (runtime.storage_mode == .relational)
+                try buildRelationalTypedFields(alloc, root, runtime.relational_columns)
+            else
+                null;
+        errdefer if (relational_typed_fields) |relational_fields| alloc.free(relational_fields);
+
         if (!runtimeHasSchemaDrivenText(runtime)) {
             return .{
                 .fields = try extractStringFieldsNoSchema(alloc, root.object),
+                .typed_fields = relational_typed_fields,
             };
         }
 
@@ -1446,10 +1460,98 @@ fn extractTextFieldsFromValue(
         return .{
             .fields = if (fields.items.len > 0) try alloc.dupe(introducer_mod.TextField, fields.items) else &.{},
             .infer_type_dynamic_paths = if (document_schema) |resolved| resolved.infer_type_dynamic_paths else &.{},
+            .typed_fields = relational_typed_fields,
         };
     }
 
     return try extractSchemaLessTextAndTypedFields(alloc, root.object, text_analysis);
+}
+
+/// Build the introducer's typed-field input for a relational document from the
+/// declared column catalog. Only columns physically stored as typed doc values
+/// are emitted (numeric -> f64, datetime -> u64 epoch ns, boolean, geopoint);
+/// keyword/text columns use the full-text index and json columns are subtrees,
+/// so they are skipped. Mirrors schema_capability.relationalTypedColumnsAlloc.
+fn buildRelationalTypedFields(
+    alloc: Allocator,
+    root: std.json.Value,
+    columns: []const runtime_schema.RelationalColumn,
+) ![]const introducer_mod.TypedFieldValue {
+    var fields = std.ArrayListUnmanaged(introducer_mod.TypedFieldValue).empty;
+    errdefer fields.deinit(alloc);
+
+    for (columns) |column| {
+        const value_type = relationalTypedValueType(column.field_type) orelse continue;
+        const found = valueAtJsonPath(root, column.path) orelse continue;
+        if (found == .null) continue;
+        const value = coerceRelationalTypedValue(value_type, found) orelse continue;
+        try fields.append(alloc, .{
+            .field_name = column.name,
+            .value_type = value_type,
+            .value = value,
+        });
+    }
+
+    return try fields.toOwnedSlice(alloc);
+}
+
+fn relationalTypedValueType(field_type: runtime_schema.AntflyType) ?typed_dv.ValueType {
+    return switch (field_type) {
+        .numeric => .f64_val,
+        .datetime => .u64_val,
+        .boolean => .bool_val,
+        .geopoint => .geo_point,
+        else => null,
+    };
+}
+
+fn coerceRelationalTypedValue(value_type: typed_dv.ValueType, json_value: std.json.Value) ?typed_dv.TypedValue {
+    switch (value_type) {
+        .f64_val => switch (json_value) {
+            .float => |number| return .{ .f64_val = number },
+            .integer => |number| return .{ .f64_val = @floatFromInt(number) },
+            else => return null,
+        },
+        .u64_val => {
+            const number: i64 = switch (json_value) {
+                .integer => |value| value,
+                .string => |text| std.fmt.parseInt(i64, text, 10) catch return null,
+                else => return null,
+            };
+            return .{ .u64_val = @bitCast(number) };
+        },
+        .bool_val => switch (json_value) {
+            .bool => |flag| return .{ .bool_val = flag },
+            else => return null,
+        },
+        .geo_point => {
+            if (json_value != .object) return null;
+            const lat = jsonNumberValue(json_value.object.get("lat") orelse return null) orelse return null;
+            const lon = jsonNumberValue(json_value.object.get("lon") orelse return null) orelse return null;
+            return .{ .geo_point = .{ .lat = lat, .lon = lon } };
+        },
+        else => return null,
+    }
+}
+
+fn jsonNumberValue(json_value: std.json.Value) ?f64 {
+    switch (json_value) {
+        .float => |number| return number,
+        .integer => |number| return @floatFromInt(number),
+        else => return null,
+    }
+}
+
+fn valueAtJsonPath(root: std.json.Value, path: []const u8) ?std.json.Value {
+    var current = root;
+    var it = std.mem.splitScalar(u8, path, '.');
+    while (it.next()) |segment| {
+        switch (current) {
+            .object => |object| current = object.get(segment) orelse return null,
+            else => return null,
+        }
+    }
+    return current;
 }
 
 fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
@@ -3333,4 +3435,73 @@ test "document mapper extracts packed sparse embeddings from _embeddings" {
     try std.testing.expectEqual(@as(u32, 5), extracted.sparse_embeddings[0].indices[1]);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), extracted.sparse_embeddings[0].values[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), extracted.sparse_embeddings[0].values[1], 0.0001);
+}
+
+test "buildRelationalTypedFields emits typed columns and skips keyword/json" {
+    const alloc = std.testing.allocator;
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"abc","amount":12.5,"ts":1000,"active":true,"payload":{"k":1}}
+    , .{});
+    defer doc.deinit();
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+        .{ .name = "ts", .path = "ts", .field_type = .datetime, .nullable = true },
+        .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
+        .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true },
+    };
+
+    const fields = try buildRelationalTypedFields(alloc, doc.value, &columns);
+    defer alloc.free(fields);
+
+    // keyword (id) and json (payload) columns are not typed doc values.
+    try std.testing.expectEqual(@as(usize, 3), fields.len);
+    var saw_amount = false;
+    var saw_ts = false;
+    var saw_active = false;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.field_name, "amount")) {
+            saw_amount = true;
+            try std.testing.expectEqual(typed_dv.ValueType.f64_val, field.value_type);
+            try std.testing.expectEqual(@as(f64, 12.5), field.value.f64_val);
+        } else if (std.mem.eql(u8, field.field_name, "ts")) {
+            saw_ts = true;
+            try std.testing.expectEqual(typed_dv.ValueType.u64_val, field.value_type);
+            try std.testing.expectEqual(@as(u64, 1000), field.value.u64_val);
+        } else if (std.mem.eql(u8, field.field_name, "active")) {
+            saw_active = true;
+            try std.testing.expectEqual(typed_dv.ValueType.bool_val, field.value_type);
+            try std.testing.expect(field.value.bool_val);
+        } else {
+            return error.UnexpectedColumn;
+        }
+    }
+    try std.testing.expect(saw_amount and saw_ts and saw_active);
+}
+
+test "extractTextFieldsFromValue attaches relational typed fields" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+        .{ .name = "ts", .path = "ts", .field_type = .datetime, .nullable = true },
+        .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
+        .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true },
+    };
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"amount":1.5,"ts":1000,"active":true,"payload":{"k":1}}
+    , .{});
+    defer doc.deinit();
+
+    const extracted = try extractTextFieldsFromValue(alloc, doc.value, .{}, schema, null);
+    defer if (extracted.typed_fields) |typed_fields| alloc.free(typed_fields);
+    defer if (extracted.fields.len > 0) alloc.free(extracted.fields);
+
+    try std.testing.expect(extracted.typed_fields != null);
+    try std.testing.expectEqual(@as(usize, 3), extracted.typed_fields.?.len);
 }
