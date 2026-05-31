@@ -48,6 +48,10 @@ pub const ExtractedEntity = struct {
     text: []const u8,
     /// Optional query embedding (e.g. a name embedding) for cosine/ANN scoring.
     embedding: ?[]const f32 = null,
+    /// Extractor's asserted confidence in this mention, in [0, 1]. Defaults to
+    /// 1.0 when the extractor omits it (legacy mentions are fully trusted). Fed
+    /// into provenance-edge confidence fusion.
+    confidence: f64 = 1.0,
 };
 
 /// A resolution candidate fetched by blocking. `record` is scored against the
@@ -632,6 +636,11 @@ pub fn parseExtractionEntities(gpa: std.mem.Allocator, json_bytes: []const u8) !
             .label = try a.dupe(u8, jsonString(o.get("label") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
             .text = try a.dupe(u8, jsonString(o.get("text") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
             .embedding = try parseEmbedding(a, o.get("embedding")),
+            .confidence = switch (o.get("confidence") orelse std.json.Value{ .float = 1.0 }) {
+                .float => |f| f,
+                .integer => |n| @floatFromInt(n),
+                else => 1.0,
+            },
         };
     }
     return .{ .arena = arena, .entities = out };

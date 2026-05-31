@@ -54,6 +54,21 @@ pub const ResolverConfig = struct {
     name_embedding: []const u8 = "",
     /// Dimensionality for `name_embedding` (0 lets the embedder decide).
     name_embedding_dims: u32 = 0,
+    /// Confidence-fusion strategy for the provenance edge weight: "" (legacy
+    /// fixed weight 1.0), "noisy_or", "max", or "mean". When set, the mention
+    /// edge's weight is `matcher.fuse` of this extractor's `fusion_trust *`
+    /// the mention's asserted confidence, folded with the config-pinned graph
+    /// prior. This is the naive first fusion implementation (one source per
+    /// resolver); cross-extractor combine over a live snapshot is a later step.
+    fusion_combine: []const u8 = "",
+    /// This extractor's trust in [0, 1]; scales its asserted confidence.
+    fusion_trust: f64 = 1.0,
+    /// Config-generation-pinned graph prior belief in [0, 1] folded into the
+    /// fused weight (a fixed snapshot value avoids the streaming self-reinforce
+    /// caveat: the prior never reads the edges currently being written).
+    fusion_prior: f64 = 0.0,
+    /// Weight of `fusion_prior` in the fusion; 0 ignores the prior.
+    fusion_prior_weight: f64 = 0.0,
     /// Bumped to force a versioned re-resolution pass.
     config_generation: u64 = 0,
 
@@ -69,6 +84,10 @@ pub const ResolverConfig = struct {
             .candidate_search = if (cfg.candidate_search.len > 0) try alloc.dupe(u8, cfg.candidate_search) else "",
             .name_embedding = if (cfg.name_embedding.len > 0) try alloc.dupe(u8, cfg.name_embedding) else "",
             .name_embedding_dims = cfg.name_embedding_dims,
+            .fusion_combine = if (cfg.fusion_combine.len > 0) try alloc.dupe(u8, cfg.fusion_combine) else "",
+            .fusion_trust = cfg.fusion_trust,
+            .fusion_prior = cfg.fusion_prior,
+            .fusion_prior_weight = cfg.fusion_prior_weight,
             .config_generation = cfg.config_generation,
         };
     }
@@ -82,6 +101,7 @@ pub const ResolverConfig = struct {
         if (self.scorer_json.len > 0) alloc.free(@constCast(self.scorer_json));
         if (self.candidate_search.len > 0) alloc.free(@constCast(self.candidate_search));
         if (self.name_embedding.len > 0) alloc.free(@constCast(self.name_embedding));
+        if (self.fusion_combine.len > 0) alloc.free(@constCast(self.fusion_combine));
         self.* = undefined;
     }
 };

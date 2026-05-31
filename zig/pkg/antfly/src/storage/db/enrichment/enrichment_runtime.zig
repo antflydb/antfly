@@ -40,6 +40,7 @@ const chunk_artifact_mod = @import("../../../chunking/chunk.zig");
 const chunking_types_mod = @import("../../../chunking/types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const resolver_lib = @import("antfly_resolver");
+const matcher_lib = @import("antfly_matcher");
 const ownership_mod = @import("../ownership.zig");
 const types = @import("../types.zig");
 const platform_clock = @import("../../../platform/clock.zig");
@@ -1681,6 +1682,26 @@ fn runtimeGraphWritesFromArtifactValueAlloc(
 /// entity node hydrates only once the entity document exists; missing entities
 /// fail closed at query time). Returns an empty slice if no resolver consumes
 /// the artifact.
+/// Mirror of `db.fusedMentionWeight` for the async materializer: calibrate the
+/// provenance edge weight by extractor trust and the mention's confidence when
+/// the resolver declares a fusion strategy, else the legacy fixed 1.0.
+fn runtimeFusedMentionWeight(cfg: *const index_manager_mod.ResolverConfig, confidence: f64) f64 {
+    const strategy: matcher_lib.FusionStrategy = if (std.mem.eql(u8, cfg.fusion_combine, "noisy_or"))
+        .noisy_or
+    else if (std.mem.eql(u8, cfg.fusion_combine, "max"))
+        .max
+    else if (std.mem.eql(u8, cfg.fusion_combine, "mean"))
+        .mean
+    else
+        return 1.0;
+    return matcher_lib.fuse(
+        strategy,
+        &.{.{ .confidence = confidence, .trust = cfg.fusion_trust }},
+        cfg.fusion_prior,
+        cfg.fusion_prior_weight,
+    );
+}
+
 fn runtimeMentionEdgeWritesAlloc(
     runtime: *EnrichmentRuntime,
     index_name: []const u8,
@@ -1732,7 +1753,7 @@ fn runtimeMentionEdgeWritesAlloc(
             .source = try runtime.alloc.dupe(u8, doc_key),
             .target = try runtime.alloc.dupe(u8, key),
             .edge_type = try runtime.alloc.dupe(u8, mention_edge_type),
-            .weight = 1.0,
+            .weight = runtimeFusedMentionWeight(cfg, entity.confidence),
             .metadata_json = metadata,
         });
     }

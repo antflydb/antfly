@@ -34,6 +34,7 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resolver_lib = @import("antfly_resolver");
+const matcher_lib = @import("antfly_matcher");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
 const types = @import("types.zig");
@@ -16254,6 +16255,29 @@ fn freeGraphWrites(alloc: Allocator, writes: []types.GraphEdgeWrite) void {
 /// consumes `artifact_name` renders via its `key_template` -- deterministic from
 /// the mention text, so the provenance edge exists even before the entity is
 /// promoted. Returns an empty slice when no resolver consumes the artifact.
+/// Edge weight for a mention from one extractor. When the resolver declares a
+/// fusion strategy, the weight is `matcher.fuse` of this extractor's
+/// `fusion_trust * confidence` folded with the config-pinned graph prior;
+/// otherwise the legacy fixed 1.0. This is the naive (one-source-per-resolver)
+/// fusion stage -- it calibrates the edge weight by extractor trust and the
+/// mention's asserted confidence without reading the live graph.
+fn fusedMentionWeight(cfg: *const index_manager_mod.ResolverConfig, confidence: f64) f64 {
+    const strategy: matcher_lib.FusionStrategy = if (std.mem.eql(u8, cfg.fusion_combine, "noisy_or"))
+        .noisy_or
+    else if (std.mem.eql(u8, cfg.fusion_combine, "max"))
+        .max
+    else if (std.mem.eql(u8, cfg.fusion_combine, "mean"))
+        .mean
+    else
+        return 1.0; // fusion disabled: legacy fixed weight
+    return matcher_lib.fuse(
+        strategy,
+        &.{.{ .confidence = confidence, .trust = cfg.fusion_trust }},
+        cfg.fusion_prior,
+        cfg.fusion_prior_weight,
+    );
+}
+
 fn mentionEdgeWritesAlloc(
     alloc: Allocator,
     index_manager: *index_manager_mod.IndexManager,
@@ -16308,7 +16332,7 @@ fn mentionEdgeWritesAlloc(
             .source = try alloc.dupe(u8, doc_key),
             .target = try alloc.dupe(u8, key),
             .edge_type = try alloc.dupe(u8, mention_edge_type),
-            .weight = 1.0,
+            .weight = fusedMentionWeight(cfg, entity.confidence),
             .metadata_json = metadata,
         });
     }
@@ -23923,6 +23947,60 @@ test "db materializes doc->entity mention edges as provenance and clears them on
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 0), inbound.len);
     }
+}
+
+test "db mention edge weight is fused from extractor trust and mention confidence" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    // A resolver declaring noisy_or fusion: this extractor is trusted 0.9, no
+    // graph prior. The mention asserts confidence 0.8, so the edge weight is
+    // fuse(noisy_or, [{0.8, 0.9}], prior=0, prior_weight=0) = 1-(1-0.72) = 0.72.
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .fusion_combine = "noisy_or",
+        .fusion_trust = 0.9,
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace","confidence":0.8}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, out);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", out[0].target);
+    // Calibrated weight, not the legacy 1.0.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.72), out[0].weight, 1e-9);
 }
 
 test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {

@@ -574,9 +574,18 @@ Open/index/enrichment validation should reject:
          learned scorer classifies match vs no-match end to end. Unit-tested.
    - [x] Calibrated fusion across extractors: `matcher.fuse` combines per-source
          `trust * confidence` (noisy_or / max / mean) with a config-generation-
-         pinned graph prior into one edge confidence. Unit-tested. Remaining:
-         the fusion stage that reads multiple extraction artifacts and sets the
-         edge weight from a pinned prior snapshot.
+         pinned graph prior into one edge confidence. Unit-tested. The fusion
+         stage is wired into the mention-edge materializer (both sync and async
+         paths): a resolver declaring `fusion_combine` (+ `fusion_trust`,
+         `fusion_prior`, `fusion_prior_weight`) sets the provenance edge weight
+         to the fused confidence of its extractor's `trust *` the mention's
+         asserted `confidence` folded with the config-pinned prior, instead of a
+         fixed 1.0. Verified by a db-test (trust 0.9 x confidence 0.8 -> edge
+         weight 0.72). The prior is a fixed config-pinned snapshot value (never
+         the live edges being written), which sidesteps the streaming
+         self-reinforce caveat. Naive in that it fuses one source per resolver;
+         multi-source combine over the same `(doc, entity)` edge across distinct
+         extractors is the next step.
    - [x] REVIEW band workflow: a review-band decision is recorded durably in the
          resolution artifact (`decision: "review"`); the review queue
          (`DB.listPendingReviews` / `resolution_runtime.listPendingReviews`)
@@ -654,8 +663,11 @@ Resolver / promoter integration:
 - [x] Provenance mention edges appear with source documents and disappear on
   source delete (db-test).
 - [x] Hydration of a not-yet-promoted entity fails closed (db-test).
-- [ ] Fusion combines per-source confidences into the edge weight from a pinned
-  prior snapshot (phase 2).
+- [x] Fusion combines per-source confidence into the edge weight from a pinned
+  prior snapshot (phase 2): `fusedMentionWeight` sets the mention edge weight via
+  `matcher.fuse(strategy, [{confidence, trust}], prior, prior_weight)` from the
+  resolver's fusion config (db-test). Multi-source combine across extractors over
+  one edge is the remaining naive->full step.
 
 ## Cross-shard candidate blocking (built; serving-layer injection remaining)
 
