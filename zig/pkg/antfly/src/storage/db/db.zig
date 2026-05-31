@@ -5423,6 +5423,9 @@ pub const DB = struct {
         var changed: u64 = 0;
         for (self.core.index_manager.algebraic_indexes.items) |*entry| {
             changed += try entry.index.evaluateAdaptiveCandidates(self.core.store, target_sequence);
+            // Promote + backfill recurring cardinality observations into HLL
+            // sketches here (leader-gated), not on the read path.
+            changed += try entry.index.evaluateHllCardinalityCandidates(self.core.store);
         }
         return changed;
     }
@@ -19714,16 +19717,17 @@ test "db open wires algebraic HLL maintenance lane and adaptively backfills sket
         @memcpy(adaptive_name_buf[0..adaptive_name.len], adaptive_name);
         adaptive_name_len = adaptive_name.len;
 
-        // First observation is below the threshold: no sketch, so no approximate
-        // total is available yet.
+        // Reads only record observations — they never promote — so no sketch and
+        // no approximate total exist after two recurring cardinality queries.
+        index.observeCardinalityForAdaptive(db.core.store, null, "product");
         index.observeCardinalityForAdaptive(db.core.store, null, "product");
         try std.testing.expect(!index.hllRegistryContains(adaptive_name));
         try std.testing.expect((try index.approxCardinalityTotalForFieldAlloc(db.core.store, "product", &.{}, null)) == null);
 
-        // Second observation reaches the threshold: the sketch is promoted and the
-        // lane-scheduled backfill runs inline, so the next read resolves an
-        // approximate distinct-product count (4 docs, 3 distinct products).
-        index.observeCardinalityForAdaptive(db.core.store, null, "product");
+        // The leader-gated adaptive maintenance pass promotes the over-threshold
+        // observation and backfills it, so the next read resolves an approximate
+        // distinct-product count (4 docs, 3 distinct products).
+        _ = try db.evaluateAlgebraicAdaptiveCandidates();
         try std.testing.expect(index.hllRegistryContains(adaptive_name));
         const estimate = (try index.approxCardinalityTotalForFieldAlloc(db.core.store, "product", &.{}, null)) orelse
             return error.TestUnexpectedResult;

@@ -16918,35 +16918,30 @@ pub const Index = struct {
     }
 
     // Records one observation of a cardinality query over `value_field` grouped
-    // by `group_field` (null = ungrouped/root). When the observation count
-    // reaches the adaptive threshold and no matching sketch exists yet, promotes
-    // one: registers it, persists the marker, and marks it dirty so maintenance
-    // backfills it. Best-effort and infallible — observation is telemetry, never
-    // a reason to fail a query. Only active when adaptive.lazy_materialization
-    // is enabled (matching the materialization promotion gate).
+    // by `group_field` (null = ungrouped/root). This only bumps a local, durable
+    // observation counter; it never promotes or backfills on the query path.
+    // Promotion is deferred to the leader-gated maintenance pass
+    // (evaluateHllCardinalityCandidates), mirroring how the tensor adaptive path
+    // records query shapes on reads but decides materializations during
+    // maintenance — so reads stay cheap and promotion is per-shard-deterministic.
+    // Best-effort and infallible: observation is telemetry, never a reason to
+    // fail a query. Only active when adaptive.lazy_materialization is enabled.
     pub fn observeCardinalityForAdaptive(self: *Index, store: *docstore_mod.DocStore, group_field: ?[]const u8, value_field: []const u8) void {
-        const promoted = self.observeCardinalityForAdaptiveImpl(store, group_field, value_field) catch false;
-        // Promotion runs on the (read) query path and leaves the new sketch
-        // dirty. Schedule the backfill now so a read-mostly cardinality workload
-        // — the case adaptive provisioning targets — actually materializes the
-        // sketch without waiting for an unrelated foreground write batch. Done
-        // outside observeCardinalityForAdaptiveImpl's write lock so the inline
-        // lane (which runs maintenance synchronously) can take it.
-        if (promoted) self.scheduleHllMaintenanceIfDirty(store);
+        self.recordHllCardinalityObservation(store, group_field, value_field) catch {};
     }
 
-    fn observeCardinalityForAdaptiveImpl(self: *Index, store: *docstore_mod.DocStore, group_field: ?[]const u8, value_field: []const u8) !bool {
-        if (!self.config().adaptive.lazy_materialization) return false;
+    fn recordHllCardinalityObservation(self: *Index, store: *docstore_mod.DocStore, group_field: ?[]const u8, value_field: []const u8) !void {
+        if (!self.config().adaptive.lazy_materialization) return;
         // Only group/value fields the schema actually exposes can back a sketch.
-        const value_resolved = self.resolveUniqueField(value_field) orelse return false;
-        if (value_resolved.role != .group) return false;
+        const value_resolved = self.resolveUniqueField(value_field) orelse return;
+        if (value_resolved.role != .group) return;
         if (group_field) |gf| {
-            const g = self.resolveUniqueField(gf) orelse return false;
-            if (g.role != .group) return false;
+            const g = self.resolveUniqueField(gf) orelse return;
+            if (g.role != .group) return;
         }
         const name = try self.hllAdaptiveNameAlloc(group_field, value_resolved.name);
         defer self.alloc.free(name);
-        if (self.hllRegistryContains(name)) return false; // already promoted
+        if (self.hllRegistryContains(name)) return; // already promoted
 
         self.lockWrites();
         defer self.unlockWrites();
@@ -16966,13 +16961,84 @@ pub const Index = struct {
         const next_text = try std.fmt.allocPrint(self.alloc, "{d}", .{next});
         defer self.alloc.free(next_text);
         try txn.put(obs_key, next_text);
-
-        var promoted = false;
-        if (next >= self.config().adaptive.policy().min_observations) {
-            try self.promoteAdaptiveHllTxn(&txn, name, group_field, value_resolved.name);
-            promoted = true;
-        }
         try txn.commit();
+    }
+
+    // Prefix for the recorded cardinality observation counters (hllobs:...). Used
+    // by the maintenance pass to scan candidates.
+    fn hllAdaptiveObservationPrefixAlloc(self: *Index) ![]u8 {
+        return try self.keyAlloc(&.{"hllobs"});
+    }
+
+    // Leader-gated maintenance: promote recurring cardinality observations into
+    // materialized sketches and backfill them from stored facts. This is the
+    // counterpart to evaluateAdaptiveCandidates (tensors) for the HLL path — the
+    // read path only records observations; promotion and backfill happen here,
+    // off the query path and only where maintenance runs (the write/leader node),
+    // so a follower serving reads never mutates derived sketch state. Returns the
+    // number of sketches promoted. Only active when adaptive.lazy_materialization
+    // is enabled.
+    pub fn evaluateHllCardinalityCandidates(self: *Index, store: *docstore_mod.DocStore) !u64 {
+        if (!self.config().adaptive.lazy_materialization) return 0;
+        const min_obs = self.config().adaptive.policy().min_observations;
+
+        const prefix = try self.hllAdaptiveObservationPrefixAlloc();
+        defer self.alloc.free(prefix);
+
+        // Collect eligible (group, value) pairs first: promotion opens its own
+        // write txn and mutates the in-memory registry, so it can't run while the
+        // read cursor is open.
+        const Pending = struct { group: ?[]u8, value: []u8 };
+        var pending = std.ArrayListUnmanaged(Pending).empty;
+        defer {
+            for (pending.items) |p| {
+                if (p.group) |g| self.alloc.free(g);
+                self.alloc.free(p.value);
+            }
+            pending.deinit(self.alloc);
+        }
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(prefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                const group_comp = token.componentAt(entry.key, prefix.len) catch continue;
+                const value_comp = token.componentAt(entry.key, group_comp.next) catch continue;
+                if (value_comp.next != entry.key.len) continue; // not an obs key
+                const count = std.fmt.parseInt(u64, entry.value, 10) catch continue;
+                if (count < min_obs) continue;
+                const group_opt: ?[]const u8 = if (group_comp.payload.len > 0) group_comp.payload else null;
+                const name = try self.hllAdaptiveNameAlloc(group_opt, value_comp.payload);
+                defer self.alloc.free(name);
+                if (self.hllRegistryContains(name)) continue; // already promoted
+                try pending.append(self.alloc, .{
+                    .group = if (group_opt) |g| try self.alloc.dupe(u8, g) else null,
+                    .value = try self.alloc.dupe(u8, value_comp.payload),
+                });
+            }
+        }
+
+        var promoted: u64 = 0;
+        for (pending.items) |p| {
+            const name = try self.hllAdaptiveNameAlloc(p.group, p.value);
+            defer self.alloc.free(name);
+            if (self.hllRegistryContains(name)) continue;
+            self.lockWrites();
+            {
+                defer self.unlockWrites();
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                try self.promoteAdaptiveHllTxn(&txn, name, p.group, p.value);
+                try txn.commit();
+            }
+            promoted += 1;
+        }
+
+        // Backfill the freshly promoted (now dirty) sketches in the same pass.
+        if (promoted > 0) _ = try self.runHllMaintenance(store);
         return promoted;
     }
 
@@ -19703,16 +19769,19 @@ test "algebraic HLL cardinality is adaptively promoted from a recurring query sh
     const adaptive_name = try idx.hllAdaptiveNameAlloc("region", "customer");
     defer alloc.free(adaptive_name);
 
-    // First observation: below threshold (2), no sketch yet.
+    // Observations only record counters on the (read) path; they never promote.
+    idx.observeCardinalityForAdaptive(&store, "region", "customer");
+    try std.testing.expect(!idx.hllRegistryContains(adaptive_name));
     idx.observeCardinalityForAdaptive(&store, "region", "customer");
     try std.testing.expect(!idx.hllRegistryContains(adaptive_name));
 
-    // Second observation reaches the threshold and promotes + dirties the sketch.
-    idx.observeCardinalityForAdaptive(&store, "region", "customer");
+    // The leader-gated maintenance pass promotes the over-threshold observation
+    // into a sketch and backfills it from the stored facts in one step.
+    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateHllCardinalityCandidates(&store));
     try std.testing.expect(idx.hllRegistryContains(adaptive_name));
 
-    // Backfill the freshly promoted sketch from the stored facts.
-    _ = try idx.runHllMaintenance(&store);
+    // Re-running maintenance is idempotent: nothing new to promote.
+    try std.testing.expectEqual(@as(u64, 0), try idx.evaluateHllCardinalityCandidates(&store));
 
     const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
     defer alloc.free(west_token);
