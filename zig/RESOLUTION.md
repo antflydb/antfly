@@ -475,10 +475,16 @@ Open/index/enrichment validation should reject:
          (via an optional `scanPrefix` store seam) and let the scorer rank the
          results, so a typo'd mention links to an existing entity under a
          different key. Tested.
-   - [ ] Remaining phase-2: ANN candidate search (needs a mention name-embedding
-         + the entity table's vector index), and cross-shard entity-table reads
-         (distributed query) so blocking sees a separate entity shard. These
-         unlock model-backed / cross-document resolution at scale.
+   - [x] Embedding (cosine) scoring: extraction entities and entity candidates
+         carry vector fields (`name_embedding`); the matcher cosine comparator
+         links by similarity even when text differs. This is the *scoring* half
+         of ANN. Tested.
+   - [ ] Sublinear ANN candidate *generation* (vector-index nearest-neighbour)
+         and cross-shard entity-table reads. Both reduce to the same blocker --
+         cross-shard distributed query -- since the entity table lives on a
+         different shard than the resolution worker. See "Cross-shard candidate
+         blocking" below. This is a multi-node subsystem (not verifiable with the
+         single-shard `db-test` tooling) and is the one remaining piece.
    - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
          per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
          / `listResolvers` through DB -> DBCore -> IndexManager (verified by a
@@ -540,3 +546,46 @@ Resolver / promoter integration (to come):
   not-yet-promoted entity fails closed.
 - Fusion combines per-source confidences into the edge weight from a pinned
   prior snapshot.
+
+## Cross-shard candidate blocking (design — the one remaining phase-2 piece)
+
+Exact/prefix/embedding blocking are all implemented and tested, but today they
+only see entities the resolution worker's own shard store can read. Canonical
+entities normally live in a dedicated `entities` table on a *different* shard,
+so meaningful cross-document blocking needs the worker to query that table
+across shards. Sublinear ANN candidate generation has the same requirement (the
+entity table's vector index is on the entity shard). Both are the same blocker.
+
+This is a multi-node subsystem; it cannot be verified with the single-shard
+`db-test` harness and needs the cluster/transport layer. Turn-key plan:
+
+1. **Topology.** Resolve `entities` table -> shard set via the metadata service
+   (the same lookup the query path uses). Cache per `config_generation`.
+2. **Candidate query.** Add a `CandidateSource` that fans a blocking query out
+   to the entity shards over `lib/multirafthttp` (the existing multi-raft
+   transport), mirroring how distributed graph expansion / `remote` indexes
+   already proxy reads:
+   - `prefix`: a ranged key scan per shard (each shard scans its key range,
+     returns matching entity docs).
+   - `ann`: a vector search per shard against the entity table's managed dense
+     index using the mention's `name_embedding` as the query vector; merge the
+     per-shard top-k.
+   Both return `(doc_ref, record)` candidates; the existing matcher scorer ranks
+   them unchanged.
+3. **Worker wiring.** The resolution worker constructs the `CandidateProvider`
+   from this `CandidateSource` (instead of the in-store exact/prefix providers)
+   when the deployment is multi-shard. The `ExactKeyCandidateProvider` /
+   `PrefixCandidateProvider` remain the single-shard / co-located fast paths and
+   the local fallback.
+4. **Promoter dependency.** Cross-document linking only pays off once the
+   promoter writes canonical entity docs (phase 3); until then blocking finds
+   nothing to link to. The promoter's cross-shard entity upsert uses the same
+   topology + transport (and the existing 2PC `BatchRequest` participants).
+5. **Embedding generation.** ANN also needs the mention `name_embedding` to be
+   produced -- a name-embedding enrichment over the extraction entities (an
+   `embedding` artifact the resolver reads), reusing the dense-embedding
+   producer already in the enrichment runtime.
+
+Recommended order: (a) cross-shard `prefix`/exact `CandidateSource` (unlocks a
+real separate entity table), (b) the name-embedding enrichment + cross-shard
+`ann` source, (c) the promoter's cross-shard entity upsert.
