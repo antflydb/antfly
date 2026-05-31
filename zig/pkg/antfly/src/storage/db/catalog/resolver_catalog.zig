@@ -47,6 +47,13 @@ pub const ResolverConfig = struct {
     /// scorer can link to an existing entity). ANN/prefix blocking over the
     /// entity table is a phase-2 extension.
     candidate_search: []const u8 = "",
+    /// Embedding model name used to backfill a mention's name embedding (for
+    /// `cosine` scoring / `ann` blocking) when the extraction artifact carries
+    /// none. Empty disables backfill. Must match the embedding the entity table
+    /// indexes over its canonical name so the vectors are comparable.
+    name_embedding: []const u8 = "",
+    /// Dimensionality for `name_embedding` (0 lets the embedder decide).
+    name_embedding_dims: u32 = 0,
     /// Bumped to force a versioned re-resolution pass.
     config_generation: u64 = 0,
 
@@ -60,6 +67,8 @@ pub const ResolverConfig = struct {
             .type_must_match = cfg.type_must_match,
             .scorer_json = if (cfg.scorer_json.len > 0) try alloc.dupe(u8, cfg.scorer_json) else "",
             .candidate_search = if (cfg.candidate_search.len > 0) try alloc.dupe(u8, cfg.candidate_search) else "",
+            .name_embedding = if (cfg.name_embedding.len > 0) try alloc.dupe(u8, cfg.name_embedding) else "",
+            .name_embedding_dims = cfg.name_embedding_dims,
             .config_generation = cfg.config_generation,
         };
     }
@@ -72,6 +81,7 @@ pub const ResolverConfig = struct {
         alloc.free(@constCast(self.key_template));
         if (self.scorer_json.len > 0) alloc.free(@constCast(self.scorer_json));
         if (self.candidate_search.len > 0) alloc.free(@constCast(self.candidate_search));
+        if (self.name_embedding.len > 0) alloc.free(@constCast(self.name_embedding));
         self.* = undefined;
     }
 };

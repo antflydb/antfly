@@ -33,6 +33,7 @@ const derived_types = @import("derived/derived_types.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
+const embedder_mod = @import("enrichment/embedder.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const backend_erased = @import("../backend_erased.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
@@ -155,6 +156,7 @@ pub fn processChangedExtraction(
     provider: ?resolver_lib.CandidateProvider,
     changed_key: []const u8,
     candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
 ) !?ProcessOutcome {
     const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(gpa, changed_key)) orelse return null;
     defer gpa.free(parsed.doc_key);
@@ -195,10 +197,44 @@ pub fn processChangedExtraction(
         break :blk null;
     };
 
-    const stage = resolver_lib.ResolutionStage{ .resolver = &resolver, .config_generation = cfg.config_generation };
+    // Name-embedding backfill: when the resolver declares a `name_embedding`
+    // model and the runtime has an embedder, mentions without a vector get one
+    // from their text so cosine/ann blocking has a query vector.
+    var mention_embedder = DenseMentionEmbedder{
+        .embedder = undefined,
+        .embedding_name = cfg.name_embedding,
+        .dims = cfg.name_embedding_dims,
+    };
+    const stage_embedder: ?resolver_lib.MentionEmbedder = if (cfg.name_embedding.len > 0) blk: {
+        const e = embedder orelse break :blk null;
+        mention_embedder.embedder = e;
+        break :blk mention_embedder.mentionEmbedder();
+    } else null;
+
+    const stage = resolver_lib.ResolutionStage{
+        .resolver = &resolver,
+        .config_generation = cfg.config_generation,
+        .embedder = stage_embedder,
+    };
     const result = try stage.run(gpa, store, effective_provider, changed_key, resolution_key);
     return .{ .result = result, .resolution_key = resolution_key };
 }
+
+/// Adapts the storage `DenseEmbedder` to the resolver's `MentionEmbedder` seam,
+/// binding the resolver's embedding model name and dimensionality.
+const DenseMentionEmbedder = struct {
+    embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    dims: u32,
+
+    fn mentionEmbedder(self: *DenseMentionEmbedder) resolver_lib.MentionEmbedder {
+        return .{ .ptr = self, .embed_fn = embed };
+    }
+    fn embed(ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8) anyerror!?[]const f32 {
+        const self: *DenseMentionEmbedder = @ptrCast(@alignCast(ptr));
+        return try self.embedder.embedDense(alloc, self.embedding_name, text, self.dims);
+    }
+};
 
 /// Build a candidate from an entity document's JSON (its string fields become
 /// the matcher record; "label"/"entity_type" set the candidate label) and
@@ -423,6 +459,7 @@ pub fn processRecordKeys(
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
     candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
 ) !void {
     var journal_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -431,7 +468,7 @@ pub fn processRecordKeys(
     }
 
     for (changed_artifact_keys) |key| {
-        const outcome = (try processChangedExtraction(gpa, resolvers, store, provider, key, candidate_source)) orelse continue;
+        const outcome = (try processChangedExtraction(gpa, resolvers, store, provider, key, candidate_source, embedder)) orelse continue;
         switch (outcome.result) {
             .written, .cleared => try journal_keys.append(gpa, outcome.resolution_key),
             else => gpa.free(outcome.resolution_key),
@@ -461,6 +498,7 @@ pub fn catchUpWindow(
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
     candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
 ) !u64 {
     const Ctx = struct {
         gpa: Allocator,
@@ -470,6 +508,7 @@ pub fn catchUpWindow(
         write_ctx: *anyopaque,
         write_fn: DerivedRecordWriter,
         candidate_source: ?CandidateSource,
+        embedder: ?embedder_mod.DenseEmbedder,
         max_seen: u64,
 
         fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
@@ -485,6 +524,7 @@ pub fn catchUpWindow(
                 self.write_ctx,
                 self.write_fn,
                 self.candidate_source,
+                self.embedder,
             );
             if (sequence > self.max_seen) self.max_seen = sequence;
         }
@@ -498,6 +538,7 @@ pub fn catchUpWindow(
         .write_ctx = write_ctx,
         .write_fn = write_fn,
         .candidate_source = candidate_source,
+        .embedder = embedder,
         // from_sequence is exclusive; with no records, return it unchanged.
         .max_seen = from_sequence,
     };
@@ -553,6 +594,9 @@ pub const ResolutionRuntime = struct {
     /// null means local-only blocking (the worker's own store). Must outlive the
     /// runtime.
     candidate_source: ?CandidateSource,
+    /// Optional name embedder, injected by the db from the enrichment config;
+    /// used to backfill mention name embeddings for cosine/ann blocking.
+    embedder: ?embedder_mod.DenseEmbedder,
     applied_sequence: std.atomic.Value(u64),
     target_sequence: std.atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
@@ -568,6 +612,7 @@ pub const ResolutionRuntime = struct {
         write_fn: DerivedRecordWriter,
         backend_runtime: *background_runtime_mod.BackendRuntime,
         candidate_source: ?CandidateSource,
+        embedder: ?embedder_mod.DenseEmbedder,
     ) !ResolutionRuntime {
         var store_handle = try initRuntimeStore(alloc, store);
         errdefer store_handle.deinit();
@@ -581,6 +626,7 @@ pub const ResolutionRuntime = struct {
             .write_fn = write_fn,
             .io_impl = backend_runtime.io_impl,
             .candidate_source = candidate_source,
+            .embedder = embedder,
             .applied_sequence = .init(applied),
             .target_sequence = .init(applied),
             .shutdown_flag = .init(false),
@@ -669,6 +715,7 @@ pub const ResolutionRuntime = struct {
                 self.write_ctx,
                 self.write_fn,
                 self.candidate_source,
+                self.embedder,
             );
             if (max_seen <= applied) {
                 // No matching records in (applied, target]; advance to target.
@@ -903,13 +950,13 @@ test "processChangedExtraction resolves and persists the resolution artifact" {
     try map.store().put(extraction_key, test_extraction);
 
     {
-        const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, extraction_key, null)).?;
+        const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, extraction_key, null, null)).?;
         defer alloc.free(outcome.resolution_key);
         try testing.expectEqual(resolver_lib.RunResult.written, outcome.result);
     }
     // Replay is idempotent.
     {
-        const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, extraction_key, null)).?;
+        const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, extraction_key, null, null)).?;
         defer alloc.free(outcome.resolution_key);
         try testing.expectEqual(resolver_lib.RunResult.unchanged, outcome.result);
     }
@@ -926,7 +973,7 @@ test "processChangedExtraction resolves and persists the resolution artifact" {
     try testing.expectEqualStrings("person/ada_lovelace", entities[0].object.get("doc_ref").?.object.get("key").?.string);
 
     // A non-asset key is ignored.
-    try testing.expect((try processChangedExtraction(alloc, &resolvers, map.store(), null, "not-an-artifact-key", null)) == null);
+    try testing.expect((try processChangedExtraction(alloc, &resolvers, map.store(), null, "not-an-artifact-key", null, null)) == null);
 }
 
 test "resolveExtraction returns null when no resolver consumes the artifact" {
@@ -1049,7 +1096,7 @@ test "processChangedExtraction runs over a DbArtifactStore" {
     try store.put(extraction_key, test_extraction);
 
     {
-        const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null)).?;
+        const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null, null)).?;
         defer alloc.free(outcome.resolution_key);
         try testing.expectEqual(resolver_lib.RunResult.written, outcome.result);
     }
@@ -1107,7 +1154,7 @@ test "processRecordKeys resolves changed asset keys and journals resolution keys
 
     // A record carrying the extraction key plus a non-asset key (ignored).
     const changed = [_][]const u8{ extraction_key, "not-an-artifact" };
-    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null);
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null, null);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:r", "resolution_v1");
     defer alloc.free(resolution_key);
@@ -1117,7 +1164,7 @@ test "processRecordKeys resolves changed asset keys and journals resolution keys
 
     // Idempotent replay: recomputed bytes match, so nothing is journaled.
     writer.calls = 0;
-    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null);
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null, null);
     try testing.expectEqual(@as(usize, 1), writer.keys.items.len);
     try testing.expectEqual(@as(u64, 0), writer.calls);
 }
@@ -1219,6 +1266,7 @@ test "catchUpWindow resolves matching records and journals resolution writes" {
         &writer,
         CaptureWriter.writeFn,
         null,
+        null,
     );
     try testing.expectEqual(@as(u64, 7), max_seen);
 
@@ -1239,7 +1287,7 @@ test "catchUpWindow with no matching records returns from-1" {
     var writer = CaptureWriter{ .alloc = alloc };
     defer writer.deinit();
 
-    const max_seen = try catchUpWindow(alloc, fake_source.source(), &resolvers, das.artifactStore(), null, 5, 0, &writer, CaptureWriter.writeFn, null);
+    const max_seen = try catchUpWindow(alloc, fake_source.source(), &resolvers, das.artifactStore(), null, 5, 0, &writer, CaptureWriter.writeFn, null, null);
     try testing.expectEqual(@as(u64, 5), max_seen);
     try testing.expectEqual(@as(u64, 0), writer.calls);
 }
@@ -1281,7 +1329,7 @@ test "processChangedExtraction with exact_key blocking links to an existing enti
         \\{ "canonical_name": "Ada Lovelace", "label": "person" }
     );
 
-    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null)).?;
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null, null)).?;
     defer alloc.free(outcome.resolution_key);
     try testing.expectEqual(resolver_lib.RunResult.written, outcome.result);
 
@@ -1331,7 +1379,7 @@ test "prefix blocking links a typo'd mention to an existing entity with a differ
         \\{ "canonical_name": "Ada Lovelace", "label": "person" }
     );
 
-    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null)).?;
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null, null)).?;
     defer alloc.free(outcome.resolution_key);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
@@ -1379,7 +1427,7 @@ test "embedding (cosine) scoring links via prefix blocking" {
         \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [0.1, 0.2, 0.3, 0.4] }
     );
 
-    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null)).?;
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null, null)).?;
     defer alloc.free(outcome.resolution_key);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
@@ -1517,7 +1565,7 @@ test "SourceCandidateProvider links via an injected cross-shard exact_key source
         \\{ "canonical_name": "Ada Lovelace", "label": "person" }
     );
 
-    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, remote.candidateSource())).?;
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, remote.candidateSource(), null)).?;
     defer alloc.free(outcome.resolution_key);
     try testing.expectEqual(resolver_lib.RunResult.written, outcome.result);
     try testing.expectEqualStrings("entities", remote.last_table);
@@ -1571,7 +1619,7 @@ test "SourceCandidateProvider prefix blocking scans a cross-shard label namespac
         \\{ "canonical_name": "Antfly", "label": "org" }
     );
 
-    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, remote.candidateSource())).?;
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, remote.candidateSource(), null)).?;
     defer alloc.free(outcome.resolution_key);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
@@ -1618,7 +1666,7 @@ test "SourceCandidateProvider ann blocking links via cross-shard nearest neighbo
         \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [0.1, 0.2, 0.3, 0.4] }
     );
 
-    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, remote.candidateSource())).?;
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, remote.candidateSource(), null)).?;
     defer alloc.free(outcome.resolution_key);
     try testing.expectEqualStrings("entities", remote.last_table);
 

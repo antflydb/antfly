@@ -538,9 +538,24 @@ Open/index/enrichment validation should reject:
          nothing rather than being fabricated or erroring -- the storage path
          returns the node id with `stored_data = null`, the distributed hydrate
          path skips the missing key. Verified by a db-test.
-   - [ ] `DocRef` endpoints threaded through graph edge artifacts (cross-table
-         hydration); 2PC entity+edge coupling. Phase 1 keeps endpoints as
-         plain keys (same-table hydration; cross-table fails closed).
+   - [~] `DocRef` endpoints threaded through graph edge artifacts: mention edges
+         now record the resolved target table (`{"target_table":...}` in edge
+         metadata, both materializer paths). Remaining: surface the per-node
+         endpoint table through traversal -> SearchHit and route a cross-table
+         lookup at the api layer (the storage path keeps failing closed). 2PC
+         entity+edge coupling is still future.
+   - [x] Name-embedding backfill for ann/cosine blocking: a resolver with a
+         `name_embedding` model (+ `name_embedding_dims`) backfills a mention's
+         name embedding from its text via an injected `DenseEmbedder`
+         (`OpenOptions.resolution_embedder`) when the extraction artifact carries
+         none, so `ann`/`cosine` blocking has a query vector. Verified by
+         lib-resolver-test (the MentionEmbedder seam) and a db-test (full storage
+         path: backfill -> cosine -> link). The entity side is config -- an
+         embeddings enrichment on the entity table over `canonical_name`
+         produces the `name_embedding` the dense index serves to
+         `DistributedCandidateSource.nearest`. Remaining: serving auto-injects
+         the table's embedder as `resolution_embedder` (its lifetime must outlive
+         the resolution runtime's final catch-up).
 2. **Learned + reviewed (phase 2).**
    - Learned weights (EM / logistic regression) over the same levels.
    - REVIEW band workflow: review queue, human curation, label capture; resolver

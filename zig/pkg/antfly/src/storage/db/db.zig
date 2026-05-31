@@ -175,6 +175,11 @@ pub const OpenOptions = struct {
     /// layer (see `api/distributed_entity_sink.zig`). Null means no promotion
     /// (the stage advances without writing entities). Must outlive the DB.
     entity_sink: ?promotion_runtime_mod.EntitySink = null,
+    /// Optional name embedder for resolution: backfills a mention's name
+    /// embedding (for cosine/ann blocking) when a resolver declares a
+    /// `name_embedding` model and the extraction artifact carries no vector.
+    /// Caller-owned; must outlive the DB. Null disables backfill.
+    resolution_embedder: ?embedder_mod.DenseEmbedder = null,
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
@@ -2255,6 +2260,7 @@ pub const DB = struct {
     resolution_append_context: ?*EnrichmentAppendContext = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
+    resolution_embedder: ?embedder_mod.DenseEmbedder = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     entity_sink: ?promotion_runtime_mod.EntitySink = null,
     ttl_cleanup_context: ?*TtlCleanupContext,
@@ -2440,6 +2446,7 @@ pub const DB = struct {
                 .enrichment_append_context = null,
                 .enrichment_runtime = null,
                 .resolution_candidate_source = opts.resolution_candidate_source,
+                .resolution_embedder = opts.resolution_embedder,
                 .entity_sink = opts.entity_sink,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
@@ -2673,6 +2680,8 @@ pub const DB = struct {
             // (via OpenOptions); null means local-only blocking against this
             // worker's own store.
             self.resolution_candidate_source,
+            // Optional name embedder for mention-embedding backfill.
+            self.resolution_embedder,
         );
         errdefer runtime.deinit();
         self.resolution_append_context = append_ctx;
@@ -23407,6 +23416,97 @@ test "db _edges writes record graph artifacts in the replay stream instead of gr
     for (journal_record.record.changed_artifact_keys) |artifact_key| {
         try std.testing.expect(internal_keys.isGraphEdgeArtifactKey(artifact_key));
     }
+}
+
+/// Embedder that returns a fixed vector for any text, so a backfilled mention
+/// embedding deterministically matches a candidate's name_embedding.
+const FixedVectorEmbedder = struct {
+    fn interface(self: *FixedVectorEmbedder) embedder_mod.DenseEmbedder {
+        return .{ .ptr = self, .dense_embed_fn = embed };
+    }
+    fn embed(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32 {
+        _ = ptr;
+        _ = embedding_name;
+        _ = text;
+        _ = dims;
+        const v = try alloc.alloc(f32, 4);
+        v[0] = 1.0;
+        v[1] = 0.0;
+        v[2] = 0.0;
+        v[3] = 0.0;
+        return v;
+    }
+};
+
+test "db backfills a mention name embedding so ann/cosine resolution links end-to-end" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var embedder = FixedVectorEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .resolution_embedder = embedder.interface() });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    // Resolver backfills a name embedding for each mention (no embedding in the
+    // extraction artifact), then prefix-blocks + cosine-scores against the entity.
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .name_embedding = "name",
+        .name_embedding_dims = 4,
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "emb", "left": "name_embedding", "right": "name_embedding",
+        \\  "levels": [ { "when": "cosine > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    });
+
+    // An existing entity under a different key, carrying the matching vector.
+    const entity_doc_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(entity_doc_key);
+    try db.core.store.put(entity_doc_key,
+        \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [1.0, 0.0, 0.0, 0.0] }
+    );
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"A. Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    // The mention had no embedding; the backfilled vector cosine-matched the
+    // entity, so it linked instead of minting a new key.
+    try std.testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 }
 
 test "db resolves extracted entities into a resolution artifact end-to-end" {

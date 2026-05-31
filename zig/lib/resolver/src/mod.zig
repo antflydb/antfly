@@ -478,11 +478,26 @@ fn writeJsonString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8
 /// Parsed entities from an extraction artifact, owning their backing memory.
 pub const ParsedEntities = struct {
     arena: std.heap.ArenaAllocator,
-    entities: []const ExtractedEntity,
+    /// Mutable so the resolution stage can backfill name embeddings in place.
+    entities: []ExtractedEntity,
 
     pub fn deinit(self: *ParsedEntities) void {
         self.arena.deinit();
         self.* = undefined;
+    }
+};
+
+/// Computes a name embedding for a mention on demand, so ANN/cosine blocking has
+/// a query vector even when the extraction artifact carries none. A function-
+/// pointer seam keeps the resolver library decoupled from the storage embedder;
+/// the returned vector must be owned by `alloc` (the parse arena) so it lives as
+/// long as the mention. Returns null to leave the mention un-embedded.
+pub const MentionEmbedder = struct {
+    ptr: *anyopaque,
+    embed_fn: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8) anyerror!?[]const f32,
+
+    pub fn embed(self: MentionEmbedder, alloc: std.mem.Allocator, text: []const u8) anyerror!?[]const f32 {
+        return self.embed_fn(self.ptr, alloc, text);
     }
 };
 
@@ -681,6 +696,10 @@ pub const RunResult = enum {
 pub const ResolutionStage = struct {
     resolver: *const Resolver,
     config_generation: u64,
+    /// Optional name-embedding backfill: when set, each mention lacking an
+    /// `embedding` gets one from its text before blocking/scoring, so `ann`
+    /// candidate search and cosine comparisons have a query vector.
+    embedder: ?MentionEmbedder = null,
 
     /// `extraction_key` / `resolution_key` are the primary-store artifact keys
     /// (encoded by the DB adapter). Returns what happened, for status/metrics.
@@ -707,6 +726,17 @@ pub const ResolutionStage = struct {
 
         var parsed = try parseExtractionEntities(gpa, extraction.?);
         defer parsed.deinit();
+
+        // Backfill name embeddings for mentions that arrived without one, using
+        // the parse arena so the vectors outlive scoring. Embedding failures are
+        // non-fatal: the mention simply scores without a vector.
+        if (self.embedder) |embedder| {
+            const arena = parsed.arena.allocator();
+            for (parsed.entities) |*entity| {
+                if (entity.embedding != null or entity.text.len == 0) continue;
+                entity.embedding = embedder.embed(arena, entity.text) catch null;
+            }
+        }
 
         var scratch = std.heap.ArenaAllocator.init(gpa);
         defer scratch.deinit();
@@ -1065,4 +1095,98 @@ test "resolution stage links to a candidate supplied by the provider" {
     const ent = parsed.value.object.get("entities").?.array.items[0].object;
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+const FixedVectorCandidate = struct {
+    doc_ref: DocRef,
+    label: []const u8,
+    vector: []const f32,
+
+    fn provider(self: *FixedVectorCandidate) CandidateProvider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable = CandidateProvider.VTable{ .candidates_for = candidatesFor };
+    fn candidatesFor(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        entity: ExtractedEntity,
+        out: *std.ArrayListUnmanaged(Candidate),
+    ) anyerror!void {
+        const self: *FixedVectorCandidate = @ptrCast(@alignCast(ptr));
+        _ = entity;
+        const fields = try allocator.alloc(matcher.Field, 1);
+        fields[0] = .{ .name = "name_embedding", .value = .{ .vector = try allocator.dupe(f32, self.vector) } };
+        try out.append(allocator, .{ .doc_ref = self.doc_ref, .label = self.label, .record = .{ .fields = fields } });
+    }
+};
+
+const FakeMentionEmbedder = struct {
+    vector: []const f32,
+    calls: usize = 0,
+
+    fn mentionEmbedder(self: *FakeMentionEmbedder) MentionEmbedder {
+        return .{ .ptr = self, .embed_fn = embed };
+    }
+    fn embed(ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8) anyerror!?[]const f32 {
+        _ = text;
+        const self: *FakeMentionEmbedder = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        return try alloc.dupe(f32, self.vector);
+    }
+};
+
+test "resolution stage backfills a mention embedding so cosine blocking links" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "entities", "key_template": "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        \\  "scorer": {
+        \\    "comparisons": [
+        \\      { "name": "emb", "left": "name_embedding", "right": "name_embedding",
+        \\        "levels": [ { "when": "cosine > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] }
+        \\    ],
+        \\    "combine": { "bias": -3.0 }, "decision": { "match": 0.9 }
+        \\  } }
+    );
+    defer resolver.deinit();
+
+    var map = MapStore{ .alloc = testing.allocator };
+    defer map.deinit();
+    // Extraction carries no embedding; the stage must backfill it.
+    try map.store().put("ext:doc1",
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+
+    const vec = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    var candidate = FixedVectorCandidate{
+        .doc_ref = .{ .table = "entities", .key = "person/ada_lovelace" },
+        .label = "person",
+        .vector = vec[0..],
+    };
+
+    // Without an embedder, the mention has no vector: cosine cannot match, so a
+    // new key is minted instead of linking.
+    {
+        const stage = ResolutionStage{ .resolver = &resolver, .config_generation = 1 };
+        try testing.expectEqual(RunResult.written, try stage.run(testing.allocator, map.store(), candidate.provider(), "ext:doc1", "res:none"));
+        const stored = (try map.store().get(testing.allocator, "res:none")).?;
+        defer testing.allocator.free(stored);
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, stored, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings("new", parsed.value.object.get("entities").?.array.items[0].object.get("decision").?.string);
+    }
+
+    // With the embedder backfilling the mention vector, cosine matches the
+    // candidate and the mention links to the existing entity.
+    {
+        var embedder = FakeMentionEmbedder{ .vector = vec[0..] };
+        const stage = ResolutionStage{ .resolver = &resolver, .config_generation = 1, .embedder = embedder.mentionEmbedder() };
+        try testing.expectEqual(RunResult.written, try stage.run(testing.allocator, map.store(), candidate.provider(), "ext:doc1", "res:emb"));
+        try testing.expect(embedder.calls >= 1);
+        const stored = (try map.store().get(testing.allocator, "res:emb")).?;
+        defer testing.allocator.free(stored);
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, stored, .{});
+        defer parsed.deinit();
+        const ent = parsed.value.object.get("entities").?.array.items[0].object;
+        try testing.expectEqualStrings("match", ent.get("decision").?.string);
+        try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+    }
 }
