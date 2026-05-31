@@ -151,8 +151,8 @@ Numeric physical encoding is chosen to match the engine's existing doc values
 reuse the existing readers rather than needing new ones:
 
 - `number` / `integer` → `f64` (native), read via `getF64` / `readF64Chunk`;
-- `datetime` → raw `u64` epoch ns, read via `getU64` (RFC3339 string parsing to
-  epoch is a follow-up; epoch integers / integer-strings are accepted today);
+- `datetime` → raw `u64` epoch ns, read via `getU64` (accepts epoch integers,
+  integer-strings, and RFC3339 UTC timestamp strings on ingest);
 - `boolean` → `bool`, `geopoint` → packed lat/lon, `string`/`blob`/`geoshape`
   → `bytes`.
 
