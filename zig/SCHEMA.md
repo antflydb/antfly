@@ -158,6 +158,12 @@ version bump or a reindex.
 - The dynamic fact identity is the full dotted path (top-level templates have
   path == field name). Numeric templates project group+measure, datetime
   project group+time, keyword/boolean project group.
+- At query time the planner resolves a queried field against the same
+  `dynamic_field_rules` (`Index.fieldConfig`/`resolveField`), so group-by, sum,
+  and term aggregations over template-promoted fields route to the sidecar's
+  docfact fold scan. Only rules carrying a name/path selector (`match` /
+  `path_match`) resolve a concrete query field; `match_mapping_type`-only rules
+  can't be evaluated without a value and so do not resolve at query time.
 
 Template-only updates propagate without a recreate on two levels:
 
