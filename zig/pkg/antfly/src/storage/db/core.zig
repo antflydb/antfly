@@ -493,12 +493,14 @@ pub const DBCore = struct {
     }
 
     pub fn addResolver(self: *DBCore, cfg: index_manager_mod.ResolverConfig) !void {
+        try cfg.validate();
         try self.index_manager.addResolver(self.store, cfg);
     }
 
     /// Add or replace a resolver; returns true if its config_generation bumped
     /// (the caller should re-resolve the corpus).
     pub fn upsertResolver(self: *DBCore, cfg: index_manager_mod.ResolverConfig) !bool {
+        try cfg.validate();
         return try self.index_manager.upsertResolver(self.store, cfg);
     }
 

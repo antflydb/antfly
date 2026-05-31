@@ -1865,6 +1865,10 @@ fn hydrateHitsForResultNodes(
     while (it.next()) |entry| {
         const eff_table = entry.key_ptr.*;
         const same_table = std.mem.eql(u8, eff_table, table_name);
+        // A cross-table endpoint whose table no longer exists fails closed (no
+        // hit), matching the same-table path's behavior for a missing key,
+        // rather than erroring the whole graph query.
+        if (!same_table and !try table_catalog.tableExists(catalog, eff_table)) continue;
         const eff_epoch = if (same_table) topology_epoch else try table_catalog.topologyEpoch(alloc, catalog, eff_table);
         const hits = try hydrateHitsForKeys(alloc, catalog, worker, eff_table, eff_epoch, identity_read_generation, resolved_doc_filter, resolved_doc_filter_wire_context, entry.value_ptr.items, consistency);
         defer alloc.free(hits);

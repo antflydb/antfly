@@ -55,7 +55,7 @@ pub const TraversalResult = struct {
 /// Extract `target_table` from an edge's metadata JSON
 /// (`{"target_table":"entities",...}`) without a full parse. Returns a slice
 /// into `metadata`; caller copies it if it must outlive the edge.
-fn metadataTargetTable(metadata: []const u8) ?[]const u8 {
+pub fn metadataTargetTable(metadata: []const u8) ?[]const u8 {
     const marker = "\"target_table\":\"";
     const start = std.mem.indexOf(u8, metadata, marker) orelse return null;
     const value_start = start + marker.len;

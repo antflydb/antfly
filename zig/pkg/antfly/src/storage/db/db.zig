@@ -34,7 +34,6 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resolver_lib = @import("antfly_resolver");
-const matcher_lib = @import("antfly_matcher");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
 const types = @import("types.zig");
@@ -16255,29 +16254,6 @@ fn freeGraphWrites(alloc: Allocator, writes: []types.GraphEdgeWrite) void {
 /// consumes `artifact_name` renders via its `key_template` -- deterministic from
 /// the mention text, so the provenance edge exists even before the entity is
 /// promoted. Returns an empty slice when no resolver consumes the artifact.
-/// Edge weight for a mention from one extractor. When the resolver declares a
-/// fusion strategy, the weight is `matcher.fuse` of this extractor's
-/// `fusion_trust * confidence` folded with the config-pinned graph prior;
-/// otherwise the legacy fixed 1.0. This is the naive (one-source-per-resolver)
-/// fusion stage -- it calibrates the edge weight by extractor trust and the
-/// mention's asserted confidence without reading the live graph.
-fn fusedMentionWeight(cfg: *const index_manager_mod.ResolverConfig, confidence: f64) f64 {
-    const strategy: matcher_lib.FusionStrategy = if (std.mem.eql(u8, cfg.fusion_combine, "noisy_or"))
-        .noisy_or
-    else if (std.mem.eql(u8, cfg.fusion_combine, "max"))
-        .max
-    else if (std.mem.eql(u8, cfg.fusion_combine, "mean"))
-        .mean
-    else
-        return 1.0; // fusion disabled: legacy fixed weight
-    return matcher_lib.fuse(
-        strategy,
-        &.{.{ .confidence = confidence, .trust = cfg.fusion_trust }},
-        cfg.fusion_prior,
-        cfg.fusion_prior_weight,
-    );
-}
-
 fn mentionEdgeWritesAlloc(
     alloc: Allocator,
     index_manager: *index_manager_mod.IndexManager,
@@ -16332,7 +16308,7 @@ fn mentionEdgeWritesAlloc(
             .source = try alloc.dupe(u8, doc_key),
             .target = try alloc.dupe(u8, key),
             .edge_type = try alloc.dupe(u8, mention_edge_type),
-            .weight = fusedMentionWeight(cfg, entity.confidence),
+            .weight = cfg.fusedMentionWeight(entity.confidence),
             .metadata_json = metadata,
         });
     }

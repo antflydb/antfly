@@ -26,6 +26,17 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const matcher = @import("antfly_matcher");
+
+/// Map a `fusion_combine` config string to a matcher fusion strategy. `null`
+/// means either "" (fusion disabled) or an unrecognized value; callers that
+/// must distinguish (config validation) check `len == 0` first.
+pub fn fusionStrategy(name: []const u8) ?matcher.FusionStrategy {
+    if (std.mem.eql(u8, name, "noisy_or")) return .noisy_or;
+    if (std.mem.eql(u8, name, "max")) return .max;
+    if (std.mem.eql(u8, name, "mean")) return .mean;
+    return null;
+}
 
 pub const ResolverConfig = struct {
     /// Catalog name of the resolver.
@@ -103,6 +114,34 @@ pub const ResolverConfig = struct {
         if (self.name_embedding.len > 0) alloc.free(@constCast(self.name_embedding));
         if (self.fusion_combine.len > 0) alloc.free(@constCast(self.fusion_combine));
         self.* = undefined;
+    }
+
+    /// Reject a config that can never behave as intended. With fusion enabled:
+    /// an unknown `fusion_combine` would silently fall back to the legacy fixed
+    /// weight (fusion configured but doing nothing); `fusion_trust` of 0 (or a
+    /// prior outside [0, 1]) collapses every edge weight toward 0, which a
+    /// weighted traversal with a positive `min_weight` would silently drop.
+    pub fn validate(self: ResolverConfig) !void {
+        if (self.fusion_combine.len == 0) return;
+        if (fusionStrategy(self.fusion_combine) == null) return error.InvalidResolverConfig;
+        if (!(self.fusion_trust > 0.0 and self.fusion_trust <= 1.0)) return error.InvalidResolverConfig;
+        if (self.fusion_prior < 0.0 or self.fusion_prior > 1.0) return error.InvalidResolverConfig;
+        if (self.fusion_prior_weight < 0.0 or self.fusion_prior_weight > 1.0) return error.InvalidResolverConfig;
+    }
+
+    /// Provenance edge weight for one mention from this extractor. When the
+    /// resolver declares a fusion strategy, the weight is `matcher.fuse` of this
+    /// extractor's `fusion_trust * confidence` folded with the config-pinned
+    /// prior; otherwise the legacy fixed 1.0. Single source of truth for both
+    /// the sync and async mention-edge materializers.
+    pub fn fusedMentionWeight(self: ResolverConfig, confidence: f64) f64 {
+        const strategy = fusionStrategy(self.fusion_combine) orelse return 1.0;
+        return matcher.fuse(
+            strategy,
+            &.{.{ .confidence = confidence, .trust = self.fusion_trust }},
+            self.fusion_prior,
+            self.fusion_prior_weight,
+        );
     }
 };
 
@@ -183,4 +222,43 @@ test "resolver catalog round trip preserves order and empty list" {
     const decoded_empty = try deserializeCatalog(alloc, empty);
     defer alloc.free(decoded_empty);
     try std.testing.expectEqual(@as(usize, 0), decoded_empty.len);
+}
+
+test "resolver config validates fusion strategy and folds confidence into the weight" {
+    const base = ResolverConfig{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ _entity.text }}",
+    };
+
+    // No fusion: legacy fixed weight, always valid.
+    try base.validate();
+    try std.testing.expectEqual(@as(f64, 1.0), base.fusedMentionWeight(0.5));
+
+    // Valid fusion: weight is the fused confidence (noisy_or, trust 0.9,
+    // confidence 0.8, no prior -> 1 - (1 - 0.72) = 0.72).
+    var fused = base;
+    fused.fusion_combine = "noisy_or";
+    fused.fusion_trust = 0.9;
+    try fused.validate();
+    try std.testing.expectApproxEqAbs(@as(f64, 0.72), fused.fusedMentionWeight(0.8), 1e-9);
+
+    // Unknown strategy is rejected, not silently treated as "fusion off".
+    var bad_strategy = base;
+    bad_strategy.fusion_combine = "noisyor";
+    try std.testing.expectError(error.InvalidResolverConfig, bad_strategy.validate());
+
+    // Zero trust would collapse every edge weight toward 0; rejected.
+    var zero_trust = base;
+    zero_trust.fusion_combine = "mean";
+    zero_trust.fusion_trust = 0.0;
+    try std.testing.expectError(error.InvalidResolverConfig, zero_trust.validate());
+
+    // Prior outside [0, 1] is rejected.
+    var bad_prior = base;
+    bad_prior.fusion_combine = "max";
+    bad_prior.fusion_prior = 1.5;
+    try std.testing.expectError(error.InvalidResolverConfig, bad_prior.validate());
 }
