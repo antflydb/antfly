@@ -568,8 +568,15 @@ Open/index/enrichment validation should reject:
          pinned graph prior into one edge confidence. Unit-tested. Remaining:
          the fusion stage that reads multiple extraction artifacts and sets the
          edge weight from a pinned prior snapshot.
-   - [ ] REVIEW band workflow: review queue, human curation, label capture;
-         resolver decision provenance and `pending_review` state.
+   - [~] REVIEW band workflow: the review queue is done -- a review-band
+         decision is recorded durably in the resolution artifact
+         (`decision: "review"`) and `DB.listPendingReviews` /
+         `resolution_runtime.listPendingReviews` enumerate the review-band
+         mentions awaiting curation (doc key, mention id, provisional entity,
+         confidence). Verified by a db-test. Remaining: the human-curation API
+         that applies a decision (confirm / relink / reject) as a durable
+         override the resolver honors, and captures it as a training label
+         (feeds `fitScorerWeights`).
    - [x] 2PC atomic promotion: the promoter commits all of a document's
          resolved entities in one multi-participant transaction
          (`EntitySink.upsertBatch` -> `DistributedEntitySink` ->

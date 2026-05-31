@@ -5484,6 +5484,14 @@ pub const DB = struct {
         return try self.core.removeResolver(name);
     }
 
+    /// The review queue: review-band mentions awaiting human curation. Empty
+    /// when no resolution runtime is active. Caller owns the result
+    /// (`resolution_runtime_mod.freePendingReviews`).
+    pub fn listPendingReviews(self: *DB, alloc: Allocator) ![]resolution_runtime_mod.PendingReview {
+        const runtime = self.resolution_runtime orelse return try alloc.alloc(resolution_runtime_mod.PendingReview, 0);
+        return try runtime.pendingReviews(alloc);
+    }
+
     pub fn hasIndex(self: *DB, name: []const u8) bool {
         return self.core.hasIndex(name);
     }

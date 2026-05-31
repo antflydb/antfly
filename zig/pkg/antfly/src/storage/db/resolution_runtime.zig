@@ -549,6 +549,78 @@ pub fn reresolveAll(
     return reresolved;
 }
 
+/// A mention whose resolution landed in the review band, awaiting human
+/// curation. The minted `key` is the provisional canonical key (phase 1 mints
+/// for review); a curator confirms it, links to another entity, or rejects it,
+/// and that decision becomes a training label.
+pub const PendingReview = struct {
+    doc_key: []u8,
+    local_id: []u8,
+    table: []u8,
+    key: []u8,
+    confidence: f64,
+
+    pub fn deinit(self: *PendingReview, alloc: std.mem.Allocator) void {
+        alloc.free(self.doc_key);
+        alloc.free(self.local_id);
+        alloc.free(self.table);
+        alloc.free(self.key);
+        self.* = undefined;
+    }
+};
+
+pub fn freePendingReviews(alloc: std.mem.Allocator, reviews: []PendingReview) void {
+    for (reviews) |*r| r.deinit(alloc);
+    if (reviews.len > 0) alloc.free(reviews);
+}
+
+/// Scan the stored resolution artifacts and collect every mention whose decision
+/// is `review` -- the review queue a human curation workflow drains. Caller owns
+/// the returned slice (`freePendingReviews`).
+pub fn listPendingReviews(
+    gpa: std.mem.Allocator,
+    store: resolver_lib.ArtifactStore,
+) ![]PendingReview {
+    var out = std.ArrayListUnmanaged(PendingReview).empty;
+    errdefer freePendingReviews(gpa, out.items);
+
+    const Ctx = struct {
+        gpa: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(PendingReview),
+
+        fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!internal_keys.isResolutionArtifactKey(key)) return;
+            const parsed_key = (try internal_keys.parseResolutionArtifactKeyAlloc(self.gpa, key)) orelse return;
+            defer self.gpa.free(parsed_key.doc_key);
+            defer self.gpa.free(parsed_key.artifact_name);
+
+            var parsed = resolver_lib.parseResolution(self.gpa, value) catch return;
+            defer parsed.deinit();
+            for (parsed.entities) |e| {
+                if (e.decision != .review) continue;
+                var review = PendingReview{
+                    .doc_key = try self.gpa.dupe(u8, parsed_key.doc_key),
+                    .local_id = try self.gpa.dupe(u8, e.local_id),
+                    .table = try self.gpa.dupe(u8, e.doc_ref.table),
+                    .key = try self.gpa.dupe(u8, e.doc_ref.key),
+                    .confidence = e.confidence,
+                };
+                errdefer review.deinit(self.gpa);
+                try self.out.append(self.gpa, review);
+            }
+        }
+    };
+    var ctx = Ctx{ .gpa = gpa, .out = &out };
+    const lower = [_]u8{internal_keys.user_namespace};
+    const upper = [_]u8{internal_keys.user_namespace + 1};
+    store.scanPrefix(lower[0..], upper[0..], &ctx, Ctx.consume) catch |err| switch (err) {
+        error.ScanUnsupported => {},
+        else => return err,
+    };
+    return try out.toOwnedSlice(gpa);
+}
+
 pub const default_max_records_per_window: usize = 1024;
 
 /// Iterate replay records matching the resolution hint from `from_sequence`,
@@ -823,6 +895,15 @@ pub const ResolutionRuntime = struct {
             self.write_ctx,
             self.write_fn,
         );
+    }
+
+    /// The review queue: every stored review-band mention awaiting curation.
+    /// Caller owns the result (`freePendingReviews`).
+    pub fn pendingReviews(self: *ResolutionRuntime, alloc: std.mem.Allocator) ![]PendingReview {
+        lockMutex(&self.catch_up_mutex);
+        defer self.catch_up_mutex.unlock();
+        var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
+        return listPendingReviews(alloc, das.artifactStore());
     }
 
     fn workerMain(self: *ResolutionRuntime) void {
@@ -1552,6 +1633,51 @@ test "reresolveAll re-resolves the corpus when a resolver config generation bump
     writer.keys.clearRetainingCapacity();
     _ = try reresolveAll(alloc, store, &bumped, null, null, &writer, CaptureWriter.writeFn);
     try testing.expectEqual(@as(u64, 0), writer.calls);
+}
+
+test "listPendingReviews collects review-band mentions awaiting curation" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+
+    // A resolution artifact with one matched and one review-band mention.
+    const res_a = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(res_a);
+    try store.put(res_a,
+        \\{"config_generation":1,"entities":[
+        \\  {"local_id":"e0","doc_ref":{"table":"entities","key":"person/ada_lovelace"},"confidence":0.98,"decision":"match"},
+        \\  {"local_id":"e1","doc_ref":{"table":"entities","key":"person/a_lovelace"},"confidence":0.72,"decision":"review"}
+        \\]}
+    );
+    // A second document with a review-band mention.
+    const res_b = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:b", "resolution_v1");
+    defer alloc.free(res_b);
+    try store.put(res_b,
+        \\{"config_generation":1,"entities":[
+        \\  {"local_id":"e0","doc_ref":{"table":"entities","key":"org/antflyish"},"confidence":0.68,"decision":"review"}
+        \\]}
+    );
+
+    const reviews = try listPendingReviews(alloc, store);
+    defer freePendingReviews(alloc, reviews);
+
+    // Only the two review-band mentions appear, not the match.
+    try testing.expectEqual(@as(usize, 2), reviews.len);
+    var saw_a = false;
+    var saw_b = false;
+    for (reviews) |r| {
+        try testing.expectEqualStrings("entities", r.table);
+        if (std.mem.eql(u8, r.doc_key, "doc:a")) {
+            saw_a = true;
+            try testing.expectEqualStrings("e1", r.local_id);
+            try testing.expectEqualStrings("person/a_lovelace", r.key);
+        } else if (std.mem.eql(u8, r.doc_key, "doc:b")) {
+            saw_b = true;
+            try testing.expectEqualStrings("org/antflyish", r.key);
+        }
+    }
+    try testing.expect(saw_a and saw_b);
 }
 
 test "prefix blocking follows a merged_into redirect to the survivor entity" {
