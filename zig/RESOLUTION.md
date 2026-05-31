@@ -470,9 +470,15 @@ Open/index/enrichment validation should reject:
          `ExactKeyCandidateProvider` look up the rendered canonical key as an
          existing entity through the store seam, so the scorer links to it
          (decision=match) instead of re-minting. Tested.
-   - [ ] Phase-2 blocking extensions: ANN/prefix candidate search over the
-         entity table, and cross-shard entity-table reads (distributed query).
-         These unlock model-backed / cross-document resolution.
+   - [x] Prefix candidate blocking: `candidate_search = "prefix"` +
+         `PrefixCandidateProvider` scan the entity table's `label/` key range
+         (via an optional `scanPrefix` store seam) and let the scorer rank the
+         results, so a typo'd mention links to an existing entity under a
+         different key. Tested.
+   - [ ] Remaining phase-2: ANN candidate search (needs a mention name-embedding
+         + the entity table's vector index), and cross-shard entity-table reads
+         (distributed query) so blocking sees a separate entity shard. These
+         unlock model-backed / cross-document resolution at scale.
    - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
          per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
          / `listResolvers` through DB -> DBCore -> IndexManager (verified by a
