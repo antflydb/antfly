@@ -2008,7 +2008,10 @@ test "index encoders expose compact algebraic public status" {
     const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "alg", &local_status)).?;
     defer alloc.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_type\":\"algebraic\"") != null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, encoded, "\"index_type\""));
+    // `index_type` is emitted once in the aggregate `status` and once per group
+    // in `shard_status`, consistent with how every other index kind reports its
+    // type in both views. This fixture has a single group, so it appears twice.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, encoded, "\"index_type\""));
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"healthy\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"parse_error_count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"schema_version\":42") != null);

@@ -371,6 +371,32 @@ fn dynamicRuleMatches(rule: fact_mod.DynamicRule, path: []const u8, field_name: 
     return true;
 }
 
+fn fieldNameFromQueryPath(path: []const u8) []const u8 {
+    const idx = std.mem.lastIndexOfScalar(u8, path, '.') orelse return path;
+    return path[idx + 1 ..];
+}
+
+/// Query-time variant of `dynamicRuleMatches` with no runtime value: a rule can
+/// only resolve a concrete query field if it carries a name/path selector
+/// (`match`/`path_match`). Rules gated solely by `match_mapping_type` cannot be
+/// evaluated without a value and so do not resolve query fields.
+fn dynamicRuleResolvesField(rule: fact_mod.DynamicRule, path: []const u8, field_name: []const u8) bool {
+    if (rule.match == null and rule.path_match == null) return false;
+    if (rule.match) |pattern| {
+        if (!runtime_schema.globMatch(pattern, field_name)) return false;
+    }
+    if (rule.unmatch) |pattern| {
+        if (runtime_schema.globMatch(pattern, field_name)) return false;
+    }
+    if (rule.path_match) |pattern| {
+        if (!runtime_schema.globMatch(pattern, path)) return false;
+    }
+    if (rule.path_unmatch) |pattern| {
+        if (runtime_schema.globMatch(pattern, path)) return false;
+    }
+    return true;
+}
+
 fn staticSpecCoversPath(specs: []const fact_mod.FieldSpec, path: []const u8) bool {
     for (specs) |spec| {
         if (std.mem.eql(u8, spec.path, path)) return true;
@@ -13936,6 +13962,29 @@ pub const Index = struct {
                 if (fieldMatchesQuery(field, query_field)) return field;
             }
         }
+        return self.dynamicFieldConfig(query_field, class);
+    }
+
+    /// Resolve a query field that is not statically declared but matches a
+    /// dynamic template, so group/measure/time queries over template-promoted
+    /// fields route to the algebraic sidecar. The synthesized config keys facts
+    /// by the full query path (matching the ingest-time fact identity).
+    fn dynamicFieldConfig(self: *const Index, query_field: []const u8, class: FieldClass) ?FieldConfig {
+        const rules = self.config().dynamic_field_rules;
+        if (rules.len == 0) return null;
+        const field_name = fieldNameFromQueryPath(query_field);
+        for (rules) |rule| {
+            if (!dynamicRuleResolvesField(rule, query_field, field_name)) continue;
+            const mask = dynamicRuleRoleMask(rule.type);
+            const matches_class = switch (class) {
+                .group => mask & role_group != 0,
+                .measure => mask & role_measure != 0,
+                .time => mask & role_time != 0,
+                .any => mask != 0,
+            };
+            if (!matches_class) continue;
+            return .{ .name = query_field, .path = query_field, .type = rule.type };
+        }
         return null;
     }
 
@@ -19125,6 +19174,89 @@ test "algebraic reloadConfigJson applies new dynamic template rules to live writ
     // The new write uses the refreshed numeric rule => measure fact present.
     try std.testing.expect(factHasField(facts.facts, .measure, "score"));
     try std.testing.expect(factHasField(facts.facts, .group, "score"));
+}
+
+test "algebraic dynamic template fields resolve and aggregate at query time" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{"version":1,"table":"events","dynamic_field_rules":[
+        \\  {"name":"ids","match":"*_id","type":"string"},
+        \\  {"name":"score","match":"score","type":"number"}
+        \\]}
+    ;
+    var idx = try Index.open(alloc, "alg_dyn_query", cfg);
+    defer idx.close();
+
+    // Query-time field resolution now recognizes template-promoted fields so the
+    // planner routes group/measure queries over them to the sidecar.
+    try std.testing.expect(idx.resolveField("user_id", .group) != null);
+    try std.testing.expectEqualStrings("string", idx.fieldConfig("user_id", .group).?.type);
+    try std.testing.expect(idx.resolveField("score", .measure) != null);
+    try std.testing.expectEqualStrings("number", idx.fieldConfig("score", .measure).?.type);
+    // A field matching no template is not algebraic, and a string field is not a
+    // measure (only numeric templates resolve as measures).
+    try std.testing.expect(idx.fieldConfig("unmatched", .group) == null);
+    try std.testing.expect(idx.fieldConfig("user_id", .measure) == null);
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"user_id\":\"u1\",\"score\":10}" },
+        .{ .key = "e2", .action = .upsert, .cleaned_value = "{\"user_id\":\"u1\",\"score\":20}" },
+        .{ .key = "e3", .action = .upsert, .cleaned_value = "{\"user_id\":\"u2\",\"score\":5}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    // Terms count grouped by the dynamic `user_id` field, executed through the
+    // docfact fold scan the planner routes to once the field resolves.
+    const fold = DocFactBucketFoldRequest{
+        .kind = .terms,
+        .op = .count,
+        .bucket_field = "user_id",
+        .bucket_role = .group,
+    };
+    const metadata = try docFactBucketFoldMetadataAlloc(alloc, fold);
+    defer alloc.free(metadata);
+    const access_paths = [_]ir.PhysicalAccessPath{ir.docFactAccessPath(idx.name)};
+    const steps = [_]ir.TensorProgramStep{
+        .{ .expr = .{
+            .fragment = .slice,
+            .output_dims = &.{ .doc, .field, .scalar },
+            .owner = idx.name,
+            .layout = .docfact_rows,
+        } },
+        .{
+            .expr = .{
+                .fragment = .reduce,
+                .input_dims = &.{ .doc, .field, .scalar },
+                .output_dims = &distributed_bucket_scalar_output_dims,
+                .semantic_id = "by_user",
+                .law_id = .count,
+                .metadata = metadata,
+            },
+            .inputs = &.{.{ .step = 0 }},
+        },
+    };
+    const program = ir.TensorProgram{ .steps = steps[0..], .output = .{ .step = 1 } };
+    const entries = (try idx.scanDocFactBucketFoldEntriesWithTensorProgram(&store, fold, access_paths[0..], program, .{ .step = 1 })) orelse return error.TestUnexpectedResult;
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    var u1_count: ?[]const u8 = null;
+    var u2_count: ?[]const u8 = null;
+    for (entries) |entry| {
+        if (std.mem.indexOf(u8, entry.group_key, "u1") != null) u1_count = entry.value;
+        if (std.mem.indexOf(u8, entry.group_key, "u2") != null) u2_count = entry.value;
+    }
+    try std.testing.expectEqualStrings("2", u1_count orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("1", u2_count orelse return error.TestUnexpectedResult);
 }
 
 test "algebraic path profile recomputes max string token count after deleting max row" {
