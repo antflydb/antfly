@@ -538,12 +538,21 @@ Open/index/enrichment validation should reject:
          nothing rather than being fabricated or erroring -- the storage path
          returns the node id with `stored_data = null`, the distributed hydrate
          path skips the missing key. Verified by a db-test.
-   - [~] `DocRef` endpoints threaded through graph edge artifacts: mention edges
-         now record the resolved target table (`{"target_table":...}` in edge
-         metadata, both materializer paths). Remaining: surface the per-node
-         endpoint table through traversal -> SearchHit and route a cross-table
-         lookup at the api layer (the storage path keeps failing closed). 2PC
-         entity+edge coupling is still future.
+   - [x] `DocRef` endpoints threaded through graph edge artifacts: mention edges
+         record the resolved target table (`{"target_table":...}` in edge
+         metadata, both materializer paths). Graph traversal now surfaces that
+         endpoint per result node (`traversal.TraversalResult.target_table` ->
+         `query.GraphResultNode.table`, preserved across the api wire/clone
+         paths), and the distributed hydrate coordinator buckets result nodes by
+         their effective table so a cross-table entity node hydrates from the
+         entities table's shard group instead of failing closed against the
+         queried table. Verified by a db-test (the node carries `table =
+         "entities"`) and the install build. The api routing runs only in the
+         cross-range coordinator path; the live resolution e2e emits the
+         `target_table`-tagged provenance edges. (Surfacing the hydrated document
+         through a *public multi-shard graph query* additionally needs the
+         pre-existing multi-shard public graph-query path -- unsupported today,
+         independent of this routing.) 2PC entity+edge coupling is still future.
    - [x] Name-embedding backfill for ann/cosine blocking: a resolver with a
          `name_embedding` model (+ `name_embedding_dims`) backfills a mention's
          name embedding from its text via an injected `DenseEmbedder`

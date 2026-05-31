@@ -119,9 +119,15 @@ pub const GraphResultNode = struct {
     path: ?[]const []const u8,
     path_edges: ?[]const PathEdgeInfo,
     provenance: ?[]const []const u8 = null,
+    /// Table the node's document lives in, when an edge reaching it declared a
+    /// cross-table endpoint (`target_table` in its metadata). Null means the
+    /// node is same-table (hydrated locally). Lets the api hydrate a cross-table
+    /// entity node from its own table instead of failing closed.
+    table: ?[]const u8 = null,
 
     pub fn deinit(self: *GraphResultNode, alloc: Allocator) void {
         alloc.free(self.key);
+        if (self.table) |t| alloc.free(t);
         if (self.path) |p| {
             for (p) |s| alloc.free(s);
             alloc.free(p);
@@ -251,6 +257,7 @@ pub const GraphQueryEngine = struct {
                     .distance = tr.total_weight,
                     .path = path_copy,
                     .path_edges = null,
+                    .table = if (tr.target_table) |tt| try self.alloc.dupe(u8, tt) else null,
                 });
 
                 if (params.max_results > 0 and all_results.items.len >= params.max_results) break;
@@ -993,6 +1000,7 @@ fn freePathEdgeItems(alloc: Allocator, edges: []const PathEdgeInfo, initialized:
 
 fn freeResultNode(alloc: Allocator, node: GraphResultNode) void {
     alloc.free(node.key);
+    if (node.table) |t| alloc.free(t);
     if (node.path) |p| {
         for (p) |s| alloc.free(s);
         alloc.free(p);

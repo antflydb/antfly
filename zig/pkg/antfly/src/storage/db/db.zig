@@ -24050,6 +24050,15 @@ test "db graph hydration fails closed for a not-yet-promoted entity node" {
         try std.testing.expectEqual(@as(usize, 1), hits.len);
         try std.testing.expectEqualStrings("person/ada_lovelace", hits[0].id);
         try std.testing.expect(hits[0].stored_data == null);
+
+        // The reached node records its home table (from the mention edge's
+        // `target_table` metadata) so the api can route hydration to the
+        // entities table instead of failing closed against the query table.
+        const nodes = result.graph_results[0].nodes;
+        try std.testing.expectEqual(@as(usize, 1), nodes.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", nodes[0].key);
+        try std.testing.expect(nodes[0].table != null);
+        try std.testing.expectEqualStrings("entities", nodes[0].table.?);
     }
 
     // Once the entity document exists (promoter wrote it; here co-located for the

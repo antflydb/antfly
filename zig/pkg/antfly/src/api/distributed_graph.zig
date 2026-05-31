@@ -1821,10 +1821,56 @@ fn hydrateHitsForResultNodes(
     nodes: []const graph_query_mod.GraphResultNode,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.SearchHit {
-    var keys = try alloc.alloc([]const u8, nodes.len);
-    defer alloc.free(keys);
-    for (nodes, 0..) |node, i| keys[i] = node.key;
-    return try hydrateHitsForKeys(alloc, catalog, worker, table_name, topology_epoch, identity_read_generation, resolved_doc_filter, resolved_doc_filter_wire_context, keys, consistency);
+    // Most nodes are hydrated from the query table. Mention/DocRef edges carry a
+    // cross-table endpoint (`node.table`, e.g. the canonical "entities" table)
+    // that must be routed and hydrated against *that* table's shard topology,
+    // not the query table's. Partition by effective table; the single-table
+    // common case keeps the original fast path untouched.
+    var needs_cross_table = false;
+    for (nodes) |node| {
+        if (node.table) |t| {
+            if (!std.mem.eql(u8, t, table_name)) {
+                needs_cross_table = true;
+                break;
+            }
+        }
+    }
+
+    if (!needs_cross_table) {
+        var keys = try alloc.alloc([]const u8, nodes.len);
+        defer alloc.free(keys);
+        for (nodes, 0..) |node, i| keys[i] = node.key;
+        return try hydrateHitsForKeys(alloc, catalog, worker, table_name, topology_epoch, identity_read_generation, resolved_doc_filter, resolved_doc_filter_wire_context, keys, consistency);
+    }
+
+    // Bucket node keys by their effective hydration table.
+    var tables = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)).empty;
+    defer {
+        for (tables.values()) |*list| list.deinit(alloc);
+        tables.deinit(alloc);
+    }
+    for (nodes) |node| {
+        const eff_table = node.table orelse table_name;
+        const gop = try tables.getOrPut(alloc, eff_table);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(alloc, node.key);
+    }
+
+    var out = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+    errdefer {
+        for (out.items) |*hit| hit.deinit(alloc);
+        out.deinit(alloc);
+    }
+    var it = tables.iterator();
+    while (it.next()) |entry| {
+        const eff_table = entry.key_ptr.*;
+        const same_table = std.mem.eql(u8, eff_table, table_name);
+        const eff_epoch = if (same_table) topology_epoch else try table_catalog.topologyEpoch(alloc, catalog, eff_table);
+        const hits = try hydrateHitsForKeys(alloc, catalog, worker, eff_table, eff_epoch, identity_read_generation, resolved_doc_filter, resolved_doc_filter_wire_context, entry.value_ptr.items, consistency);
+        defer alloc.free(hits);
+        for (hits) |hit| try out.append(alloc, hit);
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 fn hydrateHitsForKeys(
@@ -3412,6 +3458,7 @@ fn materializeResultNode(
             .distance = parent.distance + node.distance,
             .path = null,
             .path_edges = null,
+            .table = if (node.table) |t| try alloc.dupe(u8, t) else null,
         };
     }
 
@@ -3431,6 +3478,7 @@ fn materializeResultNode(
             alloc.free(path_edges);
             break :blk null;
         },
+        .table = if (node.table) |t| try alloc.dupe(u8, t) else null,
     };
 }
 
@@ -4030,6 +4078,7 @@ fn cloneGraphNode(
         .path = if (node.path) |path| try dupPath(alloc, path) else null,
         .path_edges = if (node.path_edges) |edges| try dupPathEdges(alloc, edges) else null,
         .provenance = if (node.provenance) |items| try dupPath(alloc, items) else null,
+        .table = if (node.table) |t| try alloc.dupe(u8, t) else null,
     };
 }
 

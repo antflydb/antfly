@@ -56,6 +56,11 @@ DOCUMENTS_INDEXES = {
             "artifact": "relations_v1",
             "path": "$.relations[*]",
             "format": "extraction_relation",
+            # Emit a doc->entity provenance edge per mention, tagged with the
+            # resolved entity's home table so a graph query starting from a
+            # document can hydrate the canonical entity cross-table (DocRef
+            # hydration routing).
+            "mention_edge_type": "mentions",
         },
         "artifact": {
             "name": "relations_v1",
