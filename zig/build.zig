@@ -3249,6 +3249,17 @@ pub fn build(b: *std.Build) void {
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
 
+    const lib_resolution_source_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "DistributedCandidateSource",
+            "prefixUpperBoundAlloc",
+        },
+    });
+    const run_lib_resolution_source_tests = b.addRunArtifact(lib_resolution_source_tests);
+    const lib_resolution_source_test_step = b.step("lib-resolution-source-test", "Run focused cross-shard resolution candidate-source tests");
+    lib_resolution_source_test_step.dependOn(&run_lib_resolution_source_tests.step);
+
     const lib_api_auth_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{

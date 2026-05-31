@@ -479,20 +479,33 @@ Open/index/enrichment validation should reject:
          carry vector fields (`name_embedding`); the matcher cosine comparator
          links by similarity even when text differs. This is the *scoring* half
          of ANN. Tested.
-   - [ ] Sublinear ANN candidate *generation* (vector-index nearest-neighbour)
-         and cross-shard entity-table reads. Both reduce to the same blocker --
-         cross-shard distributed query -- since the entity table lives on a
-         different shard than the resolution worker. See "Cross-shard candidate
-         blocking" below. This is a multi-node subsystem (not verifiable with the
-         single-shard `db-test` tooling) and is the one remaining piece.
+   - [x] Cross-shard candidate seam: the resolution worker threads an optional
+         `CandidateSource` (get / scan_prefix / nearest) through
+         `processChangedExtraction` -> `processRecordKeys` -> `catchUpWindow` ->
+         `ResolutionRuntime`; `SourceCandidateProvider` dispatches exact_key /
+         prefix / ann against it. Local-only (null) by default; unit-tested with
+         a fake source across all three modes (`db-test`).
+   - [x] Cross-shard candidate adapter (`api/distributed_candidate_source.zig`):
+         `DistributedCandidateSource` implements the seam over the routing-aware
+         `TableReadSource` -- `get` via `lookup`, `scan_prefix` via a ranged
+         `scan`, `ann` via a dense-vector `query` -- so blocking fans out to the
+         entity shard and resolves local-or-remote, reusing existing group
+         routing. Unit-tested with a fake `TableReadSource`
+         (`lib-resolution-source-test`).
+   - [ ] Serving-layer injection: construct a `DistributedCandidateSource` from
+         the hosted read source and pass it into `ResolutionRuntime` at DB
+         construction when a resolver declares `candidate_search`. End-to-end
+         link across a real shard boundary needs the multi-node harness.
    - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
          per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
          / `listResolvers` through DB -> DBCore -> IndexManager (verified by a
          reopen persistence test).
    - [x] `table_provisioner` parsing: ingest a `resolvers` section from table
          config so resolvers are declarable, not just API-driven.
-   - [ ] Live candidate blocking adapter: fetch candidates from the entity table
-         (`ann`/`exact`/`prefix`) so the resolver runs against real entities.
+   - [x] Live candidate blocking adapter: `DistributedCandidateSource` fetches
+         candidates from the entity table (`ann`/`exact`/`prefix`) over the
+         routing-aware read source. Pending only the serving-layer injection
+         (above) to be live end-to-end.
    - [ ] Promoter: entity upsert via `DocumentTransform`, provenance as mention
          edges, decoupled cross-shard write, fail-closed hydration.
    - [ ] `DocRef` endpoints threaded through graph edge artifacts.
@@ -547,36 +560,40 @@ Resolver / promoter integration (to come):
 - Fusion combines per-source confidences into the edge weight from a pinned
   prior snapshot.
 
-## Cross-shard candidate blocking (design — the one remaining phase-2 piece)
+## Cross-shard candidate blocking (built; serving-layer injection remaining)
 
-Exact/prefix/embedding blocking are all implemented and tested, but today they
-only see entities the resolution worker's own shard store can read. Canonical
-entities normally live in a dedicated `entities` table on a *different* shard,
-so meaningful cross-document blocking needs the worker to query that table
+Exact/prefix/embedding blocking are all implemented and tested, but on their own
+they only see entities the resolution worker's own shard store can read.
+Canonical entities normally live in a dedicated `entities` table on a *different*
+shard, so meaningful cross-document blocking needs the worker to query that table
 across shards. Sublinear ANN candidate generation has the same requirement (the
-entity table's vector index is on the entity shard). Both are the same blocker.
+entity table's vector index is on the entity shard). Both are the same blocker,
+and both are now served by the same seam.
 
-This is a multi-node subsystem; it cannot be verified with the single-shard
-`db-test` harness and needs the cluster/transport layer. Turn-key plan:
+**Implemented:**
 
-1. **Topology.** Resolve `entities` table -> shard set via the metadata service
-   (the same lookup the query path uses). Cache per `config_generation`.
-2. **Candidate query.** Add a `CandidateSource` that fans a blocking query out
-   to the entity shards over `lib/multirafthttp` (the existing multi-raft
-   transport), mirroring how distributed graph expansion / `remote` indexes
-   already proxy reads:
-   - `prefix`: a ranged key scan per shard (each shard scans its key range,
-     returns matching entity docs).
-   - `ann`: a vector search per shard against the entity table's managed dense
-     index using the mention's `name_embedding` as the query vector; merge the
-     per-shard top-k.
-   Both return `(doc_ref, record)` candidates; the existing matcher scorer ranks
-   them unchanged.
-3. **Worker wiring.** The resolution worker constructs the `CandidateProvider`
-   from this `CandidateSource` (instead of the in-store exact/prefix providers)
-   when the deployment is multi-shard. The `ExactKeyCandidateProvider` /
-   `PrefixCandidateProvider` remain the single-shard / co-located fast paths and
-   the local fallback.
+1. **Seam.** `db_mod.CandidateSource` (storage) exposes `get` / `scan_prefix` /
+   `nearest`. The resolution worker takes an optional `CandidateSource`;
+   `SourceCandidateProvider` renders the mention's canonical key and queries the
+   source by exact key, label prefix, or the mention's `name_embedding`, building
+   candidates the existing matcher scorer ranks unchanged. Null = local-only
+   blocking (the in-store exact/prefix providers stay the co-located fast path).
+2. **Adapter.** `api/distributed_candidate_source.zig`'s
+   `DistributedCandidateSource` implements the seam over the api layer's
+   routing-aware `TableReadSource`: `get` -> `lookup`, `scan_prefix` -> a ranged
+   `scan` over `[prefix, prefixUpperBound)`, `nearest` -> a dense-vector `query`.
+   The read source already resolves each group to local or remote and fans out,
+   so blocking reuses all existing topology/transport instead of re-deriving it.
+   Unit-tested with a fake `TableReadSource` (`lib-resolution-source-test`) and a
+   fake `CandidateSource` (`db-test`).
+
+**Remaining:**
+
+3. **Serving-layer injection.** Construct a `DistributedCandidateSource` from the
+   hosted read source and pass it into `ResolutionRuntime` at DB construction
+   when a resolver declares `candidate_search`. (`initResolutionRuntime` passes
+   `null` today.) End-to-end linking across a real shard boundary needs the
+   multi-node harness, not the single-shard `db-test` tooling.
 4. **Promoter dependency.** Cross-document linking only pays off once the
    promoter writes canonical entity docs (phase 3); until then blocking finds
    nothing to link to. The promoter's cross-shard entity upsert uses the same
@@ -586,6 +603,6 @@ This is a multi-node subsystem; it cannot be verified with the single-shard
    `embedding` artifact the resolver reads), reusing the dense-embedding
    producer already in the enrichment runtime.
 
-Recommended order: (a) cross-shard `prefix`/exact `CandidateSource` (unlocks a
-real separate entity table), (b) the name-embedding enrichment + cross-shard
-`ann` source, (c) the promoter's cross-shard entity upsert.
+Recommended order: (a) serving-layer injection (unlocks a real separate entity
+table), (b) the name-embedding enrichment to feed the cross-shard `ann` source,
+(c) the promoter's cross-shard entity upsert.
