@@ -1510,7 +1510,14 @@ fn algebraicDerivedJoinMetricRawAlloc(
     generation: ?u64,
 ) !?[]u8 {
     const semantic_id = request.measure orelse request.join.name;
-    const entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(index.alloc, index, store, request, semantic_id, generation)) orelse return null;
+    // A null scan means the fold can't serve this join (not provably
+    // distributive, or no tensor program could be built) — distinct from an
+    // empty join, which scans to `[]` and folds to the identity value. Surface
+    // the decline as unsupported rather than masking it as the identity; a join
+    // metric has no correct join-free fallback (the generic engine over flat
+    // hits would answer a different question). A guaranteed fanout blowup arrives
+    // here as AlgebraicJoinFanoutExceeded, propagated by this same `try`.
+    const entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(index.alloc, index, store, request, semantic_id, generation)) orelse return error.UnsupportedAggregation;
     defer {
         for (entries) |*entry| entry.deinit(index.alloc);
         if (entries.len > 0) index.alloc.free(entries);
@@ -12737,6 +12744,71 @@ test "cardinality over a join with guaranteed fanout blowup fails fast, not a jo
         .algebraic_scope = .root,
         .algebraic_available = true,
     }));
+}
+
+test "metric over a join with zero matched pairs folds to the identity, not an error" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "mixed",
+        \\  "group_fields": [
+        \\    {"name":"kind","path":"kind","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"integer"}
+        \\  ],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "joins": [
+        \\    {"name":"orders_customers","left_fields":["customer"],"right_fields":["customer"],"left_type_field":"kind","left_type_value":"order","right_type_field":"kind","right_type_value":"customer","max_fanout":8}
+        \\  ]
+        \\}
+    ;
+
+    var manager = try index_manager_mod.IndexManager.init(alloc, ".");
+    defer manager.deinit();
+    const mutex = try alloc.create(std.atomic.Mutex);
+    mutex.* = .unlocked;
+    const config = try types.IndexConfig.clone(alloc, .{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json = cfg,
+    });
+    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    try manager.algebraic_indexes.append(alloc, .{
+        .apply_mutex = mutex,
+        .config = config,
+        .index = alg_index,
+    });
+    const index = &manager.algebraic_indexes.items[0].index;
+
+    // The order references customer 99, which has no customer-side fact, so the
+    // join matches nothing. The fold is empty (not declined), so it must yield
+    // the identity value — never the UnsupportedAggregation a real decline gets.
+    const docs = [_]@import("derived/derived_types.zig").DerivedDocument{
+        .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":1}" },
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":99,\"amount\":10}" },
+    };
+    try index.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const request = SearchAggregationRequest{
+        .name = "total_amount",
+        .type = "sum",
+        .field = "amount",
+        .algebraic_join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
+    };
+    var result = (try computeAlgebraicAggregation(alloc, request, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+    })) orelse return error.TestUnexpectedResult;
+    defer result.deinit(alloc);
+    try std.testing.expect(result.value_json != null);
 }
 
 test "algebraic aggregation planner can execute derived bounded join terms plan" {
