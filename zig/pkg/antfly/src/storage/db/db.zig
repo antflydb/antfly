@@ -164,6 +164,11 @@ pub const OpenOptions = struct {
     transaction_recovery: transaction_runtime_mod.Config = .{},
     text_merge: text_merge_runtime_mod.Config = .{},
     sparse_compaction: sparse_compaction_runtime_mod.Config = .{},
+    /// Optional cross-shard candidate source for entity resolution blocking,
+    /// injected by the serving layer (see `api/distributed_candidate_source.zig`).
+    /// Null means local-only blocking against the worker's own store. Must
+    /// outlive the DB.
+    resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
@@ -2240,6 +2245,7 @@ pub const DB = struct {
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
     resolution_append_context: ?*EnrichmentAppendContext = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
@@ -2421,6 +2427,7 @@ pub const DB = struct {
                 .remote_content = opts.remote_content,
                 .enrichment_append_context = null,
                 .enrichment_runtime = null,
+                .resolution_candidate_source = opts.resolution_candidate_source,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
                 .transaction_recovery_identity_context = null,
@@ -2648,9 +2655,10 @@ pub const DB = struct {
             append_ctx,
             appendDerivedBatchFromEnrichment,
             self.backend_runtime,
-            // Local-only blocking for now; the api/serving layer injects a
-            // cross-shard CandidateSource when one is configured.
-            null,
+            // Cross-shard blocking source when the serving layer injected one
+            // (via OpenOptions); null means local-only blocking against this
+            // worker's own store.
+            self.resolution_candidate_source,
         );
         errdefer runtime.deinit();
         self.resolution_append_context = append_ctx;
