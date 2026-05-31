@@ -335,6 +335,18 @@ fn computeSingleAggregation(
     return error.UnsupportedAggregation;
 }
 
+// Renders a cardinality aggregation result. Every cardinality result is
+// self-describing: `approximate` says whether it came from a HyperLogLog sketch,
+// and approximate results also carry `relative_error` (the sketch's standard
+// error, derived from its precision) so clients can reason about the error
+// budget. Exact results report approximate:false and omit relative_error.
+fn cardinalityResultJsonAlloc(alloc: Allocator, value: anytype, relative_error: ?f64) ![]u8 {
+    if (relative_error) |err| {
+        return try std.fmt.allocPrint(alloc, "{{\"value\":{d},\"approximate\":true,\"relative_error\":{d}}}", .{ value, err });
+    }
+    return try std.fmt.allocPrint(alloc, "{{\"value\":{d},\"approximate\":false}}", .{value});
+}
+
 fn computeAlgebraicAggregation(
     alloc: Allocator,
     request: SearchAggregationRequest,
@@ -373,11 +385,12 @@ fn computeAlgebraicAggregation(
     if (std.mem.eql(u8, request.type, "cardinality")) {
         if (try index.approxCardinalityTotalForFieldAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) |estimate| {
             index.recordPlannerSelected(null, estimate);
+            const rel_err = try index.hllRelativeErrorForField(store, null, request.field, ctx.algebraic_constraints, ctx.identity_read_generation);
             return .{
                 .name = request.name,
                 .field = request.field,
                 .type = request.type,
-                .value_json = try std.fmt.allocPrint(alloc, "{{\"value\":{d}}}", .{estimate}),
+                .value_json = try cardinalityResultJsonAlloc(alloc, estimate, rel_err),
             };
         }
         const count = (try index.exactCardinalityForFieldAtGenerationAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) orelse {
@@ -389,7 +402,7 @@ fn computeAlgebraicAggregation(
             .name = request.name,
             .field = request.field,
             .type = request.type,
-            .value_json = try std.fmt.allocPrint(alloc, "{{\"value\":{d}}}", .{count}),
+            .value_json = try cardinalityResultJsonAlloc(alloc, count, null),
         };
     }
 
@@ -936,7 +949,7 @@ fn algebraicDocIdMetricResultsAlloc(
                 .name = request.name,
                 .field = request.field,
                 .type = request.type,
-                .value_json = try std.fmt.allocPrint(alloc, "{{\"value\":{d}}}", .{value}),
+                .value_json = try cardinalityResultJsonAlloc(alloc, value, null),
             };
             filled = i + 1;
             continue;
@@ -2417,6 +2430,11 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
         }
         alloc.free(child_hll_maps);
     }
+    // Parallel to child_hll_maps: the HLL standard error for each child served
+    // from a sketch, so the emitted result can carry its error budget.
+    const child_rel_errors = try alloc.alloc(?f64, child_requests.len);
+    defer alloc.free(child_rel_errors);
+    for (child_rel_errors) |*e| e.* = null;
     for (child_requests, 0..) |child_request, ci| {
         child_hll_maps[ci] = null;
         const group_entries = (try index.approxCardinalityEntriesForGroupAlloc(store, &.{bucket_field}, child_request.field, constraints, generation)) orelse continue;
@@ -2436,6 +2454,7 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
             gop.value_ptr.* = group_entry.estimate;
         }
         child_hll_maps[ci] = map;
+        child_rel_errors[ci] = try index.hllRelativeErrorForField(store, &.{bucket_field}, child_request.field, constraints, generation);
         // Record that this nested cardinality child is served from a
         // materialized HLL sketch, mirroring the root cardinality path, so
         // planner accounting/observability reflects the HLL routing.
@@ -2466,7 +2485,7 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
                 .name = child_request.name,
                 .field = child_request.field,
                 .type = child_request.type,
-                .value_json = try std.fmt.allocPrint(alloc, "{{\"value\":{d}}}", .{value}),
+                .value_json = try cardinalityResultJsonAlloc(alloc, value, child_rel_errors[child_idx]),
             };
             child_filled = child_idx + 1;
         }
@@ -2846,7 +2865,7 @@ pub fn algebraicTermsCardinalityAggregationFromDistributedPartialsAlloc(
                 .name = child_request.name,
                 .field = child_request.field,
                 .type = child_request.type,
-                .value_json = try std.fmt.allocPrint(alloc, "{{\"value\":{d}}}", .{cardinality}),
+                .value_json = try cardinalityResultJsonAlloc(alloc, cardinality, null),
             };
             child_filled = child_idx + 1;
         }
@@ -2945,7 +2964,7 @@ fn algebraicPathFactTermsCardinalityAggregationFromDistributedPartialsAlloc(
                 .name = child_request.name,
                 .field = child_request.field,
                 .type = child_request.type,
-                .value_json = try std.fmt.allocPrint(alloc, "{{\"value\":{d}}}", .{cardinality}),
+                .value_json = try cardinalityResultJsonAlloc(alloc, cardinality, null),
             };
             child_filled = child_idx + 1;
         }
@@ -3166,7 +3185,7 @@ pub fn algebraicCardinalityAggregationFromDistributedPartialsAlloc(
         .name = request.name,
         .field = request.field,
         .type = request.type,
-        .value_json = try std.fmt.allocPrint(alloc, "{{\"value\":{d}}}", .{count}),
+        .value_json = try cardinalityResultJsonAlloc(alloc, count, null),
     };
 }
 
@@ -4193,7 +4212,7 @@ fn algebraicRangeCardinalityAggregationFromDistributedPartialsAlloc(
                 .name = child_request.name,
                 .field = child_request.field,
                 .type = child_request.type,
-                .value_json = try std.fmt.allocPrint(alloc, "{{\"value\":{d}}}", .{cardinality}),
+                .value_json = try cardinalityResultJsonAlloc(alloc, cardinality, null),
             };
             child_filled = child_idx + 1;
         }
@@ -4333,7 +4352,7 @@ fn algebraicHistogramCardinalityAggregationFromDistributedPartialsAlloc(
                 .name = child_request.name,
                 .field = child_request.field,
                 .type = child_request.type,
-                .value_json = try std.fmt.allocPrint(alloc, "{{\"value\":{d}}}", .{cardinality}),
+                .value_json = try cardinalityResultJsonAlloc(alloc, cardinality, null),
             };
             child_filled = child_idx + 1;
         }
@@ -6522,7 +6541,7 @@ fn computeCardinalityAggregation(
         .name = request.name,
         .field = request.field,
         .type = request.type,
-        .value_json = try std.fmt.allocPrint(alloc, "{{\"value\":{d}}}", .{seen.count()}),
+        .value_json = try cardinalityResultJsonAlloc(alloc, seen.count(), null),
     };
 }
 
@@ -10937,10 +10956,10 @@ test "algebraic aggregation planner answers exact cardinality from fact rows" {
     defer deinitResults(alloc, aggregations);
 
     try std.testing.expectEqual(@as(usize, 4), aggregations.len);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregations[1].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":0}", aggregations[2].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":3}", aggregations[3].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":0,\"approximate\":false}", aggregations[2].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":3,\"approximate\":false}", aggregations[3].value_json.?);
 
     const constrained_requests = [_]SearchAggregationRequest{.{
         .name = "alice_product_cardinality",
@@ -10958,7 +10977,7 @@ test "algebraic aggregation planner answers exact cardinality from fact rows" {
     defer deinitResults(alloc, constrained);
 
     try std.testing.expectEqual(@as(usize, 1), constrained.len);
-    try std.testing.expectEqualStrings("{\"value\":2}", constrained[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", constrained[0].value_json.?);
 }
 
 test "algebraic aggregation planner constrains root cardinality by document role" {
@@ -11025,7 +11044,7 @@ test "algebraic aggregation planner constrains root cardinality by document role
         .algebraic_available = true,
     });
     defer deinitResults(alloc, unconstrained);
-    try std.testing.expectEqualStrings("{\"value\":3}", unconstrained[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":3,\"approximate\":false}", unconstrained[0].value_json.?);
 
     const constraints = [_]FixedConstraint{.{ .field = "kind", .value = "order" }};
     const constrained = try computeSearchAggregations(alloc, &requests, result, .{
@@ -11036,7 +11055,7 @@ test "algebraic aggregation planner constrains root cardinality by document role
         .algebraic_constraints = constraints[0..],
     });
     defer deinitResults(alloc, constrained);
-    try std.testing.expectEqualStrings("{\"value\":2}", constrained[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", constrained[0].value_json.?);
 }
 
 test "algebraic distributed cardinality merges canonical distinct values" {
@@ -11097,7 +11116,7 @@ test "algebraic distributed cardinality merges canonical distinct values" {
     defer customer_merged.deinit(alloc);
     var customer_agg = (try algebraicCardinalityAggregationFromDistributedPartialsAlloc(alloc, customer_request, customer_merged)) orelse return error.TestUnexpectedResult;
     defer customer_agg.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"value\":3}", customer_agg.value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":3,\"approximate\":false}", customer_agg.value_json.?);
 
     const tier_request = SearchAggregationRequest{
         .name = "tier_cardinality",
@@ -11116,7 +11135,7 @@ test "algebraic distributed cardinality merges canonical distinct values" {
     defer tier_merged.deinit(alloc);
     var tier_agg = (try algebraicCardinalityAggregationFromDistributedPartialsAlloc(alloc, tier_request, tier_merged)) orelse return error.TestUnexpectedResult;
     defer tier_agg.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"value\":3}", tier_agg.value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":3,\"approximate\":false}", tier_agg.value_json.?);
 
     const meta_request = SearchAggregationRequest{
         .name = "meta_cardinality",
@@ -11135,7 +11154,7 @@ test "algebraic distributed cardinality merges canonical distinct values" {
     defer meta_merged.deinit(alloc);
     var meta_agg = (try algebraicCardinalityAggregationFromDistributedPartialsAlloc(alloc, meta_request, meta_merged)) orelse return error.TestUnexpectedResult;
     defer meta_agg.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"value\":0}", meta_agg.value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":0,\"approximate\":false}", meta_agg.value_json.?);
 
     const tags_request = SearchAggregationRequest{
         .name = "tags_cardinality",
@@ -11154,7 +11173,7 @@ test "algebraic distributed cardinality merges canonical distinct values" {
     defer tags_merged.deinit(alloc);
     var tags_agg = (try algebraicCardinalityAggregationFromDistributedPartialsAlloc(alloc, tags_request, tags_merged)) orelse return error.TestUnexpectedResult;
     defer tags_agg.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"value\":4}", tags_agg.value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":4,\"approximate\":false}", tags_agg.value_json.?);
 
     const constraints = [_]FixedConstraint{.{ .field = "customer", .value = "alice" }};
     const product_request = SearchAggregationRequest{
@@ -11174,7 +11193,7 @@ test "algebraic distributed cardinality merges canonical distinct values" {
     defer product_merged.deinit(alloc);
     var product_agg = (try algebraicCardinalityAggregationFromDistributedPartialsAlloc(alloc, product_request, product_merged)) orelse return error.TestUnexpectedResult;
     defer product_agg.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"value\":2}", product_agg.value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", product_agg.value_json.?);
 
     const gold_value = try algebraic_mod.token.canonicalTupleAlloc(alloc, &.{ "string", "gold" });
     defer alloc.free(gold_value);
@@ -11196,7 +11215,7 @@ test "algebraic distributed cardinality merges canonical distinct values" {
     defer gold_product_merged.deinit(alloc);
     var gold_product_agg = (try algebraicCardinalityAggregationFromDistributedPartialsAlloc(alloc, gold_product_request, gold_product_merged)) orelse return error.TestUnexpectedResult;
     defer gold_product_agg.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"value\":2}", gold_product_agg.value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", gold_product_agg.value_json.?);
 }
 
 test "algebraic terms aggregation answers nested exact cardinality from fact rows" {
@@ -11272,12 +11291,12 @@ test "algebraic terms aggregation answers nested exact cardinality from fact row
     try std.testing.expectEqual(@as(usize, 2), aggregations[0].buckets.len);
     try std.testing.expectEqualStrings("\"alice\"", aggregations[0].buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 2), aggregations[0].buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregations[0].buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregations[0].buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregations[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregations[0].buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"bob\"", aggregations[0].buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregations[0].buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregations[0].buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregations[0].buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregations[0].buckets[1].aggregations[1].value_json.?);
 }
 
 test "algebraic terms aggregation answers path terms with nested exact cardinality" {
@@ -11351,12 +11370,12 @@ test "algebraic terms aggregation answers path terms with nested exact cardinali
     try std.testing.expectEqual(@as(usize, 2), aggregations[0].buckets.len);
     try std.testing.expectEqualStrings("\"silver\"", aggregations[0].buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 3), aggregations[0].buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregations[0].buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregations[0].buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregations[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregations[0].buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"gold\"", aggregations[0].buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 2), aggregations[0].buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregations[0].buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregations[0].buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregations[0].buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregations[0].buckets[1].aggregations[1].value_json.?);
 }
 
 test "algebraic terms aggregation answers array path terms with nested exact cardinality" {
@@ -11428,16 +11447,16 @@ test "algebraic terms aggregation answers array path terms with nested exact car
     try std.testing.expectEqual(@as(usize, 3), aggregations[0].buckets.len);
     try std.testing.expectEqualStrings("\"vip\"", aggregations[0].buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 2), aggregations[0].buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregations[0].buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregations[0].buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregations[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregations[0].buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"new\"", aggregations[0].buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregations[0].buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregations[0].buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregations[0].buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregations[0].buckets[1].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"sale\"", aggregations[0].buckets[2].key_json);
     try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[2].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregations[0].buckets[2].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregations[0].buckets[2].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregations[0].buckets[2].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregations[0].buckets[2].aggregations[1].value_json.?);
 }
 
 test "algebraic histogram aggregation answers nested exact cardinality from fact rows" {
@@ -11514,12 +11533,12 @@ test "algebraic histogram aggregation answers nested exact cardinality from fact
     try std.testing.expectEqual(@as(usize, 2), aggregations[0].buckets.len);
     try std.testing.expectEqualStrings("0", aggregations[0].buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregations[0].buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregations[0].buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregations[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregations[0].buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("20", aggregations[0].buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 2), aggregations[0].buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregations[0].buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregations[0].buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregations[0].buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregations[0].buckets[1].aggregations[1].value_json.?);
 
     const status_value = manager.algebraic_indexes.items[0].index.status();
     try std.testing.expectEqual(@as(u64, 1), status_value.planner_algebraic_selected);
@@ -11598,12 +11617,12 @@ test "algebraic distributed terms aggregation merges nested exact cardinality" {
     try std.testing.expectEqual(@as(usize, 2), aggregation.buckets.len);
     try std.testing.expectEqualStrings("\"alice\"", aggregation.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 3), aggregation.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregation.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregation.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregation.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregation.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"bob\"", aggregation.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 2), aggregation.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregation.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregation.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregation.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregation.buckets[1].aggregations[1].value_json.?);
 
     const left_tier_partials = (try left_idx.scanDistributedTermsCardinalityPartials(&left_store, "by_tier", "/meta/tier", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_tier_partials);
@@ -11628,12 +11647,12 @@ test "algebraic distributed terms aggregation merges nested exact cardinality" {
     try std.testing.expectEqual(@as(usize, 2), tier_aggregation.buckets.len);
     try std.testing.expectEqualStrings("\"silver\"", tier_aggregation.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 3), tier_aggregation.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", tier_aggregation.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", tier_aggregation.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", tier_aggregation.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", tier_aggregation.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"gold\"", tier_aggregation.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 2), tier_aggregation.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", tier_aggregation.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", tier_aggregation.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", tier_aggregation.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", tier_aggregation.buckets[1].aggregations[1].value_json.?);
 
     const tag_child_exports = [_]algebraic_mod.index.CardinalityChildRequest{
         .{ .name = "product_cardinality", .field = "product" },
@@ -11666,20 +11685,20 @@ test "algebraic distributed terms aggregation merges nested exact cardinality" {
     try std.testing.expectEqual(@as(usize, 4), tag_aggregation.buckets.len);
     try std.testing.expectEqualStrings("\"vip\"", tag_aggregation.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 3), tag_aggregation.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", tag_aggregation.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":3}", tag_aggregation.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", tag_aggregation.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":3,\"approximate\":false}", tag_aggregation.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"new\"", tag_aggregation.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 2), tag_aggregation.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", tag_aggregation.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":2}", tag_aggregation.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", tag_aggregation.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", tag_aggregation.buckets[1].aggregations[1].value_json.?);
     const clearance_bucket = findAggregationBucketByKey(tag_aggregation.buckets, "\"clearance\"") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i64, 1), clearance_bucket.count);
-    try std.testing.expectEqualStrings("{\"value\":1}", clearance_bucket.aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":2}", clearance_bucket.aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", clearance_bucket.aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", clearance_bucket.aggregations[1].value_json.?);
     const sale_bucket = findAggregationBucketByKey(tag_aggregation.buckets, "\"sale\"") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i64, 1), sale_bucket.count);
-    try std.testing.expectEqualStrings("{\"value\":1}", sale_bucket.aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", sale_bucket.aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", sale_bucket.aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", sale_bucket.aggregations[1].value_json.?);
 }
 
 test "algebraic distributed range aggregations merge nested exact cardinality" {
@@ -11789,12 +11808,12 @@ test "algebraic distributed range aggregations merge nested exact cardinality" {
     try std.testing.expectEqual(@as(usize, 2), range_agg.buckets.len);
     try std.testing.expectEqualStrings("\"low\"", range_agg.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 2), range_agg.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", range_agg.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", range_agg.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", range_agg.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", range_agg.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"high\"", range_agg.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 3), range_agg.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", range_agg.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":3}", range_agg.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", range_agg.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":3,\"approximate\":false}", range_agg.buckets[1].aggregations[1].value_json.?);
 
     const left_live_range_partials = (try left_idx.scanDistributedRangeCardinalityPartials(&left_store, "amount_ranges", "amount", .numeric, range_exports[0..], child_exports[0..], &.{}, 3)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_live_range_partials);
@@ -11807,8 +11826,8 @@ test "algebraic distributed range aggregations merge nested exact cardinality" {
     try std.testing.expectEqual(@as(i64, 1), left_live_range_agg.buckets[0].count);
     try std.testing.expectEqualStrings("\"high\"", left_live_range_agg.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 1), left_live_range_agg.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", left_live_range_agg.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", left_live_range_agg.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", left_live_range_agg.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", left_live_range_agg.buckets[1].aggregations[1].value_json.?);
 
     const left_path_range_partials = (try left_idx.scanDistributedRangeCardinalityPartials(&left_store, "path_amount_ranges", "/amount", .numeric, range_exports[0..], child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_path_range_partials);
@@ -11836,12 +11855,12 @@ test "algebraic distributed range aggregations merge nested exact cardinality" {
     try std.testing.expectEqual(@as(usize, 2), path_range_agg.buckets.len);
     try std.testing.expectEqualStrings("\"low\"", path_range_agg.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 2), path_range_agg.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", path_range_agg.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", path_range_agg.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", path_range_agg.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", path_range_agg.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"high\"", path_range_agg.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 3), path_range_agg.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", path_range_agg.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":3}", path_range_agg.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", path_range_agg.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":3,\"approximate\":false}", path_range_agg.buckets[1].aggregations[1].value_json.?);
 
     const date_exports = [_]algebraic_mod.index.CardinalityRangeRequest{
         .{ .name = "early", .start = "2026-01-02T00:00:00Z", .end = "2026-01-04T00:00:00Z" },
@@ -11873,12 +11892,12 @@ test "algebraic distributed range aggregations merge nested exact cardinality" {
     try std.testing.expectEqual(@as(usize, 2), date_agg.buckets.len);
     try std.testing.expectEqualStrings("\"early\"", date_agg.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 3), date_agg.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", date_agg.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", date_agg.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", date_agg.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", date_agg.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"late\"", date_agg.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 2), date_agg.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", date_agg.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":2}", date_agg.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", date_agg.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", date_agg.buckets[1].aggregations[1].value_json.?);
 
     const left_path_date_partials = (try left_idx.scanDistributedRangeCardinalityPartials(&left_store, "path_created_ranges", "/created_at", .date, date_exports[0..], child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_path_date_partials);
@@ -11906,12 +11925,12 @@ test "algebraic distributed range aggregations merge nested exact cardinality" {
     try std.testing.expectEqual(@as(usize, 2), path_date_agg.buckets.len);
     try std.testing.expectEqualStrings("\"early\"", path_date_agg.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 3), path_date_agg.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", path_date_agg.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", path_date_agg.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", path_date_agg.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", path_date_agg.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"late\"", path_date_agg.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 2), path_date_agg.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", path_date_agg.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":2}", path_date_agg.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", path_date_agg.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", path_date_agg.buckets[1].aggregations[1].value_json.?);
 }
 
 test "algebraic distributed histogram aggregations merge nested exact cardinality" {
@@ -11988,16 +12007,16 @@ test "algebraic distributed histogram aggregations merge nested exact cardinalit
     try std.testing.expectEqual(@as(usize, 3), histogram_agg.buckets.len);
     try std.testing.expectEqualStrings("10", histogram_agg.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 2), histogram_agg.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", histogram_agg.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", histogram_agg.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", histogram_agg.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", histogram_agg.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("20", histogram_agg.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 1), histogram_agg.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", histogram_agg.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", histogram_agg.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", histogram_agg.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", histogram_agg.buckets[1].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("30", histogram_agg.buckets[2].key_json);
     try std.testing.expectEqual(@as(i64, 2), histogram_agg.buckets[2].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", histogram_agg.buckets[2].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":2}", histogram_agg.buckets[2].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", histogram_agg.buckets[2].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", histogram_agg.buckets[2].aggregations[1].value_json.?);
 
     const left_path_histogram_partials = (try left_idx.scanDistributedHistogramCardinalityPartials(&left_store, "path_amount_histogram", "/amount", .numeric, 10, "", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_path_histogram_partials);
@@ -12022,16 +12041,16 @@ test "algebraic distributed histogram aggregations merge nested exact cardinalit
     try std.testing.expectEqual(@as(usize, 3), path_histogram_agg.buckets.len);
     try std.testing.expectEqualStrings("10", path_histogram_agg.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 2), path_histogram_agg.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", path_histogram_agg.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", path_histogram_agg.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", path_histogram_agg.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", path_histogram_agg.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("20", path_histogram_agg.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 1), path_histogram_agg.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", path_histogram_agg.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", path_histogram_agg.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", path_histogram_agg.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", path_histogram_agg.buckets[1].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("30", path_histogram_agg.buckets[2].key_json);
     try std.testing.expectEqual(@as(i64, 2), path_histogram_agg.buckets[2].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", path_histogram_agg.buckets[2].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":2}", path_histogram_agg.buckets[2].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", path_histogram_agg.buckets[2].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", path_histogram_agg.buckets[2].aggregations[1].value_json.?);
 
     const left_date_partials = (try left_idx.scanDistributedHistogramCardinalityPartials(&left_store, "orders_by_day", "created_at", .date, 0, "day", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_date_partials);
@@ -12056,20 +12075,20 @@ test "algebraic distributed histogram aggregations merge nested exact cardinalit
     try std.testing.expectEqual(@as(usize, 4), date_agg.buckets.len);
     try std.testing.expectEqualStrings("\"2026-01-02T00:00:00Z\"", date_agg.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 1), date_agg.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", date_agg.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", date_agg.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", date_agg.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", date_agg.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"2026-01-03T00:00:00Z\"", date_agg.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 2), date_agg.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", date_agg.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", date_agg.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", date_agg.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", date_agg.buckets[1].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"2026-01-04T00:00:00Z\"", date_agg.buckets[2].key_json);
     try std.testing.expectEqual(@as(i64, 1), date_agg.buckets[2].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", date_agg.buckets[2].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", date_agg.buckets[2].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", date_agg.buckets[2].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", date_agg.buckets[2].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"2026-01-05T00:00:00Z\"", date_agg.buckets[3].key_json);
     try std.testing.expectEqual(@as(i64, 1), date_agg.buckets[3].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", date_agg.buckets[3].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", date_agg.buckets[3].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", date_agg.buckets[3].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", date_agg.buckets[3].aggregations[1].value_json.?);
 
     const left_path_date_partials = (try left_idx.scanDistributedHistogramCardinalityPartials(&left_store, "path_orders_by_day", "/created_at", .date, 0, "day", child_exports[0..], &.{}, null)).?;
     defer algebraic_mod.distributed.freePartials(alloc, left_path_date_partials);
@@ -12094,20 +12113,20 @@ test "algebraic distributed histogram aggregations merge nested exact cardinalit
     try std.testing.expectEqual(@as(usize, 4), path_date_agg.buckets.len);
     try std.testing.expectEqualStrings("\"2026-01-02T00:00:00Z\"", path_date_agg.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 1), path_date_agg.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", path_date_agg.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", path_date_agg.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", path_date_agg.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", path_date_agg.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"2026-01-03T00:00:00Z\"", path_date_agg.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 2), path_date_agg.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", path_date_agg.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", path_date_agg.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", path_date_agg.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", path_date_agg.buckets[1].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"2026-01-04T00:00:00Z\"", path_date_agg.buckets[2].key_json);
     try std.testing.expectEqual(@as(i64, 1), path_date_agg.buckets[2].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", path_date_agg.buckets[2].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", path_date_agg.buckets[2].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", path_date_agg.buckets[2].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", path_date_agg.buckets[2].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"2026-01-05T00:00:00Z\"", path_date_agg.buckets[3].key_json);
     try std.testing.expectEqual(@as(i64, 1), path_date_agg.buckets[3].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", path_date_agg.buckets[3].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", path_date_agg.buckets[3].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", path_date_agg.buckets[3].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", path_date_agg.buckets[3].aggregations[1].value_json.?);
 }
 
 test "algebraic aggregation planner can use configured implicit join materialization" {
@@ -13613,12 +13632,12 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     try std.testing.expectEqual(@as(i64, 1), range_aggs[0].buckets[0].count);
     try std.testing.expectEqualStrings("10", range_aggs[0].buckets[0].aggregations[0].value_json.?);
     try std.testing.expectEqualStrings("{\"count\":1,\"sum\":10,\"avg\":10,\"min\":10,\"max\":10,\"sum_squares\":100,\"variance\":0,\"std_dev\":0}", range_aggs[0].buckets[0].aggregations[1].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", range_aggs[0].buckets[0].aggregations[2].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", range_aggs[0].buckets[0].aggregations[2].value_json.?);
     try std.testing.expectEqualStrings("\"high\"", range_aggs[0].buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 2), range_aggs[0].buckets[1].count);
     try std.testing.expectEqualStrings("50", range_aggs[0].buckets[1].aggregations[0].value_json.?);
     try std.testing.expectEqualStrings("{\"count\":2,\"sum\":50,\"avg\":25,\"min\":20,\"max\":30,\"sum_squares\":1300,\"variance\":25,\"std_dev\":5}", range_aggs[0].buckets[1].aggregations[1].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":2}", range_aggs[0].buckets[1].aggregations[2].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", range_aggs[0].buckets[1].aggregations[2].value_json.?);
 
     const histogram_requests = [_]SearchAggregationRequest{.{
         .name = "amount_histogram",
@@ -13680,7 +13699,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     });
     defer deinitResults(alloc, date_aggs);
     try std.testing.expectEqual(@as(i64, 2), date_aggs[0].buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", date_aggs[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", date_aggs[0].buckets[0].aggregations[0].value_json.?);
 
     const extra_docs = [_]@import("derived/derived_types.zig").DerivedDocument{
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":40,\"created_at\":\"2026-01-05T00:00:00Z\"}" },
@@ -13728,7 +13747,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     });
     defer deinitResults(alloc, live_root_cardinality_aggs);
     try std.testing.expectEqual(@as(usize, 1), live_root_cardinality_aggs.len);
-    try std.testing.expectEqualStrings("{\"value\":1}", live_root_cardinality_aggs[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", live_root_cardinality_aggs[0].value_json.?);
 
     const stale_root_metric_requests = [_]SearchAggregationRequest{
         .{ .name = "live_order_count", .type = "count", .field = "" },
@@ -13786,9 +13805,9 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     defer deinitResults(alloc, live_histogram_aggs);
     try std.testing.expectEqual(@as(usize, 2), live_histogram_aggs[0].buckets.len);
     try std.testing.expectEqual(@as(i64, 1), live_histogram_aggs[0].buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", live_histogram_aggs[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", live_histogram_aggs[0].buckets[0].aggregations[0].value_json.?);
     try std.testing.expectEqual(@as(i64, 1), live_histogram_aggs[0].buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":1}", live_histogram_aggs[0].buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", live_histogram_aggs[0].buckets[1].aggregations[0].value_json.?);
 
     const stale_cardinality_terms_requests = [_]SearchAggregationRequest{.{
         .name = "customer_terms_live",
@@ -13807,7 +13826,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     try std.testing.expectEqual(@as(usize, 1), live_terms_aggs[0].buckets.len);
     try std.testing.expectEqualStrings("\"alice\"", live_terms_aggs[0].buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 2), live_terms_aggs[0].buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", live_terms_aggs[0].buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", live_terms_aggs[0].buckets[0].aggregations[0].value_json.?);
 
     const stale_metric_terms_requests = [_]SearchAggregationRequest{.{
         .name = "customer_terms_metric_live",
@@ -13886,7 +13905,10 @@ test "algebraic aggregation planner answers cardinality from HLL materialization
     const root_aggs = try computeSearchAggregations(alloc, &root_requests, result, ctx);
     defer deinitResults(alloc, root_aggs);
     try std.testing.expectEqual(@as(usize, 1), root_aggs.len);
-    try std.testing.expectEqualStrings("{\"value\":3}", root_aggs[0].value_json.?);
+    // Served from the sketch: value is exact at this tiny scale, and the result
+    // is marked approximate (with a relative_error whose exact float formatting
+    // we don't pin here).
+    try expectApproxCardinality(root_aggs[0].value_json.?, 3);
 
     // terms(region) -> cardinality(customer) is served per bucket from the
     // per-region sketches: west has 3 distinct customers, east has 1.
@@ -13901,9 +13923,19 @@ test "algebraic aggregation planner answers cardinality from HLL materialization
     try std.testing.expectEqual(@as(usize, 1), terms_aggs.len);
     try std.testing.expectEqual(@as(usize, 2), terms_aggs[0].buckets.len);
     try std.testing.expectEqualStrings("\"west\"", terms_aggs[0].buckets[0].key_json);
-    try std.testing.expectEqualStrings("{\"value\":3}", terms_aggs[0].buckets[0].aggregations[0].value_json.?);
     try std.testing.expectEqualStrings("\"east\"", terms_aggs[0].buckets[1].key_json);
-    try std.testing.expectEqualStrings("{\"value\":1}", terms_aggs[0].buckets[1].aggregations[0].value_json.?);
+    try expectApproxCardinality(terms_aggs[0].buckets[0].aggregations[0].value_json.?, 3);
+    try expectApproxCardinality(terms_aggs[0].buckets[1].aggregations[0].value_json.?, 1);
+}
+
+// Asserts a cardinality result was served approximately (from a sketch): it
+// reports the expected value and is flagged approximate, without pinning the
+// exact relative_error float formatting.
+fn expectApproxCardinality(value_json: []const u8, expected_value: u64) !void {
+    var buf: [48]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&buf, "\"value\":{d},\"approximate\":true", .{expected_value});
+    try std.testing.expect(std.mem.indexOf(u8, value_json, needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, value_json, "\"relative_error\":") != null);
 }
 
 test "algebraic bucket aggregations fall back when nested metrics are unsupported" {

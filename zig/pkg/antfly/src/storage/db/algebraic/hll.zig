@@ -36,6 +36,14 @@ pub const default_precision: u6 = 14;
 pub const min_precision: u6 = 4;
 pub const max_precision: u6 = 18;
 
+/// Standard relative error of the estimate at `precision`: 1.04 / sqrt(m) where
+/// m = 2^precision is the register count (~1.6% at p=12, ~0.8% at p=14). This is
+/// the documented error budget surfaced to clients with an approximate count.
+pub fn relativeErrorForPrecision(precision: u6) f64 {
+    const m: f64 = @floatFromInt(@as(u64, 1) << precision);
+    return 1.04 / @sqrt(m);
+}
+
 const magic = "hll1";
 const seed: u64 = 0x9e3779b97f4a7c15;
 

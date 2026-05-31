@@ -16994,6 +16994,27 @@ pub const Index = struct {
         return null;
     }
 
+    /// Relative (standard) error of the HLL materialization that would answer a
+    /// cardinality of `field_or_path` grouped by `group_fields`, or null when no
+    /// materialization applies. Mirrors hllCardinalityNameForField's matching so
+    /// the estimate and its error budget always come from the same sketch.
+    pub fn hllRelativeErrorForField(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        group_fields: ?[]const []const u8,
+        field_or_path: []const u8,
+        constraints: []const ir.Constraint,
+        generation: ?u64,
+    ) !?f64 {
+        const name = (try self.hllCardinalityNameForField(store, group_fields, field_or_path, constraints, generation)) orelse return null;
+        for (self.config().hll_cardinalities) |hcfg| {
+            if (std.mem.eql(u8, hcfg.name, name)) {
+                return hll.relativeErrorForPrecision(hllCardinalityPrecision(hcfg));
+            }
+        }
+        return null;
+    }
+
     // Test helper: whether the (single) configured HLL cardinality is currently
     // marked dirty (i.e. a maintenance rebuild is pending).
     fn hllCardinalityDirtyTest(self: *Index, store: *docstore_mod.DocStore) !bool {
