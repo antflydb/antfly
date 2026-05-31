@@ -555,6 +555,33 @@ test "schema capability config can compile directly from schema json" {
     try std.testing.expectEqual(@as(usize, 0), parsed_config.value.materializations.len);
 }
 
+test "schema capability config derives from a relational schema for auto-created index" {
+    // A relational table's closed schema must derive a valid algebraic index
+    // config (the basis for auto-creating an aggregation index): keyword columns
+    // become group axes, numeric columns become measures. No eager
+    // materializations -- adaptive observation fills them in.
+    const alloc = std.testing.allocator;
+    const config_json = try configJsonFromSchemaJsonAlloc(alloc, "sales",
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created":{"type":"datetime"}},"required":["tenant","amount"],"additionalProperties":false}}}}
+    );
+    defer alloc.free(config_json);
+
+    var parsed_config = try std.json.parseFromSlice(index_mod.Config, alloc, config_json, .{ .allocate = .alloc_always });
+    defer parsed_config.deinit();
+    try std.testing.expectEqualStrings("sales", parsed_config.value.table);
+    // Group axes are every group-eligible scalar (string/boolean/datetime/number):
+    // tenant, status, amount, created. amount (number) is also a measure, and
+    // created (datetime) is also a time field. A field may carry multiple roles.
+    try std.testing.expectEqual(@as(usize, 4), parsed_config.value.group_fields.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed_config.value.measure_fields.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed_config.value.time_fields.len);
+    // No eager materializations; adaptive observation is on by default.
+    try std.testing.expectEqual(@as(usize, 0), parsed_config.value.materializations.len);
+    try std.testing.expect(parsed_config.value.adaptive.observe);
+    // The derived config must validate.
+    try index_mod.validateConfig(parsed_config.value);
+}
+
 test "schema capability change classification separates additive from rebuild changes" {
     const alloc = std.testing.allocator;
     var old_schema = try schema_mod.parseValidatedTableSchema(alloc,
