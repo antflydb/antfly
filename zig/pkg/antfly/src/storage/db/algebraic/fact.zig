@@ -31,6 +31,30 @@ pub const FieldSpec = struct {
     role: Role,
 };
 
+/// A dynamic-template selector compiled into the algebraic config. Unlike a
+/// `FieldSpec` it is not bound to a concrete path: it is evaluated against every
+/// observed field at ingest time so template-matched fields become typed facts
+/// without a schema/version bump (Elasticsearch-style runtime-adaptive mapping).
+///
+/// Selector semantics (`match`/`unmatch`/`path_match`/`path_unmatch`/
+/// `match_mapping_type`) mirror the full-text dynamic-template resolution in
+/// `storage/schema.zig`; matching is performed there via `globMatch` and
+/// `matchMappingTypeName` so both indexes stay in lockstep.
+///
+/// `type` is the resolved bounded scalar (`string`/`boolean`/`datetime`/
+/// `integer`/`number`). Templates resolving to unbounded text are intentionally
+/// NOT compiled into rules — that cardinality guard lives in
+/// `schema_capability.zig`; such fields remain on the schemaless path-fact path.
+pub const DynamicRule = struct {
+    name: []const u8 = "",
+    match: ?[]const u8 = null,
+    unmatch: ?[]const u8 = null,
+    path_match: ?[]const u8 = null,
+    path_unmatch: ?[]const u8 = null,
+    match_mapping_type: ?[]const u8 = null,
+    type: []const u8 = "string",
+};
+
 pub const Fact = struct {
     role: Role,
     field: []u8,
