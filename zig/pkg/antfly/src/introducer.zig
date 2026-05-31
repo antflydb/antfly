@@ -1777,7 +1777,11 @@ fn jsonValueToGeoPoint(value: std.json.Value) ?geo_mod.GeoPoint {
     return .{ .lat = lat, .lon = lon };
 }
 
-fn parseRfc3339ToNs(text: []const u8) !?u64 {
+/// Parse an RFC3339/ISO-8601 UTC timestamp ("YYYY-MM-DDTHH:MM:SS[.fffffffff]Z")
+/// to epoch nanoseconds. Returns null if the text is not a well-formed UTC
+/// RFC3339 instant. Shared with the relational datetime column coercion so query
+/// ingest and write ingest agree on the epoch-ns encoding.
+pub fn parseRfc3339ToNs(text: []const u8) !?u64 {
     if (text.len < 20) return null;
     if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
 

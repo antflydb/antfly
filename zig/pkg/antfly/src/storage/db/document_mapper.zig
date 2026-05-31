@@ -1663,7 +1663,16 @@ fn coerceRelationalTypedValue(value_type: typed_dv.ValueType, json_value: std.js
         .u64_val => {
             const number: i64 = switch (json_value) {
                 .integer => |value| value,
-                .string => |text| std.fmt.parseInt(i64, text, 10) catch return null,
+                .string => |text| blk: {
+                    // Accept an epoch-ns integer-string, or an RFC3339 UTC
+                    // timestamp (parsed to the same epoch-ns the column stores).
+                    if (std.fmt.parseInt(i64, text, 10)) |epoch_ns| {
+                        break :blk epoch_ns;
+                    } else |_| {
+                        const ns = (introducer_mod.parseRfc3339ToNs(text) catch return null) orelse return null;
+                        break :blk @bitCast(ns);
+                    }
+                },
                 else => return null,
             };
             return .{ .u64_val = @bitCast(number) };
@@ -1711,9 +1720,8 @@ fn valueAtJsonPath(root: std.json.Value, path: []const u8) ?std.json.Value {
 /// `bytes_val`; `json` bytes are already valid JSON and embedded verbatim,
 /// strings are JSON-escaped. Returns the JSON document; caller owns the bytes.
 ///
-/// This does not yet replace the stored_data blob on the read path; it proves
-/// the round trip (write columns -> persist segment -> reconstruct) works on a
-/// real segment, which is the prerequisite for dropping the blob.
+/// This is the live full-text read path for relational tables: the segment
+/// stored-doc body is empty and the document is reconstructed from columns here.
 pub fn reconstructRelationalDocumentFromSegmentAlloc(
     alloc: Allocator,
     reader: anytype,
@@ -4057,4 +4065,46 @@ test "materializeDocumentValueAlloc reconstructs typed rows and passes blobs thr
     const blob_back = try materializeOwnedDocumentValueAlloc(alloc, blob_owned);
     defer alloc.free(blob_back);
     try std.testing.expect(blob_back.ptr == blob_owned.ptr);
+}
+
+test "relational datetime column accepts RFC3339 strings and epoch integers" {
+    const alloc = std.testing.allocator;
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "ts", .path = "ts", .field_type = .datetime, .nullable = false },
+    };
+
+    // RFC3339 UTC string -> epoch ns (1970-01-01T00:00:01Z == 1e9 ns).
+    {
+        const row = try buildRelationalRowValueAlloc(alloc, "{\"id\":\"a\",\"ts\":\"1970-01-01T00:00:01Z\"}", &columns);
+        defer alloc.free(row);
+        const json = try reconstructRelationalRowDocumentAlloc(alloc, row);
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 1_000_000_000), parsed.value.object.get("ts").?.integer);
+    }
+
+    // Fractional seconds.
+    {
+        const row = try buildRelationalRowValueAlloc(alloc, "{\"id\":\"a\",\"ts\":\"1970-01-01T00:00:00.5Z\"}", &columns);
+        defer alloc.free(row);
+        const json = try reconstructRelationalRowDocumentAlloc(alloc, row);
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 500_000_000), parsed.value.object.get("ts").?.integer);
+    }
+
+    // Bare epoch-ns integer still works (unchanged behavior).
+    {
+        const row = try buildRelationalRowValueAlloc(alloc, "{\"id\":\"a\",\"ts\":42}", &columns);
+        defer alloc.free(row);
+        const json = try reconstructRelationalRowDocumentAlloc(alloc, row);
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 42), parsed.value.object.get("ts").?.integer);
+    }
 }

@@ -921,8 +921,8 @@ fn expectRelationalColumn(
 // columns are consumable by the existing search/query range readers:
 //   - number / integer -> f64 (native), like detectTypedValue + getF64
 //   - datetime -> raw u64 epoch ns (like the timestamp doc values read via
-//                 getU64; RFC3339 string parsing is a follow-up, epoch
-//                 integers / integer-strings are accepted today)
+//                 getU64; accepts epoch integers, integer-strings, and RFC3339
+//                 UTC timestamp strings parsed to epoch ns)
 //   - boolean  -> bool, geopoint -> packed lat/lon, string/blob/geoshape -> bytes
 // ---------------------------------------------------------------------------
 
@@ -1087,10 +1087,10 @@ fn stringifyJsonValueAlloc(alloc: Allocator, json_value: std.json.Value) ![]u8 {
 // Document reconstruction (Phase 5 foundation, see zig/RELATIONAL.md)
 //
 // reconstructRelationalDocumentAlloc rebuilds a JSON document from a projected
-// RelationalRow. This proves the typed columns carry enough information to
-// reconstruct the document, which is the prerequisite for making columns the
-// authoritative store (dropping the JSON blob for non-json columns). It does
-// not yet flip the storage switch -- the read path still uses the stored blob.
+// RelationalRow. Columns are the authoritative store for relational tables: the
+// KV value is a serialized typed row (see relational_row_codec) and the segment
+// stored-doc body is empty, so this reconstruction is the live read path, not a
+// proof-of-concept. The JSON blob is no longer written for relational tables.
 //
 // Emitted by column type:
 //   string/blob/geoshape -> JSON string      (bytes preserved verbatim)
