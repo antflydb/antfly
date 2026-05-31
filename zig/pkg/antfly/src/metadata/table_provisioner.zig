@@ -674,6 +674,7 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
     if (type_value != .string) return error.InvalidCreateTableRequest;
     if (std.mem.eql(u8, type_value.string, "full_text")) return .full_text;
     if (std.mem.eql(u8, type_value.string, "graph")) return .graph;
+    if (std.mem.eql(u8, type_value.string, "algebraic")) return .algebraic;
     if (std.mem.eql(u8, type_value.string, "embeddings")) {
         const sparse = if (value.object.get("sparse")) |sparse_value| switch (sparse_value) {
             .bool => sparse_value.bool,
@@ -686,10 +687,19 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
 
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {
     if (value != .object) return try alloc.dupe(u8, "{}");
-    switch (try parseIndexKind(value)) {
+    const kind = try parseIndexKind(value);
+    switch (kind) {
         .dense_vector, .sparse_vector => return try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, value),
         else => {},
     }
+
+    // Algebraic configs carry their own `version` field (config format version),
+    // which must be preserved -- unlike full-text, where `version` is the schema
+    // wrapper that gets stripped. `derive_from_schema` is also dropped here: by
+    // this point the marker should already be expanded into a concrete config,
+    // but stripping it defensively keeps an unexpanded marker from leaking into
+    // the stored config.
+    const is_algebraic = kind == .algebraic;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -700,8 +710,9 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
         if (std.mem.eql(u8, entry.key_ptr.*, "type") or
             std.mem.eql(u8, entry.key_ptr.*, "name") or
             std.mem.eql(u8, entry.key_ptr.*, "description") or
-            std.mem.eql(u8, entry.key_ptr.*, "version") or
-            std.mem.eql(u8, entry.key_ptr.*, "enrichments"))
+            std.mem.eql(u8, entry.key_ptr.*, "enrichments") or
+            (is_algebraic and std.mem.eql(u8, entry.key_ptr.*, "derive_from_schema")) or
+            (!is_algebraic and std.mem.eql(u8, entry.key_ptr.*, "version")))
         {
             continue;
         }
