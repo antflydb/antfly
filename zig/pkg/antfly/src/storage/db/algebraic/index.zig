@@ -3661,9 +3661,12 @@ pub const Index = struct {
             }
         }
         // Guaranteed-blowup pre-gate: if the average right-side fanout already
-        // exceeds max_fanout, some join key must exceed it, so the scan would
-        // raise AlgebraicJoinFanoutExceeded. Fail soft (unsupported) instead.
-        if (try self.derivedJoinFanoutGuaranteedExceeds(store, join_cfg)) return null;
+        // exceeds max_fanout, some join key must exceed it, so the scan is bound
+        // to raise AlgebraicJoinFanoutExceeded. Raise it now, before the O(left x
+        // fanout) scan, rather than after. A join aggregation has no correct
+        // cheaper fallback (a join-free count answers a different question), so
+        // this stays a hard error — just a fast one.
+        if (try self.derivedJoinFanoutGuaranteedExceeds(store, join_cfg)) return error.AlgebraicJoinFanoutExceeded;
 
         var txn = try store.beginReadTxn();
         defer txn.abort();
@@ -19942,13 +19945,16 @@ test "derived join fanout pre-gate fails soft on a guaranteed blowup" {
     const join_cfg = idx.joinConfigByName("orders_customers") orelse return error.TestUnexpectedResult;
     try std.testing.expect(try idx.derivedJoinFanoutGuaranteedExceeds(&store, join_cfg));
 
-    // The derived fold fails soft (null) instead of raising the runtime
-    // AlgebraicJoinFanoutExceeded error mid-scan.
+    // The derived fold fast-fails with the same AlgebraicJoinFanoutExceeded the
+    // scan would have raised — but before the O(left x fanout) scan, not after.
     const request = DerivedJoinFoldRequest{
         .join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
         .op = .count,
     };
-    try std.testing.expect((try idx.scanDerivedJoinFoldEntriesAtGeneration(&store, request, null)) == null);
+    try std.testing.expectError(
+        error.AlgebraicJoinFanoutExceeded,
+        idx.scanDerivedJoinFoldEntriesAtGeneration(&store, request, null),
+    );
 }
 
 test "algebraic HLL cardinality is adaptively promoted from a recurring query shape" {

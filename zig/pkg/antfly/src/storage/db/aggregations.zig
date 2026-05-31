@@ -395,11 +395,14 @@ fn computeAlgebraicAggregation(
         if (request.cardinality_mode != .exact and ctx.algebraic_constraints.len == 0 and ctx.identity_read_generation == null) {
             index.observeCardinalityForAdaptive(store, null, request.field);
         }
-        // `exact` never consults a sketch; `auto`/`approximate` try one first.
-        if (request.cardinality_mode != .exact) {
-            // A cardinality(field) carrying a join folds HLL sketches across the
-            // join (the distinct count of the measured field over matched pairs).
-            if (request.algebraic_join != null) {
+        // A cardinality(field) carrying a join is a distinct-count over matched
+        // join pairs, computed by folding a singleton HLL sketch per pair. It
+        // must never fall through to a join-free count (over all docs or the flat
+        // hits) — that answers a different question. So when the fold can't serve
+        // it (not provably distributive, or a guaranteed fanout blowup), this is
+        // an explicit error, not a silently-wrong number.
+        if (request.algebraic_join != null) {
+            if (request.cardinality_mode != .exact) {
                 if (try algebraicDerivedJoinCardinalityAlloc(index, store, request, ctx)) |estimate| {
                     index.recordPlannerSelected(null, estimate);
                     const rel_err = algebraic_mod.hll.relativeErrorForPrecision(algebraic_mod.hll.default_precision);
@@ -410,7 +413,13 @@ fn computeAlgebraicAggregation(
                         .value_json = try cardinalityResultJsonAlloc(alloc, estimate, rel_err),
                     };
                 }
-            } else if (try index.approxCardinalityTotalForFieldAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) |estimate| {
+            }
+            index.recordPlannerFallback("cardinality_join_unsupported", null, null);
+            return error.UnsupportedAggregation;
+        }
+        // `exact` never consults a sketch; `auto`/`approximate` try one first.
+        if (request.cardinality_mode != .exact) {
+            if (try index.approxCardinalityTotalForFieldAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) |estimate| {
                 index.recordPlannerSelected(null, estimate);
                 const rel_err = try index.hllRelativeErrorForField(store, null, request.field, ctx.algebraic_constraints, ctx.identity_read_generation);
                 return .{
@@ -1548,7 +1557,8 @@ fn algebraicDerivedJoinCardinalityTotalAlloc(
 
 // Plans the derived join fold for a cardinality(field) aggregation carrying a
 // join, then estimates the distinct count. Null when the join can't be proven
-// as a distributive fold (the caller falls back).
+// as a distributive fold; the caller turns that into an explicit error rather
+// than a join-free count (which would answer a different question).
 fn algebraicDerivedJoinCardinalityAlloc(
     index: *algebraic_mod.index.Index,
     store: *docstore_mod.DocStore,
@@ -12657,6 +12667,76 @@ test "algebraic cardinality over a join folds HLL sketches across matched pairs"
     const estimate = (try algebraicDerivedJoinCardinalityTotalAlloc(&index, &store, plan.derived_join_fold.?, "product", null)) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 2), estimate);
+}
+
+test "cardinality over a join with guaranteed fanout blowup fails fast, not a join-free count" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "mixed",
+        \\  "group_fields": [
+        \\    {"name":"kind","path":"kind","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"},
+        \\    {"name":"product","path":"product","type":"string"}
+        \\  ],
+        \\  "joins": [
+        \\    {"name":"orders_customers","left_fields":["customer"],"right_fields":["customer"],"left_type_field":"kind","left_type_value":"order","right_type_field":"kind","right_type_value":"customer","max_fanout":1}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"customers","group_by":[],"value_field":"customer","precision":14}
+        \\  ]
+        \\}
+    ;
+
+    var manager = try index_manager_mod.IndexManager.init(alloc, ".");
+    defer manager.deinit();
+    const mutex = try alloc.create(std.atomic.Mutex);
+    mutex.* = .unlocked;
+    const config = try types.IndexConfig.clone(alloc, .{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json = cfg,
+    });
+    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    try manager.algebraic_indexes.append(alloc, .{
+        .apply_mutex = mutex,
+        .config = config,
+        .index = alg_index,
+    });
+    const index = &manager.algebraic_indexes.items[0].index;
+
+    // Three customer-side facts over two distinct keys: average right fanout
+    // (1.5) exceeds max_fanout (1). No order is ingested (a matching order would
+    // trip the ingest-time guard); the pre-gate estimates from the customer NDV
+    // sketch and the fact count alone.
+    const docs = [_]@import("derived/derived_types.zig").DerivedDocument{
+        .{ .key = "c1a", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
+        .{ .key = "c1b", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
+        .{ .key = "c2", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c2\"}" },
+    };
+    try index.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const request = SearchAggregationRequest{
+        .name = "distinct_products",
+        .type = "cardinality",
+        .field = "product",
+        .algebraic_join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
+    };
+    // The fold is guaranteed to blow up, so it raises the fanout error rather
+    // than silently falling through to a join-free distinct count over all docs.
+    try std.testing.expectError(error.AlgebraicJoinFanoutExceeded, computeAlgebraicAggregation(alloc, request, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+    }));
 }
 
 test "algebraic aggregation planner can execute derived bounded join terms plan" {
