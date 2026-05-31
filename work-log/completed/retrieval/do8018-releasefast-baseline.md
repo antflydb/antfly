@@ -9,6 +9,7 @@ Updated on 2026-05-29 after adding explicit current-scan helpers for maintenance
 Updated on 2026-05-29 after moving the segment container to v3 with a zero checksum sentinel. Segment publish/open no longer performs a full-file CRC pass by default, which avoids forcing newly-written mmap segment pages resident just to validate the footer.
 Updated on 2026-05-29 from worktree commit `cf09767718c1` with a post-v3 ReleaseFast baseline. Final mapped-file resident dropped from about 519-534 MiB to about 32-33 MiB while final segment bytes stayed about 528-532 MiB; final `ps` RSS dropped from about 1.17-1.19 GiB to about 684-700 MiB.
 Updated on 2026-05-31 from worktree commit `a2dfe4cec46a` after the v18 varint postings header codec change. The baseline script now builds with `zig build install -Doptimize=ReleaseFast`.
+Updated on 2026-05-31 from worktree commit `eb338f2fdbca` after the v19 sparse block-max codec change.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -37,6 +38,10 @@ Latest segment-v3/no-eager-checksum artifacts:
 Latest v18 artifacts:
 
 `work-log/do8018/releasefast-baseline-20260531-153844/`
+
+Latest v19 artifacts:
+
+`work-log/do8018/releasefast-baseline-20260531-163822/`
 
 ## Latest Segment-v3 Metrics Off
 
@@ -697,3 +702,97 @@ Artifacts: `work-log/do8018/releasefast-baseline-20260531-153844/`.
 The v18 codec removes the fixed 24-byte postings header and encodes the six small postings header fields as varints. This is another intentional codec break with no legacy read path. In the comparable no-detail ReleaseFast run, final segment bytes fell from the v17 range of ~491-494 MiB to ~429-431 MiB, and postings fell from ~234-240 MiB to ~172 MiB.
 
 The RSS signal is not monotonic run-to-run: metrics-off ended at ~789 MiB RSS while metrics-on ended at ~683 MiB RSS. The lower-noise memory indicators are consistent with the previous slice: process footprint is ~120-123 MiB, live malloc is ~80-94 MiB, vmmap malloc allocated is ~24-35 MiB, and mapped-file resident is ~31 MiB. That means the old 2 GiB symptom is no longer explained by live heap, but there is still codec and policy work left in term blocks, stored fields, sparse block-max data, skip data, and merge/reader retirement.
+
+## Latest v19 Metrics Off
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260531-163822/`.
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Payload bytes: 246,859,144
+- Load time: 42.247539708s
+- Async catch-up time: 23.888125667s
+- Catch-up complete: true
+- Throughput: 1,671.22 records/sec, 5.10 MiB/sec
+- `ps` RSS: 672,235,520 bytes
+- Process resident metric: 672,235,520 bytes
+- Process footprint metric: 139,729,568 bytes
+- Live malloc metric: 97,712,720 bytes
+- Malloc zone metric: 139,804,672 bytes
+- vmmap footprint: 139,775,180 bytes
+- vmmap peak footprint: 806,774,374 bytes
+- vmmap mapped-file resident: 30,198,988 bytes
+- vmmap malloc allocated: 24,012,390 bytes
+- Final full-text segment files: 7
+- Final full-text segment bytes: 425,319,572
+- Final mapped segment bytes: 425,319,572
+- Max segment bytes: 112,037,295
+- Stored fields bytes: 127,749,388
+- Inverted bytes: 293,498,980
+- Inverted header bytes: 121,347
+- Inverted norms bytes: 14,735,361
+- Inverted postings bytes: 164,449,865
+- Inverted term dictionary bytes: 107,911,212
+- Term block bytes: 102,441,175
+- Term index bytes: 2,761,706
+- Term FST bytes: 2,641,971
+- Bloom bytes: 6,171,195
+- Typed doc values bytes: 3,446,657
+- Doc ordinal bytes: 282,455
+- Section index bytes: 341,812
+- Text merges completed: 138
+- Full-text build peak bytes: 166,429,970
+- Full-text pending peak bytes: 430,327,541
+- Text merge buffer peak bytes: 112,804,207
+- LSM compaction peak bytes: 67,986,888
+- LSM in-memory state peak bytes: 28,147,242
+
+## Latest v19 Metrics On
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260531-163822/`.
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Payload bytes: 246,859,144
+- Load time: 44.119132875s
+- Async catch-up time: 16.795126375s
+- Catch-up complete: true
+- Throughput: 1,600.33 records/sec, 4.88 MiB/sec
+- `ps` RSS: 646,397,952 bytes
+- Process resident metric: 646,397,952 bytes
+- Process footprint metric: 145,333,064 bytes
+- Live malloc metric: 104,379,808 bytes
+- Malloc zone metric: 138,133,504 bytes
+- vmmap footprint: 146,066,636 bytes
+- vmmap peak footprint: 774,268,518 bytes
+- vmmap mapped-file resident: 30,198,988 bytes
+- vmmap malloc allocated: 34,707,865 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 408,374,344
+- Final mapped segment bytes: 408,374,344
+- Max segment bytes: 99,685,519
+- Stored fields bytes: 127,708,649
+- Inverted bytes: 276,567,986
+- Inverted header bytes: 130,870
+- Inverted norms bytes: 11,126,861
+- Inverted postings bytes: 159,397,490
+- Inverted term dictionary bytes: 100,668,584
+- Term block bytes: 95,422,427
+- Term index bytes: 2,634,894
+- Term FST bytes: 2,538,323
+- Bloom bytes: 5,244,181
+- Typed doc values bytes: 3,449,635
+- Doc ordinal bytes: 282,460
+- Section index bytes: 365,294
+- Text merges completed: 156
+- Full-text build peak bytes: 138,565,608
+- Full-text pending peak bytes: 412,232,053
+- Text merge buffer peak bytes: 101,708,220
+- LSM compaction peak bytes: 67,379,736
+- LSM in-memory state peak bytes: 32,662,179
+
+## v19 Read
+
+The v19 codec stores block-max records only for posting chunks that contain hits. It removes the dense `first_chunk_id + num_doc_chunks` header fields and aligns each 6-byte block-max record with the compact chunk metadata entry. `BlockMaxInfo.maxImpact` now returns zero for chunks absent from the postings chunk list.
+
+Compared with the v18 baseline, v19 reduced final segment bytes from ~429-431 MiB to ~408-425 MiB and postings from ~172 MiB to ~159-164 MiB. The committed metrics-on run is the best apples-to-apples final state: RSS 646 MiB, footprint 145 MiB, live malloc 104 MiB, mapped-file resident 30 MiB, and final segment bytes 408 MiB. The remaining large on-disk components are stored fields (~127.7 MiB), term blocks (~95-102 MiB), and postings (~159-164 MiB).
