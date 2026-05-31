@@ -2192,6 +2192,22 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     return try collectSearchQueryResolvedDocSetAlloc(alloc, arena_alloc, executor, text_entry, search_query);
 }
 
+/// Names of the relational keyword columns for a table, so exact-match `.term`
+/// predicates on them route to a columnar `typed_term` scan. Returns an empty
+/// slice for document-mode tables (no relational routing). Arena-allocated.
+fn relationalKeywordColumnNamesAlloc(
+    arena_alloc: Allocator,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) ![]const []const u8 {
+    const rs = runtime_schema orelse return &.{};
+    if (rs.storage_mode != .relational or rs.relational_columns.len == 0) return &.{};
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    for (rs.relational_columns) |column| {
+        if (column.field_type == .keyword) try names.append(arena_alloc, column.name);
+    }
+    return try names.toOwnedSlice(arena_alloc);
+}
+
 fn collectSearchQueryResolvedDocSetAlloc(
     alloc: Allocator,
     arena_alloc: Allocator,
@@ -2219,7 +2235,8 @@ fn collectSearchQueryResolvedDocSetAlloc(
     if (bench_profile) capability_ns = platform_time.monotonicNs() - capability_start_ns;
 
     const filter_compile_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
+    const keyword_columns = relationalKeywordColumnNamesAlloc(arena_alloc, text_entry.runtime_schema) catch return null;
+    const filter = search_mod.searchQueryToFilterArenaRelational(arena_alloc, search_query, keyword_columns) catch return null;
     if (bench_profile) filter_compile_ns = platform_time.monotonicNs() - filter_compile_start_ns;
     const execute_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     const doc_nums = try snapshot.executeFilter(alloc, filter);
@@ -2291,7 +2308,8 @@ fn collectStructuredFilterTextDocNumsAlloc(
         text_entry.runtime_schema,
     ))) return null;
 
-    const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
+    const keyword_columns = relationalKeywordColumnNamesAlloc(arena_alloc, text_entry.runtime_schema) catch return null;
+    const filter = search_mod.searchQueryToFilterArenaRelational(arena_alloc, search_query, keyword_columns) catch return null;
     const doc_nums = try snapshot.executeFilter(alloc, filter);
     if (doc_nums.len == 0) {
         alloc.free(doc_nums);

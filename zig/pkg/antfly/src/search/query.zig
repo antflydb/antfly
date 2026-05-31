@@ -53,6 +53,7 @@ pub const FilterError = error{
 /// A filter that produces a bitmap of matching document IDs.
 pub const Filter = union(enum) {
     term: TermFilter,
+    typed_term: TypedTermFilter,
     bool_filter: BoolFilter,
     prefix: PrefixFilter,
     phrase: PhraseFilter,
@@ -77,6 +78,7 @@ pub const Filter = union(enum) {
     pub fn execute(self: Filter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
         return switch (self) {
             .term => |f| f.execute(alloc, seg),
+            .typed_term => |f| f.execute(alloc, seg),
             .bool_filter => |f| f.execute(alloc, seg),
             .prefix => |f| f.execute(alloc, seg),
             .phrase => |f| f.execute(alloc, seg),
@@ -831,6 +833,40 @@ pub const RangeFilter = struct {
                 if (above_min and below_max) {
                     try result.add(@intCast(doc_id));
                 }
+            }
+        }
+
+        return result;
+    }
+};
+
+/// Columnar term-equality filter: matches documents whose `bytes_val`
+/// typed-doc-values column equals `value`. This is the columnar-scan counterpart
+/// to `TermFilter` (which reads the inverted index) — used for relational
+/// keyword columns, where the declared column is the authoritative store and an
+/// exact-match predicate should scan the column rather than route through the
+/// analyzed full-text index (which may have tokenized the value away).
+pub const TypedTermFilter = struct {
+    field: []const u8,
+    value: []const u8,
+    boost: f32 = 1.0,
+
+    pub fn execute(self: TypedTermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+            return roaring.RoaringBitmap.init(alloc);
+
+        const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
+            return roaring.RoaringBitmap.init(alloc);
+        if (reader.value_type != .bytes_val) return roaring.RoaringBitmap.init(alloc);
+
+        var result = roaring.RoaringBitmap.init(alloc);
+        errdefer result.deinit();
+
+        for (0..seg.reader.doc_count) |doc_id| {
+            const val = (reader.getBytes(@intCast(doc_id)) catch continue) orelse continue;
+            defer alloc.free(val);
+            if (std.mem.eql(u8, val, self.value)) {
+                try result.add(@intCast(doc_id));
             }
         }
 
@@ -1742,6 +1778,58 @@ test "range filter on typed doc values" {
     var bm2 = try filter2.execute(alloc, seg);
     defer bm2.deinit();
     try testing.expectEqual(@as(usize, 3), bm2.cardinality());
+}
+
+test "typed term filter matches a keyword column from typed doc values" {
+    const alloc = testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+
+    // A keyword column "status" stored as bytes_val typed doc values.
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .bytes_val, 128);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .bytes_val = "active" });
+    try dv_writer.add(1, .{ .bytes_val = "archived" });
+    try dv_writer.add(2, .{ .bytes_val = "active" });
+
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    const field_idx = try seg_writer.addField("status");
+    try seg_writer.addSection(field_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("a", "{}");
+    try seg_writer.addStoredDoc("b", "{}");
+    try seg_writer.addStoredDoc("c", "{}");
+
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snap = writer.snapshot();
+    const seg = &snap.segments[0];
+
+    // status == "active" matches docs 0 and 2.
+    const filter = Filter{ .typed_term = .{ .field = "status", .value = "active" } };
+    var bm = try filter.execute(alloc, seg);
+    defer bm.deinit();
+    try testing.expectEqual(@as(usize, 2), bm.cardinality());
+    try testing.expect(bm.contains(0));
+    try testing.expect(bm.contains(2));
+
+    // A value present in no document matches nothing.
+    const filter_none = Filter{ .typed_term = .{ .field = "status", .value = "deleted" } };
+    var bm_none = try filter_none.execute(alloc, seg);
+    defer bm_none.deinit();
+    try testing.expectEqual(@as(usize, 0), bm_none.cardinality());
+
+    // A non-existent column matches nothing (no section).
+    const filter_missing = Filter{ .typed_term = .{ .field = "nope", .value = "active" } };
+    var bm_missing = try filter_missing.execute(alloc, seg);
+    defer bm_missing.deinit();
+    try testing.expectEqual(@as(usize, 0), bm_missing.cardinality());
 }
 
 test "geo distance filter" {
