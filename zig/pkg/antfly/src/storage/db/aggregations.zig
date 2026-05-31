@@ -1018,6 +1018,45 @@ fn exceedsAlgebraicResultBucketLimit(index: *const algebraic_mod.index.Index, bu
     return bucket_count > limit;
 }
 
+// Estimated number of result buckets for a single-field terms aggregation: the
+// global distinct-count (NDV) of the bucket field, read from a current HLL
+// sketch when one applies. Null when no sketch covers the field, the read is
+// constrained, or it pins an MVCC generation — exactly the cases
+// approxCardinalityTotalForFieldAlloc already declines. Advisory only; it never
+// gates correctness, only lets the planner fast-fail an obviously-too-large
+// aggregation before scanning.
+fn estimatedTermsBucketCount(
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    bucket_field: []const u8,
+    constraints: []const FixedConstraint,
+    generation: ?u64,
+) !?usize {
+    if (constraints.len != 0 or generation != null) return null;
+    const ndv = (try index.approxCardinalityTotalForFieldAlloc(store, bucket_field, &.{}, null)) orelse return null;
+    return std.math.cast(usize, ndv) orelse std.math.maxInt(usize);
+}
+
+// Fast-fails a terms aggregation a current NDV sketch shows would exceed
+// max_result_buckets, before any materialization scan runs. Compares the limit
+// against the low end of the sketch's ~2σ error band so a query that might
+// actually fit is never rejected here; the authoritative post-scan bucket-count
+// check remains the backstop. No-op when no sketch covers the field.
+fn rejectTermsAboveEstimatedBucketLimit(
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    bucket_field: []const u8,
+    constraints: []const FixedConstraint,
+    generation: ?u64,
+) !void {
+    const limit = index.config().max_result_buckets orelse return;
+    const estimate = (try estimatedTermsBucketCount(index, store, bucket_field, constraints, generation)) orelse return;
+    const rel_err = (try index.hllRelativeErrorForField(store, null, bucket_field, &.{}, null)) orelse 0.0;
+    const margin: usize = @intFromFloat(@as(f64, @floatFromInt(estimate)) * rel_err * 2.0);
+    const lower_bound = estimate - @min(estimate, margin);
+    if (lower_bound > limit) return error.AlgebraicResultBucketLimit;
+}
+
 fn algebraicPlanExceedsScanBudget(
     index: *algebraic_mod.index.Index,
     store: *docstore_mod.DocStore,
@@ -1732,6 +1771,19 @@ fn computeAlgebraicTermsAggregation(
         return null;
     };
     if (constraintValueForField(index, constraints, bucket_field.name) != null) return null;
+
+    // A recurring terms(field) is a recurring distinct-count of that field.
+    // Record it so leader-gated maintenance can promote an ungrouped NDV sketch
+    // — which both answers cardinality(field) and powers the bucket-count
+    // pre-gate below. Only meaningful for unconstrained, non-MVCC reads.
+    if (constraints.len == 0 and generation == null) {
+        index.observeCardinalityForAdaptive(store, null, bucket_field.name);
+    }
+    // Cheap pre-gate: reject a terms aggregation a current NDV sketch shows is
+    // over the bucket limit before doing any materialization scan. No-op when
+    // no sketch covers the field; the post-scan check stays authoritative.
+    try rejectTermsAboveEstimatedBucketLimit(index, store, bucket_field.name, constraints, generation);
+
     const child_aggs = try splitAggregationRequests(alloc, request.aggregations);
     defer child_aggs.deinit(alloc);
     if (termsChildAggsAllCardinality(child_aggs.primary)) {
@@ -13968,6 +14020,130 @@ test "algebraic aggregation planner answers cardinality from HLL materialization
     defer deinitResults(alloc, approx_aggs);
     try std.testing.expectEqual(@as(usize, 1), approx_aggs.len);
     try expectApproxCardinality(approx_aggs[0].value_json.?, 3);
+}
+
+test "terms bucket-count pre-gate rejects an over-limit aggregation from an NDV sketch" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    // An ungrouped (group_by:[]) sketch over `category` is the global NDV of the
+    // field == the number of result buckets a terms(category) would produce.
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "items",
+        \\  "group_fields": [
+        \\    {"name":"category","path":"category","type":"string"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"all_categories","group_by":[],"value_field":"category","precision":14}
+        \\  ],
+        \\  "max_result_buckets": 2
+        \\}
+    ;
+    var idx = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    defer idx.close();
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "i1", .action = .upsert, .cleaned_value = "{\"category\":\"a\"}" },
+        .{ .key = "i2", .action = .upsert, .cleaned_value = "{\"category\":\"b\"}" },
+        .{ .key = "i3", .action = .upsert, .cleaned_value = "{\"category\":\"c\"}" },
+        .{ .key = "i4", .action = .upsert, .cleaned_value = "{\"category\":\"d\"}" },
+        .{ .key = "i5", .action = .upsert, .cleaned_value = "{\"category\":\"e\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    // The sketch reports ~5 distinct categories.
+    const est = (try estimatedTermsBucketCount(&idx, &store, "category", &.{}, null)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(est >= 4 and est <= 6);
+
+    // 5 distinct > max_result_buckets (2): the pre-gate fast-fails with the same
+    // error the post-scan check raises, before any materialization scan.
+    try std.testing.expectError(
+        error.AlgebraicResultBucketLimit,
+        rejectTermsAboveEstimatedBucketLimit(&idx, &store, "category", &.{}, null),
+    );
+
+    // A field with no covering sketch yields no estimate and never pre-gates.
+    try std.testing.expect((try estimatedTermsBucketCount(&idx, &store, "missing", &.{}, null)) == null);
+    try rejectTermsAboveEstimatedBucketLimit(&idx, &store, "missing", &.{}, null);
+
+    // MVCC-pinned reads decline the estimate (the sketch can't serve them), so
+    // the pre-gate stays silent and the normal path runs.
+    try std.testing.expect((try estimatedTermsBucketCount(&idx, &store, "category", &.{}, 7)) == null);
+    try rejectTermsAboveEstimatedBucketLimit(&idx, &store, "category", &.{}, 7);
+}
+
+test "recurring terms query adaptively promotes an ungrouped NDV sketch" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "items",
+        \\  "group_fields": [
+        \\    {"name":"category","path":"category","type":"string"}
+        \\  ],
+        \\  "adaptive": {"observe": true, "lazy_materialization": true, "min_observations": 2}
+        \\}
+    ;
+    var manager = try index_manager_mod.IndexManager.init(alloc, ".");
+    defer manager.deinit();
+    const mutex = try alloc.create(std.atomic.Mutex);
+    mutex.* = .unlocked;
+    const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
+    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "i1", .action = .upsert, .cleaned_value = "{\"category\":\"a\"}" },
+        .{ .key = "i2", .action = .upsert, .cleaned_value = "{\"category\":\"b\"}" },
+        .{ .key = "i3", .action = .upsert, .cleaned_value = "{\"category\":\"c\"}" },
+    };
+    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const hits = try alloc.alloc(types.SearchHit, 0);
+    defer alloc.free(hits);
+    const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
+    const ctx = Context{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+    };
+
+    const index = &manager.algebraic_indexes.items[0].index;
+    const adaptive_name = try index.hllAdaptiveNameAlloc(null, "category");
+    defer alloc.free(adaptive_name);
+
+    const terms_requests = [_]SearchAggregationRequest{.{ .name = "cats", .type = "terms", .field = "category" }};
+
+    // Two recurring terms(category) reads record observations through the terms
+    // path but never promote on the read side.
+    const a1 = try computeSearchAggregations(alloc, &terms_requests, result, ctx);
+    deinitResults(alloc, a1);
+    const a2 = try computeSearchAggregations(alloc, &terms_requests, result, ctx);
+    deinitResults(alloc, a2);
+    try std.testing.expect(!index.hllRegistryContains(adaptive_name));
+
+    // Leader-gated maintenance promotes and backfills the ungrouped NDV sketch.
+    try std.testing.expectEqual(@as(u64, 1), try index.evaluateHllCardinalityCandidates(&store));
+    try std.testing.expect(index.hllRegistryContains(adaptive_name));
+
+    // The promoted sketch now answers a root cardinality(category): 3 distinct.
+    const est = (try index.approxCardinalityTotalForFieldAlloc(&store, "category", &.{}, null)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(est >= 2 and est <= 4);
 }
 
 test "cardinality_mode approximate errors when no sketch applies" {
