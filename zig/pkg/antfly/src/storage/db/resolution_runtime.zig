@@ -211,13 +211,128 @@ pub fn processChangedExtraction(
         break :blk mention_embedder.mentionEmbedder();
     } else null;
 
+    // Human-curation overrides recorded for this document take precedence over
+    // the scorer, and survive re-resolution (replay-stable curation).
+    const override_key = try internal_keys.artifactNamedPrefixAlloc(gpa, parsed.doc_key, "asset", review_override_artifact);
+    defer gpa.free(override_key);
+    const override_raw = try store.get(gpa, override_key);
+    defer if (override_raw) |r| gpa.free(r);
+    var override_holder: StoreOverrideProvider = undefined;
+    var stage_overrides: ?resolver_lib.OverrideProvider = null;
+    if (override_raw) |raw| {
+        if (std.json.parseFromSlice(std.json.Value, gpa, raw, .{})) |parsed_overrides| {
+            override_holder = .{ .parsed = parsed_overrides };
+            stage_overrides = override_holder.provider();
+        } else |_| {}
+    }
+    defer if (stage_overrides != null) override_holder.deinit();
+
     const stage = resolver_lib.ResolutionStage{
         .resolver = &resolver,
         .config_generation = cfg.config_generation,
         .embedder = stage_embedder,
+        .overrides = stage_overrides,
     };
     const result = try stage.run(gpa, store, effective_provider, changed_key, resolution_key);
     return .{ .result = result, .resolution_key = resolution_key };
+}
+
+/// Named asset artifact holding a document's review overrides:
+/// `{ "<local_id>": { "decision": "match", "table": "...", "key": "..." } }`.
+/// No resolver consumes it, so it never triggers resolution itself.
+pub const review_override_artifact = "_resolution_review";
+
+/// Override provider backed by a parsed review-overrides artifact. Borrowed
+/// strings live as long as the parse (the resolver copies them into its arena).
+const StoreOverrideProvider = struct {
+    parsed: std.json.Parsed(std.json.Value),
+
+    fn deinit(self: *StoreOverrideProvider) void {
+        self.parsed.deinit();
+    }
+    fn provider(self: *StoreOverrideProvider) resolver_lib.OverrideProvider {
+        return .{ .ptr = self, .override_for = overrideFor };
+    }
+    fn overrideFor(ptr: *anyopaque, local_id: []const u8) ?resolver_lib.Override {
+        const self: *StoreOverrideProvider = @ptrCast(@alignCast(ptr));
+        if (self.parsed.value != .object) return null;
+        const o = self.parsed.value.object.get(local_id) orelse return null;
+        if (o != .object) return null;
+        const decision = decisionFromName(jsonStr(o.object.get("decision")) orelse return null) orelse return null;
+        return .{
+            .decision = decision,
+            .table = jsonStr(o.object.get("table")) orelse return null,
+            .key = jsonStr(o.object.get("key")) orelse return null,
+        };
+    }
+};
+
+fn jsonStr(value: ?std.json.Value) ?[]const u8 {
+    const v = value orelse return null;
+    return if (v == .string) v.string else null;
+}
+
+fn decisionFromName(name: []const u8) ?resolver_lib.Decision {
+    if (std.mem.eql(u8, name, "match")) return .match;
+    if (std.mem.eql(u8, name, "review")) return .review;
+    if (std.mem.eql(u8, name, "new")) return .new;
+    return null;
+}
+
+/// Record a curator's decision for one reviewed mention as a durable override
+/// (read-modify-write of the document's review-overrides artifact). The next
+/// re-resolution of the document honors it. The curated record doubles as a
+/// training label for `matcher.fitScorerWeights`.
+pub fn recordReviewDecision(
+    gpa: std.mem.Allocator,
+    store: resolver_lib.ArtifactStore,
+    doc_key: []const u8,
+    local_id: []const u8,
+    decision: resolver_lib.Decision,
+    table: []const u8,
+    key: []const u8,
+) !void {
+    const override_key = try internal_keys.artifactNamedPrefixAlloc(gpa, doc_key, "asset", review_override_artifact);
+    defer gpa.free(override_key);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(gpa);
+    try out.append(gpa, '{');
+    var first = true;
+
+    // Copy existing entries, replacing any for this local_id.
+    if (try store.get(gpa, override_key)) |raw| {
+        defer gpa.free(raw);
+        if (std.json.parseFromSlice(std.json.Value, gpa, raw, .{})) |parsed| {
+            var p = parsed;
+            defer p.deinit();
+            if (p.value == .object) {
+                var it = p.value.object.iterator();
+                while (it.next()) |e| {
+                    if (std.mem.eql(u8, e.key_ptr.*, local_id)) continue;
+                    const v_str = try std.json.Stringify.valueAlloc(gpa, e.value_ptr.*, .{});
+                    defer gpa.free(v_str);
+                    const kv = try std.fmt.allocPrint(gpa, "{f}:{s}", .{ std.json.fmt(e.key_ptr.*, .{}), v_str });
+                    defer gpa.free(kv);
+                    if (!first) try out.append(gpa, ',');
+                    first = false;
+                    try out.appendSlice(gpa, kv);
+                }
+            }
+        } else |_| {}
+    }
+
+    if (!first) try out.append(gpa, ',');
+    const entry = try std.fmt.allocPrint(gpa, "{f}:{{\"decision\":\"{s}\",\"table\":{f},\"key\":{f}}}", .{
+        std.json.fmt(local_id, .{}),
+        @tagName(decision),
+        std.json.fmt(table, .{}),
+        std.json.fmt(key, .{}),
+    });
+    defer gpa.free(entry);
+    try out.appendSlice(gpa, entry);
+    try out.append(gpa, '}');
+    try store.put(override_key, out.items);
 }
 
 /// Adapts the storage `DenseEmbedder` to the resolver's `MentionEmbedder` seam,
@@ -1633,6 +1748,56 @@ test "reresolveAll re-resolves the corpus when a resolver config generation bump
     writer.keys.clearRetainingCapacity();
     _ = try reresolveAll(alloc, store, &bumped, null, null, &writer, CaptureWriter.writeFn);
     try testing.expectEqual(@as(u64, 0), writer.calls);
+}
+
+test "recordReviewDecision makes re-resolution honor a curated override" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ slug _entity.text }}",
+        .config_generation = 1,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+
+    // Deterministic first pass mints a new key.
+    {
+        const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null, null)).?;
+        alloc.free(outcome.resolution_key);
+        const stored = (try store.get(alloc, resolution_key)).?;
+        defer alloc.free(stored);
+        try testing.expect(std.mem.indexOf(u8, stored, "\"decision\":\"new\"") != null);
+        try testing.expect(std.mem.indexOf(u8, stored, "\"key\":\"ada_lovelace\"") != null);
+    }
+
+    // A curator links the mention to an existing canonical entity.
+    try recordReviewDecision(alloc, store, "doc:a", "e0", .match, "entities", "person/ada_canonical");
+
+    // Re-resolution now honors the override.
+    {
+        const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null, null)).?;
+        alloc.free(outcome.resolution_key);
+        const stored = (try store.get(alloc, resolution_key)).?;
+        defer alloc.free(stored);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+        defer parsed.deinit();
+        const ent = parsed.value.object.get("entities").?.array.items[0].object;
+        try testing.expectEqualStrings("match", ent.get("decision").?.string);
+        try testing.expectEqualStrings("person/ada_canonical", ent.get("doc_ref").?.object.get("key").?.string);
+    }
 }
 
 test "listPendingReviews collects review-band mentions awaiting curation" {

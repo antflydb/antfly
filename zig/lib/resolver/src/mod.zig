@@ -504,6 +504,29 @@ pub const ParsedEntities = struct {
     }
 };
 
+/// A human curation override for one mention: forces its decision and canonical
+/// endpoint regardless of what the scorer would pick. The strings are borrowed
+/// for the duration of the stage run (the stage copies them into the resolution
+/// arena).
+pub const Override = struct {
+    decision: Decision,
+    table: []const u8,
+    key: []const u8,
+};
+
+/// Supplies curation overrides keyed by a mention's `local_id` within the
+/// document being resolved. A function-pointer seam keeps the resolver library
+/// decoupled from the override store; the storage layer constructs one per
+/// document from recorded review decisions.
+pub const OverrideProvider = struct {
+    ptr: *anyopaque,
+    override_for: *const fn (ptr: *anyopaque, local_id: []const u8) ?Override,
+
+    pub fn overrideFor(self: OverrideProvider, local_id: []const u8) ?Override {
+        return self.override_for(self.ptr, local_id);
+    }
+};
+
 /// Computes a name embedding for a mention on demand, so ANN/cosine blocking has
 /// a query vector even when the extraction artifact carries none. A function-
 /// pointer seam keeps the resolver library decoupled from the storage embedder;
@@ -717,6 +740,10 @@ pub const ResolutionStage = struct {
     /// `embedding` gets one from its text before blocking/scoring, so `ann`
     /// candidate search and cosine comparisons have a query vector.
     embedder: ?MentionEmbedder = null,
+    /// Optional human-curation overrides: when set, a mention with a recorded
+    /// review decision takes that decision/endpoint instead of the scorer's, so
+    /// a curated link survives re-resolution (replay-stable curation).
+    overrides: ?OverrideProvider = null,
 
     /// `extraction_key` / `resolution_key` are the primary-store artifact keys
     /// (encoded by the DB adapter). Returns what happened, for status/metrics.
@@ -772,6 +799,22 @@ pub const ResolutionStage = struct {
 
         var resolution = try self.resolver.resolve(gpa, self.config_generation, parsed.entities, lists);
         defer resolution.deinit();
+
+        // Apply human-curation overrides: a reviewed mention takes the curator's
+        // decision and endpoint (strings copied into the resolution arena so they
+        // outlive the override provider).
+        if (self.overrides) |ov| {
+            const arena = resolution.arena.allocator();
+            const ents = @constCast(resolution.entities);
+            for (ents) |*e| {
+                const o = ov.overrideFor(e.local_id) orelse continue;
+                e.decision = o.decision;
+                e.doc_ref = .{
+                    .table = try arena.dupe(u8, o.table),
+                    .key = try arena.dupe(u8, o.key),
+                };
+            }
+        }
 
         const bytes = try resolution.toJson(gpa);
         defer gpa.free(bytes);
@@ -1104,6 +1147,47 @@ test "resolution stage links to a candidate supplied by the provider" {
     };
     const stage = ResolutionStage{ .resolver = &resolver, .config_generation = 1 };
     try testing.expectEqual(RunResult.written, try stage.run(testing.allocator, map.store(), candidate.provider(), "ext:doc1", "res:doc1"));
+
+    const stored = (try map.store().get(testing.allocator, "res:doc1")).?;
+    defer testing.allocator.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, stored, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+const FixedOverride = struct {
+    local_id: []const u8,
+    override: Override,
+
+    fn provider(self: *FixedOverride) OverrideProvider {
+        return .{ .ptr = self, .override_for = overrideFor };
+    }
+    fn overrideFor(ptr: *anyopaque, local_id: []const u8) ?Override {
+        const self: *FixedOverride = @ptrCast(@alignCast(ptr));
+        return if (std.mem.eql(u8, local_id, self.local_id)) self.override else null;
+    }
+};
+
+test "a human-curation override replaces the resolver's decision for a mention" {
+    var resolver = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", true, "");
+    defer resolver.deinit();
+
+    var map = MapStore{ .alloc = testing.allocator };
+    defer map.deinit();
+    try map.store().put("ext:doc1",
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+
+    // Deterministic resolver would mint "ada_lovelace" (decision new); the
+    // curator links it to an existing canonical entity instead.
+    var override = FixedOverride{
+        .local_id = "e0",
+        .override = .{ .decision = .match, .table = "entities", .key = "person/ada_lovelace" },
+    };
+    const stage = ResolutionStage{ .resolver = &resolver, .config_generation = 1, .overrides = override.provider() };
+    try testing.expectEqual(RunResult.written, try stage.run(testing.allocator, map.store(), null, "ext:doc1", "res:doc1"));
 
     const stored = (try map.store().get(testing.allocator, "res:doc1")).?;
     defer testing.allocator.free(stored);

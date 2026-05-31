@@ -568,15 +568,17 @@ Open/index/enrichment validation should reject:
          pinned graph prior into one edge confidence. Unit-tested. Remaining:
          the fusion stage that reads multiple extraction artifacts and sets the
          edge weight from a pinned prior snapshot.
-   - [~] REVIEW band workflow: the review queue is done -- a review-band
-         decision is recorded durably in the resolution artifact
-         (`decision: "review"`) and `DB.listPendingReviews` /
-         `resolution_runtime.listPendingReviews` enumerate the review-band
-         mentions awaiting curation (doc key, mention id, provisional entity,
-         confidence). Verified by a db-test. Remaining: the human-curation API
-         that applies a decision (confirm / relink / reject) as a durable
-         override the resolver honors, and captures it as a training label
-         (feeds `fitScorerWeights`).
+   - [x] REVIEW band workflow: a review-band decision is recorded durably in the
+         resolution artifact (`decision: "review"`); the review queue
+         (`DB.listPendingReviews` / `resolution_runtime.listPendingReviews`)
+         enumerates the mentions awaiting curation. Human curation:
+         `recordReviewDecision` writes a durable per-document override
+         (confirm / relink / reject), the resolver honors it through an
+         `OverrideProvider` seam, and it survives re-resolution (replay-stable
+         curation; combined with the config-bump backfill it takes effect over
+         the corpus). The override record doubles as a training label for
+         `fitScorerWeights`. Verified by lib-resolver-test (the seam) and a
+         db-test (record -> re-resolve honors the curated link).
    - [x] 2PC atomic promotion: the promoter commits all of a document's
          resolved entities in one multi-participant transaction
          (`EntitySink.upsertBatch` -> `DistributedEntitySink` ->
