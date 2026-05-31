@@ -53,7 +53,67 @@ pub const DistributedEntitySink = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = EntitySink.VTable{ .upsert = upsertFn };
+    const vtable = EntitySink.VTable{ .upsert = upsertFn, .upsert_batch = upsertBatchFn };
+
+    /// Promote all of a document's entities in one transaction. With
+    /// `transactional` set, this is a single multi-participant 2PC commit across
+    /// the entity table's shards, so a document never lands a partial set of its
+    /// entities; otherwise it falls back to independent per-entity upserts.
+    fn upsertBatchFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        entries: []const db_mod.EntityUpsert,
+    ) anyerror!void {
+        const self: *DistributedEntitySink = @ptrCast(@alignCast(ptr));
+        if (entries.len == 0) return;
+        if (!self.transactional) {
+            for (entries) |e| try upsertFn(ptr, allocator, e.table, e.key, e.doc_json);
+            return;
+        }
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // Group merge transforms by table (one TableCommitRequest per table;
+        // commitTransaction routes each key to its group and commits atomically).
+        var tables = std.ArrayListUnmanaged([]const u8).empty;
+        var table_ops = std.ArrayListUnmanaged(std.ArrayListUnmanaged(db_mod.types.DocumentTransform)).empty;
+        for (entries) |e| {
+            const ops = try buildMergeOps(a, e.doc_json);
+            if (ops.len == 0) continue;
+            const transform = db_mod.types.DocumentTransform{ .key = e.key, .operations = ops, .upsert = true };
+            const idx = blk: {
+                for (tables.items, 0..) |t, i| {
+                    if (std.mem.eql(u8, t, e.table)) break :blk i;
+                }
+                try tables.append(a, e.table);
+                try table_ops.append(a, .empty);
+                break :blk tables.items.len - 1;
+            };
+            try table_ops.items[idx].append(a, transform);
+        }
+        if (tables.items.len == 0) return;
+
+        var reqs = std.ArrayListUnmanaged(distributed_txn.TableCommitRequest).empty;
+        for (tables.items, 0..) |t, i| {
+            try reqs.append(a, .{ .table_name = t, .transforms = table_ops.items[i].items });
+        }
+
+        const outcome = self.writes.commitTransaction(allocator, reqs.items, self.sync_level) catch |err| switch (err) {
+            error.UnexpectedHttpStatus, error.TableNotFound => return,
+            else => return err,
+        };
+        if (outcome) |result| {
+            switch (result) {
+                .committed => return,
+                .conflict => return error.EntityPromotionConflict,
+            }
+        }
+        // Transaction path unsupported by this write source; fall back to
+        // independent per-entity upserts (non-atomic).
+        for (entries) |e| try upsertFn(ptr, allocator, e.table, e.key, e.doc_json);
+    }
 
     fn upsertFn(
         ptr: *anyopaque,

@@ -1659,7 +1659,9 @@ pub const DataServer = struct {
         // source so the promoter upserts canonical entity documents into the
         // shard that owns each entity key, then hand it to the write source(s)
         // that open managed DBs.
-        self.distributed_entity_sink = .{ .writes = self.write_source.source() };
+        // Promote each document's entities atomically through the 2PC commit
+        // path (multi-participant across the entity table's shards).
+        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .transactional = true };
         const entity_sink = self.distributed_entity_sink.?.entitySink();
         _ = self.write_source.withEntitySink(entity_sink);
         if (self.data_raft_apply) |apply_sm| {

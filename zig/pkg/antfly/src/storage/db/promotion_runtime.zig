@@ -50,6 +50,13 @@ pub const scope_name = "promotion";
 /// layer implements a cross-shard sink over the table write path, applying an
 /// idempotent merge transform (set canonical fields, union aliases). The
 /// promoter calls this once per resolved mention.
+/// One canonical entity upsert: the document `doc_json` at `key` in `table`.
+pub const EntityUpsert = struct {
+    table: []const u8,
+    key: []const u8,
+    doc_json: []const u8,
+};
+
 pub const EntitySink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -58,10 +65,20 @@ pub const EntitySink = struct {
         /// Upsert the entity at `key` in `table` with the canonical document
         /// `doc_json`. Must be idempotent under replay.
         upsert: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void,
+        /// Upsert all entities resolved from one document atomically (a single
+        /// multi-participant transaction), so a document never lands a partial
+        /// set of its entities. Optional: when absent, `upsertBatch` falls back
+        /// to per-entity upserts.
+        upsert_batch: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const EntityUpsert) anyerror!void = null,
     };
 
     pub fn upsert(self: EntitySink, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
         return self.vtable.upsert(self.ptr, allocator, table, key, doc_json);
+    }
+
+    pub fn upsertBatch(self: EntitySink, allocator: std.mem.Allocator, entries: []const EntityUpsert) anyerror!void {
+        if (self.vtable.upsert_batch) |f| return f(self.ptr, allocator, entries);
+        for (entries) |e| try self.upsert(allocator, e.table, e.key, e.doc_json);
     }
 };
 
@@ -101,16 +118,26 @@ pub fn processResolutionArtifact(
     var parsed = resolver_lib.parseResolution(gpa, raw) catch return 0;
     defer parsed.deinit();
 
-    var promoted: usize = 0;
+    // Collect every resolvable entity, then commit them in one batch so a
+    // document's entities promote atomically (the sink uses a multi-participant
+    // transaction when it supports one).
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var entries = std.ArrayListUnmanaged(EntityUpsert).empty;
     for (parsed.entities) |e| {
         // Need at least a canonical name to mint/merge a meaningful entity.
         if (e.canonical_name.len == 0) continue;
-        const doc = try buildEntityDocAlloc(gpa, e);
-        defer gpa.free(doc);
-        try sink.upsert(gpa, e.doc_ref.table, e.doc_ref.key, doc);
-        promoted += 1;
+        try entries.append(a, .{
+            .table = e.doc_ref.table,
+            .key = e.doc_ref.key,
+            .doc_json = try buildEntityDocAlloc(a, e),
+        });
     }
-    return promoted;
+    if (entries.items.len == 0) return 0;
+    try sink.upsertBatch(gpa, entries.items);
+    return entries.items.len;
 }
 
 /// Promote every changed resolution-artifact key in a replay record.
@@ -368,6 +395,7 @@ const CaptureSink = struct {
     keys: std.ArrayListUnmanaged([]u8) = .empty,
     tables: std.ArrayListUnmanaged([]u8) = .empty,
     docs: std.ArrayListUnmanaged([]u8) = .empty,
+    batch_calls: usize = 0,
 
     fn deinit(self: *CaptureSink) void {
         for (self.keys.items) |k| self.alloc.free(k);
@@ -382,14 +410,25 @@ const CaptureSink = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = EntitySink.VTable{ .upsert = upsert };
+    const vtable = EntitySink.VTable{ .upsert = upsert, .upsert_batch = upsertBatch };
+
+    fn record(self: *CaptureSink, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
+        try self.tables.append(self.alloc, try self.alloc.dupe(u8, table));
+        try self.keys.append(self.alloc, try self.alloc.dupe(u8, key));
+        try self.docs.append(self.alloc, try self.alloc.dupe(u8, doc_json));
+    }
 
     fn upsert(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
         _ = allocator;
         const self: *CaptureSink = @ptrCast(@alignCast(ptr));
-        try self.tables.append(self.alloc, try self.alloc.dupe(u8, table));
-        try self.keys.append(self.alloc, try self.alloc.dupe(u8, key));
-        try self.docs.append(self.alloc, try self.alloc.dupe(u8, doc_json));
+        try self.record(table, key, doc_json);
+    }
+
+    fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const EntityUpsert) anyerror!void {
+        _ = allocator;
+        const self: *CaptureSink = @ptrCast(@alignCast(ptr));
+        self.batch_calls += 1;
+        for (entries) |e| try self.record(e.table, e.key, e.doc_json);
     }
 };
 
@@ -415,6 +454,8 @@ test "processResolutionArtifact upserts a canonical entity per resolved mention"
     const promoted = try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink());
     try testing.expectEqual(@as(usize, 2), promoted);
 
+    // Both entities promoted in a single atomic batch (one transaction).
+    try testing.expectEqual(@as(usize, 1), capture.batch_calls);
     try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
     try testing.expectEqualStrings("entities", capture.tables.items[0]);
     try testing.expectEqualStrings("person/ada_lovelace", capture.keys.items[0]);

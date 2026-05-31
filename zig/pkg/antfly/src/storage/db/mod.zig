@@ -71,6 +71,7 @@ pub const resolution_runtime = @import("resolution_runtime.zig");
 pub const CandidateSource = resolution_runtime.CandidateSource;
 pub const promotion_runtime = @import("promotion_runtime.zig");
 pub const EntitySink = promotion_runtime.EntitySink;
+pub const EntityUpsert = promotion_runtime.EntityUpsert;
 pub const DB = @import("db.zig").DB;
 pub const OpenOptions = @import("db.zig").OpenOptions;
 pub const OpenMode = @import("db.zig").OpenMode;

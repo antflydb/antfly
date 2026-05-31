@@ -561,9 +561,22 @@ Open/index/enrichment validation should reject:
    - REVIEW band workflow: review queue, human curation, label capture; resolver
      decision provenance and `pending_review` state.
    - Naive -> calibrated fusion across multiple extractors.
+   - [x] 2PC atomic promotion: the promoter commits all of a document's
+         resolved entities in one multi-participant transaction
+         (`EntitySink.upsertBatch` -> `DistributedEntitySink` ->
+         `commitTransaction` across the entity table's shards), so a document
+         never lands a partial set of its entities. Enabled in serving
+         (`transactional = true`); verified live by e2e/test_resolution.py and a
+         db-test (atomic batch). NOTE: atomically coupling the entity upsert with
+         the *graph-edge* artifact is still not possible -- `TableCommitRequest`
+         carries document writes/transforms, not graph edges -- so the
+         entity+edge coupling from option 1 needs that machinery extension; the
+         decoupled + fail-closed path remains correct meanwhile.
 3. **Merge/split (phase 3).**
-   - Entity `merged_into`, config-generation re-resolution, edge rewrite.
-   - Optional 2PC coupling of entity + edge writes.
+   - [x] Entity `merged_into`: resolution follows a matched candidate's
+         `merged_into` redirect to the surviving canonical entity (lazy merge).
+   - [ ] config-generation re-resolution backfill (re-scan extraction artifacts
+         when a resolver's `config_generation` bumps) and eager edge rewrite.
 
 ## Test Plan
 
