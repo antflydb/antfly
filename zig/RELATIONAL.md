@@ -251,12 +251,17 @@ number) is additive where the physical type is compatible.
   catalog via `buildRelationalTypedFields`; the introducer materializes the
   typed columns. Covered by runtime-schema, `document_mapper`, and introducer
   tests.
-- **Phase 4 — read path (works; verified end-to-end).** Relational typed
-  columns are scanned by the engine's existing typed filters (`RangeFilter`,
+- **Phase 4 — read path with schema-aware predicate routing (done).** Relational
+  typed columns are scanned by the engine's typed filters (`RangeFilter`,
   `DateRangeFilter`, `BoolFieldFilter`, geo) via `typed_doc_values` by column
-  name; `.range` queries already route there. Verified by the end-to-end
-  range-scan test. Remaining enhancement: schema-aware auto-routing of
-  predicates on typed columns (use the runtime `relational_columns` catalog).
+  name. Predicate auto-routing is now wired: `searchQueryToFilterArenaRelational`
+  threads the declared keyword-column names through filter compilation (incl. the
+  `bool_query` recursion) and routes an exact `.term` predicate on a declared
+  keyword column to a columnar `TypedTermFilter` (the column-scan counterpart to
+  the inverted-index `TermFilter`) instead of the analyzed full-text index.
+  numeric/date/bool/geo predicates already read the columns. Document-mode queries
+  are unchanged (empty keyword-column set). datetime columns accept RFC3339 UTC
+  strings as well as epoch integers on ingest (shared `introducer.parseRfc3339ToNs`).
 - **Phase 5 — authoritative columns (Phase B).** Foundation done:
   `reconstructRelationalDocumentAlloc` rebuilds a JSON document from a projected
   `RelationalRow` (string/blob/geoshape → string, numeric/integer → number,

@@ -4108,3 +4108,46 @@ test "relational datetime column accepts RFC3339 strings and epoch integers" {
         try std.testing.expectEqual(@as(i64, 42), parsed.value.object.get("ts").?.integer);
     }
 }
+
+test "relational typed row reconstructs under additive schema change" {
+    // Schema evolution safety: a document stored as a typed row under an OLD
+    // column set must still reconstruct correctly after a new (nullable) column
+    // is added, because the row is self-describing. The new column is simply
+    // absent for the old document until it is rewritten.
+    const alloc = std.testing.allocator;
+
+    const old_columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    // Write a document under the old schema.
+    const row_value = try buildRelationalRowValueAlloc(alloc, "{\"id\":\"a\",\"amount\":12.5}", &old_columns);
+    defer alloc.free(row_value);
+
+    // Schema evolves: a new nullable column "note" is added. Reads do not depend
+    // on the schema -- reconstruction is driven by the self-describing row -- so
+    // the old document still rebuilds to exactly its original fields.
+    const rebuilt = try reconstructRelationalRowDocumentAlloc(alloc, row_value);
+    defer alloc.free(rebuilt);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rebuilt, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(usize, 2), obj.count());
+    try std.testing.expectEqualStrings("a", obj.get("id").?.string);
+    try std.testing.expect(obj.get("note") == null);
+
+    // A document written AFTER the change carries the new column.
+    const new_columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+        .{ .name = "note", .path = "note", .field_type = .keyword, .nullable = true },
+    };
+    const new_row = try buildRelationalRowValueAlloc(alloc, "{\"id\":\"b\",\"amount\":1.0,\"note\":\"hi\"}", &new_columns);
+    defer alloc.free(new_row);
+    const new_rebuilt = try reconstructRelationalRowDocumentAlloc(alloc, new_row);
+    defer alloc.free(new_rebuilt);
+    var new_parsed = try std.json.parseFromSlice(std.json.Value, alloc, new_rebuilt, .{});
+    defer new_parsed.deinit();
+    try std.testing.expectEqualStrings("hi", new_parsed.value.object.get("note").?.string);
+}
