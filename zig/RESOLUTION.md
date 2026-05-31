@@ -512,9 +512,23 @@ Open/index/enrichment validation should reject:
          candidates from the entity table (`ann`/`exact`/`prefix`) over the
          routing-aware read source. Pending only the serving-layer injection
          (above) to be live end-to-end.
-   - [ ] Promoter: entity upsert via `DocumentTransform`, provenance as mention
-         edges, decoupled cross-shard write, fail-closed hydration.
-   - [ ] `DocRef` endpoints threaded through graph edge artifacts.
+   - [x] Promoter: a managed stage (`promotion_runtime.zig`, `promotion` change-
+         journal hint) consumes resolution artifacts and upserts canonical entity
+         documents through an injected `EntitySink`. `DistributedEntitySink`
+         implements the sink over the routing-aware `TableWriteSource` with an
+         idempotent merge `DocumentTransform` (set entity_type/canonical_name,
+         add_to_set aliases, upsert) -- the decoupled cross-shard write. Wired
+         through `DataServer.initApiServer` + the managed write cache
+         (`adoptPreparedOpenLocked` and `seedCreatedDbLocked` ->
+         `DB.setEntitySink`). Verified end-to-end on a live multi-Raft swarm by
+         `e2e/antfly/test_resolution.py` (document -> extraction -> resolution ->
+         cross-shard entity upsert) plus db-test/lib-resolution-source-test.
+   - [x] Resolvers declarable via table config: a `resolvers` section in the
+         index config (top-level or nested in an index) is registered by the
+         provisioner on both the reconcile and create-local paths.
+   - [ ] Provenance as inbound mention edges; fail-closed hydration of
+         not-yet-promoted entities; `DocRef` endpoints threaded through graph
+         edge artifacts.
 2. **Learned + reviewed (phase 2).**
    - Learned weights (EM / logistic regression) over the same levels.
    - REVIEW band workflow: review queue, human curation, label capture; resolver

@@ -791,6 +791,11 @@ pub const ProvisionedTableWriteCache = struct {
         opened.* = null;
         errdefer db.close();
 
+        // Inject the cross-shard candidate source and entity sink, same as the
+        // adoptPreparedOpenLocked open path (this create-local seed bypasses it).
+        if (self.resolution_candidate_source) |src| db.setResolutionCandidateSource(src);
+        if (self.entity_sink) |sink| db.setEntitySink(sink);
+
         const owned_table_name = try self.alloc.dupe(u8, table_name);
         errdefer self.alloc.free(owned_table_name);
         const owned_schema_json = try self.alloc.dupe(u8, schema_json);
@@ -4668,6 +4673,11 @@ pub const ProvisionedTableWriteSource = struct {
             );
             defer if (opened) |*db| db.close();
             try applyLocalTableSchemaJson(alloc, &opened.?, schema_json);
+            // Register entity resolvers declared in the index config. Indexes
+            // and enrichments are provisioned through the managed-open path, but
+            // resolvers are not, so do it here (idempotent: addResolver skips
+            // names that already exist on reopen).
+            _ = try metadata_table_provisioner.ensureResolvers(alloc, &opened.?, indexes_json);
             if (self.write_cache) |cache| {
                 try cache.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table_name, indexes_json, schema_json);
             }

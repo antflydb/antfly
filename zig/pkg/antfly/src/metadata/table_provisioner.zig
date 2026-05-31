@@ -542,7 +542,7 @@ fn enrichmentExists(existing: []const db_mod.types.EnrichmentConfig, kind: db_mo
     return false;
 }
 
-fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !usize {
+pub fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !usize {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
 
