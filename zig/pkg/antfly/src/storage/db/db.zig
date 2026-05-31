@@ -2618,10 +2618,9 @@ pub const DB = struct {
     }
 
     fn initResolutionRuntime(self: *DB) !void {
-        // The worker runs on the backend_runtime io loop; without io there is no
-        // way to drive catch-up, so resolution stays inert (replay still durable).
-        if (self.backend_runtime.io_impl == null) return;
-
+        // Always constructed: with io a background loop drives catch-up; without
+        // io it is driven synchronously via runUntilIdle. Replay stays durable
+        // regardless.
         const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
         errdefer self.runtime_alloc.destroy(append_ctx);
         const resources = self.core.batchExecutionResources();
@@ -6185,6 +6184,13 @@ pub const DB = struct {
             target_sequence = @max(target_sequence, runtime.stats().target_sequence);
         }
         try self.runMaintenanceUntil(target_sequence, .{});
+        if (self.resolution_runtime) |runtime| {
+            // Drive to the latest produced sequence (extraction artifacts may
+            // have been appended above), then drain.
+            const latest = self.core.nextDerivedSequence();
+            if (latest > 0) runtime.notifySequence(latest - 1);
+            try runtime.catchUp();
+        }
         _ = try self.evaluateAlgebraicAdaptiveCandidates();
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
@@ -16737,7 +16743,15 @@ fn truncateReplayLogs(ctx: *const BatchExecutionContext, up_to_sequence: u64) !v
 
 fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
-    try ctx.store.truncateReplayUpTo(ctx.alloc, sequence);
+    var effective = sequence;
+    // The resolution stage consumes the replay journal but is not an executor
+    // worker, so clamp truncation to its applied sequence (its records must
+    // survive until it processes them).
+    if (ctx.index_manager.resolvers.items.len > 0) {
+        const resolution_applied = enrichment_state.loadAppliedSequence(ctx.alloc, ctx.store, resolution_runtime_mod.scope_name) catch effective;
+        effective = @min(effective, resolution_applied);
+    }
+    try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
 }
 
 fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
@@ -16767,6 +16781,14 @@ fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
             enrichment_runtime_mod.scope_name,
         );
         min_applied = @min(min_applied, enrichment_applied);
+    }
+    if (ctx.index_manager.resolvers.items.len > 0) {
+        const resolution_applied = try enrichment_state.loadAppliedSequence(
+            ctx.alloc,
+            ctx.store,
+            resolution_runtime_mod.scope_name,
+        );
+        min_applied = @min(min_applied, resolution_applied);
     }
     if (min_applied == 0 or min_applied == std.math.maxInt(u64)) return;
     try truncateReplayLogs(ctx, min_applied);
@@ -23197,6 +23219,64 @@ test "db _edges writes record graph artifacts in the replay stream instead of gr
     for (journal_record.record.changed_artifact_keys) |artifact_key| {
         try std.testing.expect(internal_keys.isGraphEdgeArtifactKey(artifact_key));
     }
+}
+
+test "db resolves extracted entities into a resolution artifact end-to-end" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // A graph index drives production of the relations_v1 asset (extraction)
+    // artifact; the resolver consumes the same artifact.
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "knowledge_graph",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("config_generation").?.integer);
+    const entities = parsed.value.object.get("entities").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), entities.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", entities[0].object.get("doc_ref").?.object.get("key").?.string);
+    try std.testing.expectEqualStrings("org/antfly", entities[1].object.get("doc_ref").?.object.get("key").?.string);
 }
 
 test "db graph index materializes relation asset artifacts into graph edge artifacts" {

@@ -24,6 +24,7 @@
 //! it pure and unit-testable.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const resolver_lib = @import("antfly_resolver");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
 const internal_keys = @import("../internal_keys.zig");
@@ -39,6 +40,10 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 pub const ResolverConfig = resolver_catalog.ResolverConfig;
+
+/// applied-sequence checkpoint scope; also used by the replay prune watermark
+/// so resolution records survive until the worker consumes them.
+pub const scope_name = "resolution";
 
 /// Appends a derived batch to the replay log, returning its sequence. Matches
 /// the enrichment runtime's writer so the db wires the same callback.
@@ -220,7 +225,8 @@ pub fn catchUpWindow(
         .provider = provider,
         .write_ctx = write_ctx,
         .write_fn = write_fn,
-        .max_seen = from_sequence -| 1,
+        // from_sequence is exclusive; with no records, return it unchanged.
+        .max_seen = from_sequence,
     };
     _ = try replay_source.forEachMatchingRecord(gpa, from_sequence, .resolution, max_records, &ctx, Ctx.consume);
     return ctx.max_seen;
@@ -268,12 +274,11 @@ pub const ResolutionRuntime = struct {
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
     io_impl: ?*background_runtime_mod.IoImpl,
-    applied_sequence: u64,
+    applied_sequence: std.atomic.Value(u64),
     target_sequence: std.atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
+    catch_up_mutex: std.atomic.Mutex = .unlocked,
     future: ?Io.Future(void),
-
-    const scope_name = "resolution";
 
     pub fn init(
         alloc: Allocator,
@@ -295,7 +300,7 @@ pub const ResolutionRuntime = struct {
             .write_ctx = write_ctx,
             .write_fn = write_fn,
             .io_impl = backend_runtime.io_impl,
-            .applied_sequence = applied,
+            .applied_sequence = .init(applied),
             .target_sequence = .init(applied),
             .shutdown_flag = .init(false),
             .future = null,
@@ -317,7 +322,9 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn start(self: *ResolutionRuntime) !void {
-        const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
+        // Without io there is no background thread; the stage is then driven
+        // synchronously via catchUp (e.g. from runUntilIdle).
+        const io_impl = self.io_impl orelse return;
         self.future = try io_impl.io().concurrent(workerMain, .{self});
     }
 
@@ -331,46 +338,61 @@ pub const ResolutionRuntime = struct {
         }
     }
 
-    /// One catch-up pass: drain applied -> target. Idempotent and safe to retry
-    /// (the stage skips unchanged resolutions).
+    /// Drain applied -> target. Serialized so the background worker and a
+    /// synchronous driver (runUntilIdle) cannot process the same records at
+    /// once; idempotent and safe to retry (the stage skips unchanged
+    /// resolutions). `applied_sequence` is persisted only after durable writes.
     pub fn catchUp(self: *ResolutionRuntime) !void {
-        const target = self.target_sequence.load(.acquire);
-        if (self.applied_sequence >= target) return;
+        lockMutex(&self.catch_up_mutex);
+        defer self.catch_up_mutex.unlock();
 
-        const resolvers = try self.index_manager.listResolvers(self.alloc);
-        defer {
-            for (resolvers) |*cfg| cfg.deinit(self.alloc);
-            self.alloc.free(resolvers);
-        }
-        if (resolvers.len == 0) {
-            // No resolver configured; advance so the hint does not rescan.
-            try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
-            self.applied_sequence = target;
-            return;
-        }
+        while (true) {
+            const target = self.target_sequence.load(.acquire);
+            const applied = self.applied_sequence.load(.acquire);
+            if (applied >= target) return;
 
-        var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
-        const max_seen = try catchUpWindow(
-            self.alloc,
-            self.replay_source,
-            resolvers,
-            das.artifactStore(),
-            null,
-            self.applied_sequence + 1,
-            default_max_records_per_window,
-            self.write_ctx,
-            self.write_fn,
-        );
-        if (max_seen > self.applied_sequence) {
+            const resolvers = try self.index_manager.listResolvers(self.alloc);
+            defer {
+                for (resolvers) |*cfg| cfg.deinit(self.alloc);
+                self.alloc.free(resolvers);
+            }
+            if (resolvers.len == 0) {
+                // No resolver configured; advance so the hint does not rescan.
+                try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
+                self.applied_sequence.store(target, .release);
+                return;
+            }
+
+            var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
+            const max_seen = try catchUpWindow(
+                self.alloc,
+                self.replay_source,
+                resolvers,
+                das.artifactStore(),
+                null,
+                // from_sequence is exclusive (records with seq > from), matching
+                // the derived workers, which pass their applied_sequence.
+                applied,
+                default_max_records_per_window,
+                self.write_ctx,
+                self.write_fn,
+            );
+            if (max_seen <= applied) {
+                // No matching records in (applied, target]; advance to target.
+                try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
+                self.applied_sequence.store(target, .release);
+                return;
+            }
             try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, max_seen);
-            self.applied_sequence = max_seen;
+            self.applied_sequence.store(max_seen, .release);
+            // Loop to process the next window if max_seen is still below target.
         }
     }
 
     fn workerMain(self: *ResolutionRuntime) void {
         const io = (self.io_impl orelse return).io();
         while (!self.shutdown_flag.load(.acquire)) {
-            if (self.applied_sequence < self.target_sequence.load(.acquire)) {
+            if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
                 self.catchUp() catch |err| {
                     std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
                     io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
@@ -382,6 +404,16 @@ pub const ResolutionRuntime = struct {
         self.catchUp() catch {};
     }
 };
+
+fn lockMutex(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) {
+        if (builtin.single_threaded) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        std.Thread.yield() catch {};
+    }
+}
 
 const testing = std.testing;
 
@@ -786,7 +818,7 @@ const FakeSource = struct {
         var matched: usize = 0;
         var last: u64 = 0;
         for (self.records) |rec| {
-            if (rec.sequence < from_sequence) continue;
+            if (rec.sequence <= from_sequence) continue; // exclusive, matching the real source
             if (max_matched_entries != 0 and matched >= max_matched_entries) break;
             try consume(ctx, rec.sequence, rec.payload);
             matched += 1;
@@ -871,7 +903,7 @@ test "catchUpWindow with no matching records returns from-1" {
     defer writer.deinit();
 
     const max_seen = try catchUpWindow(alloc, fake_source.source(), &resolvers, das.artifactStore(), null, 5, 0, &writer, CaptureWriter.writeFn);
-    try testing.expectEqual(@as(u64, 4), max_seen);
+    try testing.expectEqual(@as(u64, 5), max_seen);
     try testing.expectEqual(@as(u64, 0), writer.calls);
 }
 
