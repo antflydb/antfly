@@ -306,16 +306,33 @@ number) is additive where the physical type is compatible.
   introducer-built segment by the "relational document reconstructs from a
   persisted segment" test (plus an absent-nullable-column case).
 
-  Remaining (the last step, deliberately not done — it changes the read source
-  of truth): drop the `stored_data` blob. Today the blob (`segment.addStoredDoc`)
-  is still written and remains the document source of truth, consumed in many
-  read sites (`storage/db/aggregations.zig`, `db.zig`). The final step is to
-  route those reads through `reconstructRelationalDocumentFromSegmentAlloc`
-  (synthesizing `stored_data` on demand) and then stop writing the blob for
-  non-`json` columns. The full reconstruction path now exists and is segment-
-  verified; what remains is swapping the read source and removing the blob
-  write, validated against the whole suite. Until then the blob is
-  redundant-but-authoritative and the column work is additive.
+  Read-source swap done (live, full-text path): the full-text hit-materialization
+  seam (`storage/db/query/search_exec.zig`) now, for relational tables, builds a
+  hit's `stored_data` by calling `reconstructRelationalDocumentFromSegmentAlloc`
+  on the resolved segment + segment-local id (`snapshot.resolveDocId`, the same
+  id `typed_doc_values` is keyed by) instead of the segment stored-doc blob.
+  Document-mode tables are completely unchanged (they keep the blob path). Proven
+  end to end by the "relational table full-text search reconstructs stored_data
+  from columns" test (real DB: relational schema → write → full-text query with
+  `include_stored` → `stored_data` reconstructed from typed columns), and
+  validated by the full `zig build unit-test` suite (0 failed, 0 leaked).
+
+  Scope decision (deliberate): there are two document copies, in different
+  subsystems, and only one is safe to make column-derived right now.
+  - The **segment stored-doc** (`addStoredDoc`) backs full-text reads — now
+    reconstructed-from-columns for relational tables (above). The segment blob is
+    still *written* today; dropping that write is a follow-up storage saving, not
+    a correctness change, since reads no longer consult it for relational tables.
+  - The **KV-store value** (`db.get` / `getStoreValue`, keyed by doc key) is the
+    authoritative source of truth and is consumed synchronously by
+    read-modify-write **transforms** (`db.zig:4007`) and by **vector/dense search**
+    hit materialization (`db.zig:38939`). It is **intentionally not** made
+    column-derived: segments are built async/batched, so reconstruction-on-read
+    cannot satisfy a synchronous transform read without a consistency-model
+    redesign. Document mode keeps the KV blob unconditionally; relational mode
+    keeps it as the authoritative store and treats columns as the
+    reconstructable projection for full-text reads. Removing the KV blob is a
+    separate architecture task, not part of relational mode as scoped here.
 
 ## Related docs
 

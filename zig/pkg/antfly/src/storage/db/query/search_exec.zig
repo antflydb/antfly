@@ -3581,6 +3581,21 @@ pub fn searchTextQuery(
         }
     }
 
+    // Relational tables persist every column as a typed_doc_values section, so
+    // a full-text hit's document is reconstructed from those columns rather than
+    // the (still-written, for now) segment stored-doc blob. Document-mode tables
+    // are unchanged. Reconstruction needs the segment-local id, which is what
+    // typed_doc_values is keyed by -- resolveDocId maps the global hit id to
+    // (segment, local_id), exactly as storedDoc does.
+    const relational_columns: ?[]const runtime_schema_mod.RelationalColumn =
+        if (effective_req.include_stored)
+            if (text_entry.runtime_schema) |rs|
+                if (rs.storage_mode == .relational and rs.relational_columns.len > 0) rs.relational_columns else null
+            else
+                null
+        else
+            null;
+
     for (result.hits, 0..) |hit, i| {
         const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
         const id = hit.id orelse {
@@ -3595,14 +3610,24 @@ pub fn searchTextQuery(
             continue;
         };
 
+        const stored_data: ?[]u8 = if (relational_columns) |columns| blk: {
+            const resolved = snapshot.resolveDocId(hit.doc_id) orelse break :blk null;
+            break :blk try mapper_mod.reconstructRelationalDocumentFromSegmentAlloc(
+                alloc,
+                &snapshot.segments[resolved.seg_idx].reader,
+                columns,
+                resolved.local_id,
+            );
+        } else if (effective_req.include_stored and hit.stored_data != null)
+            try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
+        else
+            null;
+
         hits[i] = .{
             .id = try alloc.dupe(u8, id),
             .doc_ordinal = doc_ordinal,
             .score = hit.score,
-            .stored_data = if (effective_req.include_stored and hit.stored_data != null)
-                try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
-            else
-                null,
+            .stored_data = stored_data,
         };
         initialized += 1;
     }
