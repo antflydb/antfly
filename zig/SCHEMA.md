@@ -137,6 +137,39 @@ paths instead of falling back to field-name-only schema heuristics.
 The first debug surface for this compiled plan now hangs off the existing admin
 table and index detail routes via `?debug=runtime_schema`.
 
+## Dynamic Templates and the Algebraic Index
+
+Dynamic templates feed the algebraic sidecar as well as the full-text index, so
+a template-matched field is promoted into typed group/measure/time docfacts at
+ingest time — Elasticsearch-style runtime-adaptive mapping — without a schema
+version bump or a reindex.
+
+- `schema/mod.zig` compilation lowers each bounded template
+  (`keyword`/`link`/`numeric`/`boolean`/`datetime`) into a capability
+  `dynamic_field_rule`. Unbounded templates (`text`/`html`/`search_as_you_type`)
+  and templates with no positive selector (`match` / `path_match` /
+  `match_mapping_type`) are intentionally NOT promoted — they stay on the
+  schemaless path-fact path. This is the cardinality guard that keeps a broad
+  `match: "*"` template from exploding group-by cardinality.
+- At ingest, `storage/db/algebraic/index.zig` evaluates the rules against every
+  observed field not already covered by a static spec, reusing the same
+  `globMatch` / `match_mapping_type` semantics as the full-text resolver in
+  `storage/schema.zig`. Explicit schema fields always win over templates.
+- The dynamic fact identity is the full dotted path (top-level templates have
+  path == field name). Numeric templates project group+measure, datetime
+  project group+time, keyword/boolean project group.
+
+Template-only updates propagate without a recreate on two levels:
+
+- the durable table `indexes_json` is regenerated on every schema update
+  (`api/tables.zig: regenerateAlgebraicIndexesFromSchemaAlloc`), so fresh opens,
+  new replicas, and restarts pick up the new rules; and
+- live indexes are refreshed in place
+  (`DB.reloadAlgebraicSchemaConfigs` → `Index.reloadConfigJson`) so running
+  writers apply the new rules immediately. Existing documents are reconciled
+  lazily — only new or rewritten documents reflect a changed template until a
+  full rebuild — matching the no-reindex contract.
+
 ## Related Docs
 
 - [TODO.md](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/TODO.md)

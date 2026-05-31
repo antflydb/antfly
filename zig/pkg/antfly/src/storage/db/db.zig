@@ -14699,6 +14699,13 @@ pub const DB = struct {
         return try self.core.getStoreValue(alloc, public_schema_json_key);
     }
 
+    /// Refresh schema-derived algebraic index configs (notably dynamic-template
+    /// rules) in place from the given table schema JSON, so a dynamic-template
+    /// change applies to a running DB without a reopen.
+    pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
+        try self.core.index_manager.reloadAlgebraicSchemaConfigs(schema_json);
+    }
+
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
         const txn_id = makeTxnId(self);
         return try self.beginTransactionWithIdAndParticipants(txn_id, timestamp_ns, &.{});
