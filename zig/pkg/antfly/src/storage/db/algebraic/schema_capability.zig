@@ -189,118 +189,9 @@ pub fn configJsonFromPlanAlloc(alloc: Allocator, table_name: []const u8, plan: P
     try appendJsonString(alloc, &out, "adaptive");
     try out.appendSlice(alloc, ":{\"observe\":true,\"lazy_materialization\":false,\"dematerialization\":false,\"min_observations\":3},");
     try appendJsonString(alloc, &out, "materializations");
-    try out.append(alloc, ':');
-    try appendDefaultMaterializations(alloc, &out, plan);
-    try out.append(alloc, '}');
+    try out.appendSlice(alloc, ":[]}");
 
     return try out.toOwnedSlice(alloc);
-}
-
-/// Upper bound on default materializations emitted from a schema. Protects very
-/// wide tables from a combinatorial (group x measure) blow-up; if the grouped
-/// metric set would exceed this, only the linear-size set is emitted and hot
-/// grouped rollups are left to adaptive observation.
-const max_default_materializations: usize = 256;
-
-/// Default metric ops materialized per measure. count is materialized separately
-/// (it needs no measure); avg is derived from sum + count by the planner.
-const default_metric_ops = [_][]const u8{ "sum", "min", "max", "sumsquares" };
-
-/// Append one materialization object: `op` over optional `measure`, grouped by
-/// optional `group_by` (null => ungrouped/global). `seq` makes the name unique.
-fn appendMaterialization(
-    alloc: Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    first: *bool,
-    seq: *usize,
-    op: []const u8,
-    measure: ?[]const u8,
-    group_by: ?[]const u8,
-) !void {
-    if (!first.*) try out.append(alloc, ',');
-    first.* = false;
-    try out.append(alloc, '{');
-    try appendJsonString(alloc, out, "name");
-    try out.append(alloc, ':');
-    try appendFmt(alloc, out, "\"auto_{s}_{d}\"", .{ op, seq.* });
-    seq.* += 1;
-    try out.append(alloc, ',');
-    try appendJsonString(alloc, out, "op");
-    try out.append(alloc, ':');
-    try appendJsonString(alloc, out, op);
-    try out.append(alloc, ',');
-    try appendJsonString(alloc, out, "group_by");
-    try out.append(alloc, ':');
-    try out.append(alloc, '[');
-    if (group_by) |g| try appendJsonString(alloc, out, g);
-    try out.append(alloc, ']');
-    if (measure) |m| {
-        try out.append(alloc, ',');
-        try appendJsonString(alloc, out, "measure");
-        try out.append(alloc, ':');
-        try appendJsonString(alloc, out, m);
-    }
-    try out.append(alloc, '}');
-}
-
-/// Emit a bounded set of default materializations derived from the plan's group
-/// and measure fields, so a schema-derived algebraic index serves common
-/// aggregations out of the box rather than relying on adaptive observation to
-/// build them first (adaptive observation does not run on the single-node
-/// provisioned path):
-///   - an ungrouped count and a per-group-field count (terms / value_count);
-///   - ungrouped sum/min/max/sumsquares per measure (global metrics & stats);
-///   - the same metrics grouped by each group field (GROUP BY + metric), unless
-///     that grouped set would exceed `max_default_materializations`.
-fn appendDefaultMaterializations(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), plan: Plan) !void {
-    var group_count: usize = 0;
-    var measure_count: usize = 0;
-    for (plan.fields) |field| {
-        switch (field.role) {
-            .group => group_count += 1,
-            .measure => measure_count += 1,
-            else => {},
-        }
-    }
-
-    const linear_tier = 1 + group_count + measure_count * default_metric_ops.len;
-    const grouped_tier = group_count * measure_count * default_metric_ops.len;
-    const include_grouped = (linear_tier + grouped_tier) <= max_default_materializations;
-
-    try out.append(alloc, '[');
-    var first = true;
-    var seq: usize = 0;
-
-    // Ungrouped total count, then a count per group field.
-    try appendMaterialization(alloc, out, &first, &seq, "count", null, null);
-    for (plan.fields) |gfield| {
-        if (gfield.role != .group) continue;
-        try appendMaterialization(alloc, out, &first, &seq, "count", null, gfield.name);
-    }
-
-    // Ungrouped metric per measure.
-    for (plan.fields) |mfield| {
-        if (mfield.role != .measure) continue;
-        for (default_metric_ops) |op| {
-            try appendMaterialization(alloc, out, &first, &seq, op, mfield.name, null);
-        }
-    }
-
-    // Grouped metric per (group field, measure) -- the GROUP BY + metric case.
-    if (include_grouped) {
-        for (plan.fields) |gfield| {
-            if (gfield.role != .group) continue;
-            for (plan.fields) |mfield| {
-                if (mfield.role != .measure) continue;
-                if (std.mem.eql(u8, gfield.name, mfield.name)) continue; // degenerate self-group
-                for (default_metric_ops) |op| {
-                    try appendMaterialization(alloc, out, &first, &seq, op, mfield.name, gfield.name);
-                }
-            }
-        }
-    }
-
-    try out.append(alloc, ']');
 }
 
 fn appendLawConfig(
@@ -661,16 +552,14 @@ test "schema capability config can compile directly from schema json" {
     try std.testing.expectEqualStrings("orders", parsed_config.value.table);
     try std.testing.expectEqual(@as(usize, 2), parsed_config.value.group_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.measure_fields.len);
-    // Default materializations are derived from the schema's group/measure fields.
-    try std.testing.expect(parsed_config.value.materializations.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), parsed_config.value.materializations.len);
 }
 
 test "schema capability config derives from a relational schema for auto-created index" {
     // A relational table's closed schema must derive a valid algebraic index
     // config (the basis for auto-creating an aggregation index): keyword columns
-    // become group axes, numeric columns become measures, and a bounded set of
-    // default materializations is emitted so the index serves common
-    // aggregations immediately.
+    // become group axes, numeric columns become measures. No eager
+    // materializations -- adaptive observation fills them in.
     const alloc = std.testing.allocator;
     const config_json = try configJsonFromSchemaJsonAlloc(alloc, "sales",
         \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created":{"type":"datetime"}},"required":["tenant","amount"],"additionalProperties":false}}}}
@@ -686,9 +575,8 @@ test "schema capability config derives from a relational schema for auto-created
     try std.testing.expectEqual(@as(usize, 4), parsed_config.value.group_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.measure_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.time_fields.len);
-    // Default materializations are derived eagerly (a count and per-measure
-    // metrics, grouped and ungrouped); adaptive observation is also on.
-    try std.testing.expect(parsed_config.value.materializations.len > 0);
+    // No eager materializations; adaptive observation is on by default.
+    try std.testing.expectEqual(@as(usize, 0), parsed_config.value.materializations.len);
     try std.testing.expect(parsed_config.value.adaptive.observe);
     // The derived config must validate.
     try index_mod.validateConfig(parsed_config.value);
