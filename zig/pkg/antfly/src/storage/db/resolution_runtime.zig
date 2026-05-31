@@ -173,11 +173,38 @@ fn appendEntityCandidate(
     var label: []const u8 = "";
     var it = parsed.value.object.iterator();
     while (it.next()) |e| {
-        if (e.value_ptr.* != .string) continue;
-        const fname = try allocator.dupe(u8, e.key_ptr.*);
-        const fval = try allocator.dupe(u8, e.value_ptr.*.string);
-        try fields.append(allocator, .{ .name = fname, .value = .{ .text = fval } });
-        if (std.mem.eql(u8, e.key_ptr.*, "label") or std.mem.eql(u8, e.key_ptr.*, "entity_type")) label = fval;
+        switch (e.value_ptr.*) {
+            .string => |s| {
+                const fname = try allocator.dupe(u8, e.key_ptr.*);
+                const fval = try allocator.dupe(u8, s);
+                try fields.append(allocator, .{ .name = fname, .value = .{ .text = fval } });
+                if (std.mem.eql(u8, e.key_ptr.*, "label") or std.mem.eql(u8, e.key_ptr.*, "entity_type")) label = fval;
+            },
+            .array => |arr| {
+                // A numeric array becomes a vector field (e.g. name_embedding).
+                if (arr.items.len == 0) continue;
+                const vec = try allocator.alloc(f32, arr.items.len);
+                var ok = true;
+                for (arr.items, 0..) |item, i| {
+                    vec[i] = switch (item) {
+                        .float => |f| @floatCast(f),
+                        .integer => |n| @floatFromInt(n),
+                        .number_string => |ns| std.fmt.parseFloat(f32, ns) catch {
+                            ok = false;
+                            break;
+                        },
+                        else => {
+                            ok = false;
+                            break;
+                        },
+                    };
+                }
+                if (ok) {
+                    try fields.append(allocator, .{ .name = try allocator.dupe(u8, e.key_ptr.*), .value = .{ .vector = vec } });
+                } else allocator.free(vec);
+            },
+            else => {},
+        }
     }
 
     try out.append(allocator, .{
@@ -1174,5 +1201,53 @@ test "prefix blocking links a typo'd mention to an existing entity with a differ
     const ent = parsed.value.object.get("entities").?.array.items[0].object;
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     // Linked to the existing entity (prefix scan + scorer), not the typo'd mint.
+    try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "embedding (cosine) scoring links via prefix blocking" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "emb", "left": "name_embedding", "right": "name_embedding",
+        \\  "levels": [ { "when": "cosine > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+
+    // Mention carries a query embedding; its text differs from the entity's.
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "A Lovelace", "embedding": [0.1, 0.2, 0.3, 0.4] } ] }
+    );
+    const entity_doc_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(entity_doc_key);
+    try store.put(entity_doc_key,
+        \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [0.1, 0.2, 0.3, 0.4] }
+    );
+
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key)).?;
+    defer alloc.free(outcome.resolution_key);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const stored = (try store.get(alloc, resolution_key)).?;
+    defer alloc.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    // Linked by embedding similarity despite differing text.
+    try testing.expectEqualStrings("match", ent.get("decision").?.string);
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 }

@@ -46,6 +46,8 @@ pub const ExtractedEntity = struct {
     local_id: []const u8,
     label: []const u8,
     text: []const u8,
+    /// Optional query embedding (e.g. a name embedding) for cosine/ANN scoring.
+    embedding: ?[]const f32 = null,
 };
 
 /// A resolution candidate fetched by blocking. `record` is scored against the
@@ -243,8 +245,9 @@ pub const Resolver = struct {
                     .{ .name = "label", .value = .{ .text = entity.label } },
                     .{ .name = "text", .value = .{ .text = entity.text } },
                     .{ .name = "canonical_text", .value = .{ .text = entity.text } },
+                    .{ .name = "name_embedding", .value = if (entity.embedding) |emb| .{ .vector = emb } else .none },
                 };
-                const mention = matcher.Record{ .fields = &mention_fields };
+                const mention = matcher.Record{ .fields = mention_fields[0 .. if (entity.embedding != null) @as(usize, 4) else 3] };
 
                 var best_prob: f64 = -1;
                 var best: ?usize = null;
@@ -302,6 +305,23 @@ fn jsonString(value: std.json.Value) ?[]const u8 {
         .string => |s| s,
         else => null,
     };
+}
+
+/// Parse a JSON number array into an owned f32 slice, or null (absent / not an
+/// array / empty / non-numeric). Used for entity query embeddings.
+fn parseEmbedding(a: std.mem.Allocator, value: ?std.json.Value) !?[]const f32 {
+    const v = value orelse return null;
+    if (v != .array or v.array.items.len == 0) return null;
+    const out = try a.alloc(f32, v.array.items.len);
+    for (v.array.items, 0..) |item, i| {
+        out[i] = switch (item) {
+            .float => |f| @floatCast(f),
+            .integer => |n| @floatFromInt(n),
+            .number_string => |s| std.fmt.parseFloat(f32, s) catch return null,
+            else => return null,
+        };
+    }
+    return out;
 }
 
 // --- Key template -----------------------------------------------------------
@@ -470,6 +490,7 @@ pub fn parseExtractionEntities(gpa: std.mem.Allocator, json_bytes: []const u8) !
             .local_id = try a.dupe(u8, jsonString(o.get("id") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
             .label = try a.dupe(u8, jsonString(o.get("label") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
             .text = try a.dupe(u8, jsonString(o.get("text") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
+            .embedding = try parseEmbedding(a, o.get("embedding")),
         };
     }
     return .{ .arena = arena, .entities = out };
