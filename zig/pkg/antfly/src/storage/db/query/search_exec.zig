@@ -3573,7 +3573,12 @@ pub fn searchTextQuery(
 
     const execute_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var result = if (effective_req.count_only)
-        try search_mod.executeCountCandidates(alloc, snapshot, search_query)
+        try search_mod.executeCountCandidatesRelational(
+            alloc,
+            snapshot,
+            search_query,
+            try relationalKeywordColumnNamesAlloc(arena_alloc, text_entry.runtime_schema),
+        )
     else
         try search_mod.execute(alloc, snapshot, .{
             .query = search_query,

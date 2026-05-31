@@ -492,10 +492,23 @@ pub fn executeCountCandidates(
     snap: *const index_mod.IndexSnapshot,
     query: SearchQuery,
 ) !SearchResult {
+    return try executeCountCandidatesRelational(alloc, snap, query, &.{});
+}
+
+/// As `executeCountCandidates`, but routes exact `.term` predicates on declared
+/// relational keyword columns to a columnar `typed_term` scan (see
+/// `searchQueryToFilterArenaRelational`). `keyword_columns` empty = document-mode
+/// behavior, unchanged.
+pub fn executeCountCandidatesRelational(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    query: SearchQuery,
+    keyword_columns: []const []const u8,
+) !SearchResult {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
-    const filter = try searchQueryToFilterArena(arena.allocator(), query);
+    const filter = try searchQueryToFilterArenaRelational(arena.allocator(), query, keyword_columns);
     const doc_ids = try snap.executeFilter(alloc, filter);
     defer alloc.free(doc_ids);
 
