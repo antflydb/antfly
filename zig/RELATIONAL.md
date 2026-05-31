@@ -317,22 +317,58 @@ number) is additive where the physical type is compatible.
   `include_stored` → `stored_data` reconstructed from typed columns), and
   validated by the full `zig build unit-test` suite (0 failed, 0 leaked).
 
-  Scope decision (deliberate): there are two document copies, in different
-  subsystems, and only one is safe to make column-derived right now.
-  - The **segment stored-doc** (`addStoredDoc`) backs full-text reads — now
-    reconstructed-from-columns for relational tables (above). The segment blob is
-    still *written* today; dropping that write is a follow-up storage saving, not
-    a correctness change, since reads no longer consult it for relational tables.
-  - The **KV-store value** (`db.get` / `getStoreValue`, keyed by doc key) is the
-    authoritative source of truth and is consumed synchronously by
-    read-modify-write **transforms** (`db.zig:4007`) and by **vector/dense search**
-    hit materialization (`db.zig:38939`). It is **intentionally not** made
-    column-derived: segments are built async/batched, so reconstruction-on-read
-    cannot satisfy a synchronous transform read without a consistency-model
-    redesign. Document mode keeps the KV blob unconditionally; relational mode
-    keeps it as the authoritative store and treats columns as the
-    reconstructable projection for full-text reads. Removing the KV blob is a
-    separate architecture task, not part of relational mode as scoped here.
+  Segment-blob removal (done): relational segments no longer write a stored-doc
+  blob at all — the body is stored empty and reconstructed from the typed
+  columns at the single `SegmentReader.storedDocDecompressed` chokepoint, via a
+  self-describing per-segment manifest carried through merge and shard split.
+  See "Blob-write removal" below.
+
+- **Phase 6 — authoritative KV columns (done).** The remaining document copy,
+  the **KV-store value** (`db.get` / `getStoreValue`, keyed by doc key, the
+  synchronous source of truth), is now also column-derived for relational
+  tables. This is *not* reconstruction-from-async-segments (which could not
+  satisfy a synchronous transform read); instead the **KV value itself is the
+  serialized typed columns**, so reconstruction-on-read stays fully synchronous.
+
+  - **Storage format.** A relational document is stored as one packed
+    `relational_row_codec` value (magic `AROW`), not a JSON blob and not a
+    key-range of per-column pairs. One KV pair per document keeps point
+    lookups / read-modify-write transforms a single atomic op and shard splits
+    boundary-agnostic; the columnar predicate-pushdown tier stays in the search
+    segments. The row is self-describing (each cell carries path + physical
+    `typed_doc_values` type + `is_json`), so reconstruction needs no schema
+    lookup. Round-trip is *canonical*, not byte-exact (schema field order,
+    numbers/datetime normalized) — acceptable because relational tables are
+    closed-schema, so every referenceable field is a declared column.
+
+  - **One formatter, two read paths.** `relational_row_codec.appendCellValue` is
+    the single canonical-JSON per-value formatter, shared by the KV read path and
+    the segment read path (`document_mapper.appendReconstructedColumn` delegates
+    to it), so a document reconstructs *byte-for-byte identically* whether served
+    from a segment (full-text reads) or the KV store (point/transform/vector
+    reads).
+
+  - **Seam A — materialize to JSON.** `materializeDocumentValueAlloc` is the one
+    decode point every document-value reader routes through. The synchronous
+    `DB.get` chokepoint, and every async reader that re-reads a stored document —
+    index backfill (text/dense/sparse), derived replay collectors, and the
+    enrichment runtime — reconstruct JSON from the typed row (or pass a
+    document-mode blob through). The initial-write indexers are unaffected: they
+    carry the original JSON (`cleaned_value`/`write.value`) and never re-read the
+    store. Routed reader-first, write-flipped last, so each step stayed green.
+
+  - **Seam B — typed-column fast path.** Where a consumer genuinely wants one
+    field (the enrichment `source_field` case), `relational_row_codec.findCellByPath`
+    reads that single column straight from the row, skipping full reconstruction
+    + re-parse. Consumers that legitimately need the whole document (templates,
+    algebraic fact-projection, `db.get`) keep Seam A — that is the correct and
+    final answer for them, not a compromise.
+
+  Document-mode tables are unchanged throughout: their KV value stays a JSON
+  blob, and the seam is a pure passthrough (the row magic never matches a JSON
+  document). Validated by the full `zig build unit-test` suite (2700 passed, 0
+  failed, 0 leaked), including the end-to-end relational write → store typed row
+  → async index/catch-up → full-text query with reconstruction path.
 
 ## Related docs
 
