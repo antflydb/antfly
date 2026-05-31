@@ -339,3 +339,55 @@ number) is additive where the physical type is compatible.
 - [SCHEMA.md](SCHEMA.md) — schema contract and compiled runtime schema
 - [ALGEBRAIC.md](ALGEBRAIC.md) — fact projection, materializations, folds
 - [JOINS.md](JOINS.md) — relational join planner and distributed execution
+
+---
+
+## Blob-write removal: investigation result (ready to implement, NOT yet coded)
+
+Full read-site map of the segment stored-doc (grep of `storedDoc`/`storedDocDecompressed`):
+
+KEY FINDING — every *borrowing* `storedDoc(idx)` production caller uses only
+`.id`, never `.data`:
+  - index.zig:990 (delete-marking), search/query.zig:1256 (doc-id->doc_num),
+    persistent.zig:1272 & 1912 (doc-key collection / min-max key),
+    search_exec.zig:2258, 2390, 3602, 3811, 4024 (id collection / filters).
+The ONLY borrowed `.data` consumer is the merge path (segment.zig:844), which
+copies the stored body forward into the merged segment.
+
+All *document-body* reads go through the allocating `storedDocDecompressed`
+(index.zig:401 snapshot chokepoint; search.zig:1033/2060/2117/2207/2258;
+query.zig:694; index_manager.zig:9646; search_exec.zig:3973).
+
+=> Low-blast-radius design (recommended):
+  1. introducer.zig:289 — for relational tables write an EMPTY stored-doc body
+     (id kept, data empty). Storage saving: body no longer duplicated (columns
+     already persisted as typed_doc_values).
+  2. SegmentReader.storedDocDecompressed (segment.zig:527) — when body is empty
+     and the segment is relational, reconstruct via
+     reconstructRelationalDocumentFromSegmentAlloc from the typed_doc_values
+     columns. Single chokepoint => all body readers fixed at once.
+  3. `.id`-only borrowing callers keep working unchanged (id still present).
+  4. Merge (segment.zig:844) copies the empty body forward; reconstruction works
+     post-merge IFF the typed_doc_values column sections are preserved through
+     merge.
+
+OPEN QUESTIONS still to verify before coding (was mid-investigation):
+  - Does merge preserve typed_doc_values sections forward? (range filters work on
+    merged segments, which suggests yes — must confirm in segment.zig merge loop.)
+  - How does the SegmentReader learn the relational column list (name/type/path)
+    to drive reconstruction? Two options: (a) persist a small column manifest
+    section in the segment (must also be carried through merge); (b) derive from
+    the typed_doc_values sections if they self-describe their value type and can
+    be distinguished from non-document sections like doc_ordinals. Option (a) is
+    cleaner/safer; (b) avoids a format addition. Needs the segment.zig
+    section-kind + typed-value type-tag check that was not yet completed.
+
+VALIDATION REQUIRED before claiming done: full `zig build unit-test` (write log
+to /tmp and read it — inline output truncates in long sessions), plus the merge
+tests (merger.zig, segment.zig merge tests) and an e2e restart/durability check,
+since this touches segment format + merge + persistence.
+
+KV redesign (the synchronous source-of-truth, db.zig stageTransform:4000 reads
+`db.get`; vector include_stored db.zig ~38939 reads `db.get`) remains the larger,
+separate task documented in the section above — NOT addressed by the blob-write
+removal.
