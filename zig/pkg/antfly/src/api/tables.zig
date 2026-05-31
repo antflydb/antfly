@@ -513,7 +513,39 @@ fn regenerateAlgebraicIndexValueAlloc(
             try cloneJsonValueAlloc(alloc, entry.value_ptr.*),
         );
     }
+
+    // If the schema-derived capability changed (e.g. a dynamic template was added
+    // or retyped — these do not bump the schema version), existing documents have
+    // not been re-projected through the new dynamic rules. Persist a
+    // backfill-pending flag so query-time resolution of dynamic-template fields is
+    // withheld (those aggregations fall back to a complete scan) until the index
+    // is rebuilt; this survives reopen, mirroring the in-place flag set by
+    // index_manager.reloadAlgebraicSchemaConfigs. An already-pending flag is
+    // preserved when the capability is otherwise unchanged.
+    const derived_fp = jsonStringField(derived, "capability_fingerprint") orelse "";
+    const source_fp = jsonStringField(source, "capability_fingerprint") orelse "";
+    const capability_changed = source_fp.len > 0 and !std.mem.eql(u8, derived_fp, source_fp);
+    const source_pending = jsonBoolField(source, "dynamic_rules_backfill_pending") orelse false;
+    const has_dynamic_rules = blk: {
+        const rules = derived.object.get("dynamic_field_rules") orelse break :blk false;
+        break :blk rules == .array and rules.array.items.len > 0;
+    };
+    if (has_dynamic_rules and (capability_changed or source_pending)) {
+        try derived.object.put(alloc, try alloc.dupe(u8, "dynamic_rules_backfill_pending"), .{ .bool = true });
+    }
     return derived;
+}
+
+fn jsonStringField(value: std.json.Value, key: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    return if (field == .string) field.string else null;
+}
+
+fn jsonBoolField(value: std.json.Value, key: []const u8) ?bool {
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    return if (field == .bool) field.bool else null;
 }
 
 fn isAlgebraicInternalConfigField(field: []const u8) bool {
@@ -2320,8 +2352,42 @@ test "metadata.schema update refreshes algebraic dynamic templates without recre
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"type\":\"number\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"capability_fingerprint\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"stale\"") == null);
+    // The capability changed (fingerprint differs from the stored one), so the
+    // durable config records that existing docs need re-projection; query-time
+    // resolution of dynamic fields is withheld until rebuild.
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"dynamic_rules_backfill_pending\":true") != null);
     // The full-text index entry is left untouched.
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v2\"") != null);
+}
+
+test "metadata.schema update regenerates algebraic config and preserves user knobs" {
+    // The stored algebraic config carries a tuned adaptive policy and a real
+    // fingerprint. Re-applying the SAME schema must regenerate the config,
+    // preserve the user knob, and (since the capability is unchanged) NOT set the
+    // backfill-pending flag.
+    const schema =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}},"dynamic_templates":[{"name":"ext","match":"ext_*","mapping":{"type":"keyword"}}]}
+    ;
+    // First compute the canonical config the regenerator produces for this schema
+    // so the stored fingerprint matches (simulating an already-current index).
+    const canonical = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(std.testing.allocator, "docs", schema);
+    defer std.testing.allocator.free(canonical);
+    var canon_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, canonical, .{});
+    defer canon_parsed.deinit();
+    const fp = canon_parsed.value.object.get("capability_fingerprint").?.string;
+
+    const stored = try std.fmt.allocPrint(std.testing.allocator,
+        "{{\"alg\":{{\"type\":\"algebraic\",\"capability_fingerprint\":\"{s}\",\"adaptive\":{{\"observe\":false,\"min_observations\":9}},\"dynamic_field_rules\":[{{\"name\":\"ext\",\"match\":\"ext_*\",\"type\":\"string\"}}]}}}}",
+        .{fp});
+    defer std.testing.allocator.free(stored);
+
+    const refreshed = try regenerateAlgebraicIndexesFromSchemaAlloc(std.testing.allocator, "docs", stored, schema);
+    defer std.testing.allocator.free(refreshed);
+
+    // User knob preserved through regeneration.
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"min_observations\":9") != null);
+    // Capability unchanged (matching fingerprint) => no backfill flag forced on.
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"dynamic_rules_backfill_pending\":true") == null);
 }
 
 test "metadata.query routing selects read schema full text index" {

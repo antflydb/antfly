@@ -185,6 +185,13 @@ pub const Config = struct {
     measure_fields: []const FieldConfig = &.{},
     time_fields: []const FieldConfig = &.{},
     dynamic_field_rules: []const fact_mod.DynamicRule = &.{},
+    // Set when dynamic_field_rules changed against a table that already holds
+    // documents, so existing docs have not been re-projected through the new
+    // rules. While true, query-time resolution of dynamic-template fields is
+    // withheld (those queries fall back to a complete scan) so aggregates are
+    // never computed over only the post-change subset. Static fields are
+    // unaffected. Cleared once the sidecar is rebuilt/repopulated.
+    dynamic_rules_backfill_pending: bool = false,
     laws: []const LawConfig = &.{},
     joins: []const JoinConfig = &.{},
     materializations: []const MaterializationConfig = &.{},
@@ -316,11 +323,12 @@ pub fn validateConfig(cfg: Config) !void {
     for (cfg.dynamic_field_rules) |rule| {
         if (rule.type.len == 0) return error.InvalidAlgebraicConfig;
         if (dynamicRuleRoleMask(rule.type) == 0) return error.InvalidAlgebraicConfig;
-        // A rule with no selector at all would match every field; require at
-        // least one selector so a misconfigured template cannot blanket-project.
-        if (rule.match == null and rule.unmatch == null and
-            rule.path_match == null and rule.path_unmatch == null and
-            rule.match_mapping_type == null) return error.InvalidAlgebraicConfig;
+        // Require a name/path selector (`match` / `path_match`). A rule with no
+        // selector would blanket-match every field, and a `match_mapping_type`-
+        // only rule would project facts at ingest that can never resolve at query
+        // time (no value to classify) — keep ingest and query symmetric by
+        // rejecting both here, matching schema_capability's compile-time guard.
+        if (rule.match == null and rule.path_match == null) return error.InvalidAlgebraicConfig;
     }
 }
 
@@ -13970,8 +13978,15 @@ pub const Index = struct {
     /// fields route to the algebraic sidecar. The synthesized config keys facts
     /// by the full query path (matching the ingest-time fact identity).
     fn dynamicFieldConfig(self: *const Index, query_field: []const u8, class: FieldClass) ?FieldConfig {
-        const rules = self.config().dynamic_field_rules;
+        const cfg = self.config();
+        const rules = cfg.dynamic_field_rules;
         if (rules.len == 0) return null;
+        // While a dynamic-rule backfill is pending, existing documents have not
+        // been re-projected through the current rules, so resolving a dynamic
+        // field here would route aggregations to facts covering only the
+        // post-change subset. Withhold resolution so such queries fall back to a
+        // complete scan; static fields keep accelerating.
+        if (cfg.dynamic_rules_backfill_pending) return null;
         const field_name = fieldNameFromQueryPath(query_field);
         for (rules) |rule| {
             if (!dynamicRuleResolvesField(rule, query_field, field_name)) continue;
@@ -19257,6 +19272,40 @@ test "algebraic dynamic template fields resolve and aggregate at query time" {
     }
     try std.testing.expectEqualStrings("2", u1_count orelse return error.TestUnexpectedResult);
     try std.testing.expectEqualStrings("1", u2_count orelse return error.TestUnexpectedResult);
+}
+
+test "algebraic withholds dynamic field resolution while backfill pending" {
+    const alloc = std.testing.allocator;
+    // Same rules; the only difference is the backfill-pending flag. While pending,
+    // dynamic-template fields must not resolve (queries fall back to a complete
+    // scan) so aggregates are never computed over a partial post-change subset.
+    const ready_cfg =
+        \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}]}
+    ;
+    var ready = try Index.open(alloc, "alg_ready", ready_cfg);
+    defer ready.close();
+    try std.testing.expect(ready.resolveField("user_id", .group) != null);
+
+    const pending_cfg =
+        \\{"version":1,"table":"events","dynamic_rules_backfill_pending":true,"dynamic_field_rules":[{"name":"ids","match":"*_id","type":"string"}]}
+    ;
+    var pending = try Index.open(alloc, "alg_pending", pending_cfg);
+    defer pending.close();
+    try std.testing.expect(pending.resolveField("user_id", .group) == null);
+    try std.testing.expect(pending.fieldConfig("user_id", .group) == null);
+}
+
+test "algebraic config rejects dynamic rule without a name or path selector" {
+    const alloc = std.testing.allocator;
+    // A match_mapping_type-only rule can be evaluated at ingest but never at query
+    // time, so it must be rejected to keep ingest and query symmetric.
+    try std.testing.expectError(error.InvalidAlgebraicConfig, Index.open(alloc, "bad",
+        \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"dates","match_mapping_type":"date","type":"datetime"}]}
+    ));
+    // An unmatch-only rule (no positive selector) is likewise rejected.
+    try std.testing.expectError(error.InvalidAlgebraicConfig, Index.open(alloc, "bad",
+        \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"x","unmatch":"skip_*","type":"keyword"}]}
+    ));
 }
 
 test "algebraic path profile recomputes max string token count after deleting max row" {

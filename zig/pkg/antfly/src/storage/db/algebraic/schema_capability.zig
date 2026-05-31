@@ -108,14 +108,18 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
     var skipped_unbounded_fields: u32 = 0;
 
     for (schema.dynamic_templates) |tmpl| {
-        // A template needs at least one positive/type selector; one with only
-        // negative (or no) selectors would blanket-match every field, so it is
-        // not safe to promote into bounded algebraic facts.
-        const has_positive_selector = tmpl.match_pattern != null or tmpl.path_match != null or tmpl.match_mapping_type != null;
+        // An algebraic rule needs a name/path selector (`match` / `path_match`).
+        // `match_mapping_type` alone is NOT enough: it can be evaluated at ingest
+        // (a value is present) but never at query time (no value), so a
+        // mapping-type-only rule would project docfacts that no query can ever
+        // resolve. Such templates stay on the schemaless path-fact path so ingest
+        // and query resolution remain symmetric.
+        const has_named_selector = tmpl.match_pattern != null or tmpl.path_match != null;
         const scalar = boundedScalarForTemplateType(tmpl.field_type orelse "text");
-        if (!has_positive_selector or scalar == null) {
-            // Unbounded/open text templates and overly-broad selectors stay on
-            // the schemaless path-fact path rather than typed docfacts.
+        if (!has_named_selector or scalar == null) {
+            // Unbounded/open text templates and selector-less / mapping-type-only
+            // templates stay on the schemaless path-fact path rather than typed
+            // docfacts.
             skipped_dynamic_fields += 1;
             skipped_unbounded_fields += 1;
             continue;
@@ -743,17 +747,21 @@ test "schema capability compiles bounded dynamic templates into runtime rules" {
     var plan = try compilePlanAlloc(alloc, parsed);
     defer plan.deinit(alloc);
 
-    // keyword + numeric + datetime templates are bounded with positive selectors
-    // => 3 rules. The text template (unbounded) and the negative-only template
-    // (no positive selector) are skipped onto the schemaless path.
-    try std.testing.expectEqual(@as(usize, 3), plan.dynamic_rules.len);
-    try std.testing.expect(plan.skipped_unbounded_fields >= 2);
+    // Only templates with a name/path selector AND a bounded type become rules:
+    // ids (keyword/match) and metrics (numeric/path_match) => 2 rules. Skipped:
+    // the date template (match_mapping_type-only — can't resolve at query time),
+    // the text template (unbounded), and the negative-only template.
+    try std.testing.expectEqual(@as(usize, 2), plan.dynamic_rules.len);
+    try std.testing.expect(plan.skipped_unbounded_fields >= 3);
+    for (plan.dynamic_rules) |rule| {
+        try std.testing.expect(!std.mem.eql(u8, rule.name, "events_as_date"));
+    }
 
     const config_json = try configJsonFromPlanAlloc(alloc, "orders", plan);
     defer alloc.free(config_json);
     var parsed_config = try std.json.parseFromSlice(index_mod.Config, alloc, config_json, .{ .allocate = .alloc_always });
     defer parsed_config.deinit();
-    try std.testing.expectEqual(@as(usize, 3), parsed_config.value.dynamic_field_rules.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed_config.value.dynamic_field_rules.len);
     // The emitted config must satisfy the index validator (selector present,
     // bounded scalar type) so the index can open against it.
     try index_mod.validateConfig(parsed_config.value);

@@ -1196,22 +1196,60 @@ pub const IndexManager = struct {
     }
 
     /// Regenerate every algebraic index's schema-derived config from `schema_json`
-    /// and apply it in place. This propagates a dynamic-template change to live
-    /// indexes without a reopen; it is semantically equivalent to what a fresh
-    /// open would produce (lazy backfill — only new/rewritten docs reflect new
-    /// rules). No-op when there are no algebraic indexes or no schema.
+    /// and apply it in place when the schema-derived capability actually changed.
+    /// Carries forward user-tunable runtime knobs, and sets
+    /// dynamic_rules_backfill_pending on a real change so query-time resolution of
+    /// dynamic-template fields is withheld (those aggregations fall back to a
+    /// complete scan instead of reading facts that only cover post-change docs)
+    /// until the index is rebuilt. No-op when there are no algebraic indexes, no
+    /// schema, or the capability fingerprint is unchanged.
     pub fn reloadAlgebraicSchemaConfigs(self: *IndexManager, schema_json: []const u8) !void {
         if (schema_json.len == 0) return;
         for (self.algebraic_indexes.items) |*entry| {
-            const table_name = entry.index.config().table;
-            const new_config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(self.alloc, table_name, schema_json);
+            const cur = entry.index.config();
+            const new_config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(self.alloc, cur.table, schema_json);
             defer self.alloc.free(new_config_json);
-            // Skip the swap when the regenerated config is unchanged so periodic
-            // reconciles don't needlessly re-parse and reset the live config.
-            if (std.mem.eql(u8, new_config_json, entry.config.config_json)) continue;
-            const owned = try self.alloc.dupe(u8, new_config_json);
+
+            var new_parsed = try std.json.parseFromSlice(algebraic_mod.index.Config, self.alloc, new_config_json, .{ .allocate = .alloc_always });
+            defer new_parsed.deinit();
+
+            // Skip when the schema-derived capability is unchanged. Compare the
+            // capability fingerprint (which encodes schema_version, fields, and
+            // dynamic-template rules) rather than raw bytes: the live and durable
+            // serializations differ in shape and tunable knobs, so a byte compare
+            // would never short-circuit and every reconcile would churn the
+            // live config.
+            if (cur.capability_fingerprint.len > 0 and
+                std.mem.eql(u8, new_parsed.value.capability_fingerprint, cur.capability_fingerprint)) continue;
+
+            // Carry forward user-tunable runtime knobs (the durable regeneration
+            // in api/tables.zig preserves the same set) so a schema/template
+            // change does not silently reset planner/adaptive tuning in place.
+            new_parsed.value.adaptive = cur.adaptive;
+            new_parsed.value.pathfact_policy = cur.pathfact_policy;
+            new_parsed.value.max_result_buckets = cur.max_result_buckets;
+            new_parsed.value.max_planner_scan_rows = cur.max_planner_scan_rows;
+            new_parsed.value.max_batch_accumulator_entries = cur.max_batch_accumulator_entries;
+            new_parsed.value.min_max_candidate_cache_size = cur.min_max_candidate_cache_size;
+            new_parsed.value.enable_temporal_range_pruning = cur.enable_temporal_range_pruning;
+
+            // The capability changed against an already-open table, so existing
+            // documents have not been re-projected through the new dynamic rules.
+            // Mark dynamic-field resolution as backfill-pending so aggregations
+            // over template-promoted fields fall back to a complete scan (correct
+            // results) instead of reading facts that only cover docs written after
+            // the change. Static fields keep accelerating. The durable
+            // regeneration in api/tables.zig sets the same flag so it survives
+            // reopen. (Table create takes the fingerprint-equality skip above, so
+            // a freshly-built index is never flagged.)
+            new_parsed.value.dynamic_rules_backfill_pending = true;
+
+            const merged_json = try std.json.Stringify.valueAlloc(self.alloc, new_parsed.value, .{ .emit_null_optional_fields = false });
+            defer self.alloc.free(merged_json);
+
+            const owned = try self.alloc.dupe(u8, merged_json);
             errdefer self.alloc.free(owned);
-            try entry.index.reloadConfigJson(new_config_json);
+            try entry.index.reloadConfigJson(merged_json);
             self.alloc.free(entry.config.config_json);
             entry.config.config_json = owned;
         }

@@ -146,11 +146,16 @@ version bump or a reindex.
 
 - `schema/mod.zig` compilation lowers each bounded template
   (`keyword`/`link`/`numeric`/`boolean`/`datetime`) into a capability
-  `dynamic_field_rule`. Unbounded templates (`text`/`html`/`search_as_you_type`)
-  and templates with no positive selector (`match` / `path_match` /
-  `match_mapping_type`) are intentionally NOT promoted — they stay on the
-  schemaless path-fact path. This is the cardinality guard that keeps a broad
-  `match: "*"` template from exploding group-by cardinality.
+  `dynamic_field_rule`. A rule requires a name/path selector (`match` /
+  `path_match`). Unbounded templates (`text`/`html`/`search_as_you_type`),
+  selector-less templates, and `match_mapping_type`-only templates are
+  intentionally NOT promoted — they stay on the schemaless path-fact path. This
+  is the cardinality guard that keeps a broad `match: "*"` template from
+  exploding group-by cardinality, and it keeps ingest and query symmetric: a
+  `match_mapping_type`-only rule could be evaluated at ingest (a value is
+  present) but never at query time (no value), so it is excluded from both.
+  `index.zig:validateConfig` enforces the same selector requirement so a
+  hand-authored config cannot reintroduce the asymmetry.
 - At ingest, `storage/db/algebraic/index.zig` evaluates the rules against every
   observed field not already covered by a static spec, reusing the same
   `globMatch` / `match_mapping_type` semantics as the full-text resolver in
@@ -161,20 +166,29 @@ version bump or a reindex.
 - At query time the planner resolves a queried field against the same
   `dynamic_field_rules` (`Index.fieldConfig`/`resolveField`), so group-by, sum,
   and term aggregations over template-promoted fields route to the sidecar's
-  docfact fold scan. Only rules carrying a name/path selector (`match` /
-  `path_match`) resolve a concrete query field; `match_mapping_type`-only rules
-  can't be evaluated without a value and so do not resolve at query time.
+  docfact fold scan.
 
 Template-only updates propagate without a recreate on two levels:
 
 - the durable table `indexes_json` is regenerated on every schema update
-  (`api/tables.zig: regenerateAlgebraicIndexesFromSchemaAlloc`), so fresh opens,
-  new replicas, and restarts pick up the new rules; and
+  (`api/tables.zig: regenerateAlgebraicIndexesFromSchemaAlloc`), which carries
+  forward user-tunable runtime knobs (adaptive policy, planner/result limits) so
+  a schema change does not reset tuning; fresh opens, new replicas, and restarts
+  pick up the new rules; and
 - live indexes are refreshed in place
   (`DB.reloadAlgebraicSchemaConfigs` → `Index.reloadConfigJson`) so running
-  writers apply the new rules immediately. Existing documents are reconciled
-  lazily — only new or rewritten documents reflect a changed template until a
-  full rebuild — matching the no-reindex contract.
+  writers apply the new rules immediately.
+
+Because the change applies without re-projecting existing documents, a capability
+change (detected by a differing capability fingerprint) sets
+`dynamic_rules_backfill_pending` on the config — both durably and in the live
+index. While pending, query-time resolution of dynamic-template fields is
+withheld, so aggregations over those fields fall back to a complete scan and
+return correct results rather than aggregates computed over only the
+post-change subset. Static fields are unaffected and keep accelerating. The flag
+is cleared when the sidecar is rebuilt, which re-projects existing documents.
+Tables created with a template (rather than updated) take the fingerprint-equality
+fast path and are never flagged.
 
 ## Related Docs
 
