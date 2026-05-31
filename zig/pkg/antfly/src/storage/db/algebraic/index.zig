@@ -2733,6 +2733,12 @@ pub const Index = struct {
     // fold back). When unset, callers drive rebuilds via runHllMaintenance.
     hll_maintenance_lane: ?background_runtime.DurableJobLane = null,
     hll_maintenance_owner_id: u64 = 0,
+    // Runtime registry of HLL cardinality sketches. Seeded at open() from the
+    // parsed config and extended at runtime when the adaptive subsystem promotes
+    // a recurring cardinality query shape. Owns its strings (config entries are
+    // duped in), so config-derived and adaptive sketches are handled uniformly.
+    // All read/maintenance paths iterate this, not config().hll_cardinalities.
+    hll_registry: std.ArrayListUnmanaged(HllCardinalityConfig) = .empty,
     // Serializes index write transactions. The store contract is single-writer,
     // but background HLL maintenance (runHllMaintenance) opens its own write txn
     // on a separate thread concurrently with foreground applyBatch calls. Both
@@ -2744,11 +2750,59 @@ pub const Index = struct {
         var parsed = try std.json.parseFromSlice(Config, alloc, config_json, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         try validateConfig(parsed.value);
-        return .{
+        var self: Index = .{
             .alloc = alloc,
             .name = try alloc.dupe(u8, name),
             .parsed = parsed,
         };
+        errdefer self.freeHllRegistry();
+        // Seed the runtime registry from the static config; adaptive promotions
+        // append to it later. Owned copies so the registry's lifetime is uniform.
+        for (parsed.value.hll_cardinalities) |hcfg| {
+            try self.appendHllRegistryEntry(hcfg.name, hcfg.group_by, hcfg.value_field, hcfg.precision);
+        }
+        return self;
+    }
+
+    // Appends an owned copy of an HLL sketch config to the runtime registry.
+    fn appendHllRegistryEntry(self: *Index, name: []const u8, group_by: []const []const u8, value_field: []const u8, precision: u8) !void {
+        const name_copy = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(name_copy);
+        const value_copy = try self.alloc.dupe(u8, value_field);
+        errdefer self.alloc.free(value_copy);
+        const group_copy = try self.alloc.alloc([]const u8, group_by.len);
+        var filled: usize = 0;
+        errdefer {
+            for (group_copy[0..filled]) |g| self.alloc.free(g);
+            self.alloc.free(group_copy);
+        }
+        for (group_by, 0..) |g, i| {
+            group_copy[i] = try self.alloc.dupe(u8, g);
+            filled = i + 1;
+        }
+        try self.hll_registry.append(self.alloc, .{
+            .name = name_copy,
+            .group_by = group_copy,
+            .value_field = value_copy,
+            .precision = precision,
+        });
+    }
+
+    fn freeHllRegistry(self: *Index) void {
+        for (self.hll_registry.items) |hcfg| {
+            self.alloc.free(@constCast(hcfg.name));
+            self.alloc.free(@constCast(hcfg.value_field));
+            for (hcfg.group_by) |g| self.alloc.free(@constCast(g));
+            self.alloc.free(@constCast(hcfg.group_by));
+        }
+        self.hll_registry.deinit(self.alloc);
+        self.hll_registry = .empty;
+    }
+
+    // The set of HLL sketches the engine maintains and reads (config-seeded plus
+    // any adaptively promoted at runtime).
+    fn hllCardinalities(self: *const Index) []const HllCardinalityConfig {
+        return self.hll_registry.items;
     }
 
     pub fn attachResourceManager(self: *Index, manager: *resource_manager_mod.ResourceManager) void {
@@ -2785,6 +2839,7 @@ pub const Index = struct {
         self.clearObservedQueryState();
         self.invalidateAdaptiveReadySpecCache();
         self.clearBulkDirtyPathPromotionDictionaries();
+        self.freeHllRegistry();
         self.parsed.deinit();
         self.* = undefined;
     }
@@ -16381,7 +16436,7 @@ pub const Index = struct {
     // derives from the stored facts — otherwise an incremental estimate and a
     // post-delete rebuilt estimate could disagree for the same data.
     fn applyHllCardinalitiesForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact) !void {
-        for (self.config().hll_cardinalities) |hcfg| {
+        for (self.hllCardinalities()) |hcfg| {
             try self.applyHllCardinalityForFactsTxn(txn, facts, hcfg);
         }
     }
@@ -16395,7 +16450,7 @@ pub const Index = struct {
         old_facts: []const fact_mod.Fact,
         new_facts: []const fact_mod.Fact,
     ) !void {
-        for (self.config().hll_cardinalities) |hcfg| {
+        for (self.hllCardinalities()) |hcfg| {
             if (!hllCardinalityFactsChanged(hcfg, old_facts, new_facts)) continue;
             try self.applyHllCardinalityForFactsTxn(txn, new_facts, hcfg);
         }
@@ -16449,7 +16504,7 @@ pub const Index = struct {
     // facts give the exact group key, so mark just that group; if the group key
     // cannot be derived, fall back to the whole-materialization marker.
     fn markHllCardinalitiesDirtyForFactsTxn(self: *Index, txn: anytype, facts: []const fact_mod.Fact) !void {
-        for (self.config().hll_cardinalities) |hcfg| {
+        for (self.hllCardinalities()) |hcfg| {
             if (fact_mod.findScalar(facts, .group, hcfg.value_field) == null) continue;
             try self.markHllCardinalityDirtyForFactsTxn(txn, hcfg, facts);
         }
@@ -16503,7 +16558,7 @@ pub const Index = struct {
         old_facts: []const fact_mod.Fact,
         new_facts: []const fact_mod.Fact,
     ) !void {
-        for (self.config().hll_cardinalities) |hcfg| {
+        for (self.hllCardinalities()) |hcfg| {
             // Only relevant if the old doc actually contributed a value to this
             // sketch; a pure add of the value is handled by the warm fold.
             if (fact_mod.findScalar(old_facts, .group, hcfg.value_field) == null) continue;
@@ -16722,7 +16777,7 @@ pub const Index = struct {
     fn anyHllCardinalityDirty(self: *Index, store: *docstore_mod.DocStore) !bool {
         var txn = try store.beginReadTxn();
         defer txn.abort();
-        for (self.config().hll_cardinalities) |hcfg| {
+        for (self.hllCardinalities()) |hcfg| {
             if (try self.hllCardinalityDirtyTxn(&txn, hcfg.name)) return true;
         }
         return false;
@@ -16753,7 +16808,7 @@ pub const Index = struct {
 
     fn runHllMaintenanceTxn(self: *Index, txn: anytype) !bool {
         var did_work = false;
-        for (self.config().hll_cardinalities) |hcfg| {
+        for (self.hllCardinalities()) |hcfg| {
             // Whole-materialization marker → full rebuild (also clears per-group
             // markers), so handle it first and skip the scoped pass.
             const dirty_key = try self.hllCardinalityDirtyKeyAlloc(hcfg.name);
@@ -16808,7 +16863,7 @@ pub const Index = struct {
     /// overwrite. Safe to call repeatedly; a no-op when nothing is dirty. This is
     /// the unit of work the durable-job lane runs in the background.
     pub fn runHllMaintenance(self: *Index, store: *docstore_mod.DocStore) !bool {
-        if (self.config().hll_cardinalities.len == 0) return false;
+        if (self.hllCardinalities().len == 0) return false;
         if (!try self.anyHllCardinalityDirty(store)) return false;
         // Runs on a background thread; take the index write lock so the rebuild's
         // write txn never overlaps a foreground applyBatch write (single-writer
@@ -16821,6 +16876,136 @@ pub const Index = struct {
         const did_work = try self.runHllMaintenanceTxn(&txn);
         try txn.commit();
         return did_work;
+    }
+
+    // ---- Adaptive (observed) HLL cardinality provisioning ----------------
+    //
+    // A recurring cardinality(value_field) query, optionally grouped by a terms
+    // bucket field, promotes a HyperLogLog sketch once it has been observed at
+    // least `adaptive.min_observations` times. Promotion registers a sketch
+    // config (in the runtime registry, persisted so it survives reopen) and
+    // marks it dirty; the existing maintenance pass backfills it from the stored
+    // document facts. This deliberately keeps its own keyspace rather than going
+    // through the tensor recommendation pipeline, whose recommendation encoding
+    // keys off algebra.Op and has no `cardinality` op.
+
+    // Observation counter key: hllobs:<group_field-or-empty>:<value_field>.
+    fn hllAdaptiveObservationKeyAlloc(self: *Index, group_field: ?[]const u8, value_field: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hllobs", group_field orelse "", value_field });
+    }
+
+    // Persisted registry marker for a promoted adaptive sketch:
+    // hlladaptive:<name> -> "<group_field>\x00<value_field>". Reloaded at open.
+    fn hllAdaptiveConfigPrefixAlloc(self: *Index) ![]u8 {
+        return try self.keyAlloc(&.{"hlladaptive"});
+    }
+
+    fn hllAdaptiveConfigKeyAlloc(self: *Index, name: []const u8) ![]u8 {
+        return try self.keyAlloc(&.{ "hlladaptive", name });
+    }
+
+    // Deterministic sketch name for an adaptively promoted (group, value) pair,
+    // so repeated observation/promotion is idempotent.
+    fn hllAdaptiveNameAlloc(self: *Index, group_field: ?[]const u8, value_field: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(self.alloc, "adaptive_hll:{s}:{s}", .{ group_field orelse "", value_field });
+    }
+
+    fn hllRegistryContains(self: *const Index, name: []const u8) bool {
+        for (self.hllCardinalities()) |hcfg| {
+            if (std.mem.eql(u8, hcfg.name, name)) return true;
+        }
+        return false;
+    }
+
+    // Records one observation of a cardinality query over `value_field` grouped
+    // by `group_field` (null = ungrouped/root). When the observation count
+    // reaches the adaptive threshold and no matching sketch exists yet, promotes
+    // one: registers it, persists the marker, and marks it dirty so maintenance
+    // backfills it. Best-effort and infallible — observation is telemetry, never
+    // a reason to fail a query. Only active when adaptive.lazy_materialization
+    // is enabled (matching the materialization promotion gate).
+    pub fn observeCardinalityForAdaptive(self: *Index, store: *docstore_mod.DocStore, group_field: ?[]const u8, value_field: []const u8) void {
+        self.observeCardinalityForAdaptiveImpl(store, group_field, value_field) catch {};
+    }
+
+    fn observeCardinalityForAdaptiveImpl(self: *Index, store: *docstore_mod.DocStore, group_field: ?[]const u8, value_field: []const u8) !void {
+        if (!self.config().adaptive.lazy_materialization) return;
+        // Only group/value fields the schema actually exposes can back a sketch.
+        const value_resolved = self.resolveUniqueField(value_field) orelse return;
+        if (value_resolved.role != .group) return;
+        if (group_field) |gf| {
+            const g = self.resolveUniqueField(gf) orelse return;
+            if (g.role != .group) return;
+        }
+        const name = try self.hllAdaptiveNameAlloc(group_field, value_resolved.name);
+        defer self.alloc.free(name);
+        if (self.hllRegistryContains(name)) return; // already promoted
+
+        self.lockWrites();
+        defer self.unlockWrites();
+
+        const obs_key = try self.hllAdaptiveObservationKeyAlloc(group_field, value_resolved.name);
+        defer self.alloc.free(obs_key);
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const prior: u64 = blk: {
+            const existing = txn.get(obs_key) catch |err| switch (err) {
+                error.NotFound => break :blk 0,
+                else => return err,
+            };
+            break :blk std.fmt.parseInt(u64, existing, 10) catch 0;
+        };
+        const next = prior + 1;
+        const next_text = try std.fmt.allocPrint(self.alloc, "{d}", .{next});
+        defer self.alloc.free(next_text);
+        try txn.put(obs_key, next_text);
+
+        if (next >= self.config().adaptive.policy().min_observations) {
+            try self.promoteAdaptiveHllTxn(&txn, name, group_field, value_resolved.name);
+        }
+        try txn.commit();
+    }
+
+    // Registers a promoted adaptive sketch in the runtime registry, persists its
+    // marker, and marks it dirty so the next maintenance pass backfills it.
+    fn promoteAdaptiveHllTxn(self: *Index, txn: anytype, name: []const u8, group_field: ?[]const u8, value_field: []const u8) !void {
+        const group_by: []const []const u8 = if (group_field) |gf| &.{gf} else &.{};
+        try self.appendHllRegistryEntry(name, group_by, value_field, 0);
+        const hcfg = self.hllCardinalities()[self.hllCardinalities().len - 1];
+
+        const marker_key = try self.hllAdaptiveConfigKeyAlloc(name);
+        defer self.alloc.free(marker_key);
+        const marker_val = try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ group_field orelse "", value_field });
+        defer self.alloc.free(marker_val);
+        try txn.put(marker_key, marker_val);
+
+        // Mark dirty so maintenance recomputes it from existing facts (backfill).
+        try self.markHllCardinalityDirtyTxn(txn, hcfg);
+    }
+
+    // Reloads adaptively-promoted sketches into the runtime registry. Call after
+    // open() when reattaching to a store that already has promotions, so the
+    // read gate finds them again across restarts.
+    pub fn loadAdaptiveHllCardinalities(self: *Index, store: *docstore_mod.DocStore) !void {
+        const prefix = try self.hllAdaptiveConfigPrefixAlloc();
+        defer self.alloc.free(prefix);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const name_component = token.componentAt(entry.key, prefix.len) catch continue;
+            if (name_component.next != entry.key.len) continue;
+            const name = name_component.payload;
+            if (self.hllRegistryContains(name)) continue;
+            const sep = std.mem.indexOfScalar(u8, entry.value, 0) orelse continue;
+            const group_field = entry.value[0..sep];
+            const value_field = entry.value[sep + 1 ..];
+            const group_by: []const []const u8 = if (group_field.len > 0) &.{group_field} else &.{};
+            try self.appendHllRegistryEntry(name, group_by, value_field, 0);
+        }
     }
 
     const HllMaintenanceJob = struct {
@@ -16844,7 +17029,7 @@ pub const Index = struct {
     // lane is attached, callers drive runHllMaintenance themselves.
     fn scheduleHllMaintenance(self: *Index, store: *docstore_mod.DocStore) void {
         const lane = self.hll_maintenance_lane orelse return;
-        if (self.config().hll_cardinalities.len == 0) return;
+        if (self.hllCardinalities().len == 0) return;
         const job_ctx = self.alloc.create(HllMaintenanceJob) catch return;
         job_ctx.* = .{ .index = self, .store = store };
         lane.submit(.{
@@ -16869,7 +17054,7 @@ pub const Index = struct {
     // queries correct by falling back to the exact scan.
     fn scheduleHllMaintenanceIfDirty(self: *Index, store: *docstore_mod.DocStore) void {
         if (self.hll_maintenance_lane == null) return;
-        if (self.config().hll_cardinalities.len == 0) return;
+        if (self.hllCardinalities().len == 0) return;
         const dirty = self.anyHllCardinalityDirty(store) catch return;
         if (!dirty) return;
         self.scheduleHllMaintenance(store);
@@ -16917,7 +17102,7 @@ pub const Index = struct {
     // cardinality, or null if that group has no sketch. Keeps the regression
     // tests terse without duplicating entry iteration/cleanup.
     fn approxCardinalityEntriesForGroupTestEstimate(self: *Index, store: *docstore_mod.DocStore, group_key: []const u8) !?u64 {
-        const name = self.config().hll_cardinalities[0].name;
+        const name = self.hllCardinalities()[0].name;
         const entries = try self.approxCardinalityEntriesAlloc(store, name);
         defer {
             for (entries) |*entry| entry.deinit(self.alloc);
@@ -16983,7 +17168,7 @@ pub const Index = struct {
         if (constraints.len != 0 or generation != null) return null;
         const resolved = self.resolveUniqueField(field_or_path) orelse return null;
         if (resolved.role != .group) return null;
-        for (self.config().hll_cardinalities) |hcfg| {
+        for (self.hllCardinalities()) |hcfg| {
             if (!std.mem.eql(u8, hcfg.value_field, resolved.name)) continue;
             if (group_fields) |fields| {
                 if (!self.hllGroupByMatches(hcfg.group_by, fields)) continue;
@@ -17007,7 +17192,7 @@ pub const Index = struct {
         generation: ?u64,
     ) !?f64 {
         const name = (try self.hllCardinalityNameForField(store, group_fields, field_or_path, constraints, generation)) orelse return null;
-        for (self.config().hll_cardinalities) |hcfg| {
+        for (self.hllCardinalities()) |hcfg| {
             if (std.mem.eql(u8, hcfg.name, name)) {
                 return hll.relativeErrorForPrecision(hllCardinalityPrecision(hcfg));
             }
@@ -17018,7 +17203,7 @@ pub const Index = struct {
     // Test helper: whether the (single) configured HLL cardinality is currently
     // marked dirty (i.e. a maintenance rebuild is pending).
     fn hllCardinalityDirtyTest(self: *Index, store: *docstore_mod.DocStore) !bool {
-        return try self.hllCardinalityDirty(store, self.config().hll_cardinalities[0].name);
+        return try self.hllCardinalityDirty(store, self.hllCardinalities()[0].name);
     }
 
     fn hllCardinalityDirty(self: *Index, store: *docstore_mod.DocStore, name: []const u8) !bool {
@@ -19467,6 +19652,89 @@ test "algebraic index materializes approximate per-group cardinality" {
     // The grand total is the union of the per-group sketches: 5 distinct customers.
     const total = try idx.approxCardinalityTotalAlloc(&store, "customers_by_region");
     try std.testing.expect(@max(total, 5) - @min(total, 5) <= 1);
+}
+
+test "algebraic HLL cardinality is adaptively promoted from a recurring query shape" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    var runtime = try background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    // No static hll_cardinalities; adaptive promotion is enabled with a low
+    // observation threshold. A recurring cardinality(customer) grouped by region
+    // should promote a sketch and backfill it from the existing facts.
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "adaptive": {"observe": true, "lazy_materialization": true, "min_observations": 2}
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+    idx.attachHllMaintenanceLane(runtime.durable_jobs, runtime.allocOwnerId());
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"b\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"c\"}" },
+        .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"a\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const adaptive_name = try idx.hllAdaptiveNameAlloc("region", "customer");
+    defer alloc.free(adaptive_name);
+
+    // First observation: below threshold (2), no sketch yet.
+    idx.observeCardinalityForAdaptive(&store, "region", "customer");
+    try std.testing.expect(!idx.hllRegistryContains(adaptive_name));
+
+    // Second observation reaches the threshold and promotes + dirties the sketch.
+    idx.observeCardinalityForAdaptive(&store, "region", "customer");
+    try std.testing.expect(idx.hllRegistryContains(adaptive_name));
+
+    // Backfill the freshly promoted sketch from the stored facts.
+    _ = try idx.runHllMaintenance(&store);
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_group = try token.canonicalTupleAlloc(alloc, &.{west_token});
+    defer alloc.free(west_group);
+    const east_token = try idx.constraintTokenAlloc(alloc, "region", "east");
+    defer alloc.free(east_token);
+    const east_group = try token.canonicalTupleAlloc(alloc, &.{east_token});
+    defer alloc.free(east_group);
+
+    const entries = try idx.approxCardinalityEntriesAlloc(&store, adaptive_name);
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    var west: ?u64 = null;
+    var east: ?u64 = null;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.group_key, west_group)) west = entry.estimate;
+        if (std.mem.eql(u8, entry.group_key, east_group)) east = entry.estimate;
+    }
+    try std.testing.expect(west != null and east != null);
+    try std.testing.expect(@max(west.?, 3) - @min(west.?, 3) <= 1);
+    try std.testing.expect(@max(east.?, 1) - @min(east.?, 1) <= 1);
+
+    // The promotion survives reopen: a fresh Index reloads the adaptive sketch
+    // marker so the read path keeps finding it.
+    var idx2 = try Index.open(alloc, "alg", cfg);
+    defer idx2.close();
+    try std.testing.expect(!idx2.hllRegistryContains(adaptive_name));
+    try idx2.loadAdaptiveHllCardinalities(&store);
+    try std.testing.expect(idx2.hllRegistryContains(adaptive_name));
 }
 
 test "algebraic HLL cardinality rebuilds after deletes via maintenance lane" {

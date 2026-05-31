@@ -389,6 +389,12 @@ fn computeAlgebraicAggregation(
     }
 
     if (std.mem.eql(u8, request.type, "cardinality")) {
+        // Record the shape so a recurring root cardinality can adaptively promote
+        // a sketch (no-op unless adaptive.lazy_materialization is enabled). Skip
+        // when constrained/MVCC, matching what the read gate can actually serve.
+        if (request.cardinality_mode != .exact and ctx.algebraic_constraints.len == 0 and ctx.identity_read_generation == null) {
+            index.observeCardinalityForAdaptive(store, null, request.field);
+        }
         // `exact` never consults a sketch; `auto`/`approximate` try one first.
         if (request.cardinality_mode != .exact) {
             if (try index.approxCardinalityTotalForFieldAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) |estimate| {
@@ -2452,6 +2458,12 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
     for (child_rel_errors) |*e| e.* = null;
     for (child_requests, 0..) |child_request, ci| {
         child_hll_maps[ci] = null;
+        // Record the grouped cardinality shape so it can adaptively promote a
+        // per-group sketch (no-op unless adaptive.lazy_materialization is on, and
+        // only for unconstrained, non-MVCC reads the gate can serve).
+        if (constraints.len == 0 and generation == null) {
+            index.observeCardinalityForAdaptive(store, bucket_field, child_request.field);
+        }
         const group_entries = (try index.approxCardinalityEntriesForGroupAlloc(store, &.{bucket_field}, child_request.field, constraints, generation)) orelse continue;
         defer {
             for (group_entries) |*entry| entry.deinit(index.alloc);
