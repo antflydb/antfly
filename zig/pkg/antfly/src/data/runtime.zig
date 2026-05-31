@@ -1413,6 +1413,11 @@ pub const DataServer = struct {
     /// not move. Wraps `read_source.source()` and is handed to the write
     /// source(s) so every managed DB blocks entity resolution across shards.
     distributed_candidate_source: ?antfly.public_api.DistributedCandidateSource = null,
+    /// Long-lived backing for the promoter's cross-shard entity sink; its
+    /// `EntitySink` vtable points into this field, so it must not move. Wraps
+    /// `write_source.source()` and is handed to the write source(s) so the
+    /// promoter upserts canonical entities into whichever shard owns them.
+    distributed_entity_sink: ?antfly.public_api.DistributedEntitySink = null,
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
@@ -1648,6 +1653,18 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withResolutionCandidateSource(candidate_source);
             apply_sm.write_cache.resolution_candidate_source = candidate_source;
+        }
+
+        // The promoter's cross-shard entity sink: wrap the routing-aware write
+        // source so the promoter upserts canonical entity documents into the
+        // shard that owns each entity key, then hand it to the write source(s)
+        // that open managed DBs.
+        self.distributed_entity_sink = .{ .writes = self.write_source.source() };
+        const entity_sink = self.distributed_entity_sink.?.entitySink();
+        _ = self.write_source.withEntitySink(entity_sink);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withEntitySink(entity_sink);
+            apply_sm.write_cache.entity_sink = entity_sink;
         }
         self.http_server = antfly.public_api.ApiHttpServer.init(
             self.alloc,

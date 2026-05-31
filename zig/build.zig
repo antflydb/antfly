@@ -3254,10 +3254,11 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "DistributedCandidateSource",
             "prefixUpperBoundAlloc",
+            "DistributedEntitySink",
         },
     });
     const run_lib_resolution_source_tests = b.addRunArtifact(lib_resolution_source_tests);
-    const lib_resolution_source_test_step = b.step("lib-resolution-source-test", "Run focused cross-shard resolution candidate-source tests");
+    const lib_resolution_source_test_step = b.step("lib-resolution-source-test", "Run focused cross-shard resolution candidate-source and entity-sink tests");
     lib_resolution_source_test_step.dependOn(&run_lib_resolution_source_tests.step);
 
     const lib_api_auth_tests = b.addTest(.{
