@@ -600,7 +600,11 @@ Open/index/enrichment validation should reject:
          `ResolutionRuntime.reresolveBacklog`), re-resolving the existing corpus
          and driving the downstream promotion/graph stages. Verified by a
          db-test (bump gen 1 -> 2 re-resolves an already-ingested document).
-   - [ ] Eager edge rewrite on merge (lazy redirect via `merged_into` is done).
+   - [x] Eager edge rewrite on merge: `DB.rewriteEntityEdges` repoints every
+         inbound edge of the merged-away entity at the survivor (preserving type,
+         weight, metadata), so provenance mention edges -- which target the
+         deterministic template key and don't follow `merged_into` on their own
+         -- come into line with a merge. Verified by a db-test.
 
 ## Test Plan
 

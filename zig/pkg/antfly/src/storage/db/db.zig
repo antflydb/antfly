@@ -5492,6 +5492,45 @@ pub const DB = struct {
         return try runtime.pendingReviews(alloc);
     }
 
+    /// Eager edge rewrite for an entity merge: repoint every inbound edge of
+    /// `old_key` (the merged-away entity) at `new_key` (the survivor) in the
+    /// given graph index, preserving edge type, weight, and metadata. Provenance
+    /// mention edges target the deterministic template key, so they do not follow
+    /// `merged_into` on their own; this brings the graph in line with a merge.
+    /// Returns the number of edges rewritten.
+    pub fn rewriteEntityEdges(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        old_key: []const u8,
+        new_key: []const u8,
+    ) !usize {
+        if (std.mem.eql(u8, old_key, new_key)) return 0;
+        const inbound = try self.getEdges(alloc, index_name, old_key, "", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        if (inbound.len == 0) return 0;
+
+        var writes = try alloc.alloc(types.GraphEdgeWrite, inbound.len);
+        defer alloc.free(writes);
+        var deletes = try alloc.alloc(types.GraphEdgeDelete, inbound.len);
+        defer alloc.free(deletes);
+        for (inbound, 0..) |edge, i| {
+            deletes[i] = .{ .index_name = index_name, .source = edge.source, .target = old_key, .edge_type = edge.edge_type };
+            writes[i] = .{
+                .index_name = index_name,
+                .source = edge.source,
+                .target = new_key,
+                .edge_type = edge.edge_type,
+                .weight = edge.weight,
+                .created_at = edge.created_at,
+                .updated_at = edge.updated_at,
+                .metadata_json = edge.metadata,
+            };
+        }
+        try self.batch(.{ .graph_writes = writes, .graph_deletes = deletes, .sync_level = .write });
+        return inbound.len;
+    }
+
     pub fn hasIndex(self: *DB, name: []const u8) bool {
         return self.core.hasIndex(name);
     }
@@ -23883,6 +23922,72 @@ test "db materializes doc->entity mention edges as provenance and clears them on
         const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 0), inbound.len);
+    }
+}
+
+test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    // The mention edge points at the deterministic template key.
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    }
+
+    // Merge person/ada_lovelace into a canonical survivor: rewrite its edges.
+    const rewritten = try db.rewriteEntityEdges(alloc, "prov_graph", "person/ada_lovelace", "person/ada_canonical");
+    try std.testing.expectEqual(@as(usize, 1), rewritten);
+    try db.runUntilIdle();
+
+    // Inbound edges moved from the merged-away key to the survivor.
+    {
+        const old_inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, old_inbound);
+        try std.testing.expectEqual(@as(usize, 0), old_inbound.len);
+
+        const new_inbound = try db.getEdges(alloc, "prov_graph", "person/ada_canonical", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, new_inbound);
+        try std.testing.expectEqual(@as(usize, 1), new_inbound.len);
+        try std.testing.expectEqualStrings("doc:a", new_inbound[0].source);
+        try std.testing.expectEqualStrings("person/ada_canonical", new_inbound[0].target);
     }
 }
 
