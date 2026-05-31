@@ -143,45 +143,73 @@ pub fn deserialize(alloc: Allocator, data: []const u8) !Row {
 
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        const path = try readStr(data, &pos);
-        if (pos + 2 > data.len) return error.InvalidRelationalRow;
-        const flags = data[pos];
-        const value_type = valueTypeFromByte(data[pos + 1]) orelse return error.InvalidRelationalRow;
-        pos += 2;
-
-        const value: typed_dv.TypedValue = switch (value_type) {
-            .u64_val => .{ .u64_val = try readU64Checked(data, &pos) },
-            .f64_val => .{ .f64_val = @bitCast(try readU64Checked(data, &pos)) },
-            .bool_val => blk: {
-                if (pos + 1 > data.len) return error.InvalidRelationalRow;
-                const b = data[pos] != 0;
-                pos += 1;
-                break :blk .{ .bool_val = b };
-            },
-            .geo_point => blk: {
-                const lat: f64 = @bitCast(try readU64Checked(data, &pos));
-                const lon: f64 = @bitCast(try readU64Checked(data, &pos));
-                break :blk .{ .geo_point = .{ .lat = lat, .lon = lon } };
-            },
-            .bytes_val => blk: {
-                if (pos + 4 > data.len) return error.InvalidRelationalRow;
-                const len = readU32(data, &pos);
-                if (pos + len > data.len) return error.InvalidRelationalRow;
-                const bytes = data[pos .. pos + len];
-                pos += len;
-                break :blk .{ .bytes_val = bytes };
-            },
-        };
-
-        cells[i] = .{
-            .path = path,
-            .value_type = value_type,
-            .is_json = (flags & flag_is_json) != 0,
-            .value = value,
-        };
+        cells[i] = try readCellAt(data, &pos);
     }
 
     return .{ .cells = cells };
+}
+
+/// Decode the cell at `pos.*`, advancing `pos`. Shared by full deserialization
+/// and the single-column accessor. The `path`/`bytes_val` slices borrow `data`.
+fn readCellAt(data: []const u8, pos: *usize) !Cell {
+    const path = try readStr(data, pos);
+    if (pos.* + 2 > data.len) return error.InvalidRelationalRow;
+    const flags = data[pos.*];
+    const value_type = valueTypeFromByte(data[pos.* + 1]) orelse return error.InvalidRelationalRow;
+    pos.* += 2;
+
+    const value: typed_dv.TypedValue = switch (value_type) {
+        .u64_val => .{ .u64_val = try readU64Checked(data, pos) },
+        .f64_val => .{ .f64_val = @bitCast(try readU64Checked(data, pos)) },
+        .bool_val => blk: {
+            if (pos.* + 1 > data.len) return error.InvalidRelationalRow;
+            const b = data[pos.*] != 0;
+            pos.* += 1;
+            break :blk .{ .bool_val = b };
+        },
+        .geo_point => blk: {
+            const lat: f64 = @bitCast(try readU64Checked(data, pos));
+            const lon: f64 = @bitCast(try readU64Checked(data, pos));
+            break :blk .{ .geo_point = .{ .lat = lat, .lon = lon } };
+        },
+        .bytes_val => blk: {
+            if (pos.* + 4 > data.len) return error.InvalidRelationalRow;
+            const len = readU32(data, pos);
+            if (pos.* + len > data.len) return error.InvalidRelationalRow;
+            const bytes = data[pos.* .. pos.* + len];
+            pos.* += len;
+            break :blk .{ .bytes_val = bytes };
+        },
+    };
+
+    return .{
+        .path = path,
+        .value_type = value_type,
+        .is_json = (flags & flag_is_json) != 0,
+        .value = value,
+    };
+}
+
+/// Look up a single column by its JSON path directly from a serialized row,
+/// without allocating the full cell array. Returns the decoded cell (its
+/// `path`/`bytes_val` borrow `value`) or null if the row has no such column.
+/// This is the Seam B accessor: a field-scoped consumer (e.g. an enrichment
+/// `source_field`) reads one column instead of reconstructing the whole
+/// document. Returns null for a non-row value.
+pub fn findCellByPath(value: []const u8, path: []const u8) !?Cell {
+    if (!looksLikeRow(value)) return null;
+    if (value.len < magic.len + 8) return error.InvalidRelationalRow;
+    var pos: usize = magic.len;
+    const ver = readU32(value, &pos);
+    if (ver != version) return error.UnsupportedRelationalRowVersion;
+    const count = readU32(value, &pos);
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const cell = try readCellAt(value, &pos);
+        if (std.mem.eql(u8, cell.path, path)) return cell;
+    }
+    return null;
 }
 
 /// Reconstruct a document's canonical JSON directly from a serialized typed-row
@@ -394,4 +422,26 @@ test "relational row codec rejects bad magic, version, and truncation" {
     std.mem.writeInt(u32, verbuf[4..8], version + 1, .little);
     std.mem.writeInt(u32, verbuf[8..12], 0, .little);
     try std.testing.expectError(error.UnsupportedRelationalRowVersion, deserialize(alloc, &verbuf));
+}
+
+test "findCellByPath reads a single column without full deserialization" {
+    const alloc = std.testing.allocator;
+    const cells = [_]Cell{
+        .{ .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "abc" } },
+        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 12.5 } },
+        .{ .path = "active", .value_type = .bool_val, .value = .{ .bool_val = true } },
+    };
+    const encoded = try serialize(alloc, &cells);
+    defer alloc.free(encoded);
+
+    const id = (try findCellByPath(encoded, "id")).?;
+    try std.testing.expectEqual(typed_dv.ValueType.bytes_val, id.value_type);
+    try std.testing.expectEqualStrings("abc", id.value.bytes_val);
+
+    const amount = (try findCellByPath(encoded, "amount")).?;
+    try std.testing.expectEqual(@as(f64, 12.5), amount.value.f64_val);
+
+    try std.testing.expect((try findCellByPath(encoded, "missing")) == null);
+    // Non-row value yields null, not an error.
+    try std.testing.expect((try findCellByPath("{\"id\":\"x\"}", "id")) == null);
 }
