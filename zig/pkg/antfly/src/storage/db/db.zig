@@ -16223,13 +16223,17 @@ fn mentionEdgeWritesAlloc(
             }
         }
         if (duplicate) continue;
+        // Record the resolved DocRef target table so the endpoint can be
+        // hydrated cross-table; same-table hydration ignores it.
+        const metadata = try std.fmt.allocPrint(alloc, "{{\"target_table\":{f}}}", .{std.json.fmt(cfg.table, .{})});
+        errdefer alloc.free(metadata);
         try writes.append(alloc, .{
             .index_name = try alloc.dupe(u8, index_name),
             .source = try alloc.dupe(u8, doc_key),
             .target = try alloc.dupe(u8, key),
             .edge_type = try alloc.dupe(u8, mention_edge_type),
             .weight = 1.0,
-            .metadata_json = try alloc.dupe(u8, "{}"),
+            .metadata_json = metadata,
         });
     }
     return try writes.toOwnedSlice(alloc);
@@ -23662,6 +23666,11 @@ test "db materializes doc->entity mention edges as provenance and clears them on
         const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
         defer graph_mod.GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 2), out.len);
+        // Each mention edge records the resolved DocRef target table so the
+        // endpoint can be hydrated cross-table.
+        for (out) |edge| {
+            try std.testing.expect(std.mem.indexOf(u8, edge.metadata, "\"target_table\":\"entities\"") != null);
+        }
     }
     // Inbound provenance: "which documents mention this entity" == inbound edges.
     {

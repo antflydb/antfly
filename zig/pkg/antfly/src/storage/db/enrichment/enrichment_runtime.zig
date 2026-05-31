@@ -1725,13 +1725,15 @@ fn runtimeMentionEdgeWritesAlloc(
             }
         }
         if (duplicate) continue;
+        const metadata = try std.fmt.allocPrint(runtime.alloc, "{{\"target_table\":{f}}}", .{std.json.fmt(cfg.table, .{})});
+        errdefer runtime.alloc.free(metadata);
         try writes.append(runtime.alloc, .{
             .index_name = try runtime.alloc.dupe(u8, index_name),
             .source = try runtime.alloc.dupe(u8, doc_key),
             .target = try runtime.alloc.dupe(u8, key),
             .edge_type = try runtime.alloc.dupe(u8, mention_edge_type),
             .weight = 1.0,
-            .metadata_json = try runtime.alloc.dupe(u8, "{}"),
+            .metadata_json = metadata,
         });
     }
     return try writes.toOwnedSlice(runtime.alloc);
