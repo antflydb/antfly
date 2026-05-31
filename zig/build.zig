@@ -3283,21 +3283,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_lib_api_logic_tests = b.addRunArtifact(lib_api_logic_tests);
     run_lib_api_logic_tests.step.dependOn(&openapi_root_check.step);
-    // These api/indexes embeddings/shard status-encoder tests are pre-existing
-    // failures: they were never collected by any gated step (the api.indexes
-    // tests only became reachable once root.zig referenced public_api.indexes),
-    // so their assertions bit-rotted against the current encoder output. They
-    // are unrelated to dynamic-template work and are skipped here pending a
-    // separate triage of whether the encoder or the assertions are correct.
-    for ([_][]const u8{
-        "index encoders expose metadata-backed configs",
-        "index encoders expose local shard runtime status",
-        "index encoders aggregate preserved synthetic shard counters",
-        "single embeddings index encoder keeps published visibility separate from replay debt",
-        "managed embeddings readiness prefers replay completion once docs are indexed",
-    }) |skip| {
-        run_lib_api_logic_tests.addArgs(&.{ "--skip-test-filter", skip });
-    }
     const lib_api_logic_test_step = b.step("lib-api-logic-test", "Run focused API table/index encoder, parser, and schema-update logic tests");
     lib_api_logic_test_step.dependOn(&run_lib_api_logic_tests.step);
 
