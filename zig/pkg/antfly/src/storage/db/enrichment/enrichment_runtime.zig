@@ -22,6 +22,7 @@ const common_secrets = @import("../../../common/secrets.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
 const replay_source_mod = @import("../derived/replay_source.zig");
 const derived_types = @import("../derived/derived_types.zig");
@@ -679,7 +680,7 @@ fn getOrCreateRequestChunks(
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => null,
     };
@@ -1401,7 +1402,7 @@ fn processAsset(
 ) !void {
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return,
     };
@@ -2075,7 +2076,7 @@ fn collectPlainDenseBatchItem(
     const embedding_artifact_name = requestEmbeddingName(request);
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return null,
     };
@@ -2369,7 +2370,7 @@ fn getOrCreatePlannedRequests(
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => {
             const empty = try runtime.alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, 0);
@@ -2676,7 +2677,7 @@ fn processDenseEmbedding(
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return,
     };
@@ -2798,7 +2799,7 @@ fn processSparseEmbedding(
 
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return,
     };
@@ -3613,6 +3614,16 @@ fn storeGetAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
     defer txn.abort();
     const raw = try txn.get(key);
     return try runtime.alloc.dupe(u8, raw);
+}
+
+/// Read a DOCUMENT store value and materialize it as JSON. For a relational
+/// table the stored value is a serialized typed row; this reconstructs the
+/// document's canonical JSON so the enrichment input resolvers (source_field /
+/// source_template rendering) operate on a document exactly as in document mode.
+/// For document-mode tables the JSON blob passes through unchanged.
+fn storeGetDocumentAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
+    const raw = try storeGetAlloc(runtime, key);
+    return try relational_row_codec.materializeOwnedDocumentValueAlloc(runtime.alloc, raw);
 }
 
 fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {

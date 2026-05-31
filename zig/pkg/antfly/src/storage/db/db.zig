@@ -15241,7 +15241,11 @@ fn collectSparseFieldWritesProfiled(
             continue;
         };
         const extract_start_ns = if (profile != null) monotonicTimeNs() else 0;
-        if (try mapper.extractSparseVectorField(alloc, value, field_name)) |raw_sparse_vec| {
+        // Materialize a relational typed row to JSON before field extraction;
+        // a document-mode blob is duped. Freed after extraction either way.
+        const doc_json = try mapper.materializeDocumentValueAlloc(alloc, value);
+        defer alloc.free(doc_json);
+        if (try mapper.extractSparseVectorField(alloc, doc_json, field_name)) |raw_sparse_vec| {
             var sparse_vec = raw_sparse_vec;
             writes.append(alloc, .{
                 .doc_id = item.doc_key,
@@ -15385,7 +15389,11 @@ fn collectDocumentWritesProfiled(
             missing_required += 1;
             continue;
         };
-        const owned_value = try alloc.dupe(u8, value);
+        // Materialize the stored value to JSON: a relational typed row is
+        // reconstructed to canonical JSON, a document-mode blob is duped. So the
+        // derived consumers (text/dense/sparse indexers) downstream of this
+        // collected write always receive a document, never a raw typed row.
+        const owned_value = try mapper.materializeDocumentValueAlloc(alloc, value);
         try writes.append(alloc, .{
             .key = item.doc_key,
             .value = owned_value,
@@ -15484,6 +15492,15 @@ fn applyTextDocumentsForIndex(
     var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
     defer writes.deinit(alloc);
 
+    // Owned JSON buffers for store-read documents that were materialized from a
+    // relational typed row. Inline/cleaned values are borrowed and not tracked
+    // here; only freshly reconstructed bytes need freeing.
+    var materialized_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (materialized_values.items) |buf| alloc.free(buf);
+        materialized_values.deinit(alloc);
+    }
+
     const trust_inline = if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
         store.nextReplaySequence(sequence + 1) == sequence + 1
     else
@@ -15535,10 +15552,18 @@ fn applyTextDocumentsForIndex(
     try txn.getManySorted(read_keys, read_values);
 
     for (pending.items, 0..) |item, i| {
-        const value = read_values[i] orelse item.inline_value orelse {
+        const raw = read_values[i] orelse item.inline_value orelse {
             missing_required += 1;
             continue;
         };
+        // A store-read relational document is a typed row; reconstruct it to
+        // JSON (tracked for cleanup) so the text indexer sees a document. An
+        // inline/cleaned value or a document-mode blob is used as-is (borrowed).
+        const value = if (read_values[i] != null and mapper.isRelationalRowValue(raw)) blk: {
+            const json = try mapper.materializeDocumentValueAlloc(alloc, raw);
+            try materialized_values.append(alloc, json);
+            break :blk json;
+        } else raw;
         try writes.append(alloc, .{
             .key = item.doc_key,
             .value = value,

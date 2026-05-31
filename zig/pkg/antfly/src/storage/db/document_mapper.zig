@@ -1603,21 +1603,14 @@ pub fn isRelationalRowValue(value: []const u8) bool {
 /// magic and never collides with a real JSON document (which starts with '{').
 /// Caller owns the returned bytes.
 pub fn materializeDocumentValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
-    if (relational_row_codec.looksLikeRow(value)) {
-        return try reconstructRelationalRowDocumentAlloc(alloc, value);
-    }
-    return try alloc.dupe(u8, value);
+    return try relational_row_codec.materializeDocumentValueAlloc(alloc, value);
 }
 
 /// As `materializeDocumentValueAlloc`, but takes ownership of `value`: a typed
 /// row is reconstructed and `value` is freed; a JSON blob is returned as-is
 /// without an extra copy. Convenient at read sites that already own the bytes.
 pub fn materializeOwnedDocumentValueAlloc(alloc: Allocator, value: []u8) ![]u8 {
-    if (relational_row_codec.looksLikeRow(value)) {
-        defer alloc.free(value);
-        return try reconstructRelationalRowDocumentAlloc(alloc, value);
-    }
-    return value;
+    return try relational_row_codec.materializeOwnedDocumentValueAlloc(alloc, value);
 }
 
 /// typed_doc_values type used to persist a relational column for reconstruction.

@@ -184,6 +184,36 @@ pub fn deserialize(alloc: Allocator, data: []const u8) !Row {
     return .{ .cells = cells };
 }
 
+/// Reconstruct a document's canonical JSON directly from a serialized typed-row
+/// value. Schema-free. Caller owns the returned bytes.
+pub fn reconstructValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
+    var row = try deserialize(alloc, value);
+    defer row.deinit(alloc);
+    return try reconstructDocumentAlloc(alloc, row.cells);
+}
+
+/// Materialize a stored document value as JSON: a typed row is reconstructed to
+/// canonical JSON; anything else (a JSON blob) is returned as an owned copy.
+/// This is the single seam every document-value reader routes a raw store value
+/// through, so none of them need to know the storage format. Detection is
+/// schema-free via the row magic and never collides with a real JSON document
+/// (which starts with '{'). Caller owns the returned bytes.
+pub fn materializeDocumentValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
+    if (looksLikeRow(value)) return try reconstructValueAlloc(alloc, value);
+    return try alloc.dupe(u8, value);
+}
+
+/// As `materializeDocumentValueAlloc`, but takes ownership of `value`: a typed
+/// row is reconstructed and `value` is freed; a JSON blob is returned as-is
+/// without an extra copy. Convenient at read sites that already own the bytes.
+pub fn materializeOwnedDocumentValueAlloc(alloc: Allocator, value: []u8) ![]u8 {
+    if (looksLikeRow(value)) {
+        defer alloc.free(value);
+        return try reconstructValueAlloc(alloc, value);
+    }
+    return value;
+}
+
 /// Reconstruct a document's canonical JSON from decoded cells. Schema-free.
 /// Caller owns the returned bytes.
 pub fn reconstructDocumentAlloc(alloc: Allocator, cells: []const Cell) ![]u8 {

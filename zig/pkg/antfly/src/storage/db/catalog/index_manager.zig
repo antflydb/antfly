@@ -4525,6 +4525,21 @@ pub const IndexManager = struct {
         try self.applySparseEmbeddingWritesEntry(store, entry, writes, batch_options);
     }
 
+    /// Reconstruct any relational typed-row values in a freshly scanned set of
+    /// document rows into canonical JSON, in place. Backfill scans read the raw
+    /// stored value (a typed row for relational tables); rewriting each row's
+    /// value to JSON here means every downstream consumer (text segment build,
+    /// dense/sparse vector field extraction) sees a document exactly as in
+    /// document mode, with no further per-consumer changes. Non-document and
+    /// JSON-blob rows are left untouched. The pair's `value` is owned, so the old
+    /// buffer is freed and replaced with the reconstructed bytes.
+    fn materializeScannedDocumentRows(self: *IndexManager, rows: []backend_scan.OwnedKVPair) !void {
+        for (rows) |*row| {
+            if (!mapper.isRelationalRowValue(row.value)) continue;
+            row.value = try mapper.materializeOwnedDocumentValueAlloc(self.alloc, row.value);
+        }
+    }
+
     fn backfillTextIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, resume_from: ?[]const u8) !void {
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
         var runtime_store = try initRuntimeStore(self.alloc, store);
@@ -4537,6 +4552,7 @@ pub const IndexManager = struct {
 
         const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
         defer backend_scan.freeResults(self.alloc, docs);
+        try self.materializeScannedDocumentRows(docs);
         var identity_txn = try runtime_store.store.beginRead();
         defer identity_txn.abort();
 
@@ -5791,6 +5807,7 @@ pub const IndexManager = struct {
 
         const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
         defer backend_scan.freeResults(self.alloc, docs);
+        try self.materializeScannedDocumentRows(docs);
 
         var items = std.ArrayListUnmanaged(hbc_mod.BatchInsertItem).empty;
         defer {
@@ -5842,6 +5859,7 @@ pub const IndexManager = struct {
 
         const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
         defer backend_scan.freeResults(self.alloc, docs);
+        try self.materializeScannedDocumentRows(docs);
 
         var writes = std.ArrayListUnmanaged(sparse_mod.SparseWrite).empty;
         defer {
