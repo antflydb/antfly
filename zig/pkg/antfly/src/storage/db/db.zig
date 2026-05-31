@@ -5458,6 +5458,26 @@ pub const DB = struct {
         try self.core.addResolver(cfg);
     }
 
+    /// Add or replace a resolver. When the replacement bumps `config_generation`,
+    /// re-resolve the existing corpus so the new scorer/template applies to
+    /// documents already ingested (the extraction artifacts did not change, so
+    /// the incremental hint would not fire on its own).
+    pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+        const needs_reresolve = blk: {
+            lockApply(self);
+            defer self.core.unlockApply();
+            break :blk try self.core.upsertResolver(cfg);
+        };
+        if (needs_reresolve) {
+            if (self.resolution_runtime) |runtime| {
+                _ = try runtime.reresolveBacklog();
+                // Drive the resolution writes the backfill journaled through the
+                // downstream promotion/graph stages.
+                try self.runUntilIdle();
+            }
+        }
+    }
+
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
         lockApply(self);
         defer self.core.unlockApply();
@@ -23565,6 +23585,70 @@ test "db resolves extracted entities into a resolution artifact end-to-end" {
     try std.testing.expectEqual(@as(usize, 2), entities.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", entities[0].object.get("doc_ref").?.object.get("key").?.string);
     try std.testing.expectEqualStrings("org/antfly", entities[1].object.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "db re-resolves the corpus when upsertResolver bumps the config generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    {
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+    }
+
+    // Bump the resolver's config generation: the document was already ingested,
+    // so only the corpus backfill (triggered by upsertResolver) re-resolves it.
+    try db.upsertResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 2,
+    });
+
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":2") != null);
 }
 
 /// Thread-safe capturing entity sink for the promotion integration test.

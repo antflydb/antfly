@@ -798,6 +798,33 @@ pub const ResolutionRuntime = struct {
         }
     }
 
+    /// Re-resolve the whole stored corpus for the configured resolvers (used
+    /// when a resolver's config generation bumps). Serialized with catch-up so
+    /// the worker and this pass cannot write the same resolution at once.
+    /// Returns the number of extraction artifacts re-processed.
+    pub fn reresolveBacklog(self: *ResolutionRuntime) !usize {
+        lockMutex(&self.catch_up_mutex);
+        defer self.catch_up_mutex.unlock();
+
+        const resolvers = try self.index_manager.listResolvers(self.alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(self.alloc);
+            self.alloc.free(resolvers);
+        }
+        if (resolvers.len == 0) return 0;
+
+        var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
+        return reresolveAll(
+            self.alloc,
+            das.artifactStore(),
+            resolvers,
+            self.candidate_source,
+            self.embedder,
+            self.write_ctx,
+            self.write_fn,
+        );
+    }
+
     fn workerMain(self: *ResolutionRuntime) void {
         const io = (self.io_impl orelse return).io();
         while (!self.shutdown_flag.load(.acquire)) {

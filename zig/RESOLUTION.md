@@ -558,12 +558,11 @@ Open/index/enrichment validation should reject:
          the resolution runtime's final catch-up).
 2. **Learned + reviewed (phase 2).**
    - [x] Learned weights (logistic regression) over the same levels:
-         `matcher.fitLogisticRegression` fits a weight per feature (+ bias) from
-         labelled pairs, `predictLogistic` scores; the fitted weights populate
-         the same `Level.weight`/`combine.bias` the deterministic scorer reads
-         (only the numbers change). Unit-tested. Remaining: the offline
-         training harness that encodes pairs as feature vectors and writes a
-         learned-weights scorer config.
+         `matcher.fitLogisticRegression`/`predictLogistic` plus the training
+         harness `matcher.fitScorerWeights` (encodes labelled pairs by which
+         level matched per comparison) and `applyLearnedWeights` (writes the
+         fitted weights back into the scorer's levels + bias, in place). A
+         learned scorer classifies match vs no-match end to end. Unit-tested.
    - [x] Calibrated fusion across extractors: `matcher.fuse` combines per-source
          `trust * confidence` (noisy_or / max / mean) with a config-generation-
          pinned graph prior into one edge confidence. Unit-tested. Remaining:
@@ -585,12 +584,13 @@ Open/index/enrichment validation should reject:
 3. **Merge/split (phase 3).**
    - [x] Entity `merged_into`: resolution follows a matched candidate's
          `merged_into` redirect to the surviving canonical entity (lazy merge).
-   - [x] config-generation re-resolution backfill: `reresolveAll` scans the
-         user-key namespace for the extraction artifacts a resolver consumes and
-         re-runs resolution (idempotent; unchanged artifacts skipped), so a
-         scorer/template/`config_generation` change re-resolves the existing
-         corpus even though the incremental hint never fires. Unit-tested.
-         Remaining: auto-trigger it when a resolver's config_generation bumps.
+   - [x] config-generation re-resolution: `reresolveAll` scans the user-key
+         namespace for a resolver's extraction artifacts and re-runs resolution
+         (idempotent), and `DB.upsertResolver` auto-triggers it when a
+         resolver's `config_generation` bumps (via
+         `ResolutionRuntime.reresolveBacklog`), re-resolving the existing corpus
+         and driving the downstream promotion/graph stages. Verified by a
+         db-test (bump gen 1 -> 2 re-resolves an already-ingested document).
    - [ ] Eager edge rewrite on merge (lazy redirect via `merged_into` is done).
 
 ## Test Plan

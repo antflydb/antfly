@@ -2010,6 +2010,30 @@ pub const IndexManager = struct {
         try self.persistResolverCatalog(store);
     }
 
+    /// Add or replace a resolver by name. Returns true when an existing resolver
+    /// was replaced by one with a strictly higher `config_generation` -- the
+    /// signal that the corpus should be re-resolved (the extraction artifacts did
+    /// not change, so the incremental hint will not fire).
+    pub fn upsertResolver(self: *IndexManager, store: anytype, cfg: resolver_catalog.ResolverConfig) !bool {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        for (self.resolvers.items) |*entry| {
+            if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
+            const bumped = cfg.config_generation > entry.config_generation;
+            var replacement = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
+            errdefer replacement.deinit(self.alloc);
+            entry.deinit(self.alloc);
+            entry.* = replacement;
+            try self.persistResolverCatalog(store);
+            return bumped;
+        }
+        const checkpoint = self.resolvers.items.len;
+        errdefer self.truncateResolvers(checkpoint);
+        try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        try self.persistResolverCatalog(store);
+        return false;
+    }
+
     pub fn removeResolver(self: *IndexManager, store: anytype, name: []const u8) !bool {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();

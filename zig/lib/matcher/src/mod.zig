@@ -484,6 +484,80 @@ pub fn predictLogistic(weights: []const f64, features: []const f64) f64 {
     return logistic(z);
 }
 
+// --- Training harness: fit a scorer's level weights from labelled pairs ------
+
+/// A labelled (mention, candidate) pair for training.
+pub const TrainingPair = struct {
+    left: Record,
+    right: Record,
+    label: bool,
+};
+
+/// Total levels across all comparisons -- the feature dimension. Each level is
+/// one feature: 1.0 when it was the first-matching level of its comparison.
+fn totalLevels(scorer: Scorer) usize {
+    var n: usize = 0;
+    for (scorer.comparisons) |cmp| n += cmp.levels.len;
+    return n;
+}
+
+fn encodePairFeatures(scorer: Scorer, scratch: std.mem.Allocator, pair: TrainingPair, features: []f64) void {
+    @memset(features, 0);
+    var base: usize = 0;
+    for (scorer.comparisons) |cmp| {
+        const left = pair.left.get(cmp.left);
+        const right = pair.right.get(cmp.right);
+        for (cmp.levels, 0..) |level, li| {
+            if (level.condition.holds(scratch, left, right)) {
+                features[base + li] = 1.0;
+                break;
+            }
+        }
+        base += cmp.levels.len;
+    }
+}
+
+/// Fit the scorer's per-level weights from labelled pairs: each pair is encoded
+/// by which level matched per comparison, then logistic regression fits a weight
+/// per level (+ bias). Returns `totalLevels + 1` owned weights (last = bias),
+/// laid out comparison-by-comparison in level order -- the layout
+/// `applyLearnedWeights` writes back.
+pub fn fitScorerWeights(
+    alloc: std.mem.Allocator,
+    scorer: Scorer,
+    pairs: []const TrainingPair,
+    opts: FitOptions,
+) ![]f64 {
+    const fc = totalLevels(scorer);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const examples = try a.alloc(TrainingExample, pairs.len);
+    for (pairs, 0..) |pair, i| {
+        const features = try a.alloc(f64, fc);
+        encodePairFeatures(scorer, a, pair, features);
+        examples[i] = .{ .features = features, .label = pair.label };
+    }
+    return try fitLogisticRegression(alloc, examples, fc, opts);
+}
+
+/// Write fitted weights back into the scorer's levels (and bias), in place. The
+/// structure is unchanged; only the numbers learn. `weights` must come from
+/// `fitScorerWeights` for the same scorer.
+pub fn applyLearnedWeights(scorer: *Scorer, weights: []const f64) void {
+    const fc = totalLevels(scorer.*);
+    if (weights.len != fc + 1) return;
+    var base: usize = 0;
+    for (scorer.comparisons) |cmp| {
+        const levels = @constCast(cmp.levels);
+        for (levels, 0..) |*level, li| level.weight = weights[base + li];
+        base += cmp.levels.len;
+    }
+    scorer.bias = weights[fc];
+}
+
 // --- Fusion across multiple extractors -------------------------------------
 //
 // Multiple extractors may assert the same edge with different confidences and
@@ -899,6 +973,48 @@ test "fitLogisticRegression on no examples returns zero weights" {
     for (w) |wi| try testing.expectEqual(@as(f64, 0), wi);
     // Zero weights => probability 0.5 (no signal).
     try testing.expectApproxEqAbs(@as(f64, 0.5), predictLogistic(w, &.{ 1, 1, 1 }), 1e-9);
+}
+
+test "fitScorerWeights learns a scorer that classifies match vs no-match" {
+    const alloc = testing.allocator;
+    // Structure only; weights start at 0 (learned below).
+    var scorer = try Scorer.parse(alloc,
+        \\{ "comparisons": [ { "name": "n", "left": "name", "right": "name",
+        \\  "levels": [ { "when": "exact", "weight": 0.0 }, { "else": true, "weight": 0.0 } ] } ],
+        \\  "combine": { "bias": 0.0 }, "decision": { "match": 0.9 } }
+    );
+    defer scorer.deinit();
+
+    const ada: Value = .{ .text = "Ada Lovelace" };
+    const turing: Value = .{ .text = "Alan Turing" };
+    var mention = [_]Field{.{ .name = "name", .value = ada }};
+    var same = [_]Field{.{ .name = "name", .value = ada }};
+    var diff = [_]Field{.{ .name = "name", .value = turing }};
+    const m = Record{ .fields = &mention };
+    const matchR = Record{ .fields = &same };
+    const noR = Record{ .fields = &diff };
+
+    const pairs = [_]TrainingPair{
+        .{ .left = m, .right = matchR, .label = true },
+        .{ .left = m, .right = matchR, .label = true },
+        .{ .left = m, .right = noR, .label = false },
+        .{ .left = m, .right = noR, .label = false },
+    };
+
+    // Before training, weights are 0 -> probability 0.5 for any pair.
+    try testing.expectApproxEqAbs(@as(f64, 0.5), scorer.score(alloc, m, matchR).probability, 1e-9);
+
+    const w = try fitScorerWeights(alloc, scorer, &pairs, .{});
+    defer alloc.free(w);
+    applyLearnedWeights(&scorer, w);
+
+    // After training, an exact match scores a match and a mismatch does not.
+    const matched = scorer.score(alloc, m, matchR);
+    const missed = scorer.score(alloc, m, noR);
+    try testing.expectEqual(Outcome.match, matched.outcome);
+    try testing.expect(matched.probability > 0.9);
+    try testing.expect(missed.probability < 0.5);
+    try testing.expectEqual(Outcome.no_match, missed.outcome);
 }
 
 test "fuse combines source confidences and a prior" {
