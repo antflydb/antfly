@@ -278,11 +278,15 @@ pub const Resolver = struct {
 
                 if (best) |bi| {
                     if (best_outcome == .match) {
+                        // Follow a `merged_into` redirect so a mention linking to
+                        // a merged-away entity resolves to its canonical survivor
+                        // (lazy merge; the merged doc points at the survivor).
+                        const matched_key = recordTextField(candidates[bi].record, "merged_into") orelse candidates[bi].doc_ref.key;
                         return .{
                             .local_id = local_id,
                             .doc_ref = .{
                                 .table = try a.dupe(u8, candidates[bi].doc_ref.table),
-                                .key = try a.dupe(u8, candidates[bi].doc_ref.key),
+                                .key = try a.dupe(u8, matched_key),
                             },
                             .confidence = best_prob,
                             .decision = .match,
@@ -476,6 +480,19 @@ fn writeJsonString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8
 // --- Extraction parsing -----------------------------------------------------
 
 /// Parsed entities from an extraction artifact, owning their backing memory.
+/// Reads a text field's value from a matcher record, or null. Used to follow a
+/// candidate entity's `merged_into` redirect to its canonical survivor.
+fn recordTextField(record: matcher.Record, name: []const u8) ?[]const u8 {
+    for (record.fields) |field| {
+        if (!std.mem.eql(u8, field.name, name)) continue;
+        return switch (field.value) {
+            .text => |t| if (t.len > 0) t else null,
+            else => null,
+        };
+    }
+    return null;
+}
+
 pub const ParsedEntities = struct {
     arena: std.heap.ArenaAllocator,
     /// Mutable so the resolution stage can backfill name embeddings in place.
@@ -1094,6 +1111,70 @@ test "resolution stage links to a candidate supplied by the provider" {
     defer parsed.deinit();
     const ent = parsed.value.object.get("entities").?.array.items[0].object;
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+const MergedCandidate = struct {
+    doc_ref: DocRef,
+    label: []const u8,
+    name: []const u8,
+    merged_into: []const u8,
+
+    fn provider(self: *MergedCandidate) CandidateProvider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable = CandidateProvider.VTable{ .candidates_for = candidatesFor };
+    fn candidatesFor(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        entity: ExtractedEntity,
+        out: *std.ArrayListUnmanaged(Candidate),
+    ) anyerror!void {
+        const self: *MergedCandidate = @ptrCast(@alignCast(ptr));
+        _ = entity;
+        const fields = try allocator.alloc(matcher.Field, 2);
+        fields[0] = .{ .name = "canonical_name", .value = .{ .text = try allocator.dupe(u8, self.name) } };
+        fields[1] = .{ .name = "merged_into", .value = .{ .text = try allocator.dupe(u8, self.merged_into) } };
+        try out.append(allocator, .{ .doc_ref = self.doc_ref, .label = self.label, .record = .{ .fields = fields } });
+    }
+};
+
+test "resolution follows a candidate's merged_into redirect to the survivor" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "entities", "key_template": "{{ slug _entity.text }}",
+        \\  "scorer": {
+        \\    "comparisons": [
+        \\      { "name": "name", "left": "canonical_text", "right": "canonical_name",
+        \\        "levels": [ { "when": "exact", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] }
+        \\    ],
+        \\    "combine": { "bias": -3.0 }, "decision": { "match": 0.9 }
+        \\  } }
+    );
+    defer resolver.deinit();
+
+    var map = MapStore{ .alloc = testing.allocator };
+    defer map.deinit();
+    try map.store().put("ext:doc1",
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+
+    // The blocked candidate is a merged-away duplicate pointing at the survivor.
+    var candidate = MergedCandidate{
+        .doc_ref = .{ .table = "entities", .key = "person/ada_dup" },
+        .label = "person",
+        .name = "Ada Lovelace",
+        .merged_into = "person/ada_lovelace",
+    };
+    const stage = ResolutionStage{ .resolver = &resolver, .config_generation = 1 };
+    try testing.expectEqual(RunResult.written, try stage.run(testing.allocator, map.store(), candidate.provider(), "ext:doc1", "res:doc1"));
+
+    const stored = (try map.store().get(testing.allocator, "res:doc1")).?;
+    defer testing.allocator.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, stored, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try testing.expectEqualStrings("match", ent.get("decision").?.string);
+    // Resolved to the survivor, not the merged-away duplicate.
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 }
 

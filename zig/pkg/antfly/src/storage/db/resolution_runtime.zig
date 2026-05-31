@@ -1394,6 +1394,55 @@ test "prefix blocking links a typo'd mention to an existing entity with a differ
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 }
 
+test "prefix blocking follows a merged_into redirect to the survivor entity" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "n", "left": "canonical_text", "right": "canonical_name",
+        \\  "levels": [ { "when": "exact", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+    // The entity blocked by prefix is a merged-away duplicate pointing at the
+    // surviving canonical entity via merged_into.
+    const dup_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(dup_key);
+    try store.put(dup_key,
+        \\{ "canonical_name": "Ada Lovelace", "label": "person", "merged_into": "person/ada_canonical" }
+    );
+
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null, null)).?;
+    defer alloc.free(outcome.resolution_key);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const stored = (try store.get(alloc, resolution_key)).?;
+    defer alloc.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try testing.expectEqualStrings("match", ent.get("decision").?.string);
+    // Resolved to the survivor named by merged_into, not the matched duplicate.
+    try testing.expectEqualStrings("person/ada_canonical", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
 test "embedding (cosine) scoring links via prefix blocking" {
     const alloc = testing.allocator;
     const resolvers = [_]ResolverConfig{.{
