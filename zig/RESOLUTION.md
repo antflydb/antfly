@@ -461,11 +461,18 @@ Open/index/enrichment validation should reject:
          and `notifySequence`d wherever enrichment is (incl. the enrichment
          derived-batch append where extraction artifacts land). Verified by
          `db-test` + `root-test`.
-   - [~] Deferred (tabled): a db-level integration test driving extraction ->
-         resolution end-to-end (needs an asset-producer harness), and candidate
-         blocking over the entity table. The deterministic minting path is
-         complete and tested without either; candidate blocking is the gateway to
-         phase-2 model-backed resolution.
+   - [x] End-to-end integration test: doc write -> extraction asset artifact ->
+         resolution worker -> resolution artifact, driven via `runUntilIdle`
+         ("db resolves extracted entities into a resolution artifact
+         end-to-end"). Exposed and fixed the replay prune-watermark interaction
+         and the exclusive `from_sequence` convention.
+   - [x] Candidate blocking (exact_key): `ResolverConfig.candidate_search` +
+         `ExactKeyCandidateProvider` look up the rendered canonical key as an
+         existing entity through the store seam, so the scorer links to it
+         (decision=match) instead of re-minting. Tested.
+   - [ ] Phase-2 blocking extensions: ANN/prefix candidate search over the
+         entity table, and cross-shard entity-table reads (distributed query).
+         These unlock model-backed / cross-document resolution.
    - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
          per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
          / `listResolvers` through DB -> DBCore -> IndexManager (verified by a
