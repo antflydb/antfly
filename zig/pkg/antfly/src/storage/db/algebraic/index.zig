@@ -359,7 +359,23 @@ fn dynamicRuleRoleMask(scalar_type: []const u8) u3 {
     return 0;
 }
 
-fn dynamicRuleMatches(rule: fact_mod.DynamicRule, path: []const u8, field_name: []const u8, json_value: std.json.Value) bool {
+/// Evaluate a dynamic-template selector against a field path + leaf name. The
+/// single source of truth for both ingest projection and query resolution, so
+/// the two can never drift. `json_value` is the field's value at ingest, or null
+/// at query time (where no value is available).
+///
+/// `match_mapping_type` requires a value, so when `json_value` is null a rule
+/// gated by it cannot be evaluated. Promotion already requires a name/path
+/// selector (see `validateConfig` / schema_capability), so the only effect of a
+/// null value is that the `match_mapping_type` predicate is treated as
+/// unsatisfiable: callers that need query-time resolution must additionally
+/// check for a name/path selector (`dynamicRuleResolvesField`).
+fn dynamicRuleSelectorMatches(
+    rule: fact_mod.DynamicRule,
+    path: []const u8,
+    field_name: []const u8,
+    json_value: ?std.json.Value,
+) bool {
     if (rule.match) |pattern| {
         if (!runtime_schema.globMatch(pattern, field_name)) return false;
     }
@@ -373,7 +389,8 @@ fn dynamicRuleMatches(rule: fact_mod.DynamicRule, path: []const u8, field_name: 
         if (runtime_schema.globMatch(pattern, path)) return false;
     }
     if (rule.match_mapping_type) |expected| {
-        const actual = runtime_schema.matchMappingTypeName(json_value) orelse return false;
+        const value = json_value orelse return false;
+        const actual = runtime_schema.matchMappingTypeName(value) orelse return false;
         if (!std.mem.eql(u8, expected, actual)) return false;
     }
     return true;
@@ -390,19 +407,7 @@ fn fieldNameFromQueryPath(path: []const u8) []const u8 {
 /// evaluated without a value and so do not resolve query fields.
 fn dynamicRuleResolvesField(rule: fact_mod.DynamicRule, path: []const u8, field_name: []const u8) bool {
     if (rule.match == null and rule.path_match == null) return false;
-    if (rule.match) |pattern| {
-        if (!runtime_schema.globMatch(pattern, field_name)) return false;
-    }
-    if (rule.unmatch) |pattern| {
-        if (runtime_schema.globMatch(pattern, field_name)) return false;
-    }
-    if (rule.path_match) |pattern| {
-        if (!runtime_schema.globMatch(pattern, path)) return false;
-    }
-    if (rule.path_unmatch) |pattern| {
-        if (runtime_schema.globMatch(pattern, path)) return false;
-    }
-    return true;
+    return dynamicRuleSelectorMatches(rule, path, field_name, null);
 }
 
 fn staticSpecCoversPath(specs: []const fact_mod.FieldSpec, path: []const u8) bool {
@@ -475,14 +480,19 @@ fn projectDynamicLeaf(
     if (staticSpecCoversPath(static_specs, path)) return;
 
     for (rules) |rule| {
-        if (!dynamicRuleMatches(rule, path, field_name, json_value)) continue;
+        if (!dynamicRuleSelectorMatches(rule, path, field_name, json_value)) continue;
+        // First selector-matching rule wins (Elasticsearch dynamic-template
+        // order). Crucially we return after the first *selector* match, NOT
+        // after the first rule that yields a usable fact: a value that does not
+        // coerce under this rule's type simply produces no fact (exactly like a
+        // static typed field given a non-coercible value). Falling through to a
+        // later overlapping rule with a different type would make ingest disagree
+        // with query-time resolution, which also picks the first matching rule.
         const mask = dynamicRuleRoleMask(rule.type);
-        var projected = false;
-        if (mask & role_group != 0) projected = (try appendDynamicFact(alloc, out, .group, path, rule.type, json_value)) or projected;
-        if (mask & role_measure != 0) projected = (try appendDynamicFact(alloc, out, .measure, path, rule.type, json_value)) or projected;
-        if (mask & role_time != 0) projected = (try appendDynamicFact(alloc, out, .time, path, rule.type, json_value)) or projected;
-        // First template that yields a usable typed fact wins (Bleve/ES order).
-        if (projected) return;
+        if (mask & role_group != 0) _ = try appendDynamicFact(alloc, out, .group, path, rule.type, json_value);
+        if (mask & role_measure != 0) _ = try appendDynamicFact(alloc, out, .measure, path, rule.type, json_value);
+        if (mask & role_time != 0) _ = try appendDynamicFact(alloc, out, .time, path, rule.type, json_value);
+        return;
     }
 }
 
@@ -2867,6 +2877,17 @@ pub const Index = struct {
     /// the next ingest projects facts using the refreshed dynamic_field_rules.
     /// Persisted sidecar rows are untouched (lazy backfill); only newly written
     /// or rewritten documents reflect the new rules until a full rebuild.
+    ///
+    /// Concurrency: this frees the old parsed Config (whose slices back the
+    /// FieldConfig/DynamicRule values returned by `config()`/`fieldConfig`). It
+    /// is only safe to call with no concurrent reader of this index. That holds
+    /// today: the sole caller (`IndexManager.reloadAlgebraicSchemaConfigs` via
+    /// `applyLocalTableSchemaJson`) runs under the provisioned write source's
+    /// exclusive structural-mutation lock on a freshly-opened, unshared DB handle
+    /// — query threads read separate read-cache DB handles. This mirrors the
+    /// adjacent `core.setSchema` swap in the same code path. If the index ever
+    /// becomes shared with live readers, this swap must be guarded (e.g. by the
+    /// index apply_mutex with readers taking it too).
     pub fn reloadConfigJson(self: *Index, config_json: []const u8) !void {
         var parsed = try std.json.parseFromSlice(Config, self.alloc, config_json, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
@@ -13977,6 +13998,16 @@ pub const Index = struct {
     /// dynamic template, so group/measure/time queries over template-promoted
     /// fields route to the algebraic sidecar. The synthesized config keys facts
     /// by the full query path (matching the ingest-time fact identity).
+    ///
+    /// Lifetime: the returned `name`/`path` alias the caller's `query_field`
+    /// (unlike the static path, whose slices are config-owned). This is safe
+    /// because every consumer is query-scoped — `resolveField` already borrows
+    /// `query_field` into `ResolvedField.public`, and the planner copies the
+    /// field name into owned canonical metadata tuples
+    /// (`termsCardinalityPartialsMetadataAlloc` / `docFactBucketFoldMetadataAlloc`
+    /// via `token.canonicalTupleAlloc`) rather than retaining the borrow. Do not
+    /// stash a resolved dynamic field's name/path beyond the query that produced
+    /// `query_field`.
     fn dynamicFieldConfig(self: *const Index, query_field: []const u8, class: FieldClass) ?FieldConfig {
         const cfg = self.config();
         const rules = cfg.dynamic_field_rules;
@@ -13988,19 +14019,34 @@ pub const Index = struct {
         // complete scan; static fields keep accelerating.
         if (cfg.dynamic_rules_backfill_pending) return null;
         const field_name = fieldNameFromQueryPath(query_field);
+        // Resolve a dynamic field's type only when every rule whose name/path
+        // selector matches it AGREES on the scalar type. Ingest projects the
+        // first selector-matching rule's type, so a single matching rule (or
+        // several that agree) gives query the exact type ingest stored. When
+        // matching rules disagree (overlapping globs with different types, or a
+        // `match_mapping_type` rule whose applicability is value-dependent and
+        // unknowable here), we cannot know which type ingest stored per document,
+        // so we decline resolution and let the query fall back to a complete scan
+        // rather than read a type that may only cover part of the documents.
+        var resolved_type: ?[]const u8 = null;
         for (rules) |rule| {
             if (!dynamicRuleResolvesField(rule, query_field, field_name)) continue;
-            const mask = dynamicRuleRoleMask(rule.type);
-            const matches_class = switch (class) {
-                .group => mask & role_group != 0,
-                .measure => mask & role_measure != 0,
-                .time => mask & role_time != 0,
-                .any => mask != 0,
-            };
-            if (!matches_class) continue;
-            return .{ .name = query_field, .path = query_field, .type = rule.type };
+            if (resolved_type) |t| {
+                if (!std.mem.eql(u8, t, rule.type)) return null; // ambiguous
+            } else {
+                resolved_type = rule.type;
+            }
         }
-        return null;
+        const rule_type = resolved_type orelse return null;
+        const mask = dynamicRuleRoleMask(rule_type);
+        const matches_class = switch (class) {
+            .group => mask & role_group != 0,
+            .measure => mask & role_measure != 0,
+            .time => mask & role_time != 0,
+            .any => mask != 0,
+        };
+        if (!matches_class) return null;
+        return .{ .name = query_field, .path = query_field, .type = rule_type };
     }
 
     pub fn resolveField(self: *const Index, query_field: []const u8, class: FieldClass) ?ResolvedField {
@@ -19306,6 +19352,56 @@ test "algebraic config rejects dynamic rule without a name or path selector" {
     try std.testing.expectError(error.InvalidAlgebraicConfig, Index.open(alloc, "bad",
         \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"x","unmatch":"skip_*","type":"keyword"}]}
     ));
+}
+
+test "algebraic dynamic field resolution agrees with ingest under overlapping rules" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    // Two overlapping rules match `score` with DIFFERENT types. Ingest projects
+    // the first matching rule (number); query-time resolution must DECLINE
+    // (ambiguous) rather than resolve to a type that may disagree with what
+    // ingest stored — otherwise aggregates would decode the wrong scalar type.
+    // A non-overlapping field (`region`) still resolves cleanly.
+    const cfg =
+        \\{"version":1,"table":"events","dynamic_field_rules":[
+        \\  {"name":"score_num","match":"score","type":"number"},
+        \\  {"name":"score_str","match":"score","type":"string"},
+        \\  {"name":"region","match":"region","type":"string"}
+        \\]}
+    ;
+    var idx = try Index.open(alloc, "alg_overlap", cfg);
+    defer idx.close();
+
+    // Ambiguous field: no resolution for any class.
+    try std.testing.expect(idx.fieldConfig("score", .group) == null);
+    try std.testing.expect(idx.fieldConfig("score", .measure) == null);
+    try std.testing.expect(idx.resolveField("score", .group) == null);
+    // Unambiguous field still resolves.
+    const region = idx.fieldConfig("region", .group) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("string", region.type);
+
+    // Ingest projects the first matching rule's type (number) for `score`.
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"score\":10,\"region\":\"us\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    const fact_key = try idx.docFactKey("e1");
+    defer alloc.free(fact_key);
+    var read_txn = try store.beginReadTxn();
+    const payload = try read_txn.get(fact_key);
+    var facts = try fact_mod.decodeListAlloc(alloc, payload);
+    read_txn.abort();
+    defer facts.deinit(alloc);
+    // The number rule produces a measure fact; a string rule never would, so the
+    // presence of a `score` measure fact confirms ingest stored it number-typed
+    // (the first matching rule), consistent with query declining the ambiguity.
+    try std.testing.expect(factHasField(facts.facts, .measure, "score"));
+    try std.testing.expect(factHasField(facts.facts, .group, "score"));
 }
 
 test "algebraic path profile recomputes max string token count after deleting max row" {

@@ -157,16 +157,27 @@ version bump or a reindex.
   `index.zig:validateConfig` enforces the same selector requirement so a
   hand-authored config cannot reintroduce the asymmetry.
 - At ingest, `storage/db/algebraic/index.zig` evaluates the rules against every
-  observed field not already covered by a static spec, reusing the same
-  `globMatch` / `match_mapping_type` semantics as the full-text resolver in
-  `storage/schema.zig`. Explicit schema fields always win over templates.
+  observed field not already covered by a static spec. Both ingest and query use
+  a single shared selector evaluator (`dynamicRuleSelectorMatches`, parameterized
+  by an optional value) reusing the same `globMatch` / `match_mapping_type`
+  semantics as the full-text resolver in `storage/schema.zig`, so the two can
+  never drift. Explicit schema fields always win over templates. The FIRST
+  selector-matching rule wins (Elasticsearch dynamic-template order): a value that
+  does not coerce under that rule's type simply yields no fact (exactly like a
+  static typed field given a non-coercible value) — ingest does not fall through
+  to a later overlapping rule of a different type.
 - The dynamic fact identity is the full dotted path (top-level templates have
   path == field name). Numeric templates project group+measure, datetime
   project group+time, keyword/boolean project group.
 - At query time the planner resolves a queried field against the same
   `dynamic_field_rules` (`Index.fieldConfig`/`resolveField`), so group-by, sum,
   and term aggregations over template-promoted fields route to the sidecar's
-  docfact fold scan.
+  docfact fold scan. Resolution requires that all name/path-matching rules AGREE
+  on the scalar type: with one matching rule (or several that agree) query reads
+  the exact type ingest stored; if overlapping rules disagree, the field is
+  ambiguous and query declines (the aggregation falls back to a complete scan)
+  rather than reading a type that ingest may have stored differently per
+  document.
 
 Template-only updates propagate without a recreate on two levels:
 
