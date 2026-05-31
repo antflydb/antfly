@@ -26,6 +26,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const resolver_lib = @import("antfly_resolver");
+const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
 const internal_keys = @import("../internal_keys.zig");
 const derived_types = @import("derived/derived_types.zig");
@@ -138,10 +139,82 @@ pub fn processChangedExtraction(
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, parsed.doc_key, cfg.resolution_artifact);
     errdefer gpa.free(resolution_key);
 
+    // Candidate blocking: if configured and the caller didn't supply a provider,
+    // look up the rendered canonical key as a candidate so the scorer can link
+    // to an existing entity instead of always minting.
+    var exact_provider = ExactKeyCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table };
+    const effective_provider = provider orelse blk: {
+        if (std.mem.eql(u8, cfg.candidate_search, "exact_key")) break :blk exact_provider.provider();
+        break :blk null;
+    };
+
     const stage = resolver_lib.ResolutionStage{ .resolver = &resolver, .config_generation = cfg.config_generation };
-    const result = try stage.run(gpa, store, provider, changed_key, resolution_key);
+    const result = try stage.run(gpa, store, effective_provider, changed_key, resolution_key);
     return .{ .result = result, .resolution_key = resolution_key };
 }
+
+/// Candidate provider that looks up the resolver's rendered canonical key as an
+/// existing entity (read through the artifact-store seam by document key). This
+/// is V1 "exact_key" blocking; ANN/prefix blocking over the entity table is a
+/// phase-2 extension. Cross-shard entity tables require distributed reads and
+/// are likewise deferred -- this reads whatever the worker's store can see.
+const ExactKeyCandidateProvider = struct {
+    store: resolver_lib.ArtifactStore,
+    resolver: *const resolver_lib.Resolver,
+    table: []const u8,
+
+    fn provider(self: *ExactKeyCandidateProvider) resolver_lib.CandidateProvider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = resolver_lib.CandidateProvider.VTable{ .candidates_for = candidatesFor };
+
+    fn candidatesFor(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        entity: resolver_lib.ExtractedEntity,
+        out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
+    ) anyerror!void {
+        const self: *ExactKeyCandidateProvider = @ptrCast(@alignCast(ptr));
+        const key = try self.resolver.renderKeyAlloc(allocator, entity);
+        errdefer allocator.free(@constCast(key));
+
+        const doc_store_key = try internal_keys.documentKeyAlloc(allocator, key);
+        defer allocator.free(doc_store_key);
+        const raw = (try self.store.get(allocator, doc_store_key)) orelse {
+            allocator.free(@constCast(key));
+            return;
+        };
+        defer allocator.free(raw);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+            allocator.free(@constCast(key));
+            return;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) {
+            allocator.free(@constCast(key));
+            return;
+        }
+
+        var fields = std.ArrayListUnmanaged(matcher.Field).empty;
+        var label: []const u8 = "";
+        var it = parsed.value.object.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* != .string) continue;
+            const fname = try allocator.dupe(u8, e.key_ptr.*);
+            const fval = try allocator.dupe(u8, e.value_ptr.*.string);
+            try fields.append(allocator, .{ .name = fname, .value = .{ .text = fval } });
+            if (std.mem.eql(u8, e.key_ptr.*, "label") or std.mem.eql(u8, e.key_ptr.*, "entity_type")) label = fval;
+        }
+
+        try out.append(allocator, .{
+            .doc_ref = .{ .table = try allocator.dupe(u8, self.table), .key = key },
+            .label = label,
+            .record = .{ .fields = try fields.toOwnedSlice(allocator) },
+        });
+    }
+};
 
 /// Process every changed artifact key in a replay record: resolve each
 /// extraction artifact and journal the resolution keys that actually changed
@@ -909,4 +982,53 @@ test "catchUpWindow with no matching records returns from-1" {
 
 test "ResolutionRuntime compiles end-to-end" {
     testing.refAllDecls(ResolutionRuntime);
+}
+
+test "processChangedExtraction with exact_key blocking links to an existing entity" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "exact_key",
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "n", "left": "canonical_text", "right": "canonical_name",
+        \\  "levels": [ { "when": "exact", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+    // An existing canonical entity at the key the resolver would mint.
+    const entity_doc_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(entity_doc_key);
+    try store.put(entity_doc_key,
+        \\{ "canonical_name": "Ada Lovelace", "label": "person" }
+    );
+
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key)).?;
+    defer alloc.free(outcome.resolution_key);
+    try testing.expectEqual(resolver_lib.RunResult.written, outcome.result);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const stored = (try store.get(alloc, resolution_key)).?;
+    defer alloc.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    // Linked to the existing entity (decision=match), not minted as new.
+    try testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 }

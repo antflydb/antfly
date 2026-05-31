@@ -42,6 +42,11 @@ pub const ResolverConfig = struct {
     type_must_match: bool = true,
     /// Optional matcher scorer config; empty means deterministic minting only.
     scorer_json: []const u8 = "",
+    /// Candidate blocking strategy: "" (none, deterministic mint) or
+    /// "exact_key" (look up the rendered canonical key as a candidate so the
+    /// scorer can link to an existing entity). ANN/prefix blocking over the
+    /// entity table is a phase-2 extension.
+    candidate_search: []const u8 = "",
     /// Bumped to force a versioned re-resolution pass.
     config_generation: u64 = 0,
 
@@ -54,6 +59,7 @@ pub const ResolverConfig = struct {
             .key_template = try alloc.dupe(u8, cfg.key_template),
             .type_must_match = cfg.type_must_match,
             .scorer_json = if (cfg.scorer_json.len > 0) try alloc.dupe(u8, cfg.scorer_json) else "",
+            .candidate_search = if (cfg.candidate_search.len > 0) try alloc.dupe(u8, cfg.candidate_search) else "",
             .config_generation = cfg.config_generation,
         };
     }
@@ -65,6 +71,7 @@ pub const ResolverConfig = struct {
         alloc.free(@constCast(self.resolution_artifact));
         alloc.free(@constCast(self.key_template));
         if (self.scorer_json.len > 0) alloc.free(@constCast(self.scorer_json));
+        if (self.candidate_search.len > 0) alloc.free(@constCast(self.candidate_search));
         self.* = undefined;
     }
 };

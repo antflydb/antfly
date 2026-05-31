@@ -198,6 +198,12 @@ pub const Resolver = struct {
         self.* = undefined;
     }
 
+    /// Render the canonical entity key this resolver would mint for a mention.
+    /// Used by candidate blocking to look up an existing entity by key.
+    pub fn renderKeyAlloc(self: *const Resolver, gpa: std.mem.Allocator, entity: ExtractedEntity) ![]const u8 {
+        return renderKey(gpa, self.key_template, entity);
+    }
+
     /// Resolve every mention. `candidates[i]` holds candidates for `entities[i]`
     /// (an empty top-level slice means deterministic minting only). The returned
     /// `Resolution` owns its memory; `gpa` is also used as transient scoring
