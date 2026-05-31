@@ -33,6 +33,9 @@ pub const TargetHint = enum {
     // Appended (bit 6) so existing encoded hint masks stay compatible. Drives
     // the entity-resolution stage off changed extraction (asset) artifacts.
     resolution,
+    // Appended (bit 7). Drives the promoter stage off changed resolution
+    // artifacts (it upserts canonical entity documents into the entity table).
+    promotion,
 };
 
 pub const Record = struct {
@@ -208,6 +211,10 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
         } else if (internal_keys.isAssetArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
             try appendUniqueHintAlloc(alloc, &target_hints, .resolution);
+        } else if (internal_keys.isResolutionArtifactKey(key)) {
+            // The resolution stage journals its output; wake the promoter so it
+            // upserts the canonical entity documents for the resolved mentions.
+            try appendUniqueHintAlloc(alloc, &target_hints, .promotion);
         } else if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
             try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
@@ -355,6 +362,7 @@ fn decodeHintMask(alloc: Allocator, mask: u8) ![]TargetHint {
     if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.graph))) != 0) count += 1;
     if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.algebraic))) != 0) count += 1;
     if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.resolution))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.promotion))) != 0) count += 1;
     if (count == 0) return &.{};
 
     const hints = try alloc.alloc(TargetHint, count);
@@ -387,6 +395,10 @@ fn decodeHintMask(alloc: Allocator, mask: u8) ![]TargetHint {
         hints[index] = .resolution;
         index += 1;
     }
+    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.promotion))) != 0) {
+        hints[index] = .promotion;
+        index += 1;
+    }
     return hints;
 }
 
@@ -397,6 +409,7 @@ const sparse_vector_hint_slice = [_]TargetHint{.sparse_vector};
 const graph_hint_slice = [_]TargetHint{.graph};
 const algebraic_hint_slice = [_]TargetHint{.algebraic};
 const resolution_hint_slice = [_]TargetHint{.resolution};
+const promotion_hint_slice = [_]TargetHint{.promotion};
 
 fn targetHintsAreStaticSingleton(target_hints: []const TargetHint) bool {
     if (target_hints.len != 1) return false;
@@ -406,7 +419,8 @@ fn targetHintsAreStaticSingleton(target_hints: []const TargetHint) bool {
         target_hints.ptr == sparse_vector_hint_slice[0..].ptr or
         target_hints.ptr == graph_hint_slice[0..].ptr or
         target_hints.ptr == algebraic_hint_slice[0..].ptr or
-        target_hints.ptr == resolution_hint_slice[0..].ptr;
+        target_hints.ptr == resolution_hint_slice[0..].ptr or
+        target_hints.ptr == promotion_hint_slice[0..].ptr;
 }
 
 fn freeTargetHintsIfOwned(alloc: Allocator, target_hints: []const TargetHint) void {
@@ -425,6 +439,7 @@ fn decodeHintMaskBorrowed(alloc: Allocator, mask: u8) ![]const TargetHint {
             singleHintMask(.graph) => graph_hint_slice[0..],
             singleHintMask(.algebraic) => algebraic_hint_slice[0..],
             singleHintMask(.resolution) => resolution_hint_slice[0..],
+            singleHintMask(.promotion) => promotion_hint_slice[0..],
             else => return error.InvalidBinaryRecord,
         };
     }
@@ -759,7 +774,7 @@ pub fn encodedRecordMatchesHintMask(raw: []const u8, required_mask: u8) !bool {
 }
 
 fn recordMatchesHintMaskFast(raw: []const u8, required_mask: u8) !bool {
-    const hints = [_]TargetHint{ .enrichment, .full_text, .dense_vector, .sparse_vector, .graph, .algebraic, .resolution };
+    const hints = [_]TargetHint{ .enrichment, .full_text, .dense_vector, .sparse_vector, .graph, .algebraic, .resolution, .promotion };
     for (hints) |hint| {
         if ((required_mask & singleHintMask(hint)) == 0) continue;
         if (try recordHasHintFast(raw, hint)) return true;

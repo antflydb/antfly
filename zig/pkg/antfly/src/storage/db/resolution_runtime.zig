@@ -505,16 +505,18 @@ pub fn catchUpWindow(
     return ctx.max_seen;
 }
 
-const RuntimeStoreHandle = struct {
+/// Erased shard store + ownership, shared with the promotion runtime so both
+/// stages adapt a concrete shard store to the erased store the same way.
+pub const RuntimeStoreHandle = struct {
     store: backend_erased.Store,
     owned: bool,
 
-    fn deinit(self: *RuntimeStoreHandle) void {
+    pub fn deinit(self: *RuntimeStoreHandle) void {
         if (self.owned) self.store.deinit();
     }
 };
 
-fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
+pub fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
     const T = @TypeOf(store);
     if (T == backend_erased.Store) return .{ .store = store, .owned = false };
     if (T == *backend_erased.Store) return .{ .store = store.*, .owned = false };

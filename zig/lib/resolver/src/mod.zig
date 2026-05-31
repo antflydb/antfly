@@ -73,6 +73,12 @@ pub const ResolvedEntity = struct {
     doc_ref: DocRef,
     confidence: f64,
     decision: Decision,
+    /// Entity label / type carried from the mention so the promoter can build
+    /// the canonical entity document without re-reading the extraction artifact.
+    label: []const u8 = "",
+    /// Mention surface form; the promoter uses it as the canonical name (on a
+    /// freshly minted entity) and as an alias to union into an existing one.
+    canonical_name: []const u8 = "",
 };
 
 /// The resolution artifact: the durable record of identity decisions for one
@@ -108,6 +114,14 @@ pub const Resolution = struct {
             try appendFloat(allocator, &out, e.confidence);
             try out.appendSlice(allocator, ",\"decision\":");
             try writeJsonString(allocator, &out, @tagName(e.decision));
+            if (e.label.len > 0) {
+                try out.appendSlice(allocator, ",\"label\":");
+                try writeJsonString(allocator, &out, e.label);
+            }
+            if (e.canonical_name.len > 0) {
+                try out.appendSlice(allocator, ",\"canonical_name\":");
+                try writeJsonString(allocator, &out, e.canonical_name);
+            }
             try out.append(allocator, '}');
         }
         try out.appendSlice(allocator, "]}");
@@ -272,6 +286,8 @@ pub const Resolver = struct {
                             },
                             .confidence = best_prob,
                             .decision = .match,
+                            .label = try a.dupe(u8, entity.label),
+                            .canonical_name = try a.dupe(u8, entity.text),
                         };
                     }
                     return .{
@@ -279,6 +295,8 @@ pub const Resolver = struct {
                         .doc_ref = try self.mintRef(a, entity),
                         .confidence = best_prob,
                         .decision = if (best_outcome == .review) .review else .new,
+                        .label = try a.dupe(u8, entity.label),
+                        .canonical_name = try a.dupe(u8, entity.text),
                     };
                 }
             }
@@ -289,6 +307,8 @@ pub const Resolver = struct {
             .doc_ref = try self.mintRef(a, entity),
             .confidence = 1.0,
             .decision = .new,
+            .label = try a.dupe(u8, entity.label),
+            .canonical_name = try a.dupe(u8, entity.text),
         };
     }
 
@@ -465,6 +485,72 @@ pub const ParsedEntities = struct {
         self.* = undefined;
     }
 };
+
+/// Owns the parsed entities of a resolution artifact in an arena.
+pub const ParsedResolution = struct {
+    arena: std.heap.ArenaAllocator,
+    config_generation: u64,
+    entities: []const ResolvedEntity,
+
+    pub fn deinit(self: *ParsedResolution) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+fn decisionFromTag(tag: []const u8) ?Decision {
+    if (std.mem.eql(u8, tag, "match")) return .match;
+    if (std.mem.eql(u8, tag, "review")) return .review;
+    if (std.mem.eql(u8, tag, "new")) return .new;
+    return null;
+}
+
+/// Parse a resolution artifact (the shape produced by `Resolution.toJson`) back
+/// into resolved entities. The promoter reads this to upsert canonical entity
+/// documents; carrying `label`/`canonical_name` keeps it self-contained.
+pub fn parseResolution(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedResolution {
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json_bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidResolution;
+    const obj = parsed.value.object;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var config_generation: u64 = 0;
+    if (obj.get("config_generation")) |v| {
+        if (v == .integer and v.integer >= 0) config_generation = @intCast(v.integer);
+    }
+
+    const entities_v = obj.get("entities") orelse return error.InvalidResolution;
+    if (entities_v != .array) return error.InvalidResolution;
+
+    const out = try a.alloc(ResolvedEntity, entities_v.array.items.len);
+    for (entities_v.array.items, 0..) |ev, i| {
+        if (ev != .object) return error.InvalidResolution;
+        const o = ev.object;
+        const ref = o.get("doc_ref") orelse return error.InvalidResolution;
+        if (ref != .object) return error.InvalidResolution;
+        const decision_tag = jsonString(o.get("decision") orelse return error.InvalidResolution) orelse return error.InvalidResolution;
+        out[i] = .{
+            .local_id = try a.dupe(u8, jsonString(o.get("local_id") orelse return error.InvalidResolution) orelse return error.InvalidResolution),
+            .doc_ref = .{
+                .table = try a.dupe(u8, jsonString(ref.object.get("table") orelse return error.InvalidResolution) orelse return error.InvalidResolution),
+                .key = try a.dupe(u8, jsonString(ref.object.get("key") orelse return error.InvalidResolution) orelse return error.InvalidResolution),
+            },
+            .confidence = switch (o.get("confidence") orelse std.json.Value{ .float = 0 }) {
+                .float => |f| f,
+                .integer => |n| @floatFromInt(n),
+                else => 0,
+            },
+            .decision = decisionFromTag(decision_tag) orelse return error.InvalidResolution,
+            .label = if (o.get("label")) |v| try a.dupe(u8, jsonString(v) orelse "") else "",
+            .canonical_name = if (o.get("canonical_name")) |v| try a.dupe(u8, jsonString(v) orelse "") else "",
+        };
+    }
+    return .{ .arena = arena, .config_generation = config_generation, .entities = out };
+}
 
 /// Parse the `entities` array of an extraction artifact (the shape produced by
 /// the extractor and documented in RESOLUTION.md / GRAPH.md). Relations are not

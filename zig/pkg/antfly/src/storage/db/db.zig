@@ -32,6 +32,7 @@ const doc_set = @import("doc_set.zig");
 const shard_mod = @import("../shard.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
+const promotion_runtime_mod = @import("promotion_runtime.zig");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
 const types = @import("types.zig");
@@ -169,6 +170,10 @@ pub const OpenOptions = struct {
     /// Null means local-only blocking against the worker's own store. Must
     /// outlive the DB.
     resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
+    /// Optional cross-shard entity sink for the promoter, injected by the serving
+    /// layer (see `api/distributed_entity_sink.zig`). Null means no promotion
+    /// (the stage advances without writing entities). Must outlive the DB.
+    entity_sink: ?promotion_runtime_mod.EntitySink = null,
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
@@ -623,6 +628,7 @@ const EnrichmentAppendContext = struct {
     async_context: ?*AsyncContext,
     log_mutex: *std.atomic.Mutex,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
 
     fn batchContext(self: *const EnrichmentAppendContext) BatchExecutionContext {
         return .{
@@ -642,6 +648,7 @@ const EnrichmentAppendContext = struct {
             .async_context = self.async_context,
             .enrichment_runtime = null,
             .resolution_runtime = self.resolution_runtime,
+            .promotion_runtime = self.promotion_runtime,
         };
     }
 };
@@ -662,6 +669,7 @@ const BatchExecutionContext = struct {
     executor: *derived_executor_mod.Executor,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     async_context: ?*AsyncContext = null,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
 };
@@ -2246,6 +2254,8 @@ pub const DB = struct {
     resolution_append_context: ?*EnrichmentAppendContext = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
+    entity_sink: ?promotion_runtime_mod.EntitySink = null,
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
@@ -2289,6 +2299,7 @@ pub const DB = struct {
             .io = self.backend_runtime.io(),
             .enrichment_runtime = self.enrichment_runtime,
             .resolution_runtime = self.resolution_runtime,
+            .promotion_runtime = self.promotion_runtime,
             .async_context = self.async_context,
         };
     }
@@ -2428,6 +2439,7 @@ pub const DB = struct {
                 .enrichment_append_context = null,
                 .enrichment_runtime = null,
                 .resolution_candidate_source = opts.resolution_candidate_source,
+                .entity_sink = opts.entity_sink,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
                 .transaction_recovery_identity_context = null,
@@ -2602,6 +2614,7 @@ pub const DB = struct {
             .async_context = self.async_context,
             .log_mutex = resources.log_mutex,
             .resolution_runtime = self.resolution_runtime,
+            .promotion_runtime = self.promotion_runtime,
         };
 
         const runtime = try self.runtime_alloc.create(enrichment_runtime_mod.EnrichmentRuntime);
@@ -2665,6 +2678,29 @@ pub const DB = struct {
         self.resolution_runtime = runtime;
     }
 
+    fn initPromotionRuntime(self: *DB) !void {
+        // Always constructed (like the resolution runtime): with io a background
+        // loop drives catch-up, otherwise runUntilIdle drives it synchronously.
+        // The promoter consumes the resolution-artifact records the resolution
+        // stage journals, so it must exist whenever resolution can run.
+        const runtime = try self.runtime_alloc.create(promotion_runtime_mod.PromotionRuntime);
+        errdefer self.runtime_alloc.destroy(runtime);
+        runtime.* = try promotion_runtime_mod.PromotionRuntime.init(
+            self.runtime_alloc,
+            self.core.batchExecutionResources().store,
+            self.core.replaySource(),
+            self.backend_runtime,
+            // Cross-shard entity sink when the serving layer injected one (via
+            // OpenOptions); null means the stage advances without promoting.
+            self.entity_sink,
+        );
+        errdefer runtime.deinit();
+        self.promotion_runtime = runtime;
+        // Patch the resolution stage's append context so journaling a resolution
+        // artifact (tagged with the promotion hint) wakes the promoter.
+        if (self.resolution_append_context) |ctx| ctx.promotion_runtime = runtime;
+    }
+
     fn initOptionalTtlRuntime(self: *DB, cfg: ttl_runtime_mod.Config) !void {
         const ttl_ctx = try self.runtime_alloc.create(TtlCleanupContext);
         errdefer self.runtime_alloc.destroy(ttl_ctx);
@@ -2684,6 +2720,7 @@ pub const DB = struct {
                 .executor = self.executor,
                 .enrichment_runtime = self.enrichment_runtime,
                 .resolution_runtime = self.resolution_runtime,
+                .promotion_runtime = self.promotion_runtime,
             },
             .grace_period_ns = cfg.grace_period_ns,
         };
@@ -2768,6 +2805,9 @@ pub const DB = struct {
         // Created before enrichment so the enrichment append context can notify
         // it when extraction artifacts land.
         try self.initResolutionRuntime();
+        // Created after the resolution runtime so it can patch the resolution
+        // append context to wake the promoter when resolution artifacts land.
+        try self.initPromotionRuntime();
         if (opts.enrichment) |raw_enrichment_cfg| {
             var enrichment_cfg = raw_enrichment_cfg;
             if (enrichment_cfg.secret_store == null) enrichment_cfg.secret_store = opts.secret_store;
@@ -2786,6 +2826,7 @@ pub const DB = struct {
 
     fn startOptionalRuntimes(self: *DB) !void {
         if (self.resolution_runtime) |runtime| try runtime.start();
+        if (self.promotion_runtime) |runtime| try runtime.start();
         if (self.enrichment_runtime) |runtime| try runtime.start();
         if (self.ttl_runtime) |runtime| try runtime.start();
         if (self.transaction_runtime) |runtime| try runtime.start();
@@ -2818,6 +2859,13 @@ pub const DB = struct {
         }
         if (self.enrichment_append_context) |ctx| self.runtime_alloc.destroy(ctx);
         if (self.resolution_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+        }
+        // After the resolution runtime (its final catch-up may journal
+        // resolution artifacts that notify the promoter) but before the
+        // resolution append context the promoter is wired into is destroyed.
+        if (self.promotion_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
@@ -3775,6 +3823,7 @@ pub const DB = struct {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
         }
         if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
+        if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
     }
 
     /// Inject (or clear) the cross-shard entity-resolution candidate source on
@@ -3785,6 +3834,15 @@ pub const DB = struct {
     pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) void {
         self.resolution_candidate_source = src;
         if (self.resolution_runtime) |runtime| runtime.setCandidateSource(src);
+    }
+
+    /// Inject (or clear) the cross-shard entity sink on an already-open DB. The
+    /// serving layer (managed write cache) calls this right after a DB is opened,
+    /// since managed DBs open lazily and cannot thread the sink through
+    /// `OpenOptions`. No-op when this DB has no promotion runtime.
+    pub fn setEntitySink(self: *DB, sink: ?promotion_runtime_mod.EntitySink) void {
+        self.entity_sink = sink;
+        if (self.promotion_runtime) |runtime| runtime.setSink(sink);
     }
 
     fn failIfIdentityOrdinalExhaustedForNewUpserts(self: *DB, doc_ids: []const []const u8) !void {
@@ -6212,6 +6270,13 @@ pub const DB = struct {
             if (latest > 0) runtime.notifySequence(latest - 1);
             try runtime.catchUp();
         }
+        if (self.promotion_runtime) |runtime| {
+            // Resolution catch-up above journals resolution artifacts; drive the
+            // promoter to the new latest sequence so it upserts their entities.
+            const latest = self.core.nextDerivedSequence();
+            if (latest > 0) runtime.notifySequence(latest - 1);
+            try runtime.catchUp();
+        }
         _ = try self.evaluateAlgebraicAdaptiveCandidates();
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
@@ -6993,6 +7058,7 @@ pub const DB = struct {
             self.executor.notifySequence(sequence);
             if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
             if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
+            if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
         }
         return generated_ref_count;
     }
@@ -13679,6 +13745,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     }
     if (ctx.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
     if (ctx.resolution_runtime) |runtime| runtime.notifySequence(sequence);
+    if (ctx.promotion_runtime) |runtime| runtime.notifySequence(sequence);
 }
 
 fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const ttl_runtime_mod.DeleteCandidate) !u32 {
@@ -14322,6 +14389,9 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     var batch_ctx = ctx.batchContext();
     const sequence = try appendDerivedBatchRecordContext(&batch_ctx, batch);
     if (ctx.resolution_runtime) |runtime| runtime.notifySequence(sequence);
+    // The resolution stage journals its resolution artifacts through this path;
+    // wake the promoter so it upserts the canonical entity documents.
+    if (ctx.promotion_runtime) |runtime| runtime.notifySequence(sequence);
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
         return sequence;
@@ -16771,6 +16841,10 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     if (ctx.index_manager.resolvers.items.len > 0) {
         const resolution_applied = enrichment_state.loadAppliedSequence(ctx.alloc, ctx.store, resolution_runtime_mod.scope_name) catch effective;
         effective = @min(effective, resolution_applied);
+        // The promoter consumes the resolution-artifact records the resolution
+        // stage journals; hold the watermark back until it has promoted them.
+        const promotion_applied = enrichment_state.loadAppliedSequence(ctx.alloc, ctx.store, promotion_runtime_mod.scope_name) catch effective;
+        effective = @min(effective, promotion_applied);
     }
     try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
 }
@@ -16810,6 +16884,12 @@ fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
             resolution_runtime_mod.scope_name,
         );
         min_applied = @min(min_applied, resolution_applied);
+        const promotion_applied = try enrichment_state.loadAppliedSequence(
+            ctx.alloc,
+            ctx.store,
+            promotion_runtime_mod.scope_name,
+        );
+        min_applied = @min(min_applied, promotion_applied);
     }
     if (min_applied == 0 or min_applied == std.math.maxInt(u64)) return;
     try truncateReplayLogs(ctx, min_applied);
@@ -23298,6 +23378,110 @@ test "db resolves extracted entities into a resolution artifact end-to-end" {
     try std.testing.expectEqual(@as(usize, 2), entities.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", entities[0].object.get("doc_ref").?.object.get("key").?.string);
     try std.testing.expectEqualStrings("org/antfly", entities[1].object.get("doc_ref").?.object.get("key").?.string);
+}
+
+/// Thread-safe capturing entity sink for the promotion integration test.
+const FakePromotionSink = struct {
+    const Upsert = struct { table: []u8, key: []u8, doc: []u8 };
+    alloc: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    upserts: std.ArrayListUnmanaged(Upsert) = .empty,
+
+    fn deinit(self: *FakePromotionSink) void {
+        for (self.upserts.items) |u| {
+            self.alloc.free(u.table);
+            self.alloc.free(u.key);
+            self.alloc.free(u.doc);
+        }
+        self.upserts.deinit(self.alloc);
+    }
+
+    fn sink(self: *FakePromotionSink) promotion_runtime_mod.EntitySink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable = promotion_runtime_mod.EntitySink.VTable{ .upsert = upsertFn };
+
+    fn upsertFn(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
+        _ = allocator;
+        const self: *FakePromotionSink = @ptrCast(@alignCast(ptr));
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        const t = try self.alloc.dupe(u8, table);
+        errdefer self.alloc.free(t);
+        const k = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(k);
+        const d = try self.alloc.dupe(u8, doc_json);
+        errdefer self.alloc.free(d);
+        try self.upserts.append(self.alloc, .{ .table = t, .key = k, .doc = d });
+    }
+
+    fn findKey(self: *FakePromotionSink, key: []const u8) ?[]const u8 {
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        for (self.upserts.items) |u| {
+            if (std.mem.eql(u8, u.key, key)) return u.doc;
+        }
+        return null;
+    }
+};
+
+test "db promotes resolved entities into entity-document upserts end-to-end" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var sink = FakePromotionSink{ .alloc = alloc };
+    defer sink.deinit();
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "knowledge_graph",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    // The promoter upserted a canonical entity document per resolved mention,
+    // keyed by the rendered canonical key, into the entity table.
+    const ada = sink.findKey("person/ada_lovelace") orelse return error.MissingAdaUpsert;
+    try std.testing.expect(std.mem.indexOf(u8, ada, "\"canonical_name\":\"Ada Lovelace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ada, "\"entity_type\":\"person\"") != null);
+    const antfly = sink.findKey("org/antfly") orelse return error.MissingAntflyUpsert;
+    try std.testing.expect(std.mem.indexOf(u8, antfly, "\"canonical_name\":\"Antfly\"") != null);
+
+    // Replay is idempotent: draining again promotes nothing new.
+    const count_before = sink.upserts.items.len;
+    try db.runUntilIdle();
+    try std.testing.expectEqual(count_before, sink.upserts.items.len);
 }
 
 test "db graph index materializes relation asset artifacts into graph edge artifacts" {
