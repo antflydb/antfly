@@ -50,6 +50,40 @@ pub const scope_name = "resolution";
 /// the enrichment runtime's writer so the db wires the same callback.
 pub const DerivedRecordWriter = *const fn (ptr: *anyopaque, batch: derived_types.DerivedBatch) anyerror!u64;
 
+/// Source of candidate entities for blocking, abstracted over locality. The
+/// storage worker calls this; a local source reads the worker's own store
+/// (`localCandidateSource`), while the api layer implements a cross-shard source
+/// over the cluster transport (topology lookup + group routing +
+/// fetchGroupLookup / vector-worker). Unlike the in-store seam this works at the
+/// logical entity-key level (the cross-shard impl decodes keys on each shard).
+pub const CandidateSource = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const Consume = *const fn (ctx: *anyopaque, entity_key: []const u8, value: []const u8) anyerror!void;
+
+    pub const VTable = struct {
+        /// Fetch the entity doc for `key` in `table` (owned bytes or null).
+        get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8,
+        /// Scan `table` for entities whose key starts with `prefix`.
+        scan_prefix: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, prefix: []const u8, ctx: *anyopaque, consume: Consume) anyerror!void = null,
+        /// The `k` nearest entities in `table` to `embedding`.
+        nearest: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, embedding: []const f32, k: usize, ctx: *anyopaque, consume: Consume) anyerror!void = null,
+    };
+
+    pub fn get(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8 {
+        return self.vtable.get(self.ptr, allocator, table, key);
+    }
+    pub fn scanPrefix(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, prefix: []const u8, ctx: *anyopaque, consume: Consume) anyerror!void {
+        const f = self.vtable.scan_prefix orelse return error.ScanUnsupported;
+        return f(self.ptr, allocator, table, prefix, ctx, consume);
+    }
+    pub fn nearest(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, embedding: []const f32, k: usize, ctx: *anyopaque, consume: Consume) anyerror!void {
+        const f = self.vtable.nearest orelse return error.NearestUnsupported;
+        return f(self.ptr, allocator, table, embedding, k, ctx, consume);
+    }
+};
+
 pub const ResolutionOutput = struct {
     /// Name of the resolution artifact to write (borrows the matched config).
     resolution_artifact: []const u8,
@@ -120,6 +154,7 @@ pub fn processChangedExtraction(
     store: resolver_lib.ArtifactStore,
     provider: ?resolver_lib.CandidateProvider,
     changed_key: []const u8,
+    candidate_source: ?CandidateSource,
 ) !?ProcessOutcome {
     const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(gpa, changed_key)) orelse return null;
     defer gpa.free(parsed.doc_key);
@@ -144,7 +179,17 @@ pub fn processChangedExtraction(
     // to an existing entity instead of always minting.
     var exact_provider = ExactKeyCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table };
     var prefix_provider = PrefixCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table };
+    var source_provider: SourceCandidateProvider = undefined;
     const effective_provider = provider orelse blk: {
+        // A cross-shard source (injected by the api layer) wins over the local
+        // in-store providers when the resolver declares a candidate search mode.
+        if (candidate_source) |src| {
+            if (candidateModeFromConfig(cfg.candidate_search)) |mode| {
+                source_provider = .{ .source = src, .resolver = &resolver, .table = cfg.table, .mode = mode };
+                break :blk source_provider.provider();
+            }
+            break :blk null;
+        }
         if (std.mem.eql(u8, cfg.candidate_search, "exact_key")) break :blk exact_provider.provider();
         if (std.mem.eql(u8, cfg.candidate_search, "prefix")) break :blk prefix_provider.provider();
         break :blk null;
@@ -213,6 +258,77 @@ fn appendEntityCandidate(
         .record = .{ .fields = try fields.toOwnedSlice(allocator) },
     });
 }
+
+pub const CandidateMode = enum { exact_key, prefix, ann };
+
+fn candidateModeFromConfig(s: []const u8) ?CandidateMode {
+    if (std.mem.eql(u8, s, "exact_key")) return .exact_key;
+    if (std.mem.eql(u8, s, "prefix")) return .prefix;
+    if (std.mem.eql(u8, s, "ann")) return .ann;
+    return null;
+}
+
+/// Candidate provider over a (possibly cross-shard) `CandidateSource`: renders
+/// the mention's canonical key, then queries the source by exact key, label
+/// prefix, or vector nearest-neighbour, building candidates for the scorer.
+const SourceCandidateProvider = struct {
+    source: CandidateSource,
+    resolver: *const resolver_lib.Resolver,
+    table: []const u8,
+    mode: CandidateMode,
+
+    fn provider(self: *SourceCandidateProvider) resolver_lib.CandidateProvider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable = resolver_lib.CandidateProvider.VTable{ .candidates_for = candidatesFor };
+
+    const ScanCtx = struct {
+        allocator: std.mem.Allocator,
+        table: []const u8,
+        out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
+        fn consume(ptr: *anyopaque, entity_key: []const u8, value: []const u8) anyerror!void {
+            const self: *ScanCtx = @ptrCast(@alignCast(ptr));
+            try appendEntityCandidate(self.allocator, self.table, entity_key, value, self.out);
+        }
+    };
+
+    fn candidatesFor(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        entity: resolver_lib.ExtractedEntity,
+        out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
+    ) anyerror!void {
+        const self: *SourceCandidateProvider = @ptrCast(@alignCast(ptr));
+        switch (self.mode) {
+            .exact_key => {
+                const key = try self.resolver.renderKeyAlloc(allocator, entity);
+                defer allocator.free(@constCast(key));
+                const raw = (try self.source.get(allocator, self.table, key)) orelse return;
+                defer allocator.free(raw);
+                try appendEntityCandidate(allocator, self.table, key, raw, out);
+            },
+            .prefix => {
+                const key = try self.resolver.renderKeyAlloc(allocator, entity);
+                defer allocator.free(@constCast(key));
+                const slash = std.mem.indexOfScalar(u8, key, '/');
+                const prefix = if (slash) |i| key[0 .. i + 1] else key;
+                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .out = out };
+                self.source.scanPrefix(allocator, self.table, prefix, &ctx, ScanCtx.consume) catch |e| switch (e) {
+                    error.ScanUnsupported => return,
+                    else => return e,
+                };
+            },
+            .ann => {
+                const emb = entity.embedding orelse return;
+                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .out = out };
+                self.source.nearest(allocator, self.table, emb, 25, &ctx, ScanCtx.consume) catch |e| switch (e) {
+                    error.NearestUnsupported => return,
+                    else => return e,
+                };
+            },
+        }
+    }
+};
 
 /// "exact_key" blocking: look up the rendered canonical key as an existing
 /// entity (by document key through the store seam). Reads whatever the worker's
@@ -306,6 +422,7 @@ pub fn processRecordKeys(
     changed_artifact_keys: []const []const u8,
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
+    candidate_source: ?CandidateSource,
 ) !void {
     var journal_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -314,7 +431,7 @@ pub fn processRecordKeys(
     }
 
     for (changed_artifact_keys) |key| {
-        const outcome = (try processChangedExtraction(gpa, resolvers, store, provider, key)) orelse continue;
+        const outcome = (try processChangedExtraction(gpa, resolvers, store, provider, key, candidate_source)) orelse continue;
         switch (outcome.result) {
             .written, .cleared => try journal_keys.append(gpa, outcome.resolution_key),
             else => gpa.free(outcome.resolution_key),
@@ -343,6 +460,7 @@ pub fn catchUpWindow(
     max_records: usize,
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
+    candidate_source: ?CandidateSource,
 ) !u64 {
     const Ctx = struct {
         gpa: Allocator,
@@ -351,6 +469,7 @@ pub fn catchUpWindow(
         provider: ?resolver_lib.CandidateProvider,
         write_ctx: *anyopaque,
         write_fn: DerivedRecordWriter,
+        candidate_source: ?CandidateSource,
         max_seen: u64,
 
         fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
@@ -365,6 +484,7 @@ pub fn catchUpWindow(
                 decoded.record.changed_artifact_keys,
                 self.write_ctx,
                 self.write_fn,
+                self.candidate_source,
             );
             if (sequence > self.max_seen) self.max_seen = sequence;
         }
@@ -377,6 +497,7 @@ pub fn catchUpWindow(
         .provider = provider,
         .write_ctx = write_ctx,
         .write_fn = write_fn,
+        .candidate_source = candidate_source,
         // from_sequence is exclusive; with no records, return it unchanged.
         .max_seen = from_sequence,
     };
@@ -426,6 +547,10 @@ pub const ResolutionRuntime = struct {
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
     io_impl: ?*background_runtime_mod.IoImpl,
+    /// Optional cross-shard candidate source injected by the api/serving layer;
+    /// null means local-only blocking (the worker's own store). Must outlive the
+    /// runtime.
+    candidate_source: ?CandidateSource,
     applied_sequence: std.atomic.Value(u64),
     target_sequence: std.atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
@@ -440,6 +565,7 @@ pub const ResolutionRuntime = struct {
         write_ctx: *anyopaque,
         write_fn: DerivedRecordWriter,
         backend_runtime: *background_runtime_mod.BackendRuntime,
+        candidate_source: ?CandidateSource,
     ) !ResolutionRuntime {
         var store_handle = try initRuntimeStore(alloc, store);
         errdefer store_handle.deinit();
@@ -452,6 +578,7 @@ pub const ResolutionRuntime = struct {
             .write_ctx = write_ctx,
             .write_fn = write_fn,
             .io_impl = backend_runtime.io_impl,
+            .candidate_source = candidate_source,
             .applied_sequence = .init(applied),
             .target_sequence = .init(applied),
             .shutdown_flag = .init(false),
@@ -528,6 +655,7 @@ pub const ResolutionRuntime = struct {
                 default_max_records_per_window,
                 self.write_ctx,
                 self.write_fn,
+                self.candidate_source,
             );
             if (max_seen <= applied) {
                 // No matching records in (applied, target]; advance to target.
@@ -762,13 +890,13 @@ test "processChangedExtraction resolves and persists the resolution artifact" {
     try map.store().put(extraction_key, test_extraction);
 
     {
-        const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, extraction_key)).?;
+        const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, extraction_key, null)).?;
         defer alloc.free(outcome.resolution_key);
         try testing.expectEqual(resolver_lib.RunResult.written, outcome.result);
     }
     // Replay is idempotent.
     {
-        const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, extraction_key)).?;
+        const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, extraction_key, null)).?;
         defer alloc.free(outcome.resolution_key);
         try testing.expectEqual(resolver_lib.RunResult.unchanged, outcome.result);
     }
@@ -785,7 +913,7 @@ test "processChangedExtraction resolves and persists the resolution artifact" {
     try testing.expectEqualStrings("person/ada_lovelace", entities[0].object.get("doc_ref").?.object.get("key").?.string);
 
     // A non-asset key is ignored.
-    try testing.expect((try processChangedExtraction(alloc, &resolvers, map.store(), null, "not-an-artifact-key")) == null);
+    try testing.expect((try processChangedExtraction(alloc, &resolvers, map.store(), null, "not-an-artifact-key", null)) == null);
 }
 
 test "resolveExtraction returns null when no resolver consumes the artifact" {
@@ -908,7 +1036,7 @@ test "processChangedExtraction runs over a DbArtifactStore" {
     try store.put(extraction_key, test_extraction);
 
     {
-        const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key)).?;
+        const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null)).?;
         defer alloc.free(outcome.resolution_key);
         try testing.expectEqual(resolver_lib.RunResult.written, outcome.result);
     }
@@ -966,7 +1094,7 @@ test "processRecordKeys resolves changed asset keys and journals resolution keys
 
     // A record carrying the extraction key plus a non-asset key (ignored).
     const changed = [_][]const u8{ extraction_key, "not-an-artifact" };
-    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn);
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:r", "resolution_v1");
     defer alloc.free(resolution_key);
@@ -976,7 +1104,7 @@ test "processRecordKeys resolves changed asset keys and journals resolution keys
 
     // Idempotent replay: recomputed bytes match, so nothing is journaled.
     writer.calls = 0;
-    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn);
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null);
     try testing.expectEqual(@as(usize, 1), writer.keys.items.len);
     try testing.expectEqual(@as(u64, 0), writer.calls);
 }
@@ -1077,6 +1205,7 @@ test "catchUpWindow resolves matching records and journals resolution writes" {
         0,
         &writer,
         CaptureWriter.writeFn,
+        null,
     );
     try testing.expectEqual(@as(u64, 7), max_seen);
 
@@ -1097,7 +1226,7 @@ test "catchUpWindow with no matching records returns from-1" {
     var writer = CaptureWriter{ .alloc = alloc };
     defer writer.deinit();
 
-    const max_seen = try catchUpWindow(alloc, fake_source.source(), &resolvers, das.artifactStore(), null, 5, 0, &writer, CaptureWriter.writeFn);
+    const max_seen = try catchUpWindow(alloc, fake_source.source(), &resolvers, das.artifactStore(), null, 5, 0, &writer, CaptureWriter.writeFn, null);
     try testing.expectEqual(@as(u64, 5), max_seen);
     try testing.expectEqual(@as(u64, 0), writer.calls);
 }
@@ -1139,7 +1268,7 @@ test "processChangedExtraction with exact_key blocking links to an existing enti
         \\{ "canonical_name": "Ada Lovelace", "label": "person" }
     );
 
-    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key)).?;
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null)).?;
     defer alloc.free(outcome.resolution_key);
     try testing.expectEqual(resolver_lib.RunResult.written, outcome.result);
 
@@ -1189,7 +1318,7 @@ test "prefix blocking links a typo'd mention to an existing entity with a differ
         \\{ "canonical_name": "Ada Lovelace", "label": "person" }
     );
 
-    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key)).?;
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null)).?;
     defer alloc.free(outcome.resolution_key);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
@@ -1237,7 +1366,7 @@ test "embedding (cosine) scoring links via prefix blocking" {
         \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [0.1, 0.2, 0.3, 0.4] }
     );
 
-    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key)).?;
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null)).?;
     defer alloc.free(outcome.resolution_key);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
@@ -1248,6 +1377,246 @@ test "embedding (cosine) scoring links via prefix blocking" {
     defer parsed.deinit();
     const ent = parsed.value.object.get("entities").?.array.items[0].object;
     // Linked by embedding similarity despite differing text.
+    try testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+/// In-memory CandidateSource for cross-shard blocking tests: maps an entity key
+/// to its stored JSON doc. Serves all three blocking modes (exact key, label
+/// prefix, vector nearest) so the worker's `SourceCandidateProvider` dispatch
+/// can be exercised without a live cluster transport.
+const FakeCandidateSource = struct {
+    alloc: std.mem.Allocator,
+    map: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// Records the (table) each mode was queried with, for assertions.
+    last_table: []const u8 = "",
+
+    fn deinit(self: *FakeCandidateSource) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            self.alloc.free(e.key_ptr.*);
+            self.alloc.free(e.value_ptr.*);
+        }
+        self.map.deinit(self.alloc);
+    }
+
+    fn put(self: *FakeCandidateSource, key: []const u8, value: []const u8) !void {
+        const owned_value = try self.alloc.dupe(u8, value);
+        errdefer self.alloc.free(owned_value);
+        const gop = try self.map.getOrPut(self.alloc, key);
+        if (gop.found_existing) {
+            self.alloc.free(gop.value_ptr.*);
+        } else {
+            gop.key_ptr.* = try self.alloc.dupe(u8, key);
+        }
+        gop.value_ptr.* = owned_value;
+    }
+
+    fn candidateSource(self: *FakeCandidateSource) CandidateSource {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = CandidateSource.VTable{
+        .get = getFn,
+        .scan_prefix = scanPrefixFn,
+        .nearest = nearestFn,
+    };
+
+    fn getFn(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8 {
+        const self: *FakeCandidateSource = @ptrCast(@alignCast(ptr));
+        self.last_table = table;
+        const v = self.map.get(key) orelse return null;
+        return try allocator.dupe(u8, v);
+    }
+
+    fn scanPrefixFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        table: []const u8,
+        prefix: []const u8,
+        ctx: *anyopaque,
+        consume: CandidateSource.Consume,
+    ) anyerror!void {
+        _ = allocator;
+        const self: *FakeCandidateSource = @ptrCast(@alignCast(ptr));
+        self.last_table = table;
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            if (!std.mem.startsWith(u8, e.key_ptr.*, prefix)) continue;
+            try consume(ctx, e.key_ptr.*, e.value_ptr.*);
+        }
+    }
+
+    fn nearestFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        table: []const u8,
+        embedding: []const f32,
+        k: usize,
+        ctx: *anyopaque,
+        consume: CandidateSource.Consume,
+    ) anyerror!void {
+        _ = allocator;
+        _ = embedding;
+        const self: *FakeCandidateSource = @ptrCast(@alignCast(ptr));
+        self.last_table = table;
+        var emitted: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            if (emitted >= k) break;
+            try consume(ctx, e.key_ptr.*, e.value_ptr.*);
+            emitted += 1;
+        }
+    }
+};
+
+test "SourceCandidateProvider links via an injected cross-shard exact_key source" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "exact_key",
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "n", "left": "canonical_text", "right": "canonical_name",
+        \\  "levels": [ { "when": "exact", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    }};
+
+    // The worker's own store holds only the extraction; the entity lives on
+    // another shard, served by the injected CandidateSource.
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+
+    var remote = FakeCandidateSource{ .alloc = alloc };
+    defer remote.deinit();
+    try remote.put("person/ada_lovelace",
+        \\{ "canonical_name": "Ada Lovelace", "label": "person" }
+    );
+
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, remote.candidateSource())).?;
+    defer alloc.free(outcome.resolution_key);
+    try testing.expectEqual(resolver_lib.RunResult.written, outcome.result);
+    try testing.expectEqualStrings("entities", remote.last_table);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const stored = (try store.get(alloc, resolution_key)).?;
+    defer alloc.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    // Linked to the cross-shard entity, not minted locally.
+    try testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "SourceCandidateProvider prefix blocking scans a cross-shard label namespace" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "n", "left": "canonical_text", "right": "canonical_name",
+        \\  "levels": [ { "when": "jaro_winkler > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    // Typo'd mention would mint "person/ada_lovlace".
+    try store.put(extraction_key,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovlace" } ] }
+    );
+
+    var remote = FakeCandidateSource{ .alloc = alloc };
+    defer remote.deinit();
+    try remote.put("person/ada_lovelace",
+        \\{ "canonical_name": "Ada Lovelace", "label": "person" }
+    );
+    // A different-label entity that must be excluded by the prefix scan.
+    try remote.put("org/antfly",
+        \\{ "canonical_name": "Antfly", "label": "org" }
+    );
+
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, remote.candidateSource())).?;
+    defer alloc.free(outcome.resolution_key);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const stored = (try store.get(alloc, resolution_key)).?;
+    defer alloc.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "SourceCandidateProvider ann blocking links via cross-shard nearest neighbours" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "ann",
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "emb", "left": "name_embedding", "right": "name_embedding",
+        \\  "levels": [ { "when": "cosine > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    // Mention carries a query embedding; its text differs from the entity's.
+    try store.put(extraction_key,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "A Lovelace", "embedding": [0.1, 0.2, 0.3, 0.4] } ] }
+    );
+
+    var remote = FakeCandidateSource{ .alloc = alloc };
+    defer remote.deinit();
+    try remote.put("person/ada_lovelace",
+        \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [0.1, 0.2, 0.3, 0.4] }
+    );
+
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, remote.candidateSource())).?;
+    defer alloc.free(outcome.resolution_key);
+    try testing.expectEqualStrings("entities", remote.last_table);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const stored = (try store.get(alloc, resolution_key)).?;
+    defer alloc.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    // Linked by vector similarity across the shard boundary despite differing text.
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 }

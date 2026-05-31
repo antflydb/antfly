@@ -2648,6 +2648,9 @@ pub const DB = struct {
             append_ctx,
             appendDerivedBatchFromEnrichment,
             self.backend_runtime,
+            // Local-only blocking for now; the api/serving layer injects a
+            // cross-shard CandidateSource when one is configured.
+            null,
         );
         errdefer runtime.deinit();
         self.resolution_append_context = append_ctx;
