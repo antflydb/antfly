@@ -42,10 +42,11 @@ const bloom = @import("bloom");
 //   v17: v16 + cumulative-end postings chunk metadata
 //   v18: v17 + varint postings headers
 //   v19: v18 + sparse block-max records aligned to stored posting chunks
+//   v20: v19 + compact tagged term-block dictionary values
 //
-// This project is pre-release; writers emit only the current v19 format.
+// This project is pre-release; writers emit only the current v20 format.
 
-const wire_version_current: u8 = 19;
+const wire_version_current: u8 = 20;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4 + 4; // 33 bytes
 const postings_chunk_meta_size: usize = 12;
 const postings_skip_record_size: usize = 8;
@@ -56,7 +57,7 @@ const term_dict_block_max_entries: usize = 48;
 const term_dict_run_min_entries: usize = 4;
 const term_dict_run_max_entries: usize = 8;
 const term_dict_index_record_size: usize = 8;
-const term_dict_magic = "BTD3";
+const term_dict_magic = "BTD4";
 const term_dict_header_size: usize = 20;
 
 /// Skip building a per-segment bloom filter when there are fewer terms than this.
@@ -215,6 +216,22 @@ fn appendTermDictIndexRecord(
     try appendLeU32(alloc, out, ceiling_term_offset);
 }
 
+fn encodeTermDictBlockValue(value: u64) u64 {
+    if (fstValIs1Hit(value)) {
+        const decoded = fstValDecode1Hit(value);
+        return (decoded.doc_num << 1) | 1;
+    }
+    std.debug.assert(value <= (std.math.maxInt(u64) >> 1));
+    return value << 1;
+}
+
+fn decodeTermDictBlockValue(encoded: u64) u64 {
+    if (encoded & 1 != 0) {
+        return fstValEncode1Hit(encoded >> 1, 0);
+    }
+    return encoded >> 1;
+}
+
 fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry) ![]u8 {
     var block_data = std.ArrayListUnmanaged(u8).empty;
     defer block_data.deinit(alloc);
@@ -265,7 +282,7 @@ fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry)
                 const leaf = entry.term[prefix.len + run_prefix.len ..];
                 try writeVarintU32(alloc, &block_data, @intCast(leaf.len));
                 try block_data.appendSlice(alloc, leaf);
-                try writeVarintU64(alloc, &block_data, entry.value);
+                try writeVarintU64(alloc, &block_data, encodeTermDictBlockValue(entry.value));
             }
 
             run_start = run_end;
@@ -1334,7 +1351,7 @@ pub const InvertedIndexReader = struct {
                 if (cursor + leaf_len > self.dict_blocks.len) return error.Truncated;
                 const leaf = self.dict_blocks[cursor..][0..leaf_len];
                 cursor += leaf_len;
-                const value = try readVarintU64(self.dict_blocks, &cursor);
+                const value = decodeTermDictBlockValue(try readVarintU64(self.dict_blocks, &cursor));
                 if (in_run and std.mem.eql(u8, leaf, wanted_leaf)) return value;
             }
 
@@ -1417,7 +1434,7 @@ pub const TermIterator = struct {
             if (self.current_block_cursor + leaf_len > self.reader.dict_blocks.len) return error.InvalidData;
             const leaf = self.reader.dict_blocks[self.current_block_cursor..][0..leaf_len];
             self.current_block_cursor += leaf_len;
-            const value = readVarintU64(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData;
+            const value = decodeTermDictBlockValue(readVarintU64(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData);
             self.current_block_remaining -= 1;
             self.current_run_remaining -= 1;
 
@@ -2661,7 +2678,7 @@ fn legacyV14TermBlockDataBytesForTest(entries: []const TermDictEntry) usize {
     return total;
 }
 
-test "v16 term dictionary stores local prefix runs indexed by block ceiling" {
+test "v20 term dictionary stores local prefix runs indexed by block ceiling" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{});
     defer builder.deinit();
@@ -2721,7 +2738,7 @@ test "v16 term dictionary stores local prefix runs indexed by block ceiling" {
     try std.testing.expect(try range_iter.next() == null);
 }
 
-test "v16 term dictionary local prefix runs shrink block payload" {
+test "v20 term dictionary local prefix runs shrink block payload" {
     const alloc = std.testing.allocator;
 
     var terms = std.ArrayListUnmanaged([]const u8).empty;
@@ -2746,6 +2763,19 @@ test "v16 term dictionary local prefix runs shrink block payload" {
     const block_data_len = std.mem.readInt(u32, dict[8..12], .little);
     const legacy_block_bytes = legacyV14TermBlockDataBytesForTest(entries.items);
     try std.testing.expect(block_data_len < legacy_block_bytes);
+}
+
+test "v20 term dictionary block values compact one-hit terms" {
+    const one_hit = fstValEncode1Hit(42, 0);
+    const encoded_one_hit = encodeTermDictBlockValue(one_hit);
+    try std.testing.expectEqual(@as(u64, 85), encoded_one_hit);
+    try std.testing.expect(varintU64Size(encoded_one_hit) < varintU64Size(one_hit));
+    try std.testing.expect(fstValIs1Hit(decodeTermDictBlockValue(encoded_one_hit)));
+    try std.testing.expectEqual(@as(u64, 42), fstValDecode1Hit(decodeTermDictBlockValue(encoded_one_hit)).doc_num);
+
+    const postings_offset: u64 = 123_456;
+    const encoded_postings = encodeTermDictBlockValue(postings_offset);
+    try std.testing.expectEqual(postings_offset, decodeTermDictBlockValue(encoded_postings));
 }
 
 test "BM25 scoring" {
