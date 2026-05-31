@@ -1408,6 +1408,11 @@ pub const DataServer = struct {
     provisioned_storage: antfly.public_api.ProvisionedGroupStorage,
     read_source: antfly.public_api.ProvisionedTableReadSource,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
+    /// Long-lived backing for the cross-shard entity-resolution candidate
+    /// source; its `CandidateSource` vtable points into this field, so it must
+    /// not move. Wraps `read_source.source()` and is handed to the write
+    /// source(s) so every managed DB blocks entity resolution across shards.
+    distributed_candidate_source: ?antfly.public_api.DistributedCandidateSource = null,
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
@@ -1631,6 +1636,19 @@ pub const DataServer = struct {
         self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
         self.write_source.setLocalChangeHook(self.localChangeHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+
+        // Cross-shard entity-resolution blocking: wrap the routing-aware read
+        // source so resolution workers fetch candidate entities from whichever
+        // shard owns the entity table, then hand it to the write source(s) that
+        // open managed DBs. Captures `read_source.source()` (ptr+vtable), so
+        // later read-source mutations remain visible.
+        self.distributed_candidate_source = .{ .reads = self.read_source.source() };
+        const candidate_source = self.distributed_candidate_source.?.candidateSource();
+        _ = self.write_source.withResolutionCandidateSource(candidate_source);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withResolutionCandidateSource(candidate_source);
+            apply_sm.write_cache.resolution_candidate_source = candidate_source;
+        }
         self.http_server = antfly.public_api.ApiHttpServer.init(
             self.alloc,
             api_server_cfg,

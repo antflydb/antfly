@@ -209,6 +209,9 @@ pub const ProvisionedTableWriteCache = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    /// Cross-shard entity-resolution candidate source applied to every managed
+    /// DB this cache opens (set after open; see `setResolutionCandidateSource`).
+    resolution_candidate_source: ?db_mod.CandidateSource = null,
     open_mutex: std.atomic.Mutex = .unlocked,
     entry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     hit_count: std.atomic.Value(u64) = .init(0),
@@ -718,6 +721,12 @@ pub const ProvisionedTableWriteCache = struct {
         var db = opened.* orelse unreachable;
         opened.* = null;
         errdefer db.close();
+
+        // Hand the freshly-opened DB the cross-shard candidate source (no-op
+        // unless it has a resolution runtime). Done here, the single adoption
+        // chokepoint, because managed DBs open lazily and cannot thread the
+        // source through OpenOptions.
+        if (self.resolution_candidate_source) |src| db.setResolutionCandidateSource(src);
 
         const start_bulk_session = switch (mode) {
             .default, .default_async, .writer_no_replay => self.bulkIngestSessionActiveForTable(table_name),
@@ -2291,6 +2300,7 @@ pub const ProvisionedTableWriteSource = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    resolution_candidate_source: ?db_mod.CandidateSource = null,
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
     dirty_write_table_count: std.atomic.Value(u32) = .init(0),
     startup_catch_up_active: std.atomic.Value(bool) = .init(false),
@@ -2342,6 +2352,16 @@ pub const ProvisionedTableWriteSource = struct {
         self.remote_content = remote_content;
         if (self.write_cache) |cache| cache.remote_content = remote_content;
         if (self.startup_write_cache) |cache| cache.remote_content = remote_content;
+        return self;
+    }
+
+    pub fn withResolutionCandidateSource(
+        self: *ProvisionedTableWriteSource,
+        resolution_candidate_source: ?db_mod.CandidateSource,
+    ) *ProvisionedTableWriteSource {
+        self.resolution_candidate_source = resolution_candidate_source;
+        if (self.write_cache) |cache| cache.resolution_candidate_source = resolution_candidate_source;
+        if (self.startup_write_cache) |cache| cache.resolution_candidate_source = resolution_candidate_source;
         return self;
     }
 

@@ -3777,6 +3777,16 @@ pub const DB = struct {
         if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
     }
 
+    /// Inject (or clear) the cross-shard entity-resolution candidate source on
+    /// an already-open DB. The serving layer (managed write cache) calls this
+    /// right after a DB is opened, since managed DBs open lazily and cannot
+    /// thread the source through `OpenOptions`. No-op when this DB has no
+    /// resolution runtime (e.g. read-only / status opens).
+    pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) void {
+        self.resolution_candidate_source = src;
+        if (self.resolution_runtime) |runtime| runtime.setCandidateSource(src);
+    }
+
     fn failIfIdentityOrdinalExhaustedForNewUpserts(self: *DB, doc_ids: []const []const u8) !void {
         if (doc_ids.len == 0) return;
 

@@ -600,6 +600,17 @@ pub const ResolutionRuntime = struct {
         }
     }
 
+    /// Inject (or clear) the cross-shard candidate source after construction.
+    /// The serving layer uses this when it cannot pass the source through
+    /// `OpenOptions` (managed DBs open lazily through the write cache). Taken
+    /// under `catch_up_mutex` so it cannot tear against an in-flight catch-up;
+    /// the next catch-up window then blocks against the new source.
+    pub fn setCandidateSource(self: *ResolutionRuntime, src: ?CandidateSource) void {
+        lockMutex(&self.catch_up_mutex);
+        defer self.catch_up_mutex.unlock();
+        self.candidate_source = src;
+    }
+
     pub fn start(self: *ResolutionRuntime) !void {
         // Without io there is no background thread; the stage is then driven
         // synchronously via catchUp (e.g. from runUntilIdle).

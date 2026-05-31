@@ -492,10 +492,16 @@ Open/index/enrichment validation should reject:
          entity shard and resolves local-or-remote, reusing existing group
          routing. Unit-tested with a fake `TableReadSource`
          (`lib-resolution-source-test`).
-   - [ ] Serving-layer injection: construct a `DistributedCandidateSource` from
-         the hosted read source and pass it into `ResolutionRuntime` at DB
-         construction when a resolver declares `candidate_search`. End-to-end
-         link across a real shard boundary needs the multi-node harness.
+   - [x] Serving-layer injection: `DataServer.initApiServer` wraps
+         `read_source.source()` in a `DistributedCandidateSource` and hands it to
+         the write source(s); the managed write cache applies it to every DB it
+         opens (`adoptPreparedOpenLocked` -> `DB.setResolutionCandidateSource` ->
+         `ResolutionRuntime.setCandidateSource`, taken under `catch_up_mutex`).
+         Because the worker only queries the source when a resolver declares
+         `candidate_search`, injection is unconditional and needs no open-time
+         config discovery. Compiles + passes `public-api-parity-test`; the live
+         link across a real shard boundary still needs the multi-node harness to
+         exercise (no behavior change until a resolver + entity table exist).
    - [x] Resolver catalog config (`resolver_catalog.zig` `ResolverConfig`) +
          per-shard persistence in `IndexManager` + `addResolver` / `removeResolver`
          / `listResolvers` through DB -> DBCore -> IndexManager (verified by a
@@ -586,14 +592,21 @@ and both are now served by the same seam.
    so blocking reuses all existing topology/transport instead of re-deriving it.
    Unit-tested with a fake `TableReadSource` (`lib-resolution-source-test`) and a
    fake `CandidateSource` (`db-test`).
+3. **Serving-layer injection.** `DataServer.initApiServer` wraps
+   `read_source.source()` in a `DistributedCandidateSource` (a long-lived
+   `DataServer` field) and hands its `CandidateSource` to the API and raft-apply
+   write sources via `withResolutionCandidateSource`. The managed write cache
+   applies it to each DB at its single open chokepoint
+   (`adoptPreparedOpenLocked` -> `DB.setResolutionCandidateSource` ->
+   `ResolutionRuntime.setCandidateSource`, serialized under `catch_up_mutex`).
+   Injection is unconditional -- the worker only queries the source when a
+   resolver declares `candidate_search`, so there is no open-time config
+   discovery and no behavior change until a resolver + entity table exist.
+   Passes `public-api-parity-test`; the live cross-shard link still needs the
+   multi-node harness to exercise end to end.
 
 **Remaining:**
 
-3. **Serving-layer injection.** Construct a `DistributedCandidateSource` from the
-   hosted read source and pass it into `ResolutionRuntime` at DB construction
-   when a resolver declares `candidate_search`. (`initResolutionRuntime` passes
-   `null` today.) End-to-end linking across a real shard boundary needs the
-   multi-node harness, not the single-shard `db-test` tooling.
 4. **Promoter dependency.** Cross-document linking only pays off once the
    promoter writes canonical entity docs (phase 3); until then blocking finds
    nothing to link to. The promoter's cross-shard entity upsert uses the same
