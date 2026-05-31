@@ -8,6 +8,7 @@ Updated on 2026-05-29 from worktree commit `d255fecf291d` after caching per-segm
 Updated on 2026-05-29 after adding explicit current-scan helpers for maintenance paths so TTL/schema scans can avoid cloning the LSM mutable writer generation. This does not change the latest ReleaseFast baseline below; it is a working-set cleanup for the remaining mutable snapshot path.
 Updated on 2026-05-29 after moving the segment container to v3 with a zero checksum sentinel. Segment publish/open no longer performs a full-file CRC pass by default, which avoids forcing newly-written mmap segment pages resident just to validate the footer.
 Updated on 2026-05-29 from worktree commit `cf09767718c1` with a post-v3 ReleaseFast baseline. Final mapped-file resident dropped from about 519-534 MiB to about 32-33 MiB while final segment bytes stayed about 528-532 MiB; final `ps` RSS dropped from about 1.17-1.19 GiB to about 684-700 MiB.
+Updated on 2026-05-31 from worktree commit `a2dfe4cec46a` after the v18 varint postings header codec change. The baseline script now builds with `zig build install -Doptimize=ReleaseFast`.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -32,6 +33,10 @@ Latest layout-cache/page-advice artifacts:
 Latest segment-v3/no-eager-checksum artifacts:
 
 `work-log/do8018/releasefast-baseline-20260529-130221/`
+
+Latest v18 artifacts:
+
+`work-log/do8018/releasefast-baseline-20260531-153844/`
 
 ## Latest Segment-v3 Metrics Off
 
@@ -598,3 +603,97 @@ Metrics-on with detailed layout hit the 300s wait limit with no full-text pendin
 The v17 codec changes moved posting chunk metadata from 20-byte fixed records to 12-byte cumulative-end records. The reader derives `chunk_id` from `max_doc / chunk_size` and reconstructs each chunk payload offset from the previous cumulative end, so decode remains zero-copy while dropping redundant per-chunk fields. This is a codec break; old v16 sections are intentionally unsupported.
 
 The comparable no-detail ReleaseFast run shows the RSS story is now mostly stable: final `ps` RSS is ~651-671 MiB, vmmap footprint is ~140-147 MiB, live malloc is ~84-97 MiB, and mapped-file resident is only ~30-31 MiB despite ~491-494 MiB of mapped segment bytes. Segment bytes also moved down from the previous ~528-532 MiB v3/no-eager-checksum run to ~491-494 MiB, with postings down from ~270 MiB to ~234-240 MiB. The remaining segment-size work is still real: term blocks are ~99-103 MiB, stored fields are ~127.6 MiB, postings headers are large, and block-max/chunk metadata still account for substantial bytes in the detailed probe.
+
+## Latest v18 Metrics Off
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260531-153844/`.
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Payload bytes: 246,859,144
+- Load time: 39.109253125s
+- Async catch-up time: 12.256525s
+- Catch-up complete: true
+- Throughput: 1,805.33 records/sec, 5.51 MiB/sec
+- `ps` RSS: 788,725,760 bytes
+- Process resident metric: 787,759,104 bytes
+- Process footprint metric: 123,083,544 bytes
+- Live malloc metric: 79,669,856 bytes
+- Malloc zone metric: 154,959,872 bytes
+- vmmap footprint: 124,046,540 bytes
+- vmmap peak footprint: 741,238,374 bytes
+- vmmap mapped-file resident: 31,666,995 bytes
+- vmmap malloc allocated: 24,012,390 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 430,672,350
+- Final mapped segment bytes: 430,672,350
+- Max segment bytes: 134,859,783
+- Stored fields bytes: 127,624,684
+- Inverted bytes: 298,948,614
+- Inverted header bytes: 121,968
+- Inverted norms bytes: 10,252,155
+- Inverted postings bytes: 171,837,052
+- Inverted term dictionary bytes: 110,337,979
+- Term block bytes: 104,617,317
+- Term index bytes: 2,881,378
+- Term FST bytes: 2,765,364
+- Bloom bytes: 6,399,460
+- Typed doc values bytes: 3,445,076
+- Doc ordinal bytes: 282,460
+- Section index bytes: 371,196
+- Text merges completed: 144
+- Full-text build peak bytes: 136,861,837
+- Full-text pending peak bytes: 430,263,506
+- Text merge buffer peak bytes: 133,713,039
+- LSM compaction peak bytes: 68,460,648
+- LSM in-memory state peak bytes: 21,118,110
+
+## Latest v18 Metrics On
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260531-153844/`.
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Payload bytes: 246,859,144
+- Load time: 40.067852084s
+- Async catch-up wait: 5m0.200299291s
+- Catch-up complete: false; full-text pending bytes were zero, but a 14,040-byte derived backlog kept the wait loop open
+- Throughput: 1,762.14 records/sec, 5.38 MiB/sec
+- `ps` RSS: 683,163,648 bytes
+- Process resident metric: 683,409,408 bytes
+- Process footprint metric: 119,606,776 bytes
+- Live malloc metric: 93,763,520 bytes
+- Malloc zone metric: 139,558,912 bytes
+- vmmap footprint: 119,327,948 bytes
+- vmmap peak footprint: 751,828,992 bytes
+- vmmap mapped-file resident: 31,037,849 bytes
+- vmmap malloc allocated: 34,603,008 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 429,247,307
+- Final mapped segment bytes: 429,247,307
+- Max segment bytes: 102,688,749
+- Stored fields bytes: 127,638,562
+- Inverted bytes: 297,499,802
+- Inverted header bytes: 124,311
+- Inverted norms bytes: 12,448,214
+- Inverted postings bytes: 172,385,828
+- Inverted term dictionary bytes: 106,571,237
+- Term block bytes: 101,074,093
+- Term index bytes: 2,760,930
+- Term FST bytes: 2,660,874
+- Bloom bytes: 5,970,212
+- Typed doc values bytes: 3,446,061
+- Doc ordinal bytes: 282,460
+- Section index bytes: 380,102
+- Text merges completed: 137
+- Full-text build peak bytes: 149,473,482
+- Full-text pending peak bytes: 428,351,067
+- Text merge buffer peak bytes: 100,861,528
+- LSM compaction peak bytes: 67,785,176
+- LSM in-memory state peak bytes: 27,230,225
+
+## v18 Read
+
+The v18 codec removes the fixed 24-byte postings header and encodes the six small postings header fields as varints. This is another intentional codec break with no legacy read path. In the comparable no-detail ReleaseFast run, final segment bytes fell from the v17 range of ~491-494 MiB to ~429-431 MiB, and postings fell from ~234-240 MiB to ~172 MiB.
+
+The RSS signal is not monotonic run-to-run: metrics-off ended at ~789 MiB RSS while metrics-on ended at ~683 MiB RSS. The lower-noise memory indicators are consistent with the previous slice: process footprint is ~120-123 MiB, live malloc is ~80-94 MiB, vmmap malloc allocated is ~24-35 MiB, and mapped-file resident is ~31 MiB. That means the old 2 GiB symptom is no longer explained by live heap, but there is still codec and policy work left in term blocks, stored fields, sparse block-max data, skip data, and merge/reader retirement.
