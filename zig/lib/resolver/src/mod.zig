@@ -489,6 +489,16 @@ pub const ArtifactStore = struct {
         get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?[]u8,
         put: *const fn (ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
         delete: *const fn (ptr: *anyopaque, key: []const u8) anyerror!void,
+        /// Optional range scan over `[lower, upper)` for prefix candidate
+        /// blocking; `consume` borrows the key/value for the call. Null means
+        /// the store does not support scanning (blocking yields no candidates).
+        scan_prefix: ?*const fn (
+            ptr: *anyopaque,
+            lower: []const u8,
+            upper: []const u8,
+            ctx: *anyopaque,
+            consume: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
+        ) anyerror!void = null,
     };
 
     pub fn get(self: ArtifactStore, allocator: std.mem.Allocator, key: []const u8) anyerror!?[]u8 {
@@ -499,6 +509,16 @@ pub const ArtifactStore = struct {
     }
     pub fn delete(self: ArtifactStore, key: []const u8) anyerror!void {
         return self.vtable.delete(self.ptr, key);
+    }
+    pub fn scanPrefix(
+        self: ArtifactStore,
+        lower: []const u8,
+        upper: []const u8,
+        ctx: *anyopaque,
+        consume: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
+    ) anyerror!void {
+        const f = self.vtable.scan_prefix orelse return error.ScanUnsupported;
+        return f(self.ptr, lower, upper, ctx, consume);
     }
 };
 

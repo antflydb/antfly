@@ -143,8 +143,10 @@ pub fn processChangedExtraction(
     // look up the rendered canonical key as a candidate so the scorer can link
     // to an existing entity instead of always minting.
     var exact_provider = ExactKeyCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table };
+    var prefix_provider = PrefixCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table };
     const effective_provider = provider orelse blk: {
         if (std.mem.eql(u8, cfg.candidate_search, "exact_key")) break :blk exact_provider.provider();
+        if (std.mem.eql(u8, cfg.candidate_search, "prefix")) break :blk prefix_provider.provider();
         break :blk null;
     };
 
@@ -153,11 +155,41 @@ pub fn processChangedExtraction(
     return .{ .result = result, .resolution_key = resolution_key };
 }
 
-/// Candidate provider that looks up the resolver's rendered canonical key as an
-/// existing entity (read through the artifact-store seam by document key). This
-/// is V1 "exact_key" blocking; ANN/prefix blocking over the entity table is a
-/// phase-2 extension. Cross-shard entity tables require distributed reads and
-/// are likewise deferred -- this reads whatever the worker's store can see.
+/// Build a candidate from an entity document's JSON (its string fields become
+/// the matcher record; "label"/"entity_type" set the candidate label) and
+/// append it to `out`. `entity_key` + `table` form the candidate DocRef.
+fn appendEntityCandidate(
+    allocator: std.mem.Allocator,
+    table: []const u8,
+    entity_key: []const u8,
+    value: []const u8,
+    out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, value, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    var fields = std.ArrayListUnmanaged(matcher.Field).empty;
+    var label: []const u8 = "";
+    var it = parsed.value.object.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.* != .string) continue;
+        const fname = try allocator.dupe(u8, e.key_ptr.*);
+        const fval = try allocator.dupe(u8, e.value_ptr.*.string);
+        try fields.append(allocator, .{ .name = fname, .value = .{ .text = fval } });
+        if (std.mem.eql(u8, e.key_ptr.*, "label") or std.mem.eql(u8, e.key_ptr.*, "entity_type")) label = fval;
+    }
+
+    try out.append(allocator, .{
+        .doc_ref = .{ .table = try allocator.dupe(u8, table), .key = try allocator.dupe(u8, entity_key) },
+        .label = label,
+        .record = .{ .fields = try fields.toOwnedSlice(allocator) },
+    });
+}
+
+/// "exact_key" blocking: look up the rendered canonical key as an existing
+/// entity (by document key through the store seam). Reads whatever the worker's
+/// store can see; cross-shard entity tables need distributed reads (phase 2).
 const ExactKeyCandidateProvider = struct {
     store: resolver_lib.ArtifactStore,
     resolver: *const resolver_lib.Resolver,
@@ -166,9 +198,7 @@ const ExactKeyCandidateProvider = struct {
     fn provider(self: *ExactKeyCandidateProvider) resolver_lib.CandidateProvider {
         return .{ .ptr = self, .vtable = &vtable };
     }
-
     const vtable = resolver_lib.CandidateProvider.VTable{ .candidates_for = candidatesFor };
-
     fn candidatesFor(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -177,42 +207,64 @@ const ExactKeyCandidateProvider = struct {
     ) anyerror!void {
         const self: *ExactKeyCandidateProvider = @ptrCast(@alignCast(ptr));
         const key = try self.resolver.renderKeyAlloc(allocator, entity);
-        errdefer allocator.free(@constCast(key));
-
+        defer allocator.free(@constCast(key));
         const doc_store_key = try internal_keys.documentKeyAlloc(allocator, key);
         defer allocator.free(doc_store_key);
-        const raw = (try self.store.get(allocator, doc_store_key)) orelse {
-            allocator.free(@constCast(key));
-            return;
-        };
+        const raw = (try self.store.get(allocator, doc_store_key)) orelse return;
         defer allocator.free(raw);
+        try appendEntityCandidate(allocator, self.table, key, raw, out);
+    }
+};
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
-            allocator.free(@constCast(key));
-            return;
+/// "prefix" blocking: scan the entity key range under the rendered key's label
+/// namespace and offer every entity as a candidate for the scorer to rank, so a
+/// typo'd mention can link to an existing entity with a different key. Suited to
+/// modest entity tables; ANN blocking is the large-table successor.
+const PrefixCandidateProvider = struct {
+    store: resolver_lib.ArtifactStore,
+    resolver: *const resolver_lib.Resolver,
+    table: []const u8,
+
+    fn provider(self: *PrefixCandidateProvider) resolver_lib.CandidateProvider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable = resolver_lib.CandidateProvider.VTable{ .candidates_for = candidatesFor };
+
+    const ScanCtx = struct {
+        allocator: std.mem.Allocator,
+        table: []const u8,
+        out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
+
+        fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+            const self: *ScanCtx = @ptrCast(@alignCast(ptr));
+            const entity_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.allocator, key)) orelse return;
+            defer self.allocator.free(entity_key);
+            try appendEntityCandidate(self.allocator, self.table, entity_key, value, self.out);
+        }
+    };
+
+    fn candidatesFor(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        entity: resolver_lib.ExtractedEntity,
+        out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
+    ) anyerror!void {
+        const self: *PrefixCandidateProvider = @ptrCast(@alignCast(ptr));
+        const key = try self.resolver.renderKeyAlloc(allocator, entity);
+        defer allocator.free(@constCast(key));
+        const slash = std.mem.indexOfScalar(u8, key, '/');
+        const prefix = if (slash) |i| key[0 .. i + 1] else key;
+
+        const lower = try internal_keys.documentRangeLowerAlloc(allocator, prefix);
+        defer allocator.free(lower);
+        const upper = (try internal_keys.documentRangeUpperAlloc(allocator, prefix)) orelse return;
+        defer allocator.free(upper);
+
+        var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .out = out };
+        self.store.scanPrefix(lower, upper, &ctx, ScanCtx.consume) catch |e| switch (e) {
+            error.ScanUnsupported => return,
+            else => return e,
         };
-        defer parsed.deinit();
-        if (parsed.value != .object) {
-            allocator.free(@constCast(key));
-            return;
-        }
-
-        var fields = std.ArrayListUnmanaged(matcher.Field).empty;
-        var label: []const u8 = "";
-        var it = parsed.value.object.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.* != .string) continue;
-            const fname = try allocator.dupe(u8, e.key_ptr.*);
-            const fval = try allocator.dupe(u8, e.value_ptr.*.string);
-            try fields.append(allocator, .{ .name = fname, .value = .{ .text = fval } });
-            if (std.mem.eql(u8, e.key_ptr.*, "label") or std.mem.eql(u8, e.key_ptr.*, "entity_type")) label = fval;
-        }
-
-        try out.append(allocator, .{
-            .doc_ref = .{ .table = try allocator.dupe(u8, self.table), .key = key },
-            .label = label,
-            .record = .{ .fields = try fields.toOwnedSlice(allocator) },
-        });
     }
 };
 
@@ -505,7 +557,34 @@ pub fn DbArtifactStore(comptime Store: type) type {
             return .{ .ptr = self, .vtable = &vtable };
         }
 
-        const vtable = resolver_lib.ArtifactStore.VTable{ .get = getFn, .put = putFn, .delete = deleteFn };
+        // Range scan is only wired for the production erased store; fake stores
+        // used to compile-check the runtime do not provide a cursor.
+        const vtable = resolver_lib.ArtifactStore.VTable{
+            .get = getFn,
+            .put = putFn,
+            .delete = deleteFn,
+            .scan_prefix = if (Store == backend_erased.Store) scanPrefixFn else null,
+        };
+
+        fn scanPrefixFn(
+            ptr: *anyopaque,
+            lower: []const u8,
+            upper: []const u8,
+            ctx: *anyopaque,
+            consume: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
+        ) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            var txn = try self.store.beginRead();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            cursor.setUpperBound(upper);
+            var entry = try cursor.seekAtOrAfter(lower);
+            while (entry) |e| {
+                try consume(ctx, e.key, e.value);
+                entry = try cursor.next();
+            }
+        }
 
         fn getFn(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?[]u8 {
             const self: *Self = @ptrCast(@alignCast(ptr));
@@ -593,12 +672,28 @@ const MapStore = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = resolver_lib.ArtifactStore.VTable{ .get = get, .put = put, .delete = delete };
+    const vtable = resolver_lib.ArtifactStore.VTable{ .get = get, .put = put, .delete = delete, .scan_prefix = scanPrefix };
 
     fn get(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?[]u8 {
         const self: *MapStore = @ptrCast(@alignCast(ptr));
         const v = self.map.get(key) orelse return null;
         return try allocator.dupe(u8, v);
+    }
+    fn scanPrefix(
+        ptr: *anyopaque,
+        lower: []const u8,
+        upper: []const u8,
+        ctx: *anyopaque,
+        consume: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
+    ) anyerror!void {
+        const self: *MapStore = @ptrCast(@alignCast(ptr));
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            const k = e.key_ptr.*;
+            if (std.mem.order(u8, k, lower) == .lt) continue;
+            if (std.mem.order(u8, k, upper) != .lt) continue;
+            try consume(ctx, k, e.value_ptr.*);
+        }
     }
     fn put(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
         const self: *MapStore = @ptrCast(@alignCast(ptr));
@@ -1030,5 +1125,54 @@ test "processChangedExtraction with exact_key blocking links to an existing enti
     const ent = parsed.value.object.get("entities").?.array.items[0].object;
     // Linked to the existing entity (decision=match), not minted as new.
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "prefix blocking links a typo'd mention to an existing entity with a different key" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "n", "left": "canonical_text", "right": "canonical_name",
+        \\  "levels": [ { "when": "jaro_winkler > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+
+    // The mention has a typo and would mint "person/ada_lovlace".
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovlace" } ] }
+    );
+    // An existing entity under the correct (different) key.
+    const entity_doc_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(entity_doc_key);
+    try store.put(entity_doc_key,
+        \\{ "canonical_name": "Ada Lovelace", "label": "person" }
+    );
+
+    const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key)).?;
+    defer alloc.free(outcome.resolution_key);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const stored = (try store.get(alloc, resolution_key)).?;
+    defer alloc.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try testing.expectEqualStrings("match", ent.get("decision").?.string);
+    // Linked to the existing entity (prefix scan + scorer), not the typo'd mint.
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 }

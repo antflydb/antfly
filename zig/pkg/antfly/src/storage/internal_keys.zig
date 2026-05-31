@@ -1133,3 +1133,19 @@ test "parseAssetArtifactKeyAlloc returns doc key and artifact name" {
     defer alloc.free(res);
     try std.testing.expect((try parseAssetArtifactKeyAlloc(alloc, res)) == null);
 }
+
+test "decodePrimaryDocumentKeyAlloc round-trips and rejects non-primary keys" {
+    const alloc = std.testing.allocator;
+    const key = try documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(key);
+    try std.testing.expect(isPrimaryDocumentKey(key));
+    const decoded = (try decodePrimaryDocumentKeyAlloc(alloc, key)).?;
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("person/ada_lovelace", decoded);
+
+    // An asset artifact key is not a primary document key.
+    const asset = try artifactNamedPrefixAlloc(alloc, "person/ada_lovelace", "asset", "relations_v1");
+    defer alloc.free(asset);
+    try std.testing.expect(!isPrimaryDocumentKey(asset));
+    try std.testing.expect((try decodePrimaryDocumentKeyAlloc(alloc, asset)) == null);
+}
