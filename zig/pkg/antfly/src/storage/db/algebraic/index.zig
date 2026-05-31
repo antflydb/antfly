@@ -3652,6 +3652,19 @@ pub const Index = struct {
         // present (HLL needs it to build the per-pair singleton sketch).
         if (law_id != .count and request.measure == null) return null;
 
+        // Adaptive: record the join key as a distinct-count shape so maintenance
+        // promotes an NDV sketch that powers the fanout pre-gate below. Only for
+        // unconstrained, non-MVCC reads (what such a sketch can serve).
+        if (generation == null and request.constraints.len == 0) {
+            if (singleJoinKeyFieldName(join_cfg, .right)) |key_field| {
+                self.observeCardinalityForAdaptive(store, null, key_field);
+            }
+        }
+        // Guaranteed-blowup pre-gate: if the average right-side fanout already
+        // exceeds max_fanout, some join key must exceed it, so the scan would
+        // raise AlgebraicJoinFanoutExceeded. Fail soft (unsupported) instead.
+        if (try self.derivedJoinFanoutGuaranteedExceeds(store, join_cfg)) return null;
+
         var txn = try store.beginReadTxn();
         defer txn.abort();
         return try self.scanDerivedJoinFoldEntriesTxn(&txn, join_cfg, request, law_id, generation);
@@ -12419,6 +12432,17 @@ pub const Index = struct {
         try txn.commit();
     }
 
+    // Estimated stored-row count for a not-yet-built grouped materialization:
+    // it stores one row per distinct group-key value, i.e. the NDV of the group
+    // key. Returns that from a current HLL sketch when one covers the (single)
+    // group field, else null so the caller falls back to the doc_rows
+    // overestimate. Only the single-field, time-less case has a directly
+    // applicable sketch; this never raises the estimate above doc_rows.
+    fn adaptiveGroupKeyNdvEstimate(self: *Index, store: *docstore_mod.DocStore, spec: AdaptiveMaterializationSpec) !?u64 {
+        if (spec.time != null or spec.group_by.len != 1) return null;
+        return try self.approxCardinalityTotalForFieldAlloc(store, spec.group_by[0], &.{}, null);
+    }
+
     fn adaptiveCostInputs(
         self: *Index,
         store: *docstore_mod.DocStore,
@@ -12476,7 +12500,7 @@ pub const Index = struct {
         else if (spec.group_by.len == 0 and spec.time == null)
             1
         else
-            doc_rows;
+            (try self.adaptiveGroupKeyNdvEstimate(store, spec)) orelse doc_rows;
         const write_amplification = if (spec.path_promotion_path != null)
             @as(u64, 1)
         else
@@ -14382,6 +14406,44 @@ pub const Index = struct {
         const sequence_text = try sortableU64TextAlloc(self.alloc, sequence);
         defer self.alloc.free(sequence_text);
         return try self.keyAlloc(&.{ "path_profile_history", path, sequence_text });
+    }
+
+    // The join key field on a side, when it is a single field (composite keys
+    // have no directly-applicable NDV sketch, so callers skip them).
+    fn singleJoinKeyFieldName(join_cfg: JoinConfig, side: join_mod.Side) ?[]const u8 {
+        const fields = if (side == .left) join_cfg.left_fields else join_cfg.right_fields;
+        if (fields.len != 1) return null;
+        return fields[0];
+    }
+
+    // True only when a derived fold over this join is guaranteed to exceed
+    // max_fanout: when the average right-side fanout (right facts / NDV of the
+    // right join key) already exceeds max_fanout, the maximum per-key fanout
+    // must too (max >= mean), so the scan would raise AlgebraicJoinFanoutExceeded.
+    // Conservative — uses the upper end of the sketch's ~2sigma error band for
+    // the NDV so it never fast-fails a join that might actually fit, and returns
+    // false whenever no current sketch covers the join key.
+    fn derivedJoinFanoutGuaranteedExceeds(self: *Index, store: *docstore_mod.DocStore, join_cfg: JoinConfig) !bool {
+        const max = join_cfg.max_fanout orelse return false;
+        if (max == 0) return false;
+        const key_field = singleJoinKeyFieldName(join_cfg, .right) orelse return false;
+        const ndv = (try self.approxCardinalityTotalForFieldAlloc(store, key_field, &.{}, null)) orelse return false;
+        if (ndv == 0) return false;
+        const rel_err = hll.relativeErrorForPrecision(hll.default_precision);
+        const ndv_upper = saturatedAdd(ndv, @intFromFloat(@as(f64, @floatFromInt(ndv)) * rel_err * 2.0));
+        // Fires when total_right / ndv_real > max_fanout. ndv_upper >= ndv_real,
+        // so total_right > max * ndv_upper implies the real mean exceeds max too.
+        const threshold = saturatedMul(max, @max(ndv_upper, 1));
+        // Bounded scan: we only need to know whether the right-side fact count
+        // exceeds the threshold, so stop counting one past it rather than
+        // walking every fact on each query.
+        const prefix = try self.joinSideFactPrefixAlloc(join_cfg, .right);
+        defer self.alloc.free(prefix);
+        const cap: usize = @intCast(@min(saturatedAdd(threshold, 1), @as(u64, std.math.maxInt(usize))));
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        const count = try self.countRowsWithPrefixUpTo(&txn, prefix, cap);
+        return count > threshold;
     }
 
     fn joinSideFactPrefixAlloc(self: *Index, join_cfg: JoinConfig, side: join_mod.Side) ![]u8 {
@@ -19775,6 +19837,118 @@ test "algebraic index materializes approximate per-group cardinality" {
     // The grand total is the union of the per-group sketches: 5 distinct customers.
     const total = try idx.approxCardinalityTotalAlloc(&store, "customers_by_region");
     try std.testing.expect(@max(total, 5) - @min(total, 5) <= 1);
+}
+
+test "adaptive group-key NDV sizes a grouped materialization below the doc-row overestimate" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"regions","group_by":[],"value_field":"region","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"b\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"c\"}" },
+        .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"d\"}" },
+        .{ .key = "o5", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"e\"}" },
+        .{ .key = "o6", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"f\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    // 6 docs but only 2 distinct regions: the group-key sketch sizes a
+    // terms(region) materialization at ~2 stored rows, not the doc_rows (6)
+    // overestimate.
+    var region_group = [_][]u8{@constCast(@as([]const u8, "region"))};
+    const region_spec = AdaptiveMaterializationSpec{
+        .name = @constCast(@as([]const u8, "m")),
+        .recommendation = @constCast(@as([]const u8, "r")),
+        .op = .count,
+        .group_by = region_group[0..],
+    };
+    const region_ndv = (try idx.adaptiveGroupKeyNdvEstimate(&store, region_spec)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(region_ndv >= 1 and region_ndv <= 3);
+
+    // No sketch covers `customer`, so the estimate declines and the cost model
+    // keeps its doc_rows fallback.
+    var customer_group = [_][]u8{@constCast(@as([]const u8, "customer"))};
+    const customer_spec = AdaptiveMaterializationSpec{
+        .name = @constCast(@as([]const u8, "m")),
+        .recommendation = @constCast(@as([]const u8, "r")),
+        .op = .count,
+        .group_by = customer_group[0..],
+    };
+    try std.testing.expect((try idx.adaptiveGroupKeyNdvEstimate(&store, customer_spec)) == null);
+}
+
+test "derived join fanout pre-gate fails soft on a guaranteed blowup" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "mixed",
+        \\  "group_fields": [
+        \\    {"name":"kind","path":"kind","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"},
+        \\    {"name":"product","path":"product","type":"string"}
+        \\  ],
+        \\  "joins": [
+        \\    {"name":"orders_customers","left_fields":["customer"],"right_fields":["customer"],"left_type_field":"kind","left_type_value":"order","right_type_field":"kind","right_type_value":"customer","max_fanout":1}
+        \\  ],
+        \\  "hll_cardinalities": [
+        \\    {"name":"customers","group_by":[],"value_field":"customer","precision":14}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg", cfg);
+    defer idx.close();
+
+    // Two customer rows share the key "c1": the right side carries 3 facts over
+    // 2 distinct keys, so the average fanout (1.5) exceeds max_fanout (1) and
+    // some key must exceed it. (No matching order is ingested — that would trip
+    // the ingest-time fanout guard; the pre-gate estimates from fact-count and
+    // NDV without needing an actual match.)
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "c1a", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
+        .{ .key = "c1b", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
+        .{ .key = "c2", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c2\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const join_cfg = idx.joinConfigByName("orders_customers") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try idx.derivedJoinFanoutGuaranteedExceeds(&store, join_cfg));
+
+    // The derived fold fails soft (null) instead of raising the runtime
+    // AlgebraicJoinFanoutExceeded error mid-scan.
+    const request = DerivedJoinFoldRequest{
+        .join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
+        .op = .count,
+    };
+    try std.testing.expect((try idx.scanDerivedJoinFoldEntriesAtGeneration(&store, request, null)) == null);
 }
 
 test "algebraic HLL cardinality is adaptively promoted from a recurring query shape" {
