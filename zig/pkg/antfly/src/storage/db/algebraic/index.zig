@@ -2828,6 +2828,23 @@ pub const Index = struct {
         };
     }
 
+    /// Swap the index configuration in place from a new config JSON. Used to
+    /// apply a dynamic-template change to a running index without a reopen:
+    /// the next ingest projects facts using the refreshed dynamic_field_rules.
+    /// Persisted sidecar rows are untouched (lazy backfill); only newly written
+    /// or rewritten documents reflect the new rules until a full rebuild.
+    pub fn reloadConfigJson(self: *Index, config_json: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(Config, self.alloc, config_json, .{ .allocate = .alloc_always });
+        errdefer parsed.deinit();
+        try validateConfig(parsed.value);
+        // Cached adaptive specs are derived from the old config; drop them so
+        // they are recomputed lazily against the new one.
+        self.invalidateAdaptiveReadySpecCache();
+        const old = self.parsed;
+        self.parsed = parsed;
+        old.deinit();
+    }
+
     pub fn attachResourceManager(self: *Index, manager: *resource_manager_mod.ResourceManager) void {
         self.resource_manager = manager;
     }
@@ -19064,6 +19081,50 @@ test "algebraic dynamic templates project typed docfacts without a schema rebuil
     try std.testing.expect(!factHasField(facts2.facts, .group, "user_id"));
     try std.testing.expect(!factHasField(facts2.facts, .group, "metrics.latency"));
     try std.testing.expect(factHasField(facts2.facts, .group, "session_id"));
+}
+
+test "algebraic reloadConfigJson applies new dynamic template rules to live writes" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg_v1 =
+        \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"score","match":"score","type":"string"}]}
+    ;
+    var idx = try Index.open(alloc, "alg_reload", cfg_v1);
+    defer idx.close();
+
+    const doc_v1 = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"score\":42}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = doc_v1[0..] });
+
+    // Template-only change: `score` is now numeric (group + measure) instead of
+    // string. Reload the config in place, then write a new document.
+    const cfg_v2 =
+        \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"score","match":"score","type":"number"}]}
+    ;
+    try idx.reloadConfigJson(cfg_v2);
+
+    const doc_v2 = [_]derived_types.DerivedDocument{
+        .{ .key = "e2", .action = .upsert, .cleaned_value = "{\"score\":7}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = doc_v2[0..] });
+
+    const fact_key = try idx.docFactKey("e2");
+    defer alloc.free(fact_key);
+    var read_txn = try store.beginReadTxn();
+    const payload = try read_txn.get(fact_key);
+    var facts = try fact_mod.decodeListAlloc(alloc, payload);
+    read_txn.abort();
+    defer facts.deinit(alloc);
+
+    // The new write uses the refreshed numeric rule => measure fact present.
+    try std.testing.expect(factHasField(facts.facts, .measure, "score"));
+    try std.testing.expect(factHasField(facts.facts, .group, "score"));
 }
 
 test "algebraic path profile recomputes max string token count after deleting max row" {

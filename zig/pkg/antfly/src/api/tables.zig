@@ -426,6 +426,96 @@ fn schemaDerivedAlgebraicIndexValueAlloc(
     return derived;
 }
 
+/// Regenerate the schema-derived config for every algebraic index in
+/// `indexes_json` from `schema_json`. Used on schema update so that a
+/// dynamic-template change refreshes the durable algebraic `dynamic_field_rules`
+/// (and capability fingerprint) without requiring the table to be recreated.
+///
+/// Public algebraic indexes are always schema-derived, so each is regenerated
+/// in full; only the user-tunable runtime knobs (adaptive policy, planner/result
+/// limits) are preserved from the stored config. Returns the original bytes when
+/// there are no algebraic indexes to refresh.
+pub fn regenerateAlgebraicIndexesFromSchemaAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    indexes_json: []const u8,
+    schema_json: []const u8,
+) ![]u8 {
+    if (indexes_json.len == 0) return try alloc.dupe(u8, indexes_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return try alloc.dupe(u8, indexes_json),
+    };
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var object = std.json.ObjectMap.empty;
+    var changed = false;
+    var it = root.iterator();
+    while (it.next()) |entry| {
+        const value = if (isAlgebraicIndexValue(entry.value_ptr.*)) blk: {
+            if (schema_json.len == 0) return error.InvalidSchemaUpdateRequest;
+            changed = true;
+            break :blk try regenerateAlgebraicIndexValueAlloc(arena, table_name, schema_json, entry.value_ptr.*);
+        } else try cloneJsonValueAlloc(arena, entry.value_ptr.*);
+        try object.put(arena, try arena.dupe(u8, entry.key_ptr.*), value);
+    }
+    if (!changed) return try alloc.dupe(u8, indexes_json);
+    return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = object }, .{ .emit_null_optional_fields = false });
+}
+
+fn isAlgebraicIndexValue(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const type_value = value.object.get("type") orelse return false;
+    return type_value == .string and std.mem.eql(u8, type_value.string, "algebraic");
+}
+
+/// Runtime knobs a user may tune on an algebraic index that are NOT derived from
+/// the schema and must survive a regeneration.
+fn isAlgebraicUserTunableField(field: []const u8) bool {
+    const tunable = [_][]const u8{
+        "adaptive",
+        "pathfact_policy",
+        "max_result_buckets",
+        "max_planner_scan_rows",
+        "max_batch_accumulator_entries",
+        "min_max_candidate_cache_size",
+        "enable_temporal_range_pruning",
+    };
+    for (tunable) |name| {
+        if (std.mem.eql(u8, field, name)) return true;
+    }
+    return false;
+}
+
+fn regenerateAlgebraicIndexValueAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    schema_json: []const u8,
+    source: std.json.Value,
+) !std.json.Value {
+    const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, table_name, schema_json);
+    defer alloc.free(config_json);
+    var derived = try parseJsonValueAlloc(alloc, config_json);
+    if (derived != .object) return error.InvalidSchemaUpdateRequest;
+    try derived.object.put(alloc, try alloc.dupe(u8, "type"), .{ .string = try alloc.dupe(u8, "algebraic") });
+
+    // Schema-derived fields stay authoritative; only carry forward user knobs.
+    var it = source.object.iterator();
+    while (it.next()) |entry| {
+        if (!isAlgebraicUserTunableField(entry.key_ptr.*)) continue;
+        try derived.object.put(
+            alloc,
+            try alloc.dupe(u8, entry.key_ptr.*),
+            try cloneJsonValueAlloc(alloc, entry.value_ptr.*),
+        );
+    }
+    return derived;
+}
+
 fn isAlgebraicInternalConfigField(field: []const u8) bool {
     const internal_fields = [_][]const u8{
         "materializations",
@@ -570,6 +660,14 @@ pub fn applySchemaUpdateRecord(
     alloc.free(updated.schema_json);
     updated.schema_json = normalized_schema_json;
 
+    // Refresh schema-derived algebraic configs (dynamic_field_rules + capability
+    // fingerprint) on every update, including template-only changes that do not
+    // bump the version, so the algebraic sidecar tracks dynamic templates without
+    // a recreate.
+    const refreshed_indexes_json = try regenerateAlgebraicIndexesFromSchemaAlloc(alloc, table.name, updated.indexes_json, updated.schema_json);
+    alloc.free(updated.indexes_json);
+    updated.indexes_json = refreshed_indexes_json;
+
     if (!doc_schemas_changed) return updated;
 
     if (table.read_schema_json.len == 0) {
@@ -581,7 +679,7 @@ pub fn applySchemaUpdateRecord(
         updated.read_schema_json = normalized_read_schema_json;
     }
 
-    const next_indexes_json = try upsertVersionedFullTextIndex(alloc, table.indexes_json, current_version, next_version);
+    const next_indexes_json = try upsertVersionedFullTextIndex(alloc, updated.indexes_json, current_version, next_version);
     alloc.free(updated.indexes_json);
     updated.indexes_json = next_indexes_json;
     return updated;
@@ -2189,6 +2287,41 @@ test "metadata.schema update keeps version for template-only changes" {
     try std.testing.expectEqualStrings(table.read_schema_json, updated.read_schema_json);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v2\":{\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\"") == null);
+}
+
+test "metadata.schema update refreshes algebraic dynamic templates without recreate" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 8,
+        .name = "docs",
+        .schema_json =
+            \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}},"dynamic_templates":[{"name":"ext","match":"ext_*","mapping":{"type":"keyword"}}]}
+        ,
+        .indexes_json =
+            \\{"full_text_index_v2":{"type":"full_text"},"alg":{"type":"algebraic","schema_version":2,"capability_fingerprint":"stale","group_fields":[],"dynamic_field_rules":[{"name":"ext","match":"ext_*","type":"string"}]}}
+        ,
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    // Template-only change: ext_* now maps to numeric instead of keyword.
+    const updated = try applySchemaUpdateRecord(
+        std.testing.allocator,
+        &table,
+        \\{"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}},"dynamic_templates":[{"name":"ext","match":"ext_*","mapping":{"type":"numeric"}}]}
+        ,
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    // Version is preserved (no document_schemas change) ...
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":2") != null);
+    // ... but the durable algebraic config now carries the numeric rule, proving
+    // the dynamic template propagated without a recreate or version bump.
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"match\":\"ext_*\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"type\":\"number\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"capability_fingerprint\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"stale\"") == null);
+    // The full-text index entry is left untouched.
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v2\"") != null);
 }
 
 test "metadata.query routing selects read schema full text index" {

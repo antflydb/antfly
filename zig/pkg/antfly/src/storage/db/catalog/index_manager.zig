@@ -1195,6 +1195,28 @@ pub const IndexManager = struct {
         entry.config.deinit(self.alloc);
     }
 
+    /// Regenerate every algebraic index's schema-derived config from `schema_json`
+    /// and apply it in place. This propagates a dynamic-template change to live
+    /// indexes without a reopen; it is semantically equivalent to what a fresh
+    /// open would produce (lazy backfill — only new/rewritten docs reflect new
+    /// rules). No-op when there are no algebraic indexes or no schema.
+    pub fn reloadAlgebraicSchemaConfigs(self: *IndexManager, schema_json: []const u8) !void {
+        if (schema_json.len == 0) return;
+        for (self.algebraic_indexes.items) |*entry| {
+            const table_name = entry.index.config().table;
+            const new_config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(self.alloc, table_name, schema_json);
+            defer self.alloc.free(new_config_json);
+            // Skip the swap when the regenerated config is unchanged so periodic
+            // reconciles don't needlessly re-parse and reset the live config.
+            if (std.mem.eql(u8, new_config_json, entry.config.config_json)) continue;
+            const owned = try self.alloc.dupe(u8, new_config_json);
+            errdefer self.alloc.free(owned);
+            try entry.index.reloadConfigJson(new_config_json);
+            self.alloc.free(entry.config.config_json);
+            entry.config.config_json = owned;
+        }
+    }
+
     fn freeAlgebraicIndexEntry(self: *IndexManager, entry: *AlgebraicIndex) void {
         entry.index.close();
         self.destroyIndexApplyMutex(entry.apply_mutex);
