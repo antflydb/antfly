@@ -3366,12 +3366,20 @@ pub const DB = struct {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_artifacts_ns, graph_artifacts_start_ns);
             if (extracted[i].cleaned_value) |cleaned| {
                 const strip_store_value_start_ns = monotonicTimeNs();
-                const store_value = try strippedStoredDocumentValueAlloc(
-                    self.alloc,
-                    cleaned,
-                    vector_store_field_names,
-                    &owned_store_values,
-                );
+                // Relational tables make the typed columns the authoritative KV
+                // value: store the serialized typed row instead of the JSON
+                // blob. Every reader (sync DB.get and the async index/derived/
+                // enrichment readers) routes through the materialization seam to
+                // reconstruct canonical JSON. Document-mode tables keep the blob.
+                const store_value = if (self.relationalColumnsForStore()) |relational_columns|
+                    try relationalStoreRowValueAlloc(self.alloc, cleaned, relational_columns, &owned_store_values)
+                else
+                    try strippedStoredDocumentValueAlloc(
+                        self.alloc,
+                        cleaned,
+                        vector_store_field_names,
+                        &owned_store_values,
+                    );
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
                 const store_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
                 try owned_store_keys.append(self.alloc, store_key);
@@ -4223,7 +4231,14 @@ pub const DB = struct {
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
         const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
         defer alloc.free(store_key);
-        return try self.core.getStoreValue(alloc, store_key);
+        const value = try self.core.getStoreValue(alloc, store_key) orelse return null;
+        // Relational tables store the authoritative typed row; reconstruct the
+        // document's canonical JSON here so every consumer (point lookup,
+        // read-modify-write transform, vector include_stored) sees a document.
+        // The row is self-describing and magic-tagged, so detection needs no
+        // schema and never collides with a real JSON document. A document-mode
+        // blob is returned unchanged (in place).
+        return try mapper.materializeOwnedDocumentValueAlloc(alloc, value);
     }
 
     pub fn getGroupCreatedAtMillis(self: *DB, alloc: Allocator, group_id: u64) !?u64 {
@@ -4814,6 +4829,16 @@ pub const DB = struct {
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
         try self.core.setSchema(table_schema);
+    }
+
+    /// Returns the relational column catalog when the table is in relational
+    /// storage mode (so document writes store the typed row as the authoritative
+    /// KV value), or null for document-mode tables (which keep the JSON blob).
+    fn relationalColumnsForStore(self: *DB) ?[]const schema_mod.RelationalColumn {
+        const schema = self.core.schema orelse return null;
+        if (schema.storage_mode != .relational) return null;
+        if (schema.relational_columns.len == 0) return null;
+        return schema.relational_columns;
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
@@ -11224,6 +11249,21 @@ fn appendUniqueOwnedKey(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), k
         if (std.mem.eql(u8, existing, key)) return;
     }
     try list.append(alloc, try alloc.dupe(u8, key));
+}
+
+/// Project a relational document into its serialized typed-row KV value and
+/// track the buffer for cleanup. The row is always freshly allocated (the codec
+/// owns no input bytes), so it is appended to `owned_values` unconditionally.
+fn relationalStoreRowValueAlloc(
+    alloc: Allocator,
+    cleaned: []const u8,
+    relational_columns: []const schema_mod.RelationalColumn,
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) ![]const u8 {
+    const row_value = try mapper.buildRelationalRowValueAlloc(alloc, cleaned, relational_columns);
+    errdefer alloc.free(row_value);
+    try owned_values.append(alloc, row_value);
+    return row_value;
 }
 
 fn strippedStoredDocumentValueAlloc(
