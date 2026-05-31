@@ -16906,11 +16906,11 @@ pub const Index = struct {
 
     // Deterministic sketch name for an adaptively promoted (group, value) pair,
     // so repeated observation/promotion is idempotent.
-    fn hllAdaptiveNameAlloc(self: *Index, group_field: ?[]const u8, value_field: []const u8) ![]u8 {
+    pub fn hllAdaptiveNameAlloc(self: *Index, group_field: ?[]const u8, value_field: []const u8) ![]u8 {
         return try std.fmt.allocPrint(self.alloc, "adaptive_hll:{s}:{s}", .{ group_field orelse "", value_field });
     }
 
-    fn hllRegistryContains(self: *const Index, name: []const u8) bool {
+    pub fn hllRegistryContains(self: *const Index, name: []const u8) bool {
         for (self.hllCardinalities()) |hcfg| {
             if (std.mem.eql(u8, hcfg.name, name)) return true;
         }
@@ -16925,21 +16925,28 @@ pub const Index = struct {
     // a reason to fail a query. Only active when adaptive.lazy_materialization
     // is enabled (matching the materialization promotion gate).
     pub fn observeCardinalityForAdaptive(self: *Index, store: *docstore_mod.DocStore, group_field: ?[]const u8, value_field: []const u8) void {
-        self.observeCardinalityForAdaptiveImpl(store, group_field, value_field) catch {};
+        const promoted = self.observeCardinalityForAdaptiveImpl(store, group_field, value_field) catch false;
+        // Promotion runs on the (read) query path and leaves the new sketch
+        // dirty. Schedule the backfill now so a read-mostly cardinality workload
+        // — the case adaptive provisioning targets — actually materializes the
+        // sketch without waiting for an unrelated foreground write batch. Done
+        // outside observeCardinalityForAdaptiveImpl's write lock so the inline
+        // lane (which runs maintenance synchronously) can take it.
+        if (promoted) self.scheduleHllMaintenanceIfDirty(store);
     }
 
-    fn observeCardinalityForAdaptiveImpl(self: *Index, store: *docstore_mod.DocStore, group_field: ?[]const u8, value_field: []const u8) !void {
-        if (!self.config().adaptive.lazy_materialization) return;
+    fn observeCardinalityForAdaptiveImpl(self: *Index, store: *docstore_mod.DocStore, group_field: ?[]const u8, value_field: []const u8) !bool {
+        if (!self.config().adaptive.lazy_materialization) return false;
         // Only group/value fields the schema actually exposes can back a sketch.
-        const value_resolved = self.resolveUniqueField(value_field) orelse return;
-        if (value_resolved.role != .group) return;
+        const value_resolved = self.resolveUniqueField(value_field) orelse return false;
+        if (value_resolved.role != .group) return false;
         if (group_field) |gf| {
-            const g = self.resolveUniqueField(gf) orelse return;
-            if (g.role != .group) return;
+            const g = self.resolveUniqueField(gf) orelse return false;
+            if (g.role != .group) return false;
         }
         const name = try self.hllAdaptiveNameAlloc(group_field, value_resolved.name);
         defer self.alloc.free(name);
-        if (self.hllRegistryContains(name)) return; // already promoted
+        if (self.hllRegistryContains(name)) return false; // already promoted
 
         self.lockWrites();
         defer self.unlockWrites();
@@ -16960,10 +16967,13 @@ pub const Index = struct {
         defer self.alloc.free(next_text);
         try txn.put(obs_key, next_text);
 
+        var promoted = false;
         if (next >= self.config().adaptive.policy().min_observations) {
             try self.promoteAdaptiveHllTxn(&txn, name, group_field, value_resolved.name);
+            promoted = true;
         }
         try txn.commit();
+        return promoted;
     }
 
     // Registers a promoted adaptive sketch in the runtime registry, persists its
