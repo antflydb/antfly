@@ -402,6 +402,12 @@ pub const MaterializedExpressionRowEntry = struct {
 pub const DerivedJoinFoldRequest = struct {
     join: ir.JoinRef,
     op: algebra.Op,
+    // Overrides the law derived from `op` when the fold is not an algebra.Op
+    // metric. Used for cardinality-over-join, which folds HLL sketches (.hll)
+    // rather than a scalar reduction. The contribution for .hll is a singleton
+    // sketch of the measure value at `hll_precision`.
+    law: ?law_mod.Id = null,
+    hll_precision: u6 = hll.default_precision,
     group_by: []const []const u8 = &.{},
     histogram_field: ?[]const u8 = null,
     histogram_role: ?fact_mod.Role = null,
@@ -2174,6 +2180,29 @@ const ProjectedFact = struct {
         return null;
     }
 
+    // Raw value of `field_name` regardless of role: a group/time field's scalar
+    // token or a measure field's raw value. Used by the HLL cardinality fold,
+    // whose target field is usually a group dimension (which measureAlloc, by
+    // design limited to measure parts, can't see). Returns null if absent.
+    fn valueScalarAlloc(self: ProjectedFact, alloc: Allocator, field_name: []const u8) !?[]u8 {
+        var pos: usize = 1;
+        while (pos < self.parts.len) {
+            const kind = self.parts[pos];
+            if (std.mem.eql(u8, kind, "g") or std.mem.eql(u8, kind, "t")) {
+                if (pos + 2 >= self.parts.len) return error.InvalidAlgebraicFact;
+                if (std.mem.eql(u8, self.parts[pos + 1], field_name)) return try alloc.dupe(u8, self.parts[pos + 2]);
+                pos += 3;
+            } else if (std.mem.eql(u8, kind, "m")) {
+                if (pos + 3 >= self.parts.len) return error.InvalidAlgebraicFact;
+                if (std.mem.eql(u8, self.parts[pos + 1], field_name)) return try alloc.dupe(u8, self.parts[pos + 2]);
+                pos += 4;
+            } else {
+                return error.InvalidAlgebraicFact;
+            }
+        }
+        return null;
+    }
+
     fn timeText(self: ProjectedFact, field_name: []const u8) !?[]const u8 {
         var pos: usize = 1;
         while (pos < self.parts.len) {
@@ -3612,14 +3641,16 @@ pub const Index = struct {
     ) !?[]FoldEntry {
         if (!self.plannerLifecycleReady()) return null;
         const join_cfg = self.joinConfigByName(request.join.name) orelse return null;
-        const law_id = law_mod.fromOp(request.op);
+        const law_id = request.law orelse law_mod.fromOp(request.op);
         const proof = join_mod.queryRewriteProof(join_cfg, request.join, .{
             .kind = .derived_distributive_fold,
             .law_id = law_id,
             .bounded_fanout = join_cfg.max_fanout != null,
         });
         if (!proof.safe()) return null;
-        if (request.op != .count and request.measure == null) return null;
+        // Every law except count reduces a measure field's value, so it must be
+        // present (HLL needs it to build the per-pair singleton sketch).
+        if (law_id != .count and request.measure == null) return null;
 
         var txn = try store.beginReadTxn();
         defer txn.abort();
@@ -17849,6 +17880,22 @@ pub const Index = struct {
             else => return err,
         };
         defer self.alloc.free(group_key);
+        // Cardinality folds a singleton HLL sketch of each matched value (the
+        // accumulator then unions them per group via register-wise max), mirroring
+        // the per-document contribution in the non-join HLL backfill. The target
+        // field is usually a group dimension, so read it role-agnostically.
+        if (law_id == .hll) {
+            const field = request.measure orelse return;
+            const scalar = (measure_fact.valueScalarAlloc(self.alloc, field) catch |err| switch (err) {
+                error.InvalidAlgebraicFact => return,
+                else => return err,
+            }) orelse return;
+            defer self.alloc.free(scalar);
+            const contribution = try hll.singletonEncodedAlloc(self.alloc, request.hll_precision, scalar);
+            defer self.alloc.free(contribution);
+            try accumulator.add(self.alloc, group_key, law_id, contribution);
+            return;
+        }
         const measure_value = if (request.measure) |measure_name|
             try measure_fact.measureAlloc(self.alloc, measure_name)
         else

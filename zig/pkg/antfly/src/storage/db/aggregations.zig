@@ -397,7 +397,20 @@ fn computeAlgebraicAggregation(
         }
         // `exact` never consults a sketch; `auto`/`approximate` try one first.
         if (request.cardinality_mode != .exact) {
-            if (try index.approxCardinalityTotalForFieldAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) |estimate| {
+            // A cardinality(field) carrying a join folds HLL sketches across the
+            // join (the distinct count of the measured field over matched pairs).
+            if (request.algebraic_join != null) {
+                if (try algebraicDerivedJoinCardinalityAlloc(index, store, request, ctx)) |estimate| {
+                    index.recordPlannerSelected(null, estimate);
+                    const rel_err = algebraic_mod.hll.relativeErrorForPrecision(algebraic_mod.hll.default_precision);
+                    return .{
+                        .name = request.name,
+                        .field = request.field,
+                        .type = request.type,
+                        .value_json = try cardinalityResultJsonAlloc(alloc, estimate, rel_err),
+                    };
+                }
+            } else if (try index.approxCardinalityTotalForFieldAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) |estimate| {
                 index.recordPlannerSelected(null, estimate);
                 const rel_err = try index.hllRelativeErrorForField(store, null, request.field, ctx.algebraic_constraints, ctx.identity_read_generation);
                 return .{
@@ -1501,6 +1514,61 @@ fn algebraicDerivedJoinMetricRawAlloc(
     return try fold.rawAlloc(index.alloc);
 }
 
+// Distinct-count of `field` across a join: folds a singleton HLL sketch per
+// matched pair through the derived-join machinery (law = .hll) and estimates
+// the union of every group's sketch. `base` is the planner's derived_join_fold
+// for the same join; we only override the law and the measured field. Uses the
+// direct (law-aware) scan rather than the tensor-program path, which keys off
+// algebra.Op and has no cardinality op.
+fn algebraicDerivedJoinCardinalityTotalAlloc(
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    base: algebraic_mod.index.DerivedJoinFoldRequest,
+    field: []const u8,
+    generation: ?u64,
+) !?u64 {
+    var request = base;
+    request.law = .hll;
+    request.measure = field;
+    const entries = (try index.scanDerivedJoinFoldEntriesAtGeneration(store, request, generation)) orelse return null;
+    defer {
+        for (entries) |*entry| entry.deinit(index.alloc);
+        if (entries.len > 0) index.alloc.free(entries);
+    }
+    var merged: ?[]u8 = null;
+    defer if (merged) |bytes| index.alloc.free(bytes);
+    for (entries) |entry| {
+        const next = try algebraic_mod.hll.mergeEncodedAlloc(index.alloc, merged, entry.value);
+        if (merged) |bytes| index.alloc.free(bytes);
+        merged = next;
+    }
+    const bytes = merged orelse return 0; // no matched pairs -> zero distinct
+    return try algebraic_mod.hll.estimateEncoded(bytes);
+}
+
+// Plans the derived join fold for a cardinality(field) aggregation carrying a
+// join, then estimates the distinct count. Null when the join can't be proven
+// as a distributive fold (the caller falls back).
+fn algebraicDerivedJoinCardinalityAlloc(
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    request: SearchAggregationRequest,
+    ctx: Context,
+) !?u64 {
+    const join_ref = request.algebraic_join orelse return null;
+    const query = algebraic_mod.ir.Query{
+        .kind = .metric,
+        .aggregation_name = request.name,
+        .constraints = ctx.algebraic_constraints,
+        // op is a placeholder; the cardinality fold overrides the law to .hll.
+        .metric = .{ .name = request.name, .op = .count, .field = request.field },
+        .join = join_ref,
+    };
+    const plan_result = algebraic_mod.planner.planMetricQuery(index, query);
+    const derived = plan_result.derived_join_fold orelse return null;
+    return try algebraicDerivedJoinCardinalityTotalAlloc(index, store, derived, request.field, ctx.identity_read_generation);
+}
+
 fn scanDerivedJoinFoldEntriesWithProgramAlloc(
     alloc: Allocator,
     index: *algebraic_mod.index.Index,
@@ -1787,6 +1855,12 @@ fn computeAlgebraicTermsAggregation(
     const child_aggs = try splitAggregationRequests(alloc, request.aggregations);
     defer child_aggs.deinit(alloc);
     if (termsChildAggsAllCardinality(child_aggs.primary)) {
+        // A join folds distinct counts across matched pairs; the non-join path
+        // would ignore the join, so route to the derived-join variant (which
+        // returns null = unsupported if the join can't be proven).
+        if (request.algebraic_join != null) {
+            return try computeDerivedJoinTermsCardinalityChildrenAggregation(alloc, index, store, request, bucket_field.name, constraints, child_aggs.primary, child_aggs.pipeline, generation);
+        }
         return try computeAlgebraicTermsCardinalityChildrenAggregation(alloc, index, store, request, bucket_field.name, constraints, child_aggs.primary, child_aggs.pipeline, generation);
     }
     for (child_aggs.primary) |child| {
@@ -2578,6 +2652,169 @@ fn computeAlgebraicTermsCardinalityChildrenAggregation(
     }
     try applyPipelineAggregations(alloc, pipeline_aggs, &buckets);
 
+    return .{
+        .name = request.name,
+        .field = request.field,
+        .type = request.type,
+        .buckets = buckets,
+    };
+}
+
+// Terms over a join with cardinality children: per bucket, the distinct count
+// of each child field across the join. The bucket counts come from the
+// bucket-count fold; each cardinality child runs an HLL fold grouped by the
+// bucket field, whose per-group sketches are then estimated. Returns null when
+// the join can't be proven as a distributive fold, so the caller treats it as
+// unsupported rather than silently dropping the join (which the non-join path
+// would do).
+fn computeDerivedJoinTermsCardinalityChildrenAggregation(
+    alloc: Allocator,
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    request: SearchAggregationRequest,
+    bucket_field: []const u8,
+    constraints: []const FixedConstraint,
+    child_requests: []const SearchAggregationRequest,
+    pipeline_aggs: []const SearchAggregationRequest,
+    generation: ?u64,
+) !?SearchAggregationResult {
+    if (request.algebraic_join == null) return null;
+    const query = algebraic_mod.ir.Query{
+        .kind = .terms,
+        .aggregation_name = request.name,
+        .bucket_field = bucket_field,
+        .constraints = constraints,
+        .join = request.algebraic_join,
+    };
+    var plan_result = try algebraic_mod.planner.planBucketQueryAlloc(alloc, index, query);
+    defer plan_result.deinit(alloc);
+    const count_derived = plan_result.derived_join_fold orelse return null;
+    if (count_derived.group_by.len != 1 or !std.mem.eql(u8, count_derived.group_by[0], bucket_field)) return null;
+
+    const count_entries = (try scanDerivedJoinFoldEntriesWithProgramAlloc(alloc, index, store, count_derived, request.name, generation)) orelse return null;
+    defer {
+        for (count_entries) |*entry| entry.deinit(index.alloc);
+        if (count_entries.len > 0) index.alloc.free(count_entries);
+    }
+
+    var buckets_accum = std.ArrayListUnmanaged(TermsCardinalityBucketAccum).empty;
+    defer {
+        for (buckets_accum.items) |*item| item.deinit(alloc);
+        buckets_accum.deinit(alloc);
+    }
+    for (count_entries) |entry| {
+        const count = algebraic_mod.algebra.parseI64(entry.value) catch continue;
+        const decoded = algebraic_mod.token.decodeTupleAlloc(alloc, entry.group_key) catch continue;
+        defer {
+            for (decoded) |item| alloc.free(item);
+            alloc.free(decoded);
+        }
+        if (decoded.len != 1) continue;
+        const key = decoded[0];
+        const key_text = index.scalarTokenTextAlloc(alloc, key) catch continue;
+        defer alloc.free(key_text);
+        if (request.term_prefix.len > 0 and !std.mem.startsWith(u8, key_text, request.term_prefix)) continue;
+        if (request.term_pattern.len > 0 and !(try regexMatches(alloc, request.term_pattern, key_text))) continue;
+        const bucket = try ensureTermsCardinalityBucketAccum(alloc, &buckets_accum, key);
+        bucket.count += count;
+    }
+
+    var kept_count: usize = 0;
+    for (buckets_accum.items) |bucket| {
+        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
+        kept_count += 1;
+    }
+    if (exceedsAlgebraicResultBucketLimit(index, kept_count)) return error.AlgebraicResultBucketLimit;
+    var candidates = try alloc.alloc(TermsCardinalityBucketAccum, kept_count);
+    defer if (candidates.len > 0) alloc.free(candidates);
+    var kept_idx: usize = 0;
+    for (buckets_accum.items) |bucket| {
+        if (request.min_doc_count > 0 and bucket.count < request.min_doc_count) continue;
+        candidates[kept_idx] = bucket;
+        kept_idx += 1;
+    }
+    std.mem.sort(TermsCardinalityBucketAccum, candidates, {}, struct {
+        fn lessThan(_: void, lhs: TermsCardinalityBucketAccum, rhs: TermsCardinalityBucketAccum) bool {
+            if (lhs.count == rhs.count) return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+            return lhs.count > rhs.count;
+        }
+    }.lessThan);
+    const limit: usize = if (request.size > 0 and @as(usize, @intCast(request.size)) < candidates.len) @intCast(request.size) else candidates.len;
+
+    // Per cardinality child: an HLL fold grouped by the bucket field; estimate
+    // each group's sketch into a (group_key -> distinct count) map.
+    const HllEstimateMap = std.StringHashMapUnmanaged(u64);
+    const child_hll_maps = try alloc.alloc(?HllEstimateMap, child_requests.len);
+    defer {
+        for (child_hll_maps) |*maybe_map| {
+            if (maybe_map.*) |*map| {
+                var it = map.keyIterator();
+                while (it.next()) |key| alloc.free(key.*);
+                map.deinit(alloc);
+            }
+        }
+        alloc.free(child_hll_maps);
+    }
+    for (child_hll_maps) |*m| m.* = null;
+    const child_rel_err = algebraic_mod.hll.relativeErrorForPrecision(algebraic_mod.hll.default_precision);
+    for (child_requests, 0..) |child_request, ci| {
+        var hll_fold = count_derived;
+        hll_fold.law = .hll;
+        hll_fold.measure = child_request.field;
+        const child_entries = (try index.scanDerivedJoinFoldEntriesAtGeneration(store, hll_fold, generation)) orelse continue;
+        defer {
+            for (child_entries) |*entry| entry.deinit(index.alloc);
+            if (child_entries.len > 0) index.alloc.free(child_entries);
+        }
+        var map: HllEstimateMap = .empty;
+        errdefer {
+            var it = map.keyIterator();
+            while (it.next()) |key| alloc.free(key.*);
+            map.deinit(alloc);
+        }
+        for (child_entries) |entry| {
+            const estimate = algebraic_mod.hll.estimateEncoded(entry.value) catch continue;
+            const gop = try map.getOrPut(alloc, entry.group_key);
+            if (!gop.found_existing) gop.key_ptr.* = try alloc.dupe(u8, entry.group_key);
+            gop.value_ptr.* = estimate;
+        }
+        child_hll_maps[ci] = map;
+        index.recordPlannerSelected(null, null);
+    }
+
+    var buckets = try alloc.alloc(SearchAggregationBucket, limit);
+    var buckets_filled: usize = 0;
+    errdefer {
+        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
+        alloc.free(buckets);
+    }
+    for (candidates[0..limit], 0..) |candidate, idx| {
+        const child_results = try alloc.alloc(SearchAggregationResult, child_requests.len);
+        var child_filled: usize = 0;
+        errdefer {
+            for (child_results[0..child_filled]) |*child| child.deinit(alloc);
+            alloc.free(child_results);
+        }
+        const group_key = try index.approxCardinalityGroupKeyForScalarAlloc(candidate.key);
+        defer index.alloc.free(group_key);
+        for (child_requests, 0..) |child_request, child_idx| {
+            const value: u64 = if (child_hll_maps[child_idx]) |map| (map.get(group_key) orelse 0) else 0;
+            child_results[child_idx] = .{
+                .name = child_request.name,
+                .field = child_request.field,
+                .type = child_request.type,
+                .value_json = try cardinalityResultJsonAlloc(alloc, value, child_rel_err),
+            };
+            child_filled = child_idx + 1;
+        }
+        buckets[idx] = .{
+            .key_json = try index.scalarTokenJsonAlloc(alloc, candidate.key),
+            .count = candidate.count,
+            .aggregations = child_results,
+        };
+        buckets_filled = idx + 1;
+    }
+    try applyPipelineAggregations(alloc, pipeline_aggs, &buckets);
     return .{
         .name = request.name,
         .field = request.field,
@@ -12371,6 +12608,57 @@ test "algebraic aggregation planner can execute derived bounded join metric plan
     try std.testing.expectEqual(@as(i64, 2), avg.count);
 }
 
+test "algebraic cardinality over a join folds HLL sketches across matched pairs" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "mixed",
+        \\  "group_fields": [
+        \\    {"name":"kind","path":"kind","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"},
+        \\    {"name":"product","path":"product","type":"string"}
+        \\  ],
+        \\  "joins": [
+        \\    {"name":"orders_customers","left_fields":["customer"],"right_fields":["customer"],"left_type_field":"kind","left_type_value":"order","right_type_field":"kind","right_type_value":"customer","max_fanout":8}
+        \\  ]
+        \\}
+    ;
+    var index = try algebraic_mod.index.Index.open(alloc, "alg_join_card", cfg);
+    defer index.close();
+
+    const docs = [_]@import("derived/derived_types.zig").DerivedDocument{
+        .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
+        .{ .key = "c2", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c2\"}" },
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"product\":\"A\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"product\":\"B\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"product\":\"A\"}" },
+        .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"product\":\"A\"}" },
+    };
+    try index.applyBatch(&store, .{ .documents = docs[0..] });
+
+    // The order->customer join matches {o1,o2}->c1 and {o3,o4}->c2; folding a
+    // singleton sketch of each matched order's product and unioning yields the
+    // distinct products across the join: {A, B} == 2.
+    const plan = algebraic_mod.planner.planMetricQuery(&index, .{
+        .kind = .metric,
+        .aggregation_name = "distinct_products",
+        .metric = .{ .name = "distinct_products", .op = .count, .field = "product" },
+        .join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
+    });
+    try std.testing.expectEqual(algebraic_mod.planner.PlanKind.derived_join_fold, plan.kind);
+
+    const estimate = (try algebraicDerivedJoinCardinalityTotalAlloc(&index, &store, plan.derived_join_fold.?, "product", null)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), estimate);
+}
+
 test "algebraic aggregation planner can execute derived bounded join terms plan" {
     const alloc = std.testing.allocator;
     var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
@@ -12826,6 +13114,84 @@ test "algebraic aggregation public request can execute explicit derived join ter
     try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[1].count);
     try std.testing.expectEqualStrings("7", aggregations[0].buckets[1].aggregations[0].value_json.?);
     try std.testing.expectEqualStrings("{\"count\":1,\"sum\":7,\"avg\":7,\"min\":7,\"max\":7,\"sum_squares\":49,\"variance\":0,\"std_dev\":0}", aggregations[0].buckets[1].aggregations[1].value_json.?);
+}
+
+test "algebraic terms over a join answers per-bucket cardinality from HLL folds" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "mixed",
+        \\  "group_fields": [
+        \\    {"name":"kind","path":"kind","type":"string"},
+        \\    {"name":"customer","path":"customer","type":"string"},
+        \\    {"name":"region","path":"region","type":"string"},
+        \\    {"name":"product","path":"product","type":"string"}
+        \\  ],
+        \\  "joins": [
+        \\    {"name":"orders_customers","left_fields":["customer"],"right_fields":["customer"],"left_type_field":"kind","left_type_value":"order","right_type_field":"kind","right_type_value":"customer","max_fanout":8}
+        \\  ]
+        \\}
+    ;
+    var manager = try index_manager_mod.IndexManager.init(alloc, ".");
+    defer manager.deinit();
+    const mutex = try alloc.create(std.atomic.Mutex);
+    mutex.* = .unlocked;
+    const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
+    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg_join_terms_card", cfg);
+    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
+    const index = &manager.algebraic_indexes.items[0].index;
+
+    const docs = [_]@import("derived/derived_types.zig").DerivedDocument{
+        .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\",\"region\":\"west\"}" },
+        .{ .key = "c2", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c2\",\"region\":\"east\"}" },
+        .{ .key = "c3", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c3\",\"region\":\"west\"}" },
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"product\":\"A\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"product\":\"B\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"product\":\"A\"}" },
+        .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c3\",\"product\":\"A\"}" },
+        .{ .key = "o5", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c3\",\"product\":\"A\"}" },
+    };
+    try index.applyBatch(&store, .{ .documents = docs[0..] });
+
+    // terms(region) over the join, with cardinality(product) per bucket. West
+    // (c1,c3) matches 4 orders across products {A,B} -> 2 distinct; east (c2)
+    // matches 1 order, product {A} -> 1 distinct.
+    const child_requests = [_]SearchAggregationRequest{
+        .{ .name = "distinct_products", .type = "cardinality", .field = "product" },
+    };
+    const requests = [_]SearchAggregationRequest{.{
+        .name = "regions",
+        .type = "terms",
+        .field = "region",
+        .algebraic_join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
+        .aggregations = child_requests[0..],
+    }};
+    const hits = try alloc.alloc(types.SearchHit, 0);
+    defer alloc.free(hits);
+    const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
+    const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+    });
+    defer deinitResults(alloc, aggregations);
+
+    try std.testing.expectEqual(@as(usize, 1), aggregations.len);
+    try std.testing.expectEqual(@as(usize, 2), aggregations[0].buckets.len);
+    try std.testing.expectEqualStrings("\"west\"", aggregations[0].buckets[0].key_json);
+    try std.testing.expectEqual(@as(i64, 4), aggregations[0].buckets[0].count);
+    try expectApproxCardinality(aggregations[0].buckets[0].aggregations[0].value_json.?, 2);
+    try std.testing.expectEqualStrings("\"east\"", aggregations[0].buckets[1].key_json);
+    try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[1].count);
+    try expectApproxCardinality(aggregations[0].buckets[1].aggregations[0].value_json.?, 1);
 }
 
 test "algebraic aggregation public request can execute explicit derived join date histogram" {
