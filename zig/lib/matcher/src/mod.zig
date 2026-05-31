@@ -406,6 +406,139 @@ fn logistic(x: f64) f64 {
     return 1.0 / (1.0 + std.math.exp(-x));
 }
 
+// --- Learned weights (logistic regression) ---------------------------------
+//
+// Phase-2 "learned mode": the scorer's structure (comparisons -> levels) is
+// unchanged; only the per-level weights change, fit offline from labelled
+// match/no-match pairs. A pair is encoded as a feature vector -- in the
+// deterministic level encoding, `features[i]` is 1.0 when level i was the
+// first-matching level of its comparison, else 0.0 -- and logistic regression
+// fits a weight per feature (+ a bias). The fitted weights then populate the
+// same `Level.weight`/`combine.bias` fields the deterministic scorer reads.
+
+pub const TrainingExample = struct {
+    features: []const f64,
+    /// True when the pair is a real match (the regression target).
+    label: bool,
+};
+
+pub const FitOptions = struct {
+    iterations: usize = 1000,
+    learning_rate: f64 = 0.3,
+    /// L2 regularization strength applied to weights (not the bias).
+    l2: f64 = 0.0,
+};
+
+/// Fit logistic-regression weights over labelled examples by batch gradient
+/// descent. Returns `feature_count + 1` owned weights; the last element is the
+/// bias. Deterministic for a given input so a learned scorer is reproducible.
+pub fn fitLogisticRegression(
+    alloc: std.mem.Allocator,
+    examples: []const TrainingExample,
+    feature_count: usize,
+    opts: FitOptions,
+) ![]f64 {
+    const w = try alloc.alloc(f64, feature_count + 1);
+    @memset(w, 0);
+    errdefer alloc.free(w);
+    if (examples.len == 0) return w;
+
+    const grad = try alloc.alloc(f64, feature_count + 1);
+    defer alloc.free(grad);
+    const n: f64 = @floatFromInt(examples.len);
+
+    var iter: usize = 0;
+    while (iter < opts.iterations) : (iter += 1) {
+        @memset(grad, 0);
+        for (examples) |ex| {
+            var z: f64 = w[feature_count]; // bias
+            for (ex.features, 0..) |f, i| {
+                if (i >= feature_count) break;
+                z += w[i] * f;
+            }
+            const err = logistic(z) - (if (ex.label) @as(f64, 1.0) else 0.0);
+            for (ex.features, 0..) |f, i| {
+                if (i >= feature_count) break;
+                grad[i] += err * f;
+            }
+            grad[feature_count] += err;
+        }
+        for (w, 0..) |*wi, i| {
+            const reg = if (i < feature_count) opts.l2 * wi.* else 0.0;
+            wi.* -= opts.learning_rate * (grad[i] / n + reg);
+        }
+    }
+    return w;
+}
+
+/// Match probability for a feature vector under fitted weights
+/// (`weights[len-1]` is the bias). Mirrors the scorer's logistic link.
+pub fn predictLogistic(weights: []const f64, features: []const f64) f64 {
+    if (weights.len == 0) return logistic(0);
+    const fc = weights.len - 1;
+    var z: f64 = weights[fc];
+    for (features, 0..) |f, i| {
+        if (i >= fc) break;
+        z += weights[i] * f;
+    }
+    return logistic(z);
+}
+
+// --- Fusion across multiple extractors -------------------------------------
+//
+// Multiple extractors may assert the same edge with different confidences and
+// trust. Fusion combines them (plus an optional graph-derived prior pinned to a
+// config generation) into one calibrated confidence the graph stores as the
+// edge weight.
+
+pub const FusionStrategy = enum { noisy_or, max, mean };
+
+pub const SourceConfidence = struct {
+    /// Per-source asserted confidence in [0, 1].
+    confidence: f64,
+    /// Source trust in [0, 1]; scales the contribution.
+    trust: f64 = 1.0,
+};
+
+fn clamp01(x: f64) f64 {
+    return @max(0.0, @min(1.0, x));
+}
+
+/// Combine per-source `trust * confidence` contributions (and a `prior` scaled
+/// by `prior_weight`) into one confidence in [0, 1]. `noisy_or` treats sources
+/// as independent evidence (1 - prod(1 - c_i)); `max` takes the strongest;
+/// `mean` averages. The prior is folded in as one more term so a graph-derived
+/// belief nudges -- but cannot by itself certify -- a fused edge.
+pub fn fuse(
+    strategy: FusionStrategy,
+    sources: []const SourceConfidence,
+    prior: f64,
+    prior_weight: f64,
+) f64 {
+    const prior_term = clamp01(prior) * clamp01(prior_weight);
+    switch (strategy) {
+        .noisy_or => {
+            var complement: f64 = 1.0 - prior_term;
+            for (sources) |s| complement *= (1.0 - clamp01(clamp01(s.trust) * clamp01(s.confidence)));
+            return clamp01(1.0 - complement);
+        },
+        .max => {
+            var best: f64 = prior_term;
+            for (sources) |s| best = @max(best, clamp01(s.trust) * clamp01(s.confidence));
+            return clamp01(best);
+        },
+        .mean => {
+            var sum: f64 = prior_term;
+            var count: f64 = if (prior_weight > 0) 1.0 else 0.0;
+            for (sources) |s| {
+                sum += clamp01(s.trust) * clamp01(s.confidence);
+                count += 1.0;
+            }
+            return if (count == 0) 0.0 else clamp01(sum / count);
+        },
+    }
+}
+
 // --- Comparators ------------------------------------------------------------
 
 /// Similarity in [0, 1] between two values under `comparator`. Type mismatches
@@ -735,4 +868,59 @@ test "invalid configs are rejected" {
         \\{ "comparisons": [ { "name": "n", "left": "a", "right": "b",
         \\  "levels": [ { "when": "bogus_comparator > 0.5", "weight": 1.0 } ] } ] }
     ));
+}
+
+test "fitLogisticRegression learns separable level weights" {
+    const alloc = testing.allocator;
+    // Two features: f0 = "names match", f1 = "names differ". Matches activate
+    // f0; non-matches activate f1.
+    const examples = [_]TrainingExample{
+        .{ .features = &.{ 1, 0 }, .label = true },
+        .{ .features = &.{ 1, 0 }, .label = true },
+        .{ .features = &.{ 0, 1 }, .label = false },
+        .{ .features = &.{ 0, 1 }, .label = false },
+    };
+    const w = try fitLogisticRegression(alloc, &examples, 2, .{});
+    defer alloc.free(w);
+    try testing.expectEqual(@as(usize, 3), w.len); // 2 features + bias
+    // The "match" feature ends positive, the "differ" feature negative.
+    try testing.expect(w[0] > 0);
+    try testing.expect(w[1] < 0);
+    // And the fitted model classifies the two regimes correctly.
+    try testing.expect(predictLogistic(w, &.{ 1, 0 }) > 0.5);
+    try testing.expect(predictLogistic(w, &.{ 0, 1 }) < 0.5);
+}
+
+test "fitLogisticRegression on no examples returns zero weights" {
+    const alloc = testing.allocator;
+    const w = try fitLogisticRegression(alloc, &.{}, 3, .{});
+    defer alloc.free(w);
+    try testing.expectEqual(@as(usize, 4), w.len);
+    for (w) |wi| try testing.expectEqual(@as(f64, 0), wi);
+    // Zero weights => probability 0.5 (no signal).
+    try testing.expectApproxEqAbs(@as(f64, 0.5), predictLogistic(w, &.{ 1, 1, 1 }), 1e-9);
+}
+
+test "fuse combines source confidences and a prior" {
+    // Two strong, fully-trusted sources under noisy-or exceed either alone.
+    const sources = [_]SourceConfidence{
+        .{ .confidence = 0.8, .trust = 1.0 },
+        .{ .confidence = 0.6, .trust = 1.0 },
+    };
+    const noisy = fuse(.noisy_or, &sources, 0.0, 0.0);
+    try testing.expectApproxEqAbs(@as(f64, 0.92), noisy, 1e-9); // 1 - 0.2*0.4
+    try testing.expect(noisy > 0.8);
+
+    // Trust scales a source down.
+    const low_trust = [_]SourceConfidence{.{ .confidence = 0.9, .trust = 0.5 }};
+    try testing.expectApproxEqAbs(@as(f64, 0.45), fuse(.noisy_or, &low_trust, 0.0, 0.0), 1e-9);
+
+    // max takes the strongest contribution (including the prior).
+    try testing.expectApproxEqAbs(@as(f64, 0.8), fuse(.max, &sources, 0.0, 0.0), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 0.85), fuse(.max, &low_trust, 0.85, 1.0), 1e-9);
+
+    // Results stay clamped to [0, 1].
+    const many = [_]SourceConfidence{ .{ .confidence = 1, .trust = 1 }, .{ .confidence = 1, .trust = 1 } };
+    try testing.expectEqual(@as(f64, 1.0), fuse(.noisy_or, &many, 1.0, 1.0));
+    try testing.expectEqual(@as(f64, 0.0), fuse(.noisy_or, &.{}, 0.0, 0.0));
 }

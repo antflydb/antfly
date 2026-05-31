@@ -557,10 +557,20 @@ Open/index/enrichment validation should reject:
          the table's embedder as `resolution_embedder` (its lifetime must outlive
          the resolution runtime's final catch-up).
 2. **Learned + reviewed (phase 2).**
-   - Learned weights (EM / logistic regression) over the same levels.
-   - REVIEW band workflow: review queue, human curation, label capture; resolver
-     decision provenance and `pending_review` state.
-   - Naive -> calibrated fusion across multiple extractors.
+   - [x] Learned weights (logistic regression) over the same levels:
+         `matcher.fitLogisticRegression` fits a weight per feature (+ bias) from
+         labelled pairs, `predictLogistic` scores; the fitted weights populate
+         the same `Level.weight`/`combine.bias` the deterministic scorer reads
+         (only the numbers change). Unit-tested. Remaining: the offline
+         training harness that encodes pairs as feature vectors and writes a
+         learned-weights scorer config.
+   - [x] Calibrated fusion across extractors: `matcher.fuse` combines per-source
+         `trust * confidence` (noisy_or / max / mean) with a config-generation-
+         pinned graph prior into one edge confidence. Unit-tested. Remaining:
+         the fusion stage that reads multiple extraction artifacts and sets the
+         edge weight from a pinned prior snapshot.
+   - [ ] REVIEW band workflow: review queue, human curation, label capture;
+         resolver decision provenance and `pending_review` state.
    - [x] 2PC atomic promotion: the promoter commits all of a document's
          resolved entities in one multi-participant transaction
          (`EntitySink.upsertBatch` -> `DistributedEntitySink` ->
@@ -575,8 +585,13 @@ Open/index/enrichment validation should reject:
 3. **Merge/split (phase 3).**
    - [x] Entity `merged_into`: resolution follows a matched candidate's
          `merged_into` redirect to the surviving canonical entity (lazy merge).
-   - [ ] config-generation re-resolution backfill (re-scan extraction artifacts
-         when a resolver's `config_generation` bumps) and eager edge rewrite.
+   - [x] config-generation re-resolution backfill: `reresolveAll` scans the
+         user-key namespace for the extraction artifacts a resolver consumes and
+         re-runs resolution (idempotent; unchanged artifacts skipped), so a
+         scorer/template/`config_generation` change re-resolves the existing
+         corpus even though the incremental hint never fires. Unit-tested.
+         Remaining: auto-trigger it when a resolver's config_generation bumps.
+   - [ ] Eager edge rewrite on merge (lazy redirect via `merged_into` is done).
 
 ## Test Plan
 

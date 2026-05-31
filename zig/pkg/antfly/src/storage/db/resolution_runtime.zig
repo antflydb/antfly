@@ -480,6 +480,75 @@ pub fn processRecordKeys(
     }
 }
 
+/// Re-resolve every stored extraction artifact a configured resolver consumes,
+/// re-journaling the resolution keys that change. Used for config-generation
+/// re-resolution: when a resolver's scorer / key_template / `config_generation`
+/// changes, the incremental hint won't fire (the extraction artifacts didn't
+/// change), so this backfill re-runs resolution over the existing corpus. The
+/// stage is idempotent, so artifacts whose bytes are unchanged are skipped.
+/// Scans the user-key namespace once and processes matches after the scan so no
+/// write happens under an open read cursor.
+pub fn reresolveAll(
+    gpa: std.mem.Allocator,
+    store: resolver_lib.ArtifactStore,
+    resolvers: []const ResolverConfig,
+    candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
+    write_ctx: *anyopaque,
+    write_fn: DerivedRecordWriter,
+) !usize {
+    var asset_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (asset_keys.items) |k| gpa.free(@constCast(k));
+        asset_keys.deinit(gpa);
+    }
+
+    const Collector = struct {
+        gpa: std.mem.Allocator,
+        resolvers: []const ResolverConfig,
+        out: *std.ArrayListUnmanaged([]const u8),
+
+        fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+            _ = value;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!internal_keys.isAssetArtifactKey(key)) return;
+            const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(self.gpa, key)) orelse return;
+            defer self.gpa.free(parsed.doc_key);
+            defer self.gpa.free(parsed.artifact_name);
+            if (resolverForArtifact(self.resolvers, parsed.artifact_name) == null) return;
+            try self.out.append(self.gpa, try self.gpa.dupe(u8, key));
+        }
+    };
+    var collector = Collector{ .gpa = gpa, .resolvers = resolvers, .out = &asset_keys };
+    // All user keys live in [user_namespace, user_namespace+1); asset artifacts
+    // are a subset filtered by the collector.
+    const lower = [_]u8{internal_keys.user_namespace};
+    const upper = [_]u8{internal_keys.user_namespace + 1};
+    store.scanPrefix(lower[0..], upper[0..], &collector, Collector.consume) catch |err| switch (err) {
+        error.ScanUnsupported => return 0,
+        else => return err,
+    };
+
+    var journal_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (journal_keys.items) |k| gpa.free(@constCast(k));
+        journal_keys.deinit(gpa);
+    }
+    var reresolved: usize = 0;
+    for (asset_keys.items) |key| {
+        const outcome = (try processChangedExtraction(gpa, resolvers, store, null, key, candidate_source, embedder)) orelse continue;
+        reresolved += 1;
+        switch (outcome.result) {
+            .written, .cleared => try journal_keys.append(gpa, outcome.resolution_key),
+            else => gpa.free(outcome.resolution_key),
+        }
+    }
+    if (journal_keys.items.len > 0) {
+        _ = try write_fn(write_ctx, .{ .changed_artifact_keys = journal_keys.items });
+    }
+    return reresolved;
+}
+
 pub const default_max_records_per_window: usize = 1024;
 
 /// Iterate replay records matching the resolution hint from `from_sequence`,
@@ -1392,6 +1461,70 @@ test "prefix blocking links a typo'd mention to an existing entity with a differ
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     // Linked to the existing entity (prefix scan + scorer), not the typo'd mint.
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "reresolveAll re-resolves the corpus when a resolver config generation bumps" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+
+    // Resolve at config_generation 1.
+    {
+        const resolvers = [_]ResolverConfig{.{
+            .name = "kg",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ slug _entity.text }}",
+            .config_generation = 1,
+        }};
+        const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null, null)).?;
+        alloc.free(outcome.resolution_key);
+    }
+    {
+        const stored = (try store.get(alloc, resolution_key)).?;
+        defer alloc.free(stored);
+        try testing.expect(std.mem.indexOf(u8, stored, "\"config_generation\":1") != null);
+    }
+
+    // Bump to config_generation 2: the extraction artifact is unchanged, so the
+    // incremental hint never fires; the backfill re-resolves the corpus.
+    const bumped = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ slug _entity.text }}",
+        .config_generation = 2,
+    }};
+    var writer = CaptureWriter{ .alloc = alloc };
+    defer writer.deinit();
+    const reresolved = try reresolveAll(alloc, store, &bumped, null, null, &writer, CaptureWriter.writeFn);
+    try testing.expectEqual(@as(usize, 1), reresolved);
+    // The re-resolution changed the artifact (new generation) and was journaled.
+    try testing.expectEqual(@as(usize, 1), writer.keys.items.len);
+    try testing.expectEqualSlices(u8, resolution_key, writer.keys.items[0]);
+
+    const restored = (try store.get(alloc, resolution_key)).?;
+    defer alloc.free(restored);
+    try testing.expect(std.mem.indexOf(u8, restored, "\"config_generation\":2") != null);
+
+    // Idempotent: a second backfill at the same generation journals nothing.
+    writer.calls = 0;
+    for (writer.keys.items) |k| alloc.free(k);
+    writer.keys.clearRetainingCapacity();
+    _ = try reresolveAll(alloc, store, &bumped, null, null, &writer, CaptureWriter.writeFn);
+    try testing.expectEqual(@as(u64, 0), writer.calls);
 }
 
 test "prefix blocking follows a merged_into redirect to the survivor entity" {
