@@ -46,10 +46,16 @@ pub const DistanceRangeRequest = struct {
     to: ?f64 = null,
 };
 
+pub const CardinalityMode = enum { auto, exact, approximate };
+
 pub const SearchAggregationRequest = struct {
     name: []const u8,
     type: []const u8,
     field: []const u8,
+    // Exact-vs-approximate selection for cardinality aggregations; ignored for
+    // other types. `auto` keeps the existing behavior (sketch when it applies,
+    // else exact).
+    cardinality_mode: CardinalityMode = .auto,
     fields: []const []const u8 = &.{},
     size: i64 = 0,
     interval: f64 = 0,
@@ -383,15 +389,24 @@ fn computeAlgebraicAggregation(
     }
 
     if (std.mem.eql(u8, request.type, "cardinality")) {
-        if (try index.approxCardinalityTotalForFieldAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) |estimate| {
-            index.recordPlannerSelected(null, estimate);
-            const rel_err = try index.hllRelativeErrorForField(store, null, request.field, ctx.algebraic_constraints, ctx.identity_read_generation);
-            return .{
-                .name = request.name,
-                .field = request.field,
-                .type = request.type,
-                .value_json = try cardinalityResultJsonAlloc(alloc, estimate, rel_err),
-            };
+        // `exact` never consults a sketch; `auto`/`approximate` try one first.
+        if (request.cardinality_mode != .exact) {
+            if (try index.approxCardinalityTotalForFieldAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) |estimate| {
+                index.recordPlannerSelected(null, estimate);
+                const rel_err = try index.hllRelativeErrorForField(store, null, request.field, ctx.algebraic_constraints, ctx.identity_read_generation);
+                return .{
+                    .name = request.name,
+                    .field = request.field,
+                    .type = request.type,
+                    .value_json = try cardinalityResultJsonAlloc(alloc, estimate, rel_err),
+                };
+            }
+            // `approximate` requires a sketch; with none it is an explicit error
+            // rather than a silent O(n) exact scan the caller did not ask for.
+            if (request.cardinality_mode == .approximate) {
+                index.recordPlannerFallback("approximate_cardinality_unavailable", null, null);
+                return error.UnsupportedAggregation;
+            }
         }
         const count = (try index.exactCardinalityForFieldAtGenerationAlloc(store, request.field, ctx.algebraic_constraints, ctx.identity_read_generation)) orelse {
             index.recordPlannerFallback("cardinality_unsupported", null, null);
@@ -13926,6 +13941,61 @@ test "algebraic aggregation planner answers cardinality from HLL materialization
     try std.testing.expectEqualStrings("\"east\"", terms_aggs[0].buckets[1].key_json);
     try expectApproxCardinality(terms_aggs[0].buckets[0].aggregations[0].value_json.?, 3);
     try expectApproxCardinality(terms_aggs[0].buckets[1].aggregations[0].value_json.?, 1);
+
+    // cardinality_mode = .exact never consults the sketch — the result is exact
+    // and reports approximate:false even though a matching sketch exists.
+    const exact_requests = [_]SearchAggregationRequest{.{ .name = "unique_customers", .type = "cardinality", .field = "customer", .cardinality_mode = .exact }};
+    const exact_aggs = try computeSearchAggregations(alloc, &exact_requests, result, ctx);
+    defer deinitResults(alloc, exact_aggs);
+    try std.testing.expectEqual(@as(usize, 1), exact_aggs.len);
+    try std.testing.expectEqualStrings("{\"value\":3,\"approximate\":false}", exact_aggs[0].value_json.?);
+
+    // cardinality_mode = .approximate is served from the sketch when one applies.
+    const approx_requests = [_]SearchAggregationRequest{.{ .name = "unique_customers", .type = "cardinality", .field = "customer", .cardinality_mode = .approximate }};
+    const approx_aggs = try computeSearchAggregations(alloc, &approx_requests, result, ctx);
+    defer deinitResults(alloc, approx_aggs);
+    try std.testing.expectEqual(@as(usize, 1), approx_aggs.len);
+    try expectApproxCardinality(approx_aggs[0].value_json.?, 3);
+}
+
+test "cardinality_mode approximate errors when no sketch applies" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    // Algebraic index with NO hll_cardinalities: approximate mode has nothing to
+    // serve from and must surface an error rather than a silent exact scan.
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [{"name":"customer","path":"customer","type":"string"}]
+        \\}
+    ;
+    var manager = try index_manager_mod.IndexManager.init(alloc, ".");
+    defer manager.deinit();
+    const mutex = try alloc.create(std.atomic.Mutex);
+    mutex.* = .unlocked;
+    const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
+    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"a\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"b\"}" },
+    };
+    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const hits = try alloc.alloc(types.SearchHit, 0);
+    defer alloc.free(hits);
+    const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
+    const ctx = Context{ .index_manager = &manager, .doc_store = &store, .algebraic_scope = .root, .algebraic_available = true };
+
+    const requests = [_]SearchAggregationRequest{.{ .name = "unique_customers", .type = "cardinality", .field = "customer", .cardinality_mode = .approximate }};
+    try std.testing.expectError(error.UnsupportedAggregation, computeSearchAggregations(alloc, &requests, result, ctx));
 }
 
 // Asserts a cardinality result was served approximately (from a sketch): it

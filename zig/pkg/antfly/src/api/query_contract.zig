@@ -2490,10 +2490,13 @@ fn parseSingleAggregationRequestAlloc(
         center_lon = std.fmt.parseFloat(f64, std.mem.trim(u8, lon_text, &std.ascii.whitespace)) catch return error.InvalidQueryRequest;
     }
 
+    const cardinality_mode = try parseCardinalityModeJson(alloc, aggregation.mode);
+
     return .{
         .name = try alloc.dupe(u8, name),
         .type = try alloc.dupe(u8, @tagName(aggregation.type)),
         .field = try alloc.dupe(u8, primary_field),
+        .cardinality_mode = cardinality_mode,
         .fields = fields,
         .size = aggregation.size orelse 0,
         .interval = if (aggregation.interval) |value| value else 0,
@@ -2553,6 +2556,16 @@ fn jsonValueToFlatStringAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
         .string => |text| try alloc.dupe(u8, text),
         else => return error.UnsupportedQueryRequest,
     };
+}
+
+// The generated `mode` field is an untyped JSON value (the allOf+description
+// shape codegen emits as ?std.json.Value). Map it to the typed enum, defaulting
+// to .auto when absent.
+fn parseCardinalityModeJson(alloc: std.mem.Allocator, value_opt: ?std.json.Value) !aggregations_mod.CardinalityMode {
+    const value = value_opt orelse return .auto;
+    const text = try jsonValueToFlatStringAlloc(alloc, value);
+    defer alloc.free(text);
+    return std.meta.stringToEnum(aggregations_mod.CardinalityMode, text) orelse error.InvalidQueryRequest;
 }
 
 fn parseAggregationBackgroundQueryAlloc(
@@ -2628,6 +2641,10 @@ fn toOpenApiAggregationResult(
             .integer => |value| out.value = @floatFromInt(value),
             .object => |object| {
                 if (object.get("value")) |value| out.value = try jsonValueToF32(value);
+                if (object.get("approximate")) |value| {
+                    if (value == .bool) out.approximate = value.bool;
+                }
+                if (object.get("relative_error")) |value| out.relative_error = try jsonValueToF32(value);
                 if (object.get("count")) |value| out.count = try jsonValueToI64(value);
                 if (object.get("min")) |value| out.min = try jsonValueToF32(value);
                 if (object.get("max")) |value| out.max = try jsonValueToF32(value);
