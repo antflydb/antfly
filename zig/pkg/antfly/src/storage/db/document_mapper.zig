@@ -19,6 +19,7 @@ const regex_mod = @import("antfly_regex");
 const introducer_mod = @import("../../introducer.zig");
 const typed_dv = @import("../../section/typed_doc_values.zig");
 const relational_manifest = @import("../../section/relational_manifest.zig");
+const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const analysis_mod = @import("../../search/analysis.zig");
 const schema_api = @import("../../schema/mod.zig");
 const runtime_schema = @import("../schema.zig");
@@ -1651,6 +1652,12 @@ pub fn reconstructRelationalDocumentFromSegmentAlloc(
 
 /// Append one column's `path: value` to `out`. Returns true if a value was
 /// emitted (the doc had a value in this column's section), false otherwise.
+///
+/// Reads the typed value from the segment column, then formats it through the
+/// shared `relational_row_codec.appendCellValue` — the *same* formatter the KV
+/// store read path uses — so a relational document reconstructs byte-for-byte
+/// identically whether served from a segment (full-text reads) or from the KV
+/// store (point lookups / transforms / vector reads).
 fn appendReconstructedColumn(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1662,58 +1669,18 @@ fn appendReconstructedColumn(
     const value_type = relationalStorageValueType(column.field_type);
     const is_json = column.field_type == .json;
 
-    switch (value_type) {
-        .f64_val => {
-            const v = (try dv.getF64(doc_ordinal)) orelse return false;
-            try appendColumnKey(alloc, out, column.path, needs_comma);
-            try appendJsonFmt(alloc, out, "{d}", .{v});
-        },
-        .u64_val => {
-            const v = (try dv.getU64(doc_ordinal)) orelse return false;
-            try appendColumnKey(alloc, out, column.path, needs_comma);
-            try appendJsonFmt(alloc, out, "{d}", .{v});
-        },
-        .bool_val => {
-            const v = (try dv.getBool(doc_ordinal)) orelse return false;
-            try appendColumnKey(alloc, out, column.path, needs_comma);
-            try out.appendSlice(alloc, if (v) "true" else "false");
-        },
-        .geo_point => {
-            const gp = (try dv.getGeoPoint(doc_ordinal)) orelse return false;
-            try appendColumnKey(alloc, out, column.path, needs_comma);
-            try appendJsonFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ gp.lat, gp.lon });
-        },
-        .bytes_val => {
-            const bytes = (try dv.getBytes(doc_ordinal)) orelse return false;
-            defer alloc.free(bytes);
-            try appendColumnKey(alloc, out, column.path, needs_comma);
-            if (is_json) {
-                // Stored bytes are already canonical JSON.
-                try out.appendSlice(alloc, bytes);
-            } else {
-                try appendJsonString(alloc, out, bytes);
-            }
-        },
-    }
+    const value: typed_dv.TypedValue = switch (value_type) {
+        .f64_val => .{ .f64_val = (try dv.getF64(doc_ordinal)) orelse return false },
+        .u64_val => .{ .u64_val = (try dv.getU64(doc_ordinal)) orelse return false },
+        .bool_val => .{ .bool_val = (try dv.getBool(doc_ordinal)) orelse return false },
+        .geo_point => .{ .geo_point = (try dv.getGeoPoint(doc_ordinal)) orelse return false },
+        .bytes_val => .{ .bytes_val = (try dv.getBytes(doc_ordinal)) orelse return false },
+    };
+    // getBytes returns an owned dupe; free it after formatting.
+    defer if (value_type == .bytes_val) alloc.free(@constCast(value.bytes_val));
+
+    try relational_row_codec.appendCellValue(alloc, out, column.path, value_type, is_json, value, needs_comma);
     return true;
-}
-
-fn appendColumnKey(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), path: []const u8, needs_comma: bool) !void {
-    if (needs_comma) try out.append(alloc, ',');
-    try appendJsonString(alloc, out, path);
-    try out.append(alloc, ':');
-}
-
-fn appendJsonFmt(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) !void {
-    const text = try std.fmt.allocPrint(alloc, fmt, args);
-    defer alloc.free(text);
-    try out.appendSlice(alloc, text);
-}
-
-fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
-    defer alloc.free(encoded);
-    try out.appendSlice(alloc, encoded);
 }
 
 fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {

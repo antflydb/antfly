@@ -12,28 +12,37 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! On-disk codec for a relational document's typed columns.
+//! On-disk codec for a relational document's typed columns — the authoritative
+//! value stored in the synchronous key-value store for a relational table.
 //!
-//! In relational mode the authoritative source of truth in the synchronous
-//! key-value store is *not* a JSON blob — it is the projected typed columns of
-//! the document (`schema_capability.RelationalRow`), serialized by this codec.
-//! `db.get` decodes the row and reconstructs canonical JSON on read via
-//! `schema_capability.reconstructRelationalDocumentAlloc`.
+//! In relational mode the KV source of truth is *not* a JSON blob: it is the
+//! document's projected typed columns, serialized by this codec. `db.get`
+//! decodes the row and reconstructs canonical JSON on read.
 //!
 //! A document is one KV pair (one packed row), not a key-range of per-column
 //! pairs: every synchronous reader (point lookup, read-modify-write transform,
 //! vector `include_stored`) consumes the whole document, so a packed value is a
 //! single atomic lookup/write and keeps shard splits boundary-agnostic. The
-//! columnar/predicate-pushdown tier lives in the search segments, not here.
+//! columnar predicate-pushdown tier lives in the search segments, not here.
+//!
+//! **Self-describing on purpose.** Each cell stores the column's JSON `path`,
+//! physical `value_type`, the `is_json` flag, and the typed value — everything
+//! reconstruction needs. So the KV read chokepoint decodes and reconstructs
+//! without a schema lookup, and reconstruction works even while the table schema
+//! is mid-change. The value representation is `typed_doc_values` (the same types
+//! the search segments persist), and the per-value formatter (`appendCellValue`)
+//! is shared with the segment read path so a document reconstructs *byte for
+//! byte identically* whether served from columns in a segment or from the KV
+//! store. That single-formatter guarantee is the whole point of this layer.
 //!
 //! Format (little-endian):
 //!   magic   [4] = "AROW"
 //!   version u32 = 1
-//!   count   u32              -- number of *present* cells
+//!   count   u32              -- number of cells (present columns only)
 //!   per cell:
-//!     column_index u32
-//!     flags        u8        -- bit0: is_json
-//!     value_type   u8        -- PhysicalType tag
+//!     path_len   u32, path bytes
+//!     flags      u8          -- bit0: is_json
+//!     value_type u8          -- typed_doc_values.ValueType tag
 //!     payload:
 //!       u64_val   : 8 bytes
 //!       f64_val   : 8 bytes (bitcast)
@@ -41,27 +50,35 @@
 //!       geo_point : 16 bytes (lat f64, lon f64)
 //!       bytes_val : u32 len + len bytes
 //!
-//! Absent nullable columns produce no cell (matching projection semantics).
-//! The codec round-trips the row schema-free; JSON reconstruction is a separate
-//! step that consults the column plan for paths and scalar formatting.
+//! Cells are stored in declared-column order, and only present columns are
+//! stored (absent nullable columns are skipped) — matching the segment path,
+//! which emits columns in order and skips absent ones, so the reconstructed JSON
+//! is identical.
 //!
 //! Relational mode is new, so there is no legacy on-disk format to stay
-//! compatible with; a single row version is assumed. The 4-byte magic also lets
-//! the KV read chokepoint distinguish a typed row from any other value.
+//! compatible with; a single row version is assumed.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const schema_capability = @import("schema_capability.zig");
-
-const RelationalRow = schema_capability.RelationalRow;
-const RelationalCell = schema_capability.RelationalCell;
-const ColumnValue = schema_capability.ColumnValue;
-const PhysicalType = schema_capability.PhysicalType;
+const typed_dv = @import("../../../section/typed_doc_values.zig");
 
 pub const magic: [4]u8 = "AROW".*;
 pub const version: u32 = 1;
 
 const flag_is_json: u8 = 1;
+
+/// One reconstructable column value. Owns nothing: `path` and (for `bytes_val`)
+/// the value bytes borrow either the caller's buffers (when serializing) or the
+/// decoded `Row` storage (when reading).
+pub const Cell = struct {
+    /// Dotted JSON path the value is emitted under during reconstruction.
+    path: []const u8,
+    value_type: typed_dv.ValueType,
+    /// When true a `bytes_val` payload is already valid JSON (embedded
+    /// verbatim); otherwise it is a plain string (JSON-escaped on read).
+    is_json: bool = false,
+    value: typed_dv.TypedValue,
+};
 
 /// True if `value` begins with the typed-row magic. Lets the KV read chokepoint
 /// tell a serialized relational row apart from any other stored value without a
@@ -70,25 +87,19 @@ pub fn looksLikeRow(value: []const u8) bool {
     return value.len >= magic.len and std.mem.eql(u8, value[0..magic.len], &magic);
 }
 
-/// Serialize the present cells of a row. Caller owns the result.
-pub fn serialize(alloc: Allocator, row: RelationalRow) ![]u8 {
+/// Serialize a document's cells. Caller owns the result.
+pub fn serialize(alloc: Allocator, cells: []const Cell) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
 
     try buf.appendSlice(alloc, &magic);
     try appendU32(alloc, &buf, version);
+    try appendU32(alloc, &buf, @intCast(cells.len));
 
-    var present_count: u32 = 0;
-    for (row.cells) |c| {
-        if (c.present) present_count += 1;
-    }
-    try appendU32(alloc, &buf, present_count);
-
-    for (row.cells) |c| {
-        if (!c.present) continue;
-        try appendU32(alloc, &buf, @intCast(c.column));
+    for (cells) |c| {
+        try appendStr(alloc, &buf, c.path);
         try buf.append(alloc, if (c.is_json) flag_is_json else 0);
-        try buf.append(alloc, @intFromEnum(@as(PhysicalType, c.value)));
+        try buf.append(alloc, @intFromEnum(c.value_type));
         switch (c.value) {
             .u64_val => |v| try appendU64(alloc, &buf, v),
             .f64_val => |v| try appendU64(alloc, &buf, @bitCast(v)),
@@ -107,10 +118,19 @@ pub fn serialize(alloc: Allocator, row: RelationalRow) ![]u8 {
     return try buf.toOwnedSlice(alloc);
 }
 
-/// Deserialize a row. The returned row owns its `bytes_val` payloads (in
-/// `bytes_pool`); free via `RelationalRow.deinit`. The cells are emitted in
-/// serialized order (which is column order, as projection produces them).
-pub fn deserialize(alloc: Allocator, data: []const u8) !RelationalRow {
+/// A decoded row. `cells` and the `path`/`bytes_val` slices they reference
+/// borrow `data` (the stored value), so the row is valid only while `data` is.
+pub const Row = struct {
+    cells: []Cell,
+
+    pub fn deinit(self: *Row, alloc: Allocator) void {
+        alloc.free(self.cells);
+    }
+};
+
+/// Decode a row. The returned cell slice is heap-allocated (free via
+/// `Row.deinit`); `path` and `bytes_val` borrow `data`.
+pub fn deserialize(alloc: Allocator, data: []const u8) !Row {
     if (data.len < magic.len + 8) return error.InvalidRelationalRow;
     if (!std.mem.eql(u8, data[0..magic.len], &magic)) return error.InvalidRelationalRow;
     var pos: usize = magic.len;
@@ -118,24 +138,18 @@ pub fn deserialize(alloc: Allocator, data: []const u8) !RelationalRow {
     if (ver != version) return error.UnsupportedRelationalRowVersion;
     const count = readU32(data, &pos);
 
-    const cells = try alloc.alloc(RelationalCell, count);
+    const cells = try alloc.alloc(Cell, count);
     errdefer alloc.free(cells);
-    var pool = std.ArrayListUnmanaged([]u8).empty;
-    errdefer {
-        for (pool.items) |buffer| alloc.free(buffer);
-        pool.deinit(alloc);
-    }
 
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        if (pos + 6 > data.len) return error.InvalidRelationalRow;
-        const column_index = readU32(data, &pos);
+        const path = try readStr(data, &pos);
+        if (pos + 2 > data.len) return error.InvalidRelationalRow;
         const flags = data[pos];
-        pos += 1;
-        const value_type = physicalTypeFromByte(data[pos]) orelse return error.InvalidRelationalRow;
-        pos += 1;
+        const value_type = valueTypeFromByte(data[pos + 1]) orelse return error.InvalidRelationalRow;
+        pos += 2;
 
-        const value: ColumnValue = switch (value_type) {
+        const value: typed_dv.TypedValue = switch (value_type) {
             .u64_val => .{ .u64_val = try readU64Checked(data, &pos) },
             .f64_val => .{ .f64_val = @bitCast(try readU64Checked(data, &pos)) },
             .bool_val => blk: {
@@ -153,23 +167,82 @@ pub fn deserialize(alloc: Allocator, data: []const u8) !RelationalRow {
                 if (pos + 4 > data.len) return error.InvalidRelationalRow;
                 const len = readU32(data, &pos);
                 if (pos + len > data.len) return error.InvalidRelationalRow;
-                const owned = try alloc.dupe(u8, data[pos .. pos + len]);
-                errdefer alloc.free(owned);
-                try pool.append(alloc, owned);
+                const bytes = data[pos .. pos + len];
                 pos += len;
-                break :blk .{ .bytes_val = owned };
+                break :blk .{ .bytes_val = bytes };
             },
         };
 
         cells[i] = .{
-            .column = column_index,
-            .present = true,
+            .path = path,
+            .value_type = value_type,
             .is_json = (flags & flag_is_json) != 0,
             .value = value,
         };
     }
 
-    return .{ .cells = cells, .bytes_pool = try pool.toOwnedSlice(alloc) };
+    return .{ .cells = cells };
+}
+
+/// Reconstruct a document's canonical JSON from decoded cells. Schema-free.
+/// Caller owns the returned bytes.
+pub fn reconstructDocumentAlloc(alloc: Allocator, cells: []const Cell) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try out.append(alloc, '{');
+    for (cells, 0..) |c, i| {
+        try appendCellValue(alloc, &out, c.path, c.value_type, c.is_json, c.value, i > 0);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Append one `"path": value` pair to `out`. This is the single canonical
+/// per-value formatter shared by the KV read path and the segment read path, so
+/// a column reconstructs identically regardless of where its value came from.
+pub fn appendCellValue(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    path: []const u8,
+    value_type: typed_dv.ValueType,
+    is_json: bool,
+    value: typed_dv.TypedValue,
+    needs_comma: bool,
+) !void {
+    if (needs_comma) try out.append(alloc, ',');
+    try appendJsonString(alloc, out, path);
+    try out.append(alloc, ':');
+    switch (value_type) {
+        .f64_val => try appendFmt(alloc, out, "{d}", .{value.f64_val}),
+        .u64_val => try appendFmt(alloc, out, "{d}", .{value.u64_val}),
+        .bool_val => try out.appendSlice(alloc, if (value.bool_val) "true" else "false"),
+        .geo_point => try appendFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ value.geo_point.lat, value.geo_point.lon }),
+        .bytes_val => {
+            if (is_json) {
+                try out.appendSlice(alloc, value.bytes_val); // already canonical JSON
+            } else {
+                try appendJsonString(alloc, out, value.bytes_val);
+            }
+        },
+    }
+}
+
+fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
+fn appendFmt(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(text);
+    try out.appendSlice(alloc, text);
+}
+
+fn valueTypeFromByte(tag: u8) ?typed_dv.ValueType {
+    if (tag >= std.meta.fields(typed_dv.ValueType).len) return null;
+    return @enumFromInt(tag);
 }
 
 fn appendU32(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), val: u32) !void {
@@ -184,9 +257,9 @@ fn appendU64(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), val: u64) !void
     try buf.appendSlice(alloc, &tmp);
 }
 
-fn physicalTypeFromByte(tag: u8) ?PhysicalType {
-    if (tag >= std.meta.fields(PhysicalType).len) return null;
-    return @enumFromInt(tag);
+fn appendStr(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    try appendU32(alloc, buf, @intCast(s.len));
+    try buf.appendSlice(alloc, s);
 }
 
 fn readU32(data: []const u8, pos: *usize) u32 {
@@ -202,65 +275,73 @@ fn readU64Checked(data: []const u8, pos: *usize) !u64 {
     return val;
 }
 
-test "relational row codec round-trips every physical type" {
-    const alloc = std.testing.allocator;
-    var pool = [_][]u8{
-        try alloc.dupe(u8, "hello world"),
-        try alloc.dupe(u8, "{\"k\":1}"),
-    };
-    var row = RelationalRow{
-        .cells = try alloc.dupe(RelationalCell, &.{
-            .{ .column = 0, .present = true, .value = .{ .bytes_val = pool[0] } },
-            .{ .column = 1, .present = true, .value = .{ .f64_val = 12.5 } },
-            .{ .column = 2, .present = true, .value = .{ .u64_val = 1000 } },
-            .{ .column = 3, .present = true, .value = .{ .bool_val = true } },
-            .{ .column = 4, .present = true, .value = .{ .geo_point = .{ .lat = 1.5, .lon = -2.5 } } },
-            .{ .column = 5, .present = true, .is_json = true, .value = .{ .bytes_val = pool[1] } },
-        }),
-        .bytes_pool = try alloc.dupe([]u8, &pool),
-    };
-    defer row.deinit(alloc);
+fn readStr(data: []const u8, pos: *usize) ![]const u8 {
+    if (pos.* + 4 > data.len) return error.InvalidRelationalRow;
+    const len = readU32(data, pos);
+    if (pos.* + len > data.len) return error.InvalidRelationalRow;
+    const s = data[pos.*..][0..len];
+    pos.* += len;
+    return s;
+}
 
-    const encoded = try serialize(alloc, row);
+test "relational row codec round-trips every value type and reconstructs canonical JSON" {
+    const alloc = std.testing.allocator;
+    const cells = [_]Cell{
+        .{ .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "abc" } },
+        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 12.5 } },
+        .{ .path = "ts", .value_type = .u64_val, .value = .{ .u64_val = 1000 } },
+        .{ .path = "active", .value_type = .bool_val, .value = .{ .bool_val = true } },
+        .{ .path = "loc", .value_type = .geo_point, .value = .{ .geo_point = .{ .lat = 1.5, .lon = -2.5 } } },
+        .{ .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{\"k\":1}" } },
+    };
+
+    const encoded = try serialize(alloc, &cells);
     defer alloc.free(encoded);
     try std.testing.expect(looksLikeRow(encoded));
 
-    var decoded = try deserialize(alloc, encoded);
-    defer decoded.deinit(alloc);
+    var row = try deserialize(alloc, encoded);
+    defer row.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 6), row.cells.len);
+    try std.testing.expectEqualStrings("id", row.cells[0].path);
+    try std.testing.expectEqualStrings("abc", row.cells[0].value.bytes_val);
+    try std.testing.expectEqual(@as(f64, 12.5), row.cells[1].value.f64_val);
+    try std.testing.expectEqual(@as(u64, 1000), row.cells[2].value.u64_val);
+    try std.testing.expect(row.cells[3].value.bool_val);
+    try std.testing.expectEqual(@as(f64, -2.5), row.cells[4].value.geo_point.lon);
+    try std.testing.expect(row.cells[5].is_json);
 
-    try std.testing.expectEqual(@as(usize, 6), decoded.cells.len);
-    try std.testing.expectEqualStrings("hello world", decoded.cell(0).?.value.bytes_val);
-    try std.testing.expectEqual(@as(f64, 12.5), decoded.cell(1).?.value.f64_val);
-    try std.testing.expectEqual(@as(u64, 1000), decoded.cell(2).?.value.u64_val);
-    try std.testing.expect(decoded.cell(3).?.value.bool_val);
-    try std.testing.expectEqual(@as(f64, 1.5), decoded.cell(4).?.value.geo_point.lat);
-    try std.testing.expectEqual(@as(f64, -2.5), decoded.cell(4).?.value.geo_point.lon);
-    try std.testing.expect(decoded.cell(5).?.is_json);
-    try std.testing.expectEqualStrings("{\"k\":1}", decoded.cell(5).?.value.bytes_val);
+    const json = try reconstructDocumentAlloc(alloc, row.cells);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"abc\",\"amount\":12.5,\"ts\":1000,\"active\":true,\"loc\":{\"lat\":1.5,\"lon\":-2.5},\"payload\":{\"k\":1}}",
+        json,
+    );
 }
 
-test "relational row codec omits absent cells" {
+test "relational row codec reconstructs an empty row" {
     const alloc = std.testing.allocator;
-    const row = RelationalRow{
-        .cells = try alloc.dupe(RelationalCell, &.{
-            .{ .column = 0, .present = true, .value = .{ .u64_val = 7 } },
-            .{ .column = 1, .present = false, .value = .{ .bool_val = false } },
-            .{ .column = 2, .present = true, .value = .{ .bool_val = true } },
-        }),
-        .bytes_pool = &.{},
-    };
-    defer alloc.free(row.cells);
-
-    const encoded = try serialize(alloc, row);
+    const encoded = try serialize(alloc, &.{});
     defer alloc.free(encoded);
+    var row = try deserialize(alloc, encoded);
+    defer row.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), row.cells.len);
+    const json = try reconstructDocumentAlloc(alloc, row.cells);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings("{}", json);
+}
 
-    var decoded = try deserialize(alloc, encoded);
-    defer decoded.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 2), decoded.cells.len);
-    try std.testing.expect(decoded.cell(0) != null);
-    try std.testing.expect(decoded.cell(1) == null);
-    try std.testing.expect(decoded.cell(2) != null);
+test "relational row codec escapes string paths and values" {
+    const alloc = std.testing.allocator;
+    const cells = [_]Cell{
+        .{ .path = "na\"me", .value_type = .bytes_val, .value = .{ .bytes_val = "a\"b" } },
+    };
+    const encoded = try serialize(alloc, &cells);
+    defer alloc.free(encoded);
+    var row = try deserialize(alloc, encoded);
+    defer row.deinit(alloc);
+    const json = try reconstructDocumentAlloc(alloc, row.cells);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings("{\"na\\\"me\":\"a\\\"b\"}", json);
 }
 
 test "relational row codec rejects bad magic, version, and truncation" {
