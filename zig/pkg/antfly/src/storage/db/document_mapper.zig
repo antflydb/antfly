@@ -18,6 +18,7 @@ const vector_codec = @import("antfly_vector").codec;
 const regex_mod = @import("antfly_regex");
 const introducer_mod = @import("../../introducer.zig");
 const typed_dv = @import("../../section/typed_doc_values.zig");
+const relational_manifest = @import("../../section/relational_manifest.zig");
 const analysis_mod = @import("../../search/analysis.zig");
 const schema_api = @import("../../schema/mod.zig");
 const runtime_schema = @import("../schema.zig");
@@ -145,7 +146,31 @@ pub const BuildTextSegmentsResult = struct {
 pub const TextProjectionBatch = struct {
     docs: []const introducer_mod.TextDocument,
     observed_field_analyzers: []const ObservedFieldAnalyzer = &.{},
+    /// Non-null for relational tables: the column catalog the segment's manifest
+    /// is written from and document bodies are reconstructed against on read.
+    relational_manifest_columns: ?[]const relational_manifest.ManifestColumn = null,
 };
+
+/// Derive the segment manifest column catalog from a runtime schema, or null for
+/// document-mode tables. Allocated on `alloc`; `name`/`path` borrow the schema's
+/// column strings (valid as long as the schema is).
+pub fn relationalManifestColumnsAlloc(
+    alloc: Allocator,
+    schema: ?runtime_schema.TableSchema,
+) !?[]const relational_manifest.ManifestColumn {
+    const runtime = schema orelse return null;
+    if (runtime.storage_mode != .relational or runtime.relational_columns.len == 0) return null;
+    const columns = try alloc.alloc(relational_manifest.ManifestColumn, runtime.relational_columns.len);
+    for (runtime.relational_columns, 0..) |column, i| {
+        columns[i] = .{
+            .name = column.name,
+            .path = column.path,
+            .value_type = relationalStorageValueType(column.field_type),
+            .is_json = column.field_type == .json,
+        };
+    }
+    return columns;
+}
 
 pub const TextProjectionSourceDoc = struct {
     key: []const u8,
@@ -368,6 +393,7 @@ pub fn buildTextProjectionBatchFromSource(
     return .{
         .docs = try arena.dupe(introducer_mod.TextDocument, text_docs.items),
         .observed_field_analyzers = if (observed_field_analyzers) |items| items.items else &.{},
+        .relational_manifest_columns = try relationalManifestColumnsAlloc(arena, schema),
     };
 }
 
@@ -389,6 +415,7 @@ fn buildTextSegmentFromProjectionBatchWithProfile(
     if (projection_batch.docs.len == 0) return null;
     return try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, projection_batch.docs, &analysis_mod.default_analyzer, text_analysis, .{
         .profile = profile,
+        .relational_manifest_columns = projection_batch.relational_manifest_columns,
     });
 }
 
@@ -413,6 +440,7 @@ pub fn buildTextSegmentsFromProjectionBatch(
         const chunk: TextProjectionBatch = .{
             .docs = projection_batch.docs[start..end],
             .observed_field_analyzers = &.{},
+            .relational_manifest_columns = projection_batch.relational_manifest_columns,
         };
         if (try buildTextSegmentFromProjectionBatchWithProfile(alloc, chunk, text_analysis, options.profile)) |segment| {
             try segments.append(alloc, segment);
@@ -3805,4 +3833,96 @@ test "relational segment reconstruction omits absent nullable columns" {
     try std.testing.expectEqual(@as(usize, 2), obj.count());
     try std.testing.expectEqualStrings("x", obj.get("id").?.string);
     try std.testing.expect(obj.get("note") == null);
+}
+
+test "relational segment stores empty body and reconstructs via manifest after merge" {
+    // Proves the full write -> empty-body -> merge -> reconstruct path: the
+    // introducer writes an empty stored-doc body plus a manifest section, the
+    // merge code carries the manifest forward (a schema-less data-movement
+    // path), and the reader's storedDocDecompressed chokepoint reconstructs the
+    // document from typed columns on the *merged* segment.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const segment_mod = @import("../../segment.zig");
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+        .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
+    };
+    const manifest_columns = (try relationalManifestColumnsAlloc(alloc, .{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    })).?;
+
+    const buildSeg = struct {
+        fn run(a: std.mem.Allocator, cols: []const runtime_schema.RelationalColumn, mcols: []const relational_manifest.ManifestColumn, key: []const u8, doc_json: []const u8) ![]u8 {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, doc_json, .{});
+            defer parsed.deinit();
+            const typed = try buildRelationalTypedFields(a, parsed.value, cols);
+            const text_docs = [_]introducer_mod.TextDocument{.{
+                .id = key,
+                .stored_data = doc_json,
+                .text_fields = &.{},
+                .typed_fields = typed,
+            }};
+            return try introducer_mod.buildSegmentFromTextWithAnalysisOptions(
+                a,
+                &text_docs,
+                &analysis_mod.default_analyzer,
+                .{},
+                .{ .relational_manifest_columns = mcols },
+            );
+        }
+    }.run;
+
+    const seg1 = try buildSeg(alloc, &columns, manifest_columns, "doc:a", "{\"id\":\"doc:a\",\"amount\":1.5,\"active\":true}");
+    defer alloc.free(seg1);
+    const seg2 = try buildSeg(alloc, &columns, manifest_columns, "doc:b", "{\"id\":\"doc:b\",\"amount\":2.5}");
+    defer alloc.free(seg2);
+
+    // Each input segment stores an empty body (reconstruction-only).
+    {
+        var r1 = try segment_mod.SegmentReader.init(alloc, seg1);
+        defer r1.deinit();
+        try std.testing.expectEqual(@as(usize, 0), r1.storedDoc(0).?.data.len);
+    }
+
+    const merged = try segment_mod.mergeSegments(alloc, &.{ seg1, seg2 });
+    defer alloc.free(merged);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, merged);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u32, 2), reader.doc_count);
+
+    // The merged segment still carries the manifest, so the reader chokepoint
+    // reconstructs both documents from typed columns.
+    const checkDoc = struct {
+        fn run(a: std.mem.Allocator, rdr: *const segment_mod.SegmentReader, idx: u32, want_id: []const u8, want_amount: f64, want_active: ?bool) !void {
+            const stored = (try rdr.storedDocDecompressed(idx)).?;
+            defer a.free(stored.data);
+            try std.testing.expectEqualStrings(want_id, stored.id);
+            var doc = try std.json.parseFromSlice(std.json.Value, a, stored.data, .{});
+            defer doc.deinit();
+            const obj = doc.value.object;
+            try std.testing.expectEqualStrings(want_id, obj.get("id").?.string);
+            const amt = obj.get("amount").?;
+            const amt_num: f64 = switch (amt) {
+                .float => |f| f,
+                .integer => |i| @floatFromInt(i),
+                else => unreachable,
+            };
+            try std.testing.expectEqual(want_amount, amt_num);
+            if (want_active) |flag| {
+                try std.testing.expectEqual(flag, obj.get("active").?.bool);
+            } else {
+                try std.testing.expect(obj.get("active") == null);
+            }
+        }
+    }.run;
+
+    // Merge preserves input order: seg1's doc (doc:a) then seg2's (doc:b).
+    try checkDoc(alloc, &reader, 0, "doc:a", 1.5, true);
+    try checkDoc(alloc, &reader, 1, "doc:b", 2.5, null);
 }

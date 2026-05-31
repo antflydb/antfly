@@ -2743,6 +2743,7 @@ pub const IndexManager = struct {
                     split_key,
                     .right,
                     dest_entry.config.config_json,
+                    dest_entry.runtime_schema,
                     collect_skip_doc_keys,
                 );
                 defer if (rebuilt.segment_bytes) |segment_bytes| self.alloc.free(segment_bytes);
@@ -3274,6 +3275,7 @@ pub const IndexManager = struct {
                             split_key,
                             .left,
                             entry.config.config_json,
+                            entry.runtime_schema,
                             false,
                         );
                         defer if (rebuilt.segment_bytes) |segment_bytes| self.alloc.free(segment_bytes);
@@ -9608,6 +9610,7 @@ fn buildSplitSegment(
     split_key: []const u8,
     side: SplitSide,
     config_json: ?[]const u8,
+    runtime_schema: ?schema_mod.TableSchema,
     collect_doc_keys: bool,
 ) !SplitRebuiltSegment {
     var reader = try segment_mod.SegmentReader.init(alloc, segment_bytes);
@@ -9675,7 +9678,10 @@ fn buildSplitSegment(
 
     const split_text_analysis = try introducer_mod.parseTextAnalysisConfig(alloc, config_json);
     defer introducer_mod.freeTextAnalysisConfig(alloc, split_text_analysis);
-    const rebuilt = try mapper.buildTextSegmentFromDocuments(alloc, docs.items, split_text_analysis, null);
+    // Pass the runtime schema so a relational table's split segment re-derives
+    // its typed columns + manifest from the reconstructed documents (rather than
+    // degrading to a document-mode segment that has lost columnar pushdown).
+    const rebuilt = try mapper.buildTextSegmentFromDocuments(alloc, docs.items, split_text_analysis, runtime_schema);
     return .{
         .segment_bytes = rebuilt,
         .doc_keys = try doc_keys.toOwnedSlice(alloc),

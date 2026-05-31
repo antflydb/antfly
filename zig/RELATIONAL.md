@@ -342,52 +342,83 @@ number) is additive where the physical type is compatible.
 
 ---
 
-## Blob-write removal: investigation result (ready to implement, NOT yet coded)
+## Blob-write removal: DONE (self-describing segment manifest)
 
-Full read-site map of the segment stored-doc (grep of `storedDoc`/`storedDocDecompressed`):
+The segment stored-doc body is no longer written for relational tables. Each
+document is stored as an empty body plus its typed columns; the JSON is
+reconstructed from those columns on read. This was landed as a versioned segment
+format addition (relational mode is new, so no legacy on-disk compatibility was
+required).
 
-KEY FINDING — every *borrowing* `storedDoc(idx)` production caller uses only
-`.id`, never `.data`:
-  - index.zig:990 (delete-marking), search/query.zig:1256 (doc-id->doc_num),
-    persistent.zig:1272 & 1912 (doc-key collection / min-max key),
-    search_exec.zig:2258, 2390, 3602, 3811, 4024 (id collection / filters).
-The ONLY borrowed `.data` consumer is the merge path (segment.zig:844), which
-copies the stored body forward into the merged segment.
+### Design as built
 
-All *document-body* reads go through the allocating `storedDocDecompressed`
-(index.zig:401 snapshot chokepoint; search.zig:1033/2060/2117/2207/2258;
-query.zig:694; index_manager.zig:9646; search_exec.zig:3973).
+- **New leaf module `section/relational_manifest.zig`** (depends only on `std`
+  + `typed_doc_values`, so both the segment reader and `document_mapper` import
+  it without a cycle). Holds:
+  - `ManifestColumn{ name, path, value_type, is_json }` — the schema-free facts
+    reconstruction needs. (Physical `value_type` + `is_json` disambiguate the
+    cases the raw column type can't: a `bytes_val` column may be a string, a
+    `json` subtree, or a geoshape.)
+  - `serialize` / `parse` for the manifest section bytes.
+  - `reconstructDocumentAlloc(reader, columns, local_doc_id)` — the single
+    reconstruction routine, keyed by the **segment-local** doc id (the id
+    `typed_doc_values` is keyed by, == `resolveDocId().local_id`).
 
-=> Low-blast-radius design (recommended):
-  1. introducer.zig:289 — for relational tables write an EMPTY stored-doc body
-     (id kept, data empty). Storage saving: body no longer duplicated (columns
-     already persisted as typed_doc_values).
-  2. SegmentReader.storedDocDecompressed (segment.zig:527) — when body is empty
-     and the segment is relational, reconstruct via
-     reconstructRelationalDocumentFromSegmentAlloc from the typed_doc_values
-     columns. Single chokepoint => all body readers fixed at once.
-  3. `.id`-only borrowing callers keep working unchanged (id still present).
-  4. Merge (segment.zig:844) copies the empty body forward; reconstruction works
-     post-merge IFF the typed_doc_values column sections are preserved through
-     merge.
+- **New `SectionType.relational_manifest` (=6)** stored under the reserved field
+  `\x00__antfly_relational_manifest` (mirrors the `doc_ordinals` convention).
 
-OPEN QUESTIONS still to verify before coding (was mid-investigation):
-  - Does merge preserve typed_doc_values sections forward? (range filters work on
-    merged segments, which suggests yes — must confirm in segment.zig merge loop.)
-  - How does the SegmentReader learn the relational column list (name/type/path)
-    to drive reconstruction? Two options: (a) persist a small column manifest
-    section in the segment (must also be carried through merge); (b) derive from
-    the typed_doc_values sections if they self-describe their value type and can
-    be distinguished from non-document sections like doc_ordinals. Option (a) is
-    cleaner/safer; (b) avoids a format addition. Needs the segment.zig
-    section-kind + typed-value type-tag check that was not yet completed.
+- **Write path** (`introducer.zig`): `BuildTextOptions.relational_manifest_columns`.
+  When set, the build writes an empty stored-doc body per document and attaches
+  the manifest section (`SegmentWriter.addRelationalManifest`). `document_mapper`
+  derives the columns from the runtime schema
+  (`relationalManifestColumnsAlloc`) and threads them through every projection
+  build path (single- and multi-segment). Document-mode builds pass `null` and
+  are byte-for-byte unchanged.
 
-VALIDATION REQUIRED before claiming done: full `zig build unit-test` (write log
-to /tmp and read it — inline output truncates in long sessions), plus the merge
-tests (merger.zig, segment.zig merge tests) and an e2e restart/durability check,
-since this touches segment format + merge + persistence.
+- **Read path** (`segment.zig`): `SegmentReader.storedDocDecompressed` — the
+  single chokepoint all body reads funnel through (query hit materialization,
+  vector `include_stored`, IP-range JSON fallback, shard split) — checks for a
+  manifest (`relationalManifest()`) and, if present, reconstructs from columns;
+  the document id still comes from the stored-doc table. No call site needed
+  schema access. `.id`-only borrowing `storedDoc()` callers are untouched (id is
+  still stored).
 
-KV redesign (the synchronous source-of-truth, db.zig stageTransform:4000 reads
-`db.get`; vector include_stored db.zig ~38939 reads `db.get`) remains the larger,
-separate task documented in the section above — NOT addressed by the blob-write
-removal.
+### The two schema-less data-movement paths (and the bugs found fixing them)
+
+These are why this had to be a *self-describing* segment, not just a live-schema
+lookup — neither path has the runtime schema:
+
+- **Merge / compaction** (`segment.zig`): the manifest is carried forward
+  verbatim (the column catalog is identical across a table's segments, so the
+  first input with one is authoritative). Reconstruction then works on the
+  merged segment. **Bug found & fixed:** `mergeTypedDocValuesSections` returned
+  `error.UnsupportedTypedDocValues` for `bytes_val` columns — previously bytes
+  doc-values were never merge-critical (the blob carried strings), but
+  relational string/json columns *are* `bytes_val`, so merge now copies them.
+  Without this, compacting a relational table would have lost all string/json
+  columns (silent data loss). Covered by a dedicated build→empty-body→merge→
+  reconstruct test.
+
+- **Shard split** (`index_manager.zig` `buildSplitSegment`): reads
+  `storedDocDecompressed` (now reconstructing) and rebuilds the split segment.
+  **Bug found & fixed:** the rebuild passed `null` schema, which would have
+  degraded a relational split segment to document-mode (body present but typed
+  columns + manifest lost → no columnar pushdown on split data). Now the
+  `TextIndex.runtime_schema` is threaded in so the split segment re-derives its
+  columns + manifest.
+
+### Validation
+
+Full `zig build unit-test`: **2692 passed, 0 failed, 0 leaked.** Includes the
+new manifest round-trip + merge-survival tests, the end-to-end DB relational
+reconstruction test, and the whole merge/split/persistence suite. Document-mode
+behaviour is unchanged (its code paths are not entered when no manifest is
+present).
+
+### Still open (separate task)
+
+KV redesign (the synchronous source-of-truth, `db.zig` `stageTransform` reads
+`db.get`; vector `include_stored` reads `db.get`) remains the larger, separate
+task documented in the section above — NOT addressed by the blob-write removal.
+That is the *durability* copy of the document; this work only removed the
+*segment* copy of the body.
