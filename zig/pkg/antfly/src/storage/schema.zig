@@ -685,6 +685,13 @@ fn dynamicTemplateMatches(
     return true;
 }
 
+/// Public wrapper exposing the canonical `match_mapping_type` inference so other
+/// indexes (e.g. the algebraic sidecar) evaluate dynamic-template selectors with
+/// identical semantics instead of re-implementing type detection.
+pub fn matchMappingTypeName(value: std.json.Value) ?[]const u8 {
+    return inferDynamicTemplateMatchType(value);
+}
+
 fn inferDynamicTemplateMatchType(value: std.json.Value) ?[]const u8 {
     return switch (value) {
         .string => |text| if (parseRfc3339ToNs(text) != null or isValidDate(text)) "date" else "string",

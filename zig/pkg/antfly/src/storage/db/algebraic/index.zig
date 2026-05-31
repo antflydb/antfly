@@ -31,6 +31,7 @@ const symbol = @import("symbol.zig");
 const backend_types = @import("../../backend_types.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const runtime_schema = @import("../../schema.zig");
 const lsm_backend = @import("../../lsm_backend.zig");
 const lsm_storage_io = @import("../../lsm_backend/storage_io.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
@@ -183,6 +184,7 @@ pub const Config = struct {
     group_fields: []const FieldConfig = &.{},
     measure_fields: []const FieldConfig = &.{},
     time_fields: []const FieldConfig = &.{},
+    dynamic_field_rules: []const fact_mod.DynamicRule = &.{},
     laws: []const LawConfig = &.{},
     joins: []const JoinConfig = &.{},
     materializations: []const MaterializationConfig = &.{},
@@ -311,6 +313,159 @@ pub fn validateConfig(cfg: Config) !void {
         }
     }
     if (cfg.adaptive.observation_decay_retain_percent > 100) return error.InvalidAlgebraicConfig;
+    for (cfg.dynamic_field_rules) |rule| {
+        if (rule.type.len == 0) return error.InvalidAlgebraicConfig;
+        if (dynamicRuleRoleMask(rule.type) == 0) return error.InvalidAlgebraicConfig;
+        // A rule with no selector at all would match every field; require at
+        // least one selector so a misconfigured template cannot blanket-project.
+        if (rule.match == null and rule.unmatch == null and
+            rule.path_match == null and rule.path_unmatch == null and
+            rule.match_mapping_type == null) return error.InvalidAlgebraicConfig;
+    }
+}
+
+// ============================================================================
+// Dynamic-template docfact projection
+//
+// Templates are evaluated against every observed field at ingest time. A field
+// not already covered by a static spec that matches a rule selector is promoted
+// into typed group/measure/time docfacts, so dynamic-template changes take
+// effect for new writes without a schema version bump or reindex. The bounded-
+// type guard is enforced upstream in schema_capability.zig (only keyword/
+// numeric/boolean/datetime templates become rules); open text stays schemaless.
+// ============================================================================
+
+/// Bitmask of roles a resolved scalar type projects into. Mirrors the static
+/// classification in schema_capability.zig (numeric => group+measure, datetime
+/// => group+time, others => group).
+const role_group: u3 = 0b001;
+const role_measure: u3 = 0b010;
+const role_time: u3 = 0b100;
+
+fn dynamicRuleRoleMask(scalar_type: []const u8) u3 {
+    if (std.mem.eql(u8, scalar_type, "integer") or std.mem.eql(u8, scalar_type, "number")) {
+        return role_group | role_measure;
+    }
+    if (std.mem.eql(u8, scalar_type, "datetime")) return role_group | role_time;
+    if (std.mem.eql(u8, scalar_type, "string") or std.mem.eql(u8, scalar_type, "boolean")) return role_group;
+    return 0;
+}
+
+fn dynamicRuleMatches(rule: fact_mod.DynamicRule, path: []const u8, field_name: []const u8, json_value: std.json.Value) bool {
+    if (rule.match) |pattern| {
+        if (!runtime_schema.globMatch(pattern, field_name)) return false;
+    }
+    if (rule.unmatch) |pattern| {
+        if (runtime_schema.globMatch(pattern, field_name)) return false;
+    }
+    if (rule.path_match) |pattern| {
+        if (!runtime_schema.globMatch(pattern, path)) return false;
+    }
+    if (rule.path_unmatch) |pattern| {
+        if (runtime_schema.globMatch(pattern, path)) return false;
+    }
+    if (rule.match_mapping_type) |expected| {
+        const actual = runtime_schema.matchMappingTypeName(json_value) orelse return false;
+        if (!std.mem.eql(u8, expected, actual)) return false;
+    }
+    return true;
+}
+
+fn staticSpecCoversPath(specs: []const fact_mod.FieldSpec, path: []const u8) bool {
+    for (specs) |spec| {
+        if (std.mem.eql(u8, spec.path, path)) return true;
+    }
+    return false;
+}
+
+/// Project dynamic-template-matched docfacts for a document. The fact `field`
+/// identity is the full dotted path (so nested dynamic fields never collide with
+/// each other or with statically-declared leaf-named fields); for the common
+/// top-level template case the path equals the field name.
+fn projectDynamicDocFactsAlloc(
+    alloc: std.mem.Allocator,
+    rules: []const fact_mod.DynamicRule,
+    static_specs: []const fact_mod.FieldSpec,
+    root: std.json.Value,
+) !fact_mod.FactList {
+    var out = std.ArrayListUnmanaged(fact_mod.Fact).empty;
+    errdefer {
+        for (out.items) |*item| item.deinit(alloc);
+        out.deinit(alloc);
+    }
+    if (rules.len > 0 and root == .object) {
+        try walkDynamicDocFacts(alloc, rules, static_specs, &out, "", root);
+    }
+    return .{ .facts = try out.toOwnedSlice(alloc) };
+}
+
+fn walkDynamicDocFacts(
+    alloc: std.mem.Allocator,
+    rules: []const fact_mod.DynamicRule,
+    static_specs: []const fact_mod.FieldSpec,
+    out: *std.ArrayListUnmanaged(fact_mod.Fact),
+    prefix: []const u8,
+    node: std.json.Value,
+) !void {
+    if (node != .object) return;
+    var it = node.object.iterator();
+    while (it.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        const child_value = entry.value_ptr.*;
+        const path = if (prefix.len == 0)
+            try alloc.dupe(u8, field_name)
+        else
+            try std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, field_name });
+        defer alloc.free(path);
+        switch (child_value) {
+            // Descend into nested objects so path_match selectors can target
+            // dotted paths; arrays stay on the schemaless path-fact path.
+            .object => try walkDynamicDocFacts(alloc, rules, static_specs, out, path, child_value),
+            .array => {},
+            else => try projectDynamicLeaf(alloc, rules, static_specs, out, path, field_name, child_value),
+        }
+    }
+}
+
+fn projectDynamicLeaf(
+    alloc: std.mem.Allocator,
+    rules: []const fact_mod.DynamicRule,
+    static_specs: []const fact_mod.FieldSpec,
+    out: *std.ArrayListUnmanaged(fact_mod.Fact),
+    path: []const u8,
+    field_name: []const u8,
+    json_value: std.json.Value,
+) !void {
+    // Explicit schema fields win over dynamic templates (resolution order in
+    // SCHEMA.md): if a static spec already covers this path, skip it.
+    if (staticSpecCoversPath(static_specs, path)) return;
+
+    for (rules) |rule| {
+        if (!dynamicRuleMatches(rule, path, field_name, json_value)) continue;
+        const mask = dynamicRuleRoleMask(rule.type);
+        var projected = false;
+        if (mask & role_group != 0) projected = (try appendDynamicFact(alloc, out, .group, path, rule.type, json_value)) or projected;
+        if (mask & role_measure != 0) projected = (try appendDynamicFact(alloc, out, .measure, path, rule.type, json_value)) or projected;
+        if (mask & role_time != 0) projected = (try appendDynamicFact(alloc, out, .time, path, rule.type, json_value)) or projected;
+        // First template that yields a usable typed fact wins (Bleve/ES order).
+        if (projected) return;
+    }
+}
+
+fn appendDynamicFact(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(fact_mod.Fact),
+    role: fact_mod.Role,
+    field: []const u8,
+    scalar_type: []const u8,
+    json_value: std.json.Value,
+) !bool {
+    const scalar = (try value_mod.scalarFromJsonAlloc(alloc, scalar_type, json_value)) orelse return false;
+    errdefer alloc.free(scalar);
+    const field_copy = try alloc.dupe(u8, field);
+    errdefer alloc.free(field_copy);
+    try out.append(alloc, .{ .role = role, .field = field_copy, .scalar = scalar });
+    return true;
 }
 
 fn validateUniqueFieldNames(fields: []const FieldConfig) !void {
@@ -14744,9 +14899,7 @@ pub const Index = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return false;
 
-        const specs = try self.factSpecsAlloc();
-        defer self.alloc.free(specs);
-        var new_facts = try fact_mod.projectDocumentAlloc(self.alloc, specs, parsed.value);
+        var new_facts = try self.projectAllDocFactsAlloc(parsed.value);
         defer new_facts.deinit(self.alloc);
         const new_fact_payload = try fact_mod.encodeListAlloc(self.alloc, new_facts.facts);
         defer self.alloc.free(new_fact_payload);
@@ -14798,13 +14951,40 @@ pub const Index = struct {
         return true;
     }
 
+    /// Project both the statically-declared docfacts and any dynamic
+    /// template-matched docfacts for a document into a single fact list. This is
+    /// the one place ingest derives typed facts so the fresh-write and coalesced-
+    /// update paths stay byte-for-byte consistent in the stored docfact row.
+    fn projectAllDocFactsAlloc(self: *Index, root: std.json.Value) !fact_mod.FactList {
+        const specs = try self.factSpecsAlloc();
+        defer self.alloc.free(specs);
+        var facts = try fact_mod.projectDocumentAlloc(self.alloc, specs, root);
+        errdefer facts.deinit(self.alloc);
+
+        const rules = self.config().dynamic_field_rules;
+        if (rules.len == 0) return facts;
+
+        var dynamic = try projectDynamicDocFactsAlloc(self.alloc, rules, specs, root);
+        defer dynamic.deinit(self.alloc);
+        if (dynamic.facts.len == 0) return facts;
+
+        const combined = try self.alloc.alloc(fact_mod.Fact, facts.facts.len + dynamic.facts.len);
+        @memcpy(combined[0..facts.facts.len], facts.facts);
+        @memcpy(combined[facts.facts.len..], dynamic.facts);
+        // Element ownership transfers into `combined`; free only the backing
+        // slices and neutralize the sources so their deinits are no-ops.
+        if (facts.facts.len > 0) self.alloc.free(facts.facts);
+        if (dynamic.facts.len > 0) self.alloc.free(dynamic.facts);
+        dynamic.facts = &.{};
+        facts.facts = combined;
+        return facts;
+    }
+
     fn writeDocFacts(self: *Index, txn: anytype, doc_key: []const u8, value: []const u8, maintenance_context: ?*BatchMaintenanceContext) !void {
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, value, .{}) catch return;
         defer parsed.deinit();
         if (parsed.value != .object) return;
-        const specs = try self.factSpecsAlloc();
-        defer self.alloc.free(specs);
-        var facts = try fact_mod.projectDocumentAlloc(self.alloc, specs, parsed.value);
+        var facts = try self.projectAllDocFactsAlloc(parsed.value);
         defer facts.deinit(self.alloc);
         const encoded = try fact_mod.encodeListAlloc(self.alloc, facts.facts);
         defer self.alloc.free(encoded);
@@ -18812,6 +18992,78 @@ test "algebraic index stores schemaless path facts and lookup rows" {
         else => return err,
     };
     deleted_txn.abort();
+}
+
+fn factHasField(facts: []const fact_mod.Fact, role: fact_mod.Role, field: []const u8) bool {
+    for (facts) |f| {
+        if (f.role == role and std.mem.eql(u8, f.field, field)) return true;
+    }
+    return false;
+}
+
+test "algebraic dynamic templates project typed docfacts without a schema rebuild" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    // Explicit `tenant` group field plus three dynamic-template rules. The
+    // `tenant` rule (number) must lose to the explicit string field; `*_id`
+    // and `metrics.*` promote unknown fields into typed facts at ingest.
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "events",
+        \\  "group_fields": [{"name":"tenant","path":"tenant","type":"string"}],
+        \\  "dynamic_field_rules": [
+        \\    {"name":"explicit_loses","match":"tenant","type":"number"},
+        \\    {"name":"ids","match":"*_id","type":"string"},
+        \\    {"name":"metrics","path_match":"metrics.*","type":"number"}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_dyn_templates", cfg);
+    defer idx.close();
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"tenant\":\"t1\",\"user_id\":\"u42\",\"metrics\":{\"latency\":12}}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const fact_key = try idx.docFactKey("e1");
+    defer alloc.free(fact_key);
+    var read_txn = try store.beginReadTxn();
+    const payload = try read_txn.get(fact_key);
+    var facts = try fact_mod.decodeListAlloc(alloc, payload);
+    read_txn.abort();
+    defer facts.deinit(alloc);
+
+    // Explicit field wins: tenant is a string group fact, never a number measure.
+    try std.testing.expect(factHasField(facts.facts, .group, "tenant"));
+    try std.testing.expect(!factHasField(facts.facts, .measure, "tenant"));
+    // `user_id` matched `*_id` -> string group fact keyed by its path.
+    try std.testing.expect(factHasField(facts.facts, .group, "user_id"));
+    try std.testing.expect(!factHasField(facts.facts, .measure, "user_id"));
+    // Nested `metrics.latency` matched `metrics.*` -> numeric group + measure.
+    try std.testing.expect(factHasField(facts.facts, .group, "metrics.latency"));
+    try std.testing.expect(factHasField(facts.facts, .measure, "metrics.latency"));
+
+    // Overwriting the document removes stale dynamic facts (symmetric cleanup
+    // through the coalesced update path).
+    const overwrite = [_]derived_types.DerivedDocument{
+        .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"tenant\":\"t1\",\"session_id\":\"s7\"}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = overwrite[0..] });
+    var read_txn2 = try store.beginReadTxn();
+    const payload2 = try read_txn2.get(fact_key);
+    var facts2 = try fact_mod.decodeListAlloc(alloc, payload2);
+    read_txn2.abort();
+    defer facts2.deinit(alloc);
+    try std.testing.expect(!factHasField(facts2.facts, .group, "user_id"));
+    try std.testing.expect(!factHasField(facts2.facts, .group, "metrics.latency"));
+    try std.testing.expect(factHasField(facts2.facts, .group, "session_id"));
 }
 
 test "algebraic path profile recomputes max string token count after deleting max row" {

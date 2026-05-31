@@ -41,9 +41,34 @@ pub const FieldCapability = struct {
     }
 };
 
+/// A table-level dynamic template compiled into a runtime-adaptive algebraic
+/// rule. Only templates that resolve to a bounded scalar type become rules; the
+/// selectors are carried verbatim and evaluated per-document at ingest time.
+pub const DynamicRuleCapability = struct {
+    name: []u8,
+    match: ?[]u8 = null,
+    unmatch: ?[]u8 = null,
+    path_match: ?[]u8 = null,
+    path_unmatch: ?[]u8 = null,
+    match_mapping_type: ?[]u8 = null,
+    scalar_type: []u8,
+
+    pub fn deinit(self: *DynamicRuleCapability, alloc: Allocator) void {
+        alloc.free(self.name);
+        if (self.match) |v| alloc.free(v);
+        if (self.unmatch) |v| alloc.free(v);
+        if (self.path_match) |v| alloc.free(v);
+        if (self.path_unmatch) |v| alloc.free(v);
+        if (self.match_mapping_type) |v| alloc.free(v);
+        alloc.free(self.scalar_type);
+        self.* = undefined;
+    }
+};
+
 pub const Plan = struct {
     schema_version: u32 = 0,
     fields: []FieldCapability = &.{},
+    dynamic_rules: []DynamicRuleCapability = &.{},
     skipped_dynamic_fields: u32 = 0,
     skipped_complex_fields: u32 = 0,
     skipped_unbounded_fields: u32 = 0,
@@ -51,6 +76,8 @@ pub const Plan = struct {
     pub fn deinit(self: *Plan, alloc: Allocator) void {
         for (self.fields) |*field| field.deinit(alloc);
         if (self.fields.len > 0) alloc.free(self.fields);
+        for (self.dynamic_rules) |*rule| rule.deinit(alloc);
+        if (self.dynamic_rules.len > 0) alloc.free(self.dynamic_rules);
         self.* = undefined;
     }
 };
@@ -71,9 +98,38 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
         for (fields.items) |*field| field.deinit(alloc);
         fields.deinit(alloc);
     }
+    var dynamic_rules = std.ArrayListUnmanaged(DynamicRuleCapability).empty;
+    errdefer {
+        for (dynamic_rules.items) |*rule| rule.deinit(alloc);
+        dynamic_rules.deinit(alloc);
+    }
     var skipped_dynamic_fields: u32 = 0;
     var skipped_complex_fields: u32 = 0;
     var skipped_unbounded_fields: u32 = 0;
+
+    for (schema.dynamic_templates) |tmpl| {
+        // A template needs at least one positive/type selector; one with only
+        // negative (or no) selectors would blanket-match every field, so it is
+        // not safe to promote into bounded algebraic facts.
+        const has_positive_selector = tmpl.match_pattern != null or tmpl.path_match != null or tmpl.match_mapping_type != null;
+        const scalar = boundedScalarForTemplateType(tmpl.field_type orelse "text");
+        if (!has_positive_selector or scalar == null) {
+            // Unbounded/open text templates and overly-broad selectors stay on
+            // the schemaless path-fact path rather than typed docfacts.
+            skipped_dynamic_fields += 1;
+            skipped_unbounded_fields += 1;
+            continue;
+        }
+        try dynamic_rules.append(alloc, .{
+            .name = try alloc.dupe(u8, tmpl.name),
+            .match = try dupeOptional(alloc, tmpl.match_pattern),
+            .unmatch = try dupeOptional(alloc, tmpl.unmatch_pattern),
+            .path_match = try dupeOptional(alloc, tmpl.path_match),
+            .path_unmatch = try dupeOptional(alloc, tmpl.path_unmatch),
+            .match_mapping_type = try dupeOptional(alloc, tmpl.match_mapping_type),
+            .scalar_type = try alloc.dupe(u8, scalar.?),
+        });
+    }
 
     for (schema.document_schemas) |document_schema| {
         if (document_schema.additional_properties_allowed orelse false) {
@@ -101,10 +157,29 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
     return .{
         .schema_version = schema.version,
         .fields = try fields.toOwnedSlice(alloc),
+        .dynamic_rules = try dynamic_rules.toOwnedSlice(alloc),
         .skipped_dynamic_fields = skipped_dynamic_fields,
         .skipped_complex_fields = skipped_complex_fields,
         .skipped_unbounded_fields = skipped_unbounded_fields,
     };
+}
+
+fn dupeOptional(alloc: Allocator, value: ?[]const u8) !?[]u8 {
+    return if (value) |v| try alloc.dupe(u8, v) else null;
+}
+
+/// Map a dynamic-template Antfly field type onto the bounded algebraic scalar it
+/// projects into, or null when the type is unbounded/unsupported (text, html,
+/// search_as_you_type, embedding, geo, blob) and must stay schemaless.
+fn boundedScalarForTemplateType(field_type: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, field_type, "keyword") or
+        std.mem.eql(u8, field_type, "link") or
+        std.mem.eql(u8, field_type, "string")) return "string";
+    if (std.mem.eql(u8, field_type, "boolean") or std.mem.eql(u8, field_type, "bool")) return "boolean";
+    if (std.mem.eql(u8, field_type, "datetime")) return "datetime";
+    if (std.mem.eql(u8, field_type, "numeric") or std.mem.eql(u8, field_type, "number")) return "number";
+    if (std.mem.eql(u8, field_type, "integer")) return "integer";
+    return null;
 }
 
 pub fn configJsonFromSchemaJsonAlloc(alloc: Allocator, table_name: []const u8, schema_json: []const u8) ![]u8 {
@@ -171,6 +246,11 @@ pub fn configJsonFromPlanAlloc(alloc: Allocator, table_name: []const u8, plan: P
     try out.append(alloc, ':');
     try appendFieldArray(alloc, &out, plan, .time);
 
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, &out, "dynamic_field_rules");
+    try out.append(alloc, ':');
+    try appendDynamicRuleArray(alloc, &out, plan);
+
     try out.appendSlice(alloc, ",");
     try appendJsonString(alloc, &out, "laws");
     try out.appendSlice(alloc, ":[");
@@ -231,6 +311,17 @@ pub fn capabilityFingerprintAlloc(alloc: Allocator, plan: Plan) ![]u8 {
             field.name,
             field.path,
             field.scalar_type,
+        });
+    }
+    for (plan.dynamic_rules) |rule| {
+        try appendFmt(alloc, &canonical, "dyn:{s}:{s}:{s}:{s}:{s}:{s}:{s}|", .{
+            rule.name,
+            rule.scalar_type,
+            rule.match orelse "",
+            rule.unmatch orelse "",
+            rule.path_match orelse "",
+            rule.path_unmatch orelse "",
+            rule.match_mapping_type orelse "",
         });
     }
     try appendFmt(alloc, &canonical, "skip:{d}:{d}:{d}", .{
@@ -300,6 +391,45 @@ fn sameFieldIdentity(lhs: FieldCapability, rhs: FieldCapability) bool {
         std.mem.eql(u8, lhs.document_type, rhs.document_type) and
         std.mem.eql(u8, lhs.name, rhs.name) and
         std.mem.eql(u8, lhs.path, rhs.path);
+}
+
+fn appendDynamicRuleArray(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    plan: Plan,
+) !void {
+    try out.append(alloc, '[');
+    for (plan.dynamic_rules, 0..) |rule, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try appendJsonString(alloc, out, "name");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, rule.name);
+        try appendOptionalJsonField(alloc, out, "match", rule.match);
+        try appendOptionalJsonField(alloc, out, "unmatch", rule.unmatch);
+        try appendOptionalJsonField(alloc, out, "path_match", rule.path_match);
+        try appendOptionalJsonField(alloc, out, "path_unmatch", rule.path_unmatch);
+        try appendOptionalJsonField(alloc, out, "match_mapping_type", rule.match_mapping_type);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, out, "type");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, rule.scalar_type);
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, ']');
+}
+
+fn appendOptionalJsonField(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    key: []const u8,
+    value: ?[]const u8,
+) !void {
+    const v = value orelse return;
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, out, key);
+    try out.append(alloc, ':');
+    try appendJsonString(alloc, out, v);
 }
 
 fn appendFieldArray(
@@ -593,6 +723,76 @@ test "schema capability change classification separates additive from rebuild ch
     try std.testing.expectEqual(@as(u32, 1), breaking.changed_type_fields);
     try std.testing.expect(!breaking.compatible_additive);
     try std.testing.expect(breaking.requires_rebuild);
+}
+
+test "schema capability compiles bounded dynamic templates into runtime rules" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":9,"default_type":"doc",
+        \\"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}},
+        \\"dynamic_templates":[
+        \\{"name":"ids_as_keyword","match":"*_id","mapping":{"type":"keyword"}},
+        \\{"name":"metrics_as_numeric","path_match":"metrics.*","mapping":{"type":"numeric"}},
+        \\{"name":"events_as_date","match_mapping_type":"date","mapping":{"type":"datetime"}},
+        \\{"name":"bodies_as_text","match":"body_*","mapping":{"type":"text"}},
+        \\{"name":"only_negative","unmatch":"skip_*","mapping":{"type":"keyword"}}
+        \\]}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try compilePlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    // keyword + numeric + datetime templates are bounded with positive selectors
+    // => 3 rules. The text template (unbounded) and the negative-only template
+    // (no positive selector) are skipped onto the schemaless path.
+    try std.testing.expectEqual(@as(usize, 3), plan.dynamic_rules.len);
+    try std.testing.expect(plan.skipped_unbounded_fields >= 2);
+
+    const config_json = try configJsonFromPlanAlloc(alloc, "orders", plan);
+    defer alloc.free(config_json);
+    var parsed_config = try std.json.parseFromSlice(index_mod.Config, alloc, config_json, .{ .allocate = .alloc_always });
+    defer parsed_config.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed_config.value.dynamic_field_rules.len);
+    // The emitted config must satisfy the index validator (selector present,
+    // bounded scalar type) so the index can open against it.
+    try index_mod.validateConfig(parsed_config.value);
+
+    var found_numeric = false;
+    for (parsed_config.value.dynamic_field_rules) |rule| {
+        if (std.mem.eql(u8, rule.name, "metrics_as_numeric")) {
+            try std.testing.expectEqualStrings("metrics.*", rule.path_match.?);
+            try std.testing.expectEqualStrings("number", rule.type);
+            found_numeric = true;
+        }
+    }
+    try std.testing.expect(found_numeric);
+}
+
+test "schema capability fingerprint reflects dynamic template type change" {
+    const alloc = std.testing.allocator;
+    var keyword_schema = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}},"dynamic_templates":[{"name":"ext","match":"ext_*","mapping":{"type":"keyword"}}]}
+    );
+    defer keyword_schema.deinit(alloc);
+    var numeric_schema = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}},"dynamic_templates":[{"name":"ext","match":"ext_*","mapping":{"type":"numeric"}}]}
+    );
+    defer numeric_schema.deinit(alloc);
+
+    var keyword_plan = try compilePlanAlloc(alloc, keyword_schema);
+    defer keyword_plan.deinit(alloc);
+    var numeric_plan = try compilePlanAlloc(alloc, numeric_schema);
+    defer numeric_plan.deinit(alloc);
+
+    const keyword_fp = try capabilityFingerprintAlloc(alloc, keyword_plan);
+    defer alloc.free(keyword_fp);
+    const numeric_fp = try capabilityFingerprintAlloc(alloc, numeric_plan);
+    defer alloc.free(numeric_fp);
+
+    // A template-only type change (same schema version) must still shift the
+    // capability fingerprint so the sidecar detects drift.
+    try std.testing.expect(!std.mem.eql(u8, keyword_fp, numeric_fp));
 }
 
 fn expectCapability(
