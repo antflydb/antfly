@@ -41,10 +41,11 @@ const bloom = @import("bloom");
 //   v16: v15 + per-section packed doc norms instead of per-posting norms
 //   v17: v16 + cumulative-end postings chunk metadata
 //   v18: v17 + varint postings headers
+//   v19: v18 + sparse block-max records aligned to stored posting chunks
 //
-// This project is pre-release; writers emit only the current v18 format.
+// This project is pre-release; writers emit only the current v19 format.
 
-const wire_version_current: u8 = 18;
+const wire_version_current: u8 = 19;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4 + 4; // 33 bytes
 const postings_chunk_meta_size: usize = 12;
 const postings_skip_record_size: usize = 8;
@@ -456,14 +457,12 @@ pub const InvertedIndexBuilder = struct {
     ///   - General: postings offset within postings_data
     ///   - 1-hit: packed docNum + normBits (for single-doc, freq=1 terms)
     ///
-    /// Postings per term, v18:
+    /// Postings per term, v19:
     ///   [doc_freq: varint u32]
     ///   [stored_chunks: varint u32]
-    ///   [block_max_base_chunk: varint u32]
-    ///   [block_max_chunks: varint u32]
     ///   [positions_section_len: varint u32]
     ///   [skip_section_len: varint u32]
-    ///   [block_max_chunks × 6-byte block-max records]
+    ///   [stored_chunks × 6-byte block-max records]
     ///   [stored_chunks × compact chunk metadata]
     ///   [packed per-chunk doc-delta/freqHasLocs/norm payloads]
     ///   [positions: varint count + varint deltas per doc]
@@ -949,19 +948,6 @@ const PostingAccumulator = struct {
         const doc_freq: u32 = @intCast(self.doc_ids.items.len);
         if (doc_freq == 0) return error.InvalidData;
 
-        const first_chunk_id = self.doc_ids.items[0] / chunk_size;
-        const last_doc_id = self.doc_ids.items[self.doc_ids.items.len - 1];
-        const last_chunk_id = last_doc_id / chunk_size;
-        const num_doc_chunks = std.math.add(u32, last_chunk_id - first_chunk_id, 1) catch return error.DocumentOutOfRange;
-        try scratch.block_max.resize(alloc, @as(usize, num_doc_chunks) * 6);
-        var chunk_idx: usize = 0;
-        while (chunk_idx < num_doc_chunks) : (chunk_idx += 1) {
-            const off = chunk_idx * 6;
-            scratch.block_max.items[off..][0..2].* = .{ 0, 0 };
-            scratch.block_max.items[off + 2 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, std.math.maxInt(u16)));
-            scratch.block_max.items[off + 4 ..][0..2].* = .{ 0, 0 };
-        }
-
         var pos_offset: usize = 0;
         var doc_start: usize = 0;
         while (doc_start < self.doc_ids.items.len) {
@@ -969,6 +955,9 @@ const PostingAccumulator = struct {
             var doc_end = doc_start + 1;
             while (doc_end < self.doc_ids.items.len and self.doc_ids.items[doc_end] / chunk_size == chunk_id) : (doc_end += 1) {}
 
+            var chunk_max_freq: u16 = 0;
+            var chunk_min_norm: u16 = std.math.maxInt(u16);
+            var chunk_max_norm: u16 = 0;
             scratch.doc_deltas.clearRetainingCapacity();
             scratch.freq_values.clearRetainingCapacity();
             try scratch.doc_deltas.ensureTotalCapacity(alloc, doc_end - doc_start);
@@ -984,15 +973,11 @@ const PostingAccumulator = struct {
                 scratch.freq_values.appendAssumeCapacity(encoded_freq_has_locs);
                 prev_doc = doc_id;
 
-                const bm_off = @as(usize, chunk_id - first_chunk_id) * 6;
                 const freq_u16: u16 = if (meta.freq > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(meta.freq);
                 const norm_u16: u16 = if (meta.norm > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(meta.norm);
-                const cur_max_freq = std.mem.readInt(u16, scratch.block_max.items[bm_off..][0..2], .little);
-                const cur_min_norm = std.mem.readInt(u16, scratch.block_max.items[bm_off + 2 ..][0..2], .little);
-                const cur_max_norm = std.mem.readInt(u16, scratch.block_max.items[bm_off + 4 ..][0..2], .little);
-                if (freq_u16 > cur_max_freq) scratch.block_max.items[bm_off..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, freq_u16));
-                if (norm_u16 < cur_min_norm) scratch.block_max.items[bm_off + 2 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, norm_u16));
-                if (norm_u16 > cur_max_norm) scratch.block_max.items[bm_off + 4 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, norm_u16));
+                if (freq_u16 > chunk_max_freq) chunk_max_freq = freq_u16;
+                if (norm_u16 < chunk_min_norm) chunk_min_norm = norm_u16;
+                if (norm_u16 > chunk_max_norm) chunk_max_norm = norm_u16;
 
                 const count: usize = meta.position_count;
                 try appendPackedPositionsForDoc(
@@ -1022,6 +1007,14 @@ const PostingAccumulator = struct {
                 .freq_data_off = 0,
                 .freq_data_len = 0,
             });
+            try scratch.block_max.appendSlice(alloc, &@as([6]u8, .{
+                @truncate(chunk_max_freq),
+                @truncate(chunk_max_freq >> 8),
+                @truncate(chunk_min_norm),
+                @truncate(chunk_min_norm >> 8),
+                @truncate(chunk_max_norm),
+                @truncate(chunk_max_norm >> 8),
+            }));
 
             doc_start = doc_end;
         }
@@ -1034,8 +1027,6 @@ const PostingAccumulator = struct {
         const header_len =
             varintU32Size(doc_freq) +
             varintU32Size(stored_chunks) +
-            varintU32Size(first_chunk_id) +
-            varintU32Size(num_doc_chunks) +
             varintU32Size(positions_len) +
             varintU32Size(skip_len);
         const total_len = header_len + scratch.block_max.items.len + scratch.chunks.items.len * postings_chunk_meta_size + scratch.payload.items.len + scratch.positions.items.len + scratch.skip.items.len;
@@ -1043,8 +1034,6 @@ const PostingAccumulator = struct {
 
         try writeVarintU32(alloc, out, doc_freq);
         try writeVarintU32(alloc, out, stored_chunks);
-        try writeVarintU32(alloc, out, first_chunk_id);
-        try writeVarintU32(alloc, out, num_doc_chunks);
         try writeVarintU32(alloc, out, positions_len);
         try writeVarintU32(alloc, out, skip_len);
 
@@ -1067,7 +1056,7 @@ const PostingAccumulator = struct {
 // Index reader (query path)
 // ============================================================================
 
-/// Reads a serialized inverted index section (v18, with varint postings headers).
+/// Reads a serialized inverted index section (v19, with sparse block-max records).
 pub const InvertedIndexReader = struct {
     alloc: Allocator,
     data: []const u8,
@@ -1359,13 +1348,11 @@ pub const InvertedIndexReader = struct {
         var cursor = base;
         const doc_freq = readVarintU32(self.data, &cursor) catch unreachable;
         const stored_chunks = readVarintU32(self.data, &cursor) catch unreachable;
-        const block_max_base_chunk = readVarintU32(self.data, &cursor) catch unreachable;
-        const doc_chunks = readVarintU32(self.data, &cursor) catch unreachable;
         const positions_len = readVarintU32(self.data, &cursor) catch unreachable;
         const skip_len = readVarintU32(self.data, &cursor) catch unreachable;
         const header_len = cursor - base;
         const block_max_start = cursor;
-        const block_max_len = @as(usize, doc_chunks) * 6;
+        const block_max_len = @as(usize, stored_chunks) * 6;
         const chunk_meta_start = block_max_start + block_max_len;
         const chunk_meta_len = @as(usize, stored_chunks) * postings_chunk_meta_size;
         const payload_start = chunk_meta_start + chunk_meta_len;
@@ -1387,9 +1374,9 @@ pub const InvertedIndexReader = struct {
             .chunk_size = self.chunk_size,
             .version = self.version,
             .block_max = .{
-                .base_chunk = block_max_base_chunk,
-                .num_chunks = doc_chunks,
                 .meta = self.data[block_max_start..][0..block_max_len],
+                .chunk_size = self.chunk_size,
+                .chunk_meta_data = chunk_meta_data,
             },
             .chunk_meta_data = chunk_meta_data,
             .payload_data = self.data[payload_start..][0..payload_len],
@@ -1532,22 +1519,42 @@ pub const LookupResult = union(enum) {
 };
 
 /// Per-chunk block-max metadata for WAND scoring acceleration.
-/// Each chunk stores (max_freq, min_norm, max_norm) packed as 6 bytes.
+/// Each stored postings chunk stores (max_freq, min_norm, max_norm) packed as
+/// 6 bytes. Chunks with no postings have no block-max record.
 pub const BlockMaxInfo = struct {
-    /// First global doc chunk covered by `meta`. v8 stores sparse block-max
-    /// windows per term instead of padding every term to segment max_doc.
-    base_chunk: u32 = 0,
-    num_chunks: u32,
-    /// Packed [max_freq:u16 LE][min_norm:u16 LE][max_norm:u16 LE] per chunk.
+    /// Packed [max_freq:u16 LE][min_norm:u16 LE][max_norm:u16 LE] per stored
+    /// postings chunk, aligned with `chunk_meta_data`.
     meta: []const u8,
+    chunk_size: u32,
+    chunk_meta_data: []const u8,
+
+    fn chunkCount(self: BlockMaxInfo) usize {
+        return @min(self.meta.len / 6, self.chunk_meta_data.len / postings_chunk_meta_size);
+    }
+
+    fn storedChunkOrdinal(self: BlockMaxInfo, chunk_idx: u32) ?usize {
+        var lo: usize = 0;
+        var hi = self.chunkCount();
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const meta_record = readChunkMetaV17(self.chunk_meta_data, mid, self.chunk_size);
+            if (meta_record.chunk_id < chunk_idx) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo >= self.chunkCount()) return null;
+        const meta_record = readChunkMetaV17(self.chunk_meta_data, lo, self.chunk_size);
+        if (meta_record.chunk_id == chunk_idx) return lo;
+        return null;
+    }
 
     /// Compute the maximum possible BM25 impact for a chunk.
     /// Uses the most favorable values in the chunk: max_freq and min_norm (shortest doc).
     pub fn maxImpact(self: BlockMaxInfo, chunk_idx: u32, doc_count: u32, doc_freq: u32, avg_dl: f32, config: BM25Config) f32 {
-        if (chunk_idx < self.base_chunk) return 0;
-        const local_chunk = chunk_idx - self.base_chunk;
-        if (local_chunk >= self.num_chunks) return 0;
-        const offset = @as(usize, local_chunk) * 6;
+        const ordinal = self.storedChunkOrdinal(chunk_idx) orelse return 0;
+        const offset = ordinal * 6;
         const max_freq = std.mem.readInt(u16, self.meta[offset..][0..2], .little);
         const min_norm = std.mem.readInt(u16, self.meta[offset + 2 ..][0..2], .little);
         if (max_freq == 0) return 0;
@@ -3050,7 +3057,7 @@ test "freqHasLocs encoding round-trip" {
     try std.testing.expectEqual(@as(u64, 0), v3);
 }
 
-test "v4 block-max metadata round-trip" {
+test "v19 sparse block-max metadata round-trip" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
     defer builder.deinit();
@@ -3073,7 +3080,8 @@ test "v4 block-max metadata round-trip" {
     switch (result) {
         .postings => |p| {
             const bm = p.block_max orelse return error.TestExpectedEqual;
-            try std.testing.expectEqual(@as(u32, 2), bm.num_chunks);
+            try std.testing.expectEqual(@as(usize, 2), bm.chunkCount());
+            try std.testing.expectEqual(@as(usize, 12), bm.meta.len);
 
             // Chunk 0: max_freq=3, min_norm=10, max_norm=20
             try std.testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, bm.meta[0..2], .little));
@@ -3093,17 +3101,17 @@ test "v4 block-max metadata round-trip" {
     }
 }
 
-test "v10 block-max metadata stores only term chunk window" {
+test "v19 block-max metadata stores only chunks with postings" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
     defer builder.deinit();
 
-    try builder.addDocument(0, &.{.{ .term = "pad0", .freq = 1, .norm = 10 }});
+    try builder.addDocument(0, &.{.{ .term = "late", .freq = 3, .norm = 9 }});
     try builder.addDocument(1, &.{.{ .term = "pad1", .freq = 1, .norm = 10 }});
-    try builder.addDocument(2, &.{.{ .term = "late", .freq = 3, .norm = 9 }});
-    try builder.addDocument(3, &.{.{ .term = "late", .freq = 2, .norm = 11 }});
+    try builder.addDocument(2, &.{.{ .term = "pad2", .freq = 1, .norm = 10 }});
+    try builder.addDocument(3, &.{.{ .term = "pad3", .freq = 1, .norm = 10 }});
     try builder.addDocument(4, &.{.{ .term = "pad4", .freq = 1, .norm = 10 }});
-    try builder.addDocument(5, &.{.{ .term = "pad5", .freq = 1, .norm = 10 }});
+    try builder.addDocument(5, &.{.{ .term = "late", .freq = 2, .norm = 11 }});
 
     const section = try builder.build();
     defer alloc.free(section);
@@ -3113,18 +3121,17 @@ test "v10 block-max metadata stores only term chunk window" {
     switch (result) {
         .postings => |p| {
             const bm = p.block_max orelse return error.TestExpectedEqual;
-            try std.testing.expectEqual(@as(u32, 1), bm.base_chunk);
-            try std.testing.expectEqual(@as(u32, 1), bm.num_chunks);
-            try std.testing.expectEqual(@as(usize, 6), bm.meta.len);
-            try std.testing.expectEqual(@as(f32, 0), bm.maxImpact(0, 6, 2, reader.avgDocLen(), .{}));
-            try std.testing.expect(bm.maxImpact(1, 6, 2, reader.avgDocLen(), .{}) > 0);
-            try std.testing.expectEqual(@as(f32, 0), bm.maxImpact(2, 6, 2, reader.avgDocLen(), .{}));
+            try std.testing.expectEqual(@as(usize, 2), bm.chunkCount());
+            try std.testing.expectEqual(@as(usize, 12), bm.meta.len);
+            try std.testing.expect(bm.maxImpact(0, 6, 2, reader.avgDocLen(), .{}) > 0);
+            try std.testing.expectEqual(@as(f32, 0), bm.maxImpact(1, 6, 2, reader.avgDocLen(), .{}));
+            try std.testing.expect(bm.maxImpact(2, 6, 2, reader.avgDocLen(), .{}) > 0);
         },
         .one_hit => return error.TestExpectedEqual,
     }
 }
 
-test "v18 postings keep norms in per-section table with compact chunk metadata" {
+test "v19 postings keep norms in per-section table with compact chunk metadata" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
     defer builder.deinit();
