@@ -158,6 +158,8 @@ test "api module compiles" {
     _ = provisioned_storage;
     _ = table_reads;
     _ = table_writes;
+    _ = distributed_candidate_source;
+    _ = distributed_entity_sink;
     _ = distributed_join;
     _ = distributed_graph;
     _ = http_internal_group_read_routes;

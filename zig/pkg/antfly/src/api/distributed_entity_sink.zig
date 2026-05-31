@@ -30,6 +30,7 @@
 const std = @import("std");
 const db_mod = @import("../storage/db/mod.zig");
 const table_writes = @import("table_writes.zig");
+const distributed_txn = @import("distributed_txn.zig");
 
 const EntitySink = db_mod.EntitySink;
 
@@ -40,6 +41,13 @@ pub const DistributedEntitySink = struct {
     /// Sync level for entity upserts. `write` (durable, not full-index) keeps
     /// promotion latency low; the entity shard indexes asynchronously.
     sync_level: db_mod.types.SyncLevel = .write,
+    /// When set, commit the entity upsert through the distributed-transaction
+    /// (2PC) path rather than a plain batch. Single participant today (the entity
+    /// table), so it behaves like a transactional batch; it is the reachable
+    /// foundation for the deferred multi-participant entity+edge coupling
+    /// (RESOLUTION.md option 1). Falls back to a batch when the write source does
+    /// not implement the transaction path.
+    transactional: bool = false,
 
     pub fn entitySink(self: *DistributedEntitySink) EntitySink {
         return .{ .ptr = self, .vtable = &vtable };
@@ -62,9 +70,33 @@ pub const DistributedEntitySink = struct {
 
         const ops = try buildMergeOps(a, doc_json);
         if (ops.len == 0) return;
+        const transform = db_mod.types.DocumentTransform{ .key = key, .operations = ops, .upsert = true };
 
+        if (self.transactional) {
+            // Commit the merge through the 2PC path. A null outcome means the
+            // write source does not implement the transaction vtable, so fall
+            // back to a plain batch.
+            const outcome = self.writes.commitTransaction(allocator, &.{.{ .table_name = table, .transforms = &.{transform} }}, self.sync_level) catch |err| switch (err) {
+                error.UnexpectedHttpStatus, error.TableNotFound => return,
+                else => return err,
+            };
+            if (outcome) |result| {
+                switch (result) {
+                    .committed => return,
+                    // The idempotent merge carries no version predicate, so a
+                    // conflict means a genuine topology/intent clash; surface it
+                    // so the promoter retries on the next catch-up.
+                    .conflict => return error.EntityPromotionConflict,
+                }
+            }
+        }
+
+        return self.batchUpsert(allocator, table, transform);
+    }
+
+    fn batchUpsert(self: *DistributedEntitySink, allocator: std.mem.Allocator, table: []const u8, transform: db_mod.types.DocumentTransform) anyerror!void {
         const req = db_mod.types.BatchRequest{
-            .transforms = &.{.{ .key = key, .operations = ops, .upsert = true }},
+            .transforms = &.{transform},
             .sync_level = self.sync_level,
         };
         // null means the table is unknown to this node's routing (e.g. not yet
@@ -120,6 +152,9 @@ const FakeTableWriteSource = struct {
     table: []const u8,
     keys: std.ArrayListUnmanaged([]u8) = .empty,
     transforms_json: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Set so the source advertises the transaction vtable method.
+    support_transactions: bool = false,
+    commit_calls: usize = 0,
 
     fn deinit(self: *FakeTableWriteSource) void {
         for (self.keys.items) |k| self.alloc.free(k);
@@ -129,10 +164,45 @@ const FakeTableWriteSource = struct {
     }
 
     fn source(self: *FakeTableWriteSource) table_writes.TableWriteSource {
-        return .{ .ptr = self, .vtable = &vtable };
+        return .{ .ptr = self, .vtable = if (self.support_transactions) &txn_vtable else &vtable };
     }
 
     const vtable = table_writes.TableWriteSource.VTable{ .batch = batch };
+    const txn_vtable = table_writes.TableWriteSource.VTable{ .batch = batch, .commit_transaction = commitTransaction };
+
+    fn commitTransaction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) anyerror!?distributed_txn.CommitOutcome {
+        _ = sync_level;
+        const self: *FakeTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.commit_calls += 1;
+        for (tables) |t| {
+            if (!std.mem.eql(u8, t.table_name, self.table)) return null;
+            try recordTransforms(self, alloc, t.transforms);
+        }
+        return .{ .committed = .{ .participant_count = tables.len } };
+    }
+
+    fn recordTransforms(self: *FakeTableWriteSource, alloc: std.mem.Allocator, transforms: []const db_mod.types.DocumentTransform) anyerror!void {
+        _ = alloc;
+        for (transforms) |t| {
+            try self.keys.append(self.alloc, try self.alloc.dupe(u8, t.key));
+            var buf = std.ArrayListUnmanaged(u8).empty;
+            defer buf.deinit(self.alloc);
+            for (t.operations) |op| {
+                try buf.appendSlice(self.alloc, @tagName(op.op));
+                try buf.append(self.alloc, ' ');
+                try buf.appendSlice(self.alloc, op.path);
+                try buf.append(self.alloc, '=');
+                try buf.appendSlice(self.alloc, op.value_json orelse "");
+                try buf.append(self.alloc, ';');
+            }
+            try self.transforms_json.append(self.alloc, try self.alloc.dupe(u8, buf.items));
+        }
+    }
 
     fn batch(
         ptr: *anyopaque,
@@ -205,4 +275,41 @@ test "DistributedEntitySink skips a malformed document" {
 
     try sink.upsert(alloc, "entities", "person/x", "not json");
     try testing.expectEqual(@as(usize, 0), fake.keys.items.len);
+}
+
+test "DistributedEntitySink transactional mode commits through the 2PC path" {
+    const alloc = testing.allocator;
+    var fake = FakeTableWriteSource{ .alloc = alloc, .table = "entities", .support_transactions = true };
+    defer fake.deinit();
+
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .transactional = true };
+    const sink = sink_impl.entitySink();
+
+    try sink.upsert(alloc, "entities", "person/ada_lovelace",
+        \\{"entity_type":"person","canonical_name":"Ada Lovelace","aliases":["Ada Lovelace"]}
+    );
+
+    // Routed through commitTransaction, not batch, and carried the merge ops.
+    try testing.expectEqual(@as(usize, 1), fake.commit_calls);
+    try testing.expectEqual(@as(usize, 1), fake.keys.items.len);
+    try testing.expectEqualStrings("person/ada_lovelace", fake.keys.items[0]);
+    try testing.expect(std.mem.indexOf(u8, fake.transforms_json.items[0], "add_to_set aliases=\"Ada Lovelace\"") != null);
+}
+
+test "DistributedEntitySink transactional mode falls back to batch when unsupported" {
+    const alloc = testing.allocator;
+    // support_transactions = false -> the source has no commit_transaction vtable.
+    var fake = FakeTableWriteSource{ .alloc = alloc, .table = "entities" };
+    defer fake.deinit();
+
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .transactional = true };
+    const sink = sink_impl.entitySink();
+
+    try sink.upsert(alloc, "entities", "person/ada_lovelace",
+        \\{"entity_type":"person","canonical_name":"Ada Lovelace","aliases":["Ada Lovelace"]}
+    );
+
+    // commitTransaction returned null (unwired) -> fell back to batch, still wrote.
+    try testing.expectEqual(@as(usize, 0), fake.commit_calls);
+    try testing.expectEqual(@as(usize, 1), fake.keys.items.len);
 }
