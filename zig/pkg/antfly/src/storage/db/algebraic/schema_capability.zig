@@ -187,7 +187,12 @@ pub fn configJsonFromPlanAlloc(alloc: Allocator, table_name: []const u8, plan: P
     try appendJsonString(alloc, &out, "joins");
     try out.appendSlice(alloc, ":[],");
     try appendJsonString(alloc, &out, "adaptive");
-    try out.appendSlice(alloc, ":{\"observe\":true,\"lazy_materialization\":false,\"dematerialization\":false,\"min_observations\":3},");
+    // Enable lazy (adaptive) materialization: observe aggregation query shapes and
+    // promote hot ones to materialized rollups. The maintenance tick
+    // (DB.runUntilIdle -> evaluate/runAlgebraicAdaptiveWork, driven after writes)
+    // does the promotion + backfill; without lazy_materialization it stops at
+    // "lazy_materialization_disabled" and no rollups are ever built.
+    try out.appendSlice(alloc, ":{\"observe\":true,\"lazy_materialization\":true,\"dematerialization\":false,\"min_observations\":3},");
     try appendJsonString(alloc, &out, "materializations");
     try out.appendSlice(alloc, ":[]}");
 
