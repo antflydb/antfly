@@ -5003,6 +5003,26 @@ pub fn build(b: *std.Build) void {
     const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
 
+    const algebraic_dynamic_template_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "metadata.schema update refreshes algebraic dynamic templates",
+            "algebraic dynamic templates",
+            "algebraic reloadConfigJson",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_algebraic_dynamic_template_tests = b.addRunArtifact(algebraic_dynamic_template_tests);
+    run_algebraic_dynamic_template_tests.step.dependOn(&openapi_root_check.step);
+    const algebraic_dynamic_template_test_step = b.step(
+        "algebraic-dynamic-template-test",
+        "Run focused algebraic dynamic-template ingest, reload, and schema-update tests",
+    );
+    algebraic_dynamic_template_test_step.dependOn(&run_algebraic_dynamic_template_tests.step);
+
     const lib_storage_maintenance_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -6551,6 +6571,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
+    unit_test_step.dependOn(&run_algebraic_dynamic_template_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
     unit_test_step.dependOn(&run_api_restore_jobs_tests.step);
     unit_test_step.dependOn(&run_portable_backup_tests.step);
