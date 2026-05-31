@@ -526,9 +526,21 @@ Open/index/enrichment validation should reject:
    - [x] Resolvers declarable via table config: a `resolvers` section in the
          index config (top-level or nested in an index) is registered by the
          provisioner on both the reconcile and create-local paths.
-   - [ ] Provenance as inbound mention edges; fail-closed hydration of
-         not-yet-promoted entities; `DocRef` endpoints threaded through graph
-         edge artifacts.
+   - [x] Provenance as inbound mention edges: a graph index whose artifact
+         source sets `mention_edge_type` emits `doc -> entity` edges to the
+         canonical key the resolver renders (deterministic, so the edge exists
+         pre-promotion). "Which documents mention this entity" == the entity's
+         inbound edges. Implemented in both materializer paths (sync db.zig +
+         async enrichment_runtime); inherits replace-on-rerender and
+         delete-on-source-delete from the graph-edge-artifact machinery.
+   - [x] Fail-closed hydration: a graph node whose document is not present
+         (entity not yet promoted, or a cross-table entity key) hydrates to
+         nothing rather than being fabricated or erroring -- the storage path
+         returns the node id with `stored_data = null`, the distributed hydrate
+         path skips the missing key. Verified by a db-test.
+   - [ ] `DocRef` endpoints threaded through graph edge artifacts (cross-table
+         hydration); 2PC entity+edge coupling. Phase 1 keeps endpoints as
+         plain keys (same-table hydration; cross-table fails closed).
 2. **Learned + reviewed (phase 2).**
    - Learned weights (EM / logistic regression) over the same levels.
    - REVIEW band workflow: review queue, human curation, label capture; resolver
@@ -567,18 +579,18 @@ Resolution stage (done, `lib/resolver`):
 - [x] Deleted source extraction artifact clears the resolution artifact.
 - [x] Links to a provider-supplied candidate on a MATCH.
 
-Resolver / promoter integration (to come):
+Resolver / promoter integration:
 
-- The `resolution` worker advances `applied_sequence` only after the durable
-  job's write; a crash before the write replays the same extraction key.
-- Live candidate blocking returns the right ~k entities from the entity table.
-- Promoter upsert is idempotent under replay; concurrent promotions union
-  aliases.
-- Provenance mention edges appear/disappear with source documents.
-- Materializer writes edges to resolved `DocRef` endpoints; hydration of a
-  not-yet-promoted entity fails closed.
-- Fusion combines per-source confidences into the edge weight from a pinned
-  prior snapshot.
+- [x] The `resolution`/`promotion` workers advance `applied_sequence` only after
+  the durable write; idempotent replay re-applies (db-test).
+- [x] Live candidate blocking links across shards (e2e `test_resolution.py`).
+- [x] Promoter upsert is idempotent under replay; concurrent promotions union
+  aliases (db-test + `DistributedEntitySink` merge transform).
+- [x] Provenance mention edges appear with source documents and disappear on
+  source delete (db-test).
+- [x] Hydration of a not-yet-promoted entity fails closed (db-test).
+- [ ] Fusion combines per-source confidences into the edge weight from a pinned
+  prior snapshot (phase 2).
 
 ## Cross-shard candidate blocking (built; serving-layer injection remaining)
 

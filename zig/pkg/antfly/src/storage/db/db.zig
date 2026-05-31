@@ -23685,6 +23685,87 @@ test "db materializes doc->entity mention edges as provenance and clears them on
     }
 }
 
+test "db graph hydration fails closed for a not-yet-promoted entity node" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const mention_query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "prov_graph",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{ .edge_types = &.{"mentions"}, .direction = .out, .max_depth = 1 },
+        .include_documents = true,
+    };
+
+    // The mention edge points at person/ada_lovelace, but that entity document
+    // has not been promoted into this store: the node is returned as a graph
+    // result with its key, hydrated to nothing (fail closed), never fabricated.
+    {
+        var result = try db.search(alloc, .{ .graph_queries = &.{.{ .name = "m", .query = mention_query }} });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+        const hits = result.graph_results[0].hits;
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", hits[0].id);
+        try std.testing.expect(hits[0].stored_data == null);
+    }
+
+    // Once the entity document exists (promoter wrote it; here co-located for the
+    // single-store test), the same node hydrates instead of failing closed.
+    try db.batch(.{
+        .writes = &.{.{ .key = "person/ada_lovelace", .value =
+        \\{"entity_type":"person","canonical_name":"Ada Lovelace"}
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    {
+        var result = try db.search(alloc, .{ .graph_queries = &.{.{ .name = "m", .query = mention_query }} });
+        defer result.deinit();
+        const hits = result.graph_results[0].hits;
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", hits[0].id);
+        try std.testing.expect(hits[0].stored_data != null);
+        try std.testing.expect(std.mem.indexOf(u8, hits[0].stored_data.?, "Ada Lovelace") != null);
+    }
+}
+
 test "db graph relation artifact materializer uses mapping templates" {
     const alloc = std.testing.allocator;
 
