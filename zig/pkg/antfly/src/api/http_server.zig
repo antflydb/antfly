@@ -12743,7 +12743,9 @@ test "api http server create index expands schema-derived algebraic config" {
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"derive_from_schema\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"group_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"measure_fields\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"materializations\":[]") != null);
+    // The schema-derived config carries default materializations.
+    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"materializations\":[]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"op\":\"count\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"sum_by_customer\"") == null);
 }
 

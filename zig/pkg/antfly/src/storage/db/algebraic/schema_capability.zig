@@ -194,9 +194,98 @@ pub fn configJsonFromPlanAlloc(alloc: Allocator, table_name: []const u8, plan: P
     // "lazy_materialization_disabled" and no rollups are ever built.
     try out.appendSlice(alloc, ":{\"observe\":true,\"lazy_materialization\":true,\"dematerialization\":false,\"min_observations\":3},");
     try appendJsonString(alloc, &out, "materializations");
-    try out.appendSlice(alloc, ":[]}");
+    try out.append(alloc, ':');
+    try appendDefaultMaterializations(alloc, &out, plan);
+    try out.append(alloc, '}');
 
     return try out.toOwnedSlice(alloc);
+}
+
+/// Upper bound on the number of default materializations emitted from a schema.
+/// Each materialization is a rollup maintained on every write, so a wide table
+/// (many group x measure combinations) is capped here: beyond the cap only the
+/// per-group counts are emitted and the rest is left to adaptive materialization.
+const max_default_materializations: usize = 64;
+
+/// Default measure ops materialized per (group field, measure field). avg is
+/// derived from sum + count by the planner, so it is not materialized directly.
+const default_measure_ops = [_][]const u8{ "sum", "min", "max" };
+
+fn appendMaterializationEntry(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    seq: *usize,
+    op: []const u8,
+    group_field: []const u8,
+    measure: ?[]const u8,
+) !void {
+    if (!first.*) try out.append(alloc, ',');
+    first.* = false;
+    try out.append(alloc, '{');
+    try appendJsonString(alloc, out, "name");
+    try out.append(alloc, ':');
+    try appendFmt(alloc, out, "\"auto_{s}_{d}\"", .{ op, seq.* });
+    seq.* += 1;
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, out, "op");
+    try out.append(alloc, ':');
+    try appendJsonString(alloc, out, op);
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, out, "group_by");
+    try out.appendSlice(alloc, ":[");
+    try appendJsonString(alloc, out, group_field);
+    try out.append(alloc, ']');
+    if (measure) |m| {
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, out, "measure");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, m);
+    }
+    try out.append(alloc, '}');
+}
+
+/// Emit a bounded set of default materializations so common group-by
+/// aggregations are served from precomputed rollups immediately, rather than
+/// waiting for adaptive observation to build them: a `count` per group field,
+/// and sum/min/max per (group field, measure field). Bounded by
+/// `max_default_materializations`; a group field that is also the measure is
+/// skipped for the measure ops (a degenerate self-grouped metric).
+fn appendDefaultMaterializations(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), plan: Plan) !void {
+    var group_count: usize = 0;
+    var measure_count: usize = 0;
+    for (plan.fields) |field| {
+        switch (field.role) {
+            .group => group_count += 1,
+            .measure => measure_count += 1,
+            else => {},
+        }
+    }
+    const total = group_count + group_count * measure_count * default_measure_ops.len;
+    const include_measures = total <= max_default_materializations;
+
+    try out.append(alloc, '[');
+    var first = true;
+    var seq: usize = 0;
+
+    for (plan.fields) |gfield| {
+        if (gfield.role != .group) continue;
+        try appendMaterializationEntry(alloc, out, &first, &seq, "count", gfield.name, null);
+    }
+    if (include_measures) {
+        for (plan.fields) |gfield| {
+            if (gfield.role != .group) continue;
+            for (plan.fields) |mfield| {
+                if (mfield.role != .measure) continue;
+                if (std.mem.eql(u8, gfield.name, mfield.name)) continue;
+                for (default_measure_ops) |op| {
+                    try appendMaterializationEntry(alloc, out, &first, &seq, op, gfield.name, mfield.name);
+                }
+            }
+        }
+    }
+
+    try out.append(alloc, ']');
 }
 
 fn appendLawConfig(
@@ -506,7 +595,7 @@ test "schema capability plan extracts bounded scalar algebraic fields only" {
     try std.testing.expectEqual(@as(u32, 0), plan.skipped_unbounded_fields);
 }
 
-test "schema capability plan emits non-materializing algebraic config skeleton" {
+test "schema capability plan emits default materializations from group and measure fields" {
     const alloc = std.testing.allocator;
     var parsed = try schema_mod.parseValidatedTableSchema(alloc,
         \\{"version":5,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"}},"additionalProperties":false}}}}
@@ -524,10 +613,15 @@ test "schema capability plan emits non-materializing algebraic config skeleton" 
     try std.testing.expectEqual(@as(u32, 5), parsed_config.value.schema_version);
     try std.testing.expect(parsed_config.value.capability_fingerprint.len > 0);
     try std.testing.expectEqualStrings("current", parsed_config.value.capability_lifecycle_status);
+    // Group fields: kind, amount, created_at; measure: amount.
     try std.testing.expectEqual(@as(usize, 3), parsed_config.value.group_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.measure_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.time_fields.len);
-    try std.testing.expectEqual(@as(usize, 0), parsed_config.value.materializations.len);
+    // 3 per-group counts + sum/min/max for (kind,amount) and (created_at,amount)
+    // (amount x amount is skipped as a self-grouped metric) = 3 + 6 = 9.
+    try std.testing.expectEqual(@as(usize, 9), parsed_config.value.materializations.len);
+    // The derived config (with its default materializations) must validate.
+    try index_mod.validateConfig(parsed_config.value);
 }
 
 test "schema capability plan records unbounded dynamic schema metadata" {
@@ -557,14 +651,16 @@ test "schema capability config can compile directly from schema json" {
     try std.testing.expectEqualStrings("orders", parsed_config.value.table);
     try std.testing.expectEqual(@as(usize, 2), parsed_config.value.group_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.measure_fields.len);
-    try std.testing.expectEqual(@as(usize, 0), parsed_config.value.materializations.len);
+    // 2 per-group counts + sum/min/max for (tenant,amount) = 2 + 3 = 5.
+    try std.testing.expectEqual(@as(usize, 5), parsed_config.value.materializations.len);
 }
 
 test "schema capability config derives from a relational schema for auto-created index" {
     // A relational table's closed schema must derive a valid algebraic index
     // config (the basis for auto-creating an aggregation index): keyword columns
-    // become group axes, numeric columns become measures. No eager
-    // materializations -- adaptive observation fills them in.
+    // become group axes, numeric columns become measures, with default
+    // materializations for common group-bys (adaptive observation fills in the
+    // rest).
     const alloc = std.testing.allocator;
     const config_json = try configJsonFromSchemaJsonAlloc(alloc, "sales",
         \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created":{"type":"datetime"}},"required":["tenant","amount"],"additionalProperties":false}}}}
@@ -580,8 +676,9 @@ test "schema capability config derives from a relational schema for auto-created
     try std.testing.expectEqual(@as(usize, 4), parsed_config.value.group_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.measure_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.time_fields.len);
-    // No eager materializations; adaptive observation is on by default.
-    try std.testing.expectEqual(@as(usize, 0), parsed_config.value.materializations.len);
+    // 4 per-group counts + sum/min/max for (tenant,amount), (status,amount),
+    // (created,amount) [amount x amount skipped] = 4 + 9 = 13.
+    try std.testing.expectEqual(@as(usize, 13), parsed_config.value.materializations.len);
     try std.testing.expect(parsed_config.value.adaptive.observe);
     // The derived config must validate.
     try index_mod.validateConfig(parsed_config.value);

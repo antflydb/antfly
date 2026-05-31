@@ -1975,7 +1975,10 @@ test "metadata.table debug encoder emits runtime schemas and index bindings" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"capability_fingerprint\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lifecycle_status\":\"rebuild_required\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"requires_rebuild\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"materializations\":[]") != null);
+    // The schema-derived config carries default materializations (a per-group
+    // count for the single string group field).
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"materializations\":[]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"op\":\"count\"") != null);
 }
 
 test "create table parser preserves supported metadata fields" {
@@ -2007,7 +2010,11 @@ test "schema-derived algebraic indexes expand into explicit capability config" {
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"group_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"measure_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"time_fields\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, expanded, "\"materializations\":[]") != null);
+    // Default materializations are derived from the schema's group/measure fields.
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "\"materializations\":[]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "\"op\":\"count\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "\"op\":\"sum\"") != null);
+    // No user-named materializations are injected.
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"sum_by_customer\"") == null);
 }
 
@@ -2043,7 +2050,9 @@ test "single schema-derived algebraic index expands into explicit capability con
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"derive_from_schema\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"group_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"measure_fields\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, expanded, "\"materializations\":[]") != null);
+    // Default materializations are derived from the schema's group/measure fields.
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "\"materializations\":[]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "\"op\":\"count\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"sum_by_customer\"") == null);
 }
 
