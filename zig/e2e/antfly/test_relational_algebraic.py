@@ -174,3 +174,25 @@ def test_relational_aggregations_cover_all_matches_regardless_of_limit(stateful_
     # 3 matching rows (amounts 10 + 30 + 40 = 80), not all 5.
     s_active = _stats(stateful_api, table_name, "amount", limit=1, query="status:active")
     assert s_active["count"] == 3 and s_active["sum"] == 80, s_active
+
+
+def _cardinality(stateful_api, table_name, field, *, limit=10):
+    payload = {"limit": limit, "aggregations": {"c": {"type": "cardinality", "field": field}}}
+    result = stateful_api.query_table(table_name, payload)
+    responses = result.get("responses") or []
+    if not responses:
+        return None
+    c = (responses[0].get("aggregations") or {}).get("c")
+    return c.get("value") if c else None
+
+
+def test_relational_aggregations_served_by_algebraic_index(stateful_api):
+    """The auto-created algebraic index actually serves aggregations: a
+    cardinality aggregation (which has no scan-from-page fallback in this shape)
+    returns the correct distinct count, proving the index ingested the relational
+    rows and the planner selected it."""
+    table_name = _setup_relational(stateful_api, create_index=False)
+
+    # cardinality of `status` over the 5 rows = 2 distinct (active, archived).
+    card = wait_until(lambda: _cardinality(stateful_api, table_name, "status"), timeout_s=30.0, interval_s=0.5)
+    assert card == 2, card

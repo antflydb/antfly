@@ -3788,6 +3788,19 @@ pub const IndexManager = struct {
         return null;
     }
 
+    /// Resolve the algebraic index that should serve an aggregation. `preferred`
+    /// is the query's index_name, which usually names the *text* index, not an
+    /// algebraic one: use it only when it actually names an algebraic index,
+    /// otherwise fall back to the table's default algebraic index (the first
+    /// one). Returns null when the table has no algebraic index.
+    pub fn aggregationAlgebraicIndex(self: *IndexManager, preferred: ?[]const u8) ?*AlgebraicIndex {
+        if (preferred) |name| {
+            if (self.algebraicIndex(name)) |entry| return entry;
+        }
+        if (self.algebraic_indexes.items.len > 0) return &self.algebraic_indexes.items[0];
+        return null;
+    }
+
     fn textProjectionOptions(self: *const IndexManager, arena: Allocator) !mapper.TextProjectionOptions {
         return try self.textProjectionOptionsForSchema(arena, false);
     }

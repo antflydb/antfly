@@ -5552,10 +5552,10 @@ fn algebraicIndexFreshEnoughForName(
     index_name_opt: ?[]const u8,
     db: *db_mod.DB,
 ) !bool {
-    const entry = if (index_name_opt) |index_name|
-        db.core.index_manager.algebraicIndex(index_name) orelse return false
-    else
-        db.core.index_manager.algebraicIndex(null) orelse return false;
+    // The request's index_name selects the text index; the algebraic index used
+    // for aggregation pushdown is resolved independently (an explicit algebraic
+    // index name, else the table's default algebraic index).
+    const entry = db.core.index_manager.aggregationAlgebraicIndex(index_name_opt) orelse return false;
     if (entry.index.hasErrors()) return false;
     const target_sequence = db.core.nextDerivedSequence();
     var applied_sequence = try db.core.loadAppliedSequence(alloc, entry.config.name);

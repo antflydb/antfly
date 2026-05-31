@@ -563,11 +563,10 @@ fn resolveAlgebraicIndex(
     manager: *index_manager_mod.IndexManager,
     preferred_name: ?[]const u8,
 ) ?*index_manager_mod.IndexManager.AlgebraicIndex {
-    if (preferred_name) |name| {
-        if (manager.algebraicIndex(name)) |entry| return entry;
-        return null;
-    }
-    return manager.algebraicIndex(null);
+    // preferred_name is usually the query's text index_name, not an algebraic
+    // one: use it only if it names an algebraic index, else fall back to the
+    // table's default algebraic index.
+    return manager.aggregationAlgebraicIndex(preferred_name);
 }
 
 fn isAlgebraicMetricType(agg_type: []const u8) bool {
