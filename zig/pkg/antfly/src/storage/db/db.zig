@@ -33,6 +33,7 @@ const shard_mod = @import("../shard.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
+const resolver_lib = @import("antfly_resolver");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
 const types = @import("types.zig");
@@ -16091,7 +16092,27 @@ fn materializeGraphSourceArtifactsForIndex(
             defer if (raw_doc) |doc_value| alloc.free(doc_value);
             const graph_writes = try graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc);
             defer freeGraphWrites(alloc, graph_writes);
+            // Provenance: doc->entity mention edges to the resolved canonical
+            // keys, tracked alongside the relation edges so they share
+            // replace-on-rerender and delete-on-source-delete semantics.
+            const mention_writes: []types.GraphEdgeWrite = if (source.mention_edge_type.len > 0)
+                try mentionEdgeWritesAlloc(alloc, index_manager, index_name, artifact_ref.document_id, value, source.mention_edge_type, source.artifact_name)
+            else
+                &.{};
+            defer freeGraphWrites(alloc, mention_writes);
             for (graph_writes) |write| {
+                const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+                var key_owned = true;
+                errdefer if (key_owned) alloc.free(key);
+                const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+                var payload_owned = true;
+                errdefer if (payload_owned) alloc.free(payload);
+                try writes.append(alloc, .{ .key = key, .value = payload });
+                key_owned = false;
+                payload_owned = false;
+                try appendUniqueOwnedKey(alloc, &changed, key);
+            }
+            for (mention_writes) |write| {
                 const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
                 var key_owned = true;
                 errdefer if (key_owned) alloc.free(key);
@@ -16150,6 +16171,68 @@ fn freeGraphWrites(alloc: Allocator, writes: []types.GraphEdgeWrite) void {
         if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
     }
     if (writes.len > 0) alloc.free(writes);
+}
+
+/// Build `doc -> entity` mention edges (provenance) for the extracted mentions
+/// in `extraction_raw`. The target is the canonical entity key the resolver that
+/// consumes `artifact_name` renders via its `key_template` -- deterministic from
+/// the mention text, so the provenance edge exists even before the entity is
+/// promoted. Returns an empty slice when no resolver consumes the artifact.
+fn mentionEdgeWritesAlloc(
+    alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
+    index_name: []const u8,
+    doc_key: []const u8,
+    extraction_raw: []const u8,
+    mention_edge_type: []const u8,
+    artifact_name: []const u8,
+) ![]types.GraphEdgeWrite {
+    var resolver_cfg: ?*const index_manager_mod.ResolverConfig = null;
+    for (index_manager.resolvers.items) |*cfg| {
+        if (std.mem.eql(u8, cfg.source_artifact, artifact_name)) {
+            resolver_cfg = cfg;
+            break;
+        }
+    }
+    const cfg = resolver_cfg orelse return try alloc.alloc(types.GraphEdgeWrite, 0);
+
+    var resolver = try resolver_lib.Resolver.initFromParts(
+        alloc,
+        cfg.table,
+        cfg.key_template,
+        cfg.type_must_match,
+        cfg.scorer_json,
+    );
+    defer resolver.deinit();
+
+    var parsed = resolver_lib.parseExtractionEntities(alloc, extraction_raw) catch return try alloc.alloc(types.GraphEdgeWrite, 0);
+    defer parsed.deinit();
+
+    var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
+    errdefer freeGraphWrites(alloc, writes.items);
+    for (parsed.entities) |entity| {
+        const key = resolver.renderKeyAlloc(alloc, entity) catch continue;
+        defer alloc.free(@constCast(key));
+        if (key.len == 0) continue;
+        // One mention edge per distinct entity even if mentioned repeatedly.
+        var duplicate = false;
+        for (writes.items) |existing| {
+            if (std.mem.eql(u8, existing.target, key)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        try writes.append(alloc, .{
+            .index_name = try alloc.dupe(u8, index_name),
+            .source = try alloc.dupe(u8, doc_key),
+            .target = try alloc.dupe(u8, key),
+            .edge_type = try alloc.dupe(u8, mention_edge_type),
+            .weight = 1.0,
+            .metadata_json = try alloc.dupe(u8, "{}"),
+        });
+    }
+    return try writes.toOwnedSlice(alloc);
 }
 
 fn graphWritesFromArtifactValueAlloc(
@@ -23528,6 +23611,78 @@ test "db graph index materializes relation asset artifacts into graph edge artif
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("doc:b", edges[0].target);
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), edges[0].weight, 0.0001);
+}
+
+test "db materializes doc->entity mention edges as provenance and clears them on delete" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // The graph index materializes the relations_v1 extraction asset and, with
+    // mention_edge_type set, emits doc->entity provenance edges to the canonical
+    // entity keys the resolver renders.
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    // Outbound: doc:a mentions both canonical entities.
+    {
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 2), out.len);
+    }
+    // Inbound provenance: "which documents mention this entity" == inbound edges.
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 1), inbound.len);
+        try std.testing.expectEqualStrings("doc:a", inbound[0].source);
+        try std.testing.expectEqualStrings("person/ada_lovelace", inbound[0].target);
+    }
+
+    // Deleting the source document clears its mention edges (delete-on-source-delete).
+    try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    {
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 0), inbound.len);
+    }
 }
 
 test "db graph relation artifact materializer uses mapping templates" {

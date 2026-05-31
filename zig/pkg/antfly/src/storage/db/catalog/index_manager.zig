@@ -10060,6 +10060,11 @@ pub const GraphArtifactSource = struct {
     path: []u8 = "",
     format: GraphArtifactFormat = .extraction_relation,
     mapping: GraphArtifactMapping = .{},
+    /// When set, the materializer also emits `doc --<mention_edge_type>--> entity`
+    /// provenance edges: one per extracted mention, targeting the canonical
+    /// entity key rendered by the resolver that consumes the same source
+    /// artifact. Empty disables mention-edge provenance.
+    mention_edge_type: []u8 = "",
 
     pub fn clone(alloc: Allocator, source: GraphArtifactSource) !GraphArtifactSource {
         return .{
@@ -10067,6 +10072,7 @@ pub const GraphArtifactSource = struct {
             .path = if (source.path.len > 0) try alloc.dupe(u8, source.path) else "",
             .format = source.format,
             .mapping = try GraphArtifactMapping.clone(alloc, source.mapping),
+            .mention_edge_type = if (source.mention_edge_type.len > 0) try alloc.dupe(u8, source.mention_edge_type) else "",
         };
     }
 
@@ -10074,6 +10080,7 @@ pub const GraphArtifactSource = struct {
         alloc.free(self.artifact_name);
         if (self.path.len > 0) alloc.free(self.path);
         self.mapping.deinit(alloc);
+        if (self.mention_edge_type.len > 0) alloc.free(self.mention_edge_type);
         self.* = undefined;
     }
 };
@@ -10819,10 +10826,16 @@ fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtif
         return error.InvalidIndexConfig;
     } else GraphArtifactFormat.extraction_relation;
 
+    const mention_edge_type = if (source.object.get("mention_edge_type")) |value| blk: {
+        if (value != .string) return error.InvalidIndexConfig;
+        break :blk value.string;
+    } else "";
+
     var out = GraphArtifactSource{
         .artifact_name = try alloc.dupe(u8, artifact.string),
         .path = if (path.len > 0) try alloc.dupe(u8, path) else "",
         .format = format,
+        .mention_edge_type = if (mention_edge_type.len > 0) try alloc.dupe(u8, mention_edge_type) else "",
     };
     errdefer out.deinit(alloc);
     out.mapping = try parseGraphArtifactMapping(alloc, root);
