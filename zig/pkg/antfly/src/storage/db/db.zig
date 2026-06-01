@@ -3415,6 +3415,12 @@ pub const DB = struct {
                 const store_key = if (relational_columns != null) blk: {
                     try relational_participant.prepareUpsert("", write.key, store_value, null);
                     relational_participant_prepared = true;
+                    const primary_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
+                    var primary_key_owned = true;
+                    errdefer if (primary_key_owned) self.alloc.free(primary_key);
+                    try owned_delete_keys.append(self.alloc, primary_key);
+                    primary_key_owned = false;
+                    try delete_keys.append(self.alloc, primary_key);
                     break :blk store_writes.items[store_writes.items.len - 1].key;
                 } else blk: {
                     const key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
@@ -3529,6 +3535,12 @@ pub const DB = struct {
             if (self.relationalColumnsForStore() != null) {
                 try relational_participant.prepareDelete("", key, null);
                 relational_participant_prepared = true;
+                const primary_key = try internal_keys.documentKeyAlloc(self.alloc, key);
+                var primary_key_owned = true;
+                errdefer if (primary_key_owned) self.alloc.free(primary_key);
+                try owned_delete_keys.append(self.alloc, primary_key);
+                primary_key_owned = false;
+                try delete_keys.append(self.alloc, primary_key);
             } else {
                 const store_key = try internal_keys.documentKeyAlloc(self.alloc, key);
                 try owned_delete_keys.append(self.alloc, store_key);
@@ -14157,6 +14169,12 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     for (keys) |key| {
         if (ctx.relational_base_rows) {
             try relational_store_mod.appendDelete(ctx.alloc, &delete_keys, &owned_delete_keys, key);
+            const primary_key = try internal_keys.documentKeyAlloc(ctx.alloc, key);
+            var primary_key_owned = true;
+            errdefer if (primary_key_owned) ctx.alloc.free(primary_key);
+            try owned_delete_keys.append(ctx.alloc, primary_key);
+            primary_key_owned = false;
+            try delete_keys.append(ctx.alloc, primary_key);
         } else {
             const store_key = try internal_keys.documentKeyAlloc(ctx.alloc, key);
             try owned_delete_keys.append(ctx.alloc, store_key);
@@ -41290,9 +41308,25 @@ test "relational table point reads use only the relational base store" {
     try std.testing.expect(std.mem.indexOf(u8, scan_result.documents[0].json, "\"amount\"") == null);
 
     try db.batch(.{
+        .writes = &.{.{
+            .key = "row:base",
+            .value =
+            \\{"title":"updated row","amount":99.25,"attrs":{"tier":"platinum"}}
+            ,
+        }},
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+
+    const updated_doc = (try db.get(alloc, "row:base")).?;
+    defer alloc.free(updated_doc);
+    try std.testing.expect(std.mem.indexOf(u8, updated_doc, "\"title\":\"updated row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated_doc, "stale primary") == null);
+
+    try db.batch(.{
         .deletes = &.{"row:base"},
     });
     try std.testing.expect((try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:base")) == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
     try std.testing.expect((try db.get(alloc, "row:base")) == null);
 }
 

@@ -132,6 +132,9 @@ Current PR progress:
   relational intents now materialize only as relational base rows plus their
   timestamp/identity metadata, while stale generic primary rows are deleted as
   invariant cleanup.
+- foreground relational upserts/deletes and TTL-driven deletes also delete any
+  stale generic primary document row for the same id, so the generic primary
+  keyspace cannot survive normal relational write traffic.
 
 ## Implementation Phases
 
