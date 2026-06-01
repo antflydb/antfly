@@ -1729,3 +1729,89 @@ Metrics-on text timing aggregate:
 - Hit materialization timing: 3,653 ms
 
 Interpretation: this run is not a valid speed baseline. Both metrics-off and metrics-on ingest were much slower than the immediately preceding v23 run, object-read and batch-write latencies inflated, and the merge count rose sharply. The compact term block size held up (`88,233,855` metrics-on bytes), but the timing cannot prove that the prefix matcher recovered the front-coding CPU regression. Treat this as a noisy measurement and rerun before making throughput claims.
+
+## Valid Word-At-A-Time Prefix Matcher Baseline
+
+Run: `work-log/do8018/releasefast-baseline-20260601-093449`
+Commit: `7e94bc06c`
+
+Metrics off:
+
+- Load time: 43.828865666s
+- Async catch-up time: 12.260269584s
+- Total elapsed: 56.0892095s
+- Throughput: 1,610.92 records/sec, 4.92 MiB/sec
+- `ps` RSS: 648,232,960 bytes
+- Peak sampled RSS: 983,203,840 bytes
+- Process footprint metric: 126,753,632 bytes
+- Peak sampled process footprint: 729,390,088 bytes
+- Live malloc metric: 78,363,088 bytes
+- Peak sampled live malloc: 199,982,048 bytes
+- vmmap footprint: 126,772,838 bytes
+- vmmap mapped-file resident: 30,828,134 bytes
+- vmmap malloc allocated: 23,383,244 bytes
+- Segment files: 8
+- Segment bytes: 399,996,687
+- Stored fields bytes: 127,852,310
+- Inverted bytes: 268,032,648
+- Postings bytes: 147,064,526
+- Term block bytes: 96,824,673
+- Text merges completed: 165
+- Full-text build peak bytes: 151,777,684
+- Full-text pending peak bytes: 402,620,839
+- Text merge buffer peak bytes: 97,885,086
+- LSM mutable snapshot clone calls: 23
+- LSM mutable snapshot clone bytes total: 9,166,563
+- LSM mutable snapshot clone peak bytes: 1,019,373
+
+Metrics on:
+
+- Load time: 45.305085042s
+- Async catch-up time: 5.110258583s
+- Total elapsed: 50.415416667s
+- Throughput: 1,558.43 records/sec, 4.75 MiB/sec
+- `ps` RSS: 609,812,480 bytes
+- Peak sampled RSS: 1,044,496,384 bytes
+- Process footprint metric: 145,366,048 bytes
+- Peak sampled process footprint: 729,619,800 bytes
+- Live malloc metric: 85,401,264 bytes
+- Peak sampled live malloc: 244,445,488 bytes
+- vmmap footprint: 145,437,491 bytes
+- vmmap mapped-file resident: 31,981,568 bytes
+- vmmap malloc allocated: 33,554,432 bytes
+- Segment files: 8
+- Segment bytes: 395,329,542
+- Stored fields bytes: 127,733,242
+- Inverted bytes: 263,503,586
+- Postings bytes: 144,925,013
+- Term block bytes: 93,716,320
+- Text merges completed: 157
+- Full-text build peak bytes: 146,713,166
+- Full-text pending peak bytes: 396,592,706
+- Text merge buffer peak bytes: 129,678,722
+- LSM mutable snapshot clone calls: 32
+- LSM mutable snapshot clone bytes total: 15,954,614
+- LSM mutable snapshot clone peak bytes: 1,038,688
+
+Metrics-on text timing aggregate:
+
+- Timing lines: 177
+- Source/projection docs: 70,605 / 70,605
+- Total text build timing: 33,663 ms
+- Segment build timing: 33,646 ms
+- Segment encode timing: 12,982 ms
+- Inverted build timing: 11,214 ms
+- Inverted term dictionary timing: 7,677 ms
+- Inverted postings serialization timing: 2,338 ms
+- Inverted sort timing: 556 ms
+- Inverted final assembly timing: 244 ms
+- Inverted norms timing: 1 ms
+- Inverted bloom finish timing: 2 ms
+- Section attach timing: 0 ms
+- Segment assembly timing: 1,603 ms
+- Stored compression timing: 516 ms
+- Analyzer timing: 3,623 ms
+- Term accumulation timing: 2,560 ms
+- Hit materialization timing: 3,499 ms
+
+Interpretation: this repeat is a valid speed comparison. The noisy `20260601-092024` run was environmental; this run returned to the normal ingest band. Compared with the front-coded v23 baseline (`20260601-090240`), metrics-on text timing is effectively flat/slightly better (`34,032 ms` to `33,663 ms`), and term-dictionary timing improved (`8,118 ms` to `7,677 ms`). The prefix matcher does not make front coding dramatically faster, but it removes most evidence of a CPU regression while keeping the compact term block format.
