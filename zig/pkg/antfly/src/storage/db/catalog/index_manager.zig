@@ -2088,7 +2088,7 @@ pub const IndexManager = struct {
 
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
-        var txn = try runtime_store.store.beginRead();
+        var txn = try runtime_store.store.beginProbe();
         defer txn.abort();
         const data = txn.get(index_catalog_key) catch |err| switch (err) {
             error.NotFound => {
@@ -4889,7 +4889,7 @@ pub const IndexManager = struct {
 
         const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
         defer backend_scan.freeResults(self.alloc, docs);
-        var identity_txn = try runtime_store.store.beginRead();
+        var identity_txn = try runtime_store.store.beginProbe();
         defer identity_txn.abort();
 
         var mapped_docs = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
@@ -5567,7 +5567,7 @@ pub const IndexManager = struct {
     fn loadEnrichmentCatalog(self: *IndexManager, store: anytype) !void {
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
-        var txn = try runtime_store.store.beginRead();
+        var txn = try runtime_store.store.beginProbe();
         defer txn.abort();
         const data = txn.get(enrichment_catalog_key) catch |err| switch (err) {
             error.NotFound => return,
@@ -12149,7 +12149,7 @@ fn loadObservedTextFieldAnalyzers(alloc: Allocator, store: anytype, index_name: 
 
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginRead();
+    var txn = try runtime.store.beginProbe();
     defer txn.abort();
     const raw = txn.get(key) catch |err| switch (err) {
         error.NotFound => return &.{},
