@@ -42,6 +42,8 @@ const background_runtime = @import("../../background_runtime.zig");
 const doc_identity = @import("../doc_identity.zig");
 const doc_set = @import("../doc_set.zig");
 const derived_types = @import("../derived/derived_types.zig");
+const relational_store_mod = @import("../relational_store.zig");
+const typed_dv = @import("../../../section/typed_doc_values.zig");
 const regex_mod = @import("../../../search/regex.zig");
 const levenshtein_mod = @import("../../../search/levenshtein.zig");
 const geo_mod = @import("../../../search/geo.zig");
@@ -2968,6 +2970,7 @@ pub const Index = struct {
     // duped in), so config-derived and adaptive sketches are handled uniformly.
     // All read/maintenance paths iterate this, not config().hll_cardinalities.
     hll_registry: std.ArrayListUnmanaged(HllCardinalityConfig) = .empty,
+    relational_base_rows: bool = false,
     // Serializes index write transactions. The store contract is single-writer,
     // but background HLL maintenance (runHllMaintenance) opens its own write txn
     // on a separate thread concurrently with foreground applyBatch calls. Both
@@ -2991,6 +2994,10 @@ pub const Index = struct {
             try self.appendHllRegistryEntry(hcfg.name, hcfg.group_by, hcfg.value_field, hcfg.precision);
         }
         return self;
+    }
+
+    pub fn setRelationalBaseRows(self: *Index, enabled: bool) void {
+        self.relational_base_rows = enabled;
     }
 
     // Appends an owned copy of an HLL sketch config to the runtime registry.
@@ -3223,7 +3230,7 @@ pub const Index = struct {
             var materialized_value: ?[]u8 = null;
             defer if (materialized_value) |buf| self.alloc.free(buf);
             const value = doc.cleaned_value orelse blk: {
-                const store_key = try documentStoreKeyAlloc(self.alloc, doc.key);
+                const store_key = try self.documentStoreKeyAlloc(doc.key);
                 defer self.alloc.free(store_key);
                 const raw = txn.get(store_key) catch |err| switch (err) {
                     error.NotFound => continue,
@@ -3324,11 +3331,13 @@ pub const Index = struct {
         }
     }
 
-    fn documentStoreKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    fn documentStoreKeyAlloc(self: *const Index, doc_key: []const u8) ![]u8 {
         return if (internal_keys.isInternalUserKey(doc_key))
-            try alloc.dupe(u8, doc_key)
+            try self.alloc.dupe(u8, doc_key)
+        else if (self.relational_base_rows)
+            try relational_store_mod.rowKeyAlloc(self.alloc, doc_key)
         else
-            try internal_keys.documentKeyAlloc(alloc, doc_key);
+            try internal_keys.documentKeyAlloc(self.alloc, doc_key);
     }
 
     fn batchContainsUpsertDocument(batch: derived_types.DerivedBatch, doc_key: []const u8) bool {
@@ -20424,6 +20433,51 @@ test "algebraic HLL cardinality rebuilds after deletes via maintenance lane" {
     const deletes = [_][]const u8{ "o2", "o3" };
     try idx.applyBatch(&store, .{ .deleted_keys = deletes[0..] });
     try std.testing.expectEqual(@as(?u64, 1), try westEstimate(&idx, &store, west_group, alloc));
+}
+
+test "algebraic applyBatch reads relational base rows when document body omitted" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "events",
+        \\  "group_fields": [{"name":"region","path":"region","type":"string"}]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_relational_replay", cfg);
+    defer idx.close();
+    idx.setRelationalBaseRows(true);
+
+    const row_value = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "region",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "west" },
+        },
+    });
+    defer alloc.free(row_value);
+    const row_key = try relational_store_mod.rowKeyAlloc(alloc, "doc:a");
+    defer alloc.free(row_key);
+    try store.put(row_key, row_value);
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "doc:a", .action = .upsert, .cleaned_value = null },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const field_prefix = try idx.docFactScalarFieldPrefixAlloc(.group, "region");
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, field_prefix));
+
+    const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
+    defer alloc.free(west_token);
+    const west_prefix = try idx.docFactScalarPrefixAlloc(.group, "region", west_token);
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, west_prefix));
 }
 
 test "algebraic HLL cardinality stays correct under a concurrent threaded maintenance lane" {

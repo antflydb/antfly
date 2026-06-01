@@ -100,6 +100,9 @@ Current PR progress:
 - foreground, replay, catch-up, and split-shadow derived apply contexts carry
   the relational-base-row flag, so replays probe the relational row keyspace
   instead of the old primary document key;
+- algebraic derived apply also carries relational-base-row state, so batches
+  that need to re-read a document body hydrate from the relational row keyspace
+  before projecting facts/materializations;
 - generated-enrichment source reads carry the same relational-base-row state,
   so chunking, asset producers, dense embeddings, sparse embeddings, and
   generated-request planning read the committed relational row keyspace rather

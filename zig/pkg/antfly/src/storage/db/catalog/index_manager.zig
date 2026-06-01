@@ -1202,6 +1202,9 @@ pub const IndexManager = struct {
 
     pub fn setRelationalBaseRows(self: *IndexManager, enabled: bool) void {
         self.relational_base_rows = enabled;
+        for (self.algebraic_indexes.items) |*entry| {
+            entry.index.setRelationalBaseRows(enabled);
+        }
     }
 
     fn freeTextIndexEntry(self: *IndexManager, entry: *TextIndex) void {
@@ -5304,6 +5307,7 @@ pub const IndexManager = struct {
                     var doomed = index;
                     doomed.close();
                 };
+                index.setRelationalBaseRows(self.relational_base_rows);
                 if (self.resource_manager) |manager| index.attachResourceManager(manager);
                 if (self.hll_maintenance_lane) |lane| {
                     index.attachHllMaintenanceLane(lane, self.hll_maintenance_owner_id);
