@@ -46,10 +46,11 @@ const platform_time = @import("../platform/time.zig");
 //   v20: v19 + compact tagged term-block dictionary values
 //   v21: v20 + bit-packed postings chunk metadata columns
 //   v22: v21 + postings-offset deltas in term dictionary blocks
+//   v23: v22 + front-coded terms inside term dictionary blocks
 //
-// This project is pre-release; writers emit only the current v22 format.
+// This project is pre-release; writers emit only the current v23 format.
 
-const wire_version_current: u8 = 22;
+const wire_version_current: u8 = 23;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4 + 4; // 33 bytes
 const postings_chunk_meta_header_size: usize = 4;
 const postings_skip_record_size: usize = 8;
@@ -57,8 +58,6 @@ const postings_skip_stride_chunks: usize = 16;
 const postings_skip_min_chunks: usize = postings_skip_stride_chunks * 2;
 const term_dict_block_min_entries: usize = 25;
 const term_dict_block_max_entries: usize = 48;
-const term_dict_run_min_entries: usize = 4;
-const term_dict_run_max_entries: usize = 8;
 const term_dict_index_record_size: usize = 8;
 const term_dict_magic = "BTD4";
 const term_dict_header_size: usize = 20;
@@ -203,21 +202,6 @@ fn chooseTermBlockEnd(entries_len: usize, start: usize) usize {
     return start + block_len;
 }
 
-fn chooseTermRunEnd(block_end: usize, start: usize) usize {
-    const remaining = block_end - start;
-    if (remaining <= term_dict_run_max_entries) return block_end;
-
-    var run_len = term_dict_run_max_entries;
-    const tail = remaining - run_len;
-    if (tail > 0 and tail < term_dict_run_min_entries) {
-        const borrow = term_dict_run_min_entries - tail;
-        if (run_len > term_dict_run_min_entries + borrow) {
-            run_len -= borrow;
-        }
-    }
-    return start + run_len;
-}
-
 fn estimateTermDictBlockCount(entries_len: usize) usize {
     var count: usize = 0;
     var i: usize = 0;
@@ -314,26 +298,16 @@ fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry)
         try block_data.appendSlice(alloc, prefix);
 
         var last_postings_offset: u64 = 0;
-        var run_start = i;
-        while (run_start < end) {
-            const run_end = chooseTermRunEnd(end, run_start);
-            const first_suffix = entries[run_start].term[prefix.len..];
-            const last_suffix = entries[run_end - 1].term[prefix.len..];
-            const run_prefix_len = commonPrefixLen(first_suffix, last_suffix);
-            const run_prefix = first_suffix[0..run_prefix_len];
-
-            try writeVarintU32(alloc, &block_data, @intCast(run_prefix.len));
-            try writeVarintU32(alloc, &block_data, @intCast(run_end - run_start));
-            try block_data.appendSlice(alloc, run_prefix);
-
-            for (entries[run_start..run_end]) |entry| {
-                const leaf = entry.term[prefix.len + run_prefix.len ..];
-                try writeVarintU32(alloc, &block_data, @intCast(leaf.len));
-                try block_data.appendSlice(alloc, leaf);
-                try writeVarintU64(alloc, &block_data, encodeTermDictBlockValueDelta(entry.value, &last_postings_offset));
-            }
-
-            run_start = run_end;
+        var previous_suffix: []const u8 = &.{};
+        for (entries[i..end]) |entry| {
+            const suffix = entry.term[prefix.len..];
+            const shared_len = commonPrefixLen(previous_suffix, suffix);
+            const leaf = suffix[shared_len..];
+            try writeVarintU32(alloc, &block_data, @intCast(shared_len));
+            try writeVarintU32(alloc, &block_data, @intCast(leaf.len));
+            try block_data.appendSlice(alloc, leaf);
+            try writeVarintU64(alloc, &block_data, encodeTermDictBlockValueDelta(entry.value, &last_postings_offset));
+            previous_suffix = suffix;
         }
 
         block_count += 1;
@@ -1564,30 +1538,20 @@ pub const InvertedIndexReader = struct {
         if (!std.mem.startsWith(u8, term, prefix)) return error.NotFound;
         const wanted_suffix = term[prefix.len..];
 
+        var suffix_buf = std.ArrayListUnmanaged(u8).empty;
+        defer suffix_buf.deinit(self.alloc);
         var last_postings_offset: u64 = 0;
         var remaining = entry_count;
-        while (remaining > 0) {
-            const run_prefix_len = try readVarintU32(self.dict_blocks, &cursor);
-            const run_count = try readVarintU32(self.dict_blocks, &cursor);
-            if (run_count == 0 or run_count > remaining) return error.InvalidData;
-            if (cursor + run_prefix_len > self.dict_blocks.len) return error.Truncated;
-            const run_prefix = self.dict_blocks[cursor..][0..run_prefix_len];
-            cursor += run_prefix_len;
-
-            const in_run = std.mem.startsWith(u8, wanted_suffix, run_prefix);
-            const wanted_leaf = if (in_run) wanted_suffix[run_prefix.len..] else &.{};
-
-            var i: u32 = 0;
-            while (i < run_count) : (i += 1) {
-                const leaf_len = try readVarintU32(self.dict_blocks, &cursor);
-                if (cursor + leaf_len > self.dict_blocks.len) return error.Truncated;
-                const leaf = self.dict_blocks[cursor..][0..leaf_len];
-                cursor += leaf_len;
-                const value = decodeTermDictBlockValueDelta(try readVarintU64(self.dict_blocks, &cursor), &last_postings_offset);
-                if (in_run and std.mem.eql(u8, leaf, wanted_leaf)) return value;
-            }
-
-            remaining -= run_count;
+        while (remaining > 0) : (remaining -= 1) {
+            const shared_len = try readVarintU32(self.dict_blocks, &cursor);
+            const leaf_len = try readVarintU32(self.dict_blocks, &cursor);
+            if (shared_len > suffix_buf.items.len) return error.InvalidData;
+            if (cursor + leaf_len > self.dict_blocks.len) return error.Truncated;
+            suffix_buf.shrinkRetainingCapacity(shared_len);
+            try suffix_buf.appendSlice(self.alloc, self.dict_blocks[cursor..][0..leaf_len]);
+            cursor += leaf_len;
+            const value = decodeTermDictBlockValueDelta(try readVarintU64(self.dict_blocks, &cursor), &last_postings_offset);
+            if (std.mem.eql(u8, suffix_buf.items, wanted_suffix)) return value;
         }
         return error.NotFound;
     }
@@ -1645,8 +1609,6 @@ pub const TermIterator = struct {
     current_block_prefix: []const u8 = &.{},
     current_block_cursor: usize = 0,
     current_block_remaining: u32 = 0,
-    current_run_prefix: []const u8 = &.{},
-    current_run_remaining: u32 = 0,
     current_block_last_postings_offset: u64 = 0,
     start: ?[]const u8 = null,
     end: ?[]const u8 = null,
@@ -1661,21 +1623,17 @@ pub const TermIterator = struct {
             if (self.current_block_remaining == 0) {
                 if (!try self.loadNextBlock()) return null;
             }
-            if (self.current_run_remaining == 0) {
-                try self.loadNextRun();
-            }
 
+            const shared_len = readVarintU32(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData;
             const leaf_len = readVarintU32(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData;
+            if (shared_len > self.current_key.items.len) return error.InvalidData;
             if (self.current_block_cursor + leaf_len > self.reader.dict_blocks.len) return error.InvalidData;
             const leaf = self.reader.dict_blocks[self.current_block_cursor..][0..leaf_len];
             self.current_block_cursor += leaf_len;
             const value = decodeTermDictBlockValueDelta(readVarintU64(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData, &self.current_block_last_postings_offset);
             self.current_block_remaining -= 1;
-            self.current_run_remaining -= 1;
 
-            self.current_key.clearRetainingCapacity();
-            try self.current_key.appendSlice(self.alloc, self.current_block_prefix);
-            try self.current_key.appendSlice(self.alloc, self.current_run_prefix);
+            self.current_key.shrinkRetainingCapacity(self.current_block_prefix.len + shared_len);
             try self.current_key.appendSlice(self.alloc, leaf);
 
             if (self.start) |start| {
@@ -1713,20 +1671,9 @@ pub const TermIterator = struct {
         cursor += prefix_len;
         self.current_block_cursor = cursor;
         self.current_block_last_postings_offset = 0;
-        self.current_run_prefix = &.{};
-        self.current_run_remaining = 0;
+        self.current_key.clearRetainingCapacity();
+        try self.current_key.appendSlice(self.alloc, self.current_block_prefix);
         return true;
-    }
-
-    fn loadNextRun(self: *TermIterator) !void {
-        if (self.current_block_remaining == 0) return error.InvalidData;
-        const run_prefix_len = readVarintU32(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData;
-        const run_count = readVarintU32(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData;
-        if (run_count == 0 or run_count > self.current_block_remaining) return error.InvalidData;
-        if (self.current_block_cursor + run_prefix_len > self.reader.dict_blocks.len) return error.InvalidData;
-        self.current_run_prefix = self.reader.dict_blocks[self.current_block_cursor..][0..run_prefix_len];
-        self.current_block_cursor += run_prefix_len;
-        self.current_run_remaining = run_count;
     }
 
     pub fn deinit(self: *TermIterator) void {
@@ -2974,7 +2921,7 @@ fn legacyV14TermBlockDataBytesForTest(entries: []const TermDictEntry) usize {
     return total;
 }
 
-test "v20 term dictionary stores local prefix runs indexed by block ceiling" {
+test "v23 term dictionary stores front-coded blocks indexed by block ceiling" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{});
     defer builder.deinit();
@@ -3011,10 +2958,14 @@ test "v20 term dictionary stores local prefix runs indexed by block ceiling" {
     try std.testing.expect(first_prefix_len > 2);
     _ = try readVarintU32(dict, &block_cursor);
     block_cursor += first_prefix_len;
-    const first_run_prefix_len = try readVarintU32(dict, &block_cursor);
-    const first_run_entry_count = try readVarintU32(dict, &block_cursor);
-    try std.testing.expect(first_run_prefix_len > 0);
-    try std.testing.expect(first_run_entry_count <= term_dict_run_max_entries);
+    const first_shared_len = try readVarintU32(dict, &block_cursor);
+    const first_leaf_len = try readVarintU32(dict, &block_cursor);
+    try std.testing.expectEqual(@as(u32, 0), first_shared_len);
+    try std.testing.expect(first_leaf_len > 0);
+    block_cursor += first_leaf_len;
+    _ = try readVarintU64(dict, &block_cursor);
+    const second_shared_len = try readVarintU32(dict, &block_cursor);
+    try std.testing.expect(second_shared_len > 0);
 
     var reader = try InvertedIndexReader.init(alloc, section);
     try std.testing.expect(reader.lookup("aa000") != null);
@@ -3034,7 +2985,7 @@ test "v20 term dictionary stores local prefix runs indexed by block ceiling" {
     try std.testing.expect(try range_iter.next() == null);
 }
 
-test "v20 term dictionary local prefix runs shrink block payload" {
+test "v23 term dictionary front coding shrinks block payload" {
     const alloc = std.testing.allocator;
 
     var terms = std.ArrayListUnmanaged([]const u8).empty;
@@ -3047,7 +2998,7 @@ test "v20 term dictionary local prefix runs shrink block payload" {
 
     var i: usize = 0;
     while (i < 48) : (i += 1) {
-        const term = try std.fmt.allocPrint(alloc, "group{d:0>2}_shared_component_{d:0>3}", .{ i / term_dict_run_max_entries, i });
+        const term = try std.fmt.allocPrint(alloc, "group{d:0>2}_shared_component_{d:0>3}", .{ i / 8, i });
         errdefer alloc.free(term);
         try terms.append(alloc, term);
         try entries.append(alloc, .{ .term = term, .value = @intCast(i + 1) });
