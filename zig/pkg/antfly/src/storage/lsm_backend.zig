@@ -7300,6 +7300,49 @@ test "lsm backend current scan reuses run grouping across cursor movement" {
     try std.testing.expectEqual(after_open.run_group_l0_runs, after_scan.run_group_l0_runs);
 }
 
+test "lsm backend current probe getManySorted reuses source layout across chunks" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1024,
+        .l0_overlap_compact_threshold_runs = 1024,
+        .wal_enabled = false,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var key_buf: [32]u8 = undefined;
+    var value_buf: [32]u8 = undefined;
+    for (0..160) |i| {
+        var write = try runtime.beginWrite();
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>3}", .{i});
+        const value = try std.fmt.bufPrint(&value_buf, "value-{d}", .{i});
+        try write.put(key, value);
+        try write.commit();
+    }
+
+    try backend.mutable.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:live", "value-live", false);
+
+    var key_storage: [160][16]u8 = undefined;
+    var keys: [160][]const u8 = undefined;
+    var values: [160]?[]const u8 = undefined;
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_storage[i], "doc:{d:0>3}", .{i});
+    }
+    @memset(&values, null);
+
+    const before_read = backend.snapshotReadStats();
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+    try probe.getManySorted(&keys, &values);
+    const after_read = backend.snapshotReadStats();
+
+    try std.testing.expectEqual(@as(u64, 1), after_read.run_group_builds - before_read.run_group_builds);
+    try std.testing.expectEqualStrings("value-0", values[0].?);
+    try std.testing.expectEqualStrings("value-159", values[159].?);
+}
+
 test "lsm backend current scan does not rotate or clone mutable writer generation" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
     defer backend.close();

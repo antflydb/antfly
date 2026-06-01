@@ -211,6 +211,10 @@ Large-ingest guardrails:
 6. [ ] Cache per-cursor source layout (`runs`, L0 groups, lower levels, and
    immutable pointer slice) across repeated seeks while the cursor snapshot is
    valid.
+   - [x] Current-live probe and large write-batch `getManySorted` now build
+     the active source layout once per batch and reuse it across backend-lock
+     chunks, avoiding repeated run/L0/level reconstruction for the same live
+     read view.
 7. [ ] Add table block smallest-key metadata and use block min/max bounds to
    skip non-overlapping range-scan blocks.
    - [x] First slice: table footer metadata now records per-block smallest

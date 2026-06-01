@@ -2118,9 +2118,52 @@ fn lowerBoundRunStart(keys: []const []const u8, namespace: backend_types.Namespa
     return lo;
 }
 
-fn readManySortedCurrentLocked(
+fn CurrentReadLayout(comptime BackendType: type) type {
+    return struct {
+        backend: *BackendType,
+        metadata_allocator: Allocator,
+        immutable_memtables: []const *const State = &.{},
+        runs: []Run = &.{},
+        l0_groups: []RunGroup = &.{},
+        levels: []RunLevel = &.{},
+
+        fn init(backend: *BackendType, allocator: Allocator) !@This() {
+            const metadata_allocator = runtimeScratchAllocator(allocator);
+            const runs = try borrowRunSnapshotList(metadata_allocator, backend.runs.items);
+            errdefer freeRunSnapshotList(metadata_allocator, runs);
+            const l0_groups = try buildL0RunGroupsWithStats(backend, metadata_allocator, runs);
+            errdefer deinitRunGroups(metadata_allocator, l0_groups);
+            const levels = try buildLowerLevels(metadata_allocator, runs);
+            errdefer metadata_allocator.free(levels);
+            const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
+                try backend.snapshotImmutableMemtables()
+            else
+                &.{};
+            errdefer if (immutable_memtables.len > 0) backend.allocator.free(immutable_memtables);
+            return .{
+                .backend = backend,
+                .metadata_allocator = metadata_allocator,
+                .immutable_memtables = immutable_memtables,
+                .runs = runs,
+                .l0_groups = l0_groups,
+                .levels = levels,
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            deinitRunGroups(self.metadata_allocator, self.l0_groups);
+            self.metadata_allocator.free(self.levels);
+            freeRunSnapshotList(self.metadata_allocator, self.runs);
+            if (self.immutable_memtables.len > 0) self.backend.allocator.free(self.immutable_memtables);
+            self.* = undefined;
+        }
+    };
+}
+
+fn readManySortedCurrentWithLayoutLocked(
     comptime BackendType: type,
     backend: *BackendType,
+    layout: *const CurrentReadLayout(BackendType),
     namespace: backend_types.Namespace,
     allocator: Allocator,
     held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
@@ -2129,28 +2172,16 @@ fn readManySortedCurrentLocked(
     values: []?[]const u8,
 ) !BatchCursorReadResult {
     const LocalCursor = MergeCursor(BackendType, ActiveMemTable);
-    const metadata_allocator = runtimeScratchAllocator(allocator);
-    const runs = try borrowRunSnapshotList(metadata_allocator, backend.runs.items);
-    defer freeRunSnapshotList(metadata_allocator, runs);
-    const l0_groups = try buildL0RunGroupsWithStats(backend, metadata_allocator, runs);
-    defer deinitRunGroups(metadata_allocator, l0_groups);
-    const levels = try buildLowerLevels(metadata_allocator, runs);
-    defer metadata_allocator.free(levels);
-    const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
-        try backend.snapshotImmutableMemtables()
-    else
-        &.{};
-    defer if (immutable_memtables.len > 0) backend.allocator.free(immutable_memtables);
 
     switch (chooseMultiGetPlan(keys, .stable_probe)) {
         .cursor => {},
         .sorted_by_run => return try readManySortedByRunFromSnapshot(
             backend,
             &backend.mutable,
-            immutable_memtables,
-            runs,
-            l0_groups,
-            levels,
+            layout.immutable_memtables,
+            layout.runs,
+            layout.l0_groups,
+            layout.levels,
             allocator,
             null,
             held_values,
@@ -2162,10 +2193,10 @@ fn readManySortedCurrentLocked(
         .point => return try readManySortedPointFromSnapshot(
             backend,
             &backend.mutable,
-            immutable_memtables,
-            runs,
-            l0_groups,
-            levels,
+            layout.immutable_memtables,
+            layout.runs,
+            layout.l0_groups,
+            layout.levels,
             allocator,
             null,
             held_values,
@@ -2176,10 +2207,25 @@ fn readManySortedCurrentLocked(
         ),
     }
 
-    var cursor = try LocalCursor.init(metadata_allocator, backend, &backend.mutable, immutable_memtables, runs, l0_groups, levels, namespace, true);
+    var cursor = try LocalCursor.init(layout.metadata_allocator, backend, &backend.mutable, layout.immutable_memtables, layout.runs, layout.l0_groups, layout.levels, namespace, true);
     defer cursor.close();
 
     return try readManySortedFromCursor(backend, allocator, held_blocks, held_values, &cursor, keys, values);
+}
+
+fn readManySortedCurrentLocked(
+    comptime BackendType: type,
+    backend: *BackendType,
+    namespace: backend_types.Namespace,
+    allocator: Allocator,
+    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_values: *std.ArrayListUnmanaged([]u8),
+    keys: []const []const u8,
+    values: []?[]const u8,
+) !BatchCursorReadResult {
+    var layout = try CurrentReadLayout(BackendType).init(backend, allocator);
+    defer layout.deinit();
+    return try readManySortedCurrentWithLayoutLocked(BackendType, backend, &layout, namespace, allocator, held_blocks, held_values, keys, values);
 }
 
 pub fn BoundReadTxn(comptime BackendType: type) type {
@@ -2418,14 +2464,14 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             self.backend.recordGetManySortedLocality(keys);
 
             var result: BatchCursorReadResult = .{};
-            var offset: usize = 0;
-            while (offset < keys.len) {
-                const end = @min(offset + max_current_batch_read_keys_per_backend_lock, keys.len);
-                const plan = chooseMultiGetPlan(keys[offset..end], if (self.stable_point_view) .stable_probe else .current_live);
-                recordMultiGetPlan(self.backend, plan);
-                const chunk_result = if (self.stable_point_view) blk: {
+            if (self.stable_point_view) {
+                var offset: usize = 0;
+                while (offset < keys.len) {
+                    const end = @min(offset + max_current_batch_read_keys_per_backend_lock, keys.len);
+                    const plan = chooseMultiGetPlan(keys[offset..end], .stable_probe);
+                    recordMultiGetPlan(self.backend, plan);
                     try self.ensureStablePointViewLoaded();
-                    break :blk switch (plan) {
+                    const chunk_result = switch (plan) {
                         .sorted_by_run => try readManySortedByRunFromSnapshot(
                             self.backend,
                             &self.empty_state,
@@ -2457,17 +2503,42 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             false,
                         ),
                     };
-                } else blk: {
-                    const locked = lockBackend(BackendType, self.backend);
-                    defer unlockBackend(BackendType, self.backend, locked);
-                    break :blk switch (plan) {
-                        .cursor => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_blocks, &self.held_values, keys[offset..end], values[offset..end]),
-                        .sorted_by_run => try readManyCurrentSortedPointByRunLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_blocks, &self.held_values, keys[offset..end], values[offset..end]),
-                        .point => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_blocks, &self.held_values, keys[offset..end], values[offset..end]),
+                    result.add(chunk_result);
+                    offset = end;
+                }
+            } else {
+                const locked = lockBackend(BackendType, self.backend);
+                defer unlockBackend(BackendType, self.backend, locked);
+                var layout = try CurrentReadLayout(BackendType).init(self.backend, self.allocator);
+                defer layout.deinit();
+
+                var offset: usize = 0;
+                while (offset < keys.len) {
+                    const end = @min(offset + max_current_batch_read_keys_per_backend_lock, keys.len);
+                    const plan = chooseMultiGetPlan(keys[offset..end], .current_live);
+                    recordMultiGetPlan(self.backend, plan);
+                    const chunk_result = switch (plan) {
+                        .cursor => try readManySortedCurrentWithLayoutLocked(BackendType, self.backend, &layout, self.namespace, self.allocator, &self.held_blocks, &self.held_values, keys[offset..end], values[offset..end]),
+                        .sorted_by_run => try readManySortedByRunFromSnapshot(
+                            self.backend,
+                            &self.backend.mutable,
+                            layout.immutable_memtables,
+                            layout.runs,
+                            layout.l0_groups,
+                            layout.levels,
+                            self.allocator,
+                            &self.held_blocks,
+                            &self.held_values,
+                            self.namespace,
+                            keys[offset..end],
+                            values[offset..end],
+                            true,
+                        ),
+                        .point => try readManySortedCurrentWithLayoutLocked(BackendType, self.backend, &layout, self.namespace, self.allocator, &self.held_blocks, &self.held_values, keys[offset..end], values[offset..end]),
                     };
-                };
-                result.add(chunk_result);
-                offset = end;
+                    result.add(chunk_result);
+                    offset = end;
+                }
             }
             self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
@@ -2956,23 +3027,59 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (miss_count > 0) {
                 const miss_values = try self.metadata_allocator.alloc(?[]const u8, miss_count);
                 defer self.metadata_allocator.free(miss_values);
-                var offset: usize = 0;
-                while (offset < miss_count) {
-                    const end = @min(offset + max_current_batch_read_keys_per_backend_lock, miss_count);
-                    const plan = chooseMultiGetPlan(miss_keys[offset..end], .current_live);
-                    recordMultiGetPlan(self.backend, plan);
-                    const result = blk: {
-                        const locked = lockBackend(BackendType, self.backend);
-                        defer unlockBackend(BackendType, self.backend, locked);
-                        break :blk switch (plan) {
-                            .cursor => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                            .sorted_by_run => try readManyCurrentSortedPointByRunLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                            .point => try readManyCurrentPointLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
+                if (miss_count > max_current_batch_read_keys_per_backend_lock) {
+                    const locked = lockBackend(BackendType, self.backend);
+                    defer unlockBackend(BackendType, self.backend, locked);
+                    var layout = try CurrentReadLayout(BackendType).init(self.backend, self.allocator);
+                    defer layout.deinit();
+
+                    var offset: usize = 0;
+                    while (offset < miss_count) {
+                        const end = @min(offset + max_current_batch_read_keys_per_backend_lock, miss_count);
+                        const plan = chooseMultiGetPlan(miss_keys[offset..end], .current_live);
+                        recordMultiGetPlan(self.backend, plan);
+                        const result = switch (plan) {
+                            .cursor => try readManySortedCurrentWithLayoutLocked(BackendType, self.backend, &layout, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
+                            .sorted_by_run => try readManySortedByRunFromSnapshot(
+                                self.backend,
+                                &self.backend.mutable,
+                                layout.immutable_memtables,
+                                layout.runs,
+                                layout.l0_groups,
+                                layout.levels,
+                                self.allocator,
+                                null,
+                                &self.held_values,
+                                self.namespace,
+                                miss_keys[offset..end],
+                                miss_values[offset..end],
+                                true,
+                            ),
+                            .point => try readManySortedCurrentWithLayoutLocked(BackendType, self.backend, &layout, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
                         };
-                    };
-                    hits += result.hits;
-                    misses += result.misses;
-                    offset = end;
+                        hits += result.hits;
+                        misses += result.misses;
+                        offset = end;
+                    }
+                } else {
+                    var offset: usize = 0;
+                    while (offset < miss_count) {
+                        const end = @min(offset + max_current_batch_read_keys_per_backend_lock, miss_count);
+                        const plan = chooseMultiGetPlan(miss_keys[offset..end], .current_live);
+                        recordMultiGetPlan(self.backend, plan);
+                        const result = blk: {
+                            const locked = lockBackend(BackendType, self.backend);
+                            defer unlockBackend(BackendType, self.backend, locked);
+                            break :blk switch (plan) {
+                                .cursor => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
+                                .sorted_by_run => try readManyCurrentSortedPointByRunLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
+                                .point => try readManyCurrentPointLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
+                            };
+                        };
+                        hits += result.hits;
+                        misses += result.misses;
+                        offset = end;
+                    }
                 }
                 for (miss_values, 0..) |maybe_value, miss_index| {
                     values[miss_indexes[miss_index]] = maybe_value;
