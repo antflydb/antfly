@@ -2672,6 +2672,7 @@ pub const DB = struct {
             .store = self.core.store,
             .identity_namespace = self.core.identity_namespace,
             .alloc = self.runtime_alloc,
+            .relational_base_rows = self.relationalColumnsForStore() != null,
         };
         var effective_cfg = cfg;
         effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
@@ -4926,9 +4927,34 @@ pub const DB = struct {
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
+        var relational_intents = std.ArrayListUnmanaged(transactions_mod.WriteIntent).empty;
+        defer relational_intents.deinit(self.alloc);
+        var owned_relational_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_relational_values.items) |value| self.alloc.free(value);
+            owned_relational_values.deinit(self.alloc);
+        }
+        const effective_intents = blk: {
+            const relational_columns = self.relationalColumnsForStore() orelse break :blk intents;
+            for (intents) |intent| {
+                const value = if (intent.value) |raw|
+                    if (isMetadataKey(intent.key) or internal_keys.isInternalUserKey(intent.key))
+                        raw
+                    else
+                        try relationalStoreRowValueAlloc(self.alloc, raw, relational_columns, &owned_relational_values)
+                else
+                    null;
+                try relational_intents.append(self.alloc, .{
+                    .key = intent.key,
+                    .value = value,
+                });
+            }
+            break :blk relational_intents.items;
+        };
+
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(self.alloc);
-        for (intents) |intent| {
+        for (effective_intents) |intent| {
             if (intent.value == null or isMetadataKey(intent.key)) continue;
             try identity_upsert_keys.append(self.alloc, intent.key);
         }
@@ -4936,7 +4962,7 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
-        try self.core.writeIntents(txn_id, intents, predicates);
+        try self.core.writeIntents(txn_id, effective_intents, predicates);
     }
 
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
@@ -5003,6 +5029,24 @@ pub const DB = struct {
             }
             identity_writes.deinit(self.alloc);
         }
+        var relational_extra_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer {
+            for (relational_extra_writes.items) |item| {
+                self.alloc.free(@constCast(item.key));
+                self.alloc.free(@constCast(item.value));
+            }
+            relational_extra_writes.deinit(self.alloc);
+        }
+        var relational_extra_deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (relational_extra_deletes.items) |key| self.alloc.free(@constCast(key));
+            relational_extra_deletes.deinit(self.alloc);
+        }
+        var relational_skip_intent_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (relational_skip_intent_keys.items) |key| self.alloc.free(@constCast(key));
+            relational_skip_intent_keys.deinit(self.alloc);
+        }
 
         if (status == .committed) {
             try self.core.collectTransactionIntentDocumentKeys(self.alloc, txn_id, &raw_identity_upserts, &raw_identity_deletes);
@@ -5021,11 +5065,69 @@ pub const DB = struct {
                 identity_upserts.items,
                 identity_deletes.items,
             );
+            if (self.relationalColumnsForStore() != null) {
+                const mutations = try self.core.collectTransactionIntentMutations(self.alloc, txn_id);
+                defer {
+                    for (mutations) |*mutation| mutation.deinit(self.alloc);
+                    if (mutations.len > 0) self.alloc.free(mutations);
+                }
+                for (mutations) |mutation| {
+                    if (isMetadataKey(mutation.key) or internal_keys.isInternalUserKey(mutation.key)) continue;
+                    const skip_key = try self.alloc.dupe(u8, mutation.key);
+                    var skip_key_owned = true;
+                    errdefer if (skip_key_owned) self.alloc.free(skip_key);
+                    try relational_skip_intent_keys.append(self.alloc, skip_key);
+                    skip_key_owned = false;
+
+                    const primary_key = try internal_keys.documentKeyAlloc(self.alloc, mutation.key);
+                    var primary_key_owned = true;
+                    errdefer if (primary_key_owned) self.alloc.free(primary_key);
+                    try relational_extra_deletes.append(self.alloc, primary_key);
+                    primary_key_owned = false;
+
+                    const row_key = try relational_store_mod.rowKeyAlloc(self.alloc, mutation.key);
+                    var row_key_owned = true;
+                    errdefer if (row_key_owned) self.alloc.free(row_key);
+                    if (mutation.value) |value| {
+                        const row_value = try self.alloc.dupe(u8, value);
+                        var row_value_owned = true;
+                        errdefer if (row_value_owned) self.alloc.free(row_value);
+                        try relational_extra_writes.append(self.alloc, .{ .key = row_key, .value = row_value });
+                        row_key_owned = false;
+                        row_value_owned = false;
+                        if (shouldWriteTimestamp(mutation.key)) {
+                            const timestamp_key = try makeTimestampKey(self.alloc, mutation.key);
+                            var timestamp_key_owned = true;
+                            errdefer if (timestamp_key_owned) self.alloc.free(timestamp_key);
+                            const timestamp_value = try encodeTimestampValue(self.alloc, commit_version);
+                            var timestamp_value_owned = true;
+                            errdefer if (timestamp_value_owned) self.alloc.free(timestamp_value);
+                            try relational_extra_writes.append(self.alloc, .{ .key = timestamp_key, .value = timestamp_value });
+                            timestamp_key_owned = false;
+                            timestamp_value_owned = false;
+                        }
+                    } else {
+                        try relational_extra_deletes.append(self.alloc, row_key);
+                        row_key_owned = false;
+                        if (shouldWriteTimestamp(mutation.key)) {
+                            const timestamp_key = try makeTimestampKey(self.alloc, mutation.key);
+                            var timestamp_key_owned = true;
+                            errdefer if (timestamp_key_owned) self.alloc.free(timestamp_key);
+                            try relational_extra_deletes.append(self.alloc, timestamp_key);
+                            timestamp_key_owned = false;
+                        }
+                    }
+                }
+            }
         }
 
         const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
+        try identity_writes.appendSlice(self.alloc, relational_extra_writes.items);
+        relational_extra_writes.clearRetainingCapacity();
         try self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
             .writes = identity_writes.items,
+            .deletes = relational_extra_deletes.items,
+            .skip_intent_keys = relational_skip_intent_keys.items,
         });
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
@@ -7637,7 +7739,10 @@ pub const DB = struct {
         defer self.core.unlockApply();
         try doc_identity.reassignNamespaceAlloc(self.alloc, self.core.store, namespace);
         self.core.identity_namespace = namespace;
-        if (self.transaction_recovery_identity_context) |ctx| ctx.identity_namespace = namespace;
+        if (self.transaction_recovery_identity_context) |ctx| {
+            ctx.identity_namespace = namespace;
+            ctx.relational_base_rows = self.relationalColumnsForStore() != null;
+        }
     }
 
     fn dbDocIdentityStats(raw: doc_identity.Stats, namespace: doc_identity.Namespace) types.DocIdentityStats {
@@ -36575,6 +36680,61 @@ test "db exposes local transaction lifecycle" {
     }
 }
 
+test "db relational transaction commits through relational base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const begin_ts: u64 = 1_700_000_000_000_100_000;
+    const commit_ts: u64 = begin_ts + 1;
+    const txn_id = try db.beginTransaction(begin_ts);
+    try db.writeIntents(txn_id, &.{
+        .{ .key = "row:txn", .value = "{\"title\":\"txn row\",\"amount\":12.5}" },
+    }, &.{});
+    try db.commitTransaction(txn_id, commit_ts);
+
+    const raw = (try db.get(alloc, "row:txn")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"txn row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"amount\":12.5") != null);
+    try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "row:txn"));
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:txn");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:txn");
+    defer alloc.free(primary_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+
+    const delete_txn = try db.beginTransaction(commit_ts + 1);
+    try db.writeIntents(delete_txn, &.{
+        .{ .key = "row:txn", .value = null },
+    }, &.{});
+    try db.commitTransaction(delete_txn, commit_ts + 2);
+    try std.testing.expect((try db.get(alloc, "row:txn")) == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, relational_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "row:txn"));
+}
+
 test "db transaction intent writes reject new documents at ordinal exhaustion" {
     const alloc = std.testing.allocator;
 
@@ -37779,6 +37939,101 @@ test "db transaction recovery runtime appends identity rows for committed orphan
     const raw = (try db.get(alloc, "doc:recovered_orphan")) orelse return error.TestExpectedEqual;
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("{\"title\":\"recovered\"}", raw);
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+}
+
+test "db relational transaction recovery resolves orphaned intents into base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const commit_ts: u64 = 2_000;
+    const txn_id = blk: {
+        var setup_db = try DB.open(alloc, std.mem.span(path), .{});
+        defer setup_db.close();
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+        ;
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try setup_db.setSchema(runtime_schema);
+
+        const txn_id = try setup_db.beginTransaction(1_000);
+        try setup_db.writeTransaction(txn_id, .{
+            .writes = &.{.{ .key = "row:recovered_orphan", .value = "{\"title\":\"recovered row\",\"amount\":14.5}" }},
+        });
+
+        const record_key = blk_key: {
+            const prefix = "\x00\x00__txn_records__:";
+            var key: [prefix.len + @sizeOf(transactions_mod.TxnId)]u8 = undefined;
+            @memcpy(key[0..prefix.len], prefix);
+            @memcpy(key[prefix.len..], &txn_id);
+            break :blk_key key;
+        };
+        var record_value: [33]u8 = undefined;
+        record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+        std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
+        std.mem.writeInt(u64, record_value[9..17], commit_ts, .little);
+        std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
+        std.mem.writeInt(u64, record_value[25..33], commit_ts, .little);
+        try setup_db.core.store.put(record_key[0..], record_value[0..]);
+        break :blk txn_id;
+    };
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .cutoff_ns = 1,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    var cleaned = false;
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const status = db.getTransactionStatus(txn_id);
+        if (status) |_| {} else |err| {
+            if (err == transactions_mod.TxnError.TxnNotFound) {
+                cleaned = true;
+                break;
+            }
+            return err;
+        }
+        sleepPollInterval();
+    }
+    if (!cleaned) return error.TransactionRecoveryCleanupTimeout;
+
+    const raw = (try db.get(alloc, "row:recovered_orphan")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"recovered row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"amount\":14.5") != null);
+    try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "row:recovered_orphan"));
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:recovered_orphan");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:recovered_orphan");
+    defer alloc.free(primary_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
 
     const stats = try db.diagnosticStats(alloc);
     defer types.freeDBStats(alloc, stats);

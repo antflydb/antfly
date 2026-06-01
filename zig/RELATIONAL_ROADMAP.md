@@ -127,6 +127,11 @@ Current PR progress:
   `relational_store.WriteParticipant` with prepare/commit/abort/read/scan
   methods, giving the current row-packed implementation the same participant
   boundary the typed-column store will occupy.
+- relational transaction intent writes are projected before prepare, and commit
+  resolution/recovery skip the generic document KV apply path; committed
+  relational intents now materialize only as relational base rows plus their
+  timestamp/identity metadata, while stale generic primary rows are deleted as
+  invariant cleanup.
 
 ## Implementation Phases
 
