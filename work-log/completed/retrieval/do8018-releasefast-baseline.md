@@ -14,6 +14,7 @@ Updated on 2026-05-31 from worktree commit `629ad9cdecd2` after the v20 compact 
 Updated on 2026-05-31 from worktree commit `7f83fe7b7904` after the v21 bit-packed postings chunk metadata codec change.
 Updated on 2026-05-31 from worktree commit `312fc58f215c` after fixing idle derived-backlog release and making the DO8018 wait gate full-text scoped. Metrics-on no longer hits the 300s catch-up ceiling.
 Repeated on 2026-05-31 from worktree commit `12e7e4cb4` to check whether the corrected baseline represented a real slowdown or run noise.
+Repeated on 2026-05-31 from worktree commit `1786a764e2f0` after keeping active mmap-backed text segments warm while still discarding retired merge source pages.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -62,6 +63,10 @@ Latest corrected v21 artifacts:
 Corrected v21 repeat artifacts:
 
 `work-log/do8018/releasefast-baseline-20260531-215403/`
+
+Post active-mmap-advice artifacts:
+
+`work-log/do8018/releasefast-baseline-20260531-220831/`
 
 ## Latest Segment-v3 Metrics Off
 
@@ -1172,3 +1177,81 @@ Timing read:
 - Repeat corrected metrics-on load/catch-up was 47.85s/13.27s with 178 merges.
 
 The derived-backlog fix itself is an idle-watermark retry path, so it is not expected to affect hot foreground writes materially. The observed timing spread tracks merge composition closely enough that the current evidence should be treated as run noise plus merge-scheduler variability, not a confirmed regression.
+
+## Post Active-Mmap-Advice Repeat
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260531-220831/`.
+
+This repeat was run from commit `1786a764e2f0` after changing snapshot publish behavior so active mmap-backed segments stay warm and only retired merge source pages receive `MADV_DONTNEED`. The result does not show a throughput regression from that change. Metrics-off remained in the same band as the corrected repeat; metrics-on was faster than the previous corrected repeat and did less merge work.
+
+Metrics off:
+
+- Load time: 44.273372791s
+- Async catch-up time: 16.762287292s
+- Catch-up complete: true, `scope=full-text`
+- Throughput: 1,594.75 records/sec, 4.87 MiB/sec
+- `ps` RSS: 699,662,336 bytes
+- Peak sampled RSS: 942,096,384 bytes
+- Process footprint metric: 131,324,672 bytes
+- Peak sampled process footprint: 339,466,840 bytes
+- Live malloc metric: 100,188,928 bytes
+- Peak sampled live malloc: 269,564,016 bytes
+- vmmap footprint: 131,281,715 bytes
+- vmmap peak footprint: 879,860,121 bytes
+- vmmap mapped-file resident: 29,674,700 bytes
+- vmmap malloc allocated: 34,603,008 bytes
+- Segment files: 8
+- Segment bytes: 401,354,725
+- Peak sampled segment bytes: 420,217,837
+- Peak sampled mapped segment bytes: 401,892,045
+- Stored fields bytes: 127,662,307
+- Inverted bytes: 269,593,746
+- Postings bytes: 143,744,556
+- Term block bytes: 103,430,710
+- Text merges completed: 159
+- Full-text build peak bytes: 180,921,046
+- Full-text pending peak bytes: 403,213,585
+- Text merge buffer peak bytes: 139,500,050
+- LSM compaction peak bytes: 68,054,256
+- LSM state peak bytes: 24,719,380
+
+Metrics on:
+
+- Load time: 41.982961917s
+- Async catch-up time: 14.220626916s
+- Catch-up complete: true, `scope=full-text`
+- Final derived backlog bytes: 0
+- Throughput: 1,681.75 records/sec, 5.13 MiB/sec
+- `ps` RSS: 732,413,952 bytes
+- Peak sampled RSS: 1,058,766,848 bytes
+- Process footprint metric: 154,393,320 bytes
+- Peak sampled process footprint: 286,366,152 bytes
+- Live malloc metric: 93,664,656 bytes
+- Peak sampled live malloc: 288,753,696 bytes
+- vmmap footprint: 155,084,390 bytes
+- vmmap peak footprint: 865,704,345 bytes
+- vmmap mapped-file resident: 30,198,988 bytes
+- vmmap malloc allocated: 34,707,865 bytes
+- Segment files: 7
+- Segment bytes: 408,789,811
+- Peak sampled segment bytes: 453,026,812
+- Peak sampled mapped segment bytes: 411,198,285
+- Stored fields bytes: 127,652,968
+- Inverted bytes: 277,041,547
+- Postings bytes: 147,045,092
+- Term block bytes: 106,940,830
+- Text merges completed: 144
+- Full-text build peak bytes: 170,924,528
+- Full-text pending peak bytes: 411,205,364
+- Text merge buffer peak bytes: 94,487,820
+- LSM compaction peak bytes: 67,311,864
+- LSM state peak bytes: 30,598,832
+
+Timing read:
+
+- Corrected repeat metrics-off load/catch-up was 44.42s/16.77s with 160 merges.
+- Post active-mmap-advice metrics-off load/catch-up was 44.27s/16.76s with 159 merges.
+- Corrected repeat metrics-on load/catch-up was 47.85s/13.27s with 178 merges.
+- Post active-mmap-advice metrics-on load/catch-up was 41.98s/14.22s with 144 merges.
+
+RSS moved as expected for warmer active mappings, but the first-class memory targets stayed low: final footprint was ~131-155 MiB, final live malloc was ~94-100 MiB, and mapped-file resident was ~30 MiB. Final segment bytes remained ~401-409 MiB.
