@@ -608,6 +608,31 @@ fn shouldUseGlinerRecognizerDequantSgemm(
     return known == .Q4_K or known == .Q5_K;
 }
 
+fn isGlinerEncoderLinearWeightName(name: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, "encoder.layer.")) return false;
+    return std.mem.endsWith(u8, name, ".attention.self.query_proj.weight") or
+        std.mem.endsWith(u8, name, ".attention.self.key_proj.weight") or
+        std.mem.endsWith(u8, name, ".attention.self.value_proj.weight") or
+        std.mem.endsWith(u8, name, ".attention.output.dense.weight") or
+        std.mem.endsWith(u8, name, ".intermediate.dense.weight") or
+        std.mem.endsWith(u8, name, ".output.dense.weight");
+}
+
+fn shouldUseGlinerEncoderDequantSgemm(
+    name: []const u8,
+    rows: usize,
+    out_dim: usize,
+    tensor_type: gguf_tensor_types.TensorType,
+) bool {
+    if (rows < 16 or out_dim < 512) return false;
+    if (!isGlinerEncoderLinearWeightName(name)) return false;
+    const known = switch (tensor_type) {
+        .known => |value| value,
+        else => return false,
+    };
+    return known == .Q4_K or known == .Q5_K;
+}
+
 fn shouldUseClipClapDequantSgemm(
     name: []const u8,
     rows: usize,
@@ -661,6 +686,7 @@ fn shouldUseQuantizedDequantSgemm(
     if (!dequantSgemmSupportedQuant(known)) return false;
     if (quantizedDequantSgemmEnabled()) return true;
     if (shouldUseGlinerRecognizerDequantSgemm(name, storage.tensor_type)) return true;
+    if (shouldUseGlinerEncoderDequantSgemm(name, rows, out_dim, storage.tensor_type)) return true;
     return shouldUseClipClapDequantSgemm(name, rows, out_dim, storage.tensor_type);
 }
 
@@ -34151,8 +34177,149 @@ fn disentangledRelativeAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT
     const V = getData(v_ct);
     const Q_r = getData(q_r_ct);
     const K_r = getData(k_r_ct);
+    if (build_options.enable_system_blas and seq_len >= 64) {
+        const output = try debertaDisentangledAttentionBlasMaterialized(self.allocator, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim);
+        return self.makeBuf(output, true);
+    }
     const output = try linalg.debertaDisentangledAttentionHost(self.allocator, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim);
     return self.makeBuf(output, true);
+}
+
+fn debertaDisentangledAttentionBlasMaterialized(
+    allocator: std.mem.Allocator,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    Q_r: []const f32,
+    K_r: []const f32,
+    mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) ![]f32 {
+    if (batch == 0 or seq_len == 0) return allocator.alloc(f32, 0);
+    if (num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
+
+    const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
+    const tokens = std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape;
+    const output_len = std.math.mul(usize, tokens, H) catch return error.InvalidAttentionShape;
+    if (Q.len < output_len or K.len < output_len or V.len < output_len) return error.InvalidAttentionShape;
+
+    const rel_len = std.math.sub(usize, std.math.mul(usize, seq_len, 2) catch return error.InvalidAttentionShape, 1) catch return error.InvalidAttentionShape;
+    const rel_expected = std.math.mul(usize, rel_len, H) catch return error.InvalidAttentionShape;
+    if (Q_r.len < rel_expected or K_r.len < rel_expected) return error.InvalidAttentionShape;
+
+    const mask_expected = std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape;
+    if (mask.len < mask_expected) return error.InvalidAttentionShape;
+
+    const output = try allocator.alloc(f32, output_len);
+    errdefer allocator.free(output);
+    const scores = try allocator.alloc(f32, seq_len * seq_len);
+    defer allocator.free(scores);
+    const c2p_scores = try allocator.alloc(f32, seq_len * rel_len);
+    defer allocator.free(c2p_scores);
+    const p2c_scores = try allocator.alloc(f32, seq_len * rel_len);
+    defer allocator.free(p2c_scores);
+    const q_pack = try allocator.alloc(f32, seq_len * head_dim);
+    defer allocator.free(q_pack);
+    const k_pack = try allocator.alloc(f32, seq_len * head_dim);
+    defer allocator.free(k_pack);
+    const v_pack = try allocator.alloc(f32, seq_len * head_dim);
+    defer allocator.free(v_pack);
+    const q_r_pack = try allocator.alloc(f32, rel_len * head_dim);
+    defer allocator.free(q_r_pack);
+    const k_r_pack = try allocator.alloc(f32, rel_len * head_dim);
+    defer allocator.free(k_r_pack);
+    const out_pack = try allocator.alloc(f32, seq_len * head_dim);
+    defer allocator.free(out_pack);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)) * 3.0);
+
+    for (0..batch) |b| {
+        const mask_base = b * seq_len;
+        var all_keys_valid = true;
+        for (mask[mask_base..][0..seq_len]) |m| {
+            if (m == 0) {
+                all_keys_valid = false;
+                break;
+            }
+        }
+
+        for (0..num_heads) |h| {
+            const head_off = h * head_dim;
+            for (0..rel_len) |i| {
+                const src_base = i * H + head_off;
+                @memcpy(q_r_pack[i * head_dim ..][0..head_dim], Q_r[src_base..][0..head_dim]);
+                @memcpy(k_r_pack[i * head_dim ..][0..head_dim], K_r[src_base..][0..head_dim]);
+            }
+            for (0..seq_len) |i| {
+                const src_base = (b * seq_len + i) * H + head_off;
+                @memcpy(q_pack[i * head_dim ..][0..head_dim], Q[src_base..][0..head_dim]);
+                @memcpy(k_pack[i * head_dim ..][0..head_dim], K[src_base..][0..head_dim]);
+                @memcpy(v_pack[i * head_dim ..][0..head_dim], V[src_base..][0..head_dim]);
+            }
+
+            native.sgemmTransBSync(seq_len, seq_len, head_dim, scale, q_pack, k_pack, 0.0, scores);
+            native.sgemmTransBSync(seq_len, rel_len, head_dim, scale, q_pack, k_r_pack, 0.0, c2p_scores);
+            native.sgemmTransBSync(seq_len, rel_len, head_dim, scale, k_pack, q_r_pack, 0.0, p2c_scores);
+
+            for (0..seq_len) |qi| {
+                const row = scores[qi * seq_len ..][0..seq_len];
+                const rel_base = qi + seq_len - 1;
+                for (0..seq_len) |ki| {
+                    if (!all_keys_valid and mask[mask_base + ki] == 0) {
+                        row[ki] = -std.math.inf(f32);
+                        continue;
+                    }
+                    const rel_idx = rel_base - ki;
+                    row[ki] += c2p_scores[qi * rel_len + rel_idx] + p2c_scores[ki * rel_len + rel_idx];
+                }
+                activations_mod.softmax(row, seq_len);
+            }
+
+            native.sgemmSync(seq_len, head_dim, seq_len, 1.0, scores, v_pack, 0.0, out_pack);
+
+            for (0..seq_len) |i| {
+                const dst_base = (b * seq_len + i) * H + head_off;
+                @memcpy(output[dst_base..][0..head_dim], out_pack[i * head_dim ..][0..head_dim]);
+            }
+        }
+    }
+
+    return output;
+}
+
+test "materialized DeBERTa attention matches shared linalg reference" {
+    const allocator = std.testing.allocator;
+    const batch = 1;
+    const seq_len = 5;
+    const num_heads = 2;
+    const head_dim = 4;
+    const H = num_heads * head_dim;
+    const rel_len = seq_len * 2 - 1;
+
+    var q: [batch * seq_len * H]f32 = undefined;
+    var k: [batch * seq_len * H]f32 = undefined;
+    var v: [batch * seq_len * H]f32 = undefined;
+    var q_r: [rel_len * H]f32 = undefined;
+    var k_r: [rel_len * H]f32 = undefined;
+    for (&q, 0..) |*x, i| x.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8))) * 0.03125;
+    for (&k, 0..) |*x, i| x.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6))) * 0.02734375;
+    for (&v, 0..) |*x, i| x.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5))) * 0.046875;
+    for (&q_r, 0..) |*x, i| x.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9))) * 0.015625;
+    for (&k_r, 0..) |*x, i| x.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11))) * 0.01953125;
+    const mask = [_]i64{ 1, 1, 0, 1, 1 };
+
+    const want = try linalg.debertaDisentangledAttentionHost(allocator, &q, &k, &v, &q_r, &k_r, &mask, batch, seq_len, num_heads, head_dim);
+    defer allocator.free(want);
+    const got = try debertaDisentangledAttentionBlasMaterialized(allocator, &q, &k, &v, &q_r, &k_r, &mask, batch, seq_len, num_heads, head_dim);
+    defer allocator.free(got);
+
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |a, b| {
+        try std.testing.expectApproxEqAbs(a, b, 1e-4);
+    }
 }
 
 /// T5 relative position bucket computation.
@@ -42429,6 +42596,86 @@ test "q4 q5 unmeasured recognizer shapes use cached dense dequant sgemm" {
     const name = "span_rep.span_rep_layer.out_project.0.weight";
 
     try std.testing.expect(!shouldUseQ4_Q5_KQ8KActivationQuant(rows, out_dim, row_blocks));
+
+    inline for (.{ gguf_tensor_types.KnownTensorType.Q4_K, gguf_tensor_types.KnownTensorType.Q5_K }) |known| {
+        const tensor_type: gguf_tensor_types.TensorType = .{ .known = known };
+        const input = try allocator.alloc(f32, rows * in_dim);
+        defer allocator.free(input);
+        fillNativeQuantDispatchValues(input, rows + @intFromEnum(known), 0.015);
+
+        const weight_f32 = try allocator.alloc(f32, out_dim * in_dim);
+        defer allocator.free(weight_f32);
+        fillNativeQuantDispatchValues(weight_f32, in_dim + @intFromEnum(known), 0.0125);
+
+        const weight_raw = try quantizeNativeDispatchWeight(allocator, known, weight_f32);
+        var storage = QuantizedStorage{
+            .tensor_type = tensor_type,
+            .raw_bytes = weight_raw,
+            .shape = try allocator.dupe(i64, &.{ @as(i64, @intCast(out_dim)), @as(i64, @intCast(in_dim)) }),
+            .raw_owned = true,
+            .allocator = allocator,
+        };
+        defer storage.deinit();
+        try prepareNativeQuantizedStorage(&storage);
+
+        var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+        defer deinitPrefetchQueue(&weight_store);
+        var compute = NativeCompute.init(allocator, &weight_store, null);
+
+        const output = try allocator.alloc(f32, rows * out_dim);
+        defer allocator.free(output);
+        @memset(output, 0.0);
+
+        resetNativeQuantDispatchStatsForTest();
+        try std.testing.expect(try dispatchQuantizedLinear(.{
+            .compute = &compute,
+            .kind = .single_no_bias,
+            .input = input,
+            .rows = rows,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .storage_a = &storage,
+            .name_a = name,
+            .output_a = output,
+        }));
+        var stats = nativeQuantDispatchStatsForTest();
+        try std.testing.expectEqual(@as(u64, 1), stats.dequant_sgemm);
+        try std.testing.expectEqual(@as(u64, 0), stats.q4_q5_k_q8k_activation);
+        try std.testing.expectEqual(@as(u64, 1), weight_store.quant_dequant_cache_inserts);
+
+        const output_cached = try allocator.alloc(f32, rows * out_dim);
+        defer allocator.free(output_cached);
+        @memset(output_cached, 0.0);
+
+        resetNativeQuantDispatchStatsForTest();
+        try std.testing.expect(try dispatchQuantizedLinear(.{
+            .compute = &compute,
+            .kind = .single_no_bias,
+            .input = input,
+            .rows = rows,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .storage_a = &storage,
+            .name_a = name,
+            .output_a = output_cached,
+        }));
+        stats = nativeQuantDispatchStatsForTest();
+        try std.testing.expectEqual(@as(u64, 1), stats.dequant_sgemm);
+        try std.testing.expectEqual(@as(u64, 0), stats.q4_q5_k_q8k_activation);
+        try std.testing.expectEqual(@as(u64, 1), weight_store.quant_dequant_cache_hits);
+        for (output_cached, output) |got, expected| try std.testing.expectApproxEqAbs(expected, got, 1e-6);
+    }
+}
+
+test "q4 q5 gliner encoder shapes use cached dense dequant sgemm" {
+    const allocator = std.testing.allocator;
+    const rows: usize = 64;
+    const in_dim: usize = 768;
+    const out_dim: usize = 512;
+    const row_blocks = in_dim / 256;
+    const name = "encoder.layer.0.attention.output.dense.weight";
+
+    try std.testing.expect(shouldUseQ4_Q5_KQ8KActivationQuant(rows, out_dim, row_blocks));
 
     inline for (.{ gguf_tensor_types.KnownTensorType.Q4_K, gguf_tensor_types.KnownTensorType.Q5_K }) |known| {
         const tensor_type: gguf_tensor_types.TensorType = .{ .known = known };

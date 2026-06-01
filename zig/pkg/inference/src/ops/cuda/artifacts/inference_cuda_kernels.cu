@@ -582,17 +582,15 @@ extern "C" __global__ void termite_gliner_word_embeddings_f32(
     unsigned int b = tmp / num_words;
     long long wanted = (long long)word + 1ll;
 
-    float sum = 0.0f;
-    unsigned int n = 0;
     unsigned int token_base = b * seq_len;
     unsigned int hidden_base = token_base * hidden_size + d;
     for (unsigned int t = 0; t < seq_len; ++t) {
         if (words_mask[token_base + t] == wanted) {
-            sum += hidden[hidden_base + t * hidden_size];
-            ++n;
+            dst[idx] = hidden[hidden_base + t * hidden_size];
+            return;
         }
     }
-    dst[idx] = n == 0 ? 0.0f : sum / (float)n;
+    dst[idx] = 0.0f;
 }
 
 extern "C" __global__ void termite_repeat_first_row_f32(
