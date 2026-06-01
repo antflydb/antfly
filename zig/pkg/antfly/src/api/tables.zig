@@ -533,17 +533,23 @@ fn regenerateAlgebraicIndexValueAlloc(
         );
     }
 
-    // If the schema-derived capability changed (e.g. a dynamic template was added
-    // or retyped — these do not bump the schema version), existing documents have
-    // not been re-projected through the new dynamic rules. Persist a
-    // backfill-pending flag so query-time resolution of dynamic-template fields is
-    // withheld (those aggregations fall back to a complete scan) until the index
-    // is rebuilt; this survives reopen, mirroring the in-place flag set by
-    // index_manager.reloadAlgebraicSchemaConfigs. An already-pending flag is
-    // preserved when the capability is otherwise unchanged.
+    // If the schema-derived capability changed (static fields, dynamic templates,
+    // or embedded JSON domains), existing documents have not been re-projected
+    // through the new capability. Persist an index-level lifecycle marker so the
+    // algebraic planner falls back to row scans until a rebuild refreshes the
+    // facts. Dynamic-template and JSON-domain flags remain as more specific
+    // diagnostics and field-level guards.
     const derived_fp = jsonStringField(derived, "capability_fingerprint") orelse "";
     const source_fp = jsonStringField(source, "capability_fingerprint") orelse "";
     const capability_changed = source_fp.len > 0 and !std.mem.eql(u8, derived_fp, source_fp);
+    const source_lifecycle_pending = algebraicLifecyclePending(source);
+    if (capability_changed or source_lifecycle_pending) {
+        try derived.object.put(
+            alloc,
+            try alloc.dupe(u8, "capability_lifecycle_status"),
+            .{ .string = try alloc.dupe(u8, "rebuild_required") },
+        );
+    }
     const source_pending = jsonBoolField(source, "dynamic_rules_backfill_pending") orelse false;
     const has_dynamic_rules = blk: {
         const rules = derived.object.get("dynamic_field_rules") orelse break :blk false;
@@ -600,6 +606,13 @@ fn findJsonSubdocumentDomain(value: std.json.Value, path: []const u8) ?std.json.
 
 fn jsonDomainLifecyclePending(value: std.json.Value) bool {
     const status = jsonStringField(value, "lifecycle_status") orelse return false;
+    return status.len != 0 and
+        !std.mem.eql(u8, status, "current") and
+        !std.mem.eql(u8, status, "compatible_additive");
+}
+
+fn algebraicLifecyclePending(value: std.json.Value) bool {
+    const status = jsonStringField(value, "capability_lifecycle_status") orelse return false;
     return status.len != 0 and
         !std.mem.eql(u8, status, "current") and
         !std.mem.eql(u8, status, "compatible_additive");
@@ -2726,6 +2739,7 @@ test "metadata.schema update refreshes algebraic dynamic templates without recre
     // durable config records that existing docs need re-projection; query-time
     // resolution of dynamic fields is withheld until rebuild.
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"dynamic_rules_backfill_pending\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"capability_lifecycle_status\":\"rebuild_required\"") != null);
     // The full-text index entry is left untouched.
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v2\"") != null);
 }
@@ -2760,6 +2774,28 @@ test "metadata.schema update regenerates algebraic config and preserves user kno
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"precision\":12") != null);
     // Capability unchanged (matching fingerprint) => no backfill flag forced on.
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"dynamic_rules_backfill_pending\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"capability_lifecycle_status\":\"rebuild_required\"") == null);
+}
+
+test "metadata.schema update marks static algebraic capability changes rebuild required" {
+    const alloc = std.testing.allocator;
+    const schema_v1 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["tenant"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"keyword"},"amount":{"type":"keyword"}},"required":["tenant"],"additionalProperties":false}}}}
+    ;
+
+    const canonical = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "rows", schema_v1);
+    defer alloc.free(canonical);
+    const stored = try std.fmt.allocPrint(alloc, "{{\"alg\":{{\"type\":\"algebraic\",{s}}}", .{canonical[1..]});
+    defer alloc.free(stored);
+
+    const refreshed = try regenerateAlgebraicIndexesFromSchemaAlloc(alloc, "rows", stored, schema_v2);
+    defer alloc.free(refreshed);
+
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"capability_lifecycle_status\":\"rebuild_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"schema_version\":3") != null);
 }
 
 test "metadata.schema update marks changed relational json subdocument domains pending" {
@@ -2782,6 +2818,7 @@ test "metadata.schema update marks changed relational json subdocument domains p
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"json_subdocument_domains\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"path\":\"attrs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"lifecycle_status\":\"rebuild_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"capability_lifecycle_status\":\"rebuild_required\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"schema_version\":3") != null);
 }
 

@@ -1989,10 +1989,13 @@ fields. Schemaless `pathfact`, `path_lookup`, and `path_profile` rows are the
 discovery substrate for late-typed promotion. Mixed-kind paths require
 kind-qualified plans, explicit coercion policy, or fallback.
 
-Schema lifecycle drift marks affected algebraic capability stale or
-rebuild-required. Added compatible fields can start from the change point plus
-optional backfill; type, analyzer, coercion, or expression changes require
-readiness gating before the planner can select algebraic execution.
+Schema lifecycle drift marks the algebraic capability stale or rebuild-required.
+Until a sidecar rebuild re-projects existing documents, durable regeneration and
+live reload set `capability_lifecycle_status: "rebuild_required"` and the
+planner declines schema-derived algebraic execution. This favors correct scan
+fallback over reading facts that only cover the post-change subset. More precise
+per-field compatibility can be layered on top later, but the production contract
+is that a changed capability is not current until rebuilt.
 
 Relational embedded JSON domains apply that lifecycle per column path. Durable
 schema regeneration and live `Index.reloadConfigJson` preserve user-owned knobs,

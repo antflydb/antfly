@@ -423,22 +423,25 @@ pub fn scanColumnAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn rebuildColumnIndexesForRowRange(
+pub fn rebuildAllColumnIndexesFromRowsInRange(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     lower_doc_key: []const u8,
     upper_doc_key: []const u8,
 ) !void {
-    try rebuildColumnIndexesForRowRangeWithColumnIndexPolicy(alloc, store, lower_doc_key, upper_doc_key, ColumnIndexPolicy.all());
+    try rebuildAllColumnIndexesFromRowsInRangeWithColumnIndexPolicy(alloc, store, lower_doc_key, upper_doc_key, ColumnIndexPolicy.all());
 }
 
-pub fn rebuildColumnIndexesForRowRangeWithColumnIndexPolicy(
+pub fn rebuildAllColumnIndexesFromRowsInRangeWithColumnIndexPolicy(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     lower_doc_key: []const u8,
     upper_doc_key: []const u8,
     column_index_policy: ColumnIndexPolicy,
 ) !void {
+    // This is intentionally a whole-secondary-namespace replacement: split
+    // finalization and destination build use it after the physical row set has
+    // already been reduced to the target range.
     try clearColumnIndexNamespace(alloc, store);
 
     const rows = try scanRowsAlloc(alloc, store, lower_doc_key, upper_doc_key);
@@ -1141,7 +1144,7 @@ test "relational column scan indexes rebuild and delete from packed rows" {
     try std.testing.expectError(error.NotFound, store.get(alloc, doc_a_index));
     try std.testing.expectError(error.NotFound, store.get(alloc, doc_b_index));
 
-    try rebuildColumnIndexesForRowRange(alloc, &store, "doc:a", "doc:c");
+    try rebuildAllColumnIndexesFromRowsInRange(alloc, &store, "doc:a", "doc:c");
     const rebuilt_a = try store.get(alloc, doc_a_index);
     defer alloc.free(rebuilt_a);
     const rebuilt_b = try store.get(alloc, doc_b_index);

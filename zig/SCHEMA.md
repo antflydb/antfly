@@ -222,14 +222,14 @@ Template-only updates propagate without a recreate on two levels:
 
 Because the change applies without re-projecting existing documents, a capability
 change (detected by a differing capability fingerprint) sets
-`dynamic_rules_backfill_pending` on the config — both durably and in the live
-index. While pending, query-time resolution of dynamic-template fields is
-withheld, so aggregations over those fields fall back to a complete scan and
-return correct results rather than aggregates computed over only the
-post-change subset. Static fields are unaffected and keep accelerating. The flag
-is cleared when the sidecar is rebuilt, which re-projects existing documents.
-Tables created with a template (rather than updated) take the fingerprint-equality
-fast path and are never flagged.
+`capability_lifecycle_status: "rebuild_required"` on the algebraic config — both
+durably and in the live index. While pending, algebraic planning falls back
+instead of reading schema-derived facts that may only cover the post-change
+subset. Dynamic-template changes also keep the narrower
+`dynamic_rules_backfill_pending` diagnostic/field guard. The lifecycle marker is
+cleared when the sidecar is rebuilt, which re-projects existing documents. Tables
+created with a template (rather than updated) take the fingerprint-equality fast
+path and are never flagged.
 
 Relational `json` columns use the same shape at the column scope. Each embedded
 JSON domain is emitted as a `json_subdocument_domains` entry with the owning

@@ -17709,7 +17709,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
         &dest_indexes,
     );
     if (self.relationalColumnsForStore() != null) {
-        try relational_store_mod.rebuildColumnIndexesForRowRangeWithColumnIndexPolicy(self.alloc, dest_store, byte_range.start, byte_range.end, self.relationalColumnIndexPolicyForStore());
+        try relational_store_mod.rebuildAllColumnIndexesFromRowsInRangeWithColumnIndexPolicy(self.alloc, dest_store, byte_range.start, byte_range.end, self.relationalColumnIndexPolicyForStore());
     }
 
     try dest_indexes.syncAll(true);
@@ -18199,11 +18199,12 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     defer self.alloc.free(split_lower);
     try finalizePrimarySplitPreservingIdentity(self, split_lower);
     if (self.relationalColumnsForStore() != null) {
-        try relational_store_mod.deleteColumnIndexesByDocRange(
+        try relational_store_mod.rebuildAllColumnIndexesFromRowsInRangeWithColumnIndexPolicy(
             self.alloc,
             self.core.store,
-            split_state.split_key,
-            split_state.original_range_end,
+            new_range.start,
+            new_range.end,
+            self.relationalColumnIndexPolicyForStore(),
         );
     }
     try ensureReplayFloor(self.core.store, replay_floor);
@@ -38831,6 +38832,23 @@ test "db split moves relational rows and column entries" {
 
     try db.finalizeSplit(.{ .start = "", .end = "row:m" });
     try std.testing.expect((try db.get(alloc, "row:z")) == null);
+
+    const parent_left_amounts = try relational_store_mod.scanColumnAlloc(alloc, db.core.store, "amount", "row:a", "row:a");
+    defer relational_store_mod.freeColumnValues(alloc, parent_left_amounts);
+    try std.testing.expectEqual(@as(usize, 1), parent_left_amounts.len);
+    try std.testing.expectEqualStrings("row:a", parent_left_amounts[0].doc_key);
+    try std.testing.expectEqual(.f64_val, parent_left_amounts[0].value_type);
+    try std.testing.expectEqual(@as(f64, 10), parent_left_amounts[0].value.f64_val);
+
+    var parent_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"open\"}}",
+        .limit = 10,
+    });
+    defer parent_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parent_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", parent_filtered.hits[0].id);
 
     const parent_amounts = try relational_store_mod.scanColumnAlloc(alloc, db.core.store, "amount", "row:z", "row:z");
     defer relational_store_mod.freeColumnValues(alloc, parent_amounts);

@@ -580,7 +580,11 @@ pub const ShardManager = struct {
 
             for (to_delete) |kv| {
                 if (isSplitMetadataKey(kv.key)) continue;
-                if (internal_user_keys and !internal_keys.isInternalPhysicalTableDataKey(kv.key)) continue;
+                // This raw range scan is only valid for keys whose ordering is
+                // the encoded document-key ordering. Secondary physical
+                // namespaces embed document keys in their own layouts and are
+                // pruned/rebuilt by the DB layer that understands those layouts.
+                if (internal_user_keys and !internal_keys.isInternalUserKey(kv.key)) continue;
                 try del_keys.append(self.alloc, kv.key);
             }
 
@@ -1165,6 +1169,40 @@ test "shard finalize deletes split-off data" {
     for ([_][]const u8{ "ca", "cb", "da" }) |key| {
         try std.testing.expectError(lmdb.Error.NotFound, store.get(alloc, key));
     }
+}
+
+test "shard finalize leaves secondary physical namespaces to db layer" {
+    const alloc = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const sp = tmpPath(&pb, "fd-secondary");
+    defer cleanupTmp(sp);
+
+    var store = try DocStore.open(alloc, sp, .{});
+    defer store.close();
+
+    const left_doc = try internal_keys.documentKeyAlloc(alloc, "aa");
+    defer alloc.free(left_doc);
+    const right_doc = try internal_keys.documentKeyAlloc(alloc, "ca");
+    defer alloc.free(right_doc);
+    const secondary = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "aa");
+    defer alloc.free(secondary);
+
+    try store.put(left_doc, "left");
+    try store.put(right_doc, "right");
+    try store.put(secondary, "idx");
+
+    var mgr = try ShardManager.init(alloc, &store, .{ .start = "", .end = "" });
+    defer mgr.deinit();
+
+    try mgr.prepareSplit("ca");
+    try mgr.split(1, "ca");
+    try mgr.finalizeSplit();
+
+    const left = try store.get(alloc, left_doc);
+    alloc.free(left);
+    try std.testing.expectError(lmdb.Error.NotFound, store.get(alloc, right_doc));
+    const kept_secondary = try store.get(alloc, secondary);
+    alloc.free(kept_secondary);
 }
 
 test "shard state persistence across restart" {

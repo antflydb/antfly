@@ -1260,18 +1260,18 @@ pub const IndexManager = struct {
             new_parsed.value.min_max_candidate_cache_size = cur.min_max_candidate_cache_size;
             new_parsed.value.enable_temporal_range_pruning = cur.enable_temporal_range_pruning;
             new_parsed.value.hll_cardinalities = cur.hll_cardinalities;
+            new_parsed.value.capability_lifecycle_status = "rebuild_required";
             markJsonSubdocumentDomainLifecycles(&new_parsed.value, cur);
 
             // The capability changed against an already-open table, so existing
             // documents have not been re-projected through the new dynamic rules.
-            // Mark dynamic-field resolution as backfill-pending so aggregations
-            // over template-promoted fields fall back to a complete scan (correct
-            // results) instead of reading facts that only cover docs written after
-            // the change. Static fields keep accelerating. The durable
-            // regeneration in api/tables.zig sets the same flag so it survives
-            // reopen. (Table create takes the fingerprint-equality skip above, so
-            // a freshly-built index is never flagged.)
-            new_parsed.value.dynamic_rules_backfill_pending = true;
+            // Keep the dynamic-rule marker as a field-level diagnostic, while the
+            // index-level lifecycle marker above blocks all schema-derived
+            // algebraic planning until rebuild. The durable regeneration in
+            // api/tables.zig sets the same markers so this survives reopen. (Table
+            // create takes the fingerprint-equality skip above, so a freshly-built
+            // index is never flagged.)
+            new_parsed.value.dynamic_rules_backfill_pending = new_parsed.value.dynamic_field_rules.len > 0;
 
             const merged_json = try std.json.Stringify.valueAlloc(self.alloc, new_parsed.value, .{ .emit_null_optional_fields = false });
             defer self.alloc.free(merged_json);
@@ -11255,7 +11255,9 @@ test "index manager algebraic schema reload preserves HLL cardinalities" {
     try std.testing.expectEqualStrings("customers_by_region", reloaded.hll_cardinalities[0].name);
     try std.testing.expectEqualStrings("customer", reloaded.hll_cardinalities[0].value_field);
     try std.testing.expectEqual(@as(u8, 12), reloaded.hll_cardinalities[0].precision);
+    try std.testing.expectEqualStrings("rebuild_required", reloaded.capability_lifecycle_status);
     try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"hll_cardinalities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") != null);
 }
 
 test "index manager algebraic schema reload marks changed json subdocument domains pending" {
@@ -11306,8 +11308,10 @@ test "index manager algebraic schema reload marks changed json subdocument domai
     const reloaded = manager.algebraic_indexes.items[0].index.config();
     try std.testing.expectEqual(@as(usize, 1), reloaded.json_subdocument_domains.len);
     try std.testing.expectEqualStrings("attrs", reloaded.json_subdocument_domains[0].path);
+    try std.testing.expectEqualStrings("rebuild_required", reloaded.capability_lifecycle_status);
     try std.testing.expectEqualStrings("rebuild_required", reloaded.json_subdocument_domains[0].lifecycle_status);
     try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"lifecycle_status\":\"rebuild_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") != null);
 }
 
 fn parseMetric(raw: []const u8) !vector_mod.DistanceMetric {

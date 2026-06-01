@@ -14432,6 +14432,7 @@ pub const Index = struct {
 
     pub fn fieldConfig(self: *const Index, query_field: []const u8, class: FieldClass) ?FieldConfig {
         const cfg = self.config();
+        if (!self.plannerLifecycleReady()) return null;
         if (class == .group or class == .any) {
             for (cfg.group_fields) |field| {
                 if (fieldMatchesQuery(field, query_field)) {
@@ -20867,6 +20868,26 @@ test "algebraic index withholds fields under pending json subdocument domains" {
     try std.testing.expect(idx.fieldConfig("plan", .group) == null);
     try std.testing.expect(idx.fieldConfig("attrs.score", .measure) == null);
     try std.testing.expect(idx.fieldConfig("/attrs/score", .measure) == null);
+}
+
+test "algebraic index withholds all schema fields while capability lifecycle is pending" {
+    const alloc = std.testing.allocator;
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "events",
+        \\  "capability_lifecycle_status": "rebuild_required",
+        \\  "group_fields": [{"name":"tenant","path":"tenant","type":"string"}],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_schema_lifecycle_pending_fields", cfg);
+    defer idx.close();
+
+    try std.testing.expect(!idx.plannerLifecycleReady());
+    try std.testing.expect(idx.fieldConfig("tenant", .group) == null);
+    try std.testing.expect(idx.fieldConfig("amount", .measure) == null);
 }
 
 test "algebraic materialized expression ids include materialization semantics" {
