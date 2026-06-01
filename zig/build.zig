@@ -2742,6 +2742,7 @@ pub fn build(b: *std.Build) void {
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
+        "data public API listener uses public API request body limit",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
     };
@@ -3213,6 +3214,7 @@ pub fn build(b: *std.Build) void {
         "api http server lists cluster backups through public route",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
+        "public API request body limit matches Go linear merge contract",
         "public api smoke e2e creates table inserts and queries documents",
         "public api e2e recreates managed embeddings index after corrupt artifact",
         "public api split e2e uses distributed global text stats for bm25 and significant_terms",
@@ -3895,6 +3897,7 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts canonical host port and models dir flags",
             "termite config uses cli override before common config",
             "swarm public api caps keep alive request reuse",
+            "swarm public HTTP server uses public API request body limit",
             "parse cli accepts termite budget overrides",
             "termite config falls back to common config",
             "swarm runtime resolves paths from common storage base dir",
