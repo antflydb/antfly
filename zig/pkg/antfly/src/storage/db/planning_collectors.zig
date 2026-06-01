@@ -19,6 +19,7 @@ const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
 const graph_exec = @import("query/graph_exec.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
+const mapper = @import("document_mapper.zig");
 const planning_stats = @import("planning_stats.zig");
 const query_search = @import("query/search_exec.zig");
 const distributed_stats = @import("../../search/distributed_stats.zig");
@@ -56,7 +57,7 @@ fn scanPrimaryDocCount(core: *db_core.DBCore) !u64 {
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             _ = value;
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            if (internal_keys.isPrimaryDocumentKey(key)) state.doc_count.* += 1;
+            if (internal_keys.isStoredDocumentRowKey(key)) state.doc_count.* += 1;
             return .@"continue";
         }
     };
@@ -173,11 +174,13 @@ pub fn estimateStructuredFilterSample(
     var sampled: u32 = 0;
     var matched: u64 = 0;
     for (docs) |doc| {
-        if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
-        const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
+        if (!internal_keys.isStoredDocumentRowKey(doc.key)) continue;
+        const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
         defer alloc.free(raw_key);
+        const doc_json = try mapper.materializeDocumentValueAlloc(alloc, doc.value);
+        defer alloc.free(doc_json);
         sampled += 1;
-        if (try graph_exec.storedDocMatchesPatternFilter(alloc, raw_key, doc.value, filter_query_json)) {
+        if (try graph_exec.storedDocMatchesPatternFilter(alloc, raw_key, doc_json, filter_query_json)) {
             matched += 1;
         }
         if (sampled >= sample_size) break;

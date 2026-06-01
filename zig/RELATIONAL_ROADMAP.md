@@ -99,7 +99,11 @@ Current PR progress:
   `typed_doc_values` or relational manifests into derived text segments;
 - foreground, replay, catch-up, and split-shadow derived apply contexts carry
   the relational-base-row flag, so replays probe the relational row keyspace
-  instead of the old primary document key.
+  instead of the old primary document key;
+- public scan/median-key, identity coverage, generated-enrichment replay, and
+  planning sample collectors now decode stored document rows through the unified
+  primary-or-relational row key helper and materialize relational row values
+  before document extraction.
 
 ## Implementation Phases
 

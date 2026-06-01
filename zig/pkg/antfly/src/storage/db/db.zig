@@ -4347,7 +4347,7 @@ pub const DB = struct {
         };
         defer alloc.free(internal_key);
 
-        return (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, internal_key)) orelse error.NotFound;
+        return (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, internal_key)) orelse error.NotFound;
     }
 
     pub fn getSplitState(self: *DB, alloc: Allocator) !?types.SplitState {
@@ -6896,6 +6896,11 @@ pub const DB = struct {
         defer self.core.alloc.free(lower);
         const docs = try self.core.scanStoreRange(alloc, lower, "");
         defer docstore_mod.DocStore.freeResults(alloc, docs);
+        var materialized_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (materialized_values.items) |value| alloc.free(value);
+            materialized_values.deinit(alloc);
+        }
         const chunk_size: usize = 128;
         var index: usize = 0;
         var generated_ref_count: usize = 0;
@@ -6924,13 +6929,16 @@ pub const DB = struct {
             while (index < docs.len and filled < write_count) : (index += 1) {
                 const doc = docs[index];
                 if (!isPrimaryDocumentStoreKey(doc.key)) continue;
-                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
+                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
                 errdefer alloc.free(raw_key);
+                const doc_json = try mapper.materializeDocumentValueAlloc(alloc, doc.value);
+                errdefer alloc.free(doc_json);
+                try materialized_values.append(alloc, doc_json);
                 writes[filled] = .{
                     .key = raw_key,
-                    .value = doc.value,
+                    .value = doc_json,
                 };
-                extracted[filled] = try mapper.extractWrite(alloc, raw_key, doc.value);
+                extracted[filled] = try mapper.extractWrite(alloc, raw_key, doc_json);
                 extracted_initialized += 1;
                 filled += 1;
             }
@@ -8347,7 +8355,7 @@ pub const DB = struct {
                 _ = value;
                 const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
                 if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
-                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.alloc, key)) orelse return .@"continue";
+                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.alloc, key)) orelse return .@"continue";
                 errdefer state.alloc.free(raw_key);
                 try state.doc_ids.append(state.alloc, raw_key);
                 state.coverage.scanned_primary_docs += 1;
@@ -8418,7 +8426,7 @@ pub const DB = struct {
         var count: u32 = 0;
         for (docs) |doc| {
             if (!isPrimaryDocumentStoreKey(doc.key)) continue;
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
+            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
             defer alloc.free(raw_key);
 
             if (!byte_range.contains(raw_key)) continue;
@@ -8433,7 +8441,10 @@ pub const DB = struct {
             }
             if (try isExpiredDocumentKey(self, alloc, raw_key)) continue;
 
-            const hash = std.hash.Wyhash.hash(0, doc.value);
+            const doc_json = try mapper.materializeDocumentValueAlloc(alloc, doc.value);
+            defer alloc.free(doc_json);
+
+            const hash = std.hash.Wyhash.hash(0, doc_json);
             try hashes.append(alloc, .{
                 .id = try alloc.dupe(u8, raw_key),
                 .hash = hash,
@@ -8442,7 +8453,7 @@ pub const DB = struct {
             if (opts.include_documents) {
                 try documents.append(alloc, .{
                     .id = try alloc.dupe(u8, raw_key),
-                    .json = try projectLookupStoredBytes(self, alloc, raw_key, doc.value, .{
+                    .json = try projectLookupStoredBytes(self, alloc, raw_key, doc_json, .{
                         .fields = opts.fields,
                         .include_all_fields = opts.include_all_fields,
                     }),
@@ -40698,6 +40709,23 @@ test "relational table point reads use only the relational base store" {
     try std.testing.expect(std.mem.indexOf(u8, doc, "\"title\":\"base row\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, doc, "\"amount\":12.5") != null);
     try std.testing.expect(std.mem.indexOf(u8, doc, "\"attrs\":{\"tier\":\"gold\"}") != null);
+
+    const median = try db.findMedianKey(alloc);
+    defer alloc.free(median);
+    try std.testing.expectEqualStrings("row:base", median);
+
+    var scan_result = try db.scan(alloc, "row:", "row:\xff", .{
+        .include_documents = true,
+        .fields = &.{"title"},
+        .include_all_fields = false,
+    });
+    defer scan_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), scan_result.hashes.len);
+    try std.testing.expectEqualStrings("row:base", scan_result.hashes[0].id);
+    try std.testing.expectEqual(@as(usize, 1), scan_result.documents.len);
+    try std.testing.expectEqualStrings("row:base", scan_result.documents[0].id);
+    try std.testing.expect(std.mem.indexOf(u8, scan_result.documents[0].json, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scan_result.documents[0].json, "\"amount\"") == null);
 
     try db.batch(.{
         .deletes = &.{"row:base"},
