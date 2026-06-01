@@ -2341,3 +2341,46 @@ manual user-facing materialization lifecycle or explicit materialization definit
 best-effort approximate MIN/MAX
 using the algebraic sidecar when status indicates incomplete derived state
 ```
+
+## Approximate cardinality (HyperLogLog)
+
+An index can materialize approximate distinct-counts so a `cardinality`
+aggregation is answered from a per-group sketch instead of scanning and
+deduplicating every value. Configure it with `hll_cardinalities`:
+
+```json
+{
+  "hll_cardinalities": [
+    {"name": "customers_by_region", "group_by": ["region"],
+     "value_field": "customer", "precision": 14}
+  ]
+}
+```
+
+`group_by` are the bucket axes, `value_field` is the field whose distinct values
+are counted, and `precision` (4–18, default 14) sizes each sketch at
+`2^precision` bytes and sets its accuracy.
+
+### Result contract
+
+Every `cardinality` result is self-describing, so a client can always tell an
+estimate from an exact count and reason about the error budget:
+
+```json
+{"value": 4044, "approximate": true, "relative_error": 0.0081}   // from a sketch
+{"value": 4096, "approximate": false}                            // exact distinct scan
+```
+
+`relative_error` is the HyperLogLog standard error of the sketch that produced
+the value, `1.04 / sqrt(2^precision)` — about 1.6% at p=12 and 0.8% at p=14. It
+is present only when `approximate` is true.
+
+### Selection and maintenance
+
+The planner answers a `cardinality` from a matching sketch automatically when
+the query has no constraints and no MVCC read generation (sketches are
+maintained unconstrained and without per-generation visibility), a sketch's
+`group_by`/`value_field` match the query, and that materialization is not
+mid-rebuild; otherwise it falls back to the exact distinct scan (which reports
+`approximate: false`). Deletes and overwrites mark the affected groups dirty and
+rebuild only those groups' sketches in the background.

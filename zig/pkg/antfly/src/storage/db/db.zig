@@ -2280,6 +2280,14 @@ pub const DB = struct {
         };
     }
 
+    // Hand the durable-jobs lane to the index manager so algebraic indexes can
+    // run HLL cardinality maintenance off the foreground write path, and so that
+    // adaptively promoted sketches are reloaded and backfilled on a live server.
+    fn attachAlgebraicHllMaintenanceLane(self: *DB) void {
+        const runtime = self.backend_runtime;
+        self.core.index_manager.attachHllMaintenance(runtime.durable_jobs, runtime.allocOwnerId());
+    }
+
     fn hydrateAlgebraicObservationStatusBestEffort(self: *DB) void {
         for (self.core.index_manager.algebraic_indexes.items) |*entry| {
             entry.index.loadPersistedObservations(self.core.store) catch {};
@@ -2438,6 +2446,7 @@ pub const DB = struct {
                 profile.init_optional_runtimes_ns = elapsedSince(init_optional_started_ns);
             }
 
+            db.attachAlgebraicHllMaintenanceLane();
             if (opts.open_mode == .status_only) {
                 try db.core.loadIndexCatalogOnly();
             } else if (opts.open_mode == .query_readonly) {
@@ -5414,6 +5423,9 @@ pub const DB = struct {
         var changed: u64 = 0;
         for (self.core.index_manager.algebraic_indexes.items) |*entry| {
             changed += try entry.index.evaluateAdaptiveCandidates(self.core.store, target_sequence);
+            // Promote + backfill recurring cardinality observations into HLL
+            // sketches here (leader-gated), not on the read path.
+            changed += try entry.index.evaluateHllCardinalityCandidates(self.core.store);
         }
         return changed;
     }
@@ -19624,7 +19636,10 @@ test "db open borrows shared backend runtime" {
     try std.testing.expect(first.backend_owner_id != 0);
     try std.testing.expect(second.backend_owner_id != 0);
     try std.testing.expect(first.backend_owner_id != second.backend_owner_id);
-    try std.testing.expectEqual(@as(u64, 3), runtime.ptr().allocOwnerId());
+    // Each open allocates two owner ids from the shared runtime: one for the
+    // backend (backend_owner_id) and one dedicated to algebraic HLL cardinality
+    // maintenance. Two opens therefore consume ids 1..4, leaving 5 next.
+    try std.testing.expectEqual(@as(u64, 5), runtime.ptr().allocOwnerId());
 }
 
 test "db open downgrades borrowed manual backend runtime to manual executor" {
@@ -19644,6 +19659,98 @@ test "db open downgrades borrowed manual backend runtime to manual executor" {
 
     try std.testing.expectEqual(runtime.ptr(), db.backend_runtime);
     try std.testing.expect(db.owned_backend_runtime == null);
+}
+
+test "db open wires algebraic HLL maintenance lane and adaptively backfills sketches" {
+    const alloc = std.testing.allocator;
+
+    // A manual backend runtime drives durable jobs inline (synchronously on
+    // submit), so a lane-scheduled HLL backfill completes within the call that
+    // promotes the sketch — the path a read-mostly cardinality workload takes.
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "schema_version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"product","path":"product","type":"string"}],
+        \\  "materializations": [],
+        \\  "adaptive": {"observe": true, "lazy_materialization": true, "min_observations": 2}
+        \\}
+    ;
+
+    var adaptive_name_buf: [64]u8 = undefined;
+    var adaptive_name_len: usize = 0;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .backend_runtime = runtime.ptr(),
+        });
+        defer db.close();
+
+        try db.addIndex(.{ .name = "alg", .kind = .algebraic, .config_json = cfg });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "d1", .value = "{\"product\":\"pen\"}" },
+                .{ .key = "d2", .value = "{\"product\":\"book\"}" },
+                .{ .key = "d3", .value = "{\"product\":\"pen\"}" },
+                .{ .key = "d4", .value = "{\"product\":\"notebook\"}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        const entry = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        const index = &entry.index;
+
+        // DB.open must thread the durable-jobs lane into the algebraic index so
+        // background HLL maintenance has somewhere to run on a live server.
+        try std.testing.expect(index.hll_maintenance_lane != null);
+
+        const adaptive_name = try index.hllAdaptiveNameAlloc(null, "product");
+        defer alloc.free(adaptive_name);
+        @memcpy(adaptive_name_buf[0..adaptive_name.len], adaptive_name);
+        adaptive_name_len = adaptive_name.len;
+
+        // Reads only record observations — they never promote — so no sketch and
+        // no approximate total exist after two recurring cardinality queries.
+        index.observeCardinalityForAdaptive(db.core.store, null, "product");
+        index.observeCardinalityForAdaptive(db.core.store, null, "product");
+        try std.testing.expect(!index.hllRegistryContains(adaptive_name));
+        try std.testing.expect((try index.approxCardinalityTotalForFieldAlloc(db.core.store, "product", &.{}, null)) == null);
+
+        // The leader-gated adaptive maintenance pass promotes the over-threshold
+        // observation and backfills it, so the next read resolves an approximate
+        // distinct-product count (4 docs, 3 distinct products).
+        _ = try db.evaluateAlgebraicAdaptiveCandidates();
+        try std.testing.expect(index.hllRegistryContains(adaptive_name));
+        const estimate = (try index.approxCardinalityTotalForFieldAlloc(db.core.store, "product", &.{}, null)) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(@max(estimate, 3) - @min(estimate, 3) <= 1);
+    }
+
+    // The promotion is durable: a freshly reopened DB reloads the adaptive marker
+    // through the open-site wiring (attachHllMaintenance + loadAdaptiveHllCardinalities)
+    // and keeps serving the approximate count without re-observing.
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .backend_runtime = runtime.ptr(),
+        });
+        defer db.close();
+
+        const entry = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        const index = &entry.index;
+        const adaptive_name = adaptive_name_buf[0..adaptive_name_len];
+        try std.testing.expect(index.hllRegistryContains(adaptive_name));
+        const reopened = (try index.approxCardinalityTotalForFieldAlloc(db.core.store, "product", &.{}, null)) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(@max(reopened, 3) - @min(reopened, 3) <= 1);
+    }
 }
 
 test "db text merge enabled requires backend runtime io" {

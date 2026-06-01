@@ -1931,6 +1931,18 @@ components:
         - Bucketing: terms, range, date_range, histogram, date_histogram
         - Geo: geohash_grid, geo_distance
         - Analytics: significant_terms
+    CardinalityMode:
+      type: string
+      enum:
+        - auto
+        - exact
+        - approximate
+      description: |
+        Exact-vs-approximate selection for a cardinality aggregation:
+        - auto: use a materialized HyperLogLog sketch when one applies and is
+          current, else an exact distinct scan (default).
+        - exact: always compute an exact distinct count.
+        - approximate: require a matching sketch; error if none applies.
     AggregationRange:
       type: object
       required:
@@ -2061,6 +2073,15 @@ components:
         field:
           type: string
           description: Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
+        mode:
+          x-go-type-skip-optional-pointer: false
+          allOf:
+            - $ref: "#/components/schemas/CardinalityMode"
+          description: >-
+            Selection mode for a cardinality aggregation. `auto` (default) uses a
+            materialized HyperLogLog sketch when one applies and is current, else
+            falls back to an exact distinct scan. `exact` always scans. `approximate`
+            requires a sketch and errors if none applies. Ignored for other types.
         fields:
           type: array
           items:
@@ -2195,6 +2216,22 @@ components:
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Single value for metric aggregations (sum, avg, min, max, count, cardinality)
+        approximate:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: >-
+            For cardinality aggregations, whether the value is an approximate
+            estimate from a HyperLogLog sketch (true) or an exact distinct count
+            (false). Absent for non-cardinality aggregations.
+        relative_error:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-type-skip-optional-pointer: false
+          description: >-
+            For an approximate cardinality value, the relative standard error of
+            the estimate (e.g. 0.0081 for ~0.8%). Present only when approximate
+            is true.
         count:
           type: integer
           x-go-type-skip-optional-pointer: false

@@ -30,6 +30,7 @@ pub const AntflyType = types.AntflyType;
 pub const Table = types.Table;
 pub const TableMigration = types.TableMigration;
 pub const AggregationType = types.AggregationType;
+pub const CardinalityMode = types.CardinalityMode;
 pub const AggregationRange = types.AggregationRange;
 pub const AggregationDateRange = types.AggregationDateRange;
 pub const CalendarInterval = types.CalendarInterval;

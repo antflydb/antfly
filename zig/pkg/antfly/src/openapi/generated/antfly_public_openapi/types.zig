@@ -271,6 +271,35 @@ pub const AggregationType = enum {
     }
 };
 
+/// Exact-vs-approximate selection for a cardinality aggregation: - auto: use a materialized HyperLogLog sketch when one applies and is current, else an exact distinct scan (default). - exact: always compute an exact distinct count. - approximate: require a matching sketch; error if none applies.
+pub const CardinalityMode = enum {
+    auto,
+    exact,
+    approximate,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .exact => "exact",
+            .approximate => "approximate",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "exact", .exact },
+            .{ "approximate", .approximate },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const AggregationRange = struct {
     /// Name of the range bucket
     name: []const u8,
@@ -1418,6 +1447,8 @@ pub const AggregationRequest = struct {
     type: AggregationType,
     /// Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
     field: ?[]const u8 = null,
+    /// Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types.
+    mode: ?std.json.Value = null,
     /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
     fields: ?[]const []const u8 = null,
     /// Maximum number of buckets to return (for bucketing aggregations)
@@ -2279,6 +2310,10 @@ pub const AggregationBucket = struct {
 pub const AggregationResult = struct {
     /// Single value for metric aggregations (sum, avg, min, max, count, cardinality)
     value: ?f32 = null,
+    /// For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations.
+    approximate: ?bool = null,
+    /// For an approximate cardinality value, the relative standard error of the estimate (e.g. 0.0081 for ~0.8%). Present only when approximate is true.
+    relative_error: ?f32 = null,
     /// Document count for stats aggregations
     count: ?i64 = null,
     /// Minimum value for stats aggregations

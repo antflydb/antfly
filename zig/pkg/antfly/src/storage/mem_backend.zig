@@ -17,157 +17,94 @@ const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
-const OwnedEntry = struct {
-    namespace_name: ?[]u8,
-    key: []u8,
-    value: []u8,
-
-    fn deinit(self: *OwnedEntry, allocator: Allocator) void {
-        if (self.namespace_name) |name| allocator.free(name);
-        allocator.free(self.key);
-        allocator.free(self.value);
-        self.* = undefined;
-    }
-
-    fn entry(self: *const OwnedEntry) backend_adapter.Entry {
-        return .{
-            .key = self.key,
-            .value = self.value,
-        };
-    }
-};
+const ordered = @import("mem_ordered.zig");
 
 const State = struct {
-    arena: ?std.heap.ArenaAllocator = null,
-    entries: std.ArrayListUnmanaged(OwnedEntry) = .empty,
+    tree: ordered.Tree = .empty,
 
     fn deinit(self: *State, allocator: Allocator) void {
-        if (self.arena) |*arena| {
-            arena.deinit();
-            self.* = .{};
-            return;
-        }
-        for (self.entries.items) |*entry| entry.deinit(allocator);
-        self.entries.deinit(allocator);
+        self.tree.release(allocator);
         self.* = .{};
     }
 
+    // O(1) snapshot: the persistent tree shares structure with the source, so a
+    // transaction starts from the current version without copying it.
     fn clone(self: *const State, allocator: Allocator) !State {
-        var out: State = .{};
-        errdefer out.deinit(allocator);
-        out.arena = std.heap.ArenaAllocator.init(allocator);
-
-        const arena_alloc = out.arena.?.allocator();
-        try out.entries.ensureTotalCapacity(arena_alloc, self.entries.items.len);
-        for (self.entries.items) |entry| {
-            out.entries.appendAssumeCapacity(try cloneEntry(arena_alloc, entry));
-        }
-        return out;
+        _ = allocator;
+        return .{ .tree = self.tree.snapshot() };
     }
 
     fn get(self: *const State, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
-        const idx = self.findIndex(namespace, key) orelse return error.NotFound;
-        return self.entries.items[idx].value;
+        return self.tree.get(namespace.name, key) orelse error.NotFound;
     }
 
     fn put(self: *State, allocator: Allocator, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
-        const state_alloc = self.stateAllocator(allocator);
-        if (self.findIndex(namespace, key)) |idx| {
-            const replacement = try state_alloc.dupe(u8, value);
-            if (!self.usesArena()) allocator.free(self.entries.items[idx].value);
-            self.entries.items[idx].value = replacement;
-            return;
-        }
-
-        const idx = self.lowerBound(namespace, key);
-        try self.entries.insert(state_alloc, idx, try initEntry(state_alloc, namespace, key, value));
+        const next = try self.tree.put(allocator, namespace.name, key, value);
+        self.tree.release(allocator);
+        self.tree = next;
     }
 
     fn delete(self: *State, allocator: Allocator, namespace: backend_types.Namespace, key: []const u8) !void {
-        const idx = self.findIndex(namespace, key) orelse return;
-        var removed = self.entries.orderedRemove(idx);
-        if (!self.usesArena()) removed.deinit(allocator);
-    }
-
-    fn lowerBound(self: *const State, namespace: backend_types.Namespace, key: []const u8) usize {
-        var lo: usize = 0;
-        var hi: usize = self.entries.items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            const ord = compareEntryTo(self.entries.items[mid], namespace, key);
-            if (ord == .lt) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        return lo;
-    }
-
-    fn findIndex(self: *const State, namespace: backend_types.Namespace, key: []const u8) ?usize {
-        const idx = self.lowerBound(namespace, key);
-        if (idx >= self.entries.items.len) return null;
-        if (compareEntryTo(self.entries.items[idx], namespace, key) != .eq) return null;
-        return idx;
-    }
-
-    fn stateAllocator(self: *State, fallback: Allocator) Allocator {
-        if (self.arena) |*arena| return arena.allocator();
-        return fallback;
-    }
-
-    fn usesArena(self: *const State) bool {
-        return self.arena != null;
+        const next = try self.tree.remove(allocator, namespace.name, key);
+        self.tree.release(allocator);
+        self.tree = next;
     }
 };
 
-fn cloneEntry(allocator: Allocator, entry: OwnedEntry) !OwnedEntry {
-    return .{
-        .namespace_name = if (entry.namespace_name) |name| try allocator.dupe(u8, name) else null,
-        .key = try allocator.dupe(u8, entry.key),
-        .value = try allocator.dupe(u8, entry.value),
-    };
+fn sameNamespace(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
-fn initEntry(
-    allocator: Allocator,
-    namespace: backend_types.Namespace,
-    key: []const u8,
-    value: []const u8,
-) !OwnedEntry {
-    return .{
-        .namespace_name = if (namespace.name) |name| try allocator.dupe(u8, name) else null,
-        .key = try allocator.dupe(u8, key),
-        .value = try allocator.dupe(u8, value),
-    };
-}
-
-fn namespaceOf(entry: OwnedEntry) backend_types.Namespace {
-    return .{ .name = entry.namespace_name };
-}
-
-fn compareNamespace(a: backend_types.Namespace, b: backend_types.Namespace) std.math.Order {
-    if (a.name == null and b.name == null) return .eq;
-    if (a.name == null) return .lt;
-    if (b.name == null) return .gt;
-    return std.mem.order(u8, a.name.?, b.name.?);
-}
-
-fn compareEntryTo(entry: OwnedEntry, namespace: backend_types.Namespace, key: []const u8) std.math.Order {
-    const namespace_order = compareNamespace(namespaceOf(entry), namespace);
-    if (namespace_order != .eq) return namespace_order;
-    return std.mem.order(u8, entry.key, key);
+fn namespaceOrder(a: ?[]const u8, b: ?[]const u8) std.math.Order {
+    if (a == null and b == null) return .eq;
+    if (a == null) return .lt;
+    if (b == null) return .gt;
+    return std.mem.order(u8, a.?, b.?);
 }
 
 pub const Options = struct {
     backend: backend_types.OpenOptions = .{},
 };
 
+// Reference-counted, immutable-while-shared snapshot of the store. Read
+// transactions retain the current snapshot in O(1) instead of cloning the whole
+// entry list; a writer clones into a fresh snapshot and publishes it on commit,
+// so readers opened beforehand keep observing the snapshot they retained until
+// they release it. This keeps snapshot isolation while making reads cheap.
+const RcState = struct {
+    refs: usize,
+    state: State,
+};
+
+fn retainState(rc: *RcState) void {
+    rc.refs += 1;
+}
+
+fn releaseState(allocator: Allocator, rc: *RcState) void {
+    rc.refs -= 1;
+    if (rc.refs == 0) {
+        rc.state.deinit(allocator);
+        allocator.destroy(rc);
+    }
+}
+
 pub const Backend = struct {
     allocator: Allocator,
     open_options: backend_types.OpenOptions,
-    state: State = .{},
+    state: ?*RcState = null,
     mutex: std.atomic.Mutex = .unlocked,
+
+    // Returns the current snapshot, creating an empty one on first use. Must be
+    // called with the backend mutex held.
+    fn ensureStateLocked(self: *Backend) !*RcState {
+        if (self.state) |rc| return rc;
+        const rc = try self.allocator.create(RcState);
+        rc.* = .{ .refs = 1, .state = .{} };
+        self.state = rc;
+        return rc;
+    }
 
     const BoundStore = struct {
         backend: *Backend,
@@ -203,195 +140,205 @@ pub const Backend = struct {
         }
     };
 
+    // Namespace-scoped cursor over a retained tree snapshot. Holding its own
+    // snapshot keeps the nodes alive even if the transaction writes afterwards.
     const BoundCursor = struct {
-        state: *const State,
+        alloc: Allocator,
+        tree: ordered.Tree,
         namespace: backend_types.Namespace,
-        current: ?usize = null,
+        inner: ordered.Cursor,
 
-        pub fn close(_: *@This()) void {}
-
-        pub fn first(self: *@This()) !backend_adapter.Entry {
-            const idx = self.firstIndex() orelse return error.NotFound;
-            self.current = idx;
-            return self.state.entries.items[idx].entry();
+        fn init(alloc: Allocator, tree: ordered.Tree, namespace: backend_types.Namespace) BoundCursor {
+            return .{
+                .alloc = alloc,
+                .tree = tree.snapshot(),
+                .namespace = namespace,
+                .inner = ordered.Cursor.init(alloc),
+            };
         }
 
-        pub fn last(self: *@This()) !backend_adapter.Entry {
-            const idx = self.lastIndex() orelse return error.NotFound;
-            self.current = idx;
-            return self.state.entries.items[idx].entry();
+        pub fn close(self: *@This()) void {
+            self.inner.deinit();
+            self.tree.release(self.alloc);
+            self.* = undefined;
+        }
+
+        fn entryOf(entry: ordered.Entry) backend_adapter.Entry {
+            return .{ .key = entry.key, .value = entry.value };
+        }
+
+        // A forward step lands on the next entry in namespace order; once it
+        // crosses out of this cursor's namespace the scan is exhausted.
+        fn forward(self: *@This(), found: ?ordered.Entry) !backend_adapter.Entry {
+            const entry = found orelse return error.NotFound;
+            if (!sameNamespace(entry.name, self.namespace.name)) return error.NotFound;
+            return entryOf(entry);
+        }
+
+        pub fn first(self: *@This()) !backend_adapter.Entry {
+            return self.forward(try self.inner.seekAtOrAfter(self.tree, self.namespace.name, ""));
+        }
+
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !backend_adapter.Entry {
+            return self.forward(try self.inner.seekAtOrAfter(self.tree, self.namespace.name, key));
         }
 
         pub fn next(self: *@This()) !backend_adapter.Entry {
-            const current = self.current orelse return error.NotFound;
-            var idx = current + 1;
-            while (idx < self.state.entries.items.len) : (idx += 1) {
-                if (compareNamespace(namespaceOf(self.state.entries.items[idx]), self.namespace) == .eq) {
-                    self.current = idx;
-                    return self.state.entries.items[idx].entry();
+            return self.forward(try self.inner.next());
+        }
+
+        pub fn last(self: *@This()) !backend_adapter.Entry {
+            var found = try self.inner.last(self.tree);
+            while (found) |entry| {
+                switch (namespaceOrder(entry.name, self.namespace.name)) {
+                    .eq => return entryOf(entry),
+                    .gt => found = try self.inner.prev(),
+                    .lt => return error.NotFound,
                 }
             }
             return error.NotFound;
         }
 
         pub fn prev(self: *@This()) !backend_adapter.Entry {
-            const current = self.current orelse return error.NotFound;
-            if (current == 0) return error.NotFound;
-            var idx = current - 1;
-            while (true) {
-                if (compareNamespace(namespaceOf(self.state.entries.items[idx]), self.namespace) == .eq) {
-                    self.current = idx;
-                    return self.state.entries.items[idx].entry();
-                }
-                if (idx == 0) break;
-                idx -= 1;
-            }
-            return error.NotFound;
-        }
-
-        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !backend_adapter.Entry {
-            const idx = self.state.lowerBound(self.namespace, key);
-            if (idx >= self.state.entries.items.len) return error.NotFound;
-            if (compareNamespace(namespaceOf(self.state.entries.items[idx]), self.namespace) != .eq) return error.NotFound;
-            self.current = idx;
-            return self.state.entries.items[idx].entry();
+            const entry = (try self.inner.prev()) orelse return error.NotFound;
+            if (!sameNamespace(entry.name, self.namespace.name)) return error.NotFound;
+            return entryOf(entry);
         }
 
         pub fn seekAtOrBefore(self: *@This(), key: []const u8) !backend_adapter.Entry {
-            const idx = self.state.lowerBound(self.namespace, key);
-            if (idx < self.state.entries.items.len and compareEntryTo(self.state.entries.items[idx], self.namespace, key) == .eq) {
-                self.current = idx;
-                return self.state.entries.items[idx].entry();
-            }
-            if (idx == 0) return error.NotFound;
-            var probe = idx - 1;
-            while (true) {
-                if (compareNamespace(namespaceOf(self.state.entries.items[probe]), self.namespace) == .eq) {
-                    self.current = probe;
-                    return self.state.entries.items[probe].entry();
-                }
-                if (probe == 0) break;
-                probe -= 1;
-            }
-            return error.NotFound;
-        }
-
-        fn firstIndex(self: *const @This()) ?usize {
-            const idx = self.state.lowerBound(self.namespace, "");
-            if (idx >= self.state.entries.items.len) return null;
-            if (compareNamespace(namespaceOf(self.state.entries.items[idx]), self.namespace) != .eq) return null;
-            return idx;
-        }
-
-        fn lastIndex(self: *const @This()) ?usize {
-            if (self.state.entries.items.len == 0) return null;
-            var idx = self.state.entries.items.len;
-            while (idx > 0) {
-                idx -= 1;
-                if (compareNamespace(namespaceOf(self.state.entries.items[idx]), self.namespace) == .eq) return idx;
-            }
-            return null;
+            const entry = (try self.inner.seekAtOrBefore(self.tree, self.namespace.name, key)) orelse return error.NotFound;
+            if (!sameNamespace(entry.name, self.namespace.name)) return error.NotFound;
+            return entryOf(entry);
         }
     };
 
     const BoundTxn = struct {
         allocator: Allocator,
-        backend: ?*Backend,
+        backend: *Backend,
         namespace: backend_types.Namespace,
-        state: State,
+        read_only: bool,
+        rc: ?*RcState,
 
         fn open(backend: *Backend, namespace: backend_types.Namespace, read_only: bool) !BoundTxn {
             lockBackend(backend);
             defer backend.mutex.unlock();
+            const current = try backend.ensureStateLocked();
+            const rc: *RcState = if (read_only) blk: {
+                retainState(current);
+                break :blk current;
+            } else blk: {
+                var cloned = try current.state.clone(backend.allocator);
+                errdefer cloned.deinit(backend.allocator);
+                const new_rc = try backend.allocator.create(RcState);
+                new_rc.* = .{ .refs = 1, .state = cloned };
+                break :blk new_rc;
+            };
             return .{
                 .allocator = backend.allocator,
-                .backend = if (read_only) null else backend,
+                .backend = backend,
                 .namespace = namespace,
-                .state = try backend.state.clone(backend.allocator),
+                .read_only = read_only,
+                .rc = rc,
             };
         }
 
         pub fn abort(self: *@This()) void {
-            self.state.deinit(self.allocator);
-            self.* = undefined;
+            const rc = self.rc orelse return;
+            lockBackend(self.backend);
+            releaseState(self.allocator, rc);
+            self.backend.mutex.unlock();
+            self.rc = null;
         }
 
         pub fn commit(self: *@This()) !void {
-            const backend = self.backend orelse return error.ReadOnly;
-            lockBackend(backend);
-            defer backend.mutex.unlock();
-            var old_state = backend.state;
-            backend.state = self.state;
-            self.state = .{};
-            old_state.deinit(self.allocator);
-            self.backend = null;
+            if (self.read_only) return error.ReadOnly;
+            const rc = self.rc orelse return error.ReadOnly;
+            lockBackend(self.backend);
+            defer self.backend.mutex.unlock();
+            const old = self.backend.state.?;
+            self.backend.state = rc;
+            releaseState(self.allocator, old);
+            self.rc = null;
         }
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
-            return try self.state.get(self.namespace, key);
+            return try self.rc.?.state.get(self.namespace, key);
         }
 
         pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
-            if (self.backend == null) return error.ReadOnly;
-            try self.state.put(self.allocator, self.namespace, key, value);
+            if (self.read_only) return error.ReadOnly;
+            try self.rc.?.state.put(self.allocator, self.namespace, key, value);
         }
 
         pub fn delete(self: *@This(), key: []const u8) !void {
-            if (self.backend == null) return error.ReadOnly;
-            try self.state.delete(self.allocator, self.namespace, key);
+            if (self.read_only) return error.ReadOnly;
+            try self.rc.?.state.delete(self.allocator, self.namespace, key);
         }
 
         pub fn openCursor(self: *@This()) !BoundCursor {
-            return .{
-                .state = &self.state,
-                .namespace = self.namespace,
-            };
+            return BoundCursor.init(self.allocator, self.rc.?.state.tree, self.namespace);
         }
     };
 
     const NamespaceTxn = struct {
         allocator: Allocator,
-        backend: ?*Backend,
-        state: State,
+        backend: *Backend,
+        read_only: bool,
+        rc: ?*RcState,
 
         fn open(backend: *Backend, read_only: bool) !NamespaceTxn {
             lockBackend(backend);
             defer backend.mutex.unlock();
+            const current = try backend.ensureStateLocked();
+            const rc: *RcState = if (read_only) blk: {
+                retainState(current);
+                break :blk current;
+            } else blk: {
+                var cloned = try current.state.clone(backend.allocator);
+                errdefer cloned.deinit(backend.allocator);
+                const new_rc = try backend.allocator.create(RcState);
+                new_rc.* = .{ .refs = 1, .state = cloned };
+                break :blk new_rc;
+            };
             return .{
                 .allocator = backend.allocator,
-                .backend = if (read_only) null else backend,
-                .state = try backend.state.clone(backend.allocator),
+                .backend = backend,
+                .read_only = read_only,
+                .rc = rc,
             };
         }
 
         pub fn abort(self: *@This()) void {
-            self.state.deinit(self.allocator);
-            self.* = undefined;
+            const rc = self.rc orelse return;
+            lockBackend(self.backend);
+            releaseState(self.allocator, rc);
+            self.backend.mutex.unlock();
+            self.rc = null;
         }
 
         pub fn commit(self: *@This()) !void {
-            const backend = self.backend orelse return error.ReadOnly;
-            lockBackend(backend);
-            defer backend.mutex.unlock();
-            var old_state = backend.state;
-            backend.state = self.state;
-            self.state = .{};
-            old_state.deinit(self.allocator);
-            self.backend = null;
+            if (self.read_only) return error.ReadOnly;
+            const rc = self.rc orelse return error.ReadOnly;
+            lockBackend(self.backend);
+            defer self.backend.mutex.unlock();
+            const old = self.backend.state.?;
+            self.backend.state = rc;
+            releaseState(self.allocator, old);
+            self.rc = null;
         }
 
         pub fn get(self: *@This(), namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
-            return try self.state.get(namespace, key);
+            return try self.rc.?.state.get(namespace, key);
         }
 
         pub fn put(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
-            if (self.backend == null) return error.ReadOnly;
-            try self.state.put(self.allocator, namespace, key, value);
+            if (self.read_only) return error.ReadOnly;
+            try self.rc.?.state.put(self.allocator, namespace, key, value);
         }
 
         pub fn delete(self: *@This(), namespace: backend_types.Namespace, key: []const u8) !void {
-            if (self.backend == null) return error.ReadOnly;
-            try self.state.delete(self.allocator, namespace, key);
+            if (self.read_only) return error.ReadOnly;
+            try self.rc.?.state.delete(self.allocator, namespace, key);
         }
     };
 
@@ -404,7 +351,7 @@ pub const Backend = struct {
 
     pub fn close(self: *Backend) void {
         lockBackend(self);
-        self.state.deinit(self.allocator);
+        if (self.state) |rc| releaseState(self.allocator, rc);
         self.mutex.unlock();
         self.* = undefined;
     }

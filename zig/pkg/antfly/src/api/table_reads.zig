@@ -15988,12 +15988,12 @@ test "provisioned distributed aggregations collect path terms nested cardinality
     try std.testing.expectEqual(@as(usize, 2), aggregation.buckets.len);
     try std.testing.expectEqualStrings("\"silver\"", aggregation.buckets[0].key_json);
     try std.testing.expectEqual(@as(i64, 3), aggregation.buckets[0].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregation.buckets[0].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregation.buckets[0].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregation.buckets[0].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregation.buckets[0].aggregations[1].value_json.?);
     try std.testing.expectEqualStrings("\"gold\"", aggregation.buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 2), aggregation.buckets[1].count);
-    try std.testing.expectEqualStrings("{\"value\":2}", aggregation.buckets[1].aggregations[0].value_json.?);
-    try std.testing.expectEqualStrings("{\"value\":1}", aggregation.buckets[1].aggregations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":2,\"approximate\":false}", aggregation.buckets[1].aggregations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"value\":1,\"approximate\":false}", aggregation.buckets[1].aggregations[1].value_json.?);
 }
 
 test "algebraic partial request accepts expression cache proofs without named materializations" {
