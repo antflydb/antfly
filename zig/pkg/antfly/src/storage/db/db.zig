@@ -38568,6 +38568,80 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     try std.testing.expectEqual(@as(usize, 0), parent_incoming.len);
 }
 
+test "db split moves relational rows and column entries" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var dest_buf: [256]u8 = undefined;
+    const dest = tempPath(&dest_buf);
+    defer cleanupTempDir(dest);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"title\":\"alpha\",\"status\":\"open\",\"amount\":10}" },
+            .{ .key = "row:z", .value = "{\"title\":\"zeta\",\"status\":\"closed\",\"amount\":90}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    try db.split(db.getRange(), "row:m", "", std.mem.span(dest), true);
+
+    var split_db = try DB.open(alloc, std.mem.span(dest), .{});
+    defer split_db.close();
+    try std.testing.expectEqualStrings("row:m", split_db.getRange().start);
+
+    const split_doc = (try split_db.get(alloc, "row:z")) orelse return error.TestExpectedEqual;
+    defer alloc.free(split_doc);
+    try std.testing.expect(std.mem.indexOf(u8, split_doc, "\"title\":\"zeta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, split_doc, "\"status\":\"closed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, split_doc, "\"amount\":90") != null);
+
+    const split_amounts = try relational_store_mod.scanColumnAlloc(alloc, split_db.core.store, "amount", "row:z", "row:z");
+    defer relational_store_mod.freeColumnValues(alloc, split_amounts);
+    try std.testing.expectEqual(@as(usize, 1), split_amounts.len);
+    try std.testing.expectEqualStrings("row:z", split_amounts[0].doc_key);
+    try std.testing.expectEqual(.f64_val, split_amounts[0].value_type);
+    try std.testing.expectEqual(@as(f64, 90), split_amounts[0].value.f64_val);
+
+    var split_filtered = try split_db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "zeta" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"closed\"}}",
+        .limit = 10,
+    });
+    defer split_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), split_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:z", split_filtered.hits[0].id);
+
+    try db.finalizeSplit(.{ .start = "", .end = "row:m" });
+    try std.testing.expect((try db.get(alloc, "row:z")) == null);
+
+    const parent_amounts = try relational_store_mod.scanColumnAlloc(alloc, db.core.store, "amount", "row:z", "row:z");
+    defer relational_store_mod.freeColumnValues(alloc, parent_amounts);
+    try std.testing.expectEqual(@as(usize, 0), parent_amounts.len);
+}
+
 test "db split prepare and finalize work with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
