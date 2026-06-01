@@ -1463,6 +1463,32 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.db_open_ns);
     try out.appendSlice(alloc, ",\"load_indexes_ns\":");
     try appendIntValue(alloc, out, stats.load_indexes_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_stores\":");
+    try appendIntValue(alloc, out, stats.lsm_open_stores);
+    try out.appendSlice(alloc, ",\"lsm_open_completed\":");
+    try appendIntValue(alloc, out, stats.lsm_open_completed);
+    try out.appendSlice(alloc, ",\"lsm_open_failed\":");
+    try appendIntValue(alloc, out, stats.lsm_open_failed);
+    try out.appendSlice(alloc, ",\"lsm_open_total_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_total_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_initializing_storage_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_initializing_storage_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_manifest_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_manifest_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_ensuring_dirs_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_ensuring_dirs_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_wal_replay_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_wal_replay_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_mounting_runs_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_mounting_runs_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_loaded_runs\":");
+    try appendIntValue(alloc, out, stats.lsm_open_loaded_runs);
+    try out.appendSlice(alloc, ",\"lsm_open_obsolete_paths\":");
+    try appendIntValue(alloc, out, stats.lsm_open_obsolete_paths);
+    try out.appendSlice(alloc, ",\"lsm_open_mutable_entries_after_replay\":");
+    try appendIntValue(alloc, out, stats.lsm_open_mutable_entries_after_replay);
+    try out.appendSlice(alloc, ",\"lsm_open_immutable_memtables_after_replay\":");
+    try appendIntValue(alloc, out, stats.lsm_open_immutable_memtables_after_replay);
     try out.appendSlice(alloc, ",\"wal_replay_records\":");
     try appendIntValue(alloc, out, stats.wal_replay_records);
     try out.appendSlice(alloc, ",\"wal_replay_entries\":");
@@ -1804,6 +1830,10 @@ test "index encoders expose local shard runtime status" {
                     .phase = .opening_db,
                     .wal_retained_segments = 4,
                     .wal_retained_bytes = 99,
+                    .lsm_open_stores = 2,
+                    .lsm_open_wal_replay_ns = 123,
+                    .lsm_open_loaded_runs = 6,
+                    .wal_replay_bytes = 456,
                 },
                 .dense_catch_up = .{
                     .active = true,
@@ -1855,6 +1885,10 @@ test "index encoders expose local shard runtime status" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"phase\":\"opening_db\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_segments\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_stores\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_wal_replay_ns\":123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_loaded_runs\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_bytes\":456") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_sequence\":41") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_target_sequence\":77") != null);

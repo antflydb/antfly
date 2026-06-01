@@ -624,6 +624,19 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_opened_indexes", "gauge", "Configured indexes already opened for the active startup catch-up table", stats.startup.opened_indexes);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_db_open_ns", "gauge", "Observed DB.open duration for the active startup catch-up table", stats.startup.db_open_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_load_indexes_ns", "gauge", "Observed index-load duration inside DB.open for the active startup catch-up table", stats.startup.load_indexes_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_stores", "gauge", "LSM-backed stores observed during startup index open", stats.startup.lsm_open_stores);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_completed", "gauge", "LSM-backed stores that completed startup open", stats.startup.lsm_open_completed);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_failed", "gauge", "LSM-backed stores that failed startup open", stats.startup.lsm_open_failed);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_total_ns", "gauge", "Summed LSM open duration across startup stores", stats.startup.lsm_open_total_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_initializing_storage_ns", "gauge", "Summed LSM storage initialization duration during startup open", stats.startup.lsm_open_initializing_storage_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_manifest_ns", "gauge", "Summed LSM manifest load duration during startup open", stats.startup.lsm_open_manifest_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_ensuring_dirs_ns", "gauge", "Summed LSM directory creation duration during startup open", stats.startup.lsm_open_ensuring_dirs_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_wal_replay_ns", "gauge", "Summed LSM WAL replay duration during startup open", stats.startup.lsm_open_wal_replay_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_mounting_runs_ns", "gauge", "Summed LSM run mounting duration during startup open", stats.startup.lsm_open_mounting_runs_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_loaded_runs", "gauge", "LSM runs loaded during startup open", stats.startup.lsm_open_loaded_runs);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_obsolete_paths", "gauge", "LSM obsolete paths loaded during startup open", stats.startup.lsm_open_obsolete_paths);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_mutable_entries_after_replay", "gauge", "LSM mutable entries after startup WAL replay", stats.startup.lsm_open_mutable_entries_after_replay);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_immutable_memtables_after_replay", "gauge", "LSM immutable memtables after startup WAL replay", stats.startup.lsm_open_immutable_memtables_after_replay);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_records", "gauge", "Observed LSM WAL replay records during startup index open", stats.startup.wal_replay_records);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_entries", "gauge", "Observed LSM WAL replay entries during startup index open", stats.startup.wal_replay_entries);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_bytes", "gauge", "Observed LSM WAL replay bytes during startup index open", stats.startup.wal_replay_bytes);
@@ -12426,6 +12439,17 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
                     .phase = .opening_db,
                     .wal_retained_segments = 4,
                     .wal_retained_bytes = 99,
+                    .lsm_open_stores = 3,
+                    .lsm_open_completed = 2,
+                    .lsm_open_total_ns = 1000,
+                    .lsm_open_manifest_ns = 111,
+                    .lsm_open_wal_replay_ns = 222,
+                    .lsm_open_loaded_runs = 5,
+                    .lsm_open_mutable_entries_after_replay = 7,
+                    .wal_replay_records = 8,
+                    .wal_replay_entries = 9,
+                    .wal_replay_bytes = 10,
+                    .wal_replay_ns = 222,
                 },
             },
         },
@@ -12572,6 +12596,17 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_active 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_retained_segments 4") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_retained_bytes 99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_stores 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_completed 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_total_ns 1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_manifest_ns 111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_wal_replay_ns 222") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_loaded_runs 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_mutable_entries_after_replay 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_records 8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_entries 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_bytes 10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_ns 222") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_phase{phase=\"opening_db\"} 1") != null);
 }
 

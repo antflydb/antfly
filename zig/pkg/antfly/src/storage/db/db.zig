@@ -521,6 +521,19 @@ const StartupOpenStats = struct {
     opened_indexes: std.atomic.Value(u32) = .init(0),
     db_open_ns: AtomicU64 = .init(0),
     load_indexes_ns: AtomicU64 = .init(0),
+    lsm_open_stores: AtomicU64 = .init(0),
+    lsm_open_completed: AtomicU64 = .init(0),
+    lsm_open_failed: AtomicU64 = .init(0),
+    lsm_open_total_ns: AtomicU64 = .init(0),
+    lsm_open_initializing_storage_ns: AtomicU64 = .init(0),
+    lsm_open_manifest_ns: AtomicU64 = .init(0),
+    lsm_open_ensuring_dirs_ns: AtomicU64 = .init(0),
+    lsm_open_wal_replay_ns: AtomicU64 = .init(0),
+    lsm_open_mounting_runs_ns: AtomicU64 = .init(0),
+    lsm_open_loaded_runs: AtomicU64 = .init(0),
+    lsm_open_obsolete_paths: AtomicU64 = .init(0),
+    lsm_open_mutable_entries_after_replay: AtomicU64 = .init(0),
+    lsm_open_immutable_memtables_after_replay: AtomicU64 = .init(0),
     wal_replay_records: AtomicU64 = .init(0),
     wal_replay_entries: AtomicU64 = .init(0),
     wal_replay_bytes: AtomicU64 = .init(0),
@@ -536,6 +549,19 @@ const StartupOpenStats = struct {
             .opened_indexes = self.opened_indexes.load(.monotonic),
             .db_open_ns = self.db_open_ns.load(.monotonic),
             .load_indexes_ns = self.load_indexes_ns.load(.monotonic),
+            .lsm_open_stores = self.lsm_open_stores.load(.monotonic),
+            .lsm_open_completed = self.lsm_open_completed.load(.monotonic),
+            .lsm_open_failed = self.lsm_open_failed.load(.monotonic),
+            .lsm_open_total_ns = self.lsm_open_total_ns.load(.monotonic),
+            .lsm_open_initializing_storage_ns = self.lsm_open_initializing_storage_ns.load(.monotonic),
+            .lsm_open_manifest_ns = self.lsm_open_manifest_ns.load(.monotonic),
+            .lsm_open_ensuring_dirs_ns = self.lsm_open_ensuring_dirs_ns.load(.monotonic),
+            .lsm_open_wal_replay_ns = self.lsm_open_wal_replay_ns.load(.monotonic),
+            .lsm_open_mounting_runs_ns = self.lsm_open_mounting_runs_ns.load(.monotonic),
+            .lsm_open_loaded_runs = self.lsm_open_loaded_runs.load(.monotonic),
+            .lsm_open_obsolete_paths = self.lsm_open_obsolete_paths.load(.monotonic),
+            .lsm_open_mutable_entries_after_replay = self.lsm_open_mutable_entries_after_replay.load(.monotonic),
+            .lsm_open_immutable_memtables_after_replay = self.lsm_open_immutable_memtables_after_replay.load(.monotonic),
             .wal_replay_records = self.wal_replay_records.load(.monotonic),
             .wal_replay_entries = self.wal_replay_entries.load(.monotonic),
             .wal_replay_bytes = self.wal_replay_bytes.load(.monotonic),
@@ -3015,21 +3041,28 @@ pub const DB = struct {
         self.async_context.stats.startup.db_open_ns.store(profile.total_ns, .monotonic);
         self.async_context.stats.startup.load_indexes_ns.store(profile.load_indexes_ns, .monotonic);
 
-        var replay_records: u64 = 0;
-        var replay_entries: u64 = 0;
-        var replay_bytes: u64 = 0;
-        var replay_ns: u64 = 0;
-        for (self.core.index_manager.dense_indexes.items) |*entry| {
-            const write_stats = entry.index.snapshotLsmWriteStats() orelse continue;
-            replay_records += write_stats.wal_replay_records;
-            replay_entries += write_stats.wal_replay_entries;
-            replay_bytes += write_stats.wal_replay_bytes;
-            replay_ns += write_stats.wal_replay_ns;
+        var lsm_open_stats = lsm_backend_mod.Backend.OpenStats{};
+        if (self.core.primary_store_owner.snapshotLsmOpenStats()) |primary_open_stats| {
+            lsm_backend_mod.Backend.accumulateOpenStats(&lsm_open_stats, primary_open_stats);
         }
-        self.async_context.stats.startup.wal_replay_records.store(replay_records, .monotonic);
-        self.async_context.stats.startup.wal_replay_entries.store(replay_entries, .monotonic);
-        self.async_context.stats.startup.wal_replay_bytes.store(replay_bytes, .monotonic);
-        self.async_context.stats.startup.wal_replay_ns.store(replay_ns, .monotonic);
+        lsm_backend_mod.Backend.accumulateOpenStats(&lsm_open_stats, self.core.index_manager.snapshotLsmOpenStats());
+        self.async_context.stats.startup.lsm_open_stores.store(lsm_open_stats.started, .monotonic);
+        self.async_context.stats.startup.lsm_open_completed.store(lsm_open_stats.completed, .monotonic);
+        self.async_context.stats.startup.lsm_open_failed.store(lsm_open_stats.failed, .monotonic);
+        self.async_context.stats.startup.lsm_open_total_ns.store(lsm_open_stats.total_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_initializing_storage_ns.store(lsm_open_stats.initializing_storage_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_manifest_ns.store(lsm_open_stats.opening_manifest_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_ensuring_dirs_ns.store(lsm_open_stats.ensuring_dirs_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_wal_replay_ns.store(lsm_open_stats.replaying_wal_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_mounting_runs_ns.store(lsm_open_stats.mounting_runs_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_loaded_runs.store(lsm_open_stats.loaded_runs, .monotonic);
+        self.async_context.stats.startup.lsm_open_obsolete_paths.store(lsm_open_stats.obsolete_paths, .monotonic);
+        self.async_context.stats.startup.lsm_open_mutable_entries_after_replay.store(lsm_open_stats.mutable_entries_after_replay, .monotonic);
+        self.async_context.stats.startup.lsm_open_immutable_memtables_after_replay.store(lsm_open_stats.immutable_memtables_after_replay, .monotonic);
+        self.async_context.stats.startup.wal_replay_records.store(lsm_open_stats.wal_replay_records, .monotonic);
+        self.async_context.stats.startup.wal_replay_entries.store(lsm_open_stats.wal_replay_entries, .monotonic);
+        self.async_context.stats.startup.wal_replay_bytes.store(lsm_open_stats.wal_replay_bytes, .monotonic);
+        self.async_context.stats.startup.wal_replay_ns.store(lsm_open_stats.replaying_wal_ns, .monotonic);
     }
 
     pub fn snapshotLsmMaintenanceStats(self: *DB) lsm_backend_mod.Backend.MaintenanceStats {

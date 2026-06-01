@@ -583,6 +583,13 @@ const MainStoreOwner = union(enum) {
         };
     }
 
+    fn snapshotLsmOpenStats(self: *const MainStoreOwner) ?lsm_backend.Backend.OpenStats {
+        return switch (self.*) {
+            .lmdb, .mem => null,
+            .lsm => |handle| handle.backend.snapshotOpenStats(),
+        };
+    }
+
     fn snapshotLsmNativeStorageStats(self: *const MainStoreOwner) ?lsm_backend.NativeStorageStats {
         return switch (self.*) {
             .lmdb, .mem => null,
@@ -1079,6 +1086,10 @@ pub const PersistentIndex = struct {
 
     pub fn snapshotLsmMaintenanceStats(self: *const PersistentIndex) ?lsm_backend.Backend.MaintenanceStats {
         return self.main_store_owner.snapshotLsmMaintenanceStats();
+    }
+
+    pub fn snapshotLsmOpenStats(self: *const PersistentIndex) ?lsm_backend.Backend.OpenStats {
+        return self.main_store_owner.snapshotLsmOpenStats();
     }
 
     pub fn snapshotLsmNativeStorageStats(self: *const PersistentIndex) ?lsm_backend.NativeStorageStats {

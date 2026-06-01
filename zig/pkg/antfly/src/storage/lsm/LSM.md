@@ -996,6 +996,10 @@ startup replay tax if it retains large WAL segments between runs.
      WAL replay, and run mounting, plus replay records/bytes and loaded run
      counts. Higher-level index-runtime and catch-up phases remain separate
      runtime work.
+   - [x] DB startup/status now aggregates LSM open stats across primary and
+     index stores, and exposes the phase counters through async-index startup
+     JSON/Prometheus metrics so LSM replay time is visible separately from
+     higher-level catch-up work.
 
 2. Add aggressive checkpoint triggers for index stores.
    - After successful bulk finalize

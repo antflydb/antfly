@@ -84,6 +84,7 @@ pub const StorageBackend = vectorindex_types.StorageBackend;
 pub const BulkBuildAlgo = vectorindex_types.BulkBuildAlgo;
 pub const LsmWriteStats = lsm_backend.Backend.WriteStats;
 pub const LsmMaintenanceStats = lsm_backend.Backend.MaintenanceStats;
+pub const LsmOpenStats = lsm_backend.Backend.OpenStats;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) {
@@ -1471,6 +1472,13 @@ pub const HBCIndex = struct {
     pub fn snapshotLsmMaintenanceStats(self: *const HBCIndex) ?LsmMaintenanceStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
+            .lmdb => null,
+        };
+    }
+
+    pub fn snapshotLsmOpenStats(self: *const HBCIndex) ?LsmOpenStats {
+        return switch (self.env_owner) {
+            .lsm => |handle| handle.backend.snapshotOpenStats(),
             .lmdb => null,
         };
     }

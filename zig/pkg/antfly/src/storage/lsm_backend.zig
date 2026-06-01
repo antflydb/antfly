@@ -171,8 +171,30 @@ pub const Backend = struct {
         mutable_entries_after_replay: u64 = 0,
         immutable_memtables_after_replay: u64 = 0,
         wal_replay_records: u64 = 0,
+        wal_replay_entries: u64 = 0,
         wal_replay_bytes: u64 = 0,
     };
+
+    pub fn accumulateOpenStats(dst: *OpenStats, src: OpenStats) void {
+        if (@intFromEnum(src.phase) > @intFromEnum(dst.phase)) dst.phase = src.phase;
+        dst.started +|= src.started;
+        dst.completed +|= src.completed;
+        dst.failed +|= src.failed;
+        dst.total_ns +|= src.total_ns;
+        dst.initializing_storage_ns +|= src.initializing_storage_ns;
+        dst.opening_manifest_ns +|= src.opening_manifest_ns;
+        dst.ensuring_dirs_ns +|= src.ensuring_dirs_ns;
+        dst.replaying_wal_ns +|= src.replaying_wal_ns;
+        dst.mounting_runs_ns +|= src.mounting_runs_ns;
+        dst.loaded_manifest = dst.loaded_manifest or src.loaded_manifest;
+        dst.loaded_runs +|= src.loaded_runs;
+        dst.obsolete_paths +|= src.obsolete_paths;
+        dst.mutable_entries_after_replay +|= src.mutable_entries_after_replay;
+        dst.immutable_memtables_after_replay +|= src.immutable_memtables_after_replay;
+        dst.wal_replay_records +|= src.wal_replay_records;
+        dst.wal_replay_entries +|= src.wal_replay_entries;
+        dst.wal_replay_bytes +|= src.wal_replay_bytes;
+    }
 
     pub const CompactionStats = struct {
         compactions: usize = 0,
@@ -806,6 +828,7 @@ pub const Backend = struct {
         self.open_stats.mutable_entries_after_replay = @intCast(self.mutable.entries.items.len);
         self.open_stats.immutable_memtables_after_replay = @intCast(self.activeImmutableMemtableCount());
         self.open_stats.wal_replay_records = self.write_stats.wal_replay_records;
+        self.open_stats.wal_replay_entries = self.write_stats.wal_replay_entries;
         self.open_stats.wal_replay_bytes = self.write_stats.wal_replay_bytes;
     }
 
@@ -4018,8 +4041,10 @@ test "lsm backend replays committed mutable writes from wal after crash reopen" 
     try std.testing.expect(!open_stats.loaded_manifest);
     try std.testing.expectEqual(@as(u64, 1), open_stats.mutable_entries_after_replay);
     try std.testing.expect(open_stats.wal_replay_records > 0);
+    try std.testing.expect(open_stats.wal_replay_entries > 0);
     try std.testing.expect(open_stats.wal_replay_bytes > 0);
     try std.testing.expectEqual(backend.write_stats.wal_replay_records, open_stats.wal_replay_records);
+    try std.testing.expectEqual(backend.write_stats.wal_replay_entries, open_stats.wal_replay_entries);
     try std.testing.expectEqual(backend.write_stats.wal_replay_bytes, open_stats.wal_replay_bytes);
     var read = try backend.beginRead();
     defer read.abort();

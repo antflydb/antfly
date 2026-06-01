@@ -1714,6 +1714,21 @@ pub const IndexManager = struct {
         return stats;
     }
 
+    pub fn snapshotLsmOpenStats(self: *const IndexManager) lsm_backend_mod.Backend.OpenStats {
+        var stats = lsm_backend_mod.Backend.OpenStats{};
+        for (self.text_indexes.items) |*entry| {
+            if (entry.persistent.snapshotLsmOpenStats()) |entry_stats| {
+                lsm_backend_mod.Backend.accumulateOpenStats(&stats, entry_stats);
+            }
+        }
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.snapshotLsmOpenStats()) |entry_stats| {
+                lsm_backend_mod.Backend.accumulateOpenStats(&stats, entry_stats);
+            }
+        }
+        return stats;
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const IndexManager) lsm_backend_mod.NativeStorageStats {
         var stats = lsm_backend_mod.NativeStorageStats{};
         for (self.text_indexes.items) |*entry| {
