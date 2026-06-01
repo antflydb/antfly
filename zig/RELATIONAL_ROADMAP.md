@@ -135,6 +135,10 @@ Current PR progress:
 - foreground relational upserts/deletes and TTL-driven deletes also delete any
   stale generic primary document row for the same id, so the generic primary
   keyspace cannot survive normal relational write traffic.
+- relational transform read-modify-write paths are covered for direct and
+  transaction writes, including delete precedence and abort behavior, so
+  transforms are pinned to the committed relational base row instead of any
+  stale generic primary value.
 
 ## Implementation Phases
 

@@ -36878,6 +36878,58 @@ test "db batch resolves transforms against pending same-batch writes" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("tags").?.array.items.len);
 }
 
+test "db relational batch transforms read and rewrite base rows only" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"count":{"type":"numeric"},"active":{"type":"boolean"},"attrs":{"type":"json"}},"required":["title","count"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:transform",
+            .value = "{\"title\":\"base row\",\"count\":1,\"active\":true,\"attrs\":{\"tier\":\"gold\"}}",
+        }},
+    });
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:transform");
+    defer alloc.free(primary_key);
+    try db.core.store.put(primary_key, "{\"title\":\"stale primary\",\"count\":999,\"active\":false}");
+
+    try db.batch(.{
+        .transforms = &.{.{
+            .key = "row:transform",
+            .operations = &.{
+                .{ .op = .inc, .path = "count", .value_json = "4" },
+                .{ .op = .set, .path = "active", .value_json = "false" },
+                .{ .op = .set, .path = "attrs", .value_json = "{\"tier\":\"platinum\"}" },
+            },
+        }},
+    });
+
+    const raw = (try db.get(alloc, "row:transform")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"count\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"attrs\":{\"tier\":\"platinum\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "stale primary") == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+}
+
 test "db batch keeps delete when same-batch transform targets deleted key" {
     const alloc = std.testing.allocator;
 
@@ -36907,6 +36959,42 @@ test "db batch keeps delete when same-batch transform targets deleted key" {
     });
 
     try std.testing.expect((try db.get(alloc, "doc:delete_transform")) == null);
+}
+
+test "db relational batch keeps delete when same-batch transform targets deleted key" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"text"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:delete_transform", .value = "{\"title\":\"delete me\",\"status\":\"old\"}" }},
+    });
+
+    try db.batch(.{
+        .deletes = &.{"row:delete_transform"},
+        .transforms = &.{.{
+            .key = "row:delete_transform",
+            .operations = &.{.{ .op = .set, .path = "status", .value_json = "\"new\"" }},
+        }},
+    });
+
+    try std.testing.expect((try db.get(alloc, "row:delete_transform")) == null);
+    try std.testing.expect((try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:delete_transform")) == null);
 }
 
 test "db transaction abort leaves no visible document" {
@@ -36966,6 +37054,64 @@ test "db transaction resolves transforms against pending same-transaction writes
         .float => |value| try std.testing.expectEqual(@as(f64, 5), value),
         else => return error.TestExpectedEqual,
     }
+}
+
+test "db relational transaction transforms read base rows and honor abort" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"count":{"type":"numeric"}},"required":["title","count"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:txn_transform", .value = "{\"title\":\"base row\",\"count\":1}" }},
+    });
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:txn_transform");
+    defer alloc.free(primary_key);
+    try db.core.store.put(primary_key, "{\"title\":\"stale primary\",\"count\":999}");
+
+    const txn_id = try db.beginTransaction(11_000);
+    try db.writeTransaction(txn_id, .{
+        .transforms = &.{.{
+            .key = "row:txn_transform",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "4" }},
+        }},
+    });
+    try db.commitTransaction(txn_id, 11_001);
+
+    const raw = (try db.get(alloc, "row:txn_transform")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"count\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "stale primary") == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+
+    const abort_txn = try db.beginTransaction(12_000);
+    try db.writeTransaction(abort_txn, .{
+        .transforms = &.{.{
+            .key = "row:txn_transform",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "100" }},
+        }},
+    });
+    try db.abortTransaction(abort_txn, 12_001);
+
+    const after_abort = (try db.get(alloc, "row:txn_transform")) orelse return error.TestExpectedEqual;
+    defer alloc.free(after_abort);
+    try std.testing.expect(std.mem.indexOf(u8, after_abort, "\"count\":5") != null);
 }
 
 test "db bulk ingest write commits document writes before finish" {
