@@ -20,6 +20,8 @@ const httpx = @import("httpx");
 const antfly_client = @import("antfly-client");
 const platform = @import("antfly_platform");
 
+const antfly_cloud_binary = "antfly-cloud";
+
 pub const std_options: std.Options = .{
     .logFn = structlog.logFn,
 };
@@ -48,11 +50,16 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, subcommand, "termite")) return try cmd.termite.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
 
+    if (std.mem.eql(u8, subcommand, "cloud")) {
+        const code = try runAntflyCloud(init.gpa, init.io, &args);
+        std.process.exit(code);
+    }
+
     // CLI client subcommands — these talk to a remote Antfly server via HTTP
     const cli_commands = [_][]const u8{
-        "table", "index", "query", "lookup",
-        "load",  "insert", "delete",
-        "agents", "backup", "restore", "internal",
+        "table",  "index",   "query",    "lookup",
+        "load",   "insert",  "delete",   "agents",
+        "backup", "restore", "internal",
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
@@ -63,6 +70,53 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("unknown subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
     return error.InvalidArguments;
+}
+
+fn runAntflyCloud(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u8 {
+    var argv_list = std.ArrayListUnmanaged([]const u8).empty;
+    defer argv_list.deinit(allocator);
+
+    try argv_list.append(allocator, antfly_cloud_binary);
+    while (args.next()) |arg| {
+        try argv_list.append(allocator, arg);
+    }
+
+    return runAntflyCloudArgv(io, argv_list.items);
+}
+
+fn runAntflyCloudArgv(io: std.Io, argv: []const []const u8) !u8 {
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            printMissingAntflyCloud();
+            return 127;
+        },
+        else => return err,
+    };
+
+    const term = try child.wait(io);
+    return switch (term) {
+        .exited => |code| code,
+        else => 1,
+    };
+}
+
+fn printMissingAntflyCloud() void {
+    std.debug.print(
+        \\{s} is not installed.
+        \\
+        \\The `antfly cloud` command delegates to the separate Antfly Cloud CLI.
+        \\Install it with:
+        \\
+        \\  brew install antflydb/taps/antfly-cloud
+        \\
+        \\Then rerun this command.
+        \\
+    , .{antfly_cloud_binary});
 }
 
 fn runCliCommand(allocator: std.mem.Allocator, subcommand: []const u8, args: *std.process.Args.Iterator) !void {
@@ -117,6 +171,7 @@ fn printUsage(argv0: []const u8) void {
         \\  backup         Backup tables
         \\  restore        Restore tables from backup
         \\  internal       Internal cluster management
+        \\  cloud          Delegate to the separate Antfly Cloud CLI
         \\
     , .{argv0});
 }
@@ -139,4 +194,29 @@ fn runtimeAllocator(init: std.process.Init) std.mem.Allocator {
 
 test "main cmd compiles" {
     _ = main;
+}
+
+test "cloud shim argv starts with antfly-cloud and preserves args" {
+    const allocator = std.testing.allocator;
+
+    var argv_list = std.ArrayListUnmanaged([]const u8).empty;
+    defer argv_list.deinit(allocator);
+
+    try argv_list.append(allocator, antfly_cloud_binary);
+    try argv_list.append(allocator, "status");
+    try argv_list.append(allocator, "--json");
+
+    try std.testing.expectEqualStrings("antfly-cloud", argv_list.items[0]);
+    try std.testing.expectEqualStrings("status", argv_list.items[1]);
+    try std.testing.expectEqualStrings("--json", argv_list.items[2]);
+}
+
+test "cloud shim reports missing antfly-cloud as 127" {
+    const code = try runAntflyCloudArgv(std.testing.io, &.{"definitely-missing-antfly-cloud-for-test"});
+    try std.testing.expectEqual(@as(u8, 127), code);
+}
+
+test "cloud shim propagates child exit code" {
+    const code = try runAntflyCloudArgv(std.testing.io, &.{ "/bin/sh", "-c", "exit 23" });
+    try std.testing.expectEqual(@as(u8, 23), code);
 }
