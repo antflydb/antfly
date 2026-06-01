@@ -154,6 +154,20 @@ def test_relational_table_autocreates_algebraic_index_and_serves_aggregations(st
     assert counts == {"active": 3, "archived": 2}, counts
 
 
+def test_create_relational_table_autocreates_algebraic_index(stateful_api):
+    """Creating a table directly with a relational schema uses the same
+    schema-derived algebraic index preparation as schema updates."""
+    table_name = f"rel_alg_create_{time.time_ns()}"
+    stateful_api.create_table(table_name, num_shards=1, schema=RELATIONAL_SCHEMA)
+
+    alg = wait_until(lambda: _algebraic_index_name(stateful_api, table_name), timeout_s=30.0, interval_s=0.5)
+    assert alg is not None, f"no algebraic index; indexes={_index_names(stateful_api, table_name)}"
+
+    stateful_api.batch_write(table_name, inserts=ROWS, sync_level="full_index")
+    counts = wait_until(lambda: _terms_counts(stateful_api, table_name, "status", limit=10), timeout_s=30.0, interval_s=0.5)
+    assert counts == {"active": 3, "archived": 2}, counts
+
+
 def test_relational_aggregations_cover_all_matches_regardless_of_limit(stateful_api):
     """Aggregations are computed over every matching document, not the returned
     page: a low limit, a zero limit (aggregation-only), and a predicate all

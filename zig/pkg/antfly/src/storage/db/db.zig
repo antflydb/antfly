@@ -4904,7 +4904,6 @@ pub const DB = struct {
     fn relationalColumnsForStore(self: *DB) ?[]const schema_mod.RelationalColumn {
         const schema = self.core.schema orelse return null;
         if (schema.storage_mode != .relational) return null;
-        if (schema.relational_columns.len == 0) return null;
         return schema.relational_columns;
     }
 
@@ -41794,6 +41793,79 @@ test "relational table full-text search loads stored_data from base rows" {
     defer geo_bbox_filtered.deinit();
     try std.testing.expectEqual(@as(u32, 1), geo_bbox_filtered.total_hits);
     try std.testing.expectEqualStrings("row:a", geo_bbox_filtered.hits[0].id);
+}
+
+test "relational embedded json search intersects with top-level relational filters" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"}},"additionalProperties":true}}},"required":["status"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_json",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "row:active",
+                .value = "{\"status\":\"active\",\"attrs\":{\"title\":\"nebula plan\",\"plan\":\"pro\",\"notes\":\"alpha note\"}}",
+            },
+            .{
+                .key = "row:archived",
+                .value = "{\"status\":\"archived\",\"attrs\":{\"title\":\"nebula archive\",\"plan\":\"free\",\"notes\":\"beta note\"}}",
+            },
+        },
+        .sync_level = .full_index,
+    });
+
+    var active = try db.search(alloc, .{
+        .index_name = "ft_json",
+        .query = .{ .match = .{ .field = "attrs.title", .text = "nebula" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"active\"}}",
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer active.deinit();
+    try std.testing.expectEqual(@as(u32, 1), active.total_hits);
+    try std.testing.expectEqualStrings("row:active", active.hits[0].id);
+    try std.testing.expect(active.hits[0].stored_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, active.hits[0].stored_data.?, "\"attrs\":{\"title\":\"nebula plan\"") != null);
+
+    var archived = try db.search(alloc, .{
+        .index_name = "ft_json",
+        .query = .{ .term = .{ .field = "attrs.plan", .term = "free" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"archived\"}}",
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer archived.deinit();
+    try std.testing.expectEqual(@as(u32, 1), archived.total_hits);
+    try std.testing.expectEqualStrings("row:archived", archived.hits[0].id);
+
+    var mismatched = try db.search(alloc, .{
+        .index_name = "ft_json",
+        .query = .{ .term = .{ .field = "attrs.plan", .term = "free" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"active\"}}",
+        .limit = 10,
+    });
+    defer mismatched.deinit();
+    try std.testing.expectEqual(@as(u32, 0), mismatched.total_hits);
 }
 
 test "relational text backfill ignores generic primary rows" {

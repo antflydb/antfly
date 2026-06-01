@@ -286,7 +286,12 @@ const LocalSwarmMetadata = struct {
 
     fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
-        const table = antfly.public_api.tables.deriveTableRecord(table_name, req);
+        var normalized_req = req;
+        const indexes_json = req.indexes_json orelse antfly.public_api.tables.default_indexes_json;
+        const prepared_indexes_json = try antfly.public_api.tables.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, antfly.public_api.tables.effectiveSchemaJson(req.schema_json));
+        defer alloc.free(prepared_indexes_json);
+        normalized_req.indexes_json = prepared_indexes_json;
+        const table = antfly.public_api.tables.deriveTableRecord(table_name, normalized_req);
         const ranges = try antfly.public_api.tables.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);

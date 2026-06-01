@@ -32,6 +32,35 @@ Table-level dynamic templates may use:
 - `mapping.include_in_all`
 - `mapping.doc_values`
 
+Relational schemas are stricter. Top-level dynamic templates are rejected in
+`storage_mode: "relational"` because the row shape must stay closed. Flexible
+document-style indexing belongs behind an explicitly declared `json` column:
+
+```json
+{
+  "type": "json",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "title": {"type": "text"},
+      "score": {"type": "numeric"}
+    },
+    "additionalProperties": true
+  },
+  "dynamic_templates": {
+    "metrics": {
+      "path_match": "metrics.*",
+      "mapping": {"type": "numeric", "doc_values": true}
+    }
+  }
+}
+```
+
+The embedded `schema` and `dynamic_templates` are scoped under the owning column
+path. For a column named `attrs`, the example above emits runtime paths such as
+`attrs.title`, `attrs.score`, and `attrs.metrics.latency`. Attaching embedded
+document config to a scalar or non-`json` relational field is invalid.
+
 ## Runtime Model
 
 The runtime schema is the source of truth for execution.
@@ -201,6 +230,17 @@ post-change subset. Static fields are unaffected and keep accelerating. The flag
 is cleared when the sidecar is rebuilt, which re-projects existing documents.
 Tables created with a template (rather than updated) take the fingerprint-equality
 fast path and are never flagged.
+
+Relational `json` columns use the same shape at the column scope. Each embedded
+JSON domain is emitted as a `json_subdocument_domains` entry with the owning
+path and a capability fingerprint. Updating that column's embedded `schema` or
+column-local `dynamic_templates` marks the changed domain
+`lifecycle_status: "rebuild_required"` in durable `indexes_json` and live
+algebraic configs. While pending, algebraic field resolution withholds static
+and dynamic facts below that JSON path, but unrelated top-level relational
+fields remain eligible for the sidecar. Rebuild/backfill reprojects the JSON
+cell from the committed relational row; the schema update does not rewrite
+unchanged row values.
 
 ## Related Docs
 

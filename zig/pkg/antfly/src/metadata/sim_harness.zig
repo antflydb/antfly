@@ -3944,7 +3944,12 @@ fn applyCreateTableMutation(
     const target = currentMetadataMutationNode(node);
     var workflow = metadata_table_workflow.TableWorkflow.init(node.cluster.alloc);
     defer workflow.deinit();
-    const table = api_tables.deriveTableRecord(table_name, req);
+    var normalized_req = req;
+    const indexes_json = req.indexes_json orelse api_tables.default_indexes_json;
+    const prepared_indexes_json = try api_tables.prepareTableIndexesForSchemaAlloc(node.cluster.alloc, table_name, indexes_json, api_tables.effectiveSchemaJson(req.schema_json));
+    defer node.cluster.alloc.free(prepared_indexes_json);
+    normalized_req.indexes_json = prepared_indexes_json;
+    const table = api_tables.deriveTableRecord(table_name, normalized_req);
     _ = try workflow.createTable(&target, table, api_tables.deriveInitialRange(table));
     try target.runRound();
 }

@@ -828,7 +828,12 @@ pub fn deriveRestoreTableRecord(
     _ = location_uri;
     var req = try createTableRequestFromManifest(alloc, manifest);
     defer req.deinit(alloc);
-    var table = try metadata_table_manager.cloneTable(alloc, tables_api.deriveTableRecord(table_name, req));
+    var normalized_req = req;
+    const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
+    const prepared_indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
+    defer alloc.free(prepared_indexes_json);
+    normalized_req.indexes_json = prepared_indexes_json;
+    var table = try metadata_table_manager.cloneTable(alloc, tables_api.deriveTableRecord(table_name, normalized_req));
     table.min_ranges = @intCast(@max(manifest.shards.len, 1));
     return table;
 }

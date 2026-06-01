@@ -638,8 +638,11 @@ pub const HttpHandler = struct {
         var req = parseEnsureTableRequest(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid table request");
         defer req.deinit(self.alloc);
         const policy = req.policy orelse catalog_mod.NamespacePolicy{};
-        const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-        tables_api.validatePublicAlgebraicIndexesJson(self.alloc, indexes_json) catch |err| switch (err) {
+        const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
+        const schema_json = req.schema_json orelse "";
+        const indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(self.alloc, table_name, raw_indexes_json, schema_json);
+        defer self.alloc.free(indexes_json);
+        tables_api.validatePublicAlgebraicIndexesJson(self.alloc, raw_indexes_json) catch |err| switch (err) {
             error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
             else => return err,
         };

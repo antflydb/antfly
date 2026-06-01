@@ -1489,9 +1489,18 @@ pub fn buildRelationalRowValueFromValueAlloc(
 
     for (columns) |column| {
         const value_type = relationalStorageValueType(column.field_type);
-        const found = valueAtJsonPath(root, column.path) orelse continue;
-        if (found == .null) continue;
-        const value = try coerceRelationalStorageValue(alloc, value_type, found) orelse continue;
+        const found = valueAtJsonPath(root, column.path) orelse {
+            if (column.nullable) continue;
+            return error.InvalidBatchRequest;
+        };
+        if (found == .null) {
+            if (column.nullable) continue;
+            return error.InvalidBatchRequest;
+        }
+        const value = try coerceRelationalStorageValue(alloc, value_type, found) orelse {
+            if (column.nullable) continue;
+            return error.InvalidBatchRequest;
+        };
         if (value_type == .bytes_val and found != .string) {
             // coerceRelationalStorageValue allocated canonical JSON for a
             // structured value; track it for cleanup.
@@ -2996,6 +3005,31 @@ test "document mapper emits schema-driven search_as_you_type variants" {
     try std.testing.expect((try reader.invertedIndex("name._index_prefix")) != null);
 }
 
+test "document mapper projects embedded relational json schema fields" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    var parsed = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"}},"additionalProperties":true},"dynamic_templates":{"label":{"path_match":"labels.*","mapping":{"type":"keyword"}}}}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "row:1", .value = "{\"id\":\"row:1\",\"attrs\":{\"title\":\"Alpha beta\",\"plan\":\"pro\",\"labels\":{\"color\":\"blue\"},\"notes\":\"hello world\"}}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect((try reader.invertedIndex("attrs.title")) != null);
+    try std.testing.expect((try reader.invertedIndex("attrs.plan")) != null);
+    try std.testing.expect((try reader.invertedIndex("attrs.labels.color")) != null);
+    try std.testing.expect((try reader.invertedIndex("attrs.notes")) != null);
+    try std.testing.expect((try reader.invertedIndex("notes")) == null);
+}
+
 test "document mapper emits Go-style dynamic-template search_as_you_type field" {
     const alloc = std.testing.allocator;
     const text_analysis = introducer_mod.TextAnalysisConfig{};
@@ -3652,6 +3686,33 @@ test "relational KV row value round-trips a document through project + reconstru
         else => unreachable,
     };
     try std.testing.expectEqual(@as(f64, 12.5), amount_num);
+}
+
+test "relational KV row value rejects missing required columns" {
+    const alloc = std.testing.allocator;
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+        .{ .name = "note", .path = "note", .field_type = .keyword, .nullable = true },
+    };
+
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\"}", &columns),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\",\"amount\":null}", &columns),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\",\"amount\":\"not-a-number\"}", &columns),
+    );
+
+    const row_value = try buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\",\"amount\":12.5}", &columns);
+    defer alloc.free(row_value);
+    try std.testing.expect(isRelationalRowValue(row_value));
 }
 
 test "document materializer passes through blobs and leaves rows to relational seams" {

@@ -189,6 +189,14 @@ pub const PathFactPolicyConfig = struct {
     allow_datetime_string_coercion: bool = true,
 };
 
+pub const JsonSubdocumentDomainConfig = struct {
+    document_type: []const u8 = "",
+    name: []const u8 = "",
+    path: []const u8 = "",
+    capability_fingerprint: []const u8 = "",
+    lifecycle_status: []const u8 = "current",
+};
+
 pub const Config = struct {
     version: u16 = 2,
     table: []const u8 = "",
@@ -205,6 +213,7 @@ pub const Config = struct {
     measure_fields: []const FieldConfig = &.{},
     time_fields: []const FieldConfig = &.{},
     dynamic_field_rules: []const fact_mod.DynamicRule = &.{},
+    json_subdocument_domains: []JsonSubdocumentDomainConfig = &.{},
     // Set when dynamic_field_rules changed against a table that already holds
     // documents, so existing docs have not been re-projected through the new
     // rules. While true, query-time resolution of dynamic-template fields is
@@ -14423,22 +14432,65 @@ pub const Index = struct {
     }
 
     pub fn fieldConfig(self: *const Index, query_field: []const u8, class: FieldClass) ?FieldConfig {
+        const cfg = self.config();
         if (class == .group or class == .any) {
-            for (self.config().group_fields) |field| {
-                if (fieldMatchesQuery(field, query_field)) return field;
+            for (cfg.group_fields) |field| {
+                if (fieldMatchesQuery(field, query_field)) {
+                    if (fieldBlockedByJsonSubdocumentLifecycle(cfg, field)) return null;
+                    return field;
+                }
             }
         }
         if (class == .measure or class == .any) {
-            for (self.config().measure_fields) |field| {
-                if (fieldMatchesQuery(field, query_field)) return field;
+            for (cfg.measure_fields) |field| {
+                if (fieldMatchesQuery(field, query_field)) {
+                    if (fieldBlockedByJsonSubdocumentLifecycle(cfg, field)) return null;
+                    return field;
+                }
             }
         }
         if (class == .time or class == .any) {
-            for (self.config().time_fields) |field| {
-                if (fieldMatchesQuery(field, query_field)) return field;
+            for (cfg.time_fields) |field| {
+                if (fieldMatchesQuery(field, query_field)) {
+                    if (fieldBlockedByJsonSubdocumentLifecycle(cfg, field)) return null;
+                    return field;
+                }
             }
         }
         return self.dynamicFieldConfig(query_field, class);
+    }
+
+    fn fieldBlockedByJsonSubdocumentLifecycle(cfg: Config, field: FieldConfig) bool {
+        return pathBlockedByJsonSubdocumentLifecycle(cfg, field.path) or
+            pathBlockedByJsonSubdocumentLifecycle(cfg, field.name);
+    }
+
+    fn pathBlockedByJsonSubdocumentLifecycle(cfg: Config, path: []const u8) bool {
+        for (cfg.json_subdocument_domains) |domain| {
+            if (jsonSubdocumentDomainLifecycleReady(domain.lifecycle_status)) continue;
+            if (pathUnderJsonSubdocumentDomain(path, domain.path)) return true;
+        }
+        return false;
+    }
+
+    fn jsonSubdocumentDomainLifecycleReady(lifecycle_status: []const u8) bool {
+        return lifecycle_status.len == 0 or
+            std.mem.eql(u8, lifecycle_status, "current") or
+            std.mem.eql(u8, lifecycle_status, "compatible_additive");
+    }
+
+    fn pathUnderJsonSubdocumentDomain(path: []const u8, domain_path: []const u8) bool {
+        if (domain_path.len == 0) return false;
+        if (std.mem.eql(u8, path, domain_path)) return true;
+        if (std.mem.startsWith(u8, path, domain_path) and
+            path.len > domain_path.len and path[domain_path.len] == '.') return true;
+        if (path.len > 1 and path[0] == '/') {
+            const without_slash = path[1..];
+            if (std.mem.eql(u8, without_slash, domain_path)) return true;
+            if (std.mem.startsWith(u8, without_slash, domain_path) and
+                without_slash.len > domain_path.len and without_slash[domain_path.len] == '/') return true;
+        }
+        return false;
     }
 
     /// Resolve a query field that is not statically declared but matches a
@@ -14459,6 +14511,7 @@ pub const Index = struct {
         const cfg = self.config();
         const rules = cfg.dynamic_field_rules;
         if (rules.len == 0) return null;
+        if (pathBlockedByJsonSubdocumentLifecycle(cfg, query_field)) return null;
         // While a dynamic-rule backfill is pending, existing documents have not
         // been re-projected through the current rules, so resolving a dynamic
         // field here would route aggregations to facts covering only the
@@ -20747,6 +20800,74 @@ test "algebraic raw metric doc id reads canonicalize measure path aliases" {
     const raw = (try idx.rawMetricForDocIdsAlloc(&store, .sum, "metrics.amount", doc_ids[0..])) orelse return error.TestUnexpectedResult;
     defer alloc.free(raw);
     try std.testing.expectEqual(@as(f64, 30), try algebra.parseF64(raw));
+}
+
+test "algebraic index serves embedded relational json subdocument fields" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "rows",
+        \\  "capability_fingerprint": "json-domain-a",
+        \\  "json_subdocument_domains": [
+        \\    {"document_type":"row","name":"attrs","path":"attrs","capability_fingerprint":"attrs-a"}
+        \\  ],
+        \\  "group_fields": [{"name":"plan","path":"attrs.plan","type":"string"}],
+        \\  "measure_fields": [{"name":"score","path":"attrs.score","type":"number"}],
+        \\  "materializations": [
+        \\    {"name":"score_by_plan","op":"sum","group_by":["plan"],"measure":"score"}
+        \\  ]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_rel_json", cfg);
+    defer idx.close();
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "r1", .action = .upsert, .cleaned_value = "{\"attrs\":{\"plan\":\"pro\",\"score\":10}}" },
+        .{ .key = "r2", .action = .upsert, .cleaned_value = "{\"attrs\":{\"plan\":\"pro\",\"score\":20}}" },
+        .{ .key = "r3", .action = .upsert, .cleaned_value = "{\"attrs\":{\"plan\":\"free\",\"score\":5}}" },
+    };
+    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+
+    const plan_token = try idx.constraintTokenAlloc(alloc, "plan", "pro");
+    defer alloc.free(plan_token);
+    const group = try token.canonicalTupleAlloc(alloc, &.{plan_token});
+    defer alloc.free(group);
+
+    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(&store, "score_by_plan", group)).?);
+}
+
+test "algebraic index withholds fields under pending json subdocument domains" {
+    const alloc = std.testing.allocator;
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "rows",
+        \\  "json_subdocument_domains": [
+        \\    {"document_type":"row","name":"attrs","path":"attrs","capability_fingerprint":"attrs-b","lifecycle_status":"rebuild_required"}
+        \\  ],
+        \\  "group_fields": [
+        \\    {"name":"tenant","path":"tenant","type":"string"},
+        \\    {"name":"plan","path":"attrs.plan","type":"string"}
+        \\  ],
+        \\  "measure_fields": [{"name":"score","path":"attrs.score","type":"number"}]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_rel_json_pending", cfg);
+    defer idx.close();
+
+    try std.testing.expect(idx.fieldConfig("tenant", .group) != null);
+    try std.testing.expect(idx.fieldConfig("attrs.plan", .group) == null);
+    try std.testing.expect(idx.fieldConfig("plan", .group) == null);
+    try std.testing.expect(idx.fieldConfig("attrs.score", .measure) == null);
+    try std.testing.expect(idx.fieldConfig("/attrs/score", .measure) == null);
 }
 
 test "algebraic materialized expression ids include materialization semantics" {

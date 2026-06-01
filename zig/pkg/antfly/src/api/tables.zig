@@ -349,6 +349,20 @@ pub fn expandSchemaDerivedAlgebraicIndexesAlloc(
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = object }, .{ .emit_null_optional_fields = false });
 }
 
+pub fn prepareTableIndexesForSchemaAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    indexes_json: []const u8,
+    schema_json: []const u8,
+) ![]u8 {
+    const with_relational_default = if (try ensureRelationalAlgebraicIndexAlloc(alloc, indexes_json, schema_json)) |with_default|
+        with_default
+    else
+        try alloc.dupe(u8, indexes_json);
+    defer alloc.free(with_relational_default);
+    return try expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, with_relational_default, schema_json);
+}
+
 pub fn expandSchemaDerivedAlgebraicIndexAlloc(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -538,7 +552,57 @@ fn regenerateAlgebraicIndexValueAlloc(
     if (has_dynamic_rules and (capability_changed or source_pending)) {
         try derived.object.put(alloc, try alloc.dupe(u8, "dynamic_rules_backfill_pending"), .{ .bool = true });
     }
+    _ = try markJsonSubdocumentDomainLifecycles(alloc, &derived, source);
     return derived;
+}
+
+fn markJsonSubdocumentDomainLifecycles(
+    alloc: std.mem.Allocator,
+    derived: *std.json.Value,
+    source: std.json.Value,
+) !bool {
+    if (derived.* != .object) return false;
+    const domains = derived.object.getPtr("json_subdocument_domains") orelse return false;
+    if (domains.* != .array) return false;
+
+    var marked = false;
+    for (domains.array.items) |*domain| {
+        if (domain.* != .object) continue;
+        const path = jsonStringField(domain.*, "path") orelse continue;
+        const source_domain = findJsonSubdocumentDomain(source, path);
+        const source_pending = if (source_domain) |existing| jsonDomainLifecyclePending(existing) else false;
+        const source_fp = if (source_domain) |existing| jsonStringField(existing, "capability_fingerprint") orelse "" else "";
+        const derived_fp = jsonStringField(domain.*, "capability_fingerprint") orelse "";
+        const domain_changed = source_fp.len == 0 or !std.mem.eql(u8, source_fp, derived_fp);
+        if (domain_changed or source_pending) {
+            try domain.object.put(
+                alloc,
+                try alloc.dupe(u8, "lifecycle_status"),
+                .{ .string = try alloc.dupe(u8, "rebuild_required") },
+            );
+            marked = true;
+        }
+    }
+    return marked;
+}
+
+fn findJsonSubdocumentDomain(value: std.json.Value, path: []const u8) ?std.json.Value {
+    if (value != .object) return null;
+    const domains = value.object.get("json_subdocument_domains") orelse return null;
+    if (domains != .array) return null;
+    for (domains.array.items) |domain| {
+        if (domain != .object) continue;
+        const domain_path = jsonStringField(domain, "path") orelse continue;
+        if (std.mem.eql(u8, domain_path, path)) return domain;
+    }
+    return null;
+}
+
+fn jsonDomainLifecyclePending(value: std.json.Value) bool {
+    const status = jsonStringField(value, "lifecycle_status") orelse return false;
+    return status.len != 0 and
+        !std.mem.eql(u8, status, "current") and
+        !std.mem.eql(u8, status, "compatible_additive");
 }
 
 fn jsonStringField(value: std.json.Value, key: []const u8) ?[]const u8 {
@@ -566,6 +630,7 @@ fn isAlgebraicInternalConfigField(field: []const u8) bool {
         "capability_change_added_fields",
         "capability_change_removed_fields",
         "capability_change_changed_type_fields",
+        "json_subdocument_domains",
     };
     for (internal_fields) |internal| {
         if (std.mem.eql(u8, field, internal)) return true;
@@ -771,12 +836,9 @@ pub fn applySchemaUpdateRecord(
     // index already exists. The injected marker is expanded against the schema
     // so the stored indexes_json carries the concrete derived config,
     // provisioned like any explicit algebraic index.
-    if (try ensureRelationalAlgebraicIndexAlloc(alloc, updated.indexes_json, updated.schema_json)) |with_marker| {
-        defer alloc.free(with_marker);
-        const expanded = try expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table.name, with_marker, updated.schema_json);
-        alloc.free(updated.indexes_json);
-        updated.indexes_json = expanded;
-    }
+    const prepared_indexes_json = try prepareTableIndexesForSchemaAlloc(alloc, table.name, updated.indexes_json, updated.schema_json);
+    alloc.free(updated.indexes_json);
+    updated.indexes_json = prepared_indexes_json;
 
     return updated;
 }
@@ -1796,9 +1858,20 @@ fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, ver
     defer alloc.free(encoded_version);
     try out.appendSlice(alloc, encoded_version);
 
+    const relational_storage = blk: {
+        const storage_mode = root.get("storage_mode") orelse break :blk false;
+        break :blk storage_mode == .string and std.mem.eql(u8, storage_mode.string, "relational");
+    };
+    if (relational_storage) {
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "enforce_types");
+        try out.appendSlice(alloc, ":true");
+    }
+
     var it = root.iterator();
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "version")) continue;
+        if (relational_storage and std.mem.eql(u8, entry.key_ptr.*, "enforce_types")) continue;
         try out.append(alloc, ',');
         try appendJsonString(alloc, &out, entry.key_ptr.*);
         try out.append(alloc, ':');
@@ -2318,6 +2391,51 @@ test "validated table schema parses default type and dynamic templates" {
     try std.testing.expectEqual(@as(usize, 1), parsed.dynamic_templates.len);
 }
 
+test "relational schema implies enforced closed validation" {
+    var parsed = try parseValidatedTableSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"]}}}}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(parsed.enforce_types);
+    try validateBatchWritesAgainstTableSchema(
+        std.testing.allocator,
+        parsed,
+        &.{.{ .key = "row:ok", .value = "{\"id\":\"a\"}" }},
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        validateBatchWritesAgainstTableSchema(
+            std.testing.allocator,
+            parsed,
+            &.{.{ .key = "row:bad", .value = "{\"id\":\"a\",\"extra\":1}" }},
+        ),
+    );
+}
+
+test "relational schema rejects explicit soft validation and open root objects" {
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchemaUpdateRequest(std.testing.allocator, "{\"storage_mode\":\"relational\",\"enforce_types\":false,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}}}}}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchemaUpdateRequest(std.testing.allocator, "{\"storage_mode\":\"relational\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"properties\":{\"id\":{\"type\":\"keyword\"}}}}}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchemaUpdateRequest(std.testing.allocator, "{\"storage_mode\":\"relational\",\"dynamic_templates\":{\"meta\":{\"match\":\"meta_*\",\"mapping\":{\"type\":\"keyword\"}}},\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}}}}}}"),
+    );
+}
+
+test "relational schema rejects empty column catalogs" {
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchemaUpdateRequest(std.testing.allocator, "{\"storage_mode\":\"relational\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"embedding\":{\"type\":\"embedding\"}}}}}}"),
+    );
+}
+
 test "table schema write validation rejects unknown fields when enforce_types is enabled" {
     var parsed = try parseValidatedTableSchema(
         std.testing.allocator,
@@ -2398,6 +2516,24 @@ test "metadata.schema update auto-creates an algebraic index for relational tabl
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"derive_from_schema\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"group_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"capability_fingerprint\"") != null);
+}
+
+test "create table preparation auto-creates an algebraic index for relational schemas" {
+    const alloc = std.testing.allocator;
+    const schema_json = try normalizeSchemaVersion(
+        alloc,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"numeric\"}},\"required\":[\"tenant\",\"amount\"]}}}}",
+        0,
+    );
+    defer alloc.free(schema_json);
+
+    const indexes_json = try prepareTableIndexesForSchemaAlloc(alloc, "sales", default_indexes_json, schema_json);
+    defer alloc.free(indexes_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, schema_json, "\"enforce_types\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"algebraic_index_v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"derive_from_schema\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"group_fields\"") != null);
 }
 
 test "metadata.schema update does not add an algebraic index for document tables" {
@@ -2536,6 +2672,29 @@ test "metadata.schema update regenerates algebraic config and preserves user kno
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"precision\":12") != null);
     // Capability unchanged (matching fingerprint) => no backfill flag forced on.
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"dynamic_rules_backfill_pending\":true") == null);
+}
+
+test "metadata.schema update marks changed relational json subdocument domains pending" {
+    const alloc = std.testing.allocator;
+    const schema_v1 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"plan":{"type":"keyword"},"score":{"type":"numeric"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"plan":{"type":"keyword"},"score":{"type":"keyword"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
+    ;
+
+    const canonical = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "rows", schema_v1);
+    defer alloc.free(canonical);
+    const stored = try std.fmt.allocPrint(alloc, "{{\"alg\":{{\"type\":\"algebraic\",{s}}}", .{canonical[1..]});
+    defer alloc.free(stored);
+
+    const refreshed = try regenerateAlgebraicIndexesFromSchemaAlloc(alloc, "rows", stored, schema_v2);
+    defer alloc.free(refreshed);
+
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"json_subdocument_domains\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"path\":\"attrs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"lifecycle_status\":\"rebuild_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"schema_version\":3") != null);
 }
 
 test "metadata.query routing selects read schema full text index" {

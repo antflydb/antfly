@@ -1260,6 +1260,7 @@ pub const IndexManager = struct {
             new_parsed.value.min_max_candidate_cache_size = cur.min_max_candidate_cache_size;
             new_parsed.value.enable_temporal_range_pruning = cur.enable_temporal_range_pruning;
             new_parsed.value.hll_cardinalities = cur.hll_cardinalities;
+            markJsonSubdocumentDomainLifecycles(&new_parsed.value, cur);
 
             // The capability changed against an already-open table, so existing
             // documents have not been re-projected through the new dynamic rules.
@@ -1281,6 +1282,31 @@ pub const IndexManager = struct {
             self.alloc.free(entry.config.config_json);
             entry.config.config_json = owned;
         }
+    }
+
+    fn markJsonSubdocumentDomainLifecycles(new_config: *algebraic_mod.index.Config, current: algebraic_mod.index.Config) void {
+        for (new_config.json_subdocument_domains) |*domain| {
+            const previous = findJsonSubdocumentDomain(current, domain.path);
+            const previous_pending = if (previous) |existing| jsonDomainLifecyclePending(existing.lifecycle_status) else false;
+            const previous_fp = if (previous) |existing| existing.capability_fingerprint else "";
+            const domain_changed = previous_fp.len == 0 or !std.mem.eql(u8, previous_fp, domain.capability_fingerprint);
+            if (domain_changed or previous_pending) {
+                domain.lifecycle_status = "rebuild_required";
+            }
+        }
+    }
+
+    fn findJsonSubdocumentDomain(config: algebraic_mod.index.Config, path: []const u8) ?algebraic_mod.index.JsonSubdocumentDomainConfig {
+        for (config.json_subdocument_domains) |domain| {
+            if (std.mem.eql(u8, domain.path, path)) return domain;
+        }
+        return null;
+    }
+
+    fn jsonDomainLifecyclePending(status: []const u8) bool {
+        return status.len != 0 and
+            !std.mem.eql(u8, status, "current") and
+            !std.mem.eql(u8, status, "compatible_additive");
     }
 
     fn freeAlgebraicIndexEntry(self: *IndexManager, entry: *AlgebraicIndex) void {
@@ -11230,6 +11256,58 @@ test "index manager algebraic schema reload preserves HLL cardinalities" {
     try std.testing.expectEqualStrings("customer", reloaded.hll_cardinalities[0].value_field);
     try std.testing.expectEqual(@as(u8, 12), reloaded.hll_cardinalities[0].precision);
     try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"hll_cardinalities\"") != null);
+}
+
+test "index manager algebraic schema reload marks changed json subdocument domains pending" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "json-domain-reload");
+    defer cleanupIndexManagerDir(path_z);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+    defer manager.deinit();
+
+    const schema_v1 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"plan":{"type":"keyword"},"score":{"type":"numeric"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"plan":{"type":"keyword"},"score":{"type":"keyword"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "rows", schema_v1);
+    defer alloc.free(config_json);
+
+    var index = try algebraic_mod.index.Index.open(alloc, "alg", config_json);
+    var index_owned = true;
+    errdefer if (index_owned) index.close();
+
+    const apply_mutex = try manager.allocIndexApplyMutex();
+    var apply_mutex_owned = true;
+    errdefer if (apply_mutex_owned) manager.destroyIndexApplyMutex(apply_mutex);
+
+    var entry = IndexManager.AlgebraicIndex{
+        .apply_mutex = apply_mutex,
+        .config = try types.IndexConfig.clone(alloc, .{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = config_json,
+        }),
+        .index = index,
+    };
+    apply_mutex_owned = false;
+    index_owned = false;
+    var entry_owned = true;
+    errdefer if (entry_owned) manager.freeAlgebraicIndexEntry(&entry);
+
+    try manager.algebraic_indexes.append(alloc, entry);
+    entry_owned = false;
+
+    try manager.reloadAlgebraicSchemaConfigs(schema_v2);
+
+    const reloaded = manager.algebraic_indexes.items[0].index.config();
+    try std.testing.expectEqual(@as(usize, 1), reloaded.json_subdocument_domains.len);
+    try std.testing.expectEqualStrings("attrs", reloaded.json_subdocument_domains[0].path);
+    try std.testing.expectEqualStrings("rebuild_required", reloaded.json_subdocument_domains[0].lifecycle_status);
+    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"lifecycle_status\":\"rebuild_required\"") != null);
 }
 
 fn parseMetric(raw: []const u8) !vector_mod.DistanceMetric {

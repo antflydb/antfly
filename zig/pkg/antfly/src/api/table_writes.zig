@@ -1961,7 +1961,7 @@ pub const BoundTableWriteSource = struct {
 
         const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
         const schema_json = tables_api.effectiveSchemaJson(req.schema_json);
-        const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, raw_indexes_json, schema_json);
+        const expanded_indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, table_name, raw_indexes_json, schema_json);
         defer alloc.free(expanded_indexes_json);
         const indexes_json = expanded_indexes_json;
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
@@ -4600,7 +4600,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
         const schema_json = tables_api.effectiveSchemaJson(req.schema_json);
-        const indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, raw_indexes_json, schema_json);
+        const indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, table_name, raw_indexes_json, schema_json);
         defer alloc.free(indexes_json);
         for (group_ids) |group_id| {
             std.log.info("provisioned create table local group begin table={s} group_id={d}", .{ table_name, group_id });

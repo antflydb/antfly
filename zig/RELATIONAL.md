@@ -79,9 +79,56 @@ In `relational` mode the following are implied/enforced:
 - `required_fields` declares `NOT NULL` columns.
 - `dynamic_templates` apply only inside `json` columns.
 
+Schema create/update validation normalizes omitted `enforce_types` to `true`
+for relational schemas, rejects explicit `enforce_types: false`, rejects open
+top-level document types, and rejects relational schemas that would produce no
+storable relational columns. This keeps relational mode a single-store contract
+rather than a document-mode table with optional relational projections.
+
 `json` is added to `AntflyType`. A `json` column is stored as a `bytes` column
 and indexed like a document subtree (path facts + dynamic templates). It is the
 escape hatch for semi-structured data inside an otherwise typed row.
+
+An embedded JSON column declares its document-store indexing contract on the
+property itself:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "id": { "type": "keyword" },
+    "tenant_id": { "type": "keyword" },
+    "attrs": {
+      "type": "json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "text" },
+          "plan": { "type": "keyword" },
+          "score": { "type": "numeric", "doc_values": true }
+        },
+        "additionalProperties": true
+      },
+      "dynamic_templates": {
+        "metrics": {
+          "path_match": "metrics.*",
+          "mapping": { "type": "numeric", "doc_values": true }
+        }
+      }
+    }
+  },
+  "required": ["id", "tenant_id"],
+  "additionalProperties": false
+}
+```
+
+The embedded `schema` object is evaluated under the owning column path:
+`attrs.title` is indexed as full text, `attrs.plan` as a keyword/path fact,
+`attrs.score` as an algebraic-capable numeric fact, and
+`attrs.metrics.cpu` can be promoted by the scoped dynamic template. Unknown
+top-level fields outside `attrs` are still rejected by the closed relational
+schema. Top-level dynamic templates in relational schemas stay invalid; flexible
+fields belong behind an explicit `json` column.
 
 Constraints in scope for v1: primary key is the existing document key;
 `NOT NULL` via `required_fields`. **Out of scope for v1:** cross-document unique
@@ -258,11 +305,53 @@ second full-column `typed_doc_values` copy. Text segments keep term/scoring data
 doc identity, and projection payloads only. Query materialization and
 `include_stored` hydrate from the relational base row.
 
+Embedded `json` columns are the exception to the closed-row shape, not to the
+one-store rule. A `json` property may carry its own document `schema` and
+scoped `dynamic_templates`. Runtime compilation prefixes the embedded paths
+with the column name (`attrs.title`, `attrs.plan`, `attrs.metrics.latency`) and
+projects them into the same derived full-text/path-fact/algebraic artifacts used
+for document tables. The JSON cell itself remains stored only in the relational
+base row and is reprojected from that row during replay/backfill.
+
+Changing a JSON column's embedded `schema` or `dynamic_templates` is therefore
+a derived-index schema update, not a row migration. This follows the same
+user-facing model as document-store `jsonschema` updates: commit the new schema
+metadata, mark affected derived artifacts pending, and rebuild search and
+aggregation state from stored values. The committed relational row does not move
+unless the row value itself is updated; changing `attrs.schema` only changes how
+the `attrs` cell is interpreted for derived indexing.
+
+Schema-derived algebraic configs record each JSON column as a
+`json_subdocument_domains` entry with a capability fingerprint and lifecycle
+status. When that fingerprint changes, durable schema regeneration and live
+reload mark the affected domain `rebuild_required`, and algebraic query
+planning withholds fields below that JSON column until the sidecar is rebuilt
+from committed rows. Full-text JSON projection follows the existing
+schema-versioned index handoff.
+
+The production invariants are:
+
+- embedded JSON indexes are disposable and never accept writes that bypass the
+  relational row;
+- new derived index generations are built from committed relational rows;
+- query planners only advertise index-served JSON paths after the matching
+  generation is complete, or otherwise fall back/report pending capability;
+- stale JSON-subdocument artifacts are safe to drop because they contain no
+  authoritative data;
+- restore and replication need only the relational row plus schema metadata to
+  recreate JSON full-text and algebraic artifacts.
+
 Algebraic, graph, vector, enrichment, split-shadow, catch-up, and backfill
 readers that need a document body carry the relational-base-row context and read
 from the relational row keyspace. Algebraic fact projection and materialization
 therefore rebuild from committed typed rows, not from stale generic document KV
 values or derived text segment columns.
+
+Relational table creation and schema updates both run the same schema-aware
+index preparation: if no algebraic index exists, `algebraic_index_v0` is added
+with `derive_from_schema: true` and stored as a concrete derived config. That
+keeps aggregation pushdown available whether the table starts relational or is
+switched to relational mode later.
 
 ### Query and movement invariants
 
@@ -272,6 +361,21 @@ structured queries become base-row doc constraints over the text match-all path,
 so scalar query results follow the committed relational row rather than stale
 segment doc-values. Unsupported text-oriented shapes may still use the inverted
 text index, but not segment doc-values as a relational column source.
+
+Predicates under a `json` column route through the embedded document-derived
+index for that column path, then intersect with top-level relational column
+filters by document id. Result materialization still reconstructs from the
+relational base row.
+
+For example:
+
+```text
+tenant_id:acme AND attrs.plan:pro AND attrs.score:[10 TO *]
+```
+
+`tenant_id` uses relational column entries. `attrs.plan` and `attrs.score` use
+the embedded JSON artifacts scoped to the `attrs` column. The final hit list is
+materialized from relational rows, not from derived artifacts.
 
 Split, merge, replay, TTL cleanup, and generated-enrichment replay treat the
 relational base store as table data. Split prepare/finalize moves relational row

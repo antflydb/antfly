@@ -65,10 +65,26 @@ pub const DynamicRuleCapability = struct {
     }
 };
 
+pub const JsonSubdocumentDomain = struct {
+    document_type: []u8,
+    name: []u8,
+    path: []u8,
+    capability_fingerprint: []u8,
+
+    pub fn deinit(self: *JsonSubdocumentDomain, alloc: Allocator) void {
+        alloc.free(self.document_type);
+        alloc.free(self.name);
+        alloc.free(self.path);
+        alloc.free(self.capability_fingerprint);
+        self.* = undefined;
+    }
+};
+
 pub const Plan = struct {
     schema_version: u32 = 0,
     fields: []FieldCapability = &.{},
     dynamic_rules: []DynamicRuleCapability = &.{},
+    json_subdocuments: []JsonSubdocumentDomain = &.{},
     skipped_dynamic_fields: u32 = 0,
     skipped_complex_fields: u32 = 0,
     skipped_unbounded_fields: u32 = 0,
@@ -78,6 +94,8 @@ pub const Plan = struct {
         if (self.fields.len > 0) alloc.free(self.fields);
         for (self.dynamic_rules) |*rule| rule.deinit(alloc);
         if (self.dynamic_rules.len > 0) alloc.free(self.dynamic_rules);
+        for (self.json_subdocuments) |*domain| domain.deinit(alloc);
+        if (self.json_subdocuments.len > 0) alloc.free(self.json_subdocuments);
         self.* = undefined;
     }
 };
@@ -103,36 +121,17 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
         for (dynamic_rules.items) |*rule| rule.deinit(alloc);
         dynamic_rules.deinit(alloc);
     }
+    var json_subdocuments = std.ArrayListUnmanaged(JsonSubdocumentDomain).empty;
+    errdefer {
+        for (json_subdocuments.items) |*domain| domain.deinit(alloc);
+        json_subdocuments.deinit(alloc);
+    }
     var skipped_dynamic_fields: u32 = 0;
     var skipped_complex_fields: u32 = 0;
     var skipped_unbounded_fields: u32 = 0;
 
     for (schema.dynamic_templates) |tmpl| {
-        // An algebraic rule needs a name/path selector (`match` / `path_match`).
-        // `match_mapping_type` alone is NOT enough: it can be evaluated at ingest
-        // (a value is present) but never at query time (no value), so a
-        // mapping-type-only rule would project docfacts that no query can ever
-        // resolve. Such templates stay on the schemaless path-fact path so ingest
-        // and query resolution remain symmetric.
-        const has_named_selector = tmpl.match_pattern != null or tmpl.path_match != null;
-        const scalar = boundedScalarForTemplateType(tmpl.field_type orelse "text");
-        if (!has_named_selector or scalar == null) {
-            // Unbounded/open text templates and selector-less / mapping-type-only
-            // templates stay on the schemaless path-fact path rather than typed
-            // docfacts.
-            skipped_dynamic_fields += 1;
-            skipped_unbounded_fields += 1;
-            continue;
-        }
-        try dynamic_rules.append(alloc, .{
-            .name = try alloc.dupe(u8, tmpl.name),
-            .match = try dupeOptional(alloc, tmpl.match_pattern),
-            .unmatch = try dupeOptional(alloc, tmpl.unmatch_pattern),
-            .path_match = try dupeOptional(alloc, tmpl.path_match),
-            .path_unmatch = try dupeOptional(alloc, tmpl.path_unmatch),
-            .match_mapping_type = try dupeOptional(alloc, tmpl.match_mapping_type),
-            .scalar_type = try alloc.dupe(u8, scalar.?),
-        });
+        try appendDynamicRuleFromTemplate(alloc, &dynamic_rules, tmpl, null, &skipped_dynamic_fields, &skipped_unbounded_fields);
     }
 
     for (schema.document_schemas) |document_schema| {
@@ -151,6 +150,8 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
                 property.name,
                 property,
                 &fields,
+                &dynamic_rules,
+                &json_subdocuments,
                 &skipped_dynamic_fields,
                 &skipped_complex_fields,
                 &skipped_unbounded_fields,
@@ -162,6 +163,7 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
         .schema_version = schema.version,
         .fields = try fields.toOwnedSlice(alloc),
         .dynamic_rules = try dynamic_rules.toOwnedSlice(alloc),
+        .json_subdocuments = try json_subdocuments.toOwnedSlice(alloc),
         .skipped_dynamic_fields = skipped_dynamic_fields,
         .skipped_complex_fields = skipped_complex_fields,
         .skipped_unbounded_fields = skipped_unbounded_fields,
@@ -170,6 +172,47 @@ pub fn compilePlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) 
 
 fn dupeOptional(alloc: Allocator, value: ?[]const u8) !?[]u8 {
     return if (value) |v| try alloc.dupe(u8, v) else null;
+}
+
+fn appendDynamicRuleFromTemplate(
+    alloc: Allocator,
+    dynamic_rules: *std.ArrayListUnmanaged(DynamicRuleCapability),
+    tmpl: anytype,
+    scope_path: ?[]const u8,
+    skipped_dynamic_fields: *u32,
+    skipped_unbounded_fields: *u32,
+) !void {
+    // An algebraic rule needs an explicit name/path selector. A scoped embedded
+    // JSON template gets a path prefix, but `match_mapping_type` alone remains
+    // insufficient because query-time resolution has no runtime value.
+    const has_named_selector = tmpl.match_pattern != null or tmpl.path_match != null;
+    const scalar = boundedScalarForTemplateType(tmpl.field_type orelse "text");
+    if (!has_named_selector or scalar == null) {
+        skipped_dynamic_fields.* += 1;
+        skipped_unbounded_fields.* += 1;
+        return;
+    }
+    try dynamic_rules.append(alloc, .{
+        .name = if (scope_path) |scope| try std.fmt.allocPrint(alloc, "{s}.{s}", .{ scope, tmpl.name }) else try alloc.dupe(u8, tmpl.name),
+        .match = try dupeOptional(alloc, tmpl.match_pattern),
+        .unmatch = try dupeOptional(alloc, tmpl.unmatch_pattern),
+        .path_match = try scopedPatternAlloc(alloc, scope_path, tmpl.path_match, true),
+        .path_unmatch = try scopedPatternAlloc(alloc, scope_path, tmpl.path_unmatch, false),
+        .match_mapping_type = try dupeOptional(alloc, tmpl.match_mapping_type),
+        .scalar_type = try alloc.dupe(u8, scalar.?),
+    });
+}
+
+fn scopedPatternAlloc(
+    alloc: Allocator,
+    scope_path: ?[]const u8,
+    pattern: ?[]const u8,
+    default_to_scope: bool,
+) !?[]u8 {
+    const scope = scope_path orelse return if (pattern) |value| try alloc.dupe(u8, value) else null;
+    if (pattern) |value| return try std.fmt.allocPrint(alloc, "{s}.{s}", .{ scope, value });
+    if (default_to_scope) return try std.fmt.allocPrint(alloc, "{s}.*", .{scope});
+    return null;
 }
 
 /// Map a dynamic-template Antfly field type onto the bounded algebraic scalar it
@@ -254,6 +297,11 @@ pub fn configJsonFromPlanAlloc(alloc: Allocator, table_name: []const u8, plan: P
     try appendJsonString(alloc, &out, "dynamic_field_rules");
     try out.append(alloc, ':');
     try appendDynamicRuleArray(alloc, &out, plan);
+
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, &out, "json_subdocument_domains");
+    try out.append(alloc, ':');
+    try appendJsonSubdocumentDomainArray(alloc, &out, plan);
 
     try out.appendSlice(alloc, ",");
     try appendJsonString(alloc, &out, "laws");
@@ -422,6 +470,14 @@ pub fn capabilityFingerprintAlloc(alloc: Allocator, plan: Plan) ![]u8 {
             rule.match_mapping_type orelse "",
         });
     }
+    for (plan.json_subdocuments) |domain| {
+        try appendFmt(alloc, &canonical, "json:{s}:{s}:{s}:{s}|", .{
+            domain.document_type,
+            domain.name,
+            domain.path,
+            domain.capability_fingerprint,
+        });
+    }
     try appendFmt(alloc, &canonical, "skip:{d}:{d}:{d}", .{
         plan.skipped_dynamic_fields,
         plan.skipped_complex_fields,
@@ -517,6 +573,39 @@ fn appendDynamicRuleArray(
     try out.append(alloc, ']');
 }
 
+fn appendJsonSubdocumentDomainArray(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    plan: Plan,
+) !void {
+    try out.append(alloc, '[');
+    for (plan.json_subdocuments, 0..) |domain, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try appendJsonString(alloc, out, "document_type");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, domain.document_type);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, out, "name");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, domain.name);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, out, "path");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, domain.path);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, out, "capability_fingerprint");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, domain.capability_fingerprint);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, out, "lifecycle_status");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, "current");
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, ']');
+}
+
 fn appendOptionalJsonField(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -583,11 +672,29 @@ fn collectPropertyCapabilities(
     path: []const u8,
     property: anytype,
     fields: *std.ArrayListUnmanaged(FieldCapability),
+    dynamic_rules: *std.ArrayListUnmanaged(DynamicRuleCapability),
+    json_subdocuments: *std.ArrayListUnmanaged(JsonSubdocumentDomain),
     skipped_dynamic_fields: *u32,
     skipped_complex_fields: *u32,
     skipped_unbounded_fields: *u32,
-) !void {
+) anyerror!void {
     if (property.antfly_index != null and !property.antfly_index.?) return;
+
+    if (isJsonSubdocumentProperty(property)) {
+        try collectJsonSubdocumentDomain(
+            alloc,
+            document_type,
+            path,
+            property,
+            fields,
+            dynamic_rules,
+            json_subdocuments,
+            skipped_dynamic_fields,
+            skipped_complex_fields,
+            skipped_unbounded_fields,
+        );
+        return;
+    }
 
     if (property.additional_properties_allowed orelse false) {
         skipped_dynamic_fields.* += 1;
@@ -614,6 +721,8 @@ fn collectPropertyCapabilities(
                 child_path,
                 child,
                 fields,
+                dynamic_rules,
+                json_subdocuments,
                 skipped_dynamic_fields,
                 skipped_complex_fields,
                 skipped_unbounded_fields,
@@ -635,6 +744,104 @@ fn collectPropertyCapabilities(
     }
     if (isTimeType(scalar, property.format)) {
         try appendCapability(alloc, fields, document_type, field_name, path, "datetime", .time);
+    }
+}
+
+fn isJsonSubdocumentProperty(property: anytype) bool {
+    if (property.embedded_schema != null or property.embedded_dynamic_templates.len > 0) return true;
+    const field_type = property.field_type orelse return false;
+    return std.mem.eql(u8, field_type, "json");
+}
+
+fn collectJsonSubdocumentDomain(
+    alloc: Allocator,
+    document_type: []const u8,
+    path: []const u8,
+    property: anytype,
+    fields: *std.ArrayListUnmanaged(FieldCapability),
+    dynamic_rules: *std.ArrayListUnmanaged(DynamicRuleCapability),
+    json_subdocuments: *std.ArrayListUnmanaged(JsonSubdocumentDomain),
+    skipped_dynamic_fields: *u32,
+    skipped_complex_fields: *u32,
+    skipped_unbounded_fields: *u32,
+) anyerror!void {
+    const embedded_schema = property.embedded_schema orelse blk: {
+        if (property.properties.len == 0) {
+            skipped_complex_fields.* += 1;
+            break :blk null;
+        }
+        break :blk &property;
+    };
+
+    if (embedded_schema) |schema| {
+        try collectPropertyCapabilities(
+            alloc,
+            document_type,
+            path,
+            schema.*,
+            fields,
+            dynamic_rules,
+            json_subdocuments,
+            skipped_dynamic_fields,
+            skipped_complex_fields,
+            skipped_unbounded_fields,
+        );
+    }
+
+    for (property.embedded_dynamic_templates) |template| {
+        try appendDynamicRuleFromTemplate(alloc, dynamic_rules, template, path, skipped_dynamic_fields, skipped_unbounded_fields);
+    }
+
+    const fingerprint = try jsonSubdocumentFingerprintAlloc(alloc, path, property);
+    errdefer alloc.free(fingerprint);
+    try json_subdocuments.append(alloc, .{
+        .document_type = try alloc.dupe(u8, document_type),
+        .name = try alloc.dupe(u8, fieldNameFromPath(path)),
+        .path = try alloc.dupe(u8, path),
+        .capability_fingerprint = fingerprint,
+    });
+}
+
+fn jsonSubdocumentFingerprintAlloc(alloc: Allocator, path: []const u8, property: anytype) ![]u8 {
+    var canonical = std.ArrayListUnmanaged(u8).empty;
+    defer canonical.deinit(alloc);
+    try appendFmt(alloc, &canonical, "path:{s}|", .{path});
+    try appendPropertyFingerprint(alloc, &canonical, property);
+    const hash = std.hash.Wyhash.hash(0, canonical.items);
+    return try std.fmt.allocPrint(alloc, "{x:0>16}", .{hash});
+}
+
+fn appendPropertyFingerprint(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), property: anytype) !void {
+    try appendFmt(alloc, out, "prop:{s}:{s}:{s}:{d}:{d}|", .{
+        property.name,
+        property.field_type orelse "",
+        property.format orelse "",
+        @as(u8, if (property.additional_properties_allowed orelse false) 1 else 0),
+        @as(u8, if (property.dynamic_infer_types) 1 else 0),
+    });
+    for (property.embedded_dynamic_templates) |template| {
+        try appendFmt(alloc, out, "tmpl:{s}:{s}:{s}:{s}:{s}:{s}:{s}|", .{
+            template.name,
+            template.field_type orelse "",
+            template.match_pattern orelse "",
+            template.unmatch_pattern orelse "",
+            template.path_match orelse "",
+            template.path_unmatch orelse "",
+            template.match_mapping_type orelse "",
+        });
+    }
+    if (property.embedded_schema) |embedded_schema| {
+        try appendPropertyFingerprint(alloc, out, embedded_schema.*);
+    }
+    for (property.properties) |child| {
+        try appendPropertyFingerprint(alloc, out, child);
+    }
+    if (property.additional_properties_schema) |additional| {
+        try appendPropertyFingerprint(alloc, out, additional.*);
+    }
+    for (property.pattern_properties) |pattern_property| {
+        try appendFmt(alloc, out, "pattern:{s}|", .{pattern_property.pattern});
+        try appendPropertyFingerprint(alloc, out, pattern_property.property.*);
     }
 }
 
@@ -727,6 +934,64 @@ test "schema capability plan extracts bounded scalar algebraic fields only" {
     try expectCapability(plan, "doc", "region", "meta.region", "string", .group);
     try std.testing.expect(plan.skipped_complex_fields > 0);
     try std.testing.expectEqual(@as(u32, 0), plan.skipped_unbounded_fields);
+}
+
+test "schema capability plan treats relational json schema as embedded subdocument domain" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":9,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"plan":{"type":"keyword"},"score":{"type":"numeric"}},"additionalProperties":true},"dynamic_templates":{"flag":{"match":"flag_*","mapping":{"type":"keyword"}}}}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try compilePlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    try expectCapability(plan, "row", "plan", "attrs.plan", "string", .group);
+    try expectCapability(plan, "row", "score", "attrs.score", "number", .group);
+    try expectCapability(plan, "row", "score", "attrs.score", "number", .measure);
+    try expectJsonDomain(plan, "row", "attrs", "attrs");
+    try std.testing.expectEqual(@as(usize, 1), plan.dynamic_rules.len);
+    try std.testing.expectEqualStrings("attrs.flag", plan.dynamic_rules[0].name);
+    try std.testing.expectEqualStrings("flag_*", plan.dynamic_rules[0].match.?);
+    try std.testing.expectEqualStrings("attrs.*", plan.dynamic_rules[0].path_match.?);
+
+    const config_json = try configJsonFromPlanAlloc(alloc, "rows", plan);
+    defer alloc.free(config_json);
+    var parsed_config = try std.json.parseFromSlice(index_mod.Config, alloc, config_json, .{ .allocate = .alloc_always });
+    defer parsed_config.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_config.value.json_subdocument_domains.len);
+    try std.testing.expectEqualStrings("attrs", parsed_config.value.json_subdocument_domains[0].path);
+}
+
+test "schema capability fingerprint changes when relational json schema changes" {
+    const alloc = std.testing.allocator;
+    var original = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":9,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"plan":{"type":"keyword"},"score":{"type":"numeric"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer original.deinit(alloc);
+    var updated = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":10,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"plan":{"type":"keyword"},"score":{"type":"keyword"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer updated.deinit(alloc);
+
+    var original_plan = try compilePlanAlloc(alloc, original);
+    defer original_plan.deinit(alloc);
+    var updated_plan = try compilePlanAlloc(alloc, updated);
+    defer updated_plan.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), original_plan.json_subdocuments.len);
+    try std.testing.expectEqual(@as(usize, 1), updated_plan.json_subdocuments.len);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        original_plan.json_subdocuments[0].capability_fingerprint,
+        updated_plan.json_subdocuments[0].capability_fingerprint,
+    ));
+
+    const original_fp = try capabilityFingerprintAlloc(alloc, original_plan);
+    defer alloc.free(original_fp);
+    const updated_fp = try capabilityFingerprintAlloc(alloc, updated_plan);
+    defer alloc.free(updated_fp);
+    try std.testing.expect(!std.mem.eql(u8, original_fp, updated_fp));
 }
 
 test "schema capability plan emits default materializations from group and measure fields" {
@@ -946,6 +1211,17 @@ fn expectCapability(
         if (!std.mem.eql(u8, field.name, name)) continue;
         if (!std.mem.eql(u8, field.path, path)) continue;
         if (!std.mem.eql(u8, field.scalar_type, scalar_type_value)) continue;
+        return;
+    }
+    return error.MissingCapability;
+}
+
+fn expectJsonDomain(plan: Plan, document_type: []const u8, name: []const u8, path: []const u8) !void {
+    for (plan.json_subdocuments) |domain| {
+        if (!std.mem.eql(u8, domain.document_type, document_type)) continue;
+        if (!std.mem.eql(u8, domain.name, name)) continue;
+        if (!std.mem.eql(u8, domain.path, path)) continue;
+        try std.testing.expect(domain.capability_fingerprint.len > 0);
         return;
     }
     return error.MissingCapability;

@@ -43,12 +43,14 @@ pub fn validateWritesAgainstTableSchema(
 }
 
 pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
-    var dynamic_templates: []storage_schema.DynamicTemplate = if (schema.dynamic_templates.len == 0)
+    const embedded_dynamic_template_count = countEmbeddedDynamicTemplates(schema);
+    const dynamic_template_count = schema.dynamic_templates.len + embedded_dynamic_template_count;
+    var dynamic_templates: []storage_schema.DynamicTemplate = if (dynamic_template_count == 0)
         &[_]storage_schema.DynamicTemplate{}
     else
-        try alloc.alloc(storage_schema.DynamicTemplate, schema.dynamic_templates.len);
+        try alloc.alloc(storage_schema.DynamicTemplate, dynamic_template_count);
     var initialized: usize = 0;
-    errdefer if (schema.dynamic_templates.len > 0) {
+    errdefer if (dynamic_template_count > 0) {
         for (dynamic_templates[0..initialized]) |template| {
             alloc.free(template.name);
             if (template.match_pattern) |value| alloc.free(value);
@@ -70,25 +72,14 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .relational => .relational,
     };
 
-    for (schema.dynamic_templates, 0..) |template, i| {
-        const field_type = parseRuntimeFieldType(template.field_type orelse "text");
-        dynamic_templates[i] = .{
-            .name = try alloc.dupe(u8, template.name),
-            .match_pattern = if (template.match_pattern) |value| try alloc.dupe(u8, value) else null,
-            .unmatch_pattern = if (template.unmatch_pattern) |value| try alloc.dupe(u8, value) else null,
-            .path_match = if (template.path_match) |value| try alloc.dupe(u8, value) else null,
-            .path_unmatch = if (template.path_unmatch) |value| try alloc.dupe(u8, value) else null,
-            .match_mapping_type = if (template.match_mapping_type) |value| try alloc.dupe(u8, value) else null,
-            .mapping = .{
-                .field_type = field_type,
-                .do_index = template.do_index orelse true,
-                .store = template.store orelse false,
-                .doc_values = template.doc_values orelse false,
-                .include_in_all = template.include_in_all orelse false,
-                .analyzer = try alloc.dupe(u8, template.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
-            },
-        };
+    for (schema.dynamic_templates) |template| {
+        dynamic_templates[initialized] = try runtimeDynamicTemplateFromParsed(alloc, template, null);
         initialized += 1;
+    }
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| {
+            try appendEmbeddedRuntimeDynamicTemplates(alloc, &dynamic_templates, &initialized, property.name, property);
+        }
     }
 
     return .{
@@ -102,6 +93,82 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .full_text_documents = full_text_documents,
         .relational_columns = relational_columns,
     };
+}
+
+fn countEmbeddedDynamicTemplates(schema: ParsedTableSchema) usize {
+    var count: usize = 0;
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| count += countEmbeddedDynamicTemplatesForProperty(property);
+    }
+    return count;
+}
+
+fn countEmbeddedDynamicTemplatesForProperty(property: impl.DocumentProperty) usize {
+    var count = property.embedded_dynamic_templates.len;
+    if (property.embedded_schema) |embedded_schema| count += countEmbeddedDynamicTemplatesForProperty(embedded_schema.*);
+    if (property.item) |item| count += countEmbeddedDynamicTemplatesForProperty(item.*);
+    for (property.properties) |child| count += countEmbeddedDynamicTemplatesForProperty(child);
+    return count;
+}
+
+fn appendEmbeddedRuntimeDynamicTemplates(
+    alloc: std.mem.Allocator,
+    dynamic_templates: *[]storage_schema.DynamicTemplate,
+    initialized: *usize,
+    path: []const u8,
+    property: impl.DocumentProperty,
+) !void {
+    for (property.embedded_dynamic_templates) |template| {
+        dynamic_templates.*[initialized.*] = try runtimeDynamicTemplateFromParsed(alloc, template, path);
+        initialized.* += 1;
+    }
+    if (property.embedded_schema) |embedded_schema| {
+        try appendEmbeddedRuntimeDynamicTemplates(alloc, dynamic_templates, initialized, path, embedded_schema.*);
+    }
+    if (property.item) |item| {
+        try appendEmbeddedRuntimeDynamicTemplates(alloc, dynamic_templates, initialized, path, item.*);
+    }
+    for (property.properties) |child| {
+        const child_path = try appendPath(alloc, path, child.name);
+        defer alloc.free(child_path);
+        try appendEmbeddedRuntimeDynamicTemplates(alloc, dynamic_templates, initialized, child_path, child);
+    }
+}
+
+fn runtimeDynamicTemplateFromParsed(
+    alloc: std.mem.Allocator,
+    template: impl.DynamicTemplate,
+    scope_path: ?[]const u8,
+) !storage_schema.DynamicTemplate {
+    const field_type = parseRuntimeFieldType(template.field_type orelse "text");
+    return .{
+        .name = if (scope_path) |scope| try std.fmt.allocPrint(alloc, "{s}.{s}", .{ scope, template.name }) else try alloc.dupe(u8, template.name),
+        .match_pattern = if (template.match_pattern) |value| try alloc.dupe(u8, value) else null,
+        .unmatch_pattern = if (template.unmatch_pattern) |value| try alloc.dupe(u8, value) else null,
+        .path_match = try scopedPatternAlloc(alloc, scope_path, template.path_match, true),
+        .path_unmatch = try scopedPatternAlloc(alloc, scope_path, template.path_unmatch, false),
+        .match_mapping_type = if (template.match_mapping_type) |value| try alloc.dupe(u8, value) else null,
+        .mapping = .{
+            .field_type = field_type,
+            .do_index = template.do_index orelse true,
+            .store = template.store orelse false,
+            .doc_values = template.doc_values orelse false,
+            .include_in_all = template.include_in_all orelse false,
+            .analyzer = try alloc.dupe(u8, template.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
+        },
+    };
+}
+
+fn scopedPatternAlloc(
+    alloc: std.mem.Allocator,
+    scope_path: ?[]const u8,
+    pattern: ?[]const u8,
+    default_to_scope: bool,
+) !?[]u8 {
+    const scope = scope_path orelse return if (pattern) |value| try alloc.dupe(u8, value) else null;
+    if (pattern) |value| return try std.fmt.allocPrint(alloc, "{s}.{s}", .{ scope, value });
+    if (default_to_scope) return try std.fmt.allocPrint(alloc, "{s}.*", .{scope});
+    return null;
 }
 
 /// Derive the relational typed-column catalog from a parsed table schema. One
@@ -355,6 +422,11 @@ fn deriveRuntimeFullTextProperty(
 ) !void {
     if (property.antfly_index != null and !property.antfly_index.?) return;
 
+    if (property.embedded_schema) |embedded_schema| {
+        try deriveRuntimeFullTextProperty(alloc, path, embedded_schema.*, embedded_schema.include_in_all_fields, fields);
+        return;
+    }
+
     if (property.item) |item| {
         if (item.antfly_index != null and !item.antfly_index.?) return;
         if (item.properties.len > 0) {
@@ -444,6 +516,11 @@ fn deriveRuntimeFullTextDynamicProperty(
 ) !void {
     if (property.antfly_index != null and !property.antfly_index.?) return;
 
+    if (property.embedded_schema) |embedded_schema| {
+        try deriveRuntimeFullTextDynamicProperty(alloc, path, embedded_schema.*, rules);
+        return;
+    }
+
     if (property.additional_properties_schema) |additional_properties| {
         try appendDynamicRuleFromProperty(alloc, path, null, additional_properties.*, rules);
     }
@@ -486,6 +563,11 @@ fn deriveRuntimeFullTextOpenDynamicProperty(
 ) !void {
     if (property.antfly_index != null and !property.antfly_index.?) return;
 
+    if (property.embedded_schema) |embedded_schema| {
+        try deriveRuntimeFullTextOpenDynamicProperty(alloc, path, embedded_schema.*, open_dynamic_paths);
+        return;
+    }
+
     if (!property.dynamic_infer_types and (property.additional_properties_allowed orelse false) and property.additional_properties_schema == null) {
         try appendUniqueOwnedPath(alloc, open_dynamic_paths, path);
     }
@@ -521,6 +603,11 @@ fn deriveRuntimeFullTextInferTypeDynamicProperty(
     infer_type_dynamic_paths: *std.ArrayListUnmanaged([]const u8),
 ) !void {
     if (property.antfly_index != null and !property.antfly_index.?) return;
+
+    if (property.embedded_schema) |embedded_schema| {
+        try deriveRuntimeFullTextInferTypeDynamicProperty(alloc, path, embedded_schema.*, infer_type_dynamic_paths);
+        return;
+    }
 
     if (property.dynamic_infer_types and (property.additional_properties_allowed orelse false) and property.additional_properties_schema == null) {
         try appendUniqueOwnedPath(alloc, infer_type_dynamic_paths, path);
@@ -788,6 +875,51 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expectEqual(storage_schema.AntflyType.json, findRuntimeColumn(runtime, "payload").?.field_type);
 }
 
+test "deriveRuntimeTableSchema projects embedded json schema as prefixed document fields" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":4,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"}},"additionalProperties":true},"dynamic_templates":{"metric":{"path_match":"metrics.*","mapping":{"type":"numeric","doc_values":true}}}}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), runtime.full_text_documents.len);
+    try std.testing.expect(findRuntimeFullTextField(runtime.full_text_documents[0], "attrs.title") != null);
+    try std.testing.expect(findRuntimeFullTextField(runtime.full_text_documents[0], "attrs.plan") != null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.full_text_documents[0].open_dynamic_paths.len);
+    try std.testing.expectEqualStrings("attrs", runtime.full_text_documents[0].open_dynamic_paths[0]);
+    try std.testing.expectEqual(@as(usize, 1), runtime.dynamic_templates.len);
+    try std.testing.expectEqualStrings("attrs.metric", runtime.dynamic_templates[0].name);
+    try std.testing.expectEqualStrings("attrs.metrics.*", runtime.dynamic_templates[0].path_match.?);
+}
+
+test "relational embedded document schema is scoped to explicit json columns" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":4,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"}},"additionalProperties":true},"dynamic_templates":{"metric":{"path_match":"metrics.*","mapping":{"type":"numeric"}}}}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(parsed.document_schemas[0].properties[1].embedded_schema != null);
+    try std.testing.expectEqual(@as(usize, 1), parsed.document_schemas[0].properties[1].embedded_dynamic_templates.len);
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseValidatedTableSchema(alloc,
+            \\{"version":4,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","schema":{"type":"object"}}},"required":["id"],"additionalProperties":false}}}}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseValidatedTableSchema(alloc,
+            \\{"version":4,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"object","dynamic_templates":{"metric":{"path_match":"metrics.*","mapping":{"type":"numeric"}}}}},"required":["id"],"additionalProperties":false}}}}
+        ),
+    );
+}
+
 test "deriveRuntimeTableSchema defaults to document mode with no relational columns" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
@@ -801,4 +933,11 @@ test "deriveRuntimeTableSchema defaults to document mode with no relational colu
     try std.testing.expectEqual(storage_schema.StorageMode.document, runtime.storage_mode);
     try std.testing.expectEqual(@as(usize, 1), runtime.relational_columns.len);
     try std.testing.expectEqual(storage_schema.AntflyType.text, findRuntimeColumn(runtime, "title").?.field_type);
+}
+
+fn findRuntimeFullTextField(document: storage_schema.FullTextDocument, path: []const u8) ?storage_schema.FullTextField {
+    for (document.fields) |field| {
+        if (std.mem.eql(u8, field.path, path)) return field;
+    }
+    return null;
 }
