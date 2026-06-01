@@ -1502,3 +1502,90 @@ Metrics-on text timing aggregate:
 - Hit materialization timing: 3,069 ms
 
 Interpretation: the term-dictionary block data remains both large and CPU-heavy. The binary block index and FST are only ~2.8 MiB and ~2.7 MiB respectively in this run; the large component is the term block payload itself (~101.6 MiB metrics-on). The next Lucene-shaped codec work should target term-block payload shape and term statistics, not section attachment or stored-field compression.
+
+## Post Term-Block Value Delta Baseline
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260601-084227/`.
+
+This run was taken after a codec break to v22: term dictionary blocks now delta-code postings offsets within each block while preserving the one-hit tag encoding. This is a Lucene-shaped change because postings pointers are monotonic in sorted term order; storing deltas reduces term-block payload bytes without changing lookup semantics.
+
+Metrics off:
+
+- Load time: 44.817584208s
+- Async catch-up time: 11.192383458s
+- Catch-up complete: true, `scope=full-text`
+- Throughput: 1,575.39 records/sec, 4.81 MiB/sec
+- `ps` RSS: 618,151,936 bytes
+- Peak sampled RSS: 1,227,423,744 bytes
+- Process footprint metric: 145,120,528 bytes
+- Peak sampled process footprint: 693,492,816 bytes
+- Live malloc metric: 75,224,144 bytes
+- Peak sampled live malloc: 229,571,152 bytes
+- vmmap footprint: 145,856,921 bytes
+- vmmap mapped-file resident: 31,562,137 bytes
+- vmmap malloc allocated: 23,383,244 bytes
+- Segment files: 7
+- Segment bytes: 411,602,061
+- Stored fields bytes: 127,782,043
+- Inverted bytes: 279,725,467
+- Postings bytes: 150,176,393
+- Term block bytes: 102,639,384
+- Text merges completed: 170
+- Full-text build peak bytes: 147,089,571
+- Full-text pending peak bytes: 411,763,010
+- Text merge buffer peak bytes: 104,682,030
+- LSM mutable snapshot clone calls: 30
+- LSM mutable snapshot clone bytes total: 10,200,151
+- LSM mutable snapshot clone peak bytes: 794,275
+
+Metrics on:
+
+- Load time: 41.939514875s
+- Async catch-up time: 14.240694583s
+- Catch-up complete: true, `scope=full-text`
+- Throughput: 1,683.50 records/sec, 5.14 MiB/sec
+- `ps` RSS: 645,251,072 bytes
+- Peak sampled RSS: 1,024,671,744 bytes
+- Process footprint metric: 137,337,744 bytes
+- Peak sampled process footprint: 370,842,344 bytes
+- Live malloc metric: 86,252,784 bytes
+- Peak sampled live malloc: 267,335,136 bytes
+- vmmap footprint: 137,992,601 bytes
+- vmmap mapped-file resident: 30,723,276 bytes
+- vmmap malloc allocated: 23,383,244 bytes
+- Segment files: 7
+- Segment bytes: 402,712,728
+- Stored fields bytes: 127,717,987
+- Inverted bytes: 270,907,915
+- Postings bytes: 147,339,803
+- Term block bytes: 96,722,169
+- Text merges completed: 152
+- Full-text build peak bytes: 168,786,705
+- Full-text pending peak bytes: 402,575,115
+- Text merge buffer peak bytes: 115,747,191
+- LSM mutable snapshot clone calls: 16
+- LSM mutable snapshot clone bytes total: 5,925,370
+- LSM mutable snapshot clone peak bytes: 1,022,395
+
+Metrics-on text timing aggregate:
+
+- Timing lines: 168
+- Source/projection docs: 70,605 / 70,605
+- Total text build timing: 30,449 ms
+- Segment build timing: 30,438 ms
+- Segment encode timing: 12,288 ms
+- Inverted build timing: 10,670 ms
+- Inverted term dictionary timing: 7,277 ms
+- Inverted postings serialization timing: 2,157 ms
+- Inverted sort timing: 602 ms
+- Inverted final assembly timing: 226 ms
+- Inverted norms timing: 3 ms
+- Inverted bloom finish timing: 0 ms
+- Section attach timing: 0 ms
+- Segment assembly timing: 1,458 ms
+- Stored compression timing: 480 ms
+- Analyzer timing: 3,253 ms
+- Term accumulation timing: 2,193 ms
+- Hit materialization timing: 2,881 ms
+
+Interpretation: v22 reduced metrics-on term block bytes from the prior 101,577,520 bytes to 96,722,169 bytes, a ~4.8 MiB reduction in this run. It also moved term-dictionary build timing from 7,525 ms to 7,277 ms, though timing remains noisy. The next dictionary-size work should target repeated term text itself and per-entry varint framing inside term blocks; the value stream is no longer the only obvious waste.

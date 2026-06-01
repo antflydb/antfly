@@ -45,10 +45,11 @@ const platform_time = @import("../platform/time.zig");
 //   v19: v18 + sparse block-max records aligned to stored posting chunks
 //   v20: v19 + compact tagged term-block dictionary values
 //   v21: v20 + bit-packed postings chunk metadata columns
+//   v22: v21 + postings-offset deltas in term dictionary blocks
 //
-// This project is pre-release; writers emit only the current v21 format.
+// This project is pre-release; writers emit only the current v22 format.
 
-const wire_version_current: u8 = 21;
+const wire_version_current: u8 = 22;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4 + 4; // 33 bytes
 const postings_chunk_meta_header_size: usize = 4;
 const postings_skip_record_size: usize = 8;
@@ -251,20 +252,25 @@ fn appendTermDictIndexRecord(
     try appendLeU32(alloc, out, ceiling_term_offset);
 }
 
-fn encodeTermDictBlockValue(value: u64) u64 {
+fn encodeTermDictBlockValueDelta(value: u64, last_postings_offset: *u64) u64 {
     if (fstValIs1Hit(value)) {
         const decoded = fstValDecode1Hit(value);
         return (decoded.doc_num << 1) | 1;
     }
-    std.debug.assert(value <= (std.math.maxInt(u64) >> 1));
-    return value << 1;
+    std.debug.assert(value >= last_postings_offset.*);
+    const delta = value - last_postings_offset.*;
+    last_postings_offset.* = value;
+    std.debug.assert(delta <= (std.math.maxInt(u64) >> 1));
+    return delta << 1;
 }
 
-fn decodeTermDictBlockValue(encoded: u64) u64 {
+fn decodeTermDictBlockValueDelta(encoded: u64, last_postings_offset: *u64) u64 {
     if (encoded & 1 != 0) {
         return fstValEncode1Hit(encoded >> 1, 0);
     }
-    return encoded >> 1;
+    const delta = encoded >> 1;
+    last_postings_offset.* +|= delta;
+    return last_postings_offset.*;
 }
 
 fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry) ![]u8 {
@@ -307,6 +313,7 @@ fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry)
         try writeVarintU32(alloc, &block_data, @intCast(end - i));
         try block_data.appendSlice(alloc, prefix);
 
+        var last_postings_offset: u64 = 0;
         var run_start = i;
         while (run_start < end) {
             const run_end = chooseTermRunEnd(end, run_start);
@@ -323,7 +330,7 @@ fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry)
                 const leaf = entry.term[prefix.len + run_prefix.len ..];
                 try writeVarintU32(alloc, &block_data, @intCast(leaf.len));
                 try block_data.appendSlice(alloc, leaf);
-                try writeVarintU64(alloc, &block_data, encodeTermDictBlockValue(entry.value));
+                try writeVarintU64(alloc, &block_data, encodeTermDictBlockValueDelta(entry.value, &last_postings_offset));
             }
 
             run_start = run_end;
@@ -1557,6 +1564,7 @@ pub const InvertedIndexReader = struct {
         if (!std.mem.startsWith(u8, term, prefix)) return error.NotFound;
         const wanted_suffix = term[prefix.len..];
 
+        var last_postings_offset: u64 = 0;
         var remaining = entry_count;
         while (remaining > 0) {
             const run_prefix_len = try readVarintU32(self.dict_blocks, &cursor);
@@ -1575,7 +1583,7 @@ pub const InvertedIndexReader = struct {
                 if (cursor + leaf_len > self.dict_blocks.len) return error.Truncated;
                 const leaf = self.dict_blocks[cursor..][0..leaf_len];
                 cursor += leaf_len;
-                const value = decodeTermDictBlockValue(try readVarintU64(self.dict_blocks, &cursor));
+                const value = decodeTermDictBlockValueDelta(try readVarintU64(self.dict_blocks, &cursor), &last_postings_offset);
                 if (in_run and std.mem.eql(u8, leaf, wanted_leaf)) return value;
             }
 
@@ -1639,6 +1647,7 @@ pub const TermIterator = struct {
     current_block_remaining: u32 = 0,
     current_run_prefix: []const u8 = &.{},
     current_run_remaining: u32 = 0,
+    current_block_last_postings_offset: u64 = 0,
     start: ?[]const u8 = null,
     end: ?[]const u8 = null,
     automaton: ?vellum.Automaton = null,
@@ -1660,7 +1669,7 @@ pub const TermIterator = struct {
             if (self.current_block_cursor + leaf_len > self.reader.dict_blocks.len) return error.InvalidData;
             const leaf = self.reader.dict_blocks[self.current_block_cursor..][0..leaf_len];
             self.current_block_cursor += leaf_len;
-            const value = decodeTermDictBlockValue(readVarintU64(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData);
+            const value = decodeTermDictBlockValueDelta(readVarintU64(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData, &self.current_block_last_postings_offset);
             self.current_block_remaining -= 1;
             self.current_run_remaining -= 1;
 
@@ -1703,6 +1712,7 @@ pub const TermIterator = struct {
         self.current_block_prefix = self.reader.dict_blocks[cursor..][0..prefix_len];
         cursor += prefix_len;
         self.current_block_cursor = cursor;
+        self.current_block_last_postings_offset = 0;
         self.current_run_prefix = &.{};
         self.current_run_remaining = 0;
         return true;
@@ -3051,17 +3061,26 @@ test "v20 term dictionary local prefix runs shrink block payload" {
     try std.testing.expect(block_data_len < legacy_block_bytes);
 }
 
-test "v20 term dictionary block values compact one-hit terms" {
+test "v22 term dictionary block values compact one-hit terms and delta postings offsets" {
+    var encode_last_postings_offset: u64 = 0;
+    var decode_last_postings_offset: u64 = 0;
     const one_hit = fstValEncode1Hit(42, 0);
-    const encoded_one_hit = encodeTermDictBlockValue(one_hit);
+    const encoded_one_hit = encodeTermDictBlockValueDelta(one_hit, &encode_last_postings_offset);
     try std.testing.expectEqual(@as(u64, 85), encoded_one_hit);
     try std.testing.expect(varintU64Size(encoded_one_hit) < varintU64Size(one_hit));
-    try std.testing.expect(fstValIs1Hit(decodeTermDictBlockValue(encoded_one_hit)));
-    try std.testing.expectEqual(@as(u64, 42), fstValDecode1Hit(decodeTermDictBlockValue(encoded_one_hit)).doc_num);
+    try std.testing.expect(fstValIs1Hit(decodeTermDictBlockValueDelta(encoded_one_hit, &decode_last_postings_offset)));
+    try std.testing.expectEqual(@as(u64, 42), fstValDecode1Hit(decodeTermDictBlockValueDelta(encoded_one_hit, &decode_last_postings_offset)).doc_num);
 
     const postings_offset: u64 = 123_456;
-    const encoded_postings = encodeTermDictBlockValue(postings_offset);
-    try std.testing.expectEqual(postings_offset, decodeTermDictBlockValue(encoded_postings));
+    const encoded_postings = encodeTermDictBlockValueDelta(postings_offset, &encode_last_postings_offset);
+    try std.testing.expectEqual(postings_offset << 1, encoded_postings);
+    try std.testing.expectEqual(postings_offset, decodeTermDictBlockValueDelta(encoded_postings, &decode_last_postings_offset));
+
+    const next_postings_offset: u64 = 123_500;
+    const encoded_next_postings = encodeTermDictBlockValueDelta(next_postings_offset, &encode_last_postings_offset);
+    try std.testing.expectEqual(@as(u64, 88), encoded_next_postings);
+    try std.testing.expect(varintU64Size(encoded_next_postings) < varintU64Size(next_postings_offset << 1));
+    try std.testing.expectEqual(next_postings_offset, decodeTermDictBlockValueDelta(encoded_next_postings, &decode_last_postings_offset));
 }
 
 test "BM25 scoring" {
