@@ -93,7 +93,9 @@ Current PR progress:
   segment doc-values for unsupported text-oriented filter shapes;
 - top-level supported relational structured queries are now converted into
   base-row doc constraints over the text match-all path, so scalar query results
-  follow the committed relational row rather than stale segment doc-values.
+  follow the committed relational row rather than stale segment doc-values;
+- normal relational text projection no longer emits full-column
+  `typed_doc_values` or relational manifests into derived text segments.
 
 ## Implementation Phases
 
@@ -192,8 +194,9 @@ relational reconstruction columns from derived full-text segments:
   and index-local metadata;
 - stop writing relational full-column `typed_doc_values` sections into search
   segments when the relational base store can serve the same scans;
-- keep segment manifests only where a derived artifact still needs
-  schema-less reconstruction, or remove them if no reader needs them.
+- remove relational segment manifests entirely; relational mode has no supported
+  legacy segment format and no reader should reconstruct table rows from
+  segment-local columns.
 
 Acceptance:
 

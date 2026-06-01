@@ -40770,6 +40770,14 @@ test "relational table full-text search loads stored_data from base rows" {
         .sync_level = .full_index,
     });
 
+    const text_entry = db.core.textIndexEntry("ft_v1") orelse return error.TestExpectedEqual;
+    const snapshot = text_entry.persistent.snapshot();
+    try std.testing.expect(snapshot.segments.len > 0);
+    for (snapshot.segments) |*segment| {
+        try std.testing.expect(segment.reader.getSection("amount", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("active", .typed_doc_values) == null);
+    }
+
     const replacement_json =
         \\{"title":"base row wins","amount":77.25,"active":false}
     ;

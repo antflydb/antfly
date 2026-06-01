@@ -18,7 +18,6 @@ const vector_codec = @import("antfly_vector").codec;
 const regex_mod = @import("antfly_regex");
 const introducer_mod = @import("../../introducer.zig");
 const typed_dv = @import("../../section/typed_doc_values.zig");
-const relational_manifest = @import("../../section/relational_manifest.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const analysis_mod = @import("../../search/analysis.zig");
 const schema_api = @import("../../schema/mod.zig");
@@ -147,31 +146,7 @@ pub const BuildTextSegmentsResult = struct {
 pub const TextProjectionBatch = struct {
     docs: []const introducer_mod.TextDocument,
     observed_field_analyzers: []const ObservedFieldAnalyzer = &.{},
-    /// Non-null for relational tables: the column catalog the segment's manifest
-    /// is written from and document bodies are reconstructed against on read.
-    relational_manifest_columns: ?[]const relational_manifest.ManifestColumn = null,
 };
-
-/// Derive the segment manifest column catalog from a runtime schema, or null for
-/// document-mode tables. Allocated on `alloc`; `name`/`path` borrow the schema's
-/// column strings (valid as long as the schema is).
-pub fn relationalManifestColumnsAlloc(
-    alloc: Allocator,
-    schema: ?runtime_schema.TableSchema,
-) !?[]const relational_manifest.ManifestColumn {
-    const runtime = schema orelse return null;
-    if (runtime.storage_mode != .relational or runtime.relational_columns.len == 0) return null;
-    const columns = try alloc.alloc(relational_manifest.ManifestColumn, runtime.relational_columns.len);
-    for (runtime.relational_columns, 0..) |column, i| {
-        columns[i] = .{
-            .name = column.name,
-            .path = column.path,
-            .value_type = relationalStorageValueType(column.field_type),
-            .is_json = column.field_type == .json,
-        };
-    }
-    return columns;
-}
 
 pub const TextProjectionSourceDoc = struct {
     key: []const u8,
@@ -394,7 +369,6 @@ pub fn buildTextProjectionBatchFromSource(
     return .{
         .docs = try arena.dupe(introducer_mod.TextDocument, text_docs.items),
         .observed_field_analyzers = if (observed_field_analyzers) |items| items.items else &.{},
-        .relational_manifest_columns = try relationalManifestColumnsAlloc(arena, schema),
     };
 }
 
@@ -416,7 +390,6 @@ fn buildTextSegmentFromProjectionBatchWithProfile(
     if (projection_batch.docs.len == 0) return null;
     return try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, projection_batch.docs, &analysis_mod.default_analyzer, text_analysis, .{
         .profile = profile,
-        .relational_manifest_columns = projection_batch.relational_manifest_columns,
     });
 }
 
@@ -441,7 +414,6 @@ pub fn buildTextSegmentsFromProjectionBatch(
         const chunk: TextProjectionBatch = .{
             .docs = projection_batch.docs[start..end],
             .observed_field_analyzers = &.{},
-            .relational_manifest_columns = projection_batch.relational_manifest_columns,
         };
         if (try buildTextSegmentFromProjectionBatchWithProfile(alloc, chunk, text_analysis, options.profile)) |segment| {
             try segments.append(alloc, segment);
@@ -1455,22 +1427,10 @@ fn extractTextFieldsFromValue(
     if (root != .object) return .{ .fields = &.{} };
 
     if (schema) |runtime| {
-        // Relational tables drive typed columns from the declared catalog rather
-        // than value detection (authoritative types). NOT NULL is enforced
-        // upstream by JSON-schema `required` validation, so missing nullable
-        // columns are simply skipped here. keyword/text columns flow through the
-        // text path below; json columns are indexed as subtrees.
-        const relational_typed_fields: ?[]const introducer_mod.TypedFieldValue =
-            if (runtime.storage_mode == .relational)
-                try buildRelationalTypedFields(alloc, root, runtime.relational_columns)
-            else
-                null;
-        errdefer if (relational_typed_fields) |relational_fields| alloc.free(relational_fields);
-
         if (!runtimeHasSchemaDrivenText(runtime)) {
             return .{
                 .fields = try extractStringFieldsNoSchema(alloc, root.object),
-                .typed_fields = relational_typed_fields,
+                .typed_fields = if (runtime.storage_mode == .relational) &.{} else null,
             };
         }
 
@@ -1489,50 +1449,18 @@ fn extractTextFieldsFromValue(
         return .{
             .fields = if (fields.items.len > 0) try alloc.dupe(introducer_mod.TextField, fields.items) else &.{},
             .infer_type_dynamic_paths = if (document_schema) |resolved| resolved.infer_type_dynamic_paths else &.{},
-            .typed_fields = relational_typed_fields,
+            .typed_fields = if (runtime.storage_mode == .relational) &.{} else null,
         };
     }
 
     return try extractSchemaLessTextAndTypedFields(alloc, root.object, text_analysis);
 }
 
-/// Build the introducer's typed-field input for a relational document from the
-/// declared column catalog. Every present column is emitted as a typed-doc-value
-/// so the segment is fully reconstructable (Phase 5, authoritative columns):
-/// numeric -> f64, datetime -> u64 epoch ns, boolean, geopoint, and
-/// string/blob/geoshape/json -> bytes_val. Numeric/datetime/boolean/geopoint
-/// sections double as predicate-scan columns; string columns additionally keep
-/// their analyzed inverted-index entries for term queries. NOT NULL is enforced
-/// upstream; missing nullable columns are skipped.
-fn buildRelationalTypedFields(
-    alloc: Allocator,
-    root: std.json.Value,
-    columns: []const runtime_schema.RelationalColumn,
-) ![]const introducer_mod.TypedFieldValue {
-    var fields = std.ArrayListUnmanaged(introducer_mod.TypedFieldValue).empty;
-    errdefer fields.deinit(alloc);
-
-    for (columns) |column| {
-        const value_type = relationalStorageValueType(column.field_type);
-        const found = valueAtJsonPath(root, column.path) orelse continue;
-        if (found == .null) continue;
-        const value = try coerceRelationalStorageValue(alloc, value_type, found) orelse continue;
-        try fields.append(alloc, .{
-            .field_name = column.name,
-            .value_type = value_type,
-            .value = value,
-        });
-    }
-
-    return try fields.toOwnedSlice(alloc);
-}
-
 /// Project a relational document's JSON into the serialized typed-row value
 /// stored under the relational base-row key (in place of a JSON blob). One cell
 /// per present column, in declared-column order, using the same physical
-/// encoding + coercion as the segment columns, so the base row and segment
-/// columns reconstruct identically. Absent nullable columns are skipped (NOT
-/// NULL is enforced upstream). Caller owns the returned bytes.
+/// encoding + coercion the former segment columns used. Absent nullable columns
+/// are skipped (NOT NULL is enforced upstream). Caller owns the returned bytes.
 pub fn buildRelationalRowValueAlloc(
     alloc: Allocator,
     doc_json: []const u8,
@@ -1709,72 +1637,6 @@ fn valueAtJsonPath(root: std.json.Value, path: []const u8) ?std.json.Value {
         }
     }
     return current;
-}
-
-/// Reconstruct a relational document's JSON from the persisted column sections
-/// of a segment (Phase 5, authoritative columns -- the read counterpart of the
-/// write-path column persistence). For each declared column it reads the
-/// `typed_doc_values` section by name and pulls the value at `doc_ordinal`,
-/// emitting JSON keyed by the column path. Columns with no section (absent
-/// nullable values) are omitted. `json` and string columns are stored as
-/// `bytes_val`; `json` bytes are already valid JSON and embedded verbatim,
-/// strings are JSON-escaped. Returns the JSON document; caller owns the bytes.
-///
-/// This is the live full-text read path for relational tables: the segment
-/// stored-doc body is empty and the document is reconstructed from columns here.
-pub fn reconstructRelationalDocumentFromSegmentAlloc(
-    alloc: Allocator,
-    reader: anytype,
-    columns: []const runtime_schema.RelationalColumn,
-    doc_ordinal: u32,
-) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-
-    try out.append(alloc, '{');
-    var emitted: usize = 0;
-    for (columns) |column| {
-        const section = reader.getSection(column.name, .typed_doc_values) orelse continue;
-        const dv = typed_dv.TypedDocValuesReader.init(alloc, section) catch continue;
-        if (try appendReconstructedColumn(alloc, &out, column, dv, doc_ordinal, emitted > 0)) {
-            emitted += 1;
-        }
-    }
-    try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
-}
-
-/// Append one column's `path: value` to `out`. Returns true if a value was
-/// emitted (the doc had a value in this column's section), false otherwise.
-///
-/// Reads the typed value from the segment column, then formats it through the
-/// shared `relational_row_codec.appendCellValue` — the *same* formatter the KV
-/// store read path uses — so a relational document reconstructs byte-for-byte
-/// identically whether served from a segment (full-text reads) or from the KV
-/// store (point lookups / transforms / vector reads).
-fn appendReconstructedColumn(
-    alloc: Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    column: runtime_schema.RelationalColumn,
-    dv: typed_dv.TypedDocValuesReader,
-    doc_ordinal: u32,
-    needs_comma: bool,
-) !bool {
-    const value_type = relationalStorageValueType(column.field_type);
-    const is_json = column.field_type == .json;
-
-    const value: typed_dv.TypedValue = switch (value_type) {
-        .f64_val => .{ .f64_val = (try dv.getF64(doc_ordinal)) orelse return false },
-        .u64_val => .{ .u64_val = (try dv.getU64(doc_ordinal)) orelse return false },
-        .bool_val => .{ .bool_val = (try dv.getBool(doc_ordinal)) orelse return false },
-        .geo_point => .{ .geo_point = (try dv.getGeoPoint(doc_ordinal)) orelse return false },
-        .bytes_val => .{ .bytes_val = (try dv.getBytes(doc_ordinal)) orelse return false },
-    };
-    // getBytes returns an owned dupe; free it after formatting.
-    defer if (value_type == .bytes_val) alloc.free(@constCast(value.bytes_val));
-
-    try relational_row_codec.appendCellValue(alloc, out, column.path, value_type, is_json, value, needs_comma);
-    return true;
 }
 
 fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
@@ -3660,60 +3522,13 @@ test "document mapper extracts packed sparse embeddings from _embeddings" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), extracted.sparse_embeddings[0].values[1], 0.0001);
 }
 
-test "buildRelationalTypedFields persists every column for reconstruction" {
-    // Use an arena: bytes_val for json/string columns are stringified into the
-    // passed allocator, matching the real projection arena's lifetime.
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const alloc = arena_state.allocator();
-
-    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"id":"abc","amount":12.5,"ts":1000,"active":true,"payload":{"k":1}}
-    , .{});
-    defer doc.deinit();
-
-    const columns = [_]runtime_schema.RelationalColumn{
-        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
-        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
-        .{ .name = "ts", .path = "ts", .field_type = .datetime, .nullable = true },
-        .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
-        .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true },
-    };
-
-    const fields = try buildRelationalTypedFields(alloc, doc.value, &columns);
-
-    // All five columns are now persisted; string (id) and json (payload) as
-    // bytes_val, the rest with their scan-friendly encodings.
-    try std.testing.expectEqual(@as(usize, 5), fields.len);
-    for (fields) |field| {
-        if (std.mem.eql(u8, field.field_name, "id")) {
-            try std.testing.expectEqual(typed_dv.ValueType.bytes_val, field.value_type);
-            try std.testing.expectEqualStrings("abc", field.value.bytes_val);
-        } else if (std.mem.eql(u8, field.field_name, "amount")) {
-            try std.testing.expectEqual(typed_dv.ValueType.f64_val, field.value_type);
-            try std.testing.expectEqual(@as(f64, 12.5), field.value.f64_val);
-        } else if (std.mem.eql(u8, field.field_name, "ts")) {
-            try std.testing.expectEqual(typed_dv.ValueType.u64_val, field.value_type);
-            try std.testing.expectEqual(@as(u64, 1000), field.value.u64_val);
-        } else if (std.mem.eql(u8, field.field_name, "active")) {
-            try std.testing.expectEqual(typed_dv.ValueType.bool_val, field.value_type);
-            try std.testing.expect(field.value.bool_val);
-        } else if (std.mem.eql(u8, field.field_name, "payload")) {
-            try std.testing.expectEqual(typed_dv.ValueType.bytes_val, field.value_type);
-            // json column persisted as its canonical text
-            try std.testing.expect(std.mem.indexOf(u8, field.value.bytes_val, "\"k\"") != null);
-        } else {
-            return error.UnexpectedColumn;
-        }
-    }
-}
-
-test "extractTextFieldsFromValue attaches relational typed fields" {
+test "extractTextFieldsFromValue skips relational segment typed fields" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
 
     const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "title", .path = "title", .field_type = .text, .nullable = false },
         .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
         .{ .name = "ts", .path = "ts", .field_type = .datetime, .nullable = true },
         .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
@@ -3725,267 +3540,66 @@ test "extractTextFieldsFromValue attaches relational typed fields" {
     };
 
     var doc = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"amount":1.5,"ts":1000,"active":true,"payload":{"k":1}}
+        \\{"title":"hello","amount":1.5,"ts":1000,"active":true,"payload":{"k":1}}
     , .{});
     defer doc.deinit();
 
     const extracted = try extractTextFieldsFromValue(alloc, doc.value, .{}, schema, null);
 
-    // Every present column is now persisted (numeric/datetime/boolean + the
-    // json payload as bytes_val), so the segment can reconstruct the document.
     try std.testing.expect(extracted.typed_fields != null);
-    try std.testing.expectEqual(@as(usize, 4), extracted.typed_fields.?.len);
+    try std.testing.expectEqual(@as(usize, 0), extracted.typed_fields.?.len);
+    try std.testing.expect(extracted.fields.len > 0);
 }
 
-test "relational numeric column is range-scannable end to end" {
-    const alloc = std.testing.allocator;
-    const segment_mod = @import("../../segment.zig");
-
-    const columns = [_]runtime_schema.RelationalColumn{
-        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
-    };
-
-    const doc_json = [_][]const u8{
-        "{\"amount\":10.0}",
-        "{\"amount\":25.0}",
-        "{\"amount\":50.0}",
-    };
-    const ids = [_][]const u8{ "a", "b", "c" };
-
-    var parsed: [3]std.json.Parsed(std.json.Value) = undefined;
-    var typed: [3][]const introducer_mod.TypedFieldValue = undefined;
-    var text_docs: [3]introducer_mod.TextDocument = undefined;
-    var built: usize = 0;
-    defer for (0..built) |i| {
-        alloc.free(typed[i]);
-        parsed[i].deinit();
-    };
-
-    for (doc_json, 0..) |json, i| {
-        parsed[i] = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
-        typed[i] = try buildRelationalTypedFields(alloc, parsed[i].value, &columns);
-        text_docs[i] = .{
-            .id = ids[i],
-            .stored_data = json,
-            .text_fields = &.{},
-            .typed_fields = typed[i],
-        };
-        built += 1;
-    }
-
-    const seg_bytes = try introducer_mod.buildSegmentFromText(alloc, &text_docs, &analysis_mod.default_analyzer, null);
-    defer alloc.free(seg_bytes);
-
-    var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
-    defer reader.deinit();
-
-    const section = reader.getSection("amount", .typed_doc_values) orelse return error.TestExpectedEqual;
-    const dv = try typed_dv.TypedDocValuesReader.init(alloc, section);
-    try std.testing.expectEqual(typed_dv.ValueType.f64_val, dv.value_type);
-
-    // Range scan [15, 40): only the amount=25 document matches.
-    var matches: usize = 0;
-    var matched_doc: ?u32 = null;
-    for (0..3) |doc_id| {
-        const value = (try dv.getF64(@intCast(doc_id))) orelse continue;
-        if (value >= 15.0 and value < 40.0) {
-            matches += 1;
-            matched_doc = @intCast(doc_id);
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 1), matches);
-    try std.testing.expectEqual(@as(f64, 25.0), (try dv.getF64(matched_doc.?)).?);
-}
-
-test "relational document reconstructs from a persisted segment" {
-    // Full write -> persist -> read -> reconstruct cycle on a real segment.
+test "relational text projection omits segment typed columns" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
     const segment_mod = @import("../../segment.zig");
 
     const columns = [_]runtime_schema.RelationalColumn{
-        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "title", .path = "title", .field_type = .text, .nullable = false },
         .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
-        .{ .name = "ts", .path = "ts", .field_type = .datetime, .nullable = true },
-        .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
-        .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true },
+        .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = false },
     };
-
-    const doc_json =
-        \\{"id":"abc","amount":12.5,"ts":1000,"active":true,"payload":{"k":1}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{});
-    defer parsed.deinit();
-
-    // Write path: project all columns and build a segment via the introducer.
-    const typed = try buildRelationalTypedFields(alloc, parsed.value, &columns);
-    const text_docs = [_]introducer_mod.TextDocument{.{
-        .id = "abc",
-        .stored_data = doc_json,
-        .text_fields = &.{},
-        .typed_fields = typed,
-    }};
-    const seg_bytes = try introducer_mod.buildSegmentFromText(alloc, &text_docs, &analysis_mod.default_analyzer, null);
-    defer alloc.free(seg_bytes);
-
-    var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
-    defer reader.deinit();
-
-    // Read path: reconstruct the document from the persisted column sections.
-    const rebuilt_json = try reconstructRelationalDocumentFromSegmentAlloc(alloc, &reader, &columns, 0);
-    defer alloc.free(rebuilt_json);
-
-    var rebuilt = try std.json.parseFromSlice(std.json.Value, alloc, rebuilt_json, .{});
-    defer rebuilt.deinit();
-    const obj = rebuilt.value.object;
-
-    try std.testing.expectEqual(@as(usize, 5), obj.count());
-    try std.testing.expectEqualStrings("abc", obj.get("id").?.string);
-    const amount = obj.get("amount").?;
-    const amount_num: f64 = switch (amount) {
-        .float => |f| f,
-        .integer => |i| @floatFromInt(i),
-        else => unreachable,
-    };
-    try std.testing.expectEqual(@as(f64, 12.5), amount_num);
-    try std.testing.expectEqual(@as(i64, 1000), obj.get("ts").?.integer);
-    try std.testing.expect(obj.get("active").?.bool);
-    try std.testing.expectEqual(@as(i64, 1), obj.get("payload").?.object.get("k").?.integer);
-}
-
-test "relational segment reconstruction omits absent nullable columns" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const alloc = arena_state.allocator();
-    const segment_mod = @import("../../segment.zig");
-
-    const columns = [_]runtime_schema.RelationalColumn{
-        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
-        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
-        .{ .name = "note", .path = "note", .field_type = .keyword, .nullable = true },
-    };
-
-    // "note" is absent -> no section -> omitted from reconstruction.
-    const doc_json = "{\"id\":\"x\",\"amount\":7.0}";
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{});
-    defer parsed.deinit();
-
-    const typed = try buildRelationalTypedFields(alloc, parsed.value, &columns);
-    const text_docs = [_]introducer_mod.TextDocument{.{
-        .id = "x",
-        .stored_data = doc_json,
-        .text_fields = &.{},
-        .typed_fields = typed,
-    }};
-    const seg_bytes = try introducer_mod.buildSegmentFromText(alloc, &text_docs, &analysis_mod.default_analyzer, null);
-    defer alloc.free(seg_bytes);
-
-    var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
-    defer reader.deinit();
-
-    const rebuilt_json = try reconstructRelationalDocumentFromSegmentAlloc(alloc, &reader, &columns, 0);
-    defer alloc.free(rebuilt_json);
-
-    var rebuilt = try std.json.parseFromSlice(std.json.Value, alloc, rebuilt_json, .{});
-    defer rebuilt.deinit();
-    const obj = rebuilt.value.object;
-
-    try std.testing.expectEqual(@as(usize, 2), obj.count());
-    try std.testing.expectEqualStrings("x", obj.get("id").?.string);
-    try std.testing.expect(obj.get("note") == null);
-}
-
-test "relational segment stores empty body and reconstructs via manifest after merge" {
-    // Proves the full write -> empty-body -> merge -> reconstruct path: the
-    // introducer writes an empty stored-doc body plus a manifest section, the
-    // merge code carries the manifest forward (a schema-less data-movement
-    // path), and the reader's storedDocDecompressed chokepoint reconstructs the
-    // document from typed columns on the *merged* segment.
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const alloc = arena_state.allocator();
-    const segment_mod = @import("../../segment.zig");
-
-    const columns = [_]runtime_schema.RelationalColumn{
-        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
-        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
-        .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
-    };
-    const manifest_columns = (try relationalManifestColumnsAlloc(alloc, .{
+    const schema = runtime_schema.TableSchema{
         .storage_mode = .relational,
         .relational_columns = &columns,
-    })).?;
+    };
 
-    const buildSeg = struct {
-        fn run(a: std.mem.Allocator, cols: []const runtime_schema.RelationalColumn, mcols: []const relational_manifest.ManifestColumn, key: []const u8, doc_json: []const u8) ![]u8 {
-            var parsed = try std.json.parseFromSlice(std.json.Value, a, doc_json, .{});
-            defer parsed.deinit();
-            const typed = try buildRelationalTypedFields(a, parsed.value, cols);
-            const text_docs = [_]introducer_mod.TextDocument{.{
-                .id = key,
-                .stored_data = doc_json,
-                .text_fields = &.{},
-                .typed_fields = typed,
-            }};
-            return try introducer_mod.buildSegmentFromTextWithAnalysisOptions(
-                a,
-                &text_docs,
-                &analysis_mod.default_analyzer,
-                .{},
-                .{ .relational_manifest_columns = mcols },
-            );
-        }
-    }.run;
+    const doc_json = "{\"title\":\"hello world\",\"amount\":12.5,\"active\":true}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{});
+    defer parsed.deinit();
+    const stored_projection = try fullTextStoredProjection(alloc, parsed.value, doc_json, .{});
+    const source_docs = [_]TextProjectionSourceDoc{.{
+        .key = "doc:a",
+        .root = parsed.value,
+        .stored_data = stored_projection.stored_data,
+        .typed_source = stored_projection.typed_source,
+    }};
+    const projection = try buildTextProjectionBatchFromSource(alloc, &source_docs, .{}, schema, null);
+    try std.testing.expectEqual(@as(usize, 1), projection.docs.len);
+    try std.testing.expect(projection.docs[0].typed_fields != null);
+    try std.testing.expectEqual(@as(usize, 0), projection.docs[0].typed_fields.?.len);
+    try std.testing.expect(projection.docs[0].typed_source == null);
 
-    const seg1 = try buildSeg(alloc, &columns, manifest_columns, "doc:a", "{\"id\":\"doc:a\",\"amount\":1.5,\"active\":true}");
-    defer alloc.free(seg1);
-    const seg2 = try buildSeg(alloc, &columns, manifest_columns, "doc:b", "{\"id\":\"doc:b\",\"amount\":2.5}");
-    defer alloc.free(seg2);
+    const seg_bytes = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(
+        alloc,
+        projection.docs,
+        &analysis_mod.default_analyzer,
+        .{},
+        .{},
+    );
+    defer alloc.free(seg_bytes);
 
-    // Each input segment stores an empty body (reconstruction-only).
-    {
-        var r1 = try segment_mod.SegmentReader.init(alloc, seg1);
-        defer r1.deinit();
-        try std.testing.expectEqual(@as(usize, 0), r1.storedDoc(0).?.data.len);
-    }
-
-    const merged = try segment_mod.mergeSegments(alloc, &.{ seg1, seg2 });
-    defer alloc.free(merged);
-
-    var reader = try segment_mod.SegmentReader.init(alloc, merged);
+    var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
     defer reader.deinit();
-    try std.testing.expectEqual(@as(u32, 2), reader.doc_count);
 
-    // The merged segment still carries the manifest, so the reader chokepoint
-    // reconstructs both documents from typed columns.
-    const checkDoc = struct {
-        fn run(a: std.mem.Allocator, rdr: *const segment_mod.SegmentReader, idx: u32, want_id: []const u8, want_amount: f64, want_active: ?bool) !void {
-            const stored = (try rdr.storedDocDecompressed(idx)).?;
-            defer a.free(stored.data);
-            try std.testing.expectEqualStrings(want_id, stored.id);
-            var doc = try std.json.parseFromSlice(std.json.Value, a, stored.data, .{});
-            defer doc.deinit();
-            const obj = doc.value.object;
-            try std.testing.expectEqualStrings(want_id, obj.get("id").?.string);
-            const amt = obj.get("amount").?;
-            const amt_num: f64 = switch (amt) {
-                .float => |f| f,
-                .integer => |i| @floatFromInt(i),
-                else => unreachable,
-            };
-            try std.testing.expectEqual(want_amount, amt_num);
-            if (want_active) |flag| {
-                try std.testing.expectEqual(flag, obj.get("active").?.bool);
-            } else {
-                try std.testing.expect(obj.get("active") == null);
-            }
-        }
-    }.run;
-
-    // Merge preserves input order: seg1's doc (doc:a) then seg2's (doc:b).
-    try checkDoc(alloc, &reader, 0, "doc:a", 1.5, true);
-    try checkDoc(alloc, &reader, 1, "doc:b", 2.5, null);
+    try std.testing.expect(reader.getSection("amount", .typed_doc_values) == null);
+    try std.testing.expect(reader.getSection("active", .typed_doc_values) == null);
+    const stored = (try reader.storedDocDecompressed(0)).?;
+    defer alloc.free(stored.data);
+    try std.testing.expectEqualStrings(doc_json, stored.data);
 }
 
 test "relational KV row value round-trips a document through project + reconstruct" {

@@ -135,7 +135,7 @@ columns are read by the existing `search/query.zig` predicate readers):
 
 `schema_capability.projectRelationalRowAlloc` turns a document into one typed
 cell per declared column (`RelationalRow` / `RelationalCell` / `ColumnValue`),
-ready to hand to `section/typed_doc_values.zig` at segment-build time:
+ready to serialize as the table's authoritative base-row value:
 
 - a missing or null value on a non-nullable column is rejected
   (`error.MissingRequiredColumn`) — this is `NOT NULL` enforcement;
@@ -159,66 +159,37 @@ reuse the existing readers rather than needing new ones:
 Round-trip through the real `TypedDocValuesWriter`/`TypedDocValuesReader` is
 covered by unit tests.
 
-### How this meets the segment builder
+### How this meets derived indexes
 
-The engine already accumulates per-field typed columns at segment-build time:
-`introducer.collectTypedFieldValuesRecursiveScoped` walks each document,
-`detectTypedValue` infers a `ValueType` per field, and `appendTypedFieldValue`
-feeds a per-field `TypedDocValuesWriter` (`introducer.zig:906`) across the whole
-batch; `segment.zig` / `merger.zig` persist and merge the sections, and
-`search/query.zig` reads them for range/equality predicates.
+Relational storage is a one-store design. The packed row under the relational
+base-row keyspace is the only authoritative copy of declared column values.
+Full-text, vector, algebraic, and graph indexes are derived artifacts.
 
-The introducer also accepts **caller-supplied** typed columns directly:
-`TextDocument.typed_fields` bypasses value-based detection entirely
-(`introducer.zig:391`). This is the relational hand-off point.
-`schema_capability.relationalTypedColumnsAlloc` produces exactly that input from
-a relational document — one typed field per present column that is *physically*
-a typed doc value, carrying the schema-declared type — which gives, for free:
+The full-text segment builder still supports typed doc values for document-mode
+and schema-less indexing, but relational projection now sets
+`TextDocument.typed_fields` to an explicit empty slice. That prevents the
+introducer from inferring full-column typed doc values from the document body
+and keeps relational scalar columns out of derived text segments. Text columns
+continue through the normal analyzer/inverted-index path.
 
-- **authoritative types** (types come from the schema, not from per-value
-  detection, so a column never silently drops on a stray mistyped value);
-- **only the typed-doc-value kinds are emitted** — numeric/integer (`f64`),
-  datetime (`u64`), boolean, geopoint. `keyword`/`text` columns are *not* typed
-  doc values: they use the full-text/inverted index for term and range
-  predicates (the existing schema-aware text mapping handles them). `json`
-  columns are excluded too and indexed as document subtrees, never exploded into
-  typed columns.
-
-Both properties are verified at the introducer boundary: the
-`buildSegmentFromText indexes caller-supplied relational typed columns` test
-feeds relational typed columns through `buildSegmentFromText` and asserts the
-declared columns become readable `typed_doc_values` sections while undeclared /
-`json` fields produce none. `projectRelationalRowAlloc` underneath also enforces
-`NOT NULL` and strict types and captures the `json` subtree bytes.
-
-The hand-off keeps layers separate: `schema_capability` emits
-`RelationalTypedField` using `typed_doc_values` types only, and the
-orchestration layer renames `name` → `field_name` to get an
-`introducer.TypedFieldValue` (the other fields are identical).
-
-The write and read paths are wired end-to-end. The *compiled* runtime schema
-carries the contract: `runtime_schema.TableSchema` (`storage/schema.zig`) has
-`storage_mode` and a `relational_columns` catalog (`RelationalColumn{name, path,
-field_type, nullable}`), populated by `deriveRuntimeTableSchema` and
-round-tripped through the versioned binary format (format version 9).
-`document_mapper.extractTextFieldsFromValue` then branches on
-`schema.storage_mode == .relational` and sets `TextDocument.typed_fields` from
-the catalog via `buildRelationalTypedFields` (numeric/datetime/boolean/geopoint
-→ typed; keyword/text continue through the full-text path; json columns are
-subtrees), bypassing value detection. `NOT NULL` is enforced upstream by
-JSON-schema `required` validation. The introducer materializes those typed
-columns into segment doc-values and, for relational tables, the relational base
-row is a self-describing typed row rather than the original JSON blob.
+The *compiled* runtime schema carries the relational contract:
+`runtime_schema.TableSchema` (`storage/schema.zig`) has `storage_mode` and a
+`relational_columns` catalog (`RelationalColumn{name, path, field_type,
+nullable}`), populated by `deriveRuntimeTableSchema` and round-tripped through
+the versioned binary format. `NOT NULL` is enforced upstream by JSON-schema
+`required` validation, and `projectRelationalRowAlloc` enforces strict physical
+types before the row is serialized.
 
 ### Query path
 
 The relational win is predicate pushdown. The planner uses a **columnar table
-scan** operator that reads `typed_doc_values` chunks directly (`readU64Chunk`,
-range bounds, term equality) for predicates on typed columns, instead of
-routing every filter through the full-text index. Projection and stored-document
-reads reconstruct JSON from the typed columns at the segment and KV-row read
-seams. Joins and `GROUP BY`-over-join are unchanged — they already exist (see
-`JOINS.md`, `ALGEBRAIC.md`).
+scan** operator over the relational base store for predicates on declared
+columns, instead of routing every scalar filter through the full-text index.
+Projection and stored-document reads reconstruct JSON from the committed packed
+row. Full-text segments supply only text matching, scoring, doc identity, and
+index-local metadata; they are not a second relational column store. Joins and
+`GROUP BY`-over-join are unchanged — they already exist (see `JOINS.md`,
+`ALGEBRAIC.md`).
 
 ### Schema evolution
 
@@ -237,94 +208,27 @@ number) is additive where the physical type is compatible.
 - **Phase 2 — write path (projection done, encoding aligned).**
   `projectRelationalRowAlloc` produces typed cells per column, enforces
   `NOT NULL`, and captures `json` subtrees, verified end-to-end against the real
-  `typed_doc_values` writer/reader. The physical encoding is aligned with the
-  engine's existing doc values (`detectTypedValue` + `search/query.zig`), so the
-  existing segment builder (`introducer.zig`) already materializes correct typed
-  columns for type-enforced relational documents (see "How this meets the
-  segment builder"). The integration work is completed by Phase 3.
+  row codec and typed-value readers. The physical value kinds remain aligned
+  with the engine's typed doc values so predicate code can share comparison and
+  decoding behavior without making search segments authoritative.
 - **Phase 3 — write path wired end-to-end (done).** The compiled runtime schema
   carries `storage_mode` + the `relational_columns` catalog (derived in
-  `schema/mod.zig`, v9 binary format); `document_mapper` branches on
-  `storage_mode` and builds authoritative `TextDocument.typed_fields` from the
-  catalog via `buildRelationalTypedFields`; the introducer materializes the
-  typed columns. Covered by runtime-schema, `document_mapper`, and introducer
-  tests.
+  `schema/mod.zig`, v9 binary format); relational writes serialize the declared
+  columns into the dedicated base-row keyspace. Text projection intentionally
+  supplies an empty typed-field list so the introducer does not infer a second
+  full-column copy in derived text segments. Covered by runtime-schema,
+  `document_mapper`, and DB tests.
 - **Phase 4 — read path with schema-aware predicate routing (done).** Relational
-  typed columns are scanned by the engine's typed filters (`RangeFilter`,
-  `DateRangeFilter`, `BoolFieldFilter`, geo) via `typed_doc_values` by column
-  name. Predicate auto-routing is now wired: `searchQueryToFilterArenaRelational`
-  threads the declared keyword-column names through filter compilation (incl. the
-  `bool_query` recursion) and routes an exact `.term` predicate on a declared
-  keyword column to a columnar `TypedTermFilter` (the column-scan counterpart to
-  the inverted-index `TermFilter`) instead of the analyzed full-text index.
-  numeric/date/bool/geo predicates already read the columns. Document-mode queries
-  are unchanged (empty keyword-column set). datetime columns accept RFC3339 UTC
-  strings as well as epoch integers on ingest (shared `introducer.parseRfc3339ToNs`).
-- **Phase 5 — authoritative columns (Phase B).** Foundation done:
-  `reconstructRelationalDocumentAlloc` rebuilds a JSON document from a projected
-  `RelationalRow` (string/blob/geoshape → string, numeric/integer → number,
-  datetime → epoch number, boolean, geopoint → `{lat,lon}`, json → embedded
-  subtree; absent nullable columns omitted), verified by a doc → project →
-  reconstruct round-trip test. This proves the typed columns carry enough to
-  rebuild the document.
-
-  Read primitive done: `TypedDocValuesReader.getBytes` provides per-doc
-  random-access retrieval of `bytes_val` columns (variable-length entries walked
-  by offset), so string/blob/geoshape and `json` columns can be read back from a
-  persisted segment — the value-retrieval gap that previously only had
-  bulk chunk reads. Verified by a multi-value round-trip test.
-
-  Storage projection done: `relationalStorageColumnsAlloc` emits the *full
-  reconstructable* column set — unlike `relationalTypedColumnsAlloc` (scan/index
-  routing only), it includes string/blob/geoshape and `json` columns as
-  `bytes_val`. The full storage cycle is verified end-to-end by the "relational
-  storage columns persist and reconstruct the document" test: project → persist
-  each column through the real `TypedDocValuesWriter` → read every value back
-  (`getBytes`/`getU64`/`getF64`/`getBool`/`getGeoPoint`) → rebuild a
-  `RelationalRow` → `reconstructRelationalDocumentAlloc` → assert the document
-  matches the original. This is the complete authoritative-columns data path in
-  isolation.
-
-  Write-side wiring done (live): `document_mapper.buildRelationalTypedFields`
-  now emits **every** present relational column as a `TextDocument.typed_fields`
-  entry, persisting string/blob/geoshape/json columns as `bytes_val` sections
-  (via `relationalStorageValueType` / `coerceRelationalStorageValue`) in addition
-  to the numeric/datetime/boolean/geopoint scan columns. So a relational segment
-  written today already carries a complete, reconstructable column set —
-  numeric/datetime/boolean/geopoint sections double as predicate-scan columns,
-  string columns also keep their analyzed inverted-index entries for term
-  queries, and the `bytes_val` sections are the reconstruction source. Validated
-  by the full `zig build unit-test` suite (0 failed, 0 leaked), so every segment
-  reader/merger/search path tolerates the added sections.
-
-  Read-side reconstruction done (segment-level):
-  `document_mapper.reconstructRelationalDocumentFromSegmentAlloc` rebuilds a
-  document's JSON from the persisted column sections of a real
-  `SegmentReader` — for each declared column it reads the `typed_doc_values`
-  section by name and pulls the value at the doc ordinal
-  (`getBytes`/`getU64`/`getF64`/`getBool`/`getGeoPoint`), emitting JSON keyed by
-  column path; absent (sectionless) nullable columns are omitted; `json` bytes
-  are embedded verbatim, strings are JSON-escaped. The complete
-  write → persist → read → reconstruct cycle is verified on a real
-  introducer-built segment by the "relational document reconstructs from a
-  persisted segment" test (plus an absent-nullable-column case).
-
-  Read-source swap done (live, full-text path): the full-text hit-materialization
-  seam (`storage/db/query/search_exec.zig`) now, for relational tables, builds a
-  hit's `stored_data` by calling `reconstructRelationalDocumentFromSegmentAlloc`
-  on the resolved segment + segment-local id (`snapshot.resolveDocId`, the same
-  id `typed_doc_values` is keyed by) instead of the segment stored-doc blob.
-  Document-mode tables are completely unchanged (they keep the blob path). Proven
-  end to end by the "relational table full-text search reconstructs stored_data
-  from columns" test (real DB: relational schema → write → full-text query with
-  `include_stored` → `stored_data` reconstructed from typed columns), and
-  validated by the full `zig build unit-test` suite (0 failed, 0 leaked).
-
-  Segment-blob removal (done): relational segments no longer write a stored-doc
-  blob at all — the body is stored empty and reconstructed from the typed
-  columns at the single `SegmentReader.storedDocDecompressed` chokepoint, via a
-  self-describing per-segment manifest carried through merge and shard split.
-  See "Blob-write removal" below.
+  predicates are resolved from relational base-row column scans for supported
+  keyword/range/bool/geo clauses. Predicate auto-routing is wired through
+  `searchQueryToFilterArenaRelational`, including `bool_query` recursion.
+  Document-mode queries are unchanged.
+- **Phase 5 — derived text simplification (done).** Relational text projection
+  no longer writes full-column `typed_doc_values` sections, no longer writes a
+  segment manifest, and no longer reconstructs rows from segment-local columns.
+  Full-text segments remain derived text artifacts: they carry term/scoring
+  data, doc identity, and projection payloads only. Query materialization and
+  `include_stored` hydrate from the committed relational base row.
 
 - **Phase 6 — authoritative relational base row (done).** The remaining
   document copy is no longer a generic primary document value for relational
@@ -343,12 +247,11 @@ number) is additive where the physical type is compatible.
     numbers/datetime normalized) — acceptable because relational tables are
     closed-schema, so every referenceable field is a declared column.
 
-  - **One formatter, two read paths.** `relational_row_codec.appendCellValue` is
-    the single canonical-JSON per-value formatter, shared by the relational
-    base-row read path and the segment read path
-    (`document_mapper.appendReconstructedColumn` delegates to it), so a document
-    reconstructs *byte-for-byte identically* whether served from a segment
-    (full-text reads) or the relational row store (point/transform/vector reads).
+  - **One formatter, one row source.** `relational_row_codec.appendCellValue` is
+    the single canonical-JSON per-value formatter for relational base-row
+    materialization. Point reads, transforms, vector `include_stored`, backfill,
+    enrichment, and full-text result materialization all hydrate from the same
+    committed row representation.
 
   - **Seam A — materialize to JSON.** `materializeDocumentValueAlloc` is the one
     decode point every document-value reader routes through. The synchronous
@@ -416,82 +319,36 @@ payloads stripped from storage.
 
 ---
 
-## Blob-write removal: DONE (self-describing segment manifest)
+## One-store text projection: DONE
 
-The segment stored-doc body is no longer written for relational tables. Each
-document is stored as an empty body plus its typed columns; the JSON is
-reconstructed from those columns on read. This was landed as a versioned segment
-format addition (relational mode is new, so no legacy on-disk compatibility was
-required).
+Relational tables store one packed typed-row value under the relational base-row
+keyspace. Derived full-text segments no longer carry a second copy of the full
+relational column set as `typed_doc_values`, no longer emit a relational manifest
+section, and no longer reconstruct JSON from segment-local columns. Segment
+stored bodies are projection payloads used by the text index, while authoritative
+relational reads hydrate from the committed base row.
 
-### Design as built
+This keeps the physical model simple:
 
-- **New leaf module `section/relational_manifest.zig`** (depends only on `std`
-  + `typed_doc_values`, so both the segment reader and `document_mapper` import
-  it without a cycle). Holds:
-  - `ManifestColumn{ name, path, value_type, is_json }` — the schema-free facts
-    reconstruction needs. (Physical `value_type` + `is_json` disambiguate the
-    cases the raw column type can't: a `bytes_val` column may be a string, a
-    `json` subtree, or a geoshape.)
-  - `serialize` / `parse` for the manifest section bytes.
-  - `reconstructDocumentAlloc(reader, columns, local_doc_id)` — the single
-    reconstruction routine, keyed by the **segment-local** doc id (the id
-    `typed_doc_values` is keyed by, == `resolveDocId().local_id`).
+- **Write path**: relational writes project the declared columns once into the
+  base-row value. Full-text projection emits analyzed text and any text-specific
+  payload needed by the derived index, but it does not duplicate scalar
+  relational columns into the segment.
+- **Point and mutation reads**: `DB.get`, transforms, update/delete validation,
+  vector `include_stored`, and lookup/enrichment paths read the packed base row.
+- **Query reads**: structured relational predicates resolve document ids from
+  base rows, then full-text ranking/materialization hydrates from those same
+  base rows before returning public stored data.
+- **Merge / compaction / split**: segment data movement remains schema-less
+  because it only moves derived text-index state. It does not need a relational
+  column catalog, and it cannot become a second source of truth for row values.
 
-- **New `SectionType.relational_manifest` (=6)** stored under the reserved field
-  `\x00__antfly_relational_manifest` (mirrors the `doc_ordinals` convention).
-
-- **Write path** (`introducer.zig`): `BuildTextOptions.relational_manifest_columns`.
-  When set, the build writes an empty stored-doc body per document and attaches
-  the manifest section (`SegmentWriter.addRelationalManifest`). `document_mapper`
-  derives the columns from the runtime schema
-  (`relationalManifestColumnsAlloc`) and threads them through every projection
-  build path (single- and multi-segment). Document-mode builds pass `null` and
-  are byte-for-byte unchanged.
-
-- **Read path** (`segment.zig`): `SegmentReader.storedDocDecompressed` — the
-  single chokepoint all body reads funnel through (query hit materialization,
-  vector `include_stored`, IP-range JSON fallback, shard split) — checks for a
-  manifest (`relationalManifest()`) and, if present, reconstructs from columns;
-  the document id still comes from the stored-doc table. No call site needed
-  schema access. `.id`-only borrowing `storedDoc()` callers are untouched (id is
-  still stored).
-
-### The two schema-less data-movement paths (and the bugs found fixing them)
-
-These are why this had to be a *self-describing* segment, not just a live-schema
-lookup — neither path has the runtime schema:
-
-- **Merge / compaction** (`segment.zig`): the manifest is carried forward
-  verbatim (the column catalog is identical across a table's segments, so the
-  first input with one is authoritative). Reconstruction then works on the
-  merged segment. **Bug found & fixed:** `mergeTypedDocValuesSections` returned
-  `error.UnsupportedTypedDocValues` for `bytes_val` columns — previously bytes
-  doc-values were never merge-critical (the blob carried strings), but
-  relational string/json columns *are* `bytes_val`, so merge now copies them.
-  Without this, compacting a relational table would have lost all string/json
-  columns (silent data loss). Covered by a dedicated build→empty-body→merge→
-  reconstruct test.
-
-- **Shard split** (`index_manager.zig` `buildSplitSegment`): reads
-  `storedDocDecompressed` (now reconstructing) and rebuilds the split segment.
-  **Bug found & fixed:** the rebuild passed `null` schema, which would have
-  degraded a relational split segment to document-mode (body present but typed
-  columns + manifest lost → no columnar pushdown on split data). Now the
-  `TextIndex.runtime_schema` is threaded in so the split segment re-derives its
-  columns + manifest.
+The earlier segment-manifest approach was removed rather than retained as a
+compatibility path because relational mode is new. There is no supported
+on-disk relational segment format to migrate.
 
 ### Validation
 
-Covered by manifest round-trip + merge-survival tests, the end-to-end DB
-relational reconstruction test, and the merge/split/persistence suite.
-Document-mode behaviour is unchanged because its code paths are not entered
-when no manifest is present.
-
-### Historical note
-
-This section originally landed before the KV typed-row redesign. Phase 6 above
-has since made the synchronous source-of-truth (`db.get`, transform reads, and
-vector `include_stored`) column-derived as well. The blob-write details remain
-useful because they describe the segment manifest format and the schema-less
-merge/split paths.
+Covered by mapper tests proving relational text projection omits segment
+typed-column copies, DB tests proving full-text results hydrate from the base
+row, point-read tests over the relational base store, and the root test suite.

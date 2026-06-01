@@ -24,7 +24,6 @@ const index_mod = @import("index.zig");
 const segment_mod = @import("segment.zig");
 const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
-const relational_manifest = @import("section/relational_manifest.zig");
 const analysis_mod = @import("search/analysis.zig");
 const geo_mod = @import("search/geo.zig");
 const platform_time = @import("platform/time.zig");
@@ -185,11 +184,6 @@ pub const BuildTextOptions = struct {
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
     profile: ?*BuildTextProfile = null,
-    /// When set, the segment is relational: a manifest section describing these
-    /// columns is written, and document bodies are stored empty (reconstructed
-    /// from the typed columns on read). When null the segment stores bodies as
-    /// before (document mode, unchanged).
-    relational_manifest_columns: ?[]const relational_manifest.ManifestColumn = null,
 };
 
 pub const BuildTextProfile = struct {
@@ -292,10 +286,7 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
         const doc_alloc = doc_arena_state.allocator();
 
         const stored_attach_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
-        // Relational segments store an empty body: the document is reconstructed
-        // from its typed columns via the manifest on read. The id is still kept.
-        const stored_body: []const u8 = if (options.relational_manifest_columns != null) "" else text_doc.stored_data;
-        try seg_writer.addStoredDocBorrowed(text_doc.id, stored_body);
+        try seg_writer.addStoredDocBorrowed(text_doc.id, text_doc.stored_data);
         if (profile) |p| p.stored_doc_attach_ns +|= platform_time.monotonicNs() - stored_attach_start_ns;
 
         const doc_ordinal = text_doc.doc_ordinal orelse 0;
@@ -429,9 +420,6 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
 
     const segment_encode_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
     if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
-    if (options.relational_manifest_columns) |manifest_columns| {
-        try seg_writer.addRelationalManifest(manifest_columns);
-    }
 
     const section_attach_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
     var fit = field_builders.iterator();
