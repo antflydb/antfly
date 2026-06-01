@@ -28,6 +28,9 @@ const supports_native_metal_provider = build_options.enable_metal;
 const metal_native_provider_mod = if (supports_native_metal_provider) @import("../backends/metal_native_provider.zig") else struct {
     pub const MetalNativeProvider = void;
 };
+const metal_tensor_mod = if (supports_native_metal_provider) @import("../backends/metal_tensor.zig") else struct {
+    pub const MetalTensor = void;
+};
 
 // MLX interop is only compiled under `-Dmlx=true`. Under `-Dmlx=false`, the
 // stub provides enough shape for optional MLX-typed fields to exist as `void`.
@@ -52,6 +55,7 @@ const Tensor = @import("../backends/tensor.zig").Tensor;
 const ExpertCoord = moe_residency.ExpertCoord;
 const ResidencyTier = tier_planner.ResidencyTier;
 const PlacementPlan = tier_planner.PlacementPlan;
+const MetalTensor = metal_tensor_mod.MetalTensor;
 
 pub const QuantExecutionMode = enum {
     prefer_backend_dense,
@@ -250,6 +254,12 @@ pub const WeightStore = struct {
         if (supports_native_metal_provider) null else {},
     shared_metal_native_provider_lock: if (supports_native_metal_provider) std.Io.Mutex else void =
         if (supports_native_metal_provider) .init else {},
+    shared_deberta_embedding_weight_device_cache: if (supports_native_metal_provider) ?MetalTensor else void =
+        if (supports_native_metal_provider) null else {},
+    shared_deberta_embedding_ln_weight_device_cache: if (supports_native_metal_provider) ?MetalTensor else void =
+        if (supports_native_metal_provider) null else {},
+    shared_deberta_embedding_ln_bias_device_cache: if (supports_native_metal_provider) ?MetalTensor else void =
+        if (supports_native_metal_provider) null else {},
     jina_lora_adapter: ?*JinaLoraAdapter = null,
 };
 

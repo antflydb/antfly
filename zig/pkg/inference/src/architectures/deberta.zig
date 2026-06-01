@@ -218,12 +218,12 @@ pub fn preplanMetalDebertaEncoderFrame(
         const attn_ln_slot = debertaLayerNormSlot(layer, .attention_output);
         const ffn_ln_slot = debertaLayerNormSlot(layer, .output);
 
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = q_slot, .weight = q_w, .bias = q_b, .in_dim = H, .out_dim = H }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = k_slot, .weight = k_w, .bias = k_b, .in_dim = H, .out_dim = H }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = v_slot, .weight = v_w, .bias = v_b, .in_dim = H, .out_dim = H }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = attn_o_slot, .weight = attn_o_w, .bias = attn_o_b, .in_dim = H, .out_dim = H }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = ffn_i_slot, .weight = ffn_i_w, .bias = ffn_i_b, .in_dim = H, .out_dim = I }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = ffn_o_slot, .weight = ffn_o_w, .bias = ffn_o_b, .in_dim = I, .out_dim = H }))) return false;
+        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = q_slot, .weight = q_w, .bias = q_b, .in_dim = H, .out_dim = H, .retain_dense_fallback = true }))) return false;
+        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = k_slot, .weight = k_w, .bias = k_b, .in_dim = H, .out_dim = H, .retain_dense_fallback = true }))) return false;
+        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = v_slot, .weight = v_w, .bias = v_b, .in_dim = H, .out_dim = H, .retain_dense_fallback = true }))) return false;
+        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = attn_o_slot, .weight = attn_o_w, .bias = attn_o_b, .in_dim = H, .out_dim = H, .retain_dense_fallback = true }))) return false;
+        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = ffn_i_slot, .weight = ffn_i_w, .bias = ffn_i_b, .in_dim = H, .out_dim = I, .retain_dense_fallback = true }))) return false;
+        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = ffn_o_slot, .weight = ffn_o_w, .bias = ffn_o_b, .in_dim = I, .out_dim = H, .retain_dense_fallback = true }))) return false;
         if (!(try cb.decoderRuntimePrepareLayerNorm(&.{ .slot = attn_ln_slot, .weight = attn_ln_w, .bias = attn_ln_b, .hidden_size = H }))) return false;
         if (!(try cb.decoderRuntimePrepareLayerNorm(&.{ .slot = ffn_ln_slot, .weight = ffn_ln_w, .bias = ffn_ln_b, .hidden_size = H }))) return false;
 
