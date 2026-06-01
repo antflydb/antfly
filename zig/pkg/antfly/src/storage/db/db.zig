@@ -4475,6 +4475,7 @@ pub const DB = struct {
             self.index_backends,
         );
         errdefer shadow_manager.deinit();
+        shadow_manager.setRelationalBaseRows(self.relationalColumnsForStore() != null);
 
         const shadow_start = try self.alloc.dupe(u8, split_key);
         errdefer self.alloc.free(shadow_start);
@@ -17373,6 +17374,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
         self.index_backends,
     );
     defer dest_indexes.deinit();
+    dest_indexes.setRelationalBaseRows(self.relationalColumnsForStore() != null);
     dest_indexes.setRelaxedSplitDurability(true);
     const dest_applied_sequence_checkpoint_path = try apply_state.checkpointPathAlloc(self.alloc, dest_dir);
     defer self.alloc.free(dest_applied_sequence_checkpoint_path);

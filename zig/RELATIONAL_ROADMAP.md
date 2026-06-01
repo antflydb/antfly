@@ -107,6 +107,9 @@ Current PR progress:
 - dense HBC external-vector hydration carries relational-base-row state, so
   field-backed dense vectors can be reloaded from the committed relational row
   when the HBC layer does not hold an inline vector copy;
+- split shadow and destination index managers inherit relational-base-row state,
+  keeping temporary rebuild/handoff managers on the same source keyspace as the
+  live table;
 - TTL-driven async deletes and graph artifact-source materialization also carry
   the relational-base-row state, so background cleanup removes committed
   relational rows and graph extraction hydrates source documents from those rows;
