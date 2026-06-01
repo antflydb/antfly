@@ -751,6 +751,7 @@ pub const DBCore = struct {
             .store = self.store,
             .identity_namespace = self.identity_namespace,
             .alloc = alloc,
+            .relational_base_rows = schemaUsesRelationalBaseRows(self.schema),
         };
         var effective_config = config;
         effective_config.resolution_extra_hooks = transactionRecoveryIdentityHooks(&identity_ctx);

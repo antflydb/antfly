@@ -4896,6 +4896,7 @@ pub const DB = struct {
         self.async_context.relational_base_rows = relational_base_rows;
         if (self.ttl_cleanup_context) |ctx| ctx.batch.relational_base_rows = relational_base_rows;
         if (self.enrichment_runtime) |runtime| runtime.setRelationalBaseRows(relational_base_rows);
+        if (self.transaction_recovery_identity_context) |ctx| ctx.relational_base_rows = relational_base_rows;
     }
 
     /// Returns the relational column catalog when the table is in relational
@@ -9255,6 +9256,7 @@ pub const DB = struct {
         query: search_mod.SearchQuery,
         generation: ?u64,
     ) anyerror!?doc_set.ResolvedDocSet {
+        if (!self.relationalFilterGenerationCanUseCurrentRows(generation)) return null;
         return switch (query) {
             .match_none => .none,
             .match_all => try self.relationalAllRowsDocSetAlloc(alloc, generation),
@@ -9269,6 +9271,11 @@ pub const DB = struct {
             .bool_query => |bool_query| try self.resolveRelationalBoolQueryDocSetAlloc(alloc, runtime_schema, bool_query, generation),
             else => null,
         };
+    }
+
+    fn relationalFilterGenerationCanUseCurrentRows(self: *DB, generation: ?u64) bool {
+        const requested = generation orelse return true;
+        return requested == self.core.nextDerivedSequence();
     }
 
     fn relationalAllRowsDocSetAlloc(
@@ -21148,6 +21155,41 @@ test "db identity namespace reassignment refreshes transaction recovery hook con
     const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
     const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
     try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:a"), state.canonical_doc_id);
+}
+
+test "db setSchema refreshes transaction recovery relational mode context" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 60_000,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    const identity_ctx = db.transaction_recovery_identity_context orelse return error.TestExpectedEqual;
+    try std.testing.expect(!identity_ctx.relational_base_rows);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try std.testing.expect(identity_ctx.relational_base_rows);
 }
 
 test "db identity namespace reassignment is unavailable on status-only handles" {
@@ -38206,6 +38248,73 @@ test "db relational transaction recovery resolves orphaned intents into base row
     try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
 }
 
+test "db one-shot relational transaction recovery resolves orphaned intents into base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const commit_ts: u64 = 2_000;
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "row:one_shot_recovered", .value = "{\"title\":\"one shot\",\"amount\":21.5}" }},
+    });
+
+    const record_key = blk_key: {
+        const prefix = "\x00\x00__txn_records__:";
+        var key: [prefix.len + @sizeOf(transactions_mod.TxnId)]u8 = undefined;
+        @memcpy(key[0..prefix.len], prefix);
+        @memcpy(key[prefix.len..], &txn_id);
+        break :blk_key key;
+    };
+    var record_value: [33]u8 = undefined;
+    record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+    std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
+    std.mem.writeInt(u64, record_value[9..17], commit_ts, .little);
+    std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
+    std.mem.writeInt(u64, record_value[25..33], commit_ts, .little);
+    try db.core.store.put(record_key[0..], record_value[0..]);
+
+    var recorder = TxnResolverRecorder{};
+    const stats = try db.runTransactionRecoveryOnce(.{
+        .enabled = true,
+        .cutoff_ns = 1,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = TxnResolverRecorder.resolve,
+    });
+    try std.testing.expect(stats.resolved_finalized >= 1);
+
+    const raw = (try db.get(alloc, "row:one_shot_recovered")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"one shot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"amount\":21.5") != null);
+    try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "row:one_shot_recovered"));
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:one_shot_recovered");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:one_shot_recovered");
+    defer alloc.free(primary_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+}
+
 test "db batch enforces optimistic version predicates" {
     const alloc = std.testing.allocator;
 
@@ -41793,6 +41902,54 @@ test "relational table full-text search loads stored_data from base rows" {
     defer geo_bbox_filtered.deinit();
     try std.testing.expectEqual(@as(u32, 1), geo_bbox_filtered.total_hits);
     try std.testing.expectEqualStrings("row:a", geo_bbox_filtered.hits[0].id);
+}
+
+test "relational column filter pushdown declines stale identity generations" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:a", .value = "{\"title\":\"alpha\",\"status\":\"active\"}" }},
+    });
+    const active_generation = db.core.nextDerivedSequence();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:a", .value = "{\"title\":\"alpha\",\"status\":\"archived\"}" }},
+    });
+    const current_generation = db.core.nextDerivedSequence();
+
+    const stale = try db.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+        .term = .{ .field = "status", .term = "active" },
+    }, active_generation);
+    try std.testing.expect(stale == null);
+
+    var current = (try db.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+        .term = .{ .field = "status", .term = "archived" },
+    }, current_generation)) orelse return error.TestExpectedEqual;
+    defer current.deinit(alloc);
+    const ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &current, current_generation)) orelse return error.TestExpectedEqual;
+    defer {
+        for (ids) |id| alloc.free(@constCast(id));
+        alloc.free(ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expectEqualStrings("row:a", ids[0]);
 }
 
 test "relational embedded json search intersects with top-level relational filters" {

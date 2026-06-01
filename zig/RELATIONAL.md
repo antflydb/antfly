@@ -362,6 +362,12 @@ so scalar query results follow the committed relational row rather than stale
 segment doc-values. Unsupported text-oriented shapes may still use the inverted
 text index, but not segment doc-values as a relational column source.
 
+Relational column pushdown is only valid at the current identity generation,
+because relational rows and column entries are the committed current row image,
+not a historical value log. A stale generation must fall back to a
+generation-aware source or decline pushdown rather than filtering with current
+column values and historical identity visibility.
+
 Predicates under a `json` column route through the embedded document-derived
 index for that column path, then intersect with top-level relational column
 filters by document id. Result materialization still reconstructs from the
