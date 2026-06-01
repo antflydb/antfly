@@ -1657,3 +1657,75 @@ Metrics-on text timing aggregate:
 - Hit materialization timing: 3,141 ms
 
 Interpretation: front-coded term blocks reduced metrics-off term block bytes from 102,639,384 to 93,353,740 bytes and segment bytes from 411,602,061 to 392,182,126 bytes. Metrics-off total elapsed was effectively flat at ~56 seconds, but metrics-on got slower versus the v22 baseline: total elapsed moved from 56.180276333s to 1m1.019452417s and metrics-on text build timing moved from 30,449 ms to 34,032 ms. The slowdown is larger than ordinary noise in the instrumented path and is concentrated in the term dictionary/inverted encoding work. Next work should keep the compact format but remove extra encoder overhead, likely by avoiding per-entry suffix comparison churn and reusing block scratch when writing/looking up front-coded terms.
+
+## Post Word-At-A-Time Prefix Matcher Baseline
+
+Run: `work-log/do8018/releasefast-baseline-20260601-092024`
+
+Change under test: `commonPrefixLen` now compares word-at-a-time before the byte tail. This targets v23 front-coded term block encode overhead without changing the wire format.
+
+Metrics off:
+
+- Load time: 1m6.379795291s
+- Async catch-up time: 37.324327875s
+- Total elapsed: 1m43.7042285s
+- Throughput: 1,063.65 records/sec, 3.25 MiB/sec
+- `ps` RSS: 165,822,464 bytes
+- Peak sampled RSS: 599,965,696 bytes
+- Process footprint metric: 153,754,896 bytes
+- Peak sampled process footprint: 584,949,008 bytes
+- Live malloc metric: 117,697,808 bytes
+- Peak sampled live malloc: 266,498,224 bytes
+- Segment files: 7
+- Segment bytes: 393,395,219
+- Stored fields bytes: 127,583,212
+- Inverted bytes: 261,768,827
+- Postings bytes: 143,224,960
+- Term block bytes: 89,065,890
+- Text merges completed: 267
+- Full-text build peak bytes: 154,756,243
+- Full-text pending peak bytes: 402,195,082
+- Text merge buffer peak bytes: 216,146,921
+
+Metrics on:
+
+- Load time: 1m0.948767959s
+- Async catch-up time: 22.385270375s
+- Total elapsed: 1m23.334102709s
+- Throughput: 1,158.43 records/sec, 3.53 MiB/sec
+- `ps` RSS: 616,857,600 bytes
+- Peak sampled RSS: 987,054,080 bytes
+- Process footprint metric: 133,619,272 bytes
+- Peak sampled process footprint: 695,918,272 bytes
+- Live malloc metric: 104,432,608 bytes
+- Peak sampled live malloc: 345,195,568 bytes
+- Segment files: 8
+- Segment bytes: 385,025,743
+- Stored fields bytes: 127,466,977
+- Inverted bytes: 253,466,121
+- Postings bytes: 141,520,392
+- Term block bytes: 88,233,855
+- Text merges completed: 254
+- Full-text build peak bytes: 164,263,583
+- Full-text pending peak bytes: 393,606,375
+- Text merge buffer peak bytes: 118,942,532
+
+Metrics-on text timing aggregate:
+
+- Timing lines: 261
+- Source/projection docs: 70,605 / 70,605
+- Total text build timing: 44,475 ms
+- Segment build timing: 44,459 ms
+- Segment encode timing: 16,699 ms
+- Inverted build timing: 14,566 ms
+- Inverted term dictionary timing: 10,490 ms
+- Inverted postings serialization timing: 2,634 ms
+- Inverted sort timing: 591 ms
+- Inverted final assembly timing: 253 ms
+- Segment assembly timing: 1,896 ms
+- Stored compression timing: 540 ms
+- Analyzer timing: 4,491 ms
+- Term accumulation timing: 4,103 ms
+- Hit materialization timing: 3,653 ms
+
+Interpretation: this run is not a valid speed baseline. Both metrics-off and metrics-on ingest were much slower than the immediately preceding v23 run, object-read and batch-write latencies inflated, and the merge count rose sharply. The compact term block size held up (`88,233,855` metrics-on bytes), but the timing cannot prove that the prefix matcher recovered the front-coding CPU regression. Treat this as a noisy measurement and rerun before making throughput claims.

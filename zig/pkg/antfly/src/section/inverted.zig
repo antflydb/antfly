@@ -183,6 +183,14 @@ fn appendLeU32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !
 fn commonPrefixLen(a: []const u8, b: []const u8) usize {
     const limit = @min(a.len, b.len);
     var i: usize = 0;
+    const Word = usize;
+    const word_size = @sizeOf(Word);
+    while (i + word_size <= limit) : (i += word_size) {
+        const lhs = std.mem.readInt(Word, a[i..][0..word_size], .little);
+        const rhs = std.mem.readInt(Word, b[i..][0..word_size], .little);
+        const diff = lhs ^ rhs;
+        if (diff != 0) return i + (@ctz(diff) / 8);
+    }
     while (i < limit and a[i] == b[i]) : (i += 1) {}
     return i;
 }
