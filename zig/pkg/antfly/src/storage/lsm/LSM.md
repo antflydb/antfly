@@ -991,6 +991,11 @@ startup replay tax if it retains large WAL segments between runs.
      - `higher_level_catch_up`
    - Status/metrics should distinguish LSM replay debt from derived replay debt
      and from index rebuild/backfill work.
+   - [x] First LSM slice: `Backend.OpenStats` now records successful open phase
+     timing for storage initialization, manifest loading, directory creation,
+     WAL replay, and run mounting, plus replay records/bytes and loaded run
+     counts. Higher-level index-runtime and catch-up phases remain separate
+     runtime work.
 
 2. Add aggressive checkpoint triggers for index stores.
    - After successful bulk finalize

@@ -143,6 +143,37 @@ pub const BackgroundExecutor = lsm_background_mod.Executor;
 const max_local_cached_run_blocks: usize = 64;
 
 pub const Backend = struct {
+    pub const OpenPhase = enum {
+        idle,
+        initializing_storage,
+        opening_manifest,
+        ensuring_dirs,
+        replaying_wal,
+        mounting_runs,
+        ready,
+        failed,
+    };
+
+    pub const OpenStats = struct {
+        phase: OpenPhase = .idle,
+        started: u64 = 0,
+        completed: u64 = 0,
+        failed: u64 = 0,
+        total_ns: u64 = 0,
+        initializing_storage_ns: u64 = 0,
+        opening_manifest_ns: u64 = 0,
+        ensuring_dirs_ns: u64 = 0,
+        replaying_wal_ns: u64 = 0,
+        mounting_runs_ns: u64 = 0,
+        loaded_manifest: bool = false,
+        loaded_runs: u64 = 0,
+        obsolete_paths: u64 = 0,
+        mutable_entries_after_replay: u64 = 0,
+        immutable_memtables_after_replay: u64 = 0,
+        wal_replay_records: u64 = 0,
+        wal_replay_bytes: u64 = 0,
+    };
+
     pub const CompactionStats = struct {
         compactions: usize = 0,
         input_runs: usize = 0,
@@ -637,6 +668,7 @@ pub const Backend = struct {
     background_io_oversized_jobs: u64 = 0,
     write_pressure_enforcing: bool = false,
     remembered_compaction: ?compaction_mod.RememberedCompaction = null,
+    open_stats: OpenStats = .{},
     write_stats: WriteStats = .{},
     read_stats: AtomicReadStats = .{},
     tracked_in_memory_state_bytes: u64 = 0,
@@ -732,6 +764,69 @@ pub const Backend = struct {
 
     pub fn snapshotWriteStats(self: *const Backend) WriteStats {
         return self.write_stats;
+    }
+
+    pub fn snapshotOpenStats(self: *const Backend) OpenStats {
+        return self.open_stats;
+    }
+
+    pub fn openStatsNowNs(_: *Backend) u64 {
+        return platform_time.monotonicNs();
+    }
+
+    pub fn beginOpenPhase(self: *Backend, phase: OpenPhase) u64 {
+        const now = self.openStatsNowNs();
+        if (self.open_stats.started == 0) {
+            self.open_stats.started = 1;
+            self.open_stats.total_ns = now;
+        }
+        self.open_stats.phase = phase;
+        return now;
+    }
+
+    pub fn finishOpenPhase(self: *Backend, phase: OpenPhase, start_ns: u64) void {
+        const elapsed = self.openStatsElapsedNs(start_ns);
+        switch (phase) {
+            .initializing_storage => self.open_stats.initializing_storage_ns +|= elapsed,
+            .opening_manifest => self.open_stats.opening_manifest_ns +|= elapsed,
+            .ensuring_dirs => self.open_stats.ensuring_dirs_ns +|= elapsed,
+            .replaying_wal => self.open_stats.replaying_wal_ns +|= elapsed,
+            .mounting_runs => self.open_stats.mounting_runs_ns +|= elapsed,
+            .idle, .ready, .failed => {},
+        }
+    }
+
+    pub fn recordOpenManifestLoaded(self: *Backend, loaded_manifest: bool) void {
+        self.open_stats.loaded_manifest = loaded_manifest;
+        self.open_stats.loaded_runs = @intCast(self.runs.items.len);
+        self.open_stats.obsolete_paths = @intCast(self.obsolete_paths.items.len);
+    }
+
+    pub fn recordOpenReplayComplete(self: *Backend) void {
+        self.open_stats.mutable_entries_after_replay = @intCast(self.mutable.entries.items.len);
+        self.open_stats.immutable_memtables_after_replay = @intCast(self.activeImmutableMemtableCount());
+        self.open_stats.wal_replay_records = self.write_stats.wal_replay_records;
+        self.open_stats.wal_replay_bytes = self.write_stats.wal_replay_bytes;
+    }
+
+    pub fn finishOpenSuccess(self: *Backend) void {
+        self.open_stats.phase = .ready;
+        self.open_stats.completed = 1;
+        self.open_stats.failed = 0;
+        self.open_stats.total_ns = self.openStatsElapsedNs(self.open_stats.total_ns);
+    }
+
+    pub fn finishOpenFailure(self: *Backend) void {
+        self.open_stats.phase = .failed;
+        self.open_stats.failed = 1;
+        if (self.open_stats.total_ns != 0) {
+            self.open_stats.total_ns = self.openStatsElapsedNs(self.open_stats.total_ns);
+        }
+    }
+
+    fn openStatsElapsedNs(self: *Backend, start_ns: u64) u64 {
+        const end_ns = self.openStatsNowNs();
+        return if (end_ns >= start_ns) end_ns - start_ns else 0;
     }
 
     pub fn snapshotMaintenanceStats(self: *const Backend) MaintenanceStats {
@@ -3899,6 +3994,11 @@ test "lsm backend replays committed mutable writes from wal after crash reopen" 
     };
 
     var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    var open_stats = backend.snapshotOpenStats();
+    try std.testing.expectEqual(Backend.OpenPhase.ready, open_stats.phase);
+    try std.testing.expectEqual(@as(u64, 1), open_stats.completed);
+    try std.testing.expect(!open_stats.loaded_manifest);
+    try std.testing.expect(open_stats.total_ns > 0);
     {
         var txn = try backend.beginWrite();
         defer txn.abort();
@@ -3912,6 +4012,15 @@ test "lsm backend replays committed mutable writes from wal after crash reopen" 
 
     backend = try Backend.open(std.testing.allocator, root_dir, options);
     defer backend.close();
+    open_stats = backend.snapshotOpenStats();
+    try std.testing.expectEqual(Backend.OpenPhase.ready, open_stats.phase);
+    try std.testing.expectEqual(@as(u64, 1), open_stats.completed);
+    try std.testing.expect(!open_stats.loaded_manifest);
+    try std.testing.expectEqual(@as(u64, 1), open_stats.mutable_entries_after_replay);
+    try std.testing.expect(open_stats.wal_replay_records > 0);
+    try std.testing.expect(open_stats.wal_replay_bytes > 0);
+    try std.testing.expectEqual(backend.write_stats.wal_replay_records, open_stats.wal_replay_records);
+    try std.testing.expectEqual(backend.write_stats.wal_replay_bytes, open_stats.wal_replay_bytes);
     var read = try backend.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
@@ -8898,6 +9007,11 @@ test "lsm backend reloads persisted manifest and run files over memory storage" 
             .storage = memory_storage.storage(),
         });
         defer reopened.close();
+
+        const open_stats = reopened.snapshotOpenStats();
+        try std.testing.expectEqual(Backend.OpenPhase.ready, open_stats.phase);
+        try std.testing.expect(open_stats.loaded_manifest);
+        try std.testing.expect(open_stats.loaded_runs > 0);
 
         var runtime = try reopened.runtimeNamespaceStore(std.testing.allocator);
         defer runtime.deinit();
