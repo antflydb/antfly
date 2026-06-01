@@ -125,6 +125,9 @@ Current PR progress:
 - split prepare/finalize now has coverage proving relational row entries and
   document-scoped column entries move to the destination range and are removed
   from the finalized parent range;
+- merge bootstrap/catch-up now has coverage proving donor logical writes are
+  reprojected into receiver relational rows and column entries, and donor
+  deletes remove receiver column entries during catch-up;
 - TTL-driven async deletes and graph artifact-source materialization also carry
   the relational-base-row state, so background cleanup removes committed
   relational rows and graph extraction hydrates source documents from those rows;

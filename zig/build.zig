@@ -2753,6 +2753,7 @@ pub fn build(b: *std.Build) void {
         "db split status rejects stale destination identity namespace",
         "db merge coordinator opt-in applies configured receiver identity namespace",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
+        "db merge coordinator bootstraps relational rows and column entries",
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
     };
     const lib_data_storage_tests = b.addTest(.{
