@@ -2587,6 +2587,8 @@ pub const DB = struct {
 
     fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
         if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return;
+        var runtime_enrichment_cfg = enrichment_cfg;
+        runtime_enrichment_cfg.relational_base_rows = self.relationalColumnsForStore() != null;
 
         const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
         errdefer self.runtime_alloc.destroy(append_ctx);
@@ -2618,7 +2620,7 @@ pub const DB = struct {
             self.executor,
             notifyDerivedExecutorSequence,
             self.backend_runtime,
-            enrichment_cfg,
+            runtime_enrichment_cfg,
         );
         errdefer runtime.deinit();
         self.enrichment_append_context = append_ctx;
@@ -4849,7 +4851,9 @@ pub const DB = struct {
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
         try self.core.setSchema(table_schema);
-        self.async_context.relational_base_rows = self.relationalColumnsForStore() != null;
+        const relational_base_rows = self.relationalColumnsForStore() != null;
+        self.async_context.relational_base_rows = relational_base_rows;
+        if (self.enrichment_runtime) |runtime| runtime.setRelationalBaseRows(relational_base_rows);
     }
 
     /// Returns the relational column catalog when the table is in relational
@@ -24851,6 +24855,80 @@ test "db leased enrichment worker generates dense embeddings" {
     try std.testing.expectEqual(@as(usize, 1), artifacts.len);
     try std.testing.expectEqualStrings(artifact_key, artifacts[0].key);
     try expectDenseEmbeddingArtifactValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("generated vector text"), 3);
+}
+
+test "db relational enrichment sources read committed base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"body":{"type":"text"}},"required":["title","body"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:a",
+            .value = "{\"title\":\"alpha\",\"body\":\"generated relational vector text\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.executor.waitForAll(2);
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:a");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:a");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "generated relational vector text", 3);
+    defer alloc.free(query_vec);
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = query_vec,
+            .k = 1,
+        },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("row:a", result.hits[0].id);
 }
 
 test "db leased enrichment worker generates dense embeddings with durable lsm primary backend" {

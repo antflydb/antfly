@@ -100,6 +100,10 @@ Current PR progress:
 - foreground, replay, catch-up, and split-shadow derived apply contexts carry
   the relational-base-row flag, so replays probe the relational row keyspace
   instead of the old primary document key;
+- generated-enrichment source reads carry the same relational-base-row state,
+  so chunking, asset producers, dense embeddings, sparse embeddings, and
+  generated-request planning read the committed relational row keyspace rather
+  than probing a generic document KV value;
 - public scan/median-key, identity coverage, generated-enrichment replay, and
   planning sample collectors now decode stored document rows through the unified
   primary-or-relational row key helper and materialize relational row values
@@ -162,9 +166,9 @@ Move every relational document-value reader to the relational participant:
 - shard split/merge readers;
 - serverless/materialized publication readers if they touch relational rows.
 
-The existing `materializeDocumentValueAlloc` seam should remain for compatibility
-while the cutover is staged, but relational code should prefer a typed row from
-the participant over a generic KV value.
+The existing `materializeDocumentValueAlloc` helper can remain as a document-mode
+pass-through and typed-row materializer, but relational readers should not use it
+as a compatibility fallback to a generic document KV value.
 
 Acceptance:
 
