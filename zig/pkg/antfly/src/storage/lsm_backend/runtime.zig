@@ -50,6 +50,14 @@ fn recordCursorValueCopy(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorValueCopy")) backend.recordCursorValueCopy();
 }
 
+fn recordPointValueBorrow(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "recordPointValueBorrow")) backend.recordPointValueBorrow();
+}
+
+fn recordPointValueCopy(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "recordPointValueCopy")) backend.recordPointValueCopy();
+}
+
 fn compareTableEntryTo(entry: lsm_table_file.Entry, namespace: backend_types.Namespace, key: []const u8) std.math.Order {
     const namespace_order = compareNamespace(.{ .name = entry.namespace_name }, namespace);
     if (namespace_order != .eq) return namespace_order;
@@ -1731,6 +1739,7 @@ fn readManyCurrentPointLocked(
     backend: *BackendType,
     namespace: backend_types.Namespace,
     allocator: Allocator,
+    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
     held_values: *std.ArrayListUnmanaged([]u8),
     keys: []const []const u8,
     values: []?[]const u8,
@@ -1739,7 +1748,7 @@ fn readManyCurrentPointLocked(
     var result: BatchCursorReadResult = .{};
     backend.recordPointGets(keys.len);
     for (keys, 0..) |key, i| {
-        const value = getCurrentPointRetainedLocked(BackendType, backend, namespace, allocator, held_values, key) catch |err| switch (err) {
+        const value = getCurrentPointRetainedLocked(BackendType, backend, namespace, allocator, held_blocks, held_values, key) catch |err| switch (err) {
             error.NotFound => {
                 result.misses += 1;
                 continue;
@@ -1760,6 +1769,7 @@ fn getCurrentPointRetainedLocked(
     backend: *BackendType,
     namespace: backend_types.Namespace,
     allocator: Allocator,
+    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
     held_values: *std.ArrayListUnmanaged([]u8),
     key: []const u8,
 ) !?[]const u8 {
@@ -1769,6 +1779,7 @@ fn getCurrentPointRetainedLocked(
         const owned = try allocator.dupe(u8, entry.value);
         errdefer allocator.free(owned);
         try held_values.append(allocator, owned);
+        recordPointValueCopy(backend);
         backend.recordMutableHit();
         return owned;
     }
@@ -1783,6 +1794,7 @@ fn getCurrentPointRetainedLocked(
             const owned = try allocator.dupe(u8, entry.value);
             errdefer allocator.free(owned);
             try held_values.append(allocator, owned);
+            recordPointValueCopy(backend);
             backend.recordMutableHit();
             return owned;
         }
@@ -1790,7 +1802,7 @@ fn getCurrentPointRetainedLocked(
 
     var run_index: usize = 0;
     while (run_index < backend.runs.items.len and backend.runs.items[run_index].level == 0) : (run_index += 1) {
-        if (try getFromRunPointRetainedLocked(backend, &backend.runs.items[run_index], held_values, allocator, namespace, key)) |value| return value;
+        if (try getFromRunPointRetainedLocked(backend, &backend.runs.items[run_index], run_index, held_blocks, held_values, allocator, namespace, key)) |value| return value;
     }
 
     while (run_index < backend.runs.items.len) {
@@ -1798,7 +1810,7 @@ fn getCurrentPointRetainedLocked(
         const level_start = run_index;
         while (run_index < backend.runs.items.len and backend.runs.items[run_index].level == level) : (run_index += 1) {}
         const candidate = findRunIndexInSortedLevel(backend.runs.items[level_start..run_index], namespace, key) orelse continue;
-        if (try getFromRunPointRetainedLocked(backend, &backend.runs.items[level_start + candidate], held_values, allocator, namespace, key)) |value| return value;
+        if (try getFromRunPointRetainedLocked(backend, &backend.runs.items[level_start + candidate], level_start + candidate, held_blocks, held_values, allocator, namespace, key)) |value| return value;
     }
 
     return null;
@@ -1807,6 +1819,8 @@ fn getCurrentPointRetainedLocked(
 fn getFromRunPointRetainedLocked(
     backend: anytype,
     run: *Run,
+    run_index: usize,
+    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -1816,7 +1830,18 @@ fn getFromRunPointRetainedLocked(
     backend.recordRunProbe();
 
     if (run.path != null) {
+        if (held_blocks) |blocks| {
+            if (backend.options.cache != null) {
+                var read_hint: ?BorrowedReadHint = null;
+                const located = try getFromRunWithBlockCache(backend, run, run_index, &read_hint, blocks, namespace, key, true) orelse return null;
+                if (located.entry.tombstone) return error.NotFound;
+                recordPointValueBorrow(backend);
+                if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
+                return located.entry.value;
+            }
+        }
         const value = try getFromRunWithLocalIndex(backend, run, held_values, value_allocator, namespace, key, true) orelse return null;
+        recordPointValueCopy(backend);
         if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
         return value;
     }
@@ -1828,6 +1853,7 @@ fn getFromRunPointRetainedLocked(
         const owned = try value_allocator.dupe(u8, entry.value);
         errdefer value_allocator.free(owned);
         try held_values.append(value_allocator, owned);
+        recordPointValueCopy(backend);
         if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
         return owned;
     }
@@ -1839,6 +1865,7 @@ fn readManyCurrentSortedPointByRunLocked(
     backend: *BackendType,
     namespace: backend_types.Namespace,
     allocator: Allocator,
+    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
     held_values: *std.ArrayListUnmanaged([]u8),
     keys: []const []const u8,
     values: []?[]const u8,
@@ -1862,6 +1889,7 @@ fn readManyCurrentSortedPointByRunLocked(
                 errdefer allocator.free(owned);
                 try held_values.append(allocator, owned);
                 values[i] = owned;
+                recordPointValueCopy(backend);
                 result.hits += 1;
                 backend.recordMutableHit();
             }
@@ -1884,6 +1912,7 @@ fn readManyCurrentSortedPointByRunLocked(
                     errdefer allocator.free(owned);
                     try held_values.append(allocator, owned);
                     values[i] = owned;
+                    recordPointValueCopy(backend);
                     result.hits += 1;
                     backend.recordMutableHit();
                 }
@@ -1891,8 +1920,9 @@ fn readManyCurrentSortedPointByRunLocked(
         }
     }
 
-    var held_blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
-    defer releaseHeldBlocks(&held_blocks, backend.allocator);
+    var local_held_blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
+    defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
+    const block_handles = held_blocks orelse &local_held_blocks;
     var read_hint: ?BorrowedReadHint = null;
 
     for (backend.runs.items, 0..) |*run, run_index| {
@@ -1905,7 +1935,7 @@ fn readManyCurrentSortedPointByRunLocked(
 
             if (run.path != null) {
                 const value = if (backend.options.cache != null) blk: {
-                    const located = try getFromRunWithBlockCache(backend, run, run_index, &read_hint, &held_blocks, namespace, keys[key_index], false) orelse break :blk null;
+                    const located = try getFromRunWithBlockCache(backend, run, run_index, &read_hint, block_handles, namespace, keys[key_index], false) orelse break :blk null;
                     read_hint = .{
                         .run_index = run_index,
                         .namespace_name = namespace.name,
@@ -1930,12 +1960,19 @@ fn readManyCurrentSortedPointByRunLocked(
                 const concrete = value orelse continue;
                 resolved[key_index] = true;
                 if (backend.options.cache != null) {
-                    const owned = try allocator.dupe(u8, concrete);
-                    errdefer allocator.free(owned);
-                    try held_values.append(allocator, owned);
-                    values[key_index] = owned;
+                    if (held_blocks != null) {
+                        values[key_index] = concrete;
+                        recordPointValueBorrow(backend);
+                    } else {
+                        const owned = try allocator.dupe(u8, concrete);
+                        errdefer allocator.free(owned);
+                        try held_values.append(allocator, owned);
+                        values[key_index] = owned;
+                        recordPointValueCopy(backend);
+                    }
                 } else {
                     values[key_index] = concrete;
+                    recordPointValueCopy(backend);
                 }
                 result.hits += 1;
                 if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
@@ -1963,6 +2000,7 @@ fn readManyCurrentSortedPointByRunLocked(
                         errdefer allocator.free(owned);
                         try held_values.append(allocator, owned);
                         values[key_index] = owned;
+                        recordPointValueCopy(backend);
                         result.hits += 1;
                         if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
                     }
@@ -2013,6 +2051,7 @@ fn readManySortedCurrentLocked(
     backend: *BackendType,
     namespace: backend_types.Namespace,
     allocator: Allocator,
+    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
     held_values: *std.ArrayListUnmanaged([]u8),
     keys: []const []const u8,
     values: []?[]const u8,
@@ -2068,7 +2107,7 @@ fn readManySortedCurrentLocked(
     var cursor = try LocalCursor.init(metadata_allocator, backend, &backend.mutable, immutable_memtables, runs, l0_groups, levels, namespace, true);
     defer cursor.close();
 
-    return try readManySortedFromCursor(backend, allocator, null, held_values, &cursor, keys, values);
+    return try readManySortedFromCursor(backend, allocator, held_blocks, held_values, &cursor, keys, values);
 }
 
 pub fn BoundReadTxn(comptime BackendType: type) type {
@@ -2296,7 +2335,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             defer unlockBackend(BackendType, self.backend, locked);
             const keys = [_][]const u8{key};
             var values = [_]?[]const u8{null};
-            const result = try readManyCurrentPointLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, &keys, &values);
+            const result = try readManyCurrentPointLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_blocks, &self.held_values, &keys, &values);
             if (result.hits == 0) return error.NotFound;
             return values[0].?;
         }
@@ -2350,9 +2389,9 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     const locked = lockBackend(BackendType, self.backend);
                     defer unlockBackend(BackendType, self.backend, locked);
                     break :blk switch (plan) {
-                        .cursor => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, keys[offset..end], values[offset..end]),
-                        .sorted_by_run => try readManyCurrentSortedPointByRunLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, keys[offset..end], values[offset..end]),
-                        .point => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, keys[offset..end], values[offset..end]),
+                        .cursor => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_blocks, &self.held_values, keys[offset..end], values[offset..end]),
+                        .sorted_by_run => try readManyCurrentSortedPointByRunLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_blocks, &self.held_values, keys[offset..end], values[offset..end]),
+                        .point => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_blocks, &self.held_values, keys[offset..end], values[offset..end]),
                     };
                 };
                 result.add(chunk_result);
@@ -2786,7 +2825,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             defer unlockBackend(BackendType, self.backend, locked);
             if (comptime @hasField(BackendType, "runs") and @hasField(BackendType, "immutable_memtables")) {
                 self.backend.recordPointGets(1);
-                return try getCurrentPointRetainedLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, key) orelse error.NotFound;
+                return try getCurrentPointRetainedLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, key) orelse error.NotFound;
             }
             return self.backend.getMergedWithOverlay(&self.backend.mutable, &self.mutable, self.namespace, key);
         }
@@ -2854,9 +2893,9 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                         const locked = lockBackend(BackendType, self.backend);
                         defer unlockBackend(BackendType, self.backend, locked);
                         break :blk switch (plan) {
-                            .cursor => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                            .sorted_by_run => try readManyCurrentSortedPointByRunLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
-                            .point => try readManyCurrentPointLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
+                            .cursor => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
+                            .sorted_by_run => try readManyCurrentSortedPointByRunLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
+                            .point => try readManyCurrentPointLocked(BackendType, self.backend, self.namespace, self.allocator, null, &self.held_values, miss_keys[offset..end], miss_values[offset..end]),
                         };
                     };
                     hits += result.hits;
@@ -4919,7 +4958,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             defer unlockBackend(BackendType, self.backend, locked);
             if (comptime @hasField(BackendType, "runs") and @hasField(BackendType, "immutable_memtables")) {
                 self.backend.recordPointGets(1);
-                return try getCurrentPointRetainedLocked(BackendType, self.backend, namespace, self.allocator, &self.held_values, key) orelse error.NotFound;
+                return try getCurrentPointRetainedLocked(BackendType, self.backend, namespace, self.allocator, null, &self.held_values, key) orelse error.NotFound;
             }
             return self.backend.getMergedWithOverlay(&self.backend.mutable, &self.mutable, namespace, key);
         }

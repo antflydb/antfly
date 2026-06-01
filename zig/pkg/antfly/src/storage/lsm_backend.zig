@@ -380,6 +380,8 @@ pub const Backend = struct {
         cursor_block_loads: u64 = 0,
         cursor_value_borrows: u64 = 0,
         cursor_value_copies: u64 = 0,
+        point_value_borrows: u64 = 0,
+        point_value_copies: u64 = 0,
         run_group_builds: u64 = 0,
         run_group_build_ns: u64 = 0,
         run_group_total_runs: u64 = 0,
@@ -423,6 +425,8 @@ pub const Backend = struct {
         cursor_block_loads: CounterU64 = .init(0),
         cursor_value_borrows: CounterU64 = .init(0),
         cursor_value_copies: CounterU64 = .init(0),
+        point_value_borrows: CounterU64 = .init(0),
+        point_value_copies: CounterU64 = .init(0),
         run_group_builds: CounterU64 = .init(0),
         run_group_build_ns: CounterU64 = .init(0),
         run_group_total_runs: CounterU64 = .init(0),
@@ -466,6 +470,8 @@ pub const Backend = struct {
                 .cursor_block_loads = self.cursor_block_loads.load(.monotonic),
                 .cursor_value_borrows = self.cursor_value_borrows.load(.monotonic),
                 .cursor_value_copies = self.cursor_value_copies.load(.monotonic),
+                .point_value_borrows = self.point_value_borrows.load(.monotonic),
+                .point_value_copies = self.point_value_copies.load(.monotonic),
                 .run_group_builds = self.run_group_builds.load(.monotonic),
                 .run_group_build_ns = self.run_group_build_ns.load(.monotonic),
                 .run_group_total_runs = self.run_group_total_runs.load(.monotonic),
@@ -2239,6 +2245,14 @@ pub const Backend = struct {
 
     pub fn recordCursorValueCopy(self: *Backend) void {
         _ = self.read_stats.cursor_value_copies.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointValueBorrow(self: *Backend) void {
+        _ = self.read_stats.point_value_borrows.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordPointValueCopy(self: *Backend) void {
+        _ = self.read_stats.point_value_copies.fetchAdd(1, .monotonic);
     }
 
     pub fn recordRunGroupBuild(self: *Backend, total_runs: usize, l0_runs: usize, elapsed_ns: u64) void {
@@ -6703,6 +6717,8 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
 
         const read_stats = backend.snapshotReadStats();
         try std.testing.expectEqual(@as(u64, 1), read_stats.point_gets);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.point_value_borrows);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.point_value_copies);
     }
 
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_reads);

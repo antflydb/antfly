@@ -195,6 +195,9 @@ Large-ingest guardrails:
    - [x] Snapshot cursor-plan `getManySorted` now returns values borrowed from
      retained cache block handles or stable snapshot states instead of copying
      every hit into transaction-owned value buffers.
+   - [x] Current/probe reads can now retain cached run-block handles for
+     path-backed point hits, so persisted values survive lock release without a
+     transaction-owned value copy.
 6. [ ] Cache per-cursor source layout (`runs`, L0 groups, lower levels, and
    immutable pointer slice) across repeated seeks while the cursor snapshot is
    valid.
@@ -230,6 +233,10 @@ Large-ingest guardrails:
    - [x] Cursor scratch now uses one aligned backing allocation for all
      per-source arrays instead of allocating positions, heap state, block
      handles, and entry slots separately for every cursor open.
+   - [x] Current/probe point reads now borrow values from retained cache block
+     handles for path-backed run hits when the transaction owns a held-block
+     list; live mutable hits still copy until their generation lifetime is
+     explicitly pinned.
 4. [ ] Make sorted `getManySorted` keep per-run cursor state across keys so
    batch reads resume inside the current block where possible.
    - [x] First slice: cached sorted-by-run reads now keep a per-run forward
