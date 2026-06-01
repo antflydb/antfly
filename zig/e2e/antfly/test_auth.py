@@ -75,6 +75,10 @@ def _wait_until(predicate, timeout: float = 30.0, interval: float = 0.25):
 def _try_lookup(api: "AuthApi", table_name: str, key: str):
     try:
         return api.lookup_key(table_name, key)
+    except requests.HTTPError as err:
+        if err.response is not None and err.response.status_code == 404:
+            return None
+        raise
     except requests.RequestException:
         return None
 
@@ -619,6 +623,7 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_query(stateful_auth_ap
     stateful_auth_api.s.headers["Authorization"] = _basic_auth("reader", "reader")
 
     visible = _wait_until(lambda: _try_lookup(stateful_auth_api, "docs", "doc:gold"))
+    assert visible is not None
     assert visible["title"] == "gold doc"
 
     hidden_lookup = stateful_auth_api.s.get(f"{stateful_auth_api.url}/tables/docs/lookup/doc:silver", timeout=30)

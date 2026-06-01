@@ -1893,7 +1893,7 @@ pub const AntflyApiHandler = struct {
         const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| {
-            if (!(try self.api_server.docMatchesRowFilter(source, table_name, decoded_key, value))) {
+            if (!(try self.api_server.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
                 _ = ctx.status(404);
                 return ctx.text("not found");
             }

@@ -3202,7 +3202,7 @@ pub const ApiHttpServer = struct {
                 const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, lookup.table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
                 if (row_filter_json) |value| {
-                    if (!(try self.docMatchesRowFilter(source, lookup.table_name, decoded_key, value))) {
+                    if (!(try self.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
                         return try textResponse(self.alloc, 404, "not found");
                     }
                 }
@@ -3510,7 +3510,16 @@ pub const ApiHttpServer = struct {
     ) !bool {
         var response = (try source.lookup(self.alloc, table_name, key, .{}, .read_index)) orelse return false;
         defer response.deinit(self.alloc);
-        return try search_pattern_filter.storedDocMatchesPatternFilter(self.alloc, key, response.json, row_filter_json);
+        return try self.docJsonMatchesRowFilter(key, response.json, row_filter_json);
+    }
+
+    pub fn docJsonMatchesRowFilter(
+        self: *ApiHttpServer,
+        key: []const u8,
+        json: []const u8,
+        row_filter_json: []const u8,
+    ) !bool {
+        return try search_pattern_filter.storedDocMatchesPatternFilter(self.alloc, key, json, row_filter_json);
     }
 
     pub fn filterScanResultByRowFilter(
