@@ -138,6 +138,13 @@ type diagSnapshot struct {
 	Extra                                map[string]any `json:"extra,omitempty"`
 }
 
+type catchupScope string
+
+const (
+	catchupScopeAll      catchupScope = "all"
+	catchupScopeFullText catchupScope = "full-text"
+)
+
 type vmmapStats struct {
 	PhysicalFootprintBytes  int64
 	PhysicalPeakBytes       int64
@@ -203,6 +210,7 @@ func main() {
 		healthURL      = flag.String("health-url", "http://127.0.0.1:4200/metrics", "optional Antfly Prometheus metrics URL")
 		sampleEvery    = flag.Duration("sample-every", 0, "sample process/health diagnostics during load; disabled when 0")
 		waitCatchup    = flag.Duration("wait-catchup", 0, "after load, wait until health metrics show pending index/backlog bytes are drained; disabled when 0")
+		waitScope      = flag.String("wait-catchup-scope", string(catchupScopeAll), "catch-up wait predicate: all or full-text")
 		dataDir        = flag.String("data-dir", "", "optional Antfly data dir to scan for full-text .seg bytes at the end")
 		vmmapOut       = flag.String("vmmap-out", "", "optional file for final vmmap -summary output for --sample-pid")
 		summaryOut     = flag.String("summary-out", "", "optional JSON file for final benchmark diagnostics")
@@ -211,6 +219,10 @@ func main() {
 		metricsEnabled = flag.Bool("metrics-enabled", false, "stamp whether server metrics instrumentation was enabled")
 	)
 	flag.Parse()
+	scope, err := parseCatchupScope(*waitScope)
+	if err != nil {
+		log.Fatal(err)
+	}
 	if *localDir == "" {
 		log.Fatal("--local-dir is required")
 	}
@@ -354,14 +366,14 @@ func main() {
 	var catchupElapsed time.Duration
 	var catchupComplete bool
 	if *waitCatchup > 0 {
-		ok, diag, err := waitForCatchup(ctx, *samplePID, *healthURL, *dataDir, *waitCatchup)
+		ok, diag, err := waitForCatchup(ctx, *samplePID, *healthURL, *dataDir, *waitCatchup, scope)
 		catchupElapsed = time.Since(catchupStart)
 		catchupComplete = ok
 		if err != nil {
 			fmt.Printf("catchup_wait_error elapsed=%s err=%v\n", catchupElapsed, err)
 		} else {
-			fmt.Printf("catchup_wait elapsed=%s complete=%v full_text_pending_bytes=%d derived_backlog_bytes=%d text_merge_buffer_bytes=%d\n",
-				catchupElapsed, ok, diag.FullTextPendingBytes, diag.DerivedBacklogBytes, diag.TextMergeBufferBytes)
+			fmt.Printf("catchup_wait elapsed=%s complete=%v scope=%s full_text_pending_bytes=%d derived_backlog_bytes=%d text_merge_buffer_bytes=%d\n",
+				catchupElapsed, ok, scope, diag.FullTextPendingBytes, diag.DerivedBacklogBytes, diag.TextMergeBufferBytes)
 		}
 	}
 
@@ -575,16 +587,39 @@ func collectDiagnostics(pid int, healthURL, dataDir string, elapsed time.Duratio
 	return out
 }
 
-func waitForCatchup(ctx context.Context, pid int, healthURL, dataDir string, timeout time.Duration) (bool, diagSnapshot, error) {
+func parseCatchupScope(raw string) (catchupScope, error) {
+	switch catchupScope(raw) {
+	case catchupScopeAll, catchupScopeFullText:
+		return catchupScope(raw), nil
+	default:
+		return "", fmt.Errorf("invalid --wait-catchup-scope %q: expected %q or %q", raw, catchupScopeAll, catchupScopeFullText)
+	}
+}
+
+func catchupDrained(last diagSnapshot, scope catchupScope) bool {
+	if !last.HealthMetricsAvailable {
+		return false
+	}
+	switch scope {
+	case catchupScopeAll:
+		return last.FullTextPendingBytes == 0 &&
+			last.DerivedBacklogBytes == 0 &&
+			last.TextMergeBufferBytes == 0
+	case catchupScopeFullText:
+		return last.FullTextPendingBytes == 0 &&
+			last.TextMergeBufferBytes == 0
+	default:
+		return false
+	}
+}
+
+func waitForCatchup(ctx context.Context, pid int, healthURL, dataDir string, timeout time.Duration, scope catchupScope) (bool, diagSnapshot, error) {
 	deadline := time.Now().Add(timeout)
 	var last diagSnapshot
 	stable := 0
 	for {
 		last = collectDiagnostics(pid, healthURL, dataDir, 0)
-		drained := last.HealthMetricsAvailable &&
-			last.FullTextPendingBytes == 0 &&
-			last.DerivedBacklogBytes == 0 &&
-			last.TextMergeBufferBytes == 0
+		drained := catchupDrained(last, scope)
 		if drained {
 			stable++
 			if stable >= 2 {

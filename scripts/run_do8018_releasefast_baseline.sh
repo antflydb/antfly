@@ -13,6 +13,7 @@ batch_size="${BATCH_SIZE:-200}"
 batch_workers="${BATCH_WORKERS:-16}"
 object_workers="${OBJECT_WORKERS:-8}"
 wait_catchup="${WAIT_CATCHUP:-120s}"
+wait_catchup_scope="${WAIT_CATCHUP_SCOPE:-full-text}"
 git_commit="$(git -C "${repo_root}" rev-parse --short=12 HEAD)"
 
 if [[ ! -d "${data_source}" ]]; then
@@ -89,6 +90,7 @@ run_one() {
       --sample-every 1s \
       --health-url "http://127.0.0.1:${health_port}/metrics" \
       --wait-catchup "${wait_catchup}" \
+      --wait-catchup-scope "${wait_catchup_scope}" \
       --data-dir "${data_dir}" \
       --vmmap-out "${vmmap_file}" \
       --summary-out "${summary_file}" \
