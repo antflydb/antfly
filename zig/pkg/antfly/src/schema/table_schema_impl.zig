@@ -1200,6 +1200,7 @@ fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]
         std.mem.eql(u8, schema_type_name, "numeric") or
         std.mem.eql(u8, schema_type_name, "boolean") or
         std.mem.eql(u8, schema_type_name, "datetime") or
+        std.mem.eql(u8, schema_type_name, "geopoint") or
         std.mem.eql(u8, schema_type_name, "json") or
         std.mem.eql(u8, schema_type_name, "object") or
         std.mem.eql(u8, schema_type_name, "array"))

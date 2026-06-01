@@ -41522,7 +41522,7 @@ test "relational table full-text search loads stored_data from base rows" {
     // Relational schema: returned documents and structured filters should read
     // the relational base row, not duplicated segment typed_doc_values.
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"},"active":{"type":"boolean"}},"required":["title"],"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"},"active":{"type":"boolean"},"location":{"type":"geopoint"},"attrs":{"type":"json"}},"required":["title"],"additionalProperties":false}}}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -41539,7 +41539,7 @@ test "relational table full-text search loads stored_data from base rows" {
         .writes = &.{.{
             .key = "row:a",
             .value =
-            \\{"title":"hello world","amount":42.5,"active":true}
+            \\{"title":"hello world","status":"open","amount":42.5,"created_at":100,"active":true,"location":{"lat":0,"lon":0},"attrs":{"version":"old"}}
             ,
         }},
         .sync_level = .full_index,
@@ -41549,12 +41549,16 @@ test "relational table full-text search loads stored_data from base rows" {
     const snapshot = text_entry.persistent.snapshot();
     try std.testing.expect(snapshot.segments.len > 0);
     for (snapshot.segments) |*segment| {
+        try std.testing.expect(segment.reader.getSection("status", .typed_doc_values) == null);
         try std.testing.expect(segment.reader.getSection("amount", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("created_at", .typed_doc_values) == null);
         try std.testing.expect(segment.reader.getSection("active", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("location", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("attrs", .typed_doc_values) == null);
     }
 
     const replacement_json =
-        \\{"title":"base row wins","amount":77.25,"active":false}
+        \\{"title":"base row wins","status":"closed","amount":77.25,"created_at":200,"active":false,"location":{"lat":37.78,"lon":-122.42},"attrs":{"version":"new","nested":{"ok":true}}}
     ;
     const replacement_row = try mapper.buildRelationalRowValueAlloc(alloc, replacement_json, runtime_schema.relational_columns);
     defer alloc.free(replacement_row);
@@ -41609,7 +41613,11 @@ test "relational table full-text search loads stored_data from base rows" {
         else => unreachable,
     };
     try std.testing.expectEqual(@as(f64, 77.25), amount_num);
+    try std.testing.expectEqualStrings("closed", obj.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 200), obj.get("created_at").?.integer);
     try std.testing.expect(!obj.get("active").?.bool);
+    try std.testing.expectEqualStrings("new", obj.get("attrs").?.object.get("version").?.string);
+    try std.testing.expect(obj.get("attrs").?.object.get("nested").?.object.get("ok").?.bool);
 
     var filtered = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -41641,6 +41649,65 @@ test "relational table full-text search loads stored_data from base rows" {
     defer bool_filtered.deinit();
     try std.testing.expectEqual(@as(u32, 1), bool_filtered.total_hits);
     try std.testing.expectEqualStrings("row:a", bool_filtered.hits[0].id);
+
+    var keyword_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"closed\"}}",
+        .limit = 10,
+    });
+    defer keyword_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), keyword_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", keyword_filtered.hits[0].id);
+
+    var stale_keyword_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"open\"}}",
+        .limit = 10,
+    });
+    defer stale_keyword_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale_keyword_filtered.total_hits);
+
+    var term_range_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"term_range\":{\"field\":\"status\",\"min\":\"cl\",\"max\":\"cm\"}}",
+        .limit = 10,
+    });
+    defer term_range_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), term_range_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", term_range_filtered.hits[0].id);
+
+    var date_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .date_range = .{ .field = "created_at", .start_ns = 150 } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer date_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), date_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", date_filtered.hits[0].id);
+
+    var geo_distance_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"geo_distance\":{\"field\":\"location\",\"lat\":37.78,\"lon\":-122.42,\"radius_meters\":1000}}",
+        .limit = 10,
+    });
+    defer geo_distance_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), geo_distance_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", geo_distance_filtered.hits[0].id);
+
+    var geo_bbox_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"geo_bbox\":{\"field\":\"location\",\"min_lat\":37.0,\"min_lon\":-123.0,\"max_lat\":38.0,\"max_lon\":-122.0}}",
+        .limit = 10,
+    });
+    defer geo_bbox_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), geo_bbox_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", geo_bbox_filtered.hits[0].id);
 }
 
 test "relational text backfill ignores generic primary rows" {
