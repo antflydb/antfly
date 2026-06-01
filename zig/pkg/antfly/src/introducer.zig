@@ -288,6 +288,7 @@ pub const BuildTextProfile = struct {
     hit_materialize_ns: u64 = 0,
     typed_collect_ns: u64 = 0,
     typed_build_ns: u64 = 0,
+    inverted_build_ns: u64 = 0,
     section_attach_ns: u64 = 0,
     stored_doc_attach_ns: u64 = 0,
     stored_compress_ns: u64 = 0,
@@ -749,10 +750,13 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         }
     }
     noteBuildMemorySample(profile, profile_working_set, "rss_after_analyze");
+    const stored_docs_estimated_bytes = estimateStoredDocBytes(docs);
+    var remaining_postings_estimated_bytes = estimateFieldPostingsBuilderBytes(&field_builders);
+    const typed_doc_values_estimated_bytes = estimateTypedDocValuesBytes(&typed_fields);
     try resource_tracker.adjust(input_estimated_bytes +
-        estimateStoredDocBytes(docs) +
-        estimateFieldPostingsBuilderBytes(&field_builders) +
-        estimateTypedDocValuesBytes(&typed_fields));
+        stored_docs_estimated_bytes +
+        remaining_postings_estimated_bytes +
+        typed_doc_values_estimated_bytes);
 
     const typed_build_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     var section_bytes: u64 = 0;
@@ -776,39 +780,50 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
     const segment_encode_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
 
-    const section_attach_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
     var fit = field_builders.iterator();
     while (fit.next()) |entry| {
         const field_name = entry.key_ptr.*;
+        const builder_estimated_bytes = entry.value_ptr.estimatedMemoryBytes();
+        const inverted_build_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         const inv_data = try entry.value_ptr.buildAlloc(alloc);
+        if (profile_timings) {
+            if (profile) |p| p.inverted_build_ns +|= platform_time.monotonicNs() - inverted_build_start_ns;
+        }
         errdefer alloc.free(inv_data);
         section_bytes +|= @intCast(inv_data.len);
 
         if (inv_data.len == 0) {
             alloc.free(inv_data);
             entry.value_ptr.deinit(alloc);
+            remaining_postings_estimated_bytes -|= builder_estimated_bytes;
             continue;
         }
 
         const field_idx = field_indices.get(field_name).?;
+        const section_attach_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         try seg_writer.addSectionOwned(field_idx, .inverted_text, inv_data);
+        if (profile_timings) {
+            if (profile) |p| p.section_attach_ns +|= platform_time.monotonicNs() - section_attach_start_ns;
+        }
         entry.value_ptr.deinit(alloc);
+        remaining_postings_estimated_bytes -|= builder_estimated_bytes;
         if (profile_working_set) {
             if (profile) |p| {
                 p.section_bytes = section_bytes;
-                p.field_postings_estimated_bytes = estimateFieldPostingsBuilderBytes(&field_builders);
-                p.postings_live_bytes = p.field_postings_estimated_bytes;
+                p.field_postings_estimated_bytes = remaining_postings_estimated_bytes;
+                p.postings_live_bytes = remaining_postings_estimated_bytes;
                 p.fst_and_term_metadata_bytes = @max(p.fst_and_term_metadata_bytes, section_bytes);
             }
         }
         try resource_tracker.adjust(input_estimated_bytes +
-            estimateStoredDocBytes(docs) +
+            stored_docs_estimated_bytes +
             section_bytes +
-            estimateFieldPostingsBuilderBytes(&field_builders) +
-            estimateTypedDocValuesBytes(&typed_fields));
+            remaining_postings_estimated_bytes +
+            typed_doc_values_estimated_bytes);
     }
 
     for (typed_sections.items) |*section| {
+        const section_attach_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         const gop = try field_indices.getOrPut(alloc, section.field_name);
         if (!gop.found_existing) {
             gop.key_ptr.* = section.field_name;
@@ -817,18 +832,18 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         const owned = @constCast(section.data);
         try seg_writer.addSectionOwned(gop.value_ptr.*, section.section_type, owned);
         section.data = &.{};
-    }
-    if (profile_timings) {
-        if (profile) |p| p.section_attach_ns +|= platform_time.monotonicNs() - section_attach_start_ns;
+        if (profile_timings) {
+            if (profile) |p| p.section_attach_ns +|= platform_time.monotonicNs() - section_attach_start_ns;
+        }
     }
     if (profile_working_set) {
         if (profile) |p| {
             p.section_bytes = section_bytes;
             p.section_live_bytes = section_bytes;
-            p.field_postings_estimated_bytes = estimateFieldPostingsBuilderBytes(&field_builders);
-            p.typed_doc_values_estimated_bytes = estimateTypedDocValuesBytes(&typed_fields);
-            p.postings_live_bytes = p.field_postings_estimated_bytes;
-            p.typed_live_bytes = p.typed_doc_values_estimated_bytes;
+            p.field_postings_estimated_bytes = remaining_postings_estimated_bytes;
+            p.typed_doc_values_estimated_bytes = typed_doc_values_estimated_bytes;
+            p.postings_live_bytes = remaining_postings_estimated_bytes;
+            p.typed_live_bytes = typed_doc_values_estimated_bytes;
             p.fst_and_term_metadata_bytes = @max(p.fst_and_term_metadata_bytes, section_bytes);
         }
     }

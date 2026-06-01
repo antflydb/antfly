@@ -7042,7 +7042,7 @@ pub const IndexManager = struct {
                 },
             );
             std.log.info(
-                "antfly_bench_text_index_timing index={s} source_docs={d} projection_docs={d} total_ms={d} ordinals_ms={d} projection_ms={d} analyzer_merge_ms={d} segment_build_ms={d} index_segment_ms={d} analyzer_ms={d} term_accum_ms={d} hit_materialize_ms={d} typed_collect_ms={d} typed_build_ms={d} stored_attach_ms={d} section_attach_ms={d} stored_compress_ms={d} segment_assembly_ms={d} segment_encode_ms={d}",
+                "antfly_bench_text_index_timing index={s} source_docs={d} projection_docs={d} total_ms={d} ordinals_ms={d} projection_ms={d} analyzer_merge_ms={d} segment_build_ms={d} index_segment_ms={d} analyzer_ms={d} term_accum_ms={d} hit_materialize_ms={d} typed_collect_ms={d} typed_build_ms={d} stored_attach_ms={d} inverted_build_ms={d} section_attach_ms={d} stored_compress_ms={d} segment_assembly_ms={d} segment_encode_ms={d}",
                 .{
                     entry.config.name,
                     source_docs.len,
@@ -7059,6 +7059,7 @@ pub const IndexManager = struct {
                     nsToMs(text_build_profile.typed_collect_ns),
                     nsToMs(text_build_profile.typed_build_ns),
                     nsToMs(text_build_profile.stored_doc_attach_ns),
+                    nsToMs(text_build_profile.inverted_build_ns),
                     nsToMs(text_build_profile.section_attach_ns),
                     nsToMs(text_build_profile.stored_compress_ns),
                     nsToMs(text_build_profile.segment_assembly_ns),

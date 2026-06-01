@@ -1334,3 +1334,84 @@ Timing read:
 - Post snapshot-clone-diagnostics metrics-on load/catch-up was 41.07s/14.41s with 140 merges.
 
 The latest repeat does not show a slowdown from the diagnostics wiring. The broader slowdown versus the earlier ~35s best runs remains real enough to investigate, but this repeat points at merge/codec/write-path composition rather than metrics overhead. RSS is still mostly not live heap: final footprint is ~130-137 MiB, final live malloc is ~84-85 MiB, vmmap mapped-file resident is ~30-31 MiB, and final segment bytes are ~393-407 MiB.
+
+## Post Text Accounting Optimization Baseline
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260601-075951/`.
+
+This run was taken after removing repeated full postings/typed-value memory estimation from the per-field inverted-section build loop and adding an `inverted_build_ms` timing bucket. The prior run with text subphase timing enabled (`work-log/do8018/releasefast-baseline-20260601-074307/`) showed metrics-on load/catch-up of 45.996931583s/20.473509833s, total 1m6.470504333s. The post-change metrics-on run was 43.667769958s/12.209899375s, total 55.877737125s. That puts metrics-on back near metrics-off for this sample.
+
+Metrics off:
+
+- Load time: 44.402277625s
+- Async catch-up time: 11.18264475s
+- Catch-up complete: true, `scope=full-text`
+- Throughput: 1,590.12 records/sec, 4.85 MiB/sec
+- `ps` RSS: 721,780,736 bytes
+- Peak sampled RSS: 1,161,281,536 bytes
+- Process footprint metric: 133,765,984 bytes
+- Peak sampled process footprint: 511,531,848 bytes
+- Live malloc metric: 82,388,560 bytes
+- Peak sampled live malloc: 216,244,384 bytes
+- vmmap footprint: 133,798,297 bytes
+- vmmap mapped-file resident: 30,932,992 bytes
+- vmmap malloc allocated: 23,278,387 bytes
+- Segment files: 8
+- Segment bytes: 394,938,742
+- Stored fields bytes: 127,671,754
+- Inverted bytes: 263,187,407
+- Postings bytes: 140,903,136
+- Term block bytes: 98,281,260
+- Text merges completed: 154
+- Full-text build peak bytes: 165,443,397
+- Full-text pending peak bytes: 400,955,177
+- Text merge buffer peak bytes: 136,610,675
+- LSM mutable snapshot clone calls: 31
+- LSM mutable snapshot clone bytes total: 10,066,973
+- LSM mutable snapshot clone peak bytes: 972,937
+
+Metrics on:
+
+- Load time: 43.667769958s
+- Async catch-up time: 12.209899375s
+- Catch-up complete: true, `scope=full-text`
+- Throughput: 1,616.87 records/sec, 4.93 MiB/sec
+- `ps` RSS: 672,546,816 bytes
+- Peak sampled RSS: 1,196,015,616 bytes
+- Process footprint metric: 119,151,576 bytes
+- Peak sampled process footprint: 489,314,832 bytes
+- Live malloc metric: 91,068,656 bytes
+- Peak sampled live malloc: 217,804,992 bytes
+- vmmap footprint: 119,118,233 bytes
+- vmmap mapped-file resident: 30,198,988 bytes
+- vmmap malloc allocated: 23,383,244 bytes
+- Segment files: 8
+- Segment bytes: 388,036,949
+- Stored fields bytes: 127,570,705
+- Inverted bytes: 256,362,319
+- Postings bytes: 139,946,130
+- Term block bytes: 95,072,489
+- Text merges completed: 157
+- Full-text build peak bytes: 165,571,728
+- Full-text pending peak bytes: 391,273,807
+- Text merge buffer peak bytes: 92,508,508
+- LSM mutable snapshot clone calls: 23
+- LSM mutable snapshot clone bytes total: 8,747,644
+- LSM mutable snapshot clone peak bytes: 993,399
+
+Metrics-on text timing aggregate:
+
+- Timing lines: 167
+- Source/projection docs: 70,605 / 70,605
+- Total text build timing: 33,155 ms
+- Segment build timing: 33,137 ms
+- Segment encode timing: 13,288 ms
+- Inverted section build timing: 11,522 ms
+- Section attach timing from this run still used the old inclusive label and was 11,604 ms; the code now records attach separately, so the next run should show actual attachment overhead.
+- Segment assembly timing: 1,607 ms
+- Stored compression timing: 525 ms
+- Analyzer timing: 3,526 ms
+- Term accumulation timing: 2,572 ms
+- Hit materialization timing: 2,887 ms
+
+Interpretation: the metrics-on slowdown in the previous sample was not stable. This change removed avoidable O(fields) accounting from the field-section loop, and the next dominant CPU target is the inverted codec builder itself: sorting terms, serializing postings, and building the blocked term dictionary/FST payload. RSS remains mostly mapped segment/file-cache accounting rather than live heap; final footprint stayed ~119-134 MiB and final live malloc stayed ~82-91 MiB.
