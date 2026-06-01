@@ -8494,12 +8494,15 @@ fn identityGenerationForAggregationFullResultRerun(
 /// so its hits can be aggregated directly without a full-scan re-fetch. This
 /// only holds when the request did not bound the result below the match count:
 /// the page is complete (hits == total_hits) AND the caller asked for at least
-/// as many hits as matched (the limit did not truncate). A `limit` of 0
-/// (aggregation-only) never qualifies -- total_hits is then a truncated 0.
+/// as many hits as matched (the limit did not truncate). The hits must also
+/// include stored data because scan-based aggregations read hit `stored_data`.
+/// A `limit` of 0 (aggregation-only) never qualifies -- total_hits is then a
+/// truncated 0.
 fn aggregationFirstPassIsComplete(
     req: db_mod.types.SearchRequest,
     result: db_mod.types.SearchResult,
 ) bool {
+    if (!req.include_stored) return false;
     if (req.limit == 0) return false;
     if (result.hits.len != result.total_hits) return false;
     // hits == total_hits but the page was filled to the limit: there may be more
@@ -15804,6 +15807,11 @@ test "aggregation full-result rerun can reuse snapped result identity generation
         .total_hits = 0,
     };
     try std.testing.expectEqual(@as(?u64, null), try identityGenerationForAggregationFullResultRerun(.{}, complete));
+
+    try std.testing.expect(!aggregationFirstPassIsComplete(.{ .include_stored = false, .limit = 10 }, result));
+    try std.testing.expect(!aggregationFirstPassIsComplete(.{ .include_stored = true, .limit = 1 }, result));
+    result.total_hits = 1;
+    try std.testing.expect(aggregationFirstPassIsComplete(.{ .include_stored = true, .limit = 10 }, result));
 }
 
 test "provisioned distributed aggregations collect path terms nested cardinality" {

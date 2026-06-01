@@ -94,6 +94,9 @@ Current PR progress:
 - relational full-text `include_stored` now reconstructs returned rows from the
   relational base-row store, while the inverted index remains responsible only
   for term matching and scoring;
+- scan-based aggregations over relational search results consume the same
+  reconstructed base-row `stored_data`, and aggregation full-scan reruns now
+  force stored-data hydration instead of reusing an unstored first-pass page;
 - structured relational filters for supported keyword/range/bool/geo clauses
   resolve against relational base-row column scans; unsupported text-oriented
   filter shapes may still use the inverted text index, but not segment
@@ -281,7 +284,9 @@ Acceptance:
 
 Relational mode has not shipped as a durable public format, so this work should
 not add legacy migration support for older experimental relational encodings.
-Instead, use the final phase as a removal and invariant gate:
+Older `AROW`-as-generic-document layouts should fail the invariant checks or be
+ignored at relational seams; they are not a compatibility input. Use the final
+phase as a removal and invariant gate:
 
 - remove the remaining generic relational `AROW` write/read fallbacks once all
   readers use the relational base store;

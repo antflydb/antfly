@@ -41619,6 +41619,18 @@ test "relational table full-text search loads stored_data from base rows" {
     try std.testing.expectEqualStrings("new", obj.get("attrs").?.object.get("version").?.string);
     try std.testing.expect(obj.get("attrs").?.object.get("nested").?.object.get("ok").?.bool);
 
+    const aggregation_requests = [_]aggregations_mod.SearchAggregationRequest{
+        .{ .name = "amount_sum", .type = "sum", .field = "amount" },
+        .{ .name = "by_status", .type = "terms", .field = "status", .size = 5 },
+    };
+    const aggregation_results = try aggregations_mod.computeSearchAggregations(alloc, aggregation_requests[0..], result, .{});
+    defer aggregations_mod.deinitResults(alloc, aggregation_results);
+    try std.testing.expectEqual(@as(usize, 2), aggregation_results.len);
+    try std.testing.expectEqualStrings("77.25", aggregation_results[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), aggregation_results[1].buckets.len);
+    try std.testing.expectEqualStrings("\"closed\"", aggregation_results[1].buckets[0].key_json);
+    try std.testing.expectEqual(@as(i64, 1), aggregation_results[1].buckets[0].count);
+
     var filtered = try db.search(alloc, .{
         .index_name = "ft_v1",
         .query = .{ .match = .{ .field = "title", .text = "hello" } },
