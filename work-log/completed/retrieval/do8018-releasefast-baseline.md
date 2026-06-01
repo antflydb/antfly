@@ -1415,3 +1415,90 @@ Metrics-on text timing aggregate:
 - Hit materialization timing: 2,887 ms
 
 Interpretation: the metrics-on slowdown in the previous sample was not stable. This change removed avoidable O(fields) accounting from the field-section loop, and the next dominant CPU target is the inverted codec builder itself: sorting terms, serializing postings, and building the blocked term dictionary/FST payload. RSS remains mostly mapped segment/file-cache accounting rather than live heap; final footprint stayed ~119-134 MiB and final live malloc stayed ~82-91 MiB.
+
+## Post Inverted Codec Subphase Baseline
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260601-082303/`.
+
+This run was taken after adding optional inverted-codec subphase timing and pre-sizing the blocked term-dictionary buffers. The metrics-off run improved in this sample, but the metrics-on catch-up time remained noisy. The important new evidence is the inverted subphase split: term dictionary construction is now the clear codec CPU target.
+
+Metrics off:
+
+- Load time: 43.183520458s
+- Async catch-up time: 8.148286333s
+- Catch-up complete: true, `scope=full-text`
+- Throughput: 1,635.00 records/sec, 4.99 MiB/sec
+- `ps` RSS: 651,935,744 bytes
+- Peak sampled RSS: 1,038,188,544 bytes
+- Process footprint metric: 138,074,976 bytes
+- Peak sampled process footprint: 582,098,048 bytes
+- Live malloc metric: 71,971,376 bytes
+- Peak sampled live malloc: 233,092,432 bytes
+- vmmap footprint: 138,097,459 bytes
+- vmmap mapped-file resident: 31,247,564 bytes
+- vmmap malloc allocated: 24,222,105 bytes
+- Segment files: 8
+- Segment bytes: 410,294,306
+- Stored fields bytes: 127,631,488
+- Inverted bytes: 278,556,559
+- Postings bytes: 144,387,641
+- Term block bytes: 106,606,806
+- Text merges completed: 161
+- Full-text build peak bytes: 163,838,968
+- Full-text pending peak bytes: 410,479,403
+- Text merge buffer peak bytes: 141,231,973
+- LSM mutable snapshot clone calls: 33
+- LSM mutable snapshot clone bytes total: 12,970,888
+- LSM mutable snapshot clone peak bytes: 1,020,005
+
+Metrics on:
+
+- Load time: 43.5860295s
+- Async catch-up time: 18.840851208s
+- Catch-up complete: true, `scope=full-text`
+- Throughput: 1,619.90 records/sec, 4.94 MiB/sec
+- `ps` RSS: 649,248,768 bytes
+- Peak sampled RSS: 1,020,526,592 bytes
+- Process footprint metric: 125,164,216 bytes
+- Peak sampled process footprint: 419,699,528 bytes
+- Live malloc metric: 78,245,472 bytes
+- Peak sampled live malloc: 286,103,360 bytes
+- vmmap footprint: 125,199,974 bytes
+- vmmap mapped-file resident: 30,723,276 bytes
+- vmmap malloc allocated: 23,592,960 bytes
+- Segment files: 8
+- Segment bytes: 401,017,085
+- Stored fields bytes: 127,539,604
+- Inverted bytes: 269,370,474
+- Postings bytes: 144,373,273
+- Term block bytes: 101,577,520
+- Text merges completed: 154
+- Full-text build peak bytes: 145,439,252
+- Full-text pending peak bytes: 407,101,934
+- Text merge buffer peak bytes: 121,362,798
+- LSM mutable snapshot clone calls: 24
+- LSM mutable snapshot clone bytes total: 9,425,863
+- LSM mutable snapshot clone peak bytes: 1,035,853
+
+Metrics-on text timing aggregate:
+
+- Timing lines: 167
+- Source/projection docs: 70,605 / 70,605
+- Total text build timing: 31,777 ms
+- Segment build timing: 31,765 ms
+- Segment encode timing: 12,603 ms
+- Inverted build timing: 10,987 ms
+- Inverted term dictionary timing: 7,525 ms
+- Inverted postings serialization timing: 2,164 ms
+- Inverted sort timing: 578 ms
+- Inverted final assembly timing: 299 ms
+- Inverted norms timing: 2 ms
+- Inverted bloom finish timing: 1 ms
+- Section attach timing: 0 ms
+- Segment assembly timing: 1,456 ms
+- Stored compression timing: 474 ms
+- Analyzer timing: 3,427 ms
+- Term accumulation timing: 2,287 ms
+- Hit materialization timing: 3,069 ms
+
+Interpretation: the term-dictionary block data remains both large and CPU-heavy. The binary block index and FST are only ~2.8 MiB and ~2.7 MiB respectively in this run; the large component is the term block payload itself (~101.6 MiB metrics-on). The next Lucene-shaped codec work should target term-block payload shape and term statistics, not section attachment or stored-field compression.

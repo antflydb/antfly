@@ -116,7 +116,18 @@ const FieldPostingsBuilder = struct {
         try self.builder.addDocument(doc_idx, hits);
     }
 
-    fn buildAlloc(self: *FieldPostingsBuilder, output_alloc: Allocator) ![]u8 {
+    fn buildAlloc(self: *FieldPostingsBuilder, output_alloc: Allocator, profile: ?*BuildTextProfile) ![]u8 {
+        if (profile) |p| {
+            var inverted_profile = inverted.InvertedIndexBuildProfile{};
+            const data = try self.builder.buildAllocProfile(output_alloc, &inverted_profile);
+            p.inverted_sort_ns +|= inverted_profile.sort_ns;
+            p.inverted_postings_serialize_ns +|= inverted_profile.postings_serialize_ns;
+            p.inverted_term_dict_ns +|= inverted_profile.term_dict_ns;
+            p.inverted_norms_ns +|= inverted_profile.norms_ns;
+            p.inverted_bloom_finish_ns +|= inverted_profile.bloom_finish_ns;
+            p.inverted_final_assembly_ns +|= inverted_profile.final_assembly_ns;
+            return data;
+        }
         return try self.builder.buildAlloc(output_alloc);
     }
 
@@ -289,6 +300,12 @@ pub const BuildTextProfile = struct {
     typed_collect_ns: u64 = 0,
     typed_build_ns: u64 = 0,
     inverted_build_ns: u64 = 0,
+    inverted_sort_ns: u64 = 0,
+    inverted_postings_serialize_ns: u64 = 0,
+    inverted_term_dict_ns: u64 = 0,
+    inverted_norms_ns: u64 = 0,
+    inverted_bloom_finish_ns: u64 = 0,
+    inverted_final_assembly_ns: u64 = 0,
     section_attach_ns: u64 = 0,
     stored_doc_attach_ns: u64 = 0,
     stored_compress_ns: u64 = 0,
@@ -785,7 +802,7 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         const field_name = entry.key_ptr.*;
         const builder_estimated_bytes = entry.value_ptr.estimatedMemoryBytes();
         const inverted_build_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
-        const inv_data = try entry.value_ptr.buildAlloc(alloc);
+        const inv_data = try entry.value_ptr.buildAlloc(alloc, if (profile_timings) profile else null);
         if (profile_timings) {
             if (profile) |p| p.inverted_build_ns +|= platform_time.monotonicNs() - inverted_build_start_ns;
         }

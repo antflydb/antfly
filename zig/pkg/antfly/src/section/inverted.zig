@@ -28,6 +28,7 @@ const roaring = @import("../encoding/roaring.zig");
 const chunked = @import("../encoding/chunked_coder.zig");
 const vellum = @import("antfly_vellum");
 const bloom = @import("bloom");
+const platform_time = @import("../platform/time.zig");
 
 // ============================================================================
 // Wire format versions
@@ -166,6 +167,15 @@ const TermDictEntry = struct {
     value: u64,
 };
 
+pub const InvertedIndexBuildProfile = struct {
+    sort_ns: u64 = 0,
+    postings_serialize_ns: u64 = 0,
+    term_dict_ns: u64 = 0,
+    norms_ns: u64 = 0,
+    bloom_finish_ns: u64 = 0,
+    final_assembly_ns: u64 = 0,
+};
+
 fn appendLeU32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
     try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, value))));
 }
@@ -207,6 +217,30 @@ fn chooseTermRunEnd(block_end: usize, start: usize) usize {
     return start + run_len;
 }
 
+fn estimateTermDictBlockCount(entries_len: usize) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < entries_len) {
+        i = chooseTermBlockEnd(entries_len, i);
+        count += 1;
+    }
+    return count;
+}
+
+const TermByteStats = struct {
+    total: usize = 0,
+    max: usize = 0,
+};
+
+fn estimateTermBytes(entries: []const TermDictEntry) TermByteStats {
+    var stats = TermByteStats{};
+    for (entries) |entry| {
+        stats.total +|= entry.term.len;
+        stats.max = @max(stats.max, entry.term.len);
+    }
+    return stats;
+}
+
 fn appendTermDictIndexRecord(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -240,6 +274,12 @@ fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry)
     defer index_records.deinit(alloc);
     var index_terms = std.ArrayListUnmanaged(u8).empty;
     defer index_terms.deinit(alloc);
+
+    const estimated_block_count = estimateTermDictBlockCount(entries.len);
+    const term_bytes = estimateTermBytes(entries);
+    try block_data.ensureTotalCapacity(alloc, term_bytes.total +| entries.len * 12 +| estimated_block_count * 16);
+    try index_records.ensureTotalCapacity(alloc, estimated_block_count * term_dict_index_record_size);
+    try index_terms.ensureTotalCapacity(alloc, estimated_block_count * (term_bytes.max +| 5));
 
     const fst_registry_size: usize = std.math.clamp(entries.len, 64, 65_536);
     var block_fst_builder = try vellum.Builder.init(alloc, .{
@@ -494,11 +534,21 @@ pub const InvertedIndexBuilder = struct {
     }
 
     pub fn buildAlloc(self: *InvertedIndexBuilder, output_alloc: Allocator) ![]u8 {
+        return self.buildAllocProfile(output_alloc, null);
+    }
+
+    pub fn buildAllocProfile(
+        self: *InvertedIndexBuilder,
+        output_alloc: Allocator,
+        profile: ?*InvertedIndexBuildProfile,
+    ) ![]u8 {
+        const profile_timings = profile != null;
         const scratch_alloc = output_alloc;
         const term_count = self.terms.count();
         if (term_count == 0) return try output_alloc.dupe(u8, &.{});
 
         // Step 1: Sort terms
+        const sort_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         const sorted_terms = try scratch_alloc.alloc([]const u8, term_count);
         defer scratch_alloc.free(sorted_terms);
         {
@@ -514,6 +564,7 @@ pub const InvertedIndexBuilder = struct {
                 return std.mem.order(u8, a, b) == .lt;
             }
         }.lessThan);
+        if (profile_timings) profile.?.sort_ns +|= platform_time.monotonicNs() - sort_start_ns;
 
         // Step 2: Serialize postings data directly into the final section and
         // collect dictionary entries (term -> postings offset or 1-hit). The header is
@@ -542,6 +593,7 @@ pub const InvertedIndexBuilder = struct {
         var serialize_scratch = PostingSerializeScratch{};
         defer serialize_scratch.deinit(scratch_alloc);
 
+        const postings_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         for (sorted_terms, 0..) |term, term_idx| {
             const acc = self.terms.getPtr(term).?;
             var dict_value: u64 = 0;
@@ -572,18 +624,24 @@ pub const InvertedIndexBuilder = struct {
                 .value = dict_value,
             };
         }
+        if (profile_timings) profile.?.postings_serialize_ns +|= platform_time.monotonicNs() - postings_start_ns;
 
+        const term_dict_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         const term_dict_data = try encodeBlockedTermDictionary(scratch_alloc, dict_entries);
         defer scratch_alloc.free(term_dict_data);
+        if (profile_timings) profile.?.term_dict_ns +|= platform_time.monotonicNs() - term_dict_start_ns;
 
+        const norms_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         const norms_data = try encodeNormTable(scratch_alloc, self.doc_norms.items);
         defer scratch_alloc.free(norms_data);
+        if (profile_timings) profile.?.norms_ns +|= platform_time.monotonicNs() - norms_start_ns;
 
         // Encode bloom (if any) into a single buffer that we'll inline into
         // the section. The on-disk payload is the standard `lib/bloom` magic +
         // version + bit_count + hash_count + bytes envelope.
         var bloom_bytes: []const u8 = &.{};
         defer if (bloom_bytes.len > 0) scratch_alloc.free(@constCast(bloom_bytes));
+        const bloom_finish_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         if (bloom_builder) |*b| {
             var filter = b.finish();
             // `finish` consumes the builder (sets it to undefined); null out the
@@ -592,8 +650,11 @@ pub const InvertedIndexBuilder = struct {
             defer filter.deinit(scratch_alloc);
             bloom_bytes = try filter.encodeAlloc(scratch_alloc);
         }
+        if (profile_timings) profile.?.bloom_finish_ns +|= platform_time.monotonicNs() - bloom_finish_start_ns;
 
         // Step 3: Finish final section.
+        const final_assembly_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
+        try output.ensureUnusedCapacity(output_alloc, norms_data.len +| bloom_bytes.len +| term_dict_data.len);
         if (norms_data.len > 0) {
             try output.appendSlice(output_alloc, norms_data);
         }
@@ -612,7 +673,9 @@ pub const InvertedIndexBuilder = struct {
             @intCast(norms_data.len),
         );
 
-        return try output.toOwnedSlice(output_alloc);
+        const owned = try output.toOwnedSlice(output_alloc);
+        if (profile_timings) profile.?.final_assembly_ns +|= platform_time.monotonicNs() - final_assembly_start_ns;
+        return owned;
     }
 };
 
