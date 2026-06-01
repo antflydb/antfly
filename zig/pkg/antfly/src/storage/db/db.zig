@@ -17805,6 +17805,7 @@ fn putIndexedSplitBatchDirect(
     }
 
     for (writes) |write| {
+        if (internal_keys.isRelationalColumnKey(write.key)) continue;
         if (internal_keys.isStoredDocumentRowKey(write.key)) {
             if (!isBaseDocumentStoreKeyForMode(dest_indexes.relational_base_rows, write.key)) continue;
             const raw = (try internal_keys.decodeStoredDocumentRowKeyAlloc(dest_indexes.alloc, write.key)) orelse return error.InvalidInternalUserKey;
