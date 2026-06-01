@@ -295,23 +295,24 @@ pub const Resolver = struct {
                 if (best) |bi| {
                     if (best_outcome == .match) {
                         const matched = candidates[bi];
-                        const target_ref = matched.resolved_doc_ref orelse blk: {
-                            if (recordTextField(matched.record, "merged_into") != null) {
-                                // A redirect without a resolved survivor record is
-                                // not safe to promote: graph edges may still point
-                                // at the survivor, but promotion must not clobber
-                                // the survivor's canonical scalar fields with the
-                                // merged-away duplicate's record.
-                                break :blk DocRef{ .table = matched.doc_ref.table, .key = recordTextField(matched.record, "merged_into").? };
-                            }
-                            break :blk matched.doc_ref;
-                        };
-                        const canonical_record = matched.resolved_record orelse if (matched.resolved_doc_ref != null) matched.record else matcher.Record{ .fields = &.{} };
-                        const matched_name = recordTextField(canonical_record, "canonical_name") orelse
-                            if (matched.resolved_doc_ref == null and recordTextField(matched.record, "merged_into") == null)
-                                (recordTextField(matched.record, "canonical_name") orelse entity.text)
-                            else
-                                "";
+                        if (recordTextField(matched.record, "merged_into") != null and matched.resolved_record == null) {
+                            // The duplicate points at a survivor, but blocking
+                            // could not read that survivor. Do not promote a
+                            // survivor key with duplicate scalar fields; surface
+                            // the mention for review/retry instead.
+                            return .{
+                                .local_id = local_id,
+                                .doc_ref = try self.mintRef(a, entity),
+                                .confidence = best_prob,
+                                .decision = .review,
+                                .label = try a.dupe(u8, entity.label),
+                                .canonical_name = try a.dupe(u8, entity.text),
+                                .surface_form = try a.dupe(u8, entity.text),
+                            };
+                        }
+                        const target_ref = matched.resolved_doc_ref orelse matched.doc_ref;
+                        const canonical_record = matched.resolved_record orelse matched.record;
+                        const matched_name = recordTextField(canonical_record, "canonical_name") orelse entity.text;
                         return .{
                             .local_id = local_id,
                             .doc_ref = .{
@@ -1319,6 +1320,40 @@ test "resolution follows a candidate's merged_into redirect to the survivor" {
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
     try testing.expectEqualStrings("Augusta Ada King", ent.get("canonical_name").?.string);
     try testing.expectEqualStrings("Ada Lovelace", ent.get("surface_form").?.string);
+}
+
+test "resolution reviews a merged_into redirect when the survivor record is unavailable" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "entities", "key_template": "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        \\  "scorer": {
+        \\    "comparisons": [
+        \\      { "name": "name", "left": "canonical_text", "right": "canonical_name",
+        \\        "levels": [ { "when": "exact", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] }
+        \\    ],
+        \\    "combine": { "bias": -3.0 }, "decision": { "match": 0.9 }
+        \\  } }
+    );
+    defer resolver.deinit();
+
+    const entities = [_]ExtractedEntity{.{ .local_id = "e0", .label = "person", .text = "Ada Lovelace" }};
+    var fields = [_]matcher.Field{
+        .{ .name = "canonical_name", .value = .{ .text = "Ada Lovelace" } },
+        .{ .name = "merged_into", .value = .{ .text = "person/ada_canonical" } },
+    };
+    const cands = [_]Candidate{.{
+        .doc_ref = .{ .table = "entities", .key = "person/ada_dup" },
+        .label = "person",
+        .record = .{ .fields = &fields },
+        .resolved_doc_ref = .{ .table = "entities", .key = "person/ada_canonical" },
+    }};
+    const cand_lists = [_][]const Candidate{&cands};
+
+    var res = try resolver.resolve(testing.allocator, 1, &entities, &cand_lists);
+    defer res.deinit();
+
+    try testing.expectEqual(Decision.review, res.entities[0].decision);
+    try testing.expectEqualStrings("person/ada_lovelace", res.entities[0].doc_ref.key);
+    try testing.expectEqualStrings("Ada Lovelace", res.entities[0].canonical_name);
 }
 
 const FixedVectorCandidate = struct {

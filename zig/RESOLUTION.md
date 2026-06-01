@@ -316,6 +316,34 @@ the source document. Two options:
 Phase 1 uses decoupled + fail-closed. 2PC is a later hardening step when
 read-your-write entity guarantees are actually required.
 
+### Sync and visibility contract
+
+Semantic resolution is not part of the public `full_index` barrier. `full_index`
+continues to mean that the primary write and ordinary managed index work
+(including extraction artifacts and graph/full-text/vector materialization driven
+directly by that write) are query-visible. Resolution and promotion are separate,
+durable replay stages that may lag behind `full_index`.
+
+That separation is intentional: a resolver can produce `review` decisions that
+require a human or external curation workflow, so no normal write sync level can
+promise "all semantic resolution is complete" without risking an unbounded wait.
+Callers that need semantic readiness must inspect the stage status:
+
+```json
+{
+  "resolution": { "applied_sequence": 120, "target_sequence": 123,
+                  "catch_up_required": true },
+  "promotion":  { "applied_sequence": 119, "target_sequence": 122,
+                  "catch_up_required": true, "blocked": false }
+}
+```
+
+Query paths that depend on resolved entity state must be explicit about this:
+fail closed or omit unresolved/hydration-missing entity nodes by default, expose
+pending/review state where appropriate, and only add a future opt-in semantic
+wait mode for automatic-only stages. That future mode must return structured
+blocked status rather than waiting for human review.
+
 ### DocRef endpoints
 
 Resolution endpoints and resolved edge endpoints use a document-reference shape
@@ -665,6 +693,9 @@ Resolver / promoter integration:
 - [x] Provenance mention edges appear with source documents and disappear on
   source delete (db-test).
 - [x] Hydration of a not-yet-promoted entity fails closed (db-test).
+- [x] Resolution/promotion lag and blocked promotion are visible in DB status;
+  these stages are intentionally separate from `full_index` because review-band
+  resolution may require human input.
 - [x] Fusion combines per-source confidence into the edge weight from a pinned
   prior snapshot (phase 2): `fusedMentionWeight` sets the mention edge weight via
   `matcher.fuse(strategy, [{confidence, trust}], prior, prior_weight)` from the
