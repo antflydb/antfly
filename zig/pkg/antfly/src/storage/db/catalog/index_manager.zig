@@ -309,6 +309,14 @@ const TextMergeScheduler = struct {
     completed_merges: u64 = 0,
     skipped_stale_merges: u64 = 0,
     failed_merges: u64 = 0,
+    merge_input_segments_total: u64 = 0,
+    merge_input_bytes_total: u64 = 0,
+    merge_output_segments_total: u64 = 0,
+    merge_output_bytes_total: u64 = 0,
+    last_merge_input_segments: u64 = 0,
+    last_merge_input_bytes: u64 = 0,
+    last_merge_output_segments: u64 = 0,
+    last_merge_output_bytes: u64 = 0,
     deferred_for_pressure: u64 = 0,
 
     fn deinit(self: *TextMergeScheduler, alloc: Allocator) void {
@@ -566,6 +574,24 @@ const TextMergeScheduler = struct {
         }
         return retry_after_ns;
     }
+
+    fn noteAppliedMerge(
+        self: *TextMergeScheduler,
+        input_segments: u64,
+        input_bytes: u64,
+        output_segments: u64,
+        output_bytes: u64,
+    ) void {
+        self.completed_merges +|= 1;
+        self.merge_input_segments_total +|= input_segments;
+        self.merge_input_bytes_total +|= input_bytes;
+        self.merge_output_segments_total +|= output_segments;
+        self.merge_output_bytes_total +|= output_bytes;
+        self.last_merge_input_segments = input_segments;
+        self.last_merge_input_bytes = input_bytes;
+        self.last_merge_output_segments = output_segments;
+        self.last_merge_output_bytes = output_bytes;
+    }
 };
 
 fn sourceMatchesSegmentIds(source: []const IndexManager.TextMergeSourceSegment, segment_ids: []const u64) bool {
@@ -781,6 +807,11 @@ pub const IndexManager = struct {
             }
             self.* = undefined;
         }
+    };
+
+    const TextMergeResultOutputStats = struct {
+        segments: u64 = 0,
+        bytes: u64 = 0,
     };
 
     pub const DenseIndex = struct {
@@ -1892,17 +1923,27 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_memory_text_merge label={s} pending_indexes={d} pending_segments={d} pending_bytes={d} in_flight_merges={d} in_flight_segments={d} completed_merges={d} skipped_stale_merges={d} failed_merges={d} quarantined_merges={d} quarantined_segments={d} deferred_for_pressure={d} backpressure_events={d} backpressure_ns={d}",
+            "antfly_bench_memory_text_merge label={s} pending_indexes={d} pending_segments={d} pending_bytes={d} pending_heap_bytes={d} pending_mmap_bytes={d} in_flight_merges={d} in_flight_segments={d} completed_merges={d} skipped_stale_merges={d} failed_merges={d} merge_input_segments_total={d} merge_input_bytes_total={d} merge_output_segments_total={d} merge_output_bytes_total={d} last_merge_input_segments={d} last_merge_input_bytes={d} last_merge_output_segments={d} last_merge_output_bytes={d} quarantined_merges={d} quarantined_segments={d} deferred_for_pressure={d} backpressure_events={d} backpressure_ns={d}",
             .{
                 label,
                 text_merge_stats.pending_indexes,
                 text_merge_stats.pending_segments,
                 text_merge_stats.pending_bytes,
+                text_merge_stats.pending_heap_bytes,
+                text_merge_stats.pending_mmap_bytes,
                 text_merge_stats.in_flight_merges,
                 text_merge_stats.in_flight_segments,
                 text_merge_stats.completed_merges,
                 text_merge_stats.skipped_stale_merges,
                 text_merge_stats.failed_merges,
+                text_merge_stats.merge_input_segments_total,
+                text_merge_stats.merge_input_bytes_total,
+                text_merge_stats.merge_output_segments_total,
+                text_merge_stats.merge_output_bytes_total,
+                text_merge_stats.last_merge_input_segments,
+                text_merge_stats.last_merge_input_bytes,
+                text_merge_stats.last_merge_output_segments,
+                text_merge_stats.last_merge_output_bytes,
                 text_merge_stats.quarantined_merges,
                 text_merge_stats.quarantined_segments,
                 text_merge_stats.deferred_for_pressure,
@@ -4286,6 +4327,14 @@ pub const IndexManager = struct {
             .completed_merges = self.text_merge_scheduler.completed_merges,
             .skipped_stale_merges = self.text_merge_scheduler.skipped_stale_merges,
             .failed_merges = self.text_merge_scheduler.failed_merges,
+            .merge_input_segments_total = self.text_merge_scheduler.merge_input_segments_total,
+            .merge_input_bytes_total = self.text_merge_scheduler.merge_input_bytes_total,
+            .merge_output_segments_total = self.text_merge_scheduler.merge_output_segments_total,
+            .merge_output_bytes_total = self.text_merge_scheduler.merge_output_bytes_total,
+            .last_merge_input_segments = self.text_merge_scheduler.last_merge_input_segments,
+            .last_merge_input_bytes = self.text_merge_scheduler.last_merge_input_bytes,
+            .last_merge_output_segments = self.text_merge_scheduler.last_merge_output_segments,
+            .last_merge_output_bytes = self.text_merge_scheduler.last_merge_output_bytes,
             .quarantined_merges = self.text_merge_scheduler.activeQuarantineCount(now_ns),
             .quarantined_segments = self.text_merge_scheduler.quarantinedSegmentCount(now_ns),
             .last_merge_error = self.text_merge_scheduler.lastMergeError(now_ns),
@@ -4330,6 +4379,14 @@ pub const IndexManager = struct {
             .completed_merges = self.text_merge_scheduler.completed_merges,
             .skipped_stale_merges = self.text_merge_scheduler.skipped_stale_merges,
             .failed_merges = self.text_merge_scheduler.failed_merges,
+            .merge_input_segments_total = self.text_merge_scheduler.merge_input_segments_total,
+            .merge_input_bytes_total = self.text_merge_scheduler.merge_input_bytes_total,
+            .merge_output_segments_total = self.text_merge_scheduler.merge_output_segments_total,
+            .merge_output_bytes_total = self.text_merge_scheduler.merge_output_bytes_total,
+            .last_merge_input_segments = self.text_merge_scheduler.last_merge_input_segments,
+            .last_merge_input_bytes = self.text_merge_scheduler.last_merge_input_bytes,
+            .last_merge_output_segments = self.text_merge_scheduler.last_merge_output_segments,
+            .last_merge_output_bytes = self.text_merge_scheduler.last_merge_output_bytes,
             .quarantined_merges = self.text_merge_scheduler.activeQuarantineCountForIndex(index_name, now_ns),
             .quarantined_segments = self.text_merge_scheduler.quarantinedSegmentCountForIndex(index_name, now_ns),
             .last_merge_error = self.text_merge_scheduler.lastMergeErrorForIndex(index_name, now_ns),
@@ -5887,6 +5944,8 @@ pub const IndexManager = struct {
 
         const old_ids = try textMergeSourceIds(self.alloc, task.source);
         defer self.alloc.free(old_ids);
+        const input_bytes = textMergeTaskInputBytes(task);
+        const output_stats = textMergeResultOutputStats(result);
         const applied = if (result.prepared_segments.len > 0) blk: {
             const prepared_segments = result.prepared_segments;
             result.prepared_segments = &.{};
@@ -5919,7 +5978,14 @@ pub const IndexManager = struct {
         } else {
             TextMergeScheduler.schedule(entry);
         }
-        if (applied) self.text_merge_scheduler.completed_merges += 1;
+        if (applied) {
+            self.text_merge_scheduler.noteAppliedMerge(
+                @intCast(task.merge_indices.len),
+                input_bytes,
+                output_stats.segments,
+                output_stats.bytes,
+            );
+        }
         return applied;
     }
 
@@ -6083,6 +6149,27 @@ pub const IndexManager = struct {
         const ids = try alloc.alloc(u64, source.len);
         for (source, 0..) |segment, i| ids[i] = segment.id;
         return ids;
+    }
+
+    fn textMergeTaskInputBytes(task: *const TextMergeTask) u64 {
+        var total: u64 = 0;
+        for (task.merge_indices) |seg_idx| {
+            if (seg_idx >= task.snapshot.segments.len) continue;
+            total +|= @intCast(task.snapshot.segments[seg_idx].data.bytes().len);
+        }
+        return total;
+    }
+
+    fn textMergeResultOutputStats(result: *const TextMergeResult) TextMergeResultOutputStats {
+        var stats = TextMergeResultOutputStats{};
+        if (result.prepared_segments.len > 0) {
+            stats.segments = @intCast(result.prepared_segments.len);
+            for (result.prepared_segments) |*segment| stats.bytes +|= @intCast(segment.data.bytes().len);
+            return stats;
+        }
+        stats.segments = @intCast(result.segments.len);
+        for (result.segments) |segment| stats.bytes +|= @intCast(segment.len);
+        return stats;
     }
 
     fn textIndexNeedsMerge(self: *IndexManager, index: *persistent_mod.PersistentIndex, policy: merger_mod.MergePolicy) !bool {
@@ -16192,6 +16279,69 @@ test "text merge task skips stale source after concurrent delete" {
     const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expect(entry.compaction_pending);
     try std.testing.expect(entry.persistent.snapshot().segments.len >= 12);
+}
+
+test "text merge task records input and output bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        },
+    });
+
+    const opts: IndexBatchOptions = .{
+        .compact_text = false,
+        .compact_text_segment_threshold = 2,
+        .defer_text_compaction = true,
+    };
+    for (0..3) |i| {
+        var key_buf: [64]u8 = undefined;
+        const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
+        defer alloc.free(key);
+        const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"merge accounting {d}\"}}", .{i});
+        defer alloc.free(value);
+
+        try store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+        try manager.indexTextBatchByNameWithOptions(&store, "ft_v1", &.{.{ .key = key, .value = value }}, opts);
+    }
+
+    var task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+    defer task.deinit(alloc);
+    const expected_input_segments: u64 = @intCast(task.merge_indices.len);
+    const expected_input_bytes = IndexManager.textMergeTaskInputBytes(&task);
+
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+    const expected_output = IndexManager.textMergeResultOutputStats(&result);
+    try std.testing.expect(try manager.finishTextMergeTask(&task, &result));
+
+    const stats = manager.textMergeStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.completed_merges);
+    try std.testing.expectEqual(expected_input_segments, stats.last_merge_input_segments);
+    try std.testing.expectEqual(expected_input_bytes, stats.last_merge_input_bytes);
+    try std.testing.expectEqual(expected_output.segments, stats.last_merge_output_segments);
+    try std.testing.expectEqual(expected_output.bytes, stats.last_merge_output_bytes);
+    try std.testing.expectEqual(expected_input_segments, stats.merge_input_segments_total);
+    try std.testing.expectEqual(expected_input_bytes, stats.merge_input_bytes_total);
+    try std.testing.expectEqual(expected_output.segments, stats.merge_output_segments_total);
+    try std.testing.expectEqual(expected_output.bytes, stats.merge_output_bytes_total);
 }
 
 test "text delete clears handed-off stale docs outside current range" {

@@ -559,6 +559,14 @@ fn writeTextMergeMetrics(writer: *std.Io.Writer, stats: antfly.db.types.TextMerg
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_completed_total", "counter", "Cached write full-text merges completed", stats.completed_merges);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_skipped_stale_total", "counter", "Cached write full-text merges skipped because the candidate became stale", stats.skipped_stale_merges);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_failed_total", "counter", "Cached write full-text merges that failed", stats.failed_merges);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_input_segments_total", "counter", "Source full-text segments consumed by completed merges", stats.merge_input_segments_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_input_bytes_total", "counter", "Source full-text segment bytes consumed by completed merges", stats.merge_input_bytes_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_output_segments_total", "counter", "Output full-text segments published by completed merges", stats.merge_output_segments_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_output_bytes_total", "counter", "Output full-text segment bytes published by completed merges", stats.merge_output_bytes_total);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_input_segments", "gauge", "Source full-text segments consumed by the last completed merge", stats.last_merge_input_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_input_bytes", "gauge", "Source full-text segment bytes consumed by the last completed merge", stats.last_merge_input_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_output_segments", "gauge", "Output full-text segments published by the last completed merge", stats.last_merge_output_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_last_output_bytes", "gauge", "Output full-text segment bytes published by the last completed merge", stats.last_merge_output_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_quarantined_merges", "gauge", "Cached write full-text merge candidates currently quarantined after failure", stats.quarantined_merges);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_quarantined_segments", "gauge", "Cached write full-text source segments currently quarantined after failure", stats.quarantined_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_retry_after_ns", "gauge", "Latest monotonic retry-after timestamp for cached write full-text merge work", stats.retry_after_ns);
@@ -12302,6 +12310,14 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .in_flight_merges = 1,
         .completed_merges = 2,
         .deferred_for_pressure = 4,
+        .merge_input_segments_total = 5,
+        .merge_input_bytes_total = 600,
+        .merge_output_segments_total = 2,
+        .merge_output_bytes_total = 300,
+        .last_merge_input_segments = 3,
+        .last_merge_input_bytes = 256,
+        .last_merge_output_segments = 1,
+        .last_merge_output_bytes = 128,
         .max_pending_bytes = 8192,
     });
     const text_merge_output = writer.buffered();
@@ -12309,6 +12325,10 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_pending_bytes 4096") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_pending_heap_bytes 1024") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_pending_mmap_bytes 3072") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_input_bytes_total 600") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_output_bytes_total 300") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_last_input_bytes 256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_last_output_bytes 128") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_completed_total 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_deferred_for_pressure_total 4") != null);
 }

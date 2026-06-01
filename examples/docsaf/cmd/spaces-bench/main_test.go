@@ -147,6 +147,14 @@ antfly_text_merge_pending_heap_bytes 1024
 antfly_text_merge_pending_mmap_bytes 3072
 # TYPE antfly_text_merge_max_pending_bytes gauge
 antfly_text_merge_max_pending_bytes 8192
+# TYPE antfly_text_merge_input_bytes_total counter
+antfly_text_merge_input_bytes_total 600
+# TYPE antfly_text_merge_output_bytes_total counter
+antfly_text_merge_output_bytes_total 300
+# TYPE antfly_text_merge_last_input_bytes gauge
+antfly_text_merge_last_input_bytes 256
+# TYPE antfly_text_merge_last_output_bytes gauge
+antfly_text_merge_last_output_bytes 128
 `))
 	}))
 	defer server.Close()
@@ -163,5 +171,17 @@ antfly_text_merge_max_pending_bytes 8192
 	}
 	if diag.TextMergeMaxPendingBytes != 8192 {
 		t.Fatalf("TextMergeMaxPendingBytes=%d", diag.TextMergeMaxPendingBytes)
+	}
+	if diag.TextMergeInputBytesTotal != 600 {
+		t.Fatalf("TextMergeInputBytesTotal=%d", diag.TextMergeInputBytesTotal)
+	}
+	if diag.TextMergeOutputBytesTotal != 300 {
+		t.Fatalf("TextMergeOutputBytesTotal=%d", diag.TextMergeOutputBytesTotal)
+	}
+	if diag.TextMergeLastInputBytes != 256 {
+		t.Fatalf("TextMergeLastInputBytes=%d", diag.TextMergeLastInputBytes)
+	}
+	if diag.TextMergeLastOutputBytes != 128 {
+		t.Fatalf("TextMergeLastOutputBytes=%d", diag.TextMergeLastOutputBytes)
 	}
 }
