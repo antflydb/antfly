@@ -104,6 +104,9 @@ Current PR progress:
   so chunking, asset producers, dense embeddings, sparse embeddings, and
   generated-request planning read the committed relational row keyspace rather
   than probing a generic document KV value;
+- TTL-driven async deletes and graph artifact-source materialization also carry
+  the relational-base-row state, so background cleanup removes committed
+  relational rows and graph extraction hydrates source documents from those rows;
 - public scan/median-key, identity coverage, generated-enrichment replay, and
   planning sample collectors now decode stored document rows through the unified
   primary-or-relational row key helper and materialize relational row values

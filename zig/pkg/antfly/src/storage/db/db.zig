@@ -2645,6 +2645,7 @@ pub const DB = struct {
                 .identity_namespace = batch_resources.identity_namespace,
                 .executor = self.executor,
                 .enrichment_runtime = self.enrichment_runtime,
+                .relational_base_rows = self.relationalColumnsForStore() != null,
             },
             .grace_period_ns = cfg.grace_period_ns,
         };
@@ -4853,6 +4854,7 @@ pub const DB = struct {
         try self.core.setSchema(table_schema);
         const relational_base_rows = self.relationalColumnsForStore() != null;
         self.async_context.relational_base_rows = relational_base_rows;
+        if (self.ttl_cleanup_context) |ctx| ctx.batch.relational_base_rows = relational_base_rows;
         if (self.enrichment_runtime) |runtime| runtime.setRelationalBaseRows(relational_base_rows);
     }
 
@@ -13015,7 +13017,13 @@ fn appendPrecomputedGraphSourceArtifactKey(
         defer graph_store_writes.deinit(self.alloc);
 
         if (artifact_value) |value| {
-            const raw_doc = try batchDocumentValueForGraphSource(self.alloc, self.core.store, store_writes.items, artifact_ref.document_id);
+            const raw_doc = try batchDocumentValueForGraphSource(
+                self.alloc,
+                self.core.store,
+                store_writes.items,
+                artifact_ref.document_id,
+                self.relationalColumnsForStore() != null,
+            );
             defer if (raw_doc) |doc_value| self.alloc.free(doc_value);
             const graph_writes = try graphWritesFromArtifactValueAlloc(self.alloc, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
             defer freeGraphWrites(self.alloc, graph_writes);
@@ -13078,26 +13086,39 @@ fn batchDocumentValueForGraphSource(
     store: *docstore_mod.DocStore,
     store_writes: []const docstore_mod.KVPair,
     doc_key: []const u8,
+    relational_base_rows: bool,
 ) !?[]u8 {
-    const internal_doc_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    const internal_doc_key = try graphSourceDocumentStoreKeyAlloc(alloc, doc_key, relational_base_rows);
     defer alloc.free(internal_doc_key);
     for (store_writes) |write| {
-        if (std.mem.eql(u8, write.key, internal_doc_key)) return try alloc.dupe(u8, write.value);
+        if (std.mem.eql(u8, write.key, internal_doc_key)) return try mapper.materializeDocumentValueAlloc(alloc, write.value);
     }
-    return try storeDocumentValueForGraphSource(alloc, store, doc_key);
+    return try storeDocumentValueForGraphSource(alloc, store, doc_key, relational_base_rows);
 }
 
 fn storeDocumentValueForGraphSource(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     doc_key: []const u8,
+    relational_base_rows: bool,
 ) !?[]u8 {
-    const internal_doc_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    const internal_doc_key = try graphSourceDocumentStoreKeyAlloc(alloc, doc_key, relational_base_rows);
     defer alloc.free(internal_doc_key);
-    return store.get(alloc, internal_doc_key) catch |err| switch (err) {
+    const raw = store.get(alloc, internal_doc_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
+    return if (raw) |value|
+        try mapper.materializeOwnedDocumentValueAlloc(alloc, value)
+    else
+        null;
+}
+
+fn graphSourceDocumentStoreKeyAlloc(alloc: Allocator, doc_key: []const u8, relational_base_rows: bool) ![]u8 {
+    return if (relational_base_rows)
+        try relational_store_mod.rowKeyAlloc(alloc, doc_key)
+    else
+        try internal_keys.documentKeyAlloc(alloc, doc_key);
 }
 
 fn graphArtifactContentType(index_manager: *const index_manager_mod.IndexManager, artifact_name: []const u8) []const u8 {
@@ -13964,9 +13985,13 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     }
 
     for (keys) |key| {
-        const store_key = try internal_keys.documentKeyAlloc(ctx.alloc, key);
-        try owned_delete_keys.append(ctx.alloc, store_key);
-        try delete_keys.append(ctx.alloc, store_key);
+        if (ctx.relational_base_rows) {
+            try relational_store_mod.appendDelete(ctx.alloc, &delete_keys, &owned_delete_keys, key);
+        } else {
+            const store_key = try internal_keys.documentKeyAlloc(ctx.alloc, key);
+            try owned_delete_keys.append(ctx.alloc, store_key);
+            try delete_keys.append(ctx.alloc, store_key);
+        }
         if (!shouldWriteTimestamp(key)) continue;
         const timestamp_key = try makeTimestampKey(ctx.alloc, key);
         try timestamp_delete_keys.append(ctx.alloc, timestamp_key);
@@ -15332,7 +15357,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try applyGraphDocClearsForIndex(ctx, batch.graph_doc_clears, index_ref.name);
 
             const materialized_artifact_keys = if (ctx.allow_graph_materialization)
-                try materializeGraphSourceArtifactsForIndex(ctx.alloc, ctx.store, ctx.index_manager, batch.changed_artifact_keys, index_ref.name)
+                try materializeGraphSourceArtifactsForIndex(ctx.alloc, ctx.store, ctx.index_manager, batch.changed_artifact_keys, index_ref.name, ctx.relational_base_rows)
             else
                 try ctx.alloc.alloc([]u8, 0);
             defer freeOwnedKeySlice(ctx.alloc, materialized_artifact_keys);
@@ -16371,6 +16396,7 @@ fn materializeGraphSourceArtifactsForIndex(
     index_manager: *index_manager_mod.IndexManager,
     changed_artifact_keys: []const []const u8,
     index_name: []const u8,
+    relational_base_rows: bool,
 ) ![][]u8 {
     const source = index_manager.graphArtifactSource(index_name) orelse return try alloc.alloc([]u8, 0);
 
@@ -16405,7 +16431,7 @@ fn materializeGraphSourceArtifactsForIndex(
         }
 
         if (raw) |value| {
-            const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id);
+            const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id, relational_base_rows);
             defer if (raw_doc) |doc_value| alloc.free(doc_value);
             const graph_writes = try graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc);
             defer freeGraphWrites(alloc, graph_writes);
@@ -36072,6 +36098,55 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
     });
     defer text.deinit();
     try std.testing.expectEqual(@as(u32, 0), text.total_hits);
+}
+
+test "db ttl cleanup deletes relational base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .batch_size = 8,
+            .grace_period_ns = 0,
+        },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"body":{"type":"text"}},"required":["title","body"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    var runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    runtime_schema.ttl_duration_ns = 1_000_000_000;
+    try db.setSchema(runtime_schema);
+
+    const now_ns = currentTimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:expired", .value = "{\"title\":\"gone\",\"body\":\"common token\"}" }},
+        .timestamp_ns = now_ns - 2_000_000_000,
+    });
+
+    try waitForRawDelete(alloc, &db, "row:expired", 200);
+    try std.testing.expect((try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:expired")) == null);
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:expired");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
 }
 
 test "db stats expose ttl cleanup activity" {
