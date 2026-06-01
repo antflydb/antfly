@@ -3288,6 +3288,17 @@ pub const DB = struct {
             for (owned_delete_keys.items) |key| self.alloc.free(key);
             owned_delete_keys.deinit(self.alloc);
         }
+        var relational_participant = relational_store_mod.WriteParticipant.init(
+            self.alloc,
+            self.core.store,
+            &store_writes,
+            &delete_keys,
+            &owned_store_keys,
+        );
+        var relational_participant_prepared = false;
+        var relational_participant_closed = false;
+        defer if (relational_participant_prepared and !relational_participant_closed)
+            relational_participant.abort(null);
         var graph_artifact_clears = std.ArrayListUnmanaged(GraphArtifactClear).empty;
         defer {
             for (graph_artifact_clears.items) |*item| item.deinit(self.alloc);
@@ -3400,18 +3411,22 @@ pub const DB = struct {
                         &owned_store_values,
                     );
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
-                const store_key = if (relational_columns != null)
-                    try relational_store_mod.rowKeyAlloc(self.alloc, write.key)
-                else
-                    try internal_keys.documentKeyAlloc(self.alloc, write.key);
-                try owned_store_keys.append(self.alloc, store_key);
+                const store_key = if (relational_columns != null) blk: {
+                    try relational_participant.prepareUpsert("", write.key, store_value, null);
+                    relational_participant_prepared = true;
+                    break :blk store_writes.items[store_writes.items.len - 1].key;
+                } else blk: {
+                    const key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
+                    try owned_store_keys.append(self.alloc, key);
+                    try store_writes.append(self.alloc, .{
+                        .key = key,
+                        .value = store_value,
+                    });
+                    break :blk key;
+                };
                 try overwrite_probe_entries.append(self.alloc, .{
                     .key = store_key,
                     .write_index = i,
-                });
-                try store_writes.append(self.alloc, .{
-                    .key = store_key,
-                    .value = store_value,
                 });
                 try identity_upsert_keys.append(self.alloc, write.key);
                 try identity_upsert_write_indexes.append(self.alloc, i);
@@ -3511,7 +3526,8 @@ pub const DB = struct {
         }
         for (effective_req.deletes) |key| {
             if (self.relationalColumnsForStore() != null) {
-                try relational_store_mod.appendDelete(self.alloc, &delete_keys, &owned_delete_keys, key);
+                try relational_participant.prepareDelete("", key, null);
+                relational_participant_prepared = true;
             } else {
                 const store_key = try internal_keys.documentKeyAlloc(self.alloc, key);
                 try owned_delete_keys.append(self.alloc, store_key);
@@ -3688,6 +3704,10 @@ pub const DB = struct {
             },
             store_batch_options,
         );
+        if (relational_participant_prepared) {
+            try relational_participant.commit(null, sequence);
+            relational_participant_closed = true;
+        }
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
         }

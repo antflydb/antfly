@@ -26,6 +26,7 @@ const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const typed_dv = @import("../../section/typed_doc_values.zig");
+const transactions_mod = @import("../transactions.zig");
 
 pub const OwnedRow = struct {
     doc_key: []u8,
@@ -54,6 +55,98 @@ pub const OwnedColumnValue = struct {
 pub fn rowKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     return try internal_keys.relationalRowKeyAlloc(alloc, doc_key);
 }
+
+pub const WriteParticipant = struct {
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    writes_start: usize,
+    deletes_start: usize,
+    owned_keys_start: usize,
+    prepared: bool = false,
+    closed: bool = false,
+
+    pub fn init(
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+        deletes: *std.ArrayListUnmanaged([]const u8),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+    ) WriteParticipant {
+        return .{
+            .alloc = alloc,
+            .store = store,
+            .writes = writes,
+            .deletes = deletes,
+            .owned_keys = owned_keys,
+            .writes_start = writes.items.len,
+            .deletes_start = deletes.items.len,
+            .owned_keys_start = owned_keys.items.len,
+        };
+    }
+
+    pub fn prepareUpsert(
+        self: *WriteParticipant,
+        table: []const u8,
+        doc_key: []const u8,
+        typed_row: []const u8,
+        txn_id: ?transactions_mod.TxnId,
+    ) !void {
+        _ = table;
+        _ = txn_id;
+        if (self.closed) return error.ParticipantClosed;
+        try appendUpsert(self.alloc, self.writes, self.owned_keys, doc_key, typed_row);
+        self.prepared = true;
+    }
+
+    pub fn prepareDelete(
+        self: *WriteParticipant,
+        table: []const u8,
+        doc_key: []const u8,
+        txn_id: ?transactions_mod.TxnId,
+    ) !void {
+        _ = table;
+        _ = txn_id;
+        if (self.closed) return error.ParticipantClosed;
+        try appendDelete(self.alloc, self.deletes, self.owned_keys, doc_key);
+        self.prepared = true;
+    }
+
+    pub fn commit(self: *WriteParticipant, txn_id: ?transactions_mod.TxnId, commit_version: u64) !void {
+        _ = txn_id;
+        _ = commit_version;
+        if (self.closed) return error.ParticipantClosed;
+        self.closed = true;
+    }
+
+    pub fn abort(self: *WriteParticipant, txn_id: ?transactions_mod.TxnId) void {
+        _ = txn_id;
+        if (!self.closed) {
+            for (self.owned_keys.items[self.owned_keys_start..]) |key| self.alloc.free(key);
+            self.owned_keys.shrinkRetainingCapacity(self.owned_keys_start);
+            self.writes.shrinkRetainingCapacity(self.writes_start);
+            self.deletes.shrinkRetainingCapacity(self.deletes_start);
+        }
+        self.closed = true;
+    }
+
+    pub fn get(self: *WriteParticipant, doc_key: []const u8, read_version: ?u64) !?[]u8 {
+        _ = read_version;
+        return try getMaterializedAlloc(self.alloc, self.store, doc_key);
+    }
+
+    pub fn scanRows(self: *WriteParticipant, lower_doc_key: []const u8, upper_doc_key: []const u8, read_version: ?u64) ![]OwnedRow {
+        _ = read_version;
+        return try scanRowsAlloc(self.alloc, self.store, lower_doc_key, upper_doc_key);
+    }
+
+    pub fn scanColumn(self: *WriteParticipant, column_path: []const u8, lower_doc_key: []const u8, upper_doc_key: []const u8, read_version: ?u64) ![]OwnedColumnValue {
+        _ = read_version;
+        return try scanColumnAlloc(self.alloc, self.store, column_path, lower_doc_key, upper_doc_key);
+    }
+};
 
 pub fn appendUpsert(
     alloc: Allocator,
@@ -224,6 +317,56 @@ test "relational base store writes materialize and delete by document key" {
     writes.clearRetainingCapacity();
     try appendDelete(alloc, &deletes, &owned_keys, "doc:a");
     try store.putBatch(writes.items, deletes.items);
+    try std.testing.expect((try getRawAlloc(alloc, &store, "doc:a")) == null);
+}
+
+test "relational write participant prepares commit and abort boundaries" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "title",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "prepared" },
+        },
+    });
+    defer alloc.free(row);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+
+    var participant = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys);
+    try participant.prepareUpsert("events", "doc:a", row, null);
+    participant.abort(null);
+    try std.testing.expect((try getRawAlloc(alloc, &store, "doc:a")) == null);
+
+    var committed = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys);
+    try committed.prepareUpsert("events", "doc:a", row, null);
+    try store.putBatch(writes.items, deletes.items);
+    try committed.commit(null, 1);
+
+    const materialized = (try committed.get("doc:a", null)).?;
+    defer alloc.free(materialized);
+    try std.testing.expectEqualStrings("{\"title\":\"prepared\"}", materialized);
+
+    writes.clearRetainingCapacity();
+    deletes.clearRetainingCapacity();
+    var delete_participant = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys);
+    try delete_participant.prepareDelete("events", "doc:a", null);
+    try store.putBatch(writes.items, deletes.items);
+    try delete_participant.commit(null, 2);
     try std.testing.expect((try getRawAlloc(alloc, &store, "doc:a")) == null);
 }
 

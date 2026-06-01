@@ -123,6 +123,10 @@ Current PR progress:
 - relational read/backfill seams now treat relational row keys strictly: a
   relational row must decode as a typed row, and stale generic primary document
   rows are ignored instead of serving as a compatibility fallback.
+- relational writes now enter the base store through a named
+  `relational_store.WriteParticipant` with prepare/commit/abort/read/scan
+  methods, giving the current row-packed implementation the same participant
+  boundary the typed-column store will occupy.
 
 ## Implementation Phases
 
