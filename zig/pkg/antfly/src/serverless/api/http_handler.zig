@@ -7963,7 +7963,8 @@ test "http handler create index expands schema-derived algebraic config" {
     try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"group_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"measure_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"time_fields\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"materializations\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"materializations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"materializations\":[]") == null);
     try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"sum_by_customer\"") == null);
 
     var detail = try handler.handle(.{

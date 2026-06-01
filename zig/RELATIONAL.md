@@ -196,31 +196,29 @@ The hand-off keeps layers separate: `schema_capability` emits
 orchestration layer renames `name` → `field_name` to get an
 `introducer.TypedFieldValue` (the other fields are identical).
 
-The write path is wired end-to-end. The *compiled* runtime schema carries the
-contract: `runtime_schema.TableSchema` (`storage/schema.zig`) has `storage_mode`
-and a `relational_columns` catalog (`RelationalColumn{name, path, field_type,
-nullable}`), populated by `deriveRuntimeTableSchema` and round-tripped through
-the versioned binary format (format version 9). `document_mapper.extractTextFieldsFromValue`
-then branches on `schema.storage_mode == .relational` and sets
-`TextDocument.typed_fields` from the catalog via `buildRelationalTypedFields`
-(numeric/datetime/boolean/geopoint → typed; keyword/text continue through the
-full-text path; json columns are subtrees), bypassing value detection. `NOT NULL`
-is enforced upstream by JSON-schema `required` validation. The introducer then
-materializes the typed columns. Verified by `document_mapper` and introducer
-tests.
-
-**Remaining wiring:** the read side — a columnar scan operator + predicate
-routing (below). In Phase B this is also where the JSON blob write is dropped
-for non-`json` columns.
+The write and read paths are wired end-to-end. The *compiled* runtime schema
+carries the contract: `runtime_schema.TableSchema` (`storage/schema.zig`) has
+`storage_mode` and a `relational_columns` catalog (`RelationalColumn{name, path,
+field_type, nullable}`), populated by `deriveRuntimeTableSchema` and
+round-tripped through the versioned binary format (format version 9).
+`document_mapper.extractTextFieldsFromValue` then branches on
+`schema.storage_mode == .relational` and sets `TextDocument.typed_fields` from
+the catalog via `buildRelationalTypedFields` (numeric/datetime/boolean/geopoint
+→ typed; keyword/text continue through the full-text path; json columns are
+subtrees), bypassing value detection. `NOT NULL` is enforced upstream by
+JSON-schema `required` validation. The introducer materializes those typed
+columns into segment doc-values and, for relational tables, the KV value is a
+self-describing typed row rather than the original JSON blob.
 
 ### Query path
 
-The relational win is predicate pushdown. The planner gains a **columnar table
+The relational win is predicate pushdown. The planner uses a **columnar table
 scan** operator that reads `typed_doc_values` chunks directly (`readU64Chunk`,
 range bounds, term equality) for predicates on typed columns, instead of
-routing every filter through the full-text index. Projection is served by
-`ColumnarReader.readDoc(projection)`. Joins and `GROUP BY`-over-join are
-unchanged — they already exist (see `JOINS.md`, `ALGEBRAIC.md`).
+routing every filter through the full-text index. Projection and stored-document
+reads reconstruct JSON from the typed columns at the segment and KV-row read
+seams. Joins and `GROUP BY`-over-join are unchanged — they already exist (see
+`JOINS.md`, `ALGEBRAIC.md`).
 
 ### Schema evolution
 
@@ -243,7 +241,7 @@ number) is additive where the physical type is compatible.
   engine's existing doc values (`detectTypedValue` + `search/query.zig`), so the
   existing segment builder (`introducer.zig`) already materializes correct typed
   columns for type-enforced relational documents (see "How this meets the
-  segment builder"). Remaining wiring is folded into Phase 3.
+  segment builder"). The integration work is completed by Phase 3.
 - **Phase 3 — write path wired end-to-end (done).** The compiled runtime schema
   carries `storage_mode` + the `relational_columns` catalog (derived in
   `schema/mod.zig`, v9 binary format); `document_mapper` branches on
@@ -371,9 +369,9 @@ number) is additive where the physical type is compatible.
 
   Document-mode tables are unchanged throughout: their KV value stays a JSON
   blob, and the seam is a pure passthrough (the row magic never matches a JSON
-  document). Validated by the full `zig build unit-test` suite (2700 passed, 0
-  failed, 0 leaked), including the end-to-end relational write → store typed row
-  → async index/catch-up → full-text query with reconstruction path.
+  document). Covered by the relational write → store typed row → async
+  index/catch-up → full-text query reconstruction tests, alongside the KV
+  row-codec and document-mode passthrough coverage.
 
 ## Related docs
 
@@ -450,16 +448,15 @@ lookup — neither path has the runtime schema:
 
 ### Validation
 
-Full `zig build unit-test`: **2692 passed, 0 failed, 0 leaked.** Includes the
-new manifest round-trip + merge-survival tests, the end-to-end DB relational
-reconstruction test, and the whole merge/split/persistence suite. Document-mode
-behaviour is unchanged (its code paths are not entered when no manifest is
-present).
+Covered by manifest round-trip + merge-survival tests, the end-to-end DB
+relational reconstruction test, and the merge/split/persistence suite.
+Document-mode behaviour is unchanged because its code paths are not entered
+when no manifest is present.
 
-### Still open (separate task)
+### Historical note
 
-KV redesign (the synchronous source-of-truth, `db.zig` `stageTransform` reads
-`db.get`; vector `include_stored` reads `db.get`) remains the larger, separate
-task documented in the section above — NOT addressed by the blob-write removal.
-That is the *durability* copy of the document; this work only removed the
-*segment* copy of the body.
+This section originally landed before the KV typed-row redesign. Phase 6 above
+has since made the synchronous source-of-truth (`db.get`, transform reads, and
+vector `include_stored`) column-derived as well. The blob-write details remain
+useful because they describe the segment manifest format and the schema-less
+merge/split paths.

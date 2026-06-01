@@ -488,6 +488,7 @@ fn isAlgebraicUserTunableField(field: []const u8) bool {
         "max_batch_accumulator_entries",
         "min_max_candidate_cache_size",
         "enable_temporal_range_pruning",
+        "hll_cardinalities",
     };
     for (tunable) |name| {
         if (std.mem.eql(u8, field, name)) return true;
@@ -2521,7 +2522,7 @@ test "metadata.schema update regenerates algebraic config and preserves user kno
     defer canon_parsed.deinit();
     const fp = canon_parsed.value.object.get("capability_fingerprint").?.string;
 
-    const stored = try std.fmt.allocPrint(std.testing.allocator, "{{\"alg\":{{\"type\":\"algebraic\",\"capability_fingerprint\":\"{s}\",\"adaptive\":{{\"observe\":false,\"min_observations\":9}},\"dynamic_field_rules\":[{{\"name\":\"ext\",\"match\":\"ext_*\",\"type\":\"string\"}}]}}}}", .{fp});
+    const stored = try std.fmt.allocPrint(std.testing.allocator, "{{\"alg\":{{\"type\":\"algebraic\",\"capability_fingerprint\":\"{s}\",\"adaptive\":{{\"observe\":false,\"min_observations\":9}},\"hll_cardinalities\":[{{\"name\":\"customers_by_region\",\"group_by\":[\"region\"],\"value_field\":\"customer\",\"precision\":12}}],\"dynamic_field_rules\":[{{\"name\":\"ext\",\"match\":\"ext_*\",\"type\":\"string\"}}]}}}}", .{fp});
     defer std.testing.allocator.free(stored);
 
     const refreshed = try regenerateAlgebraicIndexesFromSchemaAlloc(std.testing.allocator, "docs", stored, schema);
@@ -2529,6 +2530,10 @@ test "metadata.schema update regenerates algebraic config and preserves user kno
 
     // User knob preserved through regeneration.
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"min_observations\":9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"hll_cardinalities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"customers_by_region\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"value_field\":\"customer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"precision\":12") != null);
     // Capability unchanged (matching fingerprint) => no backfill flag forced on.
     try std.testing.expect(std.mem.indexOf(u8, refreshed, "\"dynamic_rules_backfill_pending\":true") == null);
 }

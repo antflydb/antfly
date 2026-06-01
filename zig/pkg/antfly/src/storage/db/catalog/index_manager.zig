@@ -1241,7 +1241,7 @@ pub const IndexManager = struct {
 
             // Carry forward user-tunable runtime knobs (the durable regeneration
             // in api/tables.zig preserves the same set) so a schema/template
-            // change does not silently reset planner/adaptive tuning in place.
+            // change does not silently reset planner/adaptive/HLL tuning in place.
             new_parsed.value.adaptive = cur.adaptive;
             new_parsed.value.pathfact_policy = cur.pathfact_policy;
             new_parsed.value.max_result_buckets = cur.max_result_buckets;
@@ -1249,6 +1249,7 @@ pub const IndexManager = struct {
             new_parsed.value.max_batch_accumulator_entries = cur.max_batch_accumulator_entries;
             new_parsed.value.min_max_candidate_cache_size = cur.min_max_candidate_cache_size;
             new_parsed.value.enable_temporal_range_pruning = cur.enable_temporal_range_pruning;
+            new_parsed.value.hll_cardinalities = cur.hll_cardinalities;
 
             // The capability changed against an already-open table, so existing
             // documents have not been re-projected through the new dynamic rules.
@@ -11128,6 +11129,60 @@ test "graph config validates document field source shape" {
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"kind":"document_field","field":"links"}}
     ));
+}
+
+test "index manager algebraic schema reload preserves HLL cardinalities" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "hll-reload");
+    defer cleanupIndexManagerDir(path_z);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+    defer manager.deinit();
+
+    const config_json =
+        \\{
+        \\  "version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"region","path":"region","type":"string"},{"name":"customer","path":"customer","type":"string"}],
+        \\  "hll_cardinalities": [{"name":"customers_by_region","group_by":["region"],"value_field":"customer","precision":12}]
+        \\}
+    ;
+    var index = try algebraic_mod.index.Index.open(alloc, "alg", config_json);
+    var index_owned = true;
+    errdefer if (index_owned) index.close();
+
+    const apply_mutex = try manager.allocIndexApplyMutex();
+    var apply_mutex_owned = true;
+    errdefer if (apply_mutex_owned) manager.destroyIndexApplyMutex(apply_mutex);
+
+    var entry = IndexManager.AlgebraicIndex{
+        .apply_mutex = apply_mutex,
+        .config = try types.IndexConfig.clone(alloc, .{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = config_json,
+        }),
+        .index = index,
+    };
+    apply_mutex_owned = false;
+    index_owned = false;
+    var entry_owned = true;
+    errdefer if (entry_owned) manager.freeAlgebraicIndexEntry(&entry);
+
+    try manager.algebraic_indexes.append(alloc, entry);
+    entry_owned = false;
+
+    try manager.reloadAlgebraicSchemaConfigs(
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}},"dynamic_templates":[{"name":"ext","match":"ext_*","mapping":{"type":"numeric"}}]}
+    );
+
+    const reloaded = manager.algebraic_indexes.items[0].index.config();
+    try std.testing.expectEqual(@as(usize, 1), reloaded.hll_cardinalities.len);
+    try std.testing.expectEqualStrings("customers_by_region", reloaded.hll_cardinalities[0].name);
+    try std.testing.expectEqualStrings("customer", reloaded.hll_cardinalities[0].value_field);
+    try std.testing.expectEqual(@as(u8, 12), reloaded.hll_cardinalities[0].precision);
+    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"hll_cardinalities\"") != null);
 }
 
 fn parseMetric(raw: []const u8) !vector_mod.DistanceMetric {

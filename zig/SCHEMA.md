@@ -183,8 +183,9 @@ Template-only updates propagate without a recreate on two levels:
 
 - the durable table `indexes_json` is regenerated on every schema update
   (`api/tables.zig: regenerateAlgebraicIndexesFromSchemaAlloc`), which carries
-  forward user-tunable runtime knobs (adaptive policy, planner/result limits) so
-  a schema change does not reset tuning; fresh opens, new replicas, and restarts
+  forward user-tunable runtime knobs (adaptive policy, planner/result limits,
+  and configured HLL cardinalities) so a schema change does not reset tuning or
+  drop approximate-cardinality sketches; fresh opens, new replicas, and restarts
   pick up the new rules; and
 - live indexes are refreshed in place
   (`DB.reloadAlgebraicSchemaConfigs` → `Index.reloadConfigJson`) so running

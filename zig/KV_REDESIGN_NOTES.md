@@ -1,14 +1,18 @@
-# KV redesign — handoff notes (Phase B, KV/durability copy)
+# KV redesign — historical handoff notes (Phase B, KV/durability copy)
 
-Status: NOT STARTED in code. Investigation only. Tree clean at commit 3551602c
-(segment blob-write removal, already pushed to claude/antfly-document-store-schema-19xGk).
+Status: SUPERSEDED by [RELATIONAL.md](RELATIONAL.md) Phase 6. The code now
+implements option A below: relational KV values are self-describing typed rows,
+and `materializeDocumentValueAlloc` reconstructs JSON for synchronous readers.
+These notes are retained only for the design rationale and the original seam
+inventory.
 
 ## Goal
 Make typed columns authoritative for the KV/durability copy of relational
-documents, eliminating the JSON blob stored in the KV store. Today the segment
-stored-doc blob is already column-derived (commit 3551602c), but the KV value
-(`db.get`/`getStoreValue`, keyed by doc key) is still the authoritative JSON
-blob, read SYNCHRONOUSLY by transforms and vector/dense materialization.
+documents, eliminating the JSON blob stored in the KV store. At the time these
+notes were written, the segment stored-doc blob was already column-derived
+(commit 3551602c), but the KV value (`db.get`/`getStoreValue`, keyed by doc key)
+was still the authoritative JSON blob, read SYNCHRONOUSLY by transforms and
+vector/dense materialization.
 
 ## Key code seams (verified by reading db.zig @ commit 3551602c)
 - Write: db.zig ~3376 — `strippedStoredDocumentValueAlloc(cleaned, vector_store_field_names, ...)`

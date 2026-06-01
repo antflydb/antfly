@@ -2376,6 +2376,15 @@ estimate from an exact count and reason about the error budget:
 the value, `1.04 / sqrt(2^precision)` — about 1.6% at p=12 and 0.8% at p=14. It
 is present only when `approximate` is true.
 
+Queries choose the exact/approximate contract with `mode` on a `cardinality`
+aggregation:
+
+- `auto` (default): use a matching current sketch when one applies; otherwise
+  fall back to an exact distinct scan.
+- `exact`: always run the exact distinct scan and return `approximate: false`.
+- `approximate`: require a matching current sketch. If no sketch applies, the
+  query fails instead of silently scanning.
+
 ### Selection and maintenance
 
 The planner answers a `cardinality` from a matching sketch automatically when
@@ -2385,3 +2394,13 @@ maintained unconstrained and without per-generation visibility), a sketch's
 mid-rebuild; otherwise it falls back to the exact distinct scan (which reports
 `approximate: false`). Deletes and overwrites mark the affected groups dirty and
 rebuild only those groups' sketches in the background.
+
+`hll_cardinalities` is user-owned algebraic index configuration. Schema-derived
+regeneration and live schema reload preserve it alongside the other runtime
+knobs, so dynamic-template or schema updates do not drop configured sketches.
+
+Cardinality sketches can also be promoted adaptively. Repeated cardinality
+queries are observed in the same adaptive-materialization stream; once a
+leader-gated candidate crosses the promotion threshold, the index records an HLL
+configuration for that shape, backfills the sketch, and then maintains it with
+the same dirty-group rebuild path used by static `hll_cardinalities`.
