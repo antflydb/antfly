@@ -8646,7 +8646,8 @@ pub const IndexManager = struct {
             return false;
         }
         const raw_z = getenv("ANTFLY_BENCH_TEXT_METRICS") orelse
-            getenv("ANTFLY_BENCH_TEXT_PROFILE") orelse {
+            getenv("ANTFLY_BENCH_TEXT_PROFILE") orelse
+            getenv("ANTFLY_BENCH_METRICS") orelse {
             bench_text_metrics_cache.store(1, .monotonic);
             return false;
         };
