@@ -94,6 +94,7 @@ const default_merge_policy = merger_mod.MergePolicy{
     .max_segment_size = 5 * 1024 * 1024 * 1024,
     .floor_segment_size = 16 * 1024 * 1024,
 };
+pub const default_text_merge_max_segments_per_tier = default_merge_policy.max_segments_per_tier;
 const default_text_segment_build_target_bytes: usize = 16 * 1024 * 1024;
 const default_text_projection_source_build_target_bytes: usize = 8 * 1024 * 1024;
 const default_text_build_memory_target_bytes: usize = 96 * 1024 * 1024;
@@ -16410,7 +16411,7 @@ test "text merge failure quarantines source segments" {
         .compact_text_segment_threshold = 2,
         .defer_text_compaction = true,
     };
-    for (0..2) |i| {
+    for (0..12) |i| {
         var key_buf: [64]u8 = undefined;
         const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
         defer alloc.free(key);
@@ -16438,7 +16439,7 @@ test "text merge failure quarantines source segments" {
 
     const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expect(entry.compaction_pending);
-    try std.testing.expect(entry.persistent.snapshot().segments.len >= 2);
+    try std.testing.expect(entry.persistent.snapshot().segments.len >= default_merge_policy.max_segments_per_tier);
 }
 
 test "text merge resource manager accounts pending bytes and active buffers" {

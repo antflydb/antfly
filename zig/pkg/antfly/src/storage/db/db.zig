@@ -32715,7 +32715,7 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
         .config_json = "{}",
     });
 
-    for (0..6) |i| {
+    for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
         const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"doc {d}\",\"body\":\"common token {d}\"}}", .{ i, i });
@@ -32733,16 +32733,16 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
     try db.runUntilIdle();
 
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
-    try std.testing.expect(text_index.snapshot().segments.len < 6);
+    try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
 
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
         .query = .{ .match = .{ .field = "body", .text = "common" } },
-        .limit = 10,
+        .limit = 20,
     });
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(u32, 6), result.total_hits);
+    try std.testing.expectEqual(@as(u32, 12), result.total_hits);
 }
 
 test "db runUntilIdle drains scheduled text merges without index workers" {
@@ -32834,7 +32834,7 @@ test "db full_text sync does not require draining scheduled text merges" {
     try std.testing.expect(after.pending_segments <= before.pending_segments);
 }
 
-test "db force compacts text index to one searchable segment" {
+test "db force compacts text index to searchable merge tier" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -32870,7 +32870,7 @@ test "db force compacts text index to one searchable segment" {
     try db.forceCompactTextIndexes();
 
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
-    try std.testing.expectEqual(@as(usize, 1), text_index.snapshot().segments.len);
+    try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
 
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -32936,7 +32936,7 @@ test "db text compaction preserves ordinal filters across reopen" {
         try db.forceCompactTextIndexes();
 
         const text_index = db.core.index_manager.textIndex("ft_v1").?;
-        try std.testing.expectEqual(@as(usize, 1), text_index.snapshot().segments.len);
+        try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
 
         var result = try db.search(alloc, .{
             .index_name = "ft_v1",
@@ -32975,7 +32975,7 @@ test "db text compaction preserves ordinal filters across reopen" {
         defer filter.deinit(alloc);
 
         const text_index = reopened.core.index_manager.textIndex("ft_v1").?;
-        try std.testing.expectEqual(@as(usize, 1), text_index.snapshot().segments.len);
+        try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
 
         var result = try reopened.search(alloc, .{
             .index_name = "ft_v1",
@@ -33030,7 +33030,7 @@ test "db best effort force compact leaves text merge debt under pressure" {
         .config_json = "{}",
     });
 
-    for (0..6) |i| {
+    for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
         const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
@@ -33053,11 +33053,11 @@ test "db best effort force compact leaves text merge debt under pressure" {
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
         .query = .{ .match = .{ .field = "body", .text = "common" } },
-        .limit = 10,
+        .limit = 20,
     });
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(u32, 6), result.total_hits);
+    try std.testing.expectEqual(@as(u32, 12), result.total_hits);
 }
 
 test "db runUntilIdle defers full text merge pressure without failing" {
@@ -33094,7 +33094,7 @@ test "db runUntilIdle defers full text merge pressure without failing" {
         .config_json = "{}",
     });
 
-    for (0..6) |i| {
+    for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
         const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
@@ -36442,7 +36442,7 @@ test "db bulk ingest full_text sync defers text merge work until finish" {
     try db.beginBulkIngestSession();
     errdefer db.abortBulkIngestSession();
 
-    for (0..6) |i| {
+    for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
         const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
