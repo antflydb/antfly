@@ -3,14 +3,14 @@ module github.com/antflydb/antfly/examples/image-search
 go 1.26
 
 replace (
-	github.com/antflydb/antfly/pkg/client => ../../pkg/client
-	github.com/antflydb/antfly/pkg/libaf => ../../pkg/libaf
+	github.com/antflydb/antfly/go/pkg/sdk => ../../go/pkg/sdk
+	github.com/antflydb/antfly/go/pkg/libaf => ../../go/pkg/libaf
 )
 
-require github.com/antflydb/antfly/pkg/client v0.0.0-20260207183149-045031239f8a
+require github.com/antflydb/antfly/go/pkg/sdk v0.0.0-20260207183149-045031239f8a
 
 require (
-	github.com/antflydb/antfly/pkg/libaf v0.0.0-20260207045125-de26f4ffd0a5 // indirect
+	github.com/antflydb/antfly/go/pkg/libaf v0.0.0-20260207045125-de26f4ffd0a5 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/getkin/kin-openapi v0.133.0 // indirect
 	github.com/go-json-experiment/json v0.0.0-20251027170946-4849db3c2f7e // indirect

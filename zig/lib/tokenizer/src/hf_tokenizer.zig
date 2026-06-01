@@ -2502,13 +2502,13 @@ test "encode for model tracks wordpiece offsets" {
 
 test "encode for model handles splade wordpiece tokenizer fixture" {
     const allocator = std.testing.allocator;
-    const models_dir = if (std.c.getenv("TERMITE_MODELS_DIR")) |value|
+    const models_dir = if (std.c.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value|
         std.mem.span(value)
     else blk: {
         const home = std.c.getenv("HOME") orelse return error.SkipZigTest;
-        break :blk try std.fs.path.join(allocator, &.{ std.mem.span(home), ".termite", "models" });
+        break :blk try std.fs.path.join(allocator, &.{ std.mem.span(home), ".antfly", "inference", "models" });
     };
-    defer if (std.c.getenv("TERMITE_MODELS_DIR") == null) allocator.free(models_dir);
+    defer if (std.c.getenv("ANTFLY_INFERENCE_MODELS_DIR") == null) allocator.free(models_dir);
     const path = try std.fs.path.join(allocator, &.{ models_dir, "sparse-encoder-testing", "splade-bert-tiny-nq-onnx", "tokenizer.json" });
     defer allocator.free(path);
     const bytes = std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024) catch |err| switch (err) {

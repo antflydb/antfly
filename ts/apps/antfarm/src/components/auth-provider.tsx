@@ -5,6 +5,7 @@ import { isProductEnabled } from "../config/products";
 import type { Permission, User } from "../contexts/auth-context";
 import { AuthContext } from "../contexts/auth-context";
 import { useApiConfig } from "../hooks/use-api-config";
+import { isExternalAuthMode } from "../runtime-config";
 
 interface AuthProviderProps {
   children: ReactNode;
@@ -54,7 +55,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   // Check if authentication is enabled
   const checkAuthEnabled = useCallback(async (): Promise<boolean> => {
-    // Termite has no auth - skip the check when Antfly is not enabled
+    if (isExternalAuthMode()) {
+      return false;
+    }
+
+    // Antfly inference has no auth - skip the check when Antfly data is not enabled.
     if (!isProductEnabled("antfly")) {
       return false;
     }

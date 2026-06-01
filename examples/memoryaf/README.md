@@ -35,7 +35,7 @@ cd examples/memoryaf
 GOWORK=off go run . sync \
   --source filesystem \
   --dir ../../docs \
-  --url http://localhost:8080/api/v1 \
+  --url http://localhost:8080/db/v1 \
   --project antfly-docs
 ```
 
@@ -46,7 +46,7 @@ cd examples/memoryaf
 GOWORK=off go run . watch \
   --source filesystem \
   --dir ../../docs \
-  --url http://localhost:8080/api/v1 \
+  --url http://localhost:8080/db/v1 \
   --project antfly-docs \
   --debounce 750ms
 ```
@@ -60,7 +60,7 @@ GOWORK=off go run . sync \
   --git-url github.com/antflydb/colony \
   --git-ref main \
   --git-subpath docs \
-  --url http://localhost:8080/api/v1 \
+  --url http://localhost:8080/db/v1 \
   --project colony-docs
 ```
 
@@ -74,7 +74,7 @@ GOWORK=off go run . sync \
   --s3-prefix handbook \
   --s3-endpoint s3.amazonaws.com \
   --s3-use-ssl \
-  --url http://localhost:8080/api/v1 \
+  --url http://localhost:8080/db/v1 \
   --project handbook
 ```
 
@@ -86,7 +86,7 @@ GOWORK=off go run . sync \
   --source google-drive \
   --drive-folder-id https://drive.google.com/drive/folders/<folder-id> \
   --drive-credentials-json /path/to/service-account.json \
-  --url http://localhost:8080/api/v1 \
+  --url http://localhost:8080/db/v1 \
   --project shared-drive-docs
 ```
 
@@ -99,7 +99,7 @@ GOWORK=off go run . sync \
   --web-start-url https://docs.example.com \
   --web-max-depth 2 \
   --web-max-pages 200 \
-  --url http://localhost:8080/api/v1 \
+  --url http://localhost:8080/db/v1 \
   --project public-docs
 ```
 

@@ -1,0 +1,215 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+package db
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/encoding"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/store/storeutils"
+	json "github.com/antflydb/antfly/go/pkg/libaf/json"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/klauspost/compress/zstd"
+	"go.uber.org/zap"
+)
+
+// compressAndSet compresses value with zstd using the buffer pool and writes it to the batch.
+// The encoder is reset and reused across calls within the same Batch() invocation.
+// Returns an error if compression or batch write fails.
+func (db *DBImpl) compressAndSet(batch *pebble.Batch, encoder *zstd.Encoder, key, value []byte) error {
+	compressedVal := db.bufferPool.Get().(*bytes.Buffer)
+	compressedVal.Reset()
+	encoder.Reset(compressedVal)
+	if _, err := encoder.Write(value); err != nil {
+		db.bufferPool.Put(compressedVal)
+		return fmt.Errorf("compressing value: %w", err)
+	}
+	if err := encoder.Close(); err != nil {
+		db.bufferPool.Put(compressedVal)
+		return fmt.Errorf("closing zstd encoder: %w", err)
+	}
+	if err := batch.Set(key, compressedVal.Bytes(), nil); err != nil {
+		db.bufferPool.Put(compressedVal)
+		return fmt.Errorf("writing key: %w", err)
+	}
+	db.bufferPool.Put(compressedVal)
+	return nil
+}
+
+// specialFieldBatchResult holds the results of extracting and writing special fields to a batch.
+type specialFieldBatchResult struct {
+	// IndexWrites are the writes that should be forwarded to the IndexManager.
+	IndexWrites [][2][]byte
+	// IndexDeletes are enrichment/edge keys that should be deleted from the IndexManager.
+	IndexDeletes [][]byte
+	// NumWrites is the number of individual writes added to the batch.
+	NumWrites int
+	// CleanedJSON is the document JSON with special fields removed.
+	CleanedJSON []byte
+	// HasNonSpecialFields is true if the document has fields other than _embeddings, _summaries, _edges.
+	HasNonSpecialFields bool
+}
+
+// extractAndWriteSpecialFields checks a document for special fields (_embeddings, _summaries, _edges),
+// extracts them, writes the extracted data to the batch, and returns the results.
+// If the document has no special fields, it returns nil (no work done).
+// The timestamp parameter is used for edge timestamp writes; pass 0 to skip timestamps.
+func (db *DBImpl) extractAndWriteSpecialFields(
+	batch *pebble.Batch,
+	docJSON []byte,
+	docKey []byte,
+	timestamp uint64,
+) (*specialFieldBatchResult, error) {
+	// Fast-path check for special fields
+	hasSpecialFields := bytes.Contains(docJSON, []byte(`"_embeddings"`)) ||
+		bytes.Contains(docJSON, []byte(`"_summaries"`)) ||
+		bytes.Contains(docJSON, []byte(`"_edges"`))
+
+	if !hasSpecialFields {
+		return nil, nil
+	}
+
+	embWrites, sumWrites, edgeWrites, indexDeletes, cleanedJSON, hasNonSpecialFields, err := db.extractSpecialFields(docJSON, docKey)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &specialFieldBatchResult{
+		IndexWrites:         make([][2][]byte, 0, len(embWrites)+len(sumWrites)+len(edgeWrites)),
+		IndexDeletes:        make([][]byte, 0, len(indexDeletes)),
+		CleanedJSON:         cleanedJSON,
+		HasNonSpecialFields: hasNonSpecialFields,
+	}
+
+	// Write extracted embeddings
+	for _, w := range embWrites {
+		if err := batch.Set(w[0], w[1], nil); err != nil {
+			db.logger.Error("could not set embedding for write",
+				zap.String("key", types.FormatKey(w[0])),
+				zap.Error(err))
+			continue
+		}
+		result.NumWrites++
+		result.IndexWrites = append(result.IndexWrites, w)
+	}
+
+	// Write extracted summaries
+	for _, w := range sumWrites {
+		if err := batch.Set(w[0], w[1], nil); err != nil {
+			db.logger.Error("could not set summary for write",
+				zap.String("key", types.FormatKey(w[0])),
+				zap.Error(err))
+			continue
+		}
+		result.NumWrites++
+		result.IndexWrites = append(result.IndexWrites, w)
+	}
+
+	// Write extracted edges
+	for _, w := range edgeWrites {
+		if err := batch.Set(w[0], w[1], nil); err != nil {
+			db.logger.Error("could not set edge for write",
+				zap.String("key", types.FormatKey(w[0])),
+				zap.Error(err))
+			continue
+		}
+		result.NumWrites++
+
+		// Write timestamp for edge if timestamp is available
+		if timestamp > 0 && shouldWriteTimestamp(w[0]) {
+			txnKey := append(bytes.Clone(w[0]), storeutils.TransactionSuffix...)
+			timestampBytes := encoding.EncodeUint64Ascending(nil, timestamp)
+			if err := batch.Set(txnKey, timestampBytes, nil); err != nil {
+				db.logger.Warn("could not write timestamp for edge",
+					zap.ByteString("edgeKey", w[0]),
+					zap.Error(err))
+			}
+		}
+
+		result.IndexWrites = append(result.IndexWrites, w)
+	}
+
+	// Delete edges that aren't in _edges (reconciliation)
+	for _, d := range indexDeletes {
+		if err := batch.Delete(d, nil); err != nil {
+			db.logger.Error("could not delete index key",
+				zap.ByteString("indexKey", d),
+				zap.Error(err))
+			continue
+		}
+		result.IndexDeletes = append(result.IndexDeletes, d)
+	}
+
+	return result, nil
+}
+
+// finalizeTransaction updates a transaction record to the given status (1=Committed, 2=Aborted).
+// Returns the commit version (non-zero only for commits).
+func (db *DBImpl) finalizeTransaction(ctx context.Context, txnID []byte, status int32, label string) (uint64, error) {
+	start := time.Now()
+	defer func() {
+		transactionDurationSeconds.WithLabelValues(label).Observe(time.Since(start).Seconds())
+	}()
+	defer activeTransactionsGauge.Dec()
+
+	record, err := db.loadTxnRecord(txnID)
+	if err != nil {
+		transactionOpsTotal.WithLabelValues(label, "error").Inc()
+		return 0, err
+	}
+
+	record.Status = status
+	record.FinalizedAt = time.Now().Unix()
+	var commitVersion uint64
+	if status == TxnStatusCommitted {
+		commitVersion = storeutils.GetTimestampFromContext(ctx)
+		if commitVersion == 0 {
+			commitVersion = record.Version()
+		}
+		record.CommitVersion = commitVersion
+	}
+
+	updatedData, err := json.Marshal(record)
+	if err != nil {
+		transactionOpsTotal.WithLabelValues(label, "error").Inc()
+		return 0, fmt.Errorf("marshaling transaction record: %w", err)
+	}
+
+	pdb := db.getPDB()
+
+	if pdb == nil {
+		transactionOpsTotal.WithLabelValues(label, "error").Inc()
+		return 0, pebble.ErrClosed
+	}
+
+	if err := pdb.Set(makeTxnKey(txnID), updatedData, pebble.Sync); err != nil {
+		transactionOpsTotal.WithLabelValues(label, "error").Inc()
+		return 0, fmt.Errorf("writing %s transaction record: %w", label, err)
+	}
+
+	transactionOpsTotal.WithLabelValues(label, "success").Inc()
+
+	db.traceFinalizeTransaction(txnID, status, commitVersion)
+
+	db.logger.Info("Finalized transaction",
+		zap.Binary("txnID", txnID),
+		zap.String("status", label))
+
+	return commitVersion, nil
+}

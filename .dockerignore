@@ -9,7 +9,6 @@
 .aider*
 *aider*
 .dockerignore
-Procfile*
 README*
 
 # Test and example data
@@ -65,3 +64,17 @@ datasets/
 *.py
 laion-400m-images/
 data/
+
+# Zig local build artifacts
+zig/.zig-cache/
+zig/zig-out/
+zig/e2e/
+zig/testdata/
+zig/bench/
+zig/deps/antfly-zig
+!zig/lib/pjrt/
+!zig/lib/pjrt/**
+!zig/pkg/antfly/src/data/
+!zig/pkg/antfly/src/data/**
+!zig/pkg/termite/src/models/
+!zig/pkg/termite/src/models/**

@@ -32,7 +32,8 @@ RUN case "${TARGETARCH}" in \
         arm64) zig_target="aarch64-linux-musl" ;; \
         *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac && \
-    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseFast install-antfly --prefix /out
+    cd zig && \
+    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseFast -Dedition=full install --prefix /out
 
 FROM --platform=$TARGETPLATFORM alpine:3.21
 
@@ -44,6 +45,7 @@ RUN addgroup -S antfly && adduser -S -G antfly -h /home/antfly antfly
 
 WORKDIR /
 COPY --from=builder /out/bin/antfly /antfly
+COPY --from=builder /out/share/antfly /usr/share/antfly
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD wget -qO- http://localhost:4200/readyz || exit 1

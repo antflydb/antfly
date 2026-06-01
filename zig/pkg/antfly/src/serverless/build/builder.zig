@@ -2690,10 +2690,10 @@ fn selectTextSourceAlloc(
 ) ![]u8 {
     if (spec.source_artifact_name) |source_artifact_name| {
         if (std.mem.eql(u8, source_artifact_name, search_sources.default_chunk_preview_output_name)) {
-            const chunk_text = if (projection.chunk_preview) |chunks|
-                try joinChunksAlloc(alloc, chunks)
-            else if (spec.chunked_sources.len > 0)
+            const chunk_text = if (spec.chunked_sources.len > 0)
                 try full_text_indexes.synthesizeChunkedFullTextAlloc(alloc, raw_doc, spec.chunked_sources)
+            else if (projection.chunk_preview) |chunks|
+                try joinChunksAlloc(alloc, chunks)
             else
                 try alloc.dupe(u8, "");
             defer alloc.free(chunk_text);

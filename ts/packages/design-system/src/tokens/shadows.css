@@ -1,16 +1,21 @@
+/**
+ * Visual language: flat surfaces — borders carry all hierarchy.
+ * The shadow tokens stay defined (existing components reference them) but
+ * resolve to nothing. If a future "loud zone" wants a hard offset drop
+ * shadow, layer it explicitly there rather than reintroducing soft blurs.
+ */
 :root {
-  --shadow-xs: 0 1px 2px oklch(0.15 0.02 240 / 4%);
-  --shadow-sm: 0 1px 3px oklch(0.15 0.02 240 / 8%), 0 1px 2px oklch(0.15 0.02 240 / 4%);
-  --shadow-md: 0 4px 6px -1px oklch(0.15 0.02 240 / 8%), 0 2px 4px -2px oklch(0.15 0.02 240 / 5%);
-  --shadow-lg: 0 10px 15px -3px oklch(0.15 0.02 240 / 8%), 0 4px 6px -4px oklch(0.15 0.02 240 / 5%);
-  --shadow-xl:
-    0 20px 25px -5px oklch(0.15 0.02 240 / 10%), 0 8px 10px -6px oklch(0.15 0.02 240 / 6%);
+  --shadow-xs: 0 0 #0000;
+  --shadow-sm: 0 0 #0000;
+  --shadow-md: 0 0 #0000;
+  --shadow-lg: 0 0 #0000;
+  --shadow-xl: 0 0 #0000;
 }
 
 .dark {
-  --shadow-xs: 0 1px 2px oklch(0 0 0 / 40%);
-  --shadow-sm: 0 1px 3px oklch(0 0 0 / 45%), 0 1px 2px oklch(0 0 0 / 35%);
-  --shadow-md: 0 4px 6px -1px oklch(0 0 0 / 45%), 0 2px 4px -2px oklch(0 0 0 / 35%);
-  --shadow-lg: 0 10px 15px -3px oklch(0 0 0 / 50%), 0 4px 6px -4px oklch(0 0 0 / 40%);
-  --shadow-xl: 0 20px 25px -5px oklch(0 0 0 / 55%), 0 8px 10px -6px oklch(0 0 0 / 45%);
+  --shadow-xs: 0 0 #0000;
+  --shadow-sm: 0 0 #0000;
+  --shadow-md: 0 0 #0000;
+  --shadow-lg: 0 0 #0000;
+  --shadow-xl: 0 0 #0000;
 }

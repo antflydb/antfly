@@ -17,7 +17,7 @@ NC='\033[0m' # No Color
 
 # Default Postgres URL
 POSTGRES_URL="${POSTGRES_URL:-postgresql://postgres:postgres@localhost:5432/antfly_demo}"
-ANTFLY_URL="${ANTFLY_URL:-http://localhost:8080/api/v1}"
+ANTFLY_URL="${ANTFLY_URL:-http://localhost:8080/db/v1}"
 
 # Parse command line arguments
 SKIP_POSTGRES_CHECK=false
@@ -85,7 +85,7 @@ if [ "$SKIP_ANTFLY_CHECK" = false ]; then
     echo ""
     echo "Start Antfly first:"
     echo "  cd ../../"
-    echo "  go run ./cmd/antfly swarm"
+    echo "  go run ./go/pkg/antfly/cmd swarm"
     echo ""
     echo "Or skip this check:"
     echo "  $0 --skip-antfly-check"

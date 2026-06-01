@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const apply_state = @import("derived/apply_state.zig");
+const doc_identity = @import("doc_identity.zig");
 const internal_keys = @import("../internal_keys.zig");
 const docstore_mod = @import("../docstore.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -208,6 +209,8 @@ pub const OpenedCoreResources = struct {
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
+    identity_namespace: doc_identity.Namespace,
+    artifact_cleanup_maybe: bool,
 
     pub fn deinit(self: *OpenedCoreResources, alloc: Allocator) void {
         if (self.schema) |schema| schema_mod.freeSchema(alloc, schema);
@@ -246,6 +249,8 @@ pub const BatchExecutionResources = struct {
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     log_mutex: *std.atomic.Mutex,
+    identity_namespace: doc_identity.Namespace,
+    artifact_cleanup_maybe: *std.atomic.Value(bool),
 };
 
 pub const SplitIndexHandoffs = struct {
@@ -276,6 +281,8 @@ pub const DBCore = struct {
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
+    identity_namespace: doc_identity.Namespace,
+    artifact_cleanup_maybe: std.atomic.Value(bool),
 
     pub fn fromOpened(alloc: Allocator, opened: OpenedCoreResources) DBCore {
         return .{
@@ -290,6 +297,8 @@ pub const DBCore = struct {
             .apply_mutex = opened.apply_mutex,
             .log_mutex = opened.log_mutex,
             .schema = opened.schema,
+            .identity_namespace = opened.identity_namespace,
+            .artifact_cleanup_maybe = .init(opened.artifact_cleanup_maybe),
         };
     }
 
@@ -340,6 +349,8 @@ pub const DBCore = struct {
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
             .log_mutex = self.log_mutex,
+            .identity_namespace = self.identity_namespace,
+            .artifact_cleanup_maybe = &self.artifact_cleanup_maybe,
         };
     }
 
@@ -647,26 +658,75 @@ pub const DBCore = struct {
         );
     }
 
+    pub fn hasArtifactCleanupMaybe(self: *const DBCore) bool {
+        return self.artifact_cleanup_maybe.load(.acquire) or
+            self.index_manager.hasGeneratedEnrichmentTargets();
+    }
+
+    pub fn appendArtifactPresenceMarker(
+        self: *DBCore,
+        writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    ) !void {
+        self.artifact_cleanup_maybe.store(true, .release);
+        try writes.append(self.alloc, .{
+            .key = internal_keys.artifact_presence_key[0..],
+            .value = "1",
+        });
+    }
+
     pub fn collectAndDeleteEnrichmentArtifactsForDocContext(
         self: *DBCore,
         alloc: Allocator,
         doc_key: []const u8,
         deleted: *std.ArrayListUnmanaged([]u8),
     ) !void {
-        const prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
-        defer alloc.free(prefix);
+        if (!self.hasArtifactCleanupMaybe()) return;
+
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+        var unrecorded_delete_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (unrecorded_delete_keys.items) |key| alloc.free(key);
+            unrecorded_delete_keys.deinit(alloc);
+        }
+
+        const artifact_prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
+        defer alloc.free(artifact_prefix);
+        try self.collectDeleteKeysForPrefix(alloc, artifact_prefix, &deletes, deleted, &unrecorded_delete_keys);
+
+        const asset_state_prefix = try internal_keys.assetStateRootPrefixAlloc(alloc, doc_key);
+        defer alloc.free(asset_state_prefix);
+        try self.collectDeleteKeysForPrefix(alloc, asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
+
+        const graph_asset_state_prefix = try internal_keys.graphAssetStateRootPrefixAlloc(alloc, doc_key);
+        defer alloc.free(graph_asset_state_prefix);
+        try self.collectDeleteKeysForPrefix(alloc, graph_asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
+
+        if (deletes.items.len > 0) {
+            try self.putStoreBatch(&.{}, deletes.items);
+        }
+    }
+
+    fn collectDeleteKeysForPrefix(
+        self: *DBCore,
+        alloc: Allocator,
+        prefix: []const u8,
+        deletes: *std.ArrayListUnmanaged([]const u8),
+        recorded: ?*std.ArrayListUnmanaged([]u8),
+        unrecorded: *std.ArrayListUnmanaged([]u8),
+    ) !void {
         const existing = try self.scanStorePrefix(alloc, prefix);
         defer docstore_mod.DocStore.freeResults(alloc, existing);
-        if (existing.len == 0) return;
-
-        var deletes = try alloc.alloc([]const u8, existing.len);
-        defer alloc.free(deletes);
-        for (existing, 0..) |entry, i| {
-            const duped = try alloc.dupe(u8, entry.key);
-            deletes[i] = duped;
-            try deleted.append(alloc, duped);
+        for (existing) |entry| {
+            const owned = try alloc.dupe(u8, entry.key);
+            errdefer alloc.free(owned);
+            try deletes.append(alloc, owned);
+            if (recorded) |out| {
+                try out.append(alloc, owned);
+            } else {
+                try unrecorded.append(alloc, owned);
+            }
         }
-        try self.putStoreBatch(&.{}, deletes);
     }
 
     pub fn loadIndexes(self: *DBCore) !void {
@@ -686,7 +746,14 @@ pub const DBCore = struct {
         alloc: Allocator,
         config: transaction_runtime_mod.Config,
     ) !types.TransactionRecoveryStats {
-        return try transaction_runtime_mod.recoverOnce(alloc, self.store, config);
+        var identity_ctx = TransactionRecoveryIdentityContext{
+            .store = self.store,
+            .identity_namespace = self.identity_namespace,
+            .alloc = alloc,
+        };
+        var effective_config = config;
+        effective_config.resolution_extra_hooks = transactionRecoveryIdentityHooks(&identity_ctx);
+        return try transaction_runtime_mod.recoverOnce(alloc, self.store, effective_config);
     }
 
     pub fn writeSnapshot(self: *DBCore, snapshot_root: []const u8) !u64 {
@@ -979,9 +1046,31 @@ pub const DBCore = struct {
         status: transactions_mod.TxnStatus,
         commit_version: u64,
     ) !void {
+        try self.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{});
+    }
+
+    pub fn resolveTransactionIntentsWithExtraBatch(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+        extra_batch: transactions_mod.ResolutionExtraBatch,
+    ) !void {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.resolveIntents(txn_id, status, commit_version);
+        try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
+    }
+
+    pub fn collectTransactionIntentDocumentKeys(
+        self: *DBCore,
+        alloc: Allocator,
+        txn_id: transactions_mod.TxnId,
+        upserts: *std.ArrayListUnmanaged([]const u8),
+        deletes: *std.ArrayListUnmanaged([]const u8),
+    ) !void {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.collectIntentDocumentKeys(alloc, txn_id, upserts, deletes);
     }
 
     pub fn getTransactionStatus(self: *DBCore, txn_id: transactions_mod.TxnId) !transactions_mod.TxnStatus {
@@ -1017,9 +1106,108 @@ pub const DBCore = struct {
     pub fn recoverTransactions(self: *DBCore, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        return try manager.recoverTransactions(cutoff_timestamp, resolution_timestamp);
+        var identity_ctx = TransactionRecoveryIdentityContext{
+            .store = self.store,
+            .identity_namespace = self.identity_namespace,
+            .alloc = self.alloc,
+        };
+        return try manager.recoverTransactionsWithExtraBatchHooks(
+            cutoff_timestamp,
+            resolution_timestamp,
+            transactionRecoveryIdentityHooks(&identity_ctx),
+        );
     }
 };
+
+pub const TransactionRecoveryIdentityContext = struct {
+    store: *docstore_mod.DocStore,
+    identity_namespace: doc_identity.Namespace,
+    alloc: Allocator,
+};
+
+pub fn transactionRecoveryIdentityHooks(ctx: *TransactionRecoveryIdentityContext) transactions_mod.TxnManager.RecoveryExtraBatchHooks {
+    return .{
+        .ctx = ctx,
+        .build = buildTransactionRecoveryIdentityExtraBatch,
+        .cleanup = cleanupTransactionRecoveryIdentityExtraBatch,
+    };
+}
+
+fn transactionIdentityMetadataKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "\x00\x00__metadata__:") or
+        std.mem.startsWith(u8, key, "splitstate:") or
+        std.mem.startsWith(u8, key, "splitdelta:") or
+        internal_keys.isTtlKey(key);
+}
+
+fn buildTransactionRecoveryIdentityExtraBatch(
+    ctx: ?*anyopaque,
+    manager: *transactions_mod.TxnManager,
+    txn_id: transactions_mod.TxnId,
+    status: transactions_mod.TxnStatus,
+    timestamp: u64,
+) anyerror!transactions_mod.ResolutionExtraBatch {
+    _ = timestamp;
+    if (status != .committed) return .{};
+    const identity_ctx: *TransactionRecoveryIdentityContext = @ptrCast(@alignCast(ctx.?));
+    const alloc = identity_ctx.alloc;
+
+    var raw_upserts = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (raw_upserts.items) |key| alloc.free(@constCast(key));
+        raw_upserts.deinit(alloc);
+    }
+    var raw_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (raw_deletes.items) |key| alloc.free(@constCast(key));
+        raw_deletes.deinit(alloc);
+    }
+    try manager.collectIntentDocumentKeys(alloc, txn_id, &raw_upserts, &raw_deletes);
+
+    var identity_upserts = std.ArrayListUnmanaged([]const u8).empty;
+    defer identity_upserts.deinit(alloc);
+    var identity_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer identity_deletes.deinit(alloc);
+    for (raw_upserts.items) |key| {
+        if (!transactionIdentityMetadataKey(key)) try identity_upserts.append(alloc, key);
+    }
+    for (raw_deletes.items) |key| {
+        if (!transactionIdentityMetadataKey(key)) try identity_deletes.append(alloc, key);
+    }
+
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    errdefer {
+        for (identity_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+        alloc,
+        identity_ctx.store,
+        identity_ctx.identity_namespace,
+        identity_ctx.store.lastReplaySequence(0),
+        &identity_writes,
+        identity_upserts.items,
+        identity_deletes.items,
+    );
+    if (identity_writes.items.len == 0) return .{};
+    return .{
+        .writes = try identity_writes.toOwnedSlice(alloc),
+    };
+}
+
+fn cleanupTransactionRecoveryIdentityExtraBatch(ctx: ?*anyopaque, batch: transactions_mod.ResolutionExtraBatch) void {
+    const identity_ctx: *TransactionRecoveryIdentityContext = @ptrCast(@alignCast(ctx.?));
+    const alloc = identity_ctx.alloc;
+    for (batch.writes) |item| {
+        alloc.free(@constCast(item.key));
+        alloc.free(@constCast(item.value));
+    }
+    if (batch.writes.len > 0) alloc.free(@constCast(batch.writes));
+    if (batch.deletes.len > 0) alloc.free(@constCast(batch.deletes));
+}
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) {
@@ -1103,6 +1291,9 @@ pub fn openCoreResourcesFromPrimaryStore(
     change_journal_storage: ?lsm_backend_mod.Storage,
     index_backends: IndexBackendOptions,
     opened_primary: OpenedPrimaryStore,
+    configured_identity_namespace: ?doc_identity.Namespace,
+    persist_identity_namespace_if_missing: bool,
+    identity_namespace_mismatch_policy: doc_identity.NamespaceMismatchPolicy,
 ) !OpenedCoreResources {
     var owned_path: ?[]u8 = null;
     var owned_applied_sequence_checkpoint_path: ?[]u8 = null;
@@ -1173,6 +1364,13 @@ pub fn openCoreResourcesFromPrimaryStore(
     const persisted_range = try range_state_mod.loadRange(alloc, store);
     defer range_state_mod.freeRange(alloc, persisted_range);
     shard_manager.* = try shard_mod.ShardManager.init(alloc, store, persisted_range);
+    const identity_namespace = try doc_identity.loadOrInitNamespaceWithPolicy(
+        store,
+        configured_identity_namespace,
+        persist_identity_namespace_if_missing,
+        identity_namespace_mismatch_policy,
+    );
+    const artifact_cleanup_maybe = try loadArtifactCleanupMaybe(alloc, store);
 
     index_manager.* = try index_manager_mod.IndexManager.initWithOptions(
         alloc,
@@ -1205,7 +1403,38 @@ pub fn openCoreResourcesFromPrimaryStore(
         .apply_mutex = apply_mutex,
         .log_mutex = log_mutex,
         .schema = schema,
+        .identity_namespace = identity_namespace,
+        .artifact_cleanup_maybe = artifact_cleanup_maybe,
     };
+}
+
+fn loadArtifactCleanupMaybe(alloc: Allocator, store: *docstore_mod.DocStore) !bool {
+    const marker = store.get(alloc, internal_keys.artifact_presence_key[0..]) catch |err| switch (err) {
+        error.NotFound => return try hasAnyUserNamespaceKey(store),
+        else => return err,
+    };
+    alloc.free(marker);
+    return true;
+}
+
+fn hasAnyUserNamespaceKey(store: *docstore_mod.DocStore) !bool {
+    const State = struct {
+        found: bool = false,
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            _ = key;
+            _ = value;
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            state.found = true;
+            return .stop;
+        }
+    };
+
+    const lower = [_]u8{internal_keys.user_namespace};
+    const upper = [_]u8{internal_keys.user_namespace + 1};
+    var state = State{};
+    try store.scanWithContext(lower[0..], upper[0..], .{}, &state, State.scanEntry);
+    return state.found;
 }
 
 pub fn clearAllKeysFromStore(alloc: Allocator, store: *docstore_mod.DocStore) !void {

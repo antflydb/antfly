@@ -35,6 +35,7 @@ const CliConfig = struct {
     health_port: ?u16 = null,
     tick_ms: ?u64 = null,
     local_node_id: ?u64 = null,
+    data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
@@ -490,6 +491,10 @@ pub fn runFromIterator(
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
 
+    const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
+    defer alloc.free(data_dir);
+    try antfly.common.data_format.ensureCompatible(alloc, data_dir);
+
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
 
@@ -631,6 +636,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--data-dir")) {
+            cfg.data_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--replica-root-dir")) {
             cfg.replica_root_dir = args.next() orelse return error.InvalidArguments;
             continue;
@@ -652,8 +661,19 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
     return cfg;
 }
 
+fn resolveLocalBaseDir(
+    alloc: std.mem.Allocator,
+    cli: CliConfig,
+    cfg: ?*const antfly.common.config.Config,
+) ![]u8 {
+    if (cli.data_dir) |path| return try normalizeResolvedPathAlloc(alloc, path);
+    return try antfly.common.config.resolveLocalBaseDir(alloc, cfg);
+}
+
 fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.common.config.Config) !ResolvedPaths {
-    const base = try antfly.common.config.resolveLocalRoleBaseDir(alloc, cfg, "metadata");
+    const local_base = try resolveLocalBaseDir(alloc, cli, cfg);
+    defer alloc.free(local_base);
+    const base = try std.fmt.allocPrint(alloc, "{s}/metadata", .{local_base});
     defer alloc.free(base);
 
     const replica_root_dir = if (cli.replica_root_dir) |path|
@@ -936,6 +956,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --tick-ms <ms>                 Sleep interval while serving (default: 25)
+        \\  --data-dir <path>              Local storage root for metadata data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
         \\  --snapshot-root-dir <path>     Snapshot root directory
@@ -991,7 +1012,8 @@ test "metadata runtime prefers common config raft url for local id when cli bind
     raft_urls[0] = .{ .node_id = 7, .url = try alloc.dupe(u8, "http://127.0.0.1:7011") };
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .speech_to_text = antfly.transcribing.Registry.init(alloc),
+        .transcribers = antfly.transcribing.Registry.init(alloc),
+        .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .metadata = .{
             .raft_urls = raft_urls,
@@ -1011,7 +1033,8 @@ test "metadata runtime resolves paths from common storage base dir" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .speech_to_text = antfly.transcribing.Registry.init(alloc),
+        .transcribers = antfly.transcribing.Registry.init(alloc),
+        .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .storage = .{
             .local_base_dir = try alloc.dupe(u8, "/tmp/antflydb"),
@@ -1029,7 +1052,8 @@ test "metadata runtime resolves paths from common storage base dir" {
 test "metadata runtime derives reconciler config from common shard allocation settings" {
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(std.testing.allocator),
-        .speech_to_text = antfly.transcribing.Registry.init(std.testing.allocator),
+        .transcribers = antfly.transcribing.Registry.init(std.testing.allocator),
+        .readers = antfly.readers.Registry.init(std.testing.allocator),
         .text_to_speech = antfly.synthesizing.Registry.init(std.testing.allocator),
         .shard_allocation = .{
             .max_shard_size_bytes = 2048,

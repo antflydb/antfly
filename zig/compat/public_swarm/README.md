@@ -6,21 +6,21 @@ contract instead of comparing isolated HBC internals.
 The shared harness is `bench/storage/public_query_guardrail.zig`. It generates one
 deterministic packed-vector dataset, writes it through:
 
-- `POST /api/v1/tables/<table>/batch`
+- `POST /db/v1/tables/<table>/batch`
 - `sync_level=write` by default
 - packed `_embeddings.<index>` payloads
 
 Then it waits for the dense index status endpoint to report query-visible
 documents and runs:
 
-- `POST /api/v1/tables/<table>/query`
+- `POST /db/v1/tables/<table>/query`
 - `embeddings.<index>` packed query vectors
 - the same `k`, query count, repeat count, and concurrency
 
 ## Run Zig
 
 ```sh
-zig build install-antfly
+zig build install -Dedition=full
 zig build public-query-guardrail -- \
   --mode swarm \
   --server-kind zig \
@@ -41,9 +41,9 @@ zig build public-query-guardrail -- \
 Build the sibling Go binary first:
 
 ```sh
-(cd ~/go/src/github.com/antflydb/antfly && \
+(cd ~/go/pkg/antfly/src/github.com/antflydb/antfly && \
   GOEXPERIMENT=simd GOCACHE=/tmp/go-build-cache \
-  go build -o /tmp/antfly-go ./cmd/antfly)
+  go build -o /tmp/antfly-go ./go/pkg/antfly/cmd)
 ```
 
 Then run the same harness against Go swarm:

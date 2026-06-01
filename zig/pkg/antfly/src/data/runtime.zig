@@ -22,6 +22,7 @@ const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend_mod = @import("../storage/lsm_backend.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
+const doc_identity = @import("../storage/db/doc_identity.zig");
 const data_raft_batch = @import("raft_batch.zig");
 const platform_clock = @import("../platform/clock.zig");
 const process_memory_mod = @import("../platform/process_memory.zig");
@@ -63,8 +64,10 @@ const CliConfig = struct {
     store_role: ?[]const u8 = null,
     failure_domain: ?[]const u8 = null,
     tick_ms: ?u64 = null,
+    data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
+    snapshot_root_dir: ?[]const u8 = null,
     secret_store_path: ?[]const u8 = null,
     help: bool = false,
 
@@ -77,11 +80,13 @@ const CliConfig = struct {
 const ResolvedPaths = struct {
     replica_root_dir: []u8,
     replica_catalog_path: []u8,
+    snapshot_root_dir: []u8,
     auth_store_root_dir: []u8,
 
     fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
+        alloc.free(self.snapshot_root_dir);
         alloc.free(self.auth_store_root_dir);
     }
 };
@@ -237,7 +242,7 @@ const RaftTableApplyStateMachine = struct {
         self.write_cache.hbc_cache = &storage.hbc_cache;
         self.write_cache.resource_manager = &storage.resource_manager;
         self.write_cache.backend_runtime = storage.backend_runtime;
-        self.write_cache.local_termite_provider = self.write_source.local_termite_provider;
+        self.write_cache.antfly_provider = self.write_source.antfly_provider;
         self.write_cache.secret_store = self.write_source.secret_store;
         self.write_cache.remote_content = self.write_source.remote_content;
         self.write_source.read_cache = &storage.read_cache;
@@ -1099,6 +1104,7 @@ pub const DataServerConfig = struct {
     data_raft_state_backend: antfly.raft.ReplicaStateBackend = .wal,
     replica_root_dir: []const u8,
     replica_catalog_path: ?[]const u8 = null,
+    snapshot_root_dir: ?[]const u8 = null,
     store_registration: ?StoreRegistrationConfig = null,
     group_leadership_source: ?GroupLeadershipSource = null,
     group_membership_source: ?GroupMembershipSource = null,
@@ -1618,6 +1624,8 @@ pub const DataServer = struct {
             apply_sm.attachProvisionedStorage(&self.provisioned_storage);
             _ = apply_sm.write_source.withSecretStore(api_server_cfg.secret_store);
             apply_sm.write_cache.secret_store = api_server_cfg.secret_store;
+            _ = apply_sm.write_source.withRemoteContent(api_server_cfg.remote_content);
+            apply_sm.write_cache.remote_content = api_server_cfg.remote_content;
             apply_sm.write_source.setLocalChangeHook(self.localChangeHook());
         }
         self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
@@ -1630,20 +1638,20 @@ pub const DataServer = struct {
             self.read_source.source(),
             self.write_source.source(),
         );
-        self.http_server.?.local_termite_provider = self.read_source.local_termite_provider;
+        self.http_server.?.antfly_provider = self.read_source.antfly_provider;
     }
 
-    pub fn setLocalTermiteProvider(
+    pub fn setAntflyProvider(
         self: *DataServer,
-        provider: ?antfly.inference.managed_embedder.LocalTermiteProvider,
+        provider: ?antfly.inference.managed_embedder.AntflyProvider,
     ) void {
-        _ = self.read_source.withLocalTermiteProvider(provider);
-        _ = self.write_source.withLocalTermiteProvider(provider);
+        _ = self.read_source.withAntflyProvider(provider);
+        _ = self.write_source.withAntflyProvider(provider);
         if (self.data_raft_apply) |apply_sm| {
-            _ = apply_sm.write_source.withLocalTermiteProvider(provider);
-            apply_sm.write_cache.local_termite_provider = provider;
+            _ = apply_sm.write_source.withAntflyProvider(provider);
+            apply_sm.write_cache.antfly_provider = provider;
         }
-        if (self.http_server) |*server| server.local_termite_provider = provider;
+        if (self.http_server) |*server| server.antfly_provider = provider;
     }
 
     pub fn start(self: *DataServer) !void {
@@ -2421,6 +2429,14 @@ pub const DataServer = struct {
                         err,
                     });
                 };
+                if (self.data_raft_apply) |apply_sm| {
+                    _ = self.write_source.transferAdoptableWriteCacheEntriesTo(&apply_sm.write_source, table_name) catch |err| {
+                        std.log.warn("failed to transfer provisioned write cache to raft apply table={s} err={}", .{
+                            table_name,
+                            err,
+                        });
+                    };
+                }
                 self.syncDataRaftFromRemoteMetadata() catch |err| {
                     std.log.warn("failed to sync data raft placement after structural change table={s} err={}", .{
                         table_name,
@@ -2552,30 +2568,19 @@ pub const DataServer = struct {
             };
         }
 
-        const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, self.write_source.replica_root_dir, group_id);
-        defer alloc.free(db_path);
-
-        var db = antfly.db.DB.open(alloc, db_path, .{
-            .open_mode = .query_readonly,
-            .start_index_workers = false,
-            .ttl_cleanup = .{ .enabled = false },
-            .transaction_recovery = .{ .enabled = false },
-            .text_merge = .{ .enabled = false },
-            .lsm_cache = &self.provisioned_storage.lsm_cache,
-            .hbc_cache = &self.provisioned_storage.hbc_cache,
-            .lsm_root_generation = lsm_root_generation,
-            .resource_manager = &self.provisioned_storage.resource_manager,
-            .backend_runtime = try self.ensureBackendRuntime(),
-        }) catch |err| switch (err) {
-            error.FileNotFound => return error.UnknownGroup,
-            else => return err,
-        };
-        defer db.close();
-
-        const median_key = db.findMedianKey(alloc) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const median_key = if (self.data_raft_apply) |apply_sm|
+            (apply_sm.write_source.findMedianKeyForGroup(alloc, group_id, lsm_root_generation) catch |err| switch (err) {
+                error.FileNotFound => return error.UnknownGroup,
+                else => return err,
+            }) orelse (self.write_source.findMedianKeyForGroup(alloc, group_id, lsm_root_generation) catch |err| switch (err) {
+                error.FileNotFound => return error.UnknownGroup,
+                else => return err,
+            })
+        else
+            self.write_source.findMedianKeyForGroup(alloc, group_id, lsm_root_generation) catch |err| switch (err) {
+                error.FileNotFound => return error.UnknownGroup,
+                else => return err,
+            };
         errdefer if (median_key) |key| alloc.free(key);
         try self.storeCachedLocalSplitKey(group_id, lsm_root_generation, change_generation, median_key);
         return median_key;
@@ -2592,7 +2597,7 @@ pub const DataServer = struct {
         defer self.local_split_key_cache_mutex.unlock();
         if (try self.local_split_key_cache.snapshot(alloc, group_id, lsm_root_generation, change_generation)) |snapshot| {
             if (snapshot.split_key) |key| return .{ .key = key };
-            return .missing;
+            return null;
         }
         return null;
     }
@@ -2604,6 +2609,7 @@ pub const DataServer = struct {
         change_generation: u64,
         split_key: ?[]const u8,
     ) !void {
+        if (split_key == null) return;
         lockAtomic(&self.local_split_key_cache_mutex);
         defer self.local_split_key_cache_mutex.unlock();
         try self.local_split_key_cache.put(self.alloc, group_id, lsm_root_generation, change_generation, split_key);
@@ -2648,8 +2654,11 @@ pub const DataServer = struct {
 
     fn localObserveMerge(ptr: *anyopaque, record: antfly.metadata.MergeTransitionRecord) !antfly.metadata.transition_state.MergeObservation {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const runtime = self.local_transition_runtime orelse return error.UnsupportedOperation;
-        return try runtime.shardOperationAdapter().observeMerge(record);
+        if (self.local_transition_runtime) |runtime| return try runtime.shardOperationAdapter().observeMerge(record);
+        var runtime = try self.initLocalMergeRuntime(record.donor_group_id, record.receiver_group_id);
+        defer runtime.deinit();
+        const status = try runtime.runtime().observeStatus(record.donor_group_id, record.receiver_group_id);
+        return .{ .donor = status, .receiver = status };
     }
 
     fn localPrepareSplitSource(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "prepare_split_source")) !void {
@@ -2729,13 +2738,71 @@ pub const DataServer = struct {
         defer self.alloc.free(source_root_dir);
         const dest_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, destination_group_id);
         defer self.alloc.free(dest_root_dir);
+        var dest_db_options = antfly.db.OpenOptions{};
+        if (try self.identityNamespaceForSplitDestination(source_group_id, destination_group_id)) |namespace| {
+            dest_db_options.identity_namespace = namespace;
+        }
         try self.ensureSplitSourceApplyStoreSeeded(source_root_dir, source_group_id);
         return try antfly.raft.SplitCoordinatorRuntime.init(self.alloc, .{
             .source_root_dir = source_root_dir,
             .dest_root_dir = dest_root_dir,
             .source_group_id = source_group_id,
             .dest_group_id = destination_group_id,
+            .dest = .{ .root_dir = dest_root_dir, .db = dest_db_options },
         });
+    }
+
+    fn initLocalMergeRuntime(self: *DataServer, donor_group_id: u64, receiver_group_id: u64) !antfly.raft.MergeCoordinatorRuntime {
+        const donor_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, donor_group_id);
+        defer self.alloc.free(donor_root_dir);
+        const receiver_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, receiver_group_id);
+        defer self.alloc.free(receiver_root_dir);
+        var receiver_db_options = antfly.db.OpenOptions{};
+        const receiver_namespace = try self.identityNamespaceForLocalGroup(receiver_group_id);
+        if (receiver_namespace) |namespace| {
+            receiver_db_options.identity_namespace = namespace;
+            receiver_db_options.prefer_existing_identity_namespace = true;
+        }
+        try self.ensureSplitSourceApplyStoreSeeded(donor_root_dir, donor_group_id);
+        return try antfly.raft.MergeCoordinatorRuntime.init(self.alloc, .{
+            .donor_root_dir = donor_root_dir,
+            .receiver_root_dir = receiver_root_dir,
+            .donor_group_id = donor_group_id,
+            .receiver_group_id = receiver_group_id,
+            .receiver = .{ .root_dir = receiver_root_dir, .db = receiver_db_options },
+            .receiver_identity_reassignment_namespace = receiver_namespace,
+        });
+    }
+
+    fn identityNamespaceForLocalGroup(self: *DataServer, group_id: u64) !?antfly.db.DocIdentityNamespace {
+        var snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
+        const range = findRangeByGroupId(snapshot.ranges, group_id) orelse return null;
+        return identityNamespaceFromRange(range);
+    }
+
+    fn identityNamespaceForSplitDestination(self: *DataServer, source_group_id: u64, destination_group_id: u64) !?antfly.db.DocIdentityNamespace {
+        _ = destination_group_id;
+        return try self.identityNamespaceForLocalGroupDb(source_group_id);
+    }
+
+    fn identityNamespaceForLocalGroupDb(self: *DataServer, group_id: u64) !?antfly.db.DocIdentityNamespace {
+        const root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, group_id);
+        defer self.alloc.free(root_dir);
+
+        var db = antfly.db.DB.open(self.alloc, root_dir, .{
+            .open_mode = .status_only,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .transaction_recovery = .{ .enabled = false },
+            .text_merge = .{ .enabled = false },
+            .backend_runtime = try self.ensureBackendRuntime(),
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer db.close();
+        return db.core.identity_namespace;
     }
 
     fn ensureSplitSourceApplyStoreSeeded(self: *DataServer, source_root_dir: []const u8, source_group_id: u64) !void {
@@ -2798,29 +2865,61 @@ pub const DataServer = struct {
 
     fn localAcceptMergeReceiver(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "accept_merge_receiver")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const runtime = self.local_transition_runtime orelse return error.UnsupportedOperation;
-        try runtime.shardOperationAdapter().execute(.{ .accept_merge_receiver = op });
+        if (self.local_transition_runtime) |runtime| {
+            try runtime.shardOperationAdapter().execute(.{ .accept_merge_receiver = op });
+        } else {
+            var runtime = try self.initLocalMergeRuntime(op.donor_group_id, op.receiver_group_id);
+            defer runtime.deinit();
+            const merge = runtime.runtime();
+            if (op.allow_doc_identity_reassignment) {
+                try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+            }
+            try merge.acceptReceiver(op.donor_group_id, op.receiver_group_id);
+        }
         self.invalidateLocalGroupStatusCache();
     }
 
     fn localCatchUpMergeReceiver(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "catch_up_merge_receiver")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const runtime = self.local_transition_runtime orelse return error.UnsupportedOperation;
-        try runtime.shardOperationAdapter().execute(.{ .catch_up_merge_receiver = op });
+        if (self.local_transition_runtime) |runtime| {
+            try runtime.shardOperationAdapter().execute(.{ .catch_up_merge_receiver = op });
+        } else {
+            var runtime = try self.initLocalMergeRuntime(op.donor_group_id, op.receiver_group_id);
+            defer runtime.deinit();
+            const merge = runtime.runtime();
+            if (op.allow_doc_identity_reassignment) {
+                try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+            }
+            _ = try merge.catchUpReceiver(op.donor_group_id, op.receiver_group_id);
+        }
         self.invalidateLocalGroupStatusCache();
     }
 
     fn localFinalizeMerge(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const runtime = self.local_transition_runtime orelse return error.UnsupportedOperation;
-        try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
+        if (self.local_transition_runtime) |runtime| {
+            try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
+        } else {
+            var runtime = try self.initLocalMergeRuntime(op.donor_group_id, op.receiver_group_id);
+            defer runtime.deinit();
+            const merge = runtime.runtime();
+            if (op.allow_doc_identity_reassignment) {
+                try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+            }
+            _ = try merge.finalizeMerge(op.donor_group_id, op.receiver_group_id);
+        }
         self.invalidateLocalGroupStatusCache();
     }
 
     fn localRollbackMerge(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "rollback_merge")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const runtime = self.local_transition_runtime orelse return error.UnsupportedOperation;
-        try runtime.shardOperationAdapter().execute(.{ .rollback_merge = op });
+        if (self.local_transition_runtime) |runtime| {
+            try runtime.shardOperationAdapter().execute(.{ .rollback_merge = op });
+        } else {
+            var runtime = try self.initLocalMergeRuntime(op.donor_group_id, op.receiver_group_id);
+            defer runtime.deinit();
+            _ = try runtime.runtime().rollbackMerge(op.donor_group_id, op.receiver_group_id);
+        }
         self.invalidateLocalGroupStatusCache();
     }
 
@@ -2977,30 +3076,52 @@ pub const DataServer = struct {
             );
         }
         if (try self.cloneCachedLocalGroupStatusesMatching(alloc, generation, fingerprint, true)) |stale| {
-            try self.requestLocalGroupStatusRefreshWithSources(
-                generation,
-                fingerprint,
+            const stale_owned = stale;
+            errdefer freeGroupStatusesOwned(alloc, stale_owned);
+            const refreshed = self.collectLiveLocalGroupStatusesWithSources(
+                alloc,
                 replica_root_dir,
                 group_ids,
                 tables,
                 ranges,
+                group_leadership_source,
+                group_membership_source,
                 stores,
                 merged_group_statuses,
                 split_transitions,
                 merge_transitions,
                 split_observations,
                 merge_observations,
-                inferred_group_leadership,
-                group_leadership_source,
-                group_membership_source,
-            );
-            return try mergeRaftOnlyLocalGroupStatusFallbacks(
-                alloc,
-                stale,
-                group_ids,
-                group_leadership_source,
-                group_membership_source,
-            );
+            ) catch |err| {
+                std.log.warn("store status stale group refresh failed err={}", .{err});
+                try self.requestLocalGroupStatusRefreshWithSources(
+                    generation,
+                    fingerprint,
+                    replica_root_dir,
+                    group_ids,
+                    tables,
+                    ranges,
+                    stores,
+                    merged_group_statuses,
+                    split_transitions,
+                    merge_transitions,
+                    split_observations,
+                    merge_observations,
+                    inferred_group_leadership,
+                    group_leadership_source,
+                    group_membership_source,
+                );
+                return try mergeRaftOnlyLocalGroupStatusFallbacks(
+                    alloc,
+                    stale_owned,
+                    group_ids,
+                    group_leadership_source,
+                    group_membership_source,
+                );
+            };
+            freeGroupStatusesOwned(alloc, stale_owned);
+            try self.storeCachedLocalGroupStatuses(generation, fingerprint, refreshed);
+            return refreshed;
         }
         try self.requestLocalGroupStatusRefreshWithSources(
             generation,
@@ -3090,7 +3211,7 @@ pub const DataServer = struct {
                     if (self.shouldSkipActiveStartupGroupStatusOpen(table.name, group_id, active_target)) {
                         continue;
                     }
-                    if (self.write_source.hasReadBlockingActivityBestEffort(table.name, group_id)) {
+                    if (self.hasReadBlockingActivityBestEffort(table.name, group_id)) {
                         if (try self.snapshotCachedLocalGroupStatusReport(alloc, group_id, generation, fingerprint, true)) |cached| {
                             try reports.append(alloc, cached);
                             continue;
@@ -3098,7 +3219,7 @@ pub const DataServer = struct {
                         continue;
                     }
 
-                    switch (self.write_source.probeManagedWriterGroupBestEffort(table.name, group_id)) {
+                    switch (self.probeManagedWriterGroupBestEffort(table.name, group_id)) {
                         .leased => {
                             if (try self.snapshotCachedLocalGroupStatusReport(alloc, group_id, generation, fingerprint, true)) |cached| {
                                 try reports.append(alloc, cached);
@@ -3543,6 +3664,73 @@ pub const DataServer = struct {
         return try reports.toOwnedSlice(alloc);
     }
 
+    fn liveRuntimeWriteSource(self: *DataServer) *antfly.public_api.ProvisionedTableWriteSource {
+        if (self.data_raft_apply) |apply_sm| return &apply_sm.write_source;
+        return &self.write_source;
+    }
+
+    fn snapshotManagedWriterGroupStatusBestEffort(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+    ) !?runtime_status.LocalTableRuntimeStatus {
+        if (try self.liveRuntimeWriteSource().snapshotManagedWriterGroupStatusBestEffort(alloc, table_name, group_id)) |status| {
+            return status;
+        }
+        if (self.data_raft_apply != null) {
+            return try self.write_source.snapshotManagedWriterGroupStatusBestEffort(alloc, table_name, group_id);
+        }
+        return null;
+    }
+
+    fn overlayManagedWriterGroupStatusBestEffort(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+        status: *runtime_status.LocalTableRuntimeStatus,
+    ) void {
+        if (self.data_raft_apply) |apply_sm| {
+            switch (apply_sm.write_source.probeManagedWriterGroupBestEffort(table_name, group_id)) {
+                .leased => |cached| {
+                    var lease = cached;
+                    const release_alloc = if (lease.cache) |cache| cache.alloc else std.heap.page_allocator;
+                    defer lease.deinit(release_alloc);
+                    apply_sm.write_source.overlayManagedWriterGroupStatusBestEffort(alloc, table_name, group_id, status);
+                    return;
+                },
+                .unknown => return,
+                .absent => {},
+            }
+        }
+        self.write_source.overlayManagedWriterGroupStatusBestEffort(alloc, table_name, group_id, status);
+    }
+
+    fn hasReadBlockingActivityBestEffort(
+        self: *DataServer,
+        table_name: []const u8,
+        group_id: u64,
+    ) bool {
+        if (self.liveRuntimeWriteSource().hasReadBlockingActivityBestEffort(table_name, group_id)) return true;
+        if (self.data_raft_apply != null and self.write_source.hasReadBlockingActivityBestEffort(table_name, group_id)) return true;
+        return false;
+    }
+
+    fn probeManagedWriterGroupBestEffort(
+        self: *DataServer,
+        table_name: []const u8,
+        group_id: u64,
+    ) antfly.public_api.ProvisionedTableWriteSource.ManagedWriterGroupProbe {
+        const live_probe = self.liveRuntimeWriteSource().probeManagedWriterGroupBestEffort(table_name, group_id);
+        switch (live_probe) {
+            .leased, .unknown => return live_probe,
+            .absent => {},
+        }
+        if (self.data_raft_apply != null) return self.write_source.probeManagedWriterGroupBestEffort(table_name, group_id);
+        return live_probe;
+    }
+
     fn applyRuntimeStatusStorageFactsBestEffort(
         self: *DataServer,
         status: *runtime_status.LocalTableRuntimeStatus,
@@ -3573,14 +3761,15 @@ pub const DataServer = struct {
         lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
         if (self.runtime_status_disk_usage_cache.get(group_id)) |entry| {
             const fresh = now_ns -| entry.checked_at_ns < runtime_status_disk_usage_refresh_interval_ns;
-            if (active or fresh) {
+            const zero_cache_for_nonempty_group = entry.disk_bytes == 0 and status.stats.doc_count > 0;
+            if ((active or fresh) and !zero_cache_for_nonempty_group) {
                 self.runtime_status_disk_usage_cache_mutex.unlock();
                 return entry.disk_bytes;
             }
         }
         self.runtime_status_disk_usage_cache_mutex.unlock();
 
-        if (active) return null;
+        if (active and status.stats.doc_count == 0) return null;
         const disk_bytes = directoryUsageBytes(self.alloc, db_path) catch return null;
 
         lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
@@ -4257,7 +4446,8 @@ pub const DataServer = struct {
         _ = self.runtime_status_refresh_started.fetchAdd(1, .monotonic);
         var stats: RuntimeStatusRefreshStats = .{};
         var budget: RuntimeStatusRefreshBudget = .{ .max_db_opens = max_db_opens };
-        var replay_debt_present = false;
+        var pending_runtime_work = false;
+        var startup_catch_up_debt_present = false;
         defer self.runtime_status_refresh_last_table_count.store(stats.table_count, .monotonic);
         defer self.runtime_status_refresh_last_group_count.store(stats.group_count, .monotonic);
         defer self.runtime_status_refresh_last_db_opens.store(stats.db_opens, .monotonic);
@@ -4293,7 +4483,8 @@ pub const DataServer = struct {
         stats.table_count = @intCast(snapshots.len);
         for (snapshots) |entry| {
             stats.group_count += @intCast(entry.statuses.items.len);
-            if (replayDebtPresent(entry.statuses.items)) replay_debt_present = true;
+            if (runtimeStatusWorkPending(entry.statuses.items)) pending_runtime_work = true;
+            if (runtimeStatusStartupCatchUpDebtPresent(entry.statuses.items)) startup_catch_up_debt_present = true;
         }
         if (active_target_owned) |target| {
             self.provisioned_storage.runtime_status_cache.replaceOwnedPreservingGroupStatus(snapshots, target.table_name, target.group_id) catch |err| {
@@ -4304,18 +4495,25 @@ pub const DataServer = struct {
         } else {
             self.provisioned_storage.runtime_status_cache.replaceOwned(snapshots);
         }
-        self.provisioned_startup_catch_up_dirty.store(replay_debt_present, .release);
+        self.provisioned_startup_catch_up_dirty.store(startup_catch_up_debt_present, .release);
         self.runtime_status_last_refresh_at_ms.store(
             @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)),
             .monotonic,
         );
-        self.runtime_status_dirty.store(false, .release);
+        self.runtime_status_dirty.store(pending_runtime_work, .release);
         self.store_status_dirty = true;
         _ = self.runtime_status_refresh_completed.fetchAdd(1, .monotonic);
         return stats;
     }
 
-    fn replayDebtPresent(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
+    fn runtimeStatusWorkPending(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
+        for (statuses) |status| {
+            if (runtimeStatusHasActiveBackgroundWork(status)) return true;
+        }
+        return false;
+    }
+
+    fn runtimeStatusStartupCatchUpDebtPresent(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
         for (statuses) |status| {
             for (status.stats.indexes) |index| {
                 if (index.replay_catch_up_required or index.backfill_active) return true;
@@ -4426,30 +4624,30 @@ pub const DataServer = struct {
             if (self.shouldSkipActiveStartupGroupStatusOpen(table.name, group_id, active_target)) {
                 continue;
             }
-            if (try self.write_source.snapshotManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id)) |live_status| {
+            if (try self.snapshotManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id)) |live_status| {
                 var status = live_status;
                 status.metadata = status.metadata.withDefaults(.live_writer_publish, platform_time.monotonicNs());
                 self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
                 try items.append(self.alloc, status);
                 continue;
             }
-            if (self.write_source.hasReadBlockingActivityBestEffort(table.name, group_id)) {
+            if (self.hasReadBlockingActivityBestEffort(table.name, group_id)) {
                 if (try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(self.alloc, table.name, group_id)) |cached| {
                     var status = cached;
-                    self.write_source.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
+                    self.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
                     self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
                     try items.append(self.alloc, status);
                     continue;
                 }
                 if (try syntheticConfiguredRuntimeStatus(self.alloc, table, group_id)) |synthetic| {
                     var status = synthetic;
-                    self.write_source.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
+                    self.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
                     self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
                     try items.append(self.alloc, status);
                 }
                 continue;
             }
-            switch (self.write_source.probeManagedWriterGroupBestEffort(table.name, group_id)) {
+            switch (self.probeManagedWriterGroupBestEffort(table.name, group_id)) {
                 .leased => |cached| {
                     var lease = cached;
                     const release_alloc = if (lease.cache) |cache| cache.alloc else std.heap.page_allocator;
@@ -4464,7 +4662,7 @@ pub const DataServer = struct {
                         .stats = try lease.db.stats(self.alloc),
                     };
                     errdefer status.deinit(self.alloc);
-                    self.write_source.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
+                    self.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
                     self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, lease.db);
                     try items.append(self.alloc, status);
                     continue;
@@ -4472,7 +4670,7 @@ pub const DataServer = struct {
                 .unknown => {
                     if (try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(self.alloc, table.name, group_id)) |cached| {
                         var status = cached;
-                        self.write_source.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
+                        self.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
                         self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
                         try items.append(self.alloc, status);
                         continue;
@@ -4514,8 +4712,10 @@ pub const DataServer = struct {
         if (status.stats.enrichment.target_sequence > status.stats.enrichment.applied_sequence) return true;
         if (status.stats.async_indexing.startup.active) return true;
         if (status.stats.async_indexing.dense_catch_up.active) return true;
+        if (status.stats.async_indexing.bulk_coalescing.active_session) return true;
         for (status.stats.indexes) |index| {
             if (index.backfill_active) return true;
+            if (index.catch_up_active) return true;
             if (index.replay_catch_up_required) return true;
             if (index.replay_target_sequence > index.replay_applied_sequence) return true;
         }
@@ -4875,16 +5075,13 @@ pub const DataServer = struct {
             self.last_provision_metadata_epoch = head.metadata_epoch;
             return;
         }
-        _ = try antfly.metadata.reconcileReplicaRootTablesWithOptions(
+        _ = try self.write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
             self.alloc,
-            self.write_source.replica_root_dir,
             head.metadata_group_id,
             local_group_ids,
             snapshot.tables,
             snapshot.ranges,
-            .{
-                .backend_runtime = try self.ensureBackendRuntime(),
-            },
+            try self.ensureBackendRuntime(),
         );
         try self.provisioned_storage.bumpGroupGenerations(local_group_ids);
         self.provisioned_storage.read_cache.clear();
@@ -5036,7 +5233,7 @@ pub const DataServer = struct {
                         },
                         .transport = .{
                             .snapshot = .{
-                                .root_dir = cfg.replica_root_dir,
+                                .root_dir = cfg.snapshot_root_dir orelse cfg.replica_root_dir,
                             },
                         },
                     },
@@ -5833,7 +6030,7 @@ fn runtimeStatusReportFromLocalStatus(
         .group_id = group_id,
         .store_id = registration.store_id,
         .node_id = registration.node_id,
-        .updated_at_ns = status.metadata.updated_at_ns,
+        .updated_at_ns = platform_time.monotonicNs(),
         .source = source,
         .freshness = freshness,
         .topology_generation = status.metadata.topology_generation,
@@ -5854,7 +6051,56 @@ fn runtimeStatusReportFromLocalStatus(
         .async_startup_active = status.stats.async_indexing.startup.active,
         .async_dense_catch_up_active = status.stats.async_indexing.dense_catch_up.active,
         .async_bulk_coalescing_active = status.stats.async_indexing.bulk_coalescing.active_session,
+        .doc_identity = runtimeDocIdentityStatusReportFromStats(status.stats.doc_identity),
+        .doc_set_planning = runtimeDocSetPlanningStatusReportFromStats(status.stats.doc_set_planning),
         .indexes = indexes,
+    };
+}
+
+fn runtimeDocIdentityStatusReportFromStats(
+    stats: antfly.db.types.DocIdentityStats,
+) antfly.metadata.table_manager.RuntimeDocIdentityStatusReport {
+    return .{
+        .namespace_table_id = stats.namespace_table_id,
+        .namespace_shard_id = stats.namespace_shard_id,
+        .namespace_range_id = stats.namespace_range_id,
+        .next_ordinal = stats.next_ordinal,
+        .allocated_ordinals = stats.allocated_ordinals,
+        .ordinal_capacity_remaining = stats.ordinal_capacity_remaining,
+        .ordinal_capacity_exhausted = stats.ordinal_capacity_exhausted,
+        .rebuild_required = stats.rebuild_required,
+        .state_rows = stats.state_rows,
+        .live_ordinals = stats.live_ordinals,
+        .tombstone_ordinals = stats.tombstone_ordinals,
+        .min_created_generation = stats.min_created_generation,
+        .max_created_generation = stats.max_created_generation,
+        .min_deleted_generation = stats.min_deleted_generation,
+        .max_deleted_generation = stats.max_deleted_generation,
+        .scanned_primary_docs = stats.scanned_primary_docs,
+        .primary_docs_missing_ordinals = stats.primary_docs_missing_ordinals,
+        .primary_docs_missing_identity_state = stats.primary_docs_missing_identity_state,
+        .primary_docs_with_tombstone_ordinals = stats.primary_docs_with_tombstone_ordinals,
+        .complete = stats.complete,
+    };
+}
+
+fn runtimeDocSetPlanningStatusReportFromStats(
+    stats: antfly.db.types.DocSetPlanningStats,
+) antfly.metadata.table_manager.RuntimeDocSetPlanningStatusReport {
+    return .{
+        .resolved_set_count = stats.resolved_set_count,
+        .all_set_count = stats.all_set_count,
+        .none_set_count = stats.none_set_count,
+        .doc_key_list_count = stats.doc_key_list_count,
+        .ordinal_list_count = stats.ordinal_list_count,
+        .ordinal_bitmap_count = stats.ordinal_bitmap_count,
+        .doc_key_list_docs = stats.doc_key_list_docs,
+        .ordinal_list_docs = stats.ordinal_list_docs,
+        .ordinal_bitmap_docs = stats.ordinal_bitmap_docs,
+        .missing_ordinal_coverage_count = stats.missing_ordinal_coverage_count,
+        .bitmap_promotion_count = stats.bitmap_promotion_count,
+        .unsupported_filter_shape_count = stats.unsupported_filter_shape_count,
+        .stale_identity_generation_rejection_count = stats.stale_identity_generation_rejection_count,
     };
 }
 
@@ -5953,6 +6199,14 @@ fn findRangeByGroupId(
         if (range.group_id == group_id) return range;
     }
     return null;
+}
+
+fn identityNamespaceFromRange(range: antfly.metadata.table_manager.RangeRecord) antfly.db.DocIdentityNamespace {
+    return .{
+        .table_id = range.table_id,
+        .shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range),
+        .range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
+    };
 }
 
 fn findTableById(
@@ -6741,6 +6995,10 @@ pub fn runFromIterator(
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
 
+    const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
+    defer alloc.free(data_dir);
+    try antfly.common.data_format.ensureCompatible(alloc, data_dir);
+
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
 
@@ -6752,6 +7010,7 @@ pub fn runFromIterator(
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
     defer setup_io.deinit();
     try ensureDirAndParent(setup_io.io(), resolved.replica_root_dir, resolved.replica_catalog_path);
+    try fs_paths.createDirPathPortable(setup_io.io(), resolved.snapshot_root_dir);
     try fs_paths.createDirPathPortable(setup_io.io(), resolved.auth_store_root_dir);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
@@ -6794,6 +7053,8 @@ pub fn runFromIterator(
         .raft_bind_host = cli.raft_bind_host orelse "127.0.0.1",
         .raft_bind_port = cli.raft_bind_port orelse 0,
         .replica_root_dir = resolved.replica_root_dir,
+        .replica_catalog_path = resolved.replica_catalog_path,
+        .snapshot_root_dir = resolved.snapshot_root_dir,
         .store_registration = if (cli.node_id != null and cli.store_id != null) .{
             .node_id = cli.node_id.?,
             .store_id = cli.store_id.?,
@@ -6921,12 +7182,20 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--data-dir")) {
+            cfg.data_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--replica-root-dir")) {
             cfg.replica_root_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--replica-catalog-path")) {
             cfg.replica_catalog_path = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--snapshot-root-dir")) {
+            cfg.snapshot_root_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--secret-store-path")) {
@@ -6938,31 +7207,55 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
     return cfg;
 }
 
+fn resolveLocalBaseDir(
+    alloc: std.mem.Allocator,
+    cli: CliConfig,
+    cfg: ?*const antfly.common.config.Config,
+) ![]u8 {
+    if (cli.data_dir) |path| return try normalizeResolvedPathAlloc(alloc, path);
+    return try antfly.common.config.resolveLocalBaseDir(alloc, cfg);
+}
+
 fn resolvePaths(
     alloc: std.mem.Allocator,
     cli: CliConfig,
     cfg: ?*const antfly.common.config.Config,
 ) !ResolvedPaths {
+    const local_base = try resolveLocalBaseDir(alloc, cli, cfg);
+    defer alloc.free(local_base);
+    const metadata_base = try std.fmt.allocPrint(alloc, "{s}/metadata", .{local_base});
+    defer alloc.free(metadata_base);
+
     if (cli.replica_root_dir != null and cli.replica_catalog_path != null) {
-        const base = try antfly.common.config.resolveLocalRoleBaseDir(alloc, cfg, "data");
+        const base = try std.fmt.allocPrint(alloc, "{s}/data", .{local_base});
         defer alloc.free(base);
         const replica_root_dir = try normalizeResolvedPathAlloc(alloc, cli.replica_root_dir.?);
         errdefer alloc.free(replica_root_dir);
         const replica_catalog_path = try normalizeResolvedPathAlloc(alloc, cli.replica_catalog_path.?);
         errdefer alloc.free(replica_catalog_path);
-        const auth_store_root_dir = blk: {
-            const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{base});
+        const snapshot_root_dir = if (cli.snapshot_root_dir) |path|
+            try normalizeResolvedPathAlloc(alloc, path)
+        else blk: {
+            const raw = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{base});
             defer alloc.free(raw);
             break :blk try normalizeResolvedPathAlloc(alloc, raw);
         };
+        errdefer alloc.free(snapshot_root_dir);
+        const auth_store_root_dir = blk: {
+            const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{metadata_base});
+            defer alloc.free(raw);
+            break :blk try normalizeResolvedPathAlloc(alloc, raw);
+        };
+        errdefer alloc.free(auth_store_root_dir);
         return .{
             .replica_root_dir = replica_root_dir,
             .replica_catalog_path = replica_catalog_path,
+            .snapshot_root_dir = snapshot_root_dir,
             .auth_store_root_dir = auth_store_root_dir,
         };
     }
 
-    const base = try antfly.common.config.resolveLocalRoleBaseDir(alloc, cfg, "data");
+    const base = try std.fmt.allocPrint(alloc, "{s}/data", .{local_base});
     defer alloc.free(base);
     const replica_root_dir = if (cli.replica_root_dir) |path|
         try normalizeResolvedPathAlloc(alloc, path)
@@ -6980,14 +7273,24 @@ fn resolvePaths(
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(replica_catalog_path);
-    const auth_store_root_dir = blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{base});
+    const snapshot_root_dir = if (cli.snapshot_root_dir) |path|
+        try normalizeResolvedPathAlloc(alloc, path)
+    else blk: {
+        const raw = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
+    errdefer alloc.free(snapshot_root_dir);
+    const auth_store_root_dir = blk: {
+        const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{metadata_base});
+        defer alloc.free(raw);
+        break :blk try normalizeResolvedPathAlloc(alloc, raw);
+    };
+    errdefer alloc.free(auth_store_root_dir);
     return .{
         .replica_root_dir = replica_root_dir,
         .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = snapshot_root_dir,
         .auth_store_root_dir = auth_store_root_dir,
     };
 }
@@ -7086,8 +7389,10 @@ fn printUsage(argv0: []const u8) void {
         \\  --store-role <role>            Registered store role (default: data)
         \\  --failure-domain <name>        Registered store failure domain
         \\  --tick-ms <ms>                 Sleep interval while serving (default: 25)
+        \\  --data-dir <path>              Local storage root for data node data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
+        \\  --snapshot-root-dir <path>     Data raft snapshot root directory
         \\  --secret-store-path <path>     Antfly secrets.json file path
         \\  -h, --help                     Show this help
         \\
@@ -7178,7 +7483,8 @@ test "data runtime resolves metadata api urls from common config" {
     orchestration_urls[1] = .{ .node_id = 2, .url = try alloc.dupe(u8, "http://127.0.0.1:7102") };
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .speech_to_text = antfly.transcribing.Registry.init(alloc),
+        .transcribers = antfly.transcribing.Registry.init(alloc),
+        .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .metadata = .{
             .orchestration_urls = orchestration_urls,
@@ -7197,7 +7503,8 @@ test "data runtime resolves paths from common storage base dir" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
         .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .speech_to_text = antfly.transcribing.Registry.init(alloc),
+        .transcribers = antfly.transcribing.Registry.init(alloc),
+        .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .storage = .{ .local_base_dir = try alloc.dupe(u8, "/tmp/antflydb") },
     };
@@ -7207,7 +7514,8 @@ test "data runtime resolves paths from common storage base dir" {
     defer resolved.deinit(alloc);
     try std.testing.expectEqualStrings("/tmp/antflydb/data/replicas", resolved.replica_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/data/catalog.txt", resolved.replica_catalog_path);
-    try std.testing.expectEqualStrings("/tmp/antflydb/data/auth", resolved.auth_store_root_dir);
+    try std.testing.expectEqualStrings("/tmp/antflydb/data/snapshots", resolved.snapshot_root_dir);
+    try std.testing.expectEqualStrings("/tmp/antflydb/metadata/auth", resolved.auth_store_root_dir);
 }
 
 test "data runtime parses optional split store registration flags" {
@@ -7695,6 +8003,291 @@ test "data runtime local group status provider collects and caches group statuse
     const empty_cached = (try server.cloneCachedLocalGroupStatuses(alloc, 3, 99)) orelse return error.TestUnexpectedResult;
     defer antfly.metadata.table_manager.freeGroupStatuses(alloc, empty_cached);
     try std.testing.expectEqual(@as(usize, 0), empty_cached.len);
+}
+
+test "data runtime local split fallback preserves source identity namespace" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-split-identity", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const source_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 180);
+    defer alloc.free(source_db_path);
+    const destination_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 181);
+    defer alloc.free(destination_db_path);
+
+    const source_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 180,
+        .range_id = 9000,
+    };
+
+    {
+        var db = try antfly.db.DB.open(alloc, source_db_path, .{
+            .identity_namespace = source_namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(.{ .start = "doc:a", .end = "doc:z" });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:t", .value = "{\"v\":\"right\"}" }},
+        });
+    }
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 180,
+                    .table_id = 7,
+                    .range_id = 9000,
+                    .start_key = "doc:a",
+                    .end_key = "doc:z",
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{.{
+                    .transition_id = 9001,
+                    .source_group_id = 180,
+                    .destination_group_id = 181,
+                    .split_key = "doc:m",
+                    .source_range_end = "doc:z",
+                }})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    var ops = server.localShardOperationAdapter();
+    try ops.execute(.{ .prepare_split_source = .{
+        .transition_id = 9001,
+        .source_group_id = 180,
+        .destination_group_id = 181,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+    } });
+    try ops.execute(.{ .start_split_source = .{
+        .transition_id = 9001,
+        .source_group_id = 180,
+        .destination_group_id = 181,
+    } });
+    try ops.execute(.{ .bootstrap_split_destination = .{
+        .transition_id = 9001,
+        .source_group_id = 180,
+        .destination_group_id = 181,
+    } });
+    try ops.execute(.{ .catch_up_split_destination = .{
+        .transition_id = 9001,
+        .source_group_id = 180,
+        .destination_group_id = 181,
+    } });
+
+    var dest = try antfly.db.DB.open(alloc, destination_db_path, .{
+        .identity_namespace = source_namespace,
+        .start_index_workers = false,
+    });
+    defer dest.close();
+
+    const replayed = (try dest.get(alloc, "doc:t")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(replayed);
+    try std.testing.expectEqualStrings("{\"v\":\"right\"}", replayed);
+
+    const stats = try dest.runtimeStatusStatsConsistent(alloc);
+    try std.testing.expectEqual(source_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(source_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(source_namespace.range_id, stats.doc_identity.namespace_range_id);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.allocated_ordinals);
+    try std.testing.expect(!stats.doc_identity.rebuild_required);
+}
+
+test "data runtime local merge fallback derives receiver identity namespace from catalog" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-merge-identity", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const donor_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 190);
+    defer alloc.free(donor_db_path);
+    const receiver_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 191);
+    defer alloc.free(receiver_db_path);
+
+    const donor_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 190,
+        .range_id = 9000,
+    };
+    const old_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 191,
+        .range_id = 9001,
+    };
+    const target_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 191,
+        .range_id = 9002,
+    };
+
+    {
+        var db = try antfly.db.DB.open(alloc, donor_db_path, .{
+            .identity_namespace = donor_namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(.{ .start = "doc:m", .end = "doc:z" });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:t", .value = "{\"v\":\"donor\"}" }},
+        });
+    }
+
+    {
+        var db = try antfly.db.DB.open(alloc, receiver_db_path, .{
+            .identity_namespace = old_namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(.{ .start = "doc:a", .end = "doc:m" });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"v\":\"receiver\"}" }},
+        });
+    }
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{
+                    .{
+                        .group_id = 190,
+                        .table_id = 7,
+                        .range_id = 9000,
+                        .start_key = "",
+                        .end_key = "doc:m",
+                    },
+                    .{
+                        .group_id = 191,
+                        .table_id = 7,
+                        .range_id = 9002,
+                        .start_key = "doc:m",
+                        .end_key = null,
+                    },
+                })[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    var ops = server.localShardOperationAdapter();
+    try ops.execute(.{ .accept_merge_receiver = .{
+        .transition_id = 9002,
+        .donor_group_id = 190,
+        .receiver_group_id = 191,
+        .allow_doc_identity_reassignment = true,
+    } });
+    try ops.execute(.{ .catch_up_merge_receiver = .{
+        .transition_id = 9002,
+        .donor_group_id = 190,
+        .receiver_group_id = 191,
+        .allow_doc_identity_reassignment = true,
+    } });
+
+    var reopened = try antfly.db.DB.open(alloc, receiver_db_path, .{
+        .identity_namespace = target_namespace,
+        .start_index_workers = false,
+    });
+    defer reopened.close();
+
+    const replayed = (try reopened.get(alloc, "doc:t")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(replayed);
+    try std.testing.expectEqualStrings("{\"v\":\"donor\"}", replayed);
+
+    const stats = try reopened.runtimeStatusStatsConsistent(alloc);
+    try std.testing.expectEqual(target_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(target_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(target_namespace.range_id, stats.doc_identity.namespace_range_id);
+
+    var txn = try reopened.core.store.beginProbeTxn();
+    defer txn.abort();
+    const receiver_ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+    const receiver_state = (try doc_identity.lookupStateTxn(&txn, receiver_ordinal)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:b"), receiver_state.canonical_doc_id);
+    const donor_ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:t")) orelse return error.TestUnexpectedResult;
+    const donor_state = (try doc_identity.lookupStateTxn(&txn, donor_ordinal)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:t"), donor_state.canonical_doc_id);
+    try std.testing.expect(receiver_ordinal != donor_ordinal);
 }
 
 test "data runtime local split key cache is scoped by root and change generation" {
@@ -10467,6 +11060,32 @@ test "data runtime startup catch-up stays dirty when metadata snapshot is unavai
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_completed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_last_group_count.load(.monotonic));
+}
+
+test "data runtime keeps status refresh dirty for non-startup async index work" {
+    var catch_up_indexes = [_]antfly.db.types.DBIndexStats{.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .catch_up_active = true,
+    }};
+    const catch_up_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .stats = .{
+            .indexes = catch_up_indexes[0..],
+            .index_count = 1,
+        },
+    }};
+    try std.testing.expect(DataServer.runtimeStatusWorkPending(catch_up_statuses[0..]));
+    try std.testing.expect(!DataServer.runtimeStatusStartupCatchUpDebtPresent(catch_up_statuses[0..]));
+
+    const bulk_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .stats = .{
+            .async_indexing = .{
+                .bulk_coalescing = .{ .active_session = true },
+            },
+        },
+    }};
+    try std.testing.expect(DataServer.runtimeStatusWorkPending(bulk_statuses[0..]));
+    try std.testing.expect(!DataServer.runtimeStatusStartupCatchUpDebtPresent(bulk_statuses[0..]));
 }
 
 test "data runtime defers replica-root reconcile only for unresolved startup debt on known metadata" {

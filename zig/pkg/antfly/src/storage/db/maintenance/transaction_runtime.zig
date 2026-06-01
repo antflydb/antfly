@@ -38,6 +38,7 @@ pub const Config = struct {
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     resolver_ctx: ?*anyopaque = null,
     resolve_participant_fn: ?resolution_mod.ResolveParticipantFn = null,
+    resolution_extra_hooks: transactions_mod.TxnManager.RecoveryExtraBatchHooks = .{},
 };
 
 pub const default_lease_key = "\x00\x00__metadata__:transaction_recovery_lease";
@@ -267,7 +268,7 @@ fn runRecoveryWithConfig(
     }
 
     const cutoff = now_ns -| config.cutoff_ns;
-    summary.recovery = try manager.recoverTransactions(cutoff, now_ns);
+    summary.recovery = try manager.recoverTransactionsWithExtraBatchHooks(cutoff, now_ns, config.resolution_extra_hooks);
     return summary;
 }
 

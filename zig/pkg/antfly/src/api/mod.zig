@@ -42,6 +42,8 @@ pub const table_reads = @import("table_reads.zig");
 pub const table_writes = @import("table_writes.zig");
 pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
+pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
+pub const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
 pub const http_server = @import("http_server.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
@@ -154,6 +156,8 @@ test "api module compiles" {
     _ = table_writes;
     _ = distributed_join;
     _ = distributed_graph;
+    _ = http_internal_group_read_routes;
+    _ = http_internal_group_join_routes;
     _ = http_server;
     _ = http_client;
     _ = httpx_handler;
@@ -176,6 +180,145 @@ test "api module compiles" {
     _ = HostedGroupRouter;
     _ = ApiHttpServer;
     _ = ApiHttpClient;
+}
+
+test "distributed graph result_ref fail-closed guards are covered" {
+    try distributed_graph.testResultRefFailClosedGuards(std.testing.allocator);
+}
+
+test "api distributed graph hydrate carries identity generation and clears cross-range ordinals" {
+    try distributed_graph.testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(std.testing.allocator);
+}
+
+test "public graph result_ref fail-closed guards are covered" {
+    try public_graph_query.testResolveGraphSelectorFailClosedGuard(std.testing.allocator);
+}
+
+test "api table reads reject distributed resolved doc filters" {
+    const db_mod = @import("../storage/db/mod.zig");
+
+    var sentinel: u8 = 0;
+    var req: db_mod.types.SearchRequest = .{
+        .resolved_doc_filter = &sentinel,
+    };
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, table_reads.testing.rejectResolvedDocFilterForCrossGroup(req, 2));
+    try table_reads.testing.rejectResolvedDocFilterForCrossGroup(req, 1);
+    try table_reads.testing.rejectResolvedDocFilterForRemoteRoute(req, .local);
+    var remote_uri_buf = [_]u8{'h'};
+    try std.testing.expectError(error.UnsupportedQueryRequest, table_reads.testing.rejectResolvedDocFilterForRemoteRoute(req, .{ .remote = .{ .node_id = 2, .base_uri = remote_uri_buf[0..] } }));
+    req.resolved_doc_filter = null;
+    try table_reads.testing.rejectResolvedDocFilterForCrossGroup(req, 2);
+    try table_reads.testing.rejectResolvedDocFilterForRemoteRoute(req, .{ .remote = .{ .node_id = 2, .base_uri = remote_uri_buf[0..] } });
+}
+
+test "api table reads reject stale doc identity before multigroup fanout" {
+    const alloc = std.testing.allocator;
+    const metadata_api = @import("../metadata/api.zig");
+    const metadata_table_manager = @import("../metadata/table_manager.zig");
+    const metadata_reconciler = @import("../metadata/reconciler.zig");
+    const metadata_transition_state = @import("../metadata/transition_state.zig");
+    const raft_reconciler = @import("../raft/reconciler.zig");
+
+    const FakeCatalog = struct {
+        statuses: []const metadata_reconciler.MergedGroupStatus,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(self.statuses),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const healthy_statuses = [_]metadata_reconciler.MergedGroupStatus{
+        .{ .group_id = 7001, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7001, .namespace_range_id = 7001, .allocated_ordinals = 1 } },
+        .{ .group_id = 7002, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7002, .namespace_range_id = 7002, .allocated_ordinals = 1 } },
+    };
+    var healthy_catalog = FakeCatalog{ .statuses = healthy_statuses[0..] };
+    try table_reads.testing.validateDocIdentityReadyForMultiGroupRead(alloc, healthy_catalog.iface(), "docs", 2);
+    try table_reads.testing.validateDocIdentityReadyForMultiGroupRead(alloc, healthy_catalog.iface(), "docs", 1);
+
+    const rebuild_required = [_]metadata_reconciler.MergedGroupStatus{
+        .{ .group_id = 7001, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7001, .namespace_range_id = 7001, .allocated_ordinals = 1 } },
+        .{ .group_id = 7002, .doc_identity = .{ .rebuild_required = true } },
+    };
+    var rebuild_catalog = FakeCatalog{ .statuses = rebuild_required[0..] };
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, table_reads.testing.validateDocIdentityReadyForMultiGroupRead(alloc, rebuild_catalog.iface(), "docs", 2));
+}
+
+test "api public table query rejects only top-level internal fields" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect(try public_table_http.testing.hasInternalShardQueryFields(alloc,
+        \\{"query":{"match_all":{}},"_identity_read_generation":1}
+    ));
+    try std.testing.expect(try public_table_http.testing.hasInternalShardQueryFields(alloc,
+        \\{"query":{"match_all":{}},"allow_doc_identity_reassignment":true}
+    ));
+    try std.testing.expect(!try public_table_http.testing.hasInternalShardQueryFields(alloc,
+        \\{"full_text_search":{"query":"mentions \"_identity_read_generation\" and \"native_doc_id_constraints\""}}
+    ));
+    try std.testing.expect(try query_contract.testing.bodyHasInternalShardFields(alloc,
+        \\{"query":{"match_all":{}},"native_doc_id_constraints":{"include_doc_ids":["doc:a"]}}
+    ));
+    try std.testing.expect(!try query_contract.testing.bodyHasInternalShardFields(alloc,
+        \\{"full_text_search":{"query":"mentions \"native_doc_id_constraints\""}}
+    ));
+    try std.testing.expect(!try query_contract.testing.bodyHasPublicDocFilterBindings(alloc,
+        \\{"full_text_search":{"query":"mentions \"with\""}}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, query_contract.parseQueryRequest(alloc, null, "docs",
+        \\{"with":{"visible":{"match_all":{}}},"identity_read_generation":1,"query":{"match_all":{}}}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, query_contract.parseQueryRequest(alloc, null, "docs",
+        \\{"with":{"visible":{"match_all":{}}},"allow_doc_identity_reassignment":true,"query":{"match_all":{}}}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, query_contract.parseQueryRequest(alloc, null, "docs",
+        \\{"embeddings":{"dense_idx":"AACAPwAAAEAAAEBA"},"indexes":["dense_idx"],"identity_read_generation":1}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, query_contract.parseQueryRequest(alloc, null, "docs",
+        \\{"embeddings":{"dense_idx":"AACAPwAAAEAAAEBA"},"indexes":["dense_idx"],"allow_doc_identity_reassignment":true}
+    ));
+    try public_graph_query.rejectInternalDocIdentityFields(alloc,
+        \\{"graph_searches":{"g":{"type":"neighbors","index_name":"graph","start_nodes":{"keys":["doc:a"]}}}}
+    );
+    try std.testing.expectError(error.InvalidQueryRequest, public_graph_query.rejectInternalDocIdentityFields(alloc,
+        \\{"graph_searches":{"g":{"type":"neighbors","index_name":"graph","start_nodes":{"keys":["doc:a"]}}},"identity_read_generation":1}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, public_graph_query.rejectInternalDocIdentityFields(alloc,
+        \\{"graph_searches":{"g":{"type":"neighbors","index_name":"graph","start_nodes":{"keys":["doc:a"]}}},"allow_doc_identity_reassignment":true}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, public_graph_query.rejectInternalDocIdentityFields(alloc,
+        \\{"graph_searches":{"g":{"type":"neighbors","index_name":"graph","start_nodes":{"keys":["doc:a"]}}},"native_doc_id_constraints":{"include_doc_ids":["doc:a"]}}
+    ));
 }
 
 test "api query contract tensor program envelope preserves dictionary identity" {

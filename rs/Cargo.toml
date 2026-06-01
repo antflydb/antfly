@@ -1,5 +1,5 @@
 [workspace]
-members = ["antfly-client", "pgaf"]
+members = ["crates/sdk", "crates/pgaf"]
 resolver = "3"
 
 [profile.dev]

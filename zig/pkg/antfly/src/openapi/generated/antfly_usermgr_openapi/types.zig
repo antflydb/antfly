@@ -97,7 +97,7 @@ pub const Error = struct {
 pub const RowFilterEntry = struct {
     /// Table name (or '*' for all tables).
     table: []const u8,
-    /// Bleve query JSON that documents must match to be visible.
+    /// Antfly query JSON that documents must match to be visible.
     filter: std.json.ArrayHashMap(std.json.Value),
 };
 
@@ -128,7 +128,7 @@ pub const ApiKey = struct {
     username: []const u8,
     /// Optional permission scoping. If empty, inherits owner's full permissions.
     permissions: ?[]const Permission = null,
-    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are bleve query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
+    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// When the API key was created.
     created_at: []const u8,
@@ -144,7 +144,7 @@ pub const CreateApiKeyRequest = struct {
     expires_in: ?[]const u8 = null,
     /// Optional permission scoping. Each permission must be a subset of the creator's permissions.
     permissions: ?[]const Permission = null,
-    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are bleve query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
+    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
 };
 
@@ -158,7 +158,7 @@ pub const ApiKeyWithSecret = struct {
     username: []const u8,
     /// Optional permission scoping. If empty, inherits owner's full permissions.
     permissions: ?[]const Permission = null,
-    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are bleve query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
+    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// When the API key was created.
     created_at: []const u8,

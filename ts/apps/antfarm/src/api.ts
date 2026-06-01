@@ -1,7 +1,8 @@
 import type { AntflyType } from "@antfly/sdk";
 import { AntflyClient } from "@antfly/sdk";
+import { getAntfarmRuntimeConfig } from "./runtime-config";
 
-const baseUrl = "/api/v1";
+const baseUrl = getAntfarmRuntimeConfig().apiUrl ?? "/db/v1";
 
 /**
  * @deprecated Use the `useApi()` hook from `@/hooks/use-api-config` instead
@@ -68,7 +69,7 @@ export interface TableSchema {
 }
 
 export interface ChunkerConfig {
-  provider: "termite" | "mock";
+  provider: "antfly" | "mock";
   strategy: "hugot" | "fixed";
   api_url?: string;
   target_tokens?: number;

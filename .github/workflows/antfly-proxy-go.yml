@@ -1,6 +1,4 @@
-# Combined proxy CI: tests, builds, and smoke-runs the antfly-proxy and
-# termite-proxy modules. Both are pure-Go submodules with no native deps,
-# so they share one runner pod.
+# Proxy CI for the Antfly proxy library module.
 
 name: Proxy Tests
 
@@ -8,14 +6,12 @@ on:
   push:
     branches: ["main"]
     paths:
-      - "pkg/antfly-proxy/**"
-      - "pkg/termite-proxy/**"
+      - "go/pkg/proxy/**"
       - ".github/workflows/antfly-proxy-go.yml"
   pull_request:
     branches: ["main"]
     paths:
-      - "pkg/antfly-proxy/**"
-      - "pkg/termite-proxy/**"
+      - "go/pkg/proxy/**"
       - ".github/workflows/antfly-proxy-go.yml"
   workflow_dispatch:
 
@@ -37,20 +33,5 @@ jobs:
           go-version: "1.26"
           cache: false
 
-      - name: Test antfly-proxy
-        run: cd pkg/antfly-proxy && GOWORK=off go test ./...
-
-      - name: Build antfly-proxy
-        run: cd pkg/antfly-proxy && GOWORK=off go build -v -o ../../antfly-proxy ./cmd/antfly-proxy
-
-      - name: Smoke test antfly-proxy
-        run: timeout 2 ./antfly-proxy || [ $? -eq 124 ]
-
-      - name: Test termite-proxy
-        run: cd pkg/termite-proxy && GOWORK=off go test ./...
-
-      - name: Build termite-proxy
-        run: cd pkg/termite-proxy && GOWORK=off go build -v -o ../../termite-proxy ./cmd/termite-proxy
-
-      - name: Smoke test termite-proxy
-        run: timeout 2 ./termite-proxy || [ $? -eq 124 ]
+      - name: Test proxies
+        run: cd go/pkg/proxy && GOWORK=off go test ./...

@@ -20,6 +20,30 @@ const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const query_contract = @import("query_contract.zig");
 
+pub fn rejectInternalDocIdentityFields(alloc: std.mem.Allocator, body: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    if (objectHasInternalDocIdentityField(parsed.value.object)) return error.InvalidQueryRequest;
+}
+
+fn objectHasInternalDocIdentityField(object: std.json.ObjectMap) bool {
+    const internal_fields = [_][]const u8{
+        "identity_read_generation",
+        "allow_doc_identity_reassignment",
+        "_identity_read_generation",
+        "native_doc_id_constraints",
+        "_filter_doc_ids",
+        "_filter_doc_ids_positive",
+        "_exclude_doc_ids",
+        "_resolved_doc_filter",
+    };
+    inline for (internal_fields) |field| {
+        if (object.get(field) != null) return true;
+    }
+    return false;
+}
+
 pub fn parseSupportedGraphQueriesAlloc(
     alloc: std.mem.Allocator,
     request: metadata_openapi.QueryRequest,
@@ -103,6 +127,7 @@ pub fn resolveGraphSelectorAlloc(
         },
         .result_ref => |result_ref| blk: {
             const set = findResultSetByRef(available_sets, result_ref.ref) orelse return error.GraphResultRefNotImplemented;
+            if (result_ref.limit == 0 and resultSetMayBeIncompleteForUnboundedRef(set)) return error.UnsupportedQueryRequest;
             const count: usize = if (result_ref.limit == 0) set.hits.len else @min(set.hits.len, result_ref.limit);
             const duped = try alloc.alloc([]u8, count);
             errdefer alloc.free(duped);
@@ -117,6 +142,65 @@ pub fn resolveGraphSelectorAlloc(
             break :blk duped;
         },
     };
+}
+
+pub fn testResolveGraphSelectorFailClosedGuard(alloc: std.mem.Allocator) !void {
+    const ResultSet = struct {
+        name: []const u8,
+        hits: []const db_mod.types.SearchHit,
+        total_hits: u32,
+    };
+    const hit = db_mod.types.SearchHit{ .id = @constCast("doc:a") };
+    const sets = [_]ResultSet{.{
+        .name = "$full_text_results",
+        .hits = @constCast((&[_]db_mod.types.SearchHit{hit})[0..]),
+        .total_hits = 2,
+    }};
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, resolveGraphSelectorAlloc(
+        alloc,
+        .{ .result_ref = .{ .ref = "$full_text_results", .limit = 0 } },
+        &sets,
+    ));
+
+    const limited = try resolveGraphSelectorAlloc(
+        alloc,
+        .{ .result_ref = .{ .ref = "$full_text_results", .limit = 1 } },
+        &sets,
+    );
+    defer {
+        for (limited) |key| alloc.free(key);
+        alloc.free(limited);
+    }
+    try std.testing.expectEqual(@as(usize, 1), limited.len);
+    try std.testing.expectEqualStrings("doc:a", limited[0]);
+
+    const saturated_sets = [_]struct {
+        name: []const u8,
+        hits: []const db_mod.types.SearchHit,
+        total_hits: u32,
+        page_limit: u32,
+    }{.{
+        .name = "$fused_results",
+        .hits = @constCast((&[_]db_mod.types.SearchHit{hit})[0..]),
+        .total_hits = 1,
+        .page_limit = 1,
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, resolveGraphSelectorAlloc(
+        alloc,
+        .{ .result_ref = .{ .ref = "$fused_results", .limit = 0 } },
+        &saturated_sets,
+    ));
+}
+
+fn resultSetMayBeIncompleteForUnboundedRef(set: anytype) bool {
+    if (@as(u64, set.total_hits) > set.hits.len) return true;
+    const Set = @TypeOf(set);
+    if (@hasField(Set, "page_limit")) {
+        const page_limit = @field(set, "page_limit");
+        return page_limit > 0 and set.hits.len >= page_limit;
+    }
+    return false;
 }
 
 fn parseSupportedGraphQuery(
@@ -592,6 +676,10 @@ test "parse supported graph queries accepts embeddings result refs" {
     defer freeNamedGraphQueries(alloc, embeddings_items);
     try std.testing.expectEqualStrings("$embeddings_results", embeddings_items[0].query.start_nodes.result_ref.ref);
     try std.testing.expectEqual(@as(u32, 2), embeddings_items[0].query.start_nodes.result_ref.limit);
+}
+
+test "resolve graph selector fails closed for unbounded paged result refs" {
+    try testResolveGraphSelectorFailClosedGuard(std.testing.allocator);
 }
 
 test "parse supported graph queries accepts pattern requests" {

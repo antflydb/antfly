@@ -36,9 +36,12 @@ from conftest import (
     find_free_port,
     lookup_key_path,
     maybe_preserve_tempdir,
+    raise_request_error_with_logs,
     resolve_binary_path,
     wait_for_server,
 )
+
+AUTH_PUBLIC_API_ROOT = "/auth/v1"
 
 
 def _basic_auth(username: str, password: str) -> str:
@@ -79,11 +82,24 @@ def _try_lookup(api: "AuthApi", table_name: str, key: str):
 class AuthApi:
     def __init__(self, base_url: str, server_ref: "SwarmAuthServer | SplitAuthServer"):
         self.url = base_url.rstrip("/")
+        self.auth_url = self._auth_url_from_db_url(self.url)
         self.s = requests.Session()
         self.s.headers["Content-Type"] = "application/json"
         self.s.headers["Connection"] = "close"
         self._server = server_ref
         self._request_lock = threading.Lock()
+
+    @staticmethod
+    def _auth_url_from_db_url(db_url: str) -> str:
+        rootless = db_url.removesuffix("/db/v1")
+        return f"{rootless}{AUTH_PUBLIC_API_ROOT}"
+
+    def _url_for(self, path: str) -> str:
+        if path == AUTH_PUBLIC_API_ROOT:
+            return self.auth_url
+        if path.startswith(f"{AUTH_PUBLIC_API_ROOT}/"):
+            return f"{self.auth_url}{path[len(AUTH_PUBLIC_API_ROOT):]}"
+        return f"{self.url}{path}"
 
     def _check(self, response: requests.Response):
         if response.status_code >= 400:
@@ -104,19 +120,35 @@ class AuthApi:
 
     def get(self, path: str):
         with self._request_lock:
-            return self._check(self.s.get(f"{self.url}{path}", timeout=30))
+            try:
+                response = self.s.get(self._url_for(path), timeout=30)
+            except requests.RequestException as err:
+                raise_request_error_with_logs(err, self._server)
+            return self._check(response)
 
     def post(self, path: str, payload: dict):
         with self._request_lock:
-            return self._check(self.s.post(f"{self.url}{path}", json=payload, timeout=30))
+            try:
+                response = self.s.post(self._url_for(path), json=payload, timeout=30)
+            except requests.RequestException as err:
+                raise_request_error_with_logs(err, self._server)
+            return self._check(response)
 
     def put(self, path: str, payload: dict):
         with self._request_lock:
-            return self._check(self.s.put(f"{self.url}{path}", json=payload, timeout=30))
+            try:
+                response = self.s.put(self._url_for(path), json=payload, timeout=30)
+            except requests.RequestException as err:
+                raise_request_error_with_logs(err, self._server)
+            return self._check(response)
 
     def delete(self, path: str):
         with self._request_lock:
-            return self._check(self.s.delete(f"{self.url}{path}", timeout=30))
+            try:
+                response = self.s.delete(self._url_for(path), timeout=30)
+            except requests.RequestException as err:
+                raise_request_error_with_logs(err, self._server)
+            return self._check(response)
 
     def create_table(self, table_name: str, payload: dict | None = None):
         body = payload or {"num_shards": 1}
@@ -375,7 +407,7 @@ def test_swarm_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
 
     auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
     escalated = auth_api.s.post(
-        f"{auth_api.url}/auth/v1/users/alice/api-keys",
+        f"{auth_api.auth_url}/users/alice/api-keys",
         json={
             "name": "escalated key",
             "permissions": [
@@ -544,7 +576,7 @@ def test_stateful_auth_enforces_table_permissions(stateful_auth_api: AuthApi):
     tables_resp = stateful_auth_api.s.get(f"{stateful_auth_api.url}/tables", timeout=30)
     assert tables_resp.status_code == 403
 
-    admin_resp = stateful_auth_api.s.get(f"{stateful_auth_api.url}/auth/v1/users", timeout=30)
+    admin_resp = stateful_auth_api.s.get(f"{stateful_auth_api.auth_url}/users", timeout=30)
     assert admin_resp.status_code == 403
 
 

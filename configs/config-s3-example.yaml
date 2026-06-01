@@ -63,6 +63,6 @@ disable_shard_alloc: false
 log_level: "info"
 logging_style: "json"  # Use structured logging for production
 
-# Optional: Termite embedding cache service
-# termite:
+# Optional: Antfly inference service
+# inference:
 #   api_url: "http://127.0.0.1:11433"

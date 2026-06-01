@@ -12,8 +12,8 @@ import (
 	"time"
 
 	exampleentity "github.com/antflydb/antfly/examples/docsaf/entity"
-	antfly "github.com/antflydb/antfly/pkg/client"
-	"github.com/antflydb/antfly/pkg/docsaf"
+	"github.com/antflydb/antfly/go/pkg/docsaf"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
 // StringSliceFlag allows repeated flags to build a slice
@@ -148,7 +148,7 @@ func prepareCmd(args []string) error {
 // ANCHOR: load_cmd
 func loadCmd(args []string) error {
 	fs := flag.NewFlagSet("load", flag.ExitOnError)
-	antflyURL := fs.String("url", "http://localhost:8080/api/v1", "Antfly API URL")
+	antflyURL := fs.String("url", "http://localhost:8080/db/v1", "Antfly API URL")
 	tableName := fs.String("table", "docs", "Table name to merge into")
 	inputFile := fs.String("input", "docs.json", "Input JSON file path")
 	dryRun := fs.Bool("dry-run", false, "Preview changes without applying them")
@@ -245,7 +245,7 @@ func loadCmd(args []string) error {
 // ANCHOR: sync_cmd
 func syncCmd(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
-	antflyURL := fs.String("url", "http://localhost:8080/api/v1", "Antfly API URL")
+	antflyURL := fs.String("url", "http://localhost:8080/db/v1", "Antfly API URL")
 	tableName := fs.String("table", "docs", "Table name to merge into")
 	dirPath := fs.String("dir", "", "Path to directory containing documentation files (required)")
 	baseURL := fs.String("base-url", "", "Base URL for generating document links (optional)")
@@ -424,10 +424,10 @@ func createEmbeddingIndex(embeddingModel, chunkerModel string, targetTokens, ove
 		return nil, fmt.Errorf("failed to configure embedder: %w", err)
 	}
 
-	// Configure chunker via Termite
+	// Configure chunker via Antfly inference.
 	// Model can be "fixed-bert-tokenizer", "fixed-bpe-tokenizer", or any ONNX model directory name
 	chunker := antfly.ChunkerConfig{}
-	err = chunker.FromTermiteChunkerConfig(antfly.TermiteChunkerConfig{
+	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
 		Model: chunkerModel,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  targetTokens,

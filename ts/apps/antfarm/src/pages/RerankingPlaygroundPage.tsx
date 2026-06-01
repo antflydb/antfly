@@ -36,7 +36,7 @@ import { fetchWithRetry } from "@/lib/utils";
 
 interface RerankResponse {
   model: string;
-  scores: number[];
+  data: { index: number; score: number }[];
 }
 
 interface ModelInfo {
@@ -74,7 +74,7 @@ const SAMPLE_DATA = {
 };
 
 const RerankingPlaygroundPage: React.FC = () => {
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -141,7 +141,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/ml/v1/models`, {
+        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -163,7 +163,7 @@ const RerankingPlaygroundPage: React.FC = () => {
       }
     })();
     return () => controller.abort();
-  }, [termiteApiUrl]);
+  }, [inferenceApiUrl]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
@@ -211,7 +211,7 @@ const RerankingPlaygroundPage: React.FC = () => {
     const startTime = performance.now();
 
     try {
-      const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/rerank`, {
+      const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/rerank`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -237,12 +237,12 @@ const RerankingPlaygroundPage: React.FC = () => {
       setError(
         err instanceof Error
           ? err.message
-          : "Failed to connect to Termite. Make sure Termite is running."
+          : "Failed to connect to Antfly inference. Make sure the runtime is running."
       );
     } finally {
       setIsLoading(false);
     }
-  }, [query, documents, selectedModel, termiteApiUrl]);
+  }, [query, documents, selectedModel, inferenceApiUrl]);
 
   // Cmd+Enter shortcut
   useEffect(() => {
@@ -293,15 +293,17 @@ const RerankingPlaygroundPage: React.FC = () => {
 
   // Get ranked documents sorted by score
   const getRankedDocuments = (): RankedDocument[] => {
-    if (!result?.scores) return [];
+    if (!result?.data) return [];
 
     const nonEmptyDocs = documents.filter((d) => d.trim());
-    const ranked = result.scores.map((score, index) => ({
-      index,
-      text: nonEmptyDocs[index] || "",
-      score,
-      rank: 0,
-    }));
+    const ranked = [...result.data]
+      .sort((a, b) => a.index - b.index)
+      .map((item) => ({
+        index: item.index,
+        text: nonEmptyDocs[item.index] || "",
+        score: item.score,
+        rank: 0,
+      }));
 
     // Sort by score descending
     ranked.sort((a, b) => b.score - a.score);
@@ -316,8 +318,8 @@ const RerankingPlaygroundPage: React.FC = () => {
 
   // Get the max score for normalization
   const getMaxScore = (): number => {
-    if (!result?.scores || result.scores.length === 0) return 1;
-    return Math.max(...result.scores);
+    if (!result?.data || result.data.length === 0) return 1;
+    return Math.max(...result.data.map((item) => item.score));
   };
 
   const getScoreColor = (score: number, maxScore: number) => {
@@ -436,7 +438,7 @@ const RerankingPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -446,7 +448,7 @@ const RerankingPlaygroundPage: React.FC = () => {
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           <Badge variant="secondary" className="gap-1.5">
             <Hash className="h-3 w-3" />
-            {result.scores.length} documents
+            {result.data.length} documents
           </Badge>
           <Badge variant="secondary" className="gap-1.5">
             <Zap className="h-3 w-3" />
@@ -514,7 +516,7 @@ const RerankingPlaygroundPage: React.FC = () => {
                   const barWidth = maxScore > 0 ? Math.max(2, (doc.score / maxScore) * 100) : 0;
 
                   return (
-                    <div key={doc.index} className="p-3 bg-muted/30 rounded-lg border space-y-2">
+                    <div key={doc.index} className="p-3 bg-muted/30 rounded-none border space-y-2">
                       <div className="flex items-center gap-2">
                         <span className="flex items-center justify-center w-6 h-6 rounded-full bg-primary/10 text-primary text-xs font-bold shrink-0">
                           {doc.rank}

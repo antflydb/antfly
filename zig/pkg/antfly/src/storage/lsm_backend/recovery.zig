@@ -20,9 +20,36 @@ const compaction_mod = @import("compaction.zig");
 const runtime_mod = @import("runtime.zig");
 const storage_io = @import("storage_io.zig");
 
+fn openDebugLogsEnabled() bool {
+    return std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+}
+
 pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !BackendType {
-    var backend = BackendType.init(allocator, backend_options);
+    var backend: BackendType = undefined;
+    try openInto(BackendType, &backend, allocator, root_dir, options, backend_options);
+    return backend;
+}
+
+pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !void {
+    if (@hasDecl(BackendType, "initInPlace")) {
+        BackendType.initInPlace(backend, allocator, backend_options);
+    } else {
+        backend.* = BackendType.init(allocator, backend_options);
+    }
     backend.root_dir = try allocator.dupe(u8, root_dir);
+    const debug_open = openDebugLogsEnabled();
+    if (debug_open) {
+        std.log.info(
+            "lsm backend open begin root={s} read_only={any} create_if_missing={any} wal_enabled={any} storage_provided={any}",
+            .{
+                backend.root_dir.?,
+                options.read_only,
+                options.create_if_missing,
+                backend.options.wal_enabled,
+                backend_options.storage != null,
+            },
+        );
+    }
 
     if (backend_options.storage) |storage| {
         backend.storage = storage;
@@ -33,7 +60,7 @@ pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const 
         backend.storage_owner = owned;
         backend.storage = owned.storage();
     }
-    errdefer cleanup(BackendType, &backend, false);
+    errdefer cleanup(BackendType, backend, false);
 
     const loaded_manifest = try repository_mod.loadManifestIfPresentWithStorage(
         backend.storage.?,
@@ -44,22 +71,51 @@ pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const 
         &backend.runs,
         &backend.obsolete_paths,
     );
+    if (debug_open) {
+        std.log.info(
+            "lsm backend open manifest loaded root={s} loaded={any} runs={d} obsolete_paths={d} next_run_id={d}",
+            .{
+                backend.root_dir.?,
+                loaded_manifest,
+                backend.runs.items.len,
+                backend.obsolete_paths.items.len,
+                backend.next_run_id,
+            },
+        );
+    }
     if (!loaded_manifest and options.create_if_missing) {
-        try repository_mod.ensureOpenDirsWithStorage(backend.storage.?, root_dir);
+        try repository_mod.ensureOpenDirsWithStorage(backend.storage.?, backend.root_dir.?);
+        if (debug_open) std.log.info("lsm backend open ensured dirs root={s}", .{backend.root_dir.?});
     }
     {
-        const locked = runtime_mod.lockBackend(BackendType, &backend);
-        defer runtime_mod.unlockBackend(BackendType, &backend, locked);
+        const locked = runtime_mod.lockBackend(BackendType, backend);
+        defer runtime_mod.unlockBackend(BackendType, backend, locked);
 
         if (@hasDecl(BackendType, "replayWalIntoMutable")) {
+            if (debug_open) std.log.info("lsm backend open wal replay begin root={s}", .{backend.root_dir.?});
             try backend.replayWalIntoMutable();
+            if (debug_open) {
+                std.log.info(
+                    "lsm backend open wal replay done root={s} mutable_entries={d} immutable_memtables={d}",
+                    .{
+                        backend.root_dir.?,
+                        backend.mutable.entries.items.len,
+                        if (@hasField(BackendType, "immutable_memtables")) backend.immutable_memtables.items.len else 0,
+                    },
+                );
+            }
         }
         compaction_mod.sortRuns(backend.runs.items);
     }
     if (@hasDecl(BackendType, "refreshMaintenanceDebtHint")) {
         backend.refreshMaintenanceDebtHint();
     }
-    return backend;
+    if (debug_open) {
+        std.log.info(
+            "lsm backend open done root={s} runs={d} mutable_entries={d}",
+            .{ backend.root_dir.?, backend.runs.items.len, backend.mutable.entries.items.len },
+        );
+    }
 }
 
 pub fn close(comptime BackendType: type, backend: *BackendType) void {

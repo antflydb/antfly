@@ -56,7 +56,7 @@ Lookup rules:
 
 Current helpers:
 
-- `src/storage/db/artifact_ids.zig` encodes and decodes public artifact IDs and
+- `go/pkg/antfly/src/storage/db/artifact_ids.zig` encodes and decodes public artifact IDs and
   reconstructs internal keys from `ArtifactRef`.
 - `DB.getArtifact` looks up a stored artifact by public artifact ID.
 - `antfly_db_decode_artifact_id_json` decodes a public artifact ID to
@@ -429,7 +429,7 @@ Go avoids that by storing a hash with each enrichment output:
 - Dense embedding row: `[hashID:uint64][vector]`.
 - Sparse embedding row: `[hashID:uint64][sparse_vector]`.
 - Chunk row: `[hashID:uint64][chunk_json]`.
-- Summary row: `[hashID:uint64][summary_text]`.
+- Asset artifact row: `[hashID:uint64][payload]`.
 
 Before generating new output, Go renders/extracts the source prompt, computes
 the prompt hash, reads the existing enrichment row, and skips the operation when
@@ -530,7 +530,7 @@ and temporary, not hidden behind artifact-oriented method names.
 ### Required Follow-Up
 
 1. Add internal-key range helpers for artifact families.
-   - Lower/upper bounds for embedding, chunk, summary, and any other
+   - Lower/upper bounds for embedding, chunk, asset, and any other
      enrichment-owned artifact namespaces.
 
 2. Add docstore/store scan APIs that enumerate those artifact ranges directly.
@@ -1019,7 +1019,7 @@ Initial kind values:
 - `2`: dense embedding, `u32 dims` followed by `dims` little-endian `f32`
   values.
 - `3`: sparse embedding, encoded sparse vector payload.
-- `4`: summary text payload.
+- `4`: asset payload.
 
 Initial flags:
 

@@ -1,28 +1,27 @@
 SHELL := /bin/bash
 ZIG_MAKE := $(MAKE) -C ./zig
 ZIG_BUILD_FLAGS ?=
+SCRIPTS_PY ?= uv run --project scripts --locked python
 # ====================================================================================
 # Go Version Configuration
 # ====================================================================================
 # Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
-GO := GOEXPERIMENT=simd go
-
-# Go modules outside of root
+GO := GOWORK=off GOEXPERIMENT=simd go
+ANTFLY_GO_MODULE := ./go/pkg/antfly
+# Go modules outside of the Antfly product module
 GO_SUBMODULES := \
-	./e2e \
-	./pkg/client \
-	./pkg/antfly-proxy \
-	./pkg/libaf \
-	./pkg/operator \
-	./pkg/docsaf \
-	./pkg/generating \
-	./pkg/evalaf \
-	./pkg/evalaf/plugins/antfly \
-	./pkg/genkit/antfly \
-	./pkg/genkit/openrouter \
-	./pkg/termite \
-	./pkg/termite-client \
-	./pkg/termite-proxy
+	./go/e2e \
+	./go/pkg/sdk \
+	./go/pkg/proxy \
+	./go/pkg/libaf \
+	./go/pkg/operator \
+	./go/pkg/docsaf \
+	./go/pkg/generating \
+	./go/pkg/evalaf \
+	./go/pkg/evalaf/plugins/antfly \
+	./go/pkg/genkit/antfly \
+	./go/pkg/genkit/openrouter \
+	./go/pkg/memoryaf
 
 # ====================================================================================
 # General Commands
@@ -36,7 +35,7 @@ help:
 	@echo "  build              Build the Zig antfly binary"
 	@echo "  build-go           Build the legacy Go antfly binary"
 	@echo "  build-antfarm      Build the antfarm frontend (React admin UI)"
-	@echo "  build-docs         Join and lint OpenAPI specifications"
+	@echo "  build-docs         Join OpenAPI specifications"
 	@echo "  generate           Generate code, client SDKs, and all website documentation (API, config, changelog)"
 	@echo "  lint               Run golangci-lint with auto-fix"
 	@echo "  tidy               Run go mod tidy across root and Go submodules"
@@ -47,7 +46,6 @@ help:
 	@echo "  zig-generated-check  Verify migrated Zig generated sources"
 	@echo "  install-git-hooks  Configure Git to use the repository hooks in .githooks/"
 	@echo "  update-deps        Update Go dependencies"
-	@echo "  cleanup-goreman    Clean up goreman logs and data"
 	@echo "  sim-validate       Run simulator-focused validation"
 	@echo "  sim-validate-repo  Run broader repo validation including go test ./..."
 	@echo "  sim-soak           Run simulator soak scenarios"
@@ -95,79 +93,34 @@ build-antfarm: build-antfarm-main
 build-antfarm-main:
 	@echo "Building antfarm frontend..."
 	cd ts && pnpm install && pnpm --filter antfarm... build
-	@echo "Copying dist files to src/metadata/antfarm..."
-	rm -rf src/metadata/antfarm/*
-	cp -r ts/apps/antfarm/dist/* src/metadata/antfarm/
+	@echo "Copying dist files to go/pkg/antfly/src/metadata/antfarm..."
+	rm -rf go/pkg/antfly/src/metadata/antfarm/*
+	cp -r ts/apps/antfarm/dist/* go/pkg/antfly/src/metadata/antfarm/
 
 build: build-antfarm
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
 	cp zig/zig-out/bin/antfly ./antfly
 
 build-go: build-antfarm generate
-	$(GO) build -tags "afrelease" -ldflags="-s -w" -o antfly ./cmd/antfly
+	(cd $(ANTFLY_GO_MODULE) && $(GO) build -tags "afrelease" -ldflags="-s -w" -o ../../../antfly ./cmd)
 
 build-docs:
-	npx @redocly/cli@latest join src/metadata/api.yaml src/usermgr/api.yaml
-	npx @redocly/cli@latest lint openapi.yaml
+	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
 
 generate: build-docs tidy
-	$(GO) generate ./...
+	(cd $(ANTFLY_GO_MODULE) && $(GO) generate ./...)
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Generating in $$mod"; \
-		(cd $$mod && go generate ./...) || exit 1; \
+		(cd $$mod && $(GO) generate ./...) || exit 1; \
 	done
 	cd ts && pnpm --filter @antfly/sdk generate
-	cd ts && pnpm --filter @antfly/termite-sdk generate
-	$(MAKE) -C ./py generate
+	$(MAKE) -C ./py/packages/sdk generate
 
-license-headers: ## Add ELv2 license headers to core files missing them
-	$(GO) run github.com/google/addlicense@latest \
-		-f .license-header.txt \
-		-ignore 'zig/**' \
-		-ignore 'lib/multirafthttp/**' \
-		-ignore 'lib/types/**' \
-		-ignore 'pkg/**' \
-		-ignore 'ts/**' \
-		-ignore 'py/**' \
-		-ignore 'rs/**' \
-		-ignore 'vendor/**' \
-		-ignore '.github/**' \
-		-ignore 'examples/**' \
-		-ignore 'configs/**' \
-		-ignore 'devops/**' \
-		-ignore 'scripts/**' \
-		-ignore '**/*.pb.go' \
-		-ignore '**/zz_generated*' \
-		-ignore '**/Dockerfile*' \
-		-ignore '**/*.yaml' \
-		-ignore '**/*.yml' \
-		.
-	$(ZIG_MAKE) license-headers
+license-headers: ## Add first-party license headers.
+	$(SCRIPTS_PY) scripts/license_headers.py
 
-license-check: ## Check that all core files have license headers
-	$(GO) run github.com/google/addlicense@latest \
-		-check \
-		-f .license-header.txt \
-		-ignore 'zig/**' \
-		-ignore 'lib/multirafthttp/**' \
-		-ignore 'lib/types/**' \
-		-ignore 'pkg/**' \
-		-ignore 'ts/**' \
-		-ignore 'py/**' \
-		-ignore 'rs/**' \
-		-ignore 'vendor/**' \
-		-ignore '.github/**' \
-		-ignore 'examples/**' \
-		-ignore 'configs/**' \
-		-ignore 'devops/**' \
-		-ignore 'scripts/**' \
-		-ignore '**/*.pb.go' \
-		-ignore '**/zz_generated*' \
-		-ignore '**/Dockerfile*' \
-		-ignore '**/*.yaml' \
-		-ignore '**/*.yml' \
-		.
-	$(ZIG_MAKE) license-check
+license-check: ## Check first-party license headers.
+	$(SCRIPTS_PY) scripts/license_headers.py --check
 
 zig-build:
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
@@ -205,20 +158,20 @@ lint:
 	$(GO) run github.com/Antonboom/testifylint@latest --fix ./...
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Linting $$mod"; \
-		(cd $$mod && go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./...) && \
-		(cd $$mod && go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run --fix ./...) && \
-		(cd $$mod && go run github.com/Antonboom/testifylint@latest --fix ./...) || exit 1; \
+		(cd $$mod && $(GO) run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./...) && \
+		(cd $$mod && $(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run --fix ./...) && \
+		(cd $$mod && $(GO) run github.com/Antonboom/testifylint@latest --fix ./...) || exit 1; \
 	done
 	cd ts && pnpm run lint
 
 sim-validate:
-	$(GO) run ./cmd/debugging/sim -action validate -scope sim
+	(cd $(ANTFLY_GO_MODULE) && $(GO) run ./cmd/sim -action validate -scope sim)
 
 sim-validate-repo:
-	$(GO) run ./cmd/debugging/sim -action validate -scope repo
+	(cd $(ANTFLY_GO_MODULE) && $(GO) run ./cmd/sim -action validate -scope repo)
 
 sim-soak:
-	$(GO) run ./cmd/debugging/sim -action soak -json
+	(cd $(ANTFLY_GO_MODULE) && $(GO) run ./cmd/sim -action soak -json)
 
 
 # ====================================================================================
@@ -262,17 +215,17 @@ force-download-omni-deps: ## Force re-download of ONNX Runtime and PJRT.
 	$(MAKE) download-omni-deps
 
 tidy:
-	$(GO) mod tidy
+	(cd $(ANTFLY_GO_MODULE) && $(GO) mod tidy)
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Tidying $$mod"; \
-		(cd $$mod && go mod tidy) || exit 1; \
+		(cd $$mod && $(GO) mod tidy) || exit 1; \
 	done
 
 tidy-check:
-	$(GO) mod tidy -diff
+	(cd $(ANTFLY_GO_MODULE) && $(GO) mod tidy -diff)
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Checking tidy in $$mod"; \
-		(cd $$mod && go mod tidy -diff) || exit 1; \
+		(cd $$mod && $(GO) mod tidy -diff) || exit 1; \
 	done
 
 install-git-hooks:
@@ -283,7 +236,7 @@ update-deps:
 	$(GO) get -u ./...
 	@for mod in $(GO_SUBMODULES); do \
 		echo "==> Updating deps in $$mod"; \
-		(cd $$mod && go get -u ./...) || exit 1; \
+		(cd $$mod && $(GO) get -u ./...) || exit 1; \
 	done
 	$(MAKE) tidy
 
@@ -304,7 +257,7 @@ build-omni: download-omni-deps
 	export LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LIBRARY_PATH && \
 	export LD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
 	export DYLD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
-	$(GO) build -tags="onnx,ORT,xla,XLA" -ldflags="-s -w" -o antfly ./cmd/antfly
+	(cd $(ANTFLY_GO_MODULE) && $(GO) build -tags="onnx,ORT,xla,XLA" -ldflags="-s -w" -o ../../../antfly ./cmd)
 
 
 # ====================================================================================
@@ -339,7 +292,7 @@ E2E_MEMLIMIT ?= 16GiB
 e2e-deps: download-omni-deps
 
 e2e: e2e-deps
-	@echo "Running E2E tests with ONNX+XLA build (Termite provider)..."
+	@echo "Running E2E tests with ONNX+XLA build (Antfly inference provider)..."
 	@echo "This will download models on first run (embedder, chunker, reranker, generator)."
 	@echo "Platform: $(E2E_PLATFORM)"
 ifdef E2E_TEST
@@ -355,8 +308,8 @@ endif
 	export LD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$LD_LIBRARY_PATH && \
 	export DYLD_LIBRARY_PATH=$(ONNXRUNTIME_ROOT)/$(E2E_PLATFORM)/lib:$$DYLD_LIBRARY_PATH && \
 	export RUN_EVAL_TESTS=true && \
-	export E2E_PROVIDER=termite && \
-	cd e2e && $(GO) test -v -tags="onnx,ORT,xla,XLA" -timeout $(E2E_TIMEOUT) $(if $(E2E_TEST),-run '$(E2E_TEST)') ./...
+	export E2E_PROVIDER=antfly && \
+	cd go/e2e && $(GO) test -v -tags="onnx,ORT,xla,XLA" -timeout $(E2E_TIMEOUT) $(if $(E2E_TEST),-run '$(E2E_TEST)') ./...
 
 
 # ====================================================================================
@@ -490,46 +443,32 @@ show-ingress:
 # ====================================================================================
 
 .PHONY: operator-build operator-test operator-docker-build operator-lint \
-        termite-proxy-build \
-        termite-build termite-test termite-lint \
-        termite-client-test termite-client-lint
+        inference-runtime-build inference-runtime-test inference-runtime-lint \
+        sdk-test sdk-lint
 
 operator-build: ## Build the antfly-operator binary
-	(cd ./pkg/operator && $(MAKE) build)
+	(cd ./go/pkg/operator && $(MAKE) build)
 
 operator-test: ## Run antfly-operator tests
-	(cd ./pkg/operator && $(MAKE) test)
+	(cd ./go/pkg/operator && $(MAKE) test)
 
 operator-lint: ## Run linter on antfly-operator
-	(cd ./pkg/operator && $(MAKE) lint)
+	(cd ./go/pkg/operator && $(MAKE) lint)
 
 operator-docker-build: ## Build antfly-operator Docker image
-	docker build -t antfly-operator:latest -f ./Dockerfile.antfly-operator .
+	docker build -t antfly-operator:latest -f ./go/pkg/operator/Dockerfile .
 
-termite-proxy-build: ## Build the termite-proxy binary
-	(cd ./pkg/termite-proxy && $(GO) build -o ../../termite-proxy ./cmd/termite-proxy)
+inference-runtime-build: ## Build the Go inference runtime module
+	(cd $(GO_INFERENCE_RUNTIME_MODULE) && $(GO) build ./...)
 
-termite-build: ## Build the termite binary (pure Go)
-	(cd ./pkg/termite && $(GO) build -o ../../termite ./cmd)
+inference-runtime-test: ## Run Go inference runtime tests
+	(cd $(GO_INFERENCE_RUNTIME_MODULE) && $(GO) test ./...)
 
-termite-test: ## Run termite unit tests (pure Go)
-	(cd ./pkg/termite && $(GO) test ./...)
+inference-runtime-lint: ## Run Go inference runtime linter
+	(cd $(GO_INFERENCE_RUNTIME_MODULE) && $(GO) vet ./...)
 
-termite-lint: ## Run linter on termite
-	(cd ./pkg/termite && $(GO) vet ./...)
+sdk-test: ## Run SDK tests
+	(cd ./go/pkg/sdk && $(GO) test ./...)
 
-termite-client-test: ## Run termite-client tests
-	(cd ./pkg/termite-client && $(GO) test ./...)
-
-termite-client-lint: ## Run linter on termite-client
-	(cd ./pkg/termite-client && $(GO) vet ./...)
-
-
-# ====================================================================================
-# Cleanup Commands
-# ====================================================================================
-
-.PHONY: cleanup-goreman
-
-cleanup-goreman:
-	rm -rf goreman.log antflydb/metadata antflydb/store qlogdir; lsof -i udp:9021 -i udp:9022 -i udp:9023 -i udp:9024 -i udp:9025 -i udp:9026 -i udp:52380 -i udp:42380 -i udp:22380 -i udp:42380 -i udp:12380 -i udp:32380 -i udp:12277 -i udp:9018 -i udp:9019 -i tcp:8080 -i udp:9017 -i udp:4211 -i tcp:8080 -i tcp:9021 -i tcp:4201 -i tcp:4202 -i tcp:4203 -i tcp:4211 -i tcp:4212 -i tcp:4213 -i tcp:4201 -i tcp:9022 -i tcp:9025 -i tcp:9023 -i tcp:9024 -i tcp:11433 -i udp:11433 | awk '{print $2 }' | sed '1d' | xargs kill -9
+sdk-lint: ## Run SDK linter
+	(cd ./go/pkg/sdk && $(GO) vet ./...)

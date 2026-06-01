@@ -70,6 +70,11 @@ fn runtimeScratchAllocator(fallback: Allocator) Allocator {
     return std.heap.smp_allocator;
 }
 
+fn elapsedNs(start_ns: u64) u64 {
+    const end_ns = platform_time.monotonicNs();
+    return if (end_ns >= start_ns) end_ns - start_ns else 0;
+}
+
 pub fn lockBackend(comptime BackendType: type, backend: *BackendType) bool {
     if (builtin.os.tag == .freestanding) return false;
     if (@hasField(BackendType, "mu")) {
@@ -1286,11 +1291,10 @@ fn chooseMultiGetPlan(keys: []const []const u8, context: MultiGetContext) MultiG
     if (keys.len < 2) return .point;
     if (!keysAreStrictlySorted(keys)) return .point;
 
-    // Live/current-tip batches hold the backend lock while they observe mutable
-    // state. Until we have a real run/block cost model, keep those reads on the
-    // point path; sorted key order is not enough evidence that the table layout
-    // is scan-friendly, especially for HBC artifact payload reads.
-    if (context == .current_live) return .point;
+    // Probe batches are exact key lookups, not range scans. Sorted key order is
+    // not enough evidence that the table layout is scan-friendly, especially
+    // for public source hydration and HBC artifact payload reads.
+    if (context != .snapshot) return .point;
 
     if (isCursorFriendlyExactBatch(keys)) return .cursor;
     if (keys.len >= min_sorted_by_run_keys and context == .snapshot) return .sorted_by_run;
@@ -2033,6 +2037,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         backend: *BackendType,
         namespace: backend_types.Namespace,
         stable_point_view: bool = false,
+        stable_point_view_loaded: bool = false,
         empty_state: State = .{},
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
@@ -2049,34 +2054,18 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             errdefer backend.releaseReader();
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             const stable_point_view = backend.mutable.entries.items.len == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
-            var runs: []Run = &.{};
-            var l0_groups: []RunGroup = &.{};
-            var levels: []RunLevel = &.{};
-            errdefer {
-                deinitRunGroups(metadata_allocator, l0_groups);
-                metadata_allocator.free(levels);
-                freeRunSnapshotList(metadata_allocator, runs);
-            }
-            if (stable_point_view) {
-                runs = try borrowRunSnapshotList(metadata_allocator, backend.runs.items);
-                l0_groups = try buildL0RunGroupsWithStats(backend, metadata_allocator, runs);
-                levels = try buildLowerLevels(metadata_allocator, runs);
-            }
             return .{
                 .allocator = runtimeScratchAllocator(backend.allocator),
                 .metadata_allocator = metadata_allocator,
                 .backend = backend,
                 .namespace = namespace,
                 .stable_point_view = stable_point_view,
-                .runs = runs,
-                .l0_groups = l0_groups,
-                .levels = levels,
             };
         }
 
         pub fn abort(self: *@This()) void {
             const backend = self.backend;
-            if (self.stable_point_view) {
+            if (self.stable_point_view_loaded) {
                 deinitRunGroups(self.metadata_allocator, self.l0_groups);
                 self.metadata_allocator.free(self.levels);
                 freeRunSnapshotList(self.metadata_allocator, self.runs);
@@ -2089,8 +2078,25 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             self.* = undefined;
         }
 
+        fn ensureStablePointViewLoaded(self: *@This()) !void {
+            if (!self.stable_point_view or self.stable_point_view_loaded) return;
+            const locked = lockBackend(BackendType, self.backend);
+            defer unlockBackend(BackendType, self.backend, locked);
+            const runs = try borrowRunSnapshotList(self.metadata_allocator, self.backend.runs.items);
+            errdefer freeRunSnapshotList(self.metadata_allocator, runs);
+            const l0_groups = try buildL0RunGroupsWithStats(self.backend, self.metadata_allocator, runs);
+            errdefer deinitRunGroups(self.metadata_allocator, l0_groups);
+            const levels = try buildLowerLevels(self.metadata_allocator, runs);
+            errdefer self.metadata_allocator.free(levels);
+            self.runs = runs;
+            self.l0_groups = l0_groups;
+            self.levels = levels;
+            self.stable_point_view_loaded = true;
+        }
+
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             if (self.stable_point_view) {
+                try self.ensureStablePointViewLoaded();
                 self.backend.recordPointGet();
                 switch (try getFromStableCachedPointView(self.backend, self.metadata_allocator, self.runs, self.l0_groups, self.levels, &self.last_l0_group_index, self.namespace, key)) {
                     .hit => |value| return value,
@@ -2134,13 +2140,47 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 const end = @min(offset + max_current_batch_read_keys_per_backend_lock, keys.len);
                 const plan = chooseMultiGetPlan(keys[offset..end], if (self.stable_point_view) .stable_probe else .current_live);
                 recordMultiGetPlan(self.backend, plan);
-                const chunk_result = blk: {
+                const chunk_result = if (self.stable_point_view) blk: {
+                    try self.ensureStablePointViewLoaded();
+                    break :blk switch (plan) {
+                        .sorted_by_run => try readManySortedByRunFromSnapshot(
+                            self.backend,
+                            &self.empty_state,
+                            &.{},
+                            self.runs,
+                            self.l0_groups,
+                            self.levels,
+                            self.allocator,
+                            &self.held_blocks,
+                            &self.held_values,
+                            self.namespace,
+                            keys[offset..end],
+                            values[offset..end],
+                            false,
+                        ),
+                        .cursor, .point => try readManySortedPointFromSnapshot(
+                            self.backend,
+                            &self.empty_state,
+                            &.{},
+                            self.runs,
+                            self.l0_groups,
+                            self.levels,
+                            self.allocator,
+                            &self.held_blocks,
+                            &self.held_values,
+                            self.namespace,
+                            keys[offset..end],
+                            values[offset..end],
+                            false,
+                        ),
+                    };
+                } else blk: {
                     const locked = lockBackend(BackendType, self.backend);
                     defer unlockBackend(BackendType, self.backend, locked);
                     break :blk switch (plan) {
                         .cursor => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, keys[offset..end], values[offset..end]),
                         .sorted_by_run => try readManyCurrentSortedPointByRunLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, keys[offset..end], values[offset..end]),
-                        .point => try readManyCurrentPointLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, keys[offset..end], values[offset..end]),
+                        .point => try readManySortedCurrentLocked(BackendType, self.backend, self.namespace, self.allocator, &self.held_values, keys[offset..end], values[offset..end]),
                     };
                 };
                 result.add(chunk_result);
@@ -2414,6 +2454,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         backend: *BackendType,
         namespace: backend_types.Namespace,
         mutable: ActiveMemTable,
+        bulk_appends: State = .{},
         snapshot: ?State = null,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
         batch_options: backend_types.BatchOptions = .{},
@@ -2444,6 +2485,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (self.closed) return;
             const backend = self.backend;
             self.mutable.deinit(self.allocator);
+            self.bulk_appends.deinit(self.allocator);
             invalidateSnapshot(&self.snapshot, self.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
@@ -2461,12 +2503,15 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             errdefer if (release_on_error) {
                 self.mutable.deinit(self.allocator);
                 self.mutable = .{};
+                self.bulk_appends.deinit(self.allocator);
+                self.bulk_appends = .{};
                 invalidateSnapshot(&self.snapshot, self.allocator);
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
                 self.backend.releaseReader();
                 self.closed = true;
             };
+            const direct_ingested_bulk_appends = try self.tryCommitDirectBulkAppends();
             if (!try self.tryCommitDirectBulkIngest()) {
                 const mutated = self.mutable.entries.items.len > 0;
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
@@ -2484,7 +2529,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
                 invalidateSnapshot(&self.snapshot, self.allocator);
-                if (mutated and @hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
+                if ((mutated or direct_ingested_bulk_appends) and @hasDecl(BackendType, "notePotentialMaintenanceDebt")) self.backend.notePotentialMaintenanceDebt();
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 try self.backend.maybeFlushMutable();
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
@@ -2503,28 +2548,125 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (finalize_err) |err| return err;
         }
 
+        fn tryCommitDirectBulkAppends(self: *@This()) !bool {
+            var entries = self.bulk_appends.entries.items.len;
+            if (entries == 0) return false;
+            if (self.batch_options.mode != .bulk_ingest) {
+                if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackNonBulk")) self.backend.recordBulkAppendFallbackNonBulk(entries);
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+            if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
+                if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackUnsupported")) self.backend.recordBulkAppendFallbackUnsupported(entries);
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+            if (self.backend.mutable.entries.items.len != 0 and @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest")) {
+                if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
+                    if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+                    if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
+                    try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                    return false;
+                }
+            }
+            if (self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) {
+                if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+            if (self.mutable.entries.items.len > 0) {
+                try state_mod.applyMutableMoveToMutable(&self.bulk_appends, self.allocator, &self.mutable);
+                entries = self.bulk_appends.entries.items.len;
+            }
+            if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
+
+            const sort_start_ns = platform_time.monotonicNs();
+            state_mod.sortStateEntries(&self.bulk_appends);
+            const sort_ns = elapsedNs(sort_start_ns);
+            if (!bulkStateEntriesAreUnique(&self.bulk_appends)) {
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, sort_ns);
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+            if (!self.backend.shouldDirectIngestBulkState(&self.bulk_appends)) {
+                if (@hasDecl(BackendType, "recordBulkAppendFallbackBelowThreshold")) self.backend.recordBulkAppendFallbackBelowThreshold(entries, sort_ns);
+                try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+                return false;
+            }
+
+            if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&self.bulk_appends);
+            if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                try self.backend.ingestOwnedSortedState(&self.bulk_appends);
+            } else {
+                try self.backend.ingestSortedState(&self.bulk_appends);
+            }
+            if (@hasDecl(BackendType, "recordBulkAppendSuccess")) self.backend.recordBulkAppendSuccess(entries, sort_ns);
+            self.bulk_appends.deinit(self.allocator);
+            self.bulk_appends = .{};
+            invalidateSnapshot(&self.snapshot, self.allocator);
+            return true;
+        }
+
+        fn bulkStateEntriesAreUnique(state: *const State) bool {
+            if (state.entries.items.len <= 1) return true;
+            var previous = state.entries.items[0];
+            for (state.entries.items[1..]) |entry| {
+                if (compareEntryTo(previous, state_mod.namespaceOf(entry), entry.key) == .eq) return false;
+                previous = entry;
+            }
+            return true;
+        }
+
         fn tryCommitDirectBulkIngest(self: *@This()) !bool {
             if (self.batch_options.mode != .bulk_ingest) return false;
-            if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) return false;
-            if (self.backend.mutable.entries.items.len != 0) return false;
-            if (self.mutable.entries.items.len == 0) return false;
-
+            const entries = self.mutable.entries.items.len;
+            if (entries == 0) return false;
+            if (@hasDecl(BackendType, "recordDirectBulkIngestAttempt")) self.backend.recordDirectBulkIngestAttempt(entries);
+            if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
+                if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackUnsupported")) self.backend.recordDirectBulkIngestFallbackUnsupported();
+                return false;
+            }
+            if (self.backend.mutable.entries.items.len != 0) {
+                if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBackendMutable")) self.backend.recordDirectBulkIngestFallbackBackendMutable();
+                return false;
+            }
             if (@hasDecl(BackendType, "shouldDirectIngestBulkMutable")) {
-                if (!self.backend.shouldDirectIngestBulkMutable(&self.mutable)) return false;
+                if (!self.backend.shouldDirectIngestBulkMutable(&self.mutable)) {
+                    if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBelowThreshold")) self.backend.recordDirectBulkIngestFallbackBelowThreshold();
+                    return false;
+                }
                 if (@hasDecl(BackendType, "appendWalForMutable")) try self.backend.appendWalForMutable(&self.mutable);
+                const sort_start_ns = platform_time.monotonicNs();
                 var sorted = try self.mutable.toStateMove(self.allocator);
                 errdefer sorted.deinit(self.allocator);
-                try self.backend.ingestSortedState(&sorted);
+                const sort_ns = elapsedNs(sort_start_ns);
+                if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                    try self.backend.ingestOwnedSortedState(&sorted);
+                } else {
+                    try self.backend.ingestSortedState(&sorted);
+                }
+                if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, sort_ns);
                 sorted.deinit(self.allocator);
             } else {
+                const sort_start_ns = platform_time.monotonicNs();
                 var sorted = try self.mutable.clone(self.allocator);
                 errdefer sorted.deinit(self.allocator);
+                const sort_ns = elapsedNs(sort_start_ns);
                 if (!self.backend.shouldDirectIngestBulkState(&sorted)) {
+                    if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBelowThreshold")) self.backend.recordDirectBulkIngestFallbackBelowThreshold();
                     sorted.deinit(self.allocator);
                     return false;
                 }
                 if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&sorted);
-                try self.backend.ingestSortedState(&sorted);
+                if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                    try self.backend.ingestOwnedSortedState(&sorted);
+                } else {
+                    try self.backend.ingestSortedState(&sorted);
+                }
+                if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, sort_ns);
                 sorted.deinit(self.allocator);
             }
             self.mutable.deinit(self.allocator);
@@ -2535,6 +2677,15 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            var bulk_idx = self.bulk_appends.entries.items.len;
+            while (bulk_idx > 0) {
+                bulk_idx -= 1;
+                const entry = self.bulk_appends.entries.items[bulk_idx];
+                if (compareEntryTo(entry, self.namespace, key) == .eq) {
+                    if (entry.tombstone) return error.NotFound;
+                    return entry.value;
+                }
+            }
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
             return self.backend.getMergedWithOverlay(&self.backend.mutable, &self.mutable, self.namespace, key);
@@ -2556,20 +2707,38 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             var miss_count: usize = 0;
             var overlay_point_gets: usize = 0;
             for (keys, 0..) |key, i| {
-                if (self.mutable.findIndex(self.namespace, key)) |idx| {
-                    overlay_point_gets += 1;
-                    const entry = self.mutable.entries.items[idx];
-                    if (entry.tombstone) {
-                        misses += 1;
-                    } else {
-                        values[i] = entry.value;
-                        hits += 1;
+                var bulk_idx = self.bulk_appends.entries.items.len;
+                while (bulk_idx > 0) {
+                    bulk_idx -= 1;
+                    const entry = self.bulk_appends.entries.items[bulk_idx];
+                    if (compareEntryTo(entry, self.namespace, key) == .eq) {
+                        overlay_point_gets += 1;
+                        if (entry.tombstone) {
+                            misses += 1;
+                        } else {
+                            values[i] = entry.value;
+                            hits += 1;
+                        }
+                        break;
                     }
+                } else {
+                    if (self.mutable.findIndex(self.namespace, key)) |idx| {
+                        overlay_point_gets += 1;
+                        const entry = self.mutable.entries.items[idx];
+                        if (entry.tombstone) {
+                            misses += 1;
+                        } else {
+                            values[i] = entry.value;
+                            hits += 1;
+                        }
+                        continue;
+                    }
+                    miss_keys[miss_count] = key;
+                    miss_indexes[miss_count] = i;
+                    miss_count += 1;
                     continue;
                 }
-                miss_keys[miss_count] = key;
-                miss_indexes[miss_count] = i;
-                miss_count += 1;
+                continue;
             }
             self.backend.recordPointGets(overlay_point_gets);
 
@@ -2608,6 +2777,12 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
+            if (self.batch_options.mode == .bulk_ingest) {
+                const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
+                try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, self.namespace, key, value, false));
+                invalidateSnapshot(&self.snapshot, self.allocator);
+                return;
+            }
             try self.mutable.appendUpsert(self.allocator, self.namespace, key, value, false);
             invalidateSnapshot(&self.snapshot, self.allocator);
         }
@@ -2622,6 +2797,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 const locked = lockBackend(BackendType, self.backend);
                 defer unlockBackend(BackendType, self.backend, locked);
                 self.snapshot = try self.backend.materializeVisibleStateWithOverlay(&self.backend.mutable, &self.mutable);
+                try state_mod.applyState(&self.snapshot.?, self.allocator, &self.bulk_appends);
             }
             return .{
                 .state = &self.snapshot.?,
@@ -4486,26 +4662,51 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
         fn tryCommitDirectBulkIngest(self: *@This()) !bool {
             if (self.batch_options.mode != .bulk_ingest) return false;
-            if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) return false;
-            if (self.backend.mutable.entries.items.len != 0) return false;
-            if (self.mutable.entries.items.len == 0) return false;
-
+            const entries = self.mutable.entries.items.len;
+            if (entries == 0) return false;
+            if (@hasDecl(BackendType, "recordDirectBulkIngestAttempt")) self.backend.recordDirectBulkIngestAttempt(entries);
+            if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
+                if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackUnsupported")) self.backend.recordDirectBulkIngestFallbackUnsupported();
+                return false;
+            }
+            if (self.backend.mutable.entries.items.len != 0) {
+                if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBackendMutable")) self.backend.recordDirectBulkIngestFallbackBackendMutable();
+                return false;
+            }
             if (@hasDecl(BackendType, "shouldDirectIngestBulkMutable")) {
-                if (!self.backend.shouldDirectIngestBulkMutable(&self.mutable)) return false;
+                if (!self.backend.shouldDirectIngestBulkMutable(&self.mutable)) {
+                    if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBelowThreshold")) self.backend.recordDirectBulkIngestFallbackBelowThreshold();
+                    return false;
+                }
                 if (@hasDecl(BackendType, "appendWalForMutable")) try self.backend.appendWalForMutable(&self.mutable);
+                const sort_start_ns = platform_time.monotonicNs();
                 var sorted = try self.mutable.toStateMove(self.allocator);
                 errdefer sorted.deinit(self.allocator);
-                try self.backend.ingestSortedState(&sorted);
+                const sort_ns = elapsedNs(sort_start_ns);
+                if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                    try self.backend.ingestOwnedSortedState(&sorted);
+                } else {
+                    try self.backend.ingestSortedState(&sorted);
+                }
+                if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, sort_ns);
                 sorted.deinit(self.allocator);
             } else {
+                const sort_start_ns = platform_time.monotonicNs();
                 var sorted = try self.mutable.clone(self.allocator);
                 errdefer sorted.deinit(self.allocator);
+                const sort_ns = elapsedNs(sort_start_ns);
                 if (!self.backend.shouldDirectIngestBulkState(&sorted)) {
+                    if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBelowThreshold")) self.backend.recordDirectBulkIngestFallbackBelowThreshold();
                     sorted.deinit(self.allocator);
                     return false;
                 }
                 if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&sorted);
-                try self.backend.ingestSortedState(&sorted);
+                if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                    try self.backend.ingestOwnedSortedState(&sorted);
+                } else {
+                    try self.backend.ingestSortedState(&sorted);
+                }
+                if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, sort_ns);
                 sorted.deinit(self.allocator);
             }
             self.mutable.deinit(self.allocator);

@@ -18,9 +18,9 @@ pub const generated = @import("antfly_public_openapi");
 pub const client_generated = @import("antfly_client_openapi");
 pub const schema_generated = @import("antfly_schema_openapi");
 pub const indexes_generated = @import("antfly_indexes_openapi");
-pub const ai_generated = @import("antfly_ai_openapi");
+pub const generating_api_generated = @import("antfly_generating_api_openapi");
 pub const eval_generated = @import("antfly_eval_openapi");
-pub const bleve_generated = @import("antfly_bleve_query_openapi");
+pub const query_generated = @import("antfly_query_openapi");
 pub const metadata_generated = @import("antfly_metadata_openapi");
 pub const usermgr_generated = @import("antfly_usermgr_openapi");
 pub const chunking_generated = @import("antfly_chunking_openapi");
@@ -196,9 +196,9 @@ test "generated extractors: route table covers public API" {
 }
 
 test "bleve and metadata openapi modules are generated and wired" {
-    try std.testing.expect(@hasDecl(bleve_generated, "Query"));
-    try std.testing.expect(@hasDecl(bleve_generated, "BooleanQuery"));
-    try std.testing.expect(@hasDecl(bleve_generated, "TermQuery"));
+    try std.testing.expect(@hasDecl(query_generated, "Query"));
+    try std.testing.expect(@hasDecl(query_generated, "BooleanQuery"));
+    try std.testing.expect(@hasDecl(query_generated, "TermQuery"));
     try std.testing.expect(@hasDecl(metadata_generated, "TableStatus"));
     try std.testing.expect(@hasDecl(metadata_generated, "IndexStatus"));
     try std.testing.expect(@hasDecl(metadata_generated, "BatchResponse"));
@@ -219,8 +219,8 @@ test "schema and indexes openapi modules are generated and wired" {
     try std.testing.expect(@hasDecl(indexes_generated, "IndexConfig"));
     try std.testing.expect(@hasDecl(indexes_generated, "EmbeddingsIndexConfig"));
     try std.testing.expect(@hasDecl(indexes_generated, "SortField"));
-    try std.testing.expect(@hasDecl(ai_generated, "GenerationStepConfig"));
-    try std.testing.expect(@hasDecl(ai_generated, "ClassificationTransformationResult"));
+    try std.testing.expect(@hasDecl(generating_api_generated, "GenerationStepConfig"));
+    try std.testing.expect(@hasDecl(generating_api_generated, "ClassificationTransformationResult"));
     try std.testing.expect(@hasDecl(eval_generated, "EvalConfig"));
     try std.testing.expect(@hasDecl(eval_generated, "EvalResult"));
     try std.testing.expect(@hasDecl(eval_generated, "EvaluatorName"));
@@ -380,10 +380,10 @@ test "public query contract exposes reranker and pruner fields" {
     try std.testing.expect(@hasField(generated.QueryRequest, "pruner"));
 }
 
-test "bleve query integration generates a recursive query union" {
-    try std.testing.expect(@typeInfo(bleve_generated.Query) == .@"union");
-    try std.testing.expect(@hasField(bleve_generated.Query, "match_query"));
-    try std.testing.expect(@hasField(bleve_generated.Query, "boolean_query"));
+test "query OpenAPI integration generates a recursive query union" {
+    try std.testing.expect(@typeInfo(query_generated.Query) == .@"union");
+    try std.testing.expect(@hasField(query_generated.Query, "match_query"));
+    try std.testing.expect(@hasField(query_generated.Query, "boolean_query"));
 }
 
 test "public and metadata query wrappers still keep raw full_text_search payloads" {
@@ -556,7 +556,7 @@ test "public openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@FieldType(generated.Table, "schema") == ?schema_generated.TableSchema);
     try std.testing.expect(@FieldType(generated.QueryRequest, "pruner") == ?indexes_generated.Pruner);
     try std.testing.expect(@FieldType(generated.QueryRequest, "reranker") == ?reranking_generated.RerankerConfig);
-    try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "generation") == ?ai_generated.GenerationStepConfig);
+    try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "generation") == ?generating_api_generated.GenerationStepConfig);
     try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "evaluators") == ?[]const eval_generated.EvaluatorName);
 }
 
@@ -589,6 +589,6 @@ test "client openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@FieldType(client_generated.CreateTableRequest, "schema") == ?schema_generated.TableSchema);
     try std.testing.expect(@FieldType(client_generated.QueryRequest, "pruner") == ?indexes_generated.Pruner);
     try std.testing.expect(@FieldType(client_generated.QueryRequest, "reranker") == ?reranking_generated.RerankerConfig);
-    try std.testing.expect(@FieldType(client_generated.RetrievalAgentRequest, "generation") == ?ai_generated.GenerationStepConfig);
+    try std.testing.expect(@FieldType(client_generated.RetrievalAgentRequest, "generation") == ?generating_api_generated.GenerationStepConfig);
     try std.testing.expect(@FieldType(client_generated.RetrievalAgentRequest, "evaluators") == ?[]const eval_generated.EvaluatorName);
 }

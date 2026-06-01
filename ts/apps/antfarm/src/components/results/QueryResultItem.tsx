@@ -101,7 +101,7 @@ const QueryResultItem: React.FC<QueryResultItemProps> = ({
     <Collapsible
       open={isExpanded}
       onOpenChange={onToggle}
-      className="border rounded-lg bg-card hover:bg-accent/50 transition-colors"
+      className="border rounded-none bg-card hover:bg-accent/50 transition-colors"
     >
       <CollapsibleTrigger asChild>
         <Button variant="ghost" className="w-full h-auto p-4 hover:bg-transparent justify-start">
@@ -119,7 +119,7 @@ const QueryResultItem: React.FC<QueryResultItemProps> = ({
             <div className="flex-1 min-w-0 space-y-1">
               {/* Header: ID and Score */}
               <div className="flex items-center gap-2 flex-wrap">
-                <code className="text-sm font-mono bg-muted px-2 py-0.5 rounded">
+                <code className="text-sm font-mono bg-muted px-2 py-0.5 rounded-none">
                   {_id || `Result #${index + 1}`}
                 </code>
 

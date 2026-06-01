@@ -169,12 +169,19 @@ pub const AntflyApiHandler = struct {
     ) !httpx.Response {
         const runtime = backend_runtime orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
         var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+        const job_alloc = std.heap.page_allocator;
+        const owned_table_name = try job_alloc.dupe(u8, table_name);
+        errdefer job_alloc.free(owned_table_name);
+        const owned_body_data = try job_alloc.dupe(u8, body_data);
+        errdefer job_alloc.free(owned_body_data);
         var job = OffloadedTableBatch{
-            .alloc = std.heap.page_allocator,
-            .table_name = table_name,
-            .body_data = body_data,
+            .alloc = job_alloc,
+            .table_name = owned_table_name,
+            .body_data = owned_body_data,
             .api = api,
         };
+        defer job_alloc.free(owned_table_name);
+        defer job_alloc.free(owned_body_data);
         var future = try runtime_io.concurrent(OffloadedTableBatch.run, .{&job});
         while (!job.done.load(.acquire)) {
             ctx.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
@@ -182,7 +189,7 @@ pub const AntflyApiHandler = struct {
         _ = future.await(runtime_io);
         if (job.err) |err| return err;
         var resp = job.result.?;
-        defer resp.deinit(std.heap.page_allocator);
+        defer resp.deinit(job_alloc);
         return respondApiResponseBody(ctx, resp.status, resp.body);
     }
 
@@ -289,7 +296,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn getStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const metadata_status = try self.api_server.source.status();
@@ -306,9 +313,40 @@ pub const AntflyApiHandler = struct {
         return ctx.json(public_status);
     }
 
+    pub fn getCluster(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const metadata_status = try self.api_server.source.status();
+        var public_status = try cluster.fromMetadataStatus(alloc, metadata_status);
+        defer public_status.deinit(alloc);
+        public_status.auth_enabled = self.api_server.cfg.auth_enabled;
+        public_status.swarm_mode = self.api_server.cfg.swarm_mode;
+        if (self.api_server.cfg.secret_store) |secret_store| {
+            _ = secret_store.refreshIfChanged() catch |err| {
+                std.log.warn("secret store status refresh skipped err={}", .{err});
+            };
+            cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+        }
+        var snapshot_opt = try self.api_server.source.cachedAdminSnapshot();
+        if (snapshot_opt == null) {
+            snapshot_opt = try self.api_server.source.adminSnapshot();
+        }
+        if (snapshot_opt) |*snapshot| {
+            defer self.api_server.source.freeAdminSnapshot(snapshot);
+            var topology = try cluster.topologyFromStatusAndSnapshot(alloc, public_status, snapshot);
+            defer topology.deinit(alloc);
+            return ctx.json(topology);
+        }
+        var topology = try cluster.topologyFromStatus(alloc, public_status);
+        defer topology.deinit(alloc);
+        return ctx.json(topology);
+    }
+
     pub fn listSecrets(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const listed = if (self.api_server.cfg.secret_store) |secret_store|
@@ -323,7 +361,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn putSecret(self: *AntflyApiHandler, ctx: *httpx.Context, key: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const secret_store = self.api_server.cfg.secret_store orelse {
@@ -352,7 +390,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn deleteSecret(self: *AntflyApiHandler, ctx: *httpx.Context, key: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const secret_store = self.api_server.cfg.secret_store orelse {
             _ = ctx.status(503);
@@ -368,7 +406,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn multiBatchWrite(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
@@ -379,7 +417,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn commitTransaction(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const source = self.api_server.table_writes orelse {
@@ -450,6 +488,18 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.json(response);
             },
+            error.DocIdentityNamespaceMismatch => {
+                var arena_impl = std.heap.ArenaAllocator.init(alloc);
+                defer arena_impl.deinit();
+                const response = try transactions_api.buildCommitResponse(
+                    arena_impl.allocator(),
+                    "aborted",
+                    transactions_api.docIdentityUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
+                    null,
+                );
+                _ = ctx.status(409);
+                return ctx.json(response);
+            },
             error.TxnNotFound, error.InvalidTxnRecord => {
                 var arena_impl = std.heap.ArenaAllocator.init(alloc);
                 defer arena_impl.deinit();
@@ -501,7 +551,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn listTransactionSessions(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = self.api_server.alloc;
         const sessions = try self.api_server.txn_sessions.listStatuses(alloc);
@@ -514,7 +564,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn cleanupTransactionSessions(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.CleanupTransactionSessionsParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const now_ns = platform_time.realtimeNs();
         const cutoff_ns = if (params.cutoff_ns) |value|
@@ -534,7 +584,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn beginTransaction(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         const alloc = self.api_server.alloc;
@@ -552,7 +602,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn getTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const txn_id = distributed_txn.parseTxnIdHex(transaction_id) catch {
             _ = ctx.status(400);
@@ -586,7 +636,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn stageTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         const txn_id = distributed_txn.parseTxnIdHex(transaction_id) catch {
@@ -628,7 +678,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn stageTransactionRead(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         const txn_id = distributed_txn.parseTxnIdHex(transaction_id) catch {
@@ -723,7 +773,7 @@ pub const AntflyApiHandler = struct {
 
     fn stageSessionMutation(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8, kind: SessionMutationKind) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         const txn_id = distributed_txn.parseTxnIdHex(transaction_id) catch {
@@ -768,7 +818,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn createTransactionSavepoint(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         const txn_id = distributed_txn.parseTxnIdHex(transaction_id) catch {
@@ -806,7 +856,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn rollbackTransactionSavepoint(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8, savepoint_id: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         const txn_id = distributed_txn.parseTxnIdHex(transaction_id) catch {
@@ -844,7 +894,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn commitTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         const source = self.api_server.table_writes orelse {
@@ -955,6 +1005,19 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.json(response);
             },
+            error.DocIdentityNamespaceMismatch => {
+                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+                defer arena_impl.deinit();
+                const response = try transactions_api.buildSessionCommitResponse(
+                    arena_impl.allocator(),
+                    txn_id,
+                    "aborted",
+                    transactions_api.docIdentityUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
+                    null,
+                );
+                _ = ctx.status(409);
+                return ctx.json(response);
+            },
             error.UnsupportedOperation => {
                 _ = ctx.status(405);
                 return ctx.text("method not allowed");
@@ -1010,7 +1073,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn abortTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         const txn_id = distributed_txn.parseTxnIdHex(transaction_id) catch {
@@ -1038,7 +1101,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn backup(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         var resp = try cluster_api_http.handleClusterBackup(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store);
@@ -1047,7 +1110,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn restore(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         var resp = try cluster_api_http.handleClusterRestore(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store);
@@ -1056,7 +1119,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn listBackups(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListBackupsParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         var resp = try cluster_api_http.handleClusterBackupList(ctx.allocator, params.location, self.api_server.clusterApi());
         return respondOwnedApiResponse(ctx, &resp);
@@ -1064,7 +1127,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn globalQuery(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
@@ -1085,7 +1148,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn evaluate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const body_data = (try ctx.body()) orelse {
@@ -1111,7 +1174,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn queryBuilderAgent(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const body_data = (try ctx.body()) orelse {
@@ -1158,7 +1221,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const QueryBuilderGenerationRunner = struct {
-            local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
 
             fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
@@ -1179,15 +1242,19 @@ pub const AntflyApiHandler = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = QueryBuilderGenerationRunner{ .local_termite_provider = self.api_server.local_termite_provider, .secret_store = self.api_server.cfg.secret_store };
+        var generation_runner = QueryBuilderGenerationRunner{ .antfly_provider = self.api_server.antfly_provider, .secret_store = self.api_server.cfg.secret_store };
         var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
         const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
             error.InvalidQueryBuilderRequest => {
                 _ = ctx.status(400);
                 return ctx.text("invalid query builder request");
+            },
+            error.DocIdentityNamespaceMismatch => {
+                _ = ctx.status(503);
+                return ctx.text("doc identity unavailable");
             },
             else => return err,
         };
@@ -1196,7 +1263,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn retrievalAgent(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const source = self.api_server.table_reads orelse {
@@ -1229,8 +1296,8 @@ pub const AntflyApiHandler = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var semantic_resolver = http_server_mod.SemanticStatusResolver{ .source = runner.server.source, .local_termite_provider = runner.server.local_termite_provider };
-                var query_req = query_api.parseQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
+                var semantic_resolver = http_server_mod.SemanticStatusResolver{ .source = runner.server.source, .antfly_provider = runner.server.antfly_provider };
+                var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
                 };
@@ -1246,6 +1313,7 @@ pub const AntflyApiHandler = struct {
                     query_req.req,
                     .read_index,
                 ) catch |err| {
+                    if (err == error.DocIdentityNamespaceMismatch) return err;
                     std.log.err("retrieval query failed table={s} query={s} err={}", .{ table_name, query_json, err });
                     return err;
                 }) orelse error.TableNotFound;
@@ -1284,7 +1352,7 @@ pub const AntflyApiHandler = struct {
         };
 
         const RetrievalGenerationRunner = struct {
-            local_termite_provider: ?managed_embedder.LocalTermiteProvider,
+            antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
@@ -1305,10 +1373,10 @@ pub const AntflyApiHandler = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .local_termite_provider = runner.local_termite_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .local_termite_provider = self.api_server.local_termite_provider, .secret_store = self.api_server.cfg.secret_store };
+        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.api_server.antfly_provider, .secret_store = self.api_server.cfg.secret_store };
 
         var query_runner = RetrievalQueryRunner{
             .server = self.api_server,
@@ -1322,6 +1390,10 @@ pub const AntflyApiHandler = struct {
             error.TableNotFound => {
                 _ = ctx.status(404);
                 return ctx.text("not found");
+            },
+            error.DocIdentityNamespaceMismatch => {
+                _ = ctx.status(503);
+                return ctx.text("doc identity unavailable");
             },
             else => {
                 std.log.err("public retrieval failed err={}", .{err});
@@ -1344,7 +1416,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn listTables(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListTablesParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         var snapshot = (try self.api_server.source.adminSnapshot()) orelse {
@@ -1366,7 +1438,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn getTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         var snapshot = (try self.api_server.source.adminSnapshot()) orelse {
@@ -1387,7 +1459,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn createTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const body_data = (try ctx.body()) orelse {
@@ -1493,7 +1565,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn dropTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         var local_drop_group_ids: ?[]u64 = null;
@@ -1543,7 +1615,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn queryTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
@@ -1559,7 +1631,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn batchWrite(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
@@ -1570,7 +1642,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn linearMerge(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const reads = self.api_server.table_reads orelse {
@@ -1630,7 +1702,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn backupTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         var resp = try public_table_http.handleTableBackup(ctx.allocator, table_name, body_data, self.api_server.tableApi(), self.api_server.cfg.secret_store);
@@ -1639,7 +1711,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn restoreTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         var resp = try public_table_http.handleTableRestore(ctx.allocator, table_name, body_data, self.api_server.tableApi(), self.api_server.cfg.secret_store);
@@ -1648,7 +1720,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn updateSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const body_data = (try ctx.body()) orelse {
@@ -1755,7 +1827,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn scanKeys(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const source = self.api_server.table_reads orelse {
@@ -1799,7 +1871,7 @@ pub const AntflyApiHandler = struct {
     pub fn lookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_openapi.server.LookupKeyParams) !httpx.Response {
         _ = params;
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, key);
@@ -1836,7 +1908,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn listIndexes(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         var resp = try public_table_http.handleTableListIndexes(ctx.allocator, table_name, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
@@ -1844,7 +1916,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn getIndex(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         var resp = try public_table_http.handleTableGetIndex(ctx.allocator, table_name, index_name, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
@@ -1852,7 +1924,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn createIndex(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
         var resp = try public_table_http.handleTableCreateIndex(ctx.allocator, table_name, index_name, body_data, self.api_server.tableApi());
@@ -1861,7 +1933,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn dropIndex(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         var resp = try public_table_http.handleTableDeleteIndex(ctx.allocator, table_name, index_name, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
@@ -1874,7 +1946,7 @@ pub const AntflyApiHandler = struct {
     pub fn getCurrentUser(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const alloc = ctx.allocator;
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(alloc);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const identity = authenticated_identity orelse return try unauthorizedResponse(ctx);
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
@@ -1885,7 +1957,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn listUsers(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -1901,7 +1973,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn getUserByName(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -1924,7 +1996,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn createUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -1961,7 +2033,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn deleteUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const manager = self.api_server.cfg.user_manager orelse {
             _ = ctx.status(503);
@@ -1980,7 +2052,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn updateUserPassword(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2008,7 +2080,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn getUserPermissions(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2030,7 +2102,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn addPermissionToUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2063,7 +2135,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn removePermissionFromUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, params: usermgr_openapi.server.RemovePermissionFromUserParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const manager = self.api_server.cfg.user_manager orelse {
             _ = ctx.status(503);
@@ -2089,7 +2161,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn listUserRoles(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2109,7 +2181,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn addRoleToUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2142,7 +2214,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn removeRoleFromUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, params: usermgr_openapi.server.RemoveRoleFromUserParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const manager = self.api_server.cfg.user_manager orelse {
             _ = ctx.status(503);
@@ -2161,7 +2233,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn listAuthSubjects(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2177,7 +2249,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn listRowFilters(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2204,7 +2276,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn getRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2230,7 +2302,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn setRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2273,7 +2345,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn removeRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const manager = self.api_server.cfg.user_manager orelse {
             _ = ctx.status(503);
@@ -2292,7 +2364,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn listSubjectRowFilters(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2313,7 +2385,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn getSubjectRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2339,7 +2411,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn setSubjectRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2376,7 +2448,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn removeSubjectRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const manager = self.api_server.cfg.user_manager orelse {
             _ = ctx.status(503);
@@ -2395,7 +2467,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn listApiKeys(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2422,7 +2494,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn createApiKey(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const manager = self.api_server.cfg.user_manager orelse {
@@ -2465,7 +2537,7 @@ pub const AntflyApiHandler = struct {
 
     pub fn deleteApiKey(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, key_id: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
-        defer if (authenticated_identity) |*identity| identity.deinit(ctx.allocator);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const manager = self.api_server.cfg.user_manager orelse {
             _ = ctx.status(503);
@@ -2574,11 +2646,11 @@ const HttpxE2eServer = struct {
         errdefer self.server.deinit();
 
         const metadata_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(&self.handler);
-        var prefixed = PrefixedServer("/api/v1", httpx.Server){ .inner = &self.server };
+        var prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = &self.server };
         try metadata_router.register(&prefixed);
 
         const usermgr_router = usermgr_openapi.server.ServerRouter(AntflyApiHandler).init(&self.handler);
-        try usermgr_router.register(&prefixed);
+        try usermgr_router.register(&self.server);
 
         try self.server.bind();
         self.thread = try std.Thread.spawn(.{}, listenHttpxE2eServer, .{&self.server});
@@ -2834,7 +2906,7 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
 
-    const status_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/status", .{base_url});
+    const status_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/status", .{base_url});
     defer alloc.free(status_url);
     var unauthorized = try getWithRetry(&client, client_io.io(), status_url, null, 20);
     defer unauthorized.deinit();
@@ -2847,7 +2919,7 @@ test "httpx antfly routes require auth and enforce admin middleware" {
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
-    const secrets_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/secrets", .{base_url});
+    const secrets_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/secrets", .{base_url});
     defer alloc.free(secrets_url);
     const reader_headers = [_][2][]const u8{.{ "authorization", reader_auth }};
     var forbidden = try getWithRetry(&client, client_io.io(), secrets_url, &reader_headers, 20);
@@ -2858,7 +2930,7 @@ test "httpx antfly routes require auth and enforce admin middleware" {
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
-    const me_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/auth/v1/me", .{base_url});
+    const me_url = try std.fmt.allocPrint(alloc, "{s}/auth/v1/me", .{base_url});
     defer alloc.free(me_url);
     const admin_headers = [_][2][]const u8{.{ "authorization", admin_auth }};
     var me_resp = try getWithRetry(&client, client_io.io(), me_url, &admin_headers, 20);
@@ -2912,7 +2984,7 @@ test "httpx antfly lookup route preserves projection and headers" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
-    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/tables/docs/lookup/doc:a?fields=title", .{base_url});
+    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/lookup/doc:a?fields=title", .{base_url});
     defer alloc.free(lookup_url);
 
     var resp = try getWithRetry(&client, client_io.io(), lookup_url, null, 20);
@@ -2968,7 +3040,7 @@ test "httpx antfly lookup decodes percent-encoded path keys" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
-    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/tables/docs/lookup/docs%2Fgetting-started.md?fields=title", .{base_url});
+    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/lookup/docs%2Fgetting-started.md?fields=title", .{base_url});
     defer alloc.free(lookup_url);
 
     var resp = try getWithRetry(&client, client_io.io(), lookup_url, null, 20);
@@ -2999,7 +3071,7 @@ test "httpx antfly schema update returns full table status after projection" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
-    const schema_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/tables/docs/schema", .{base_url});
+    const schema_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/schema", .{base_url});
     defer alloc.free(schema_url);
     const schema_body = try test_contract_helpers.encodeSchemaUpdateRequest(alloc);
     defer alloc.free(schema_body);
@@ -3043,7 +3115,7 @@ test "httpx antfly cluster restore preserves backup location validation" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
-    const restore_url = try std.fmt.allocPrint(alloc, "{s}/api/v1/restore", .{base_url});
+    const restore_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/restore", .{base_url});
     defer alloc.free(restore_url);
     const restore_body = "{\"backup_id\":\"snap1\",\"location\":\"ftp://bad\"}";
     const headers = [_][2][]const u8{.{ "content-type", "application/json" }};

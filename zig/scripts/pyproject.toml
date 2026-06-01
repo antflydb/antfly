@@ -1,8 +1,0 @@
-[project]
-name = "antfly-zig-scripts"
-version = "0.1.0"
-description = "Python tooling for antfly-zig build and OpenAPI helpers"
-requires-python = ">=3.11"
-dependencies = [
-    "PyYAML>=6.0",
-]

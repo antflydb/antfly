@@ -3,8 +3,8 @@
 // with CLIP embeddings for image search.
 //
 // Prerequisites:
-// - Antfly running with Termite and ONNX Runtime
-// - CLIP model: antfly termite pull openai/clip-vit-base-patch32
+// - Antfly running with inference and ONNX Runtime
+// - CLIP model: antfly inference pull openai/clip-vit-base-patch32
 //
 // Run: go run main.go
 
@@ -23,8 +23,8 @@ import (
 	"strings"
 	"time"
 
-	antfly "github.com/antflydb/antfly/pkg/client"
-	"github.com/antflydb/antfly/pkg/client/oapi"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
 // ANCHOR_END: imports
@@ -33,7 +33,7 @@ func main() {
 	ctx := context.Background()
 
 	// Step 1: Create the client
-	client, err := antfly.NewAntflyClient("http://localhost:8080/api/v1", http.DefaultClient)
+	client, err := antfly.NewAntflyClient("http://localhost:8080/db/v1", http.DefaultClient)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -44,8 +44,8 @@ func main() {
 
 	// Build the embedder config (union type)
 	var embedderConfig oapi.EmbedderConfig
-	embedderConfig.Provider = oapi.EmbedderProviderTermite
-	embedderConfig.FromTermiteEmbedderConfig(oapi.TermiteEmbedderConfig{
+	embedderConfig.Provider = oapi.EmbedderProviderAntfly
+	embedderConfig.FromAntflyEmbedderConfig(oapi.AntflyEmbedderConfig{
 		Model: "openai/clip-vit-base-patch32",
 	})
 
@@ -244,4 +244,3 @@ func batchImport(ctx context.Context, client *antfly.AntflyClient) {
 }
 
 // ANCHOR_END: batch_import
-

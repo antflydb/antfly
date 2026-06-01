@@ -31,19 +31,29 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Install dependencies
-        working-directory: py
+        working-directory: py/packages/sdk
         run: uv sync
 
+      - name: Verify generated client
+        working-directory: py/packages/sdk
+        run: |
+          make generate
+          status="$(git status --porcelain -- src/antfly/client_generated)"
+          if [ -n "$status" ]; then
+            echo "$status"
+            exit 1
+          fi
+
       - name: Run linting
-        working-directory: py
+        working-directory: py/packages/sdk
         run: |
           uv run ruff check src tests
           uv run ruff format --check src tests
 
       - name: Run type checking
-        working-directory: py
+        working-directory: py/packages/sdk
         run: uv run pyright src tests
 
       - name: Run tests
-        working-directory: py
+        working-directory: py/packages/sdk
         run: uv run pytest tests

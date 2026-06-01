@@ -59,6 +59,7 @@ const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const search_sources = @import("../search_sources.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
+const scraping = @import("antfly_scraping");
 const platform_time = @import("../../platform/time.zig");
 const graph_segment_mod = @import("../graph_segment/mod.zig");
 const foreign_mod = @import("../../foreign/mod.zig");
@@ -140,6 +141,21 @@ const GraphResultSet = struct {
     total_hits: u32,
 };
 
+fn publicGraphSeedTotalHits(hits_len: usize, limit: u32) u32 {
+    var total: u32 = @intCast(@min(hits_len, std.math.maxInt(u32)));
+    if (limit > 0 and hits_len >= limit) {
+        total = @max(total, @as(u32, @intCast(@min(hits_len + 1, @as(usize, std.math.maxInt(u32))))));
+    }
+    return total;
+}
+
+pub fn testPublicGraphSeedTotalHits() !void {
+    try std.testing.expectEqual(@as(u32, 0), publicGraphSeedTotalHits(0, 10));
+    try std.testing.expectEqual(@as(u32, 1), publicGraphSeedTotalHits(1, 10));
+    try std.testing.expectEqual(@as(u32, 2), publicGraphSeedTotalHits(1, 1));
+    try std.testing.expectEqual(@as(u32, 11), publicGraphSeedTotalHits(10, 10));
+}
+
 pub const SupportedJoinRequest = query_execution.SupportedJoinRequest;
 const SupportedJoinFilters = query_execution.SupportedJoinFilters;
 const JoinedQueryStats = query_execution.JoinedQueryStats;
@@ -161,6 +177,7 @@ pub const HttpHandler = struct {
     query: *query_mod.QueryRuntime,
     query_cache: ?*query_mod.QueryCache = null,
     managed_query_embedder: ?*managed_embedder.ManagedEmbedder = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     published_search_sources: search_sources.PublishedSearchSources = .{},
     runtime_status: *const api_types.RuntimeStatusResult,
@@ -264,6 +281,10 @@ pub const HttpHandler = struct {
     ) void {
         self.managed_query_embedder = embedder;
         self.published_search_sources = search_sources.withDenseQueryIndexName(self.published_search_sources, index_name);
+    }
+
+    pub fn setRemoteContent(self: *HttpHandler, remote_content: ?*const scraping.RemoteContentConfig) void {
+        self.remote_content = remote_content;
     }
 
     pub fn setPublishedSearchSources(self: *HttpHandler, sources: search_sources.PublishedSearchSources) void {
@@ -2490,6 +2511,9 @@ pub const HttpHandler = struct {
         namespace: []const u8,
         body: []const u8,
     ) !?HttpResponse {
+        public_graph_query.rejectInternalDocIdentityFields(self.alloc, body) catch |err| switch (err) {
+            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+        };
         var parsed_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
@@ -2561,7 +2585,7 @@ pub const HttpHandler = struct {
             req.count_only = execution.plan.request.count_only;
             req.profile = execution.profile_requested;
             search_hits = try allocDbSearchHitsAlloc(self.alloc, execution.hits);
-            search_total_hits = @intCast(@min(execution.hits.len, std.math.maxInt(u32)));
+            search_total_hits = publicGraphSeedTotalHits(execution.hits.len, req.limit);
             try initial_sets.append(self.alloc, .{
                 .name = "$fused_results",
                 .hits = search_hits,
@@ -2850,7 +2874,9 @@ pub const HttpHandler = struct {
             var table = (try self.catalog.getTableAlloc(self.alloc, name)) orelse return error.InvalidQueryRequest;
             defer table.deinit(self.alloc);
 
-            var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJson(self.alloc, table.indexes_json);
+            var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(self.alloc, table.indexes_json, .{
+                .remote_content = self.remote_content,
+            });
             defer runtime.deinit();
             if (runtime.hasDenseEntries()) {
                 plan.request.vector = if (plan.request.embedding_template) |value|
@@ -4269,6 +4295,11 @@ pub const HttpHandler = struct {
         if (status.full_text_index_actions.len > 0) {
             for (status.full_text_index_actions) |entry| {
                 if (entry.action == .rebuild) return false;
+                if (entry.chunked_source_count > 0 and
+                    (status.pending_materialization_families.chunk_preview or !status.chunk_preview_complete))
+                {
+                    return false;
+                }
             }
             return true;
         }
@@ -4288,6 +4319,7 @@ pub const HttpHandler = struct {
         return self.executePublicTableQueryJsonAlloc(table_name, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.FileNotFound => return error.NotFound,
+            error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -4305,6 +4337,7 @@ pub const HttpHandler = struct {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         return self.executePublicTableQueryViewJsonAlloc(table_name, view) catch |err| switch (err) {
             error.FileNotFound => return error.NotFound,
+            error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             else => return error.InternalFailure,
         };
     }
@@ -7437,7 +7470,7 @@ test "http handler index status exposes chunk preview blocker for chunk-backed f
         },
         "{\"version\":0}",
         "",
-        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"semantic_chunked_idx\":{\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4}}}}",
+        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"semantic_chunked_idx\":{\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":0}}}}",
     ));
 
     const first = [_]api_types.DocumentMutation{
@@ -7527,7 +7560,7 @@ test "http handler index status exposes chunk embeddings blocker for chunked den
         },
         "{\"version\":0}",
         "",
-        "{\"semantic_chunked_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":4}}}}",
+        "{\"semantic_chunked_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":4,\"overlap_tokens\":0}}}}",
     ));
 
     const first = [_]api_types.DocumentMutation{
@@ -9346,6 +9379,10 @@ test "http handler rejects ingest when namespace is backpressured" {
     });
     defer second_ingest.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 429), second_ingest.status);
+}
+
+test "serverless public graph seed total marks saturated pages incomplete" {
+    try testPublicGraphSeedTotalHits();
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

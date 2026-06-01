@@ -9,13 +9,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@antfly/design-system";
-import type { bleve_components } from "@antfly/sdk";
+import type { query_components } from "@antfly/sdk";
 import { Cross2Icon } from "@radix-ui/react-icons";
 import type React from "react";
 import type { SearchableField } from "../../utils/fieldUtils";
 import FieldSelector from "./FieldSelector";
 
-type Query = bleve_components["schemas"]["Query"];
+type Query = query_components["schemas"]["Query"];
 
 const getQueryType = (query: Query): string => {
   if ("match_phrase" in query) return "Match Phrase";
@@ -106,7 +106,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
   const renderQueryFields = () => {
     switch (queryType) {
       case "Term": {
-        const q = query as bleve_components["schemas"]["TermQuery"];
+        const q = query as query_components["schemas"]["TermQuery"];
         return (
           <div className="flex flex-col gap-2">
             <Input
@@ -120,7 +120,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         );
       }
       case "Match": {
-        const q = query as bleve_components["schemas"]["MatchQuery"];
+        const q = query as query_components["schemas"]["MatchQuery"];
         return (
           <div className="flex flex-col gap-2">
             <Input
@@ -134,7 +134,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         );
       }
       case "Match Phrase": {
-        const q = query as bleve_components["schemas"]["MatchPhraseQuery"];
+        const q = query as query_components["schemas"]["MatchPhraseQuery"];
         return (
           <div className="flex flex-col gap-2">
             <Input
@@ -148,7 +148,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         );
       }
       case "Prefix": {
-        const q = query as bleve_components["schemas"]["PrefixQuery"];
+        const q = query as query_components["schemas"]["PrefixQuery"];
         return (
           <div className="flex flex-col gap-2">
             <Input
@@ -162,7 +162,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         );
       }
       case "Wildcard": {
-        const q = query as bleve_components["schemas"]["WildcardQuery"];
+        const q = query as query_components["schemas"]["WildcardQuery"];
         return (
           <div className="flex flex-col gap-2">
             <Input
@@ -176,7 +176,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         );
       }
       case "Regexp": {
-        const q = query as bleve_components["schemas"]["RegexpQuery"];
+        const q = query as query_components["schemas"]["RegexpQuery"];
         return (
           <div className="flex flex-col gap-2">
             <Input
@@ -190,7 +190,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         );
       }
       case "Fuzzy": {
-        const q = query as bleve_components["schemas"]["FuzzyQuery"];
+        const q = query as query_components["schemas"]["FuzzyQuery"];
         return (
           <div className="flex flex-col gap-2">
             <div className="flex gap-2">
@@ -218,7 +218,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         );
       }
       case "Query String": {
-        const q = query as bleve_components["schemas"]["QueryStringQuery"];
+        const q = query as query_components["schemas"]["QueryStringQuery"];
         return (
           <Input
             placeholder="Query"
@@ -229,7 +229,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         );
       }
       case "Numeric Range": {
-        const q = query as bleve_components["schemas"]["NumericRangeQuery"];
+        const q = query as query_components["schemas"]["NumericRangeQuery"];
         return (
           <div className="flex flex-col gap-2">
             <div className="flex gap-2">
@@ -283,10 +283,10 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         );
       }
       case "Boolean": {
-        const q = query as bleve_components["schemas"]["BooleanQuery"];
+        const q = query as query_components["schemas"]["BooleanQuery"];
         return (
           <div className="mt-2 flex flex-col gap-2">
-            <div className="bg-muted/50 rounded-lg p-2 space-y-2">
+            <div className="bg-muted/50 rounded-none p-2 space-y-2">
               <h4 className="font-semibold text-xs text-foreground uppercase tracking-wide">
                 Must
               </h4>
@@ -297,7 +297,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
                 availableFields={availableFields}
               />
             </div>
-            <div className="bg-muted/50 rounded-lg p-2 space-y-2">
+            <div className="bg-muted/50 rounded-none p-2 space-y-2">
               <h4 className="font-semibold text-xs text-foreground uppercase tracking-wide">
                 Should
               </h4>
@@ -308,7 +308,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
                 availableFields={availableFields}
               />
             </div>
-            <div className="bg-muted/50 rounded-lg p-2 space-y-2">
+            <div className="bg-muted/50 rounded-none p-2 space-y-2">
               <h4 className="font-semibold text-xs text-foreground uppercase tracking-wide">
                 Must Not
               </h4>
@@ -323,7 +323,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         );
       }
       case "Conjunction": {
-        const q = query as bleve_components["schemas"]["ConjunctionQuery"];
+        const q = query as query_components["schemas"]["ConjunctionQuery"];
         return (
           <div className="mt-2">
             <QueryGroup
@@ -336,7 +336,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         );
       }
       case "Disjunction": {
-        const q = query as bleve_components["schemas"]["DisjunctionQuery"];
+        const q = query as query_components["schemas"]["DisjunctionQuery"];
         return (
           <div className="mt-2">
             <QueryGroup
@@ -354,7 +354,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
   };
 
   return (
-    <div className="p-3 mb-2 border rounded-lg bg-card shadow-sm space-y-2">
+    <div className="p-3 mb-2 border rounded-none bg-card space-y-2">
       <div className="flex items-start gap-2 flex-wrap">
         <div className="shrink-0 w-44">
           <Label className="text-xs mb-1 block">Query Type</Label>
@@ -412,7 +412,7 @@ const QueryGroup: React.FC<QueryGroupProps> = ({
   };
 
   return (
-    <div className="bg-background/50 rounded-lg p-3 space-y-2 border">
+    <div className="bg-background/50 rounded-none p-3 space-y-2 border">
       <h4 className="font-semibold text-xs text-muted-foreground uppercase tracking-wide">
         {title}
       </h4>

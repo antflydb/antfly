@@ -17,28 +17,41 @@ The documents are processed page-by-page, chunked for semantic search, and made 
 ### Prerequisites
 
 - Go 1.21+
-- Running Antfly instance with Termite (for embeddings)
+- Zig 0.16.0+
+- Running Zig Antfly swarm with Antfly inference models
 
-### 1. Start Antfly
+### 1. Build and Start Zig Antfly
 
 ```bash
 # From the antfly root directory
-go run ./cmd/antfly swarm
+cd zig
+zig build install
+./zig-out/bin/antfly swarm
 ```
 
-This starts a single-node Antfly cluster with:
-- Metadata server on port 8080
-- Store server on port 8081
-- Termite ML service on port 8082
+This starts a single-node Antfly cluster on `http://localhost:8080` with the
+Zig inference routes mounted under the same public API.
 
-### 2. Build the Tool
+### 2. Pull Models
+
+The Zig model pull path treats HuggingFace as the default source, so `hf:` is
+omitted here.
+
+```bash
+cd zig
+./zig-out/bin/antfly inference pull antflydb/clipclap:gguf:Q4_K --tasks embedders
+./zig-out/bin/antfly inference pull Xenova/trocr-base-printed --tasks readers
+./zig-out/bin/antfly inference pull fastino/gliner2-base-v1:native --tasks recognizers
+```
+
+### 3. Build the Tool
 
 ```bash
 cd examples/epstein
 go build -o epstein .
 ```
 
-### 3. Download Documents
+### 4. Download or Point at Local Documents
 
 Choose a dataset based on your needs:
 
@@ -58,18 +71,38 @@ Choose a dataset based on your needs:
 ./epstein download --dataset all
 ```
 
-### 4. Index and Load
+If the files are already on an external disk, point the tool at them instead:
 
 ```bash
-# Process PDFs and load into Antfly
-./epstein sync --create-table
-
-# Or do it in steps:
-./epstein prepare                    # Extract text from PDFs
-./epstein load --create-table        # Load into Antfly
+export EPSTEIN_DOCS_DIR="/path/to/T9/epstein-files"
+export EPSTEIN_ZIP="/path/to/T9/DataSet_10.zip"
 ```
 
-### 5. Start Search Interface
+### 5. Prepare, Enrich, and Load
+
+```bash
+# Process PDFs into page records. --split-pages enables direct PDF viewing.
+./epstein prepare --dir "$EPSTEIN_DOCS_DIR" --split-pages
+
+# Optional: OCR low-quality pages through Zig Antfly inference.
+./epstein enrich --input epstein-docs.json --dir "$EPSTEIN_DOCS_DIR"
+
+# Optional: add entity metadata to each page record.
+./epstein entities --input epstein-docs-enriched.json
+
+# Load into Antfly using ClipClap embeddings.
+./epstein load --input epstein-docs-enriched-entities.json --create-table
+```
+
+For ZIP sources that should not be extracted first:
+
+```bash
+./epstein prepare --zip "$EPSTEIN_ZIP" --split-pages
+./epstein entities --input epstein-docs.json
+./epstein load --input epstein-docs-entities.json --create-table
+```
+
+### 6. Start Search Interface
 
 ```bash
 ./epstein serve
@@ -102,6 +135,14 @@ Flags:
   --dir       Path to PDF directory (default: ./epstein-docs)
   --output    Output JSON file (default: epstein-docs.json)
   --base-url  Base URL for document links
+  --split-pages
+              Split PDFs into individual page PDFs for direct viewing
+  --zip       Path to ZIP archive containing PDFs (repeatable)
+  --enable-ocr
+              Enable OCR fallback through Antfly inference readers
+  --ocr-url   Antfly inference URL (default: ANTFLY_INFERENCE_URL or http://localhost:8080)
+  --ocr-models
+              OCR models to try (default: Xenova/trocr-base-printed)
 ```
 
 ### `load`
@@ -112,14 +153,15 @@ Loads prepared JSON data into Antfly.
 ./epstein load [flags]
 
 Flags:
-  --url             Antfly API URL (default: http://localhost:8080/api/v1)
+  --url             Antfly API URL (default: http://localhost:8080/db/v1)
   --table           Table name (default: epstein_docs)
   --input           Input JSON file (default: epstein-docs.json)
   --create-table    Create table if it doesn't exist
   --dry-run         Preview changes without applying
   --num-shards      Number of shards (default: 1)
   --batch-size      Batch size for linear merge (default: 25)
-  --embedding-model Embedding model (default: embeddinggemma)
+  --inference-url     Antfly inference root URL for chunking; table config stores its /ai/v1 route (default: ANTFLY_INFERENCE_URL or http://localhost:8080)
+  --embedding-model Embedding model (default: antflydb/clipclap)
   --chunker-model   Chunker model (default: fixed-bert-tokenizer)
   --target-tokens   Target tokens per chunk (default: 512)
   --overlap-tokens  Overlap between chunks (default: 50)
@@ -135,6 +177,43 @@ Full pipeline: process PDFs and load directly.
 # Combines prepare + load flags
 ```
 
+### `enrich`
+
+Runs a second OCR/vision pass over prepared JSON and writes a new JSON file.
+
+```bash
+./epstein enrich [flags]
+
+Flags:
+  --input       Input JSON file (default: epstein-docs.json)
+  --output      Output JSON file (default: {input-base}-enriched.json)
+  --inference-url Antfly inference URL (default: ANTFLY_INFERENCE_URL or http://localhost:8080)
+  --model       Reader model (default: Xenova/trocr-base-printed)
+  --category    ocr, vision, quality, or all (default: ocr)
+  --dir         Base directory for resolving split page PDFs
+  --zip         Source ZIP archive for page lookup (repeatable)
+```
+
+### `entities`
+
+Adds Antfly inference NER metadata to prepared or enriched JSON records.
+
+```bash
+./epstein entities [flags]
+
+Flags:
+  --input           Input JSON file (default: epstein-docs.json)
+  --output          Output JSON file (default: {input-base}-entities.json)
+  --inference-url     Antfly inference URL (default: ANTFLY_INFERENCE_URL or http://localhost:8080)
+  --model           Recognizer model (default: fastino/gliner2-base-v1)
+  --labels          Entity labels to extract
+  --relation-labels Relation labels to extract (default: associated with, communicated with, traveled to, visited, worked for, represented by, mentioned in, located in)
+  --batch-size      Text windows per Antfly inference recognize request (default: 16)
+  --max-chars       Maximum characters per recognizer window (default: 3000)
+  --overlap-chars   Characters of overlap between recognizer windows (default: 300)
+  --reprocess       Re-process records that already have entities
+```
+
 ### `serve`
 
 Starts a web server with search interface.
@@ -143,7 +222,7 @@ Starts a web server with search interface.
 ./epstein serve [flags]
 
 Flags:
-  --url     Antfly API URL (default: http://localhost:8080/api/v1)
+  --url     Antfly API URL (default: http://localhost:8080/db/v1)
   --table   Table name to search (default: epstein_docs)
   --listen  Listen address (default: :3000)
 ```
@@ -169,13 +248,20 @@ Documents are indexed with:
 
 2. **Embedding Index** (aknn_v0)
    - Semantic similarity search
-   - Powered by Termite + embedding model
+   - Powered by the native Zig Antfly embedder + `antflydb/clipclap`
    - Chunked with configurable overlap
+
+3. **Entity Metadata** (optional)
+   - `epstein entities` stores recognized entities in `metadata.entities`
+   - Optional relations are stored in `metadata.relations`
+   - Long pages are processed as overlapping windows and offsets are rebased to the page
+   - Failed entity windows are tracked and retried on the next run
+   - The search UI displays entity chips when present
 
 ### Search
 
 The web interface performs hybrid search:
-- Queries both `full_text_index` and `embeddings` indexes
+- Queries both `full_text_index_v0` and `embeddings` indexes
 - Results are ranked by combined relevance score
 - Supports natural language queries
 
@@ -221,11 +307,11 @@ You can also query the Antfly API directly:
 
 ```bash
 # Search via curl
-curl "http://localhost:8080/api/v1/tables/epstein_docs/query" \
+curl "http://localhost:8080/db/v1/tables/epstein_docs/query" \
   -H "Content-Type: application/json" \
   -d '{
     "semantic_search": "flight logs to Little St James",
-    "indexes": ["full_text_index", "embeddings"],
+    "indexes": ["full_text_index_v0", "embeddings"],
     "limit": 10
   }'
 ```
@@ -233,11 +319,11 @@ curl "http://localhost:8080/api/v1/tables/epstein_docs/query" \
 Or use the Go SDK:
 
 ```go
-client, _ := antfly.NewAntflyClient("http://localhost:8080/api/v1", http.DefaultClient)
+client, _ := antfly.NewAntflyClient("http://localhost:8080/db/v1", http.DefaultClient)
 
 resp, _ := client.Query(ctx, "epstein_docs", antfly.QueryRequest{
     SemanticSearch: "flight logs",
-    Indexes:        []string{"full_text_index", "embeddings"},
+    Indexes:        []string{"full_text_index_v0", "embeddings"},
     Limit:          10,
 })
 
@@ -261,7 +347,7 @@ The table already exists. This is fine - the sync will update existing documents
 Embedding generation runs asynchronously. You can monitor progress:
 
 ```bash
-curl "http://localhost:8080/api/v1/tables/epstein_docs/indexes/embeddings" | jq '.status.total_indexed'
+curl "http://localhost:8080/db/v1/tables/epstein_docs/indexes/embeddings" | jq '.status.total_indexed'
 ```
 
 ### Out of memory

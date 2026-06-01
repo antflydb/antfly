@@ -415,7 +415,7 @@ fn tokenizeUnicodeWords(alloc: Allocator, text: []const u8) ![]Token {
         position += 1;
     }
 
-    return try alloc.dupe(Token, tokens.items);
+    return try tokens.toOwnedSlice(alloc);
 }
 
 fn tokenizeWhitespace(alloc: Allocator, text: []const u8) ![]Token {
@@ -443,7 +443,7 @@ fn tokenizeWhitespace(alloc: Allocator, text: []const u8) ![]Token {
         position += 1;
     }
 
-    return try alloc.dupe(Token, tokens.items);
+    return try tokens.toOwnedSlice(alloc);
 }
 
 fn tokenizeKeyword(alloc: Allocator, text: []const u8) ![]Token {
@@ -479,7 +479,7 @@ fn tokenizeCharacter(alloc: Allocator, text: []const u8) ![]Token {
         pos = end;
     }
 
-    return try alloc.dupe(Token, tokens.items);
+    return try tokens.toOwnedSlice(alloc);
 }
 
 fn tokenizeNgram(alloc: Allocator, text: []const u8, cfg: NgramConfig) ![]Token {
@@ -505,7 +505,7 @@ fn tokenizeNgram(alloc: Allocator, text: []const u8, cfg: NgramConfig) ![]Token 
         }
     }
 
-    return try alloc.dupe(Token, tokens.items);
+    return try tokens.toOwnedSlice(alloc);
 }
 
 fn tokenizeEdgeNgram(alloc: Allocator, text: []const u8, cfg: EdgeNgramConfig) ![]Token {
@@ -538,7 +538,7 @@ fn tokenizeEdgeNgram(alloc: Allocator, text: []const u8, cfg: EdgeNgramConfig) !
         }
     }
 
-    return try alloc.dupe(Token, tokens.items);
+    return try tokens.toOwnedSlice(alloc);
 }
 
 fn isAlphanumeric(c: u8) bool {
@@ -606,6 +606,7 @@ pub const TokenFilter = union(enum) {
 
 fn applyLowercase(alloc: Allocator, tokens: []Token) ![]Token {
     for (tokens) |*tok| {
+        if (!containsAsciiUpper(tok.term)) continue;
         const lowered = try alloc.alloc(u8, tok.term.len);
         const len = tok.term.len;
         var i: usize = 0;
@@ -634,6 +635,25 @@ fn applyLowercase(alloc: Allocator, tokens: []Token) ![]Token {
         tok.term = lowered;
     }
     return tokens;
+}
+
+fn containsAsciiUpper(s: []const u8) bool {
+    var i: usize = 0;
+    const simd_len = s.len - (s.len % 16);
+    while (i < simd_len) : (i += 16) {
+        const V = @Vector(16, u8);
+        const v: V = s[i..][0..16].*;
+        const a_vec: V = @splat('A');
+        const z_vec: V = @splat('Z');
+        const ge_a: u16 = @bitCast(v >= a_vec);
+        const le_z: u16 = @bitCast(v <= z_vec);
+        if ((ge_a & le_z) != 0) return true;
+    }
+
+    while (i < s.len) : (i += 1) {
+        if (s[i] >= 'A' and s[i] <= 'Z') return true;
+    }
+    return false;
 }
 
 fn applyStopWords(alloc: Allocator, tokens: []Token) ![]Token {
@@ -667,7 +687,7 @@ fn applyNgramFilter(alloc: Allocator, tokens: []Token, cfg: NgramConfig) ![]Toke
     }
 
     alloc.free(tokens);
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn applyEdgeNgramFilter(alloc: Allocator, tokens: []Token, cfg: EdgeNgramConfig) ![]Token {
@@ -693,7 +713,7 @@ fn applyEdgeNgramFilter(alloc: Allocator, tokens: []Token, cfg: EdgeNgramConfig)
     }
 
     alloc.free(tokens);
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn applyShingle(alloc: Allocator, tokens: []Token, cfg: TokenFilter.ShingleConfig) ![]Token {
@@ -735,7 +755,7 @@ fn applyShingle(alloc: Allocator, tokens: []Token, cfg: TokenFilter.ShingleConfi
     for (tokens) |tok| alloc.free(@constCast(tok.term));
     alloc.free(tokens);
 
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn applyLength(alloc: Allocator, tokens: []Token, cfg: TokenFilter.LengthConfig) ![]Token {
@@ -756,7 +776,7 @@ fn applyLength(alloc: Allocator, tokens: []Token, cfg: TokenFilter.LengthConfig)
     }
 
     alloc.free(tokens);
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn applyTruncate(alloc: Allocator, tokens: []Token, cfg: TokenFilter.TruncateConfig) ![]Token {
@@ -791,7 +811,7 @@ fn applyUnique(alloc: Allocator, tokens: []Token) ![]Token {
     }
 
     alloc.free(tokens);
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn applyReverse(alloc: Allocator, tokens: []Token) ![]Token {
@@ -846,7 +866,7 @@ fn applyCamelCase(alloc: Allocator, tokens: []Token) ![]Token {
     }
 
     alloc.free(tokens);
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn toLowerDupe(alloc: Allocator, s: []const u8) ![]u8 {
@@ -896,6 +916,15 @@ fn applyApostrophe(alloc: Allocator, tokens: []Token) ![]Token {
 
 fn applyStopWordsLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Token {
     const stops = stopwords_mod.getStopWords(lang);
+    var has_stop = false;
+    for (tokens) |tok| {
+        if (stops.has(tok.term)) {
+            has_stop = true;
+            break;
+        }
+    }
+    if (!has_stop) return tokens;
+
     var result = std.ArrayListUnmanaged(Token).empty;
     defer result.deinit(alloc);
 
@@ -912,7 +941,7 @@ fn applyStopWordsLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Toke
     }
 
     alloc.free(tokens);
-    return try alloc.dupe(Token, result.items);
+    return try result.toOwnedSlice(alloc);
 }
 
 fn applyStemmerLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Token {
@@ -934,9 +963,19 @@ fn applyStemmerLang(alloc: Allocator, tokens: []Token, lang: Language) ![]Token 
 /// the word was modified, otherwise returns the original slice.
 pub fn porter2Stem(alloc: Allocator, word: []const u8) ![]const u8 {
     if (word.len <= 2) return word;
+    if (!porter2MayChange(word)) return word;
 
-    // Work on a mutable copy
-    var buf = try alloc.alloc(u8, word.len);
+    // Work on a mutable copy. Most indexed terms are short and many do not
+    // stem; keep that common path off the allocator and only allocate the final
+    // returned term when the stem actually changes.
+    var stack_buf: [256]u8 = undefined;
+    var heap_buf: ?[]u8 = null;
+    var buf: []u8 = if (word.len <= stack_buf.len) stack_buf[0..word.len] else blk: {
+        const owned = try alloc.alloc(u8, word.len);
+        heap_buf = owned;
+        break :blk owned;
+    };
+    defer if (heap_buf) |owned| alloc.free(owned);
     @memcpy(buf, word);
     var len = buf.len;
 
@@ -965,17 +1004,22 @@ pub fn porter2Stem(alloc: Allocator, word: []const u8) ![]const u8 {
     len = step5(buf, len);
 
     if (len == word.len and std.mem.eql(u8, buf[0..len], word)) {
-        alloc.free(buf);
         return word;
     }
 
-    // Resize buffer to actual length
-    if (len < buf.len) {
-        const result = try alloc.dupe(u8, buf[0..len]);
-        alloc.free(buf);
-        return result;
-    }
-    return buf[0..len];
+    return try alloc.dupe(u8, buf[0..len]);
+}
+
+fn porter2MayChange(word: []const u8) bool {
+    const last = word[word.len - 1];
+    // Conservative final-byte filter for the Porter2 suffix table. If the word
+    // does not end in one of these bytes, no step can remove or replace a
+    // suffix. This keeps generated identifier-like terms off the stemmer's
+    // region scans without changing stemming semantics.
+    return switch (last) {
+        's', 'd', 'g', 'y', 'Y', 'l', 'i', 'n', 'r', 'm', 'e', 't', 'c' => true,
+        else => false,
+    };
 }
 
 pub fn isVowel(c: u8) bool {
@@ -1239,6 +1283,8 @@ pub const Analyzer = struct {
 
     /// Analyze text into tokens. Caller owns the returned slice and all token terms.
     pub fn analyze(self: *const Analyzer, alloc: Allocator, text: []const u8) ![]Token {
+        if (self.isDefaultEnglishNoCharFilters()) return analyzeDefaultEnglish(alloc, text);
+
         // Apply character filters
         var processed: []const u8 = text;
         var owned = false;
@@ -1257,6 +1303,15 @@ pub const Analyzer = struct {
         return tokens;
     }
 
+    fn isDefaultEnglishNoCharFilters(self: *const Analyzer) bool {
+        if (self.char_filters.len != 0) return false;
+        if (self.tokenizer != .unicode_words) return false;
+        if (self.filters.len != 3) return false;
+        return self.filters[0] == .lowercase and
+            self.filters[1] == .stop_words and
+            self.filters[2] == .stemmer;
+    }
+
     /// Free tokens returned by analyze().
     pub fn freeTokens(alloc: Allocator, tokens: []Token) void {
         for (tokens) |tok| {
@@ -1265,6 +1320,72 @@ pub const Analyzer = struct {
         alloc.free(tokens);
     }
 };
+
+fn analyzeDefaultEnglish(alloc: Allocator, text: []const u8) ![]Token {
+    const stops = stopwords_mod.getStopWords(.english);
+    var tokens = std.ArrayListUnmanaged(Token).empty;
+    defer tokens.deinit(alloc);
+
+    var pos: u32 = 0;
+    var position: u32 = 0;
+    const len: u32 = @intCast(text.len);
+
+    while (pos < len) {
+        while (pos < len and !isAlphanumeric(text[pos])) {
+            pos += utf8ByteLen(text[pos]);
+        }
+        if (pos >= len) break;
+
+        const start = pos;
+        while (pos < len and isAlphanumeric(text[pos])) {
+            pos += utf8ByteLen(text[pos]);
+        }
+
+        const raw = text[start..pos];
+        var stack_lower: [256]u8 = undefined;
+        var heap_lower: ?[]u8 = null;
+        const normalized = try lowercaseScratch(alloc, raw, &stack_lower, &heap_lower);
+        defer if (heap_lower) |owned| alloc.free(owned);
+
+        if (stops.has(normalized)) continue;
+
+        var owned_term = try alloc.dupe(u8, normalized);
+        errdefer alloc.free(owned_term);
+        const stemmed = try porter2Stem(alloc, owned_term);
+        if (stemmed.ptr != owned_term.ptr) {
+            alloc.free(owned_term);
+            owned_term = @constCast(stemmed);
+        }
+
+        try tokens.append(alloc, .{
+            .term = owned_term,
+            .position = position,
+            .start_byte = start,
+            .end_byte = pos,
+        });
+        position += 1;
+    }
+
+    return try tokens.toOwnedSlice(alloc);
+}
+
+fn lowercaseScratch(
+    alloc: Allocator,
+    text: []const u8,
+    stack: *[256]u8,
+    heap: *?[]u8,
+) ![]const u8 {
+    if (!containsAsciiUpper(text)) return text;
+    const out: []u8 = if (text.len <= stack.len) stack[0..text.len] else blk: {
+        const owned = try alloc.alloc(u8, text.len);
+        heap.* = owned;
+        break :blk owned;
+    };
+    for (text, 0..) |c, i| {
+        out[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+    }
+    return out;
+}
 
 /// Default English analyzer: unicode_words → lowercase → stop_words → stemmer
 pub const default_analyzer = Analyzer{
@@ -1291,11 +1412,25 @@ pub const html_analyzer = Analyzer{
     .filters = &.{ .lowercase, .stop_words, .stemmer },
 };
 
-/// Search-as-you-type: unicode_words → lowercase → edge_ngram(min=2, max=4)
-pub const search_as_you_type_analyzer = Analyzer{
+/// Search-as-you-type 2-gram shingle subfield: unicode_words → lowercase → shingle(2)
+pub const search_as_you_type_2gram_analyzer = Analyzer{
     .tokenizer = .unicode_words,
-    .filters = &.{ .lowercase, .{ .edge_ngram = .{ .min = 2, .max = 4 } } },
+    .filters = &.{ .lowercase, .{ .shingle = .{ .min = 2, .max = 2 } } },
 };
+
+/// Search-as-you-type 3-gram shingle subfield: unicode_words → lowercase → shingle(3)
+pub const search_as_you_type_3gram_analyzer = Analyzer{
+    .tokenizer = .unicode_words,
+    .filters = &.{ .lowercase, .{ .shingle = .{ .min = 3, .max = 3 } } },
+};
+
+/// Search-as-you-type prefix subfield: unicode_words → lowercase → shingle(1..3) → edge_ngram(min=2, max=20)
+pub const search_as_you_type_index_prefix_analyzer = Analyzer{
+    .tokenizer = .unicode_words,
+    .filters = &.{ .lowercase, .{ .shingle = .{ .min = 1, .max = 3 } }, .{ .edge_ngram = .{ .min = 2, .max = 20 } } },
+};
+
+pub const search_as_you_type_analyzer = search_as_you_type_index_prefix_analyzer;
 
 /// Language-specific analyzer: unicode_words → lowercase → language stop words → language stemmer
 pub fn languageAnalyzer(comptime lang: Language) Analyzer {
@@ -1326,6 +1461,9 @@ pub fn builtinAnalyzerByName(name: []const u8) ?*const Analyzer {
     if (std.mem.eql(u8, name, "keyword")) return &keyword_analyzer;
     if (std.mem.eql(u8, name, "html") or std.mem.eql(u8, name, "html_analyzer")) return &html_analyzer;
     if (std.mem.eql(u8, name, "search_as_you_type") or std.mem.eql(u8, name, "search_as_you_type_analyzer")) return &search_as_you_type_analyzer;
+    if (std.mem.eql(u8, name, "search_as_you_type_2gram")) return &search_as_you_type_2gram_analyzer;
+    if (std.mem.eql(u8, name, "search_as_you_type_3gram")) return &search_as_you_type_3gram_analyzer;
+    if (std.mem.eql(u8, name, "search_as_you_type_index_prefix")) return &search_as_you_type_index_prefix_analyzer;
     if (std.mem.eql(u8, name, "german")) return &german_analyzer;
     if (std.mem.eql(u8, name, "french")) return &french_analyzer;
     if (std.mem.eql(u8, name, "spanish")) return &spanish_analyzer;
@@ -1786,16 +1924,39 @@ test "html_analyzer end-to-end" {
     }
 }
 
-test "search_as_you_type analyzer" {
-    const alloc = std.testing.allocator;
-    const tokens = try search_as_you_type_analyzer.analyze(alloc, "hello");
-    defer Analyzer.freeTokens(alloc, tokens);
+fn expectTokenTerm(tokens: []const Token, expected: []const u8) !void {
+    for (tokens) |token| {
+        if (std.mem.eql(u8, token.term, expected)) return;
+    }
+    return error.TestUnexpectedResult;
+}
 
-    // "hello" → lowercase → "hello" → edge_ngram(2,4) → "he","hel","hell"
-    try std.testing.expectEqual(@as(usize, 3), tokens.len);
-    try std.testing.expectEqualStrings("he", tokens[0].term);
-    try std.testing.expectEqualStrings("hel", tokens[1].term);
-    try std.testing.expectEqualStrings("hell", tokens[2].term);
+test "search_as_you_type analyzers" {
+    const alloc = std.testing.allocator;
+    const grams2 = try search_as_you_type_2gram_analyzer.analyze(alloc, "quick brown fox");
+    defer Analyzer.freeTokens(alloc, grams2);
+    try std.testing.expectEqual(@as(usize, 2), grams2.len);
+    try std.testing.expectEqualStrings("quick brown", grams2[0].term);
+    try std.testing.expectEqualStrings("brown fox", grams2[1].term);
+
+    const grams3 = try search_as_you_type_3gram_analyzer.analyze(alloc, "quick brown fox");
+    defer Analyzer.freeTokens(alloc, grams3);
+    try std.testing.expectEqual(@as(usize, 1), grams3.len);
+    try std.testing.expectEqualStrings("quick brown fox", grams3[0].term);
+
+    // "hello" → lowercase → shingle(1,3) → "hello" → edge_ngram(2,20)
+    const prefixes = try search_as_you_type_index_prefix_analyzer.analyze(alloc, "hello");
+    defer Analyzer.freeTokens(alloc, prefixes);
+    try std.testing.expectEqual(@as(usize, 4), prefixes.len);
+    try std.testing.expectEqualStrings("he", prefixes[0].term);
+    try std.testing.expectEqualStrings("hel", prefixes[1].term);
+    try std.testing.expectEqualStrings("hell", prefixes[2].term);
+    try std.testing.expectEqualStrings("hello", prefixes[3].term);
+
+    const phrase_prefixes = try search_as_you_type_index_prefix_analyzer.analyze(alloc, "quick brown fox");
+    defer Analyzer.freeTokens(alloc, phrase_prefixes);
+    try expectTokenTerm(phrase_prefixes, "brown f");
+    try expectTokenTerm(phrase_prefixes, "quick brown f");
 }
 
 test "german analyzer end-to-end" {

@@ -61,6 +61,10 @@ pub const MergeStatus = struct {
     receiver_ready_for_reads: bool,
     donor_delta_sequence: u64,
     receiver_delta_sequence: u64,
+    allow_doc_identity_reassignment: bool = false,
+    receiver_identity_reassignment_namespace_table_id: u64 = 0,
+    receiver_identity_reassignment_namespace_shard_id: u64 = 0,
+    receiver_identity_reassignment_namespace_range_id: u64 = 0,
 };
 
 pub const MergeParticipantStatus = struct {

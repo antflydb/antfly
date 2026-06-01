@@ -1,0 +1,411 @@
+openapi: 3.0.3
+info:
+  title: Generator Provider Configuration
+  description: "An OpenAPI specification for configuring different generative AI providers in AntflyDB."
+  version: "0.0.1"
+components:
+  schemas:
+    GeneratorProvider:
+      $ref: "../shared/generating.yaml#/components/schemas/GeneratorProvider"
+
+    GeneratorConfig:
+      $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
+
+    GenerateResult:
+      type: object
+      description: "Result of a generate operation. Formatted as markdown by default with inline resource references using [resource_id <id>] or [resource_id <id1>, <id2>] format."
+      required:
+        - text
+      properties:
+        text:
+          type: string
+          description: "The generated text in markdown format with inline resource references like [resource_id res1] or [resource_id res1, res2]"
+
+    RouteType:
+      type: string
+      enum: ["question", "search"]
+      description: "Classification of query type: question (specific factual query) or search (exploratory query)"
+
+    QueryStrategy:
+      type: string
+      enum: ["simple", "decompose", "step_back", "hyde"]
+      description: |
+        Strategy for query transformation and retrieval:
+        - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries.
+        - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions.
+        - step_back: Generate broader background query first, then specific query. Best for questions needing context.
+        - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
+
+    SemanticQueryMode:
+      type: string
+      enum: ["rewrite", "hypothetical"]
+      description: |
+        Mode for semantic query generation:
+        - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level 2 optimization)
+        - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE - Level 3 optimization)
+
+    ClassificationTransformationResult:
+      type: object
+      description: "Query classification and transformation result combining all query enhancements including strategy selection and semantic optimization"
+      required:
+        - route_type
+        - improved_query
+        - semantic_query
+        - semantic_mode
+        - strategy
+        - confidence
+      properties:
+        route_type:
+          x-go-type-skip-optional-pointer: true
+          $ref: "#/components/schemas/RouteType"
+        strategy:
+          x-go-type-skip-optional-pointer: true
+          $ref: "#/components/schemas/QueryStrategy"
+        semantic_mode:
+          x-go-type-skip-optional-pointer: true
+          $ref: "#/components/schemas/SemanticQueryMode"
+        improved_query:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Clarified query with added context for answer generation (human-readable)"
+        semantic_query:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Optimized query for vector/semantic search. Content style depends on semantic_mode: keywords for 'rewrite', hypothetical answer for 'hypothetical'"
+        step_back_query:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Broader background query for context (only present when strategy is 'step_back')"
+        sub_questions:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Decomposed sub-questions (only present when strategy is 'decompose')"
+        multi_phrases:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Alternative phrasings of the query for expanded retrieval coverage"
+        reasoning:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Pre-retrieval reasoning explaining query analysis and strategy selection (only present when with_classification_reasoning is enabled)"
+        confidence:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: "Classification confidence (0.0 to 1.0)"
+
+    GenerationConfidence:
+      type: object
+      description: "Confidence assessment for the generated response"
+      required:
+        - generation_confidence
+        - context_relevance
+      properties:
+        generation_confidence:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: "Overall confidence in the generation (0.0 to 1.0). Considers both ability to answer from provided resources and general knowledge."
+        context_relevance:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: "Relevance of the provided resources to the question (0.0 to 1.0)"
+
+    GenerationResult:
+      type: object
+      description: "Result from generation with optional confidence and follow-up questions"
+      required:
+        - generation
+      properties:
+        generation_confidence:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: "Overall confidence in the generation (0.0 to 1.0)"
+        context_relevance:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: "Relevance of the provided resources to the question (0.0 to 1.0)"
+        generation:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Generated response in markdown format"
+        followup_questions:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+          description: "Suggested follow-up questions"
+
+    # Step Configuration Schemas for Retrieval Agent Pipeline
+
+    RetryConfig:
+      $ref: "../shared/generating.yaml#/components/schemas/RetryConfig"
+
+    ChainCondition:
+      $ref: "../shared/generating.yaml#/components/schemas/ChainCondition"
+
+    ChainLink:
+      $ref: "../shared/generating.yaml#/components/schemas/ChainLink"
+
+    ClassificationStepConfig:
+      type: object
+      description: |
+        Configuration for the classification step. This step analyzes the query,
+        selects the optimal retrieval strategy, and generates semantic transformations.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: "Enable query classification and strategy selection"
+        generator:
+          $ref: "#/components/schemas/GeneratorConfig"
+          description: "Generator to use for classification. If not specified, uses the default summarizer."
+        chain:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChainLink"
+          description: "Chain of generators to try in order. Mutually exclusive with 'generator'."
+        with_reasoning:
+          type: boolean
+          default: false
+          description: "Include pre-retrieval reasoning explaining query analysis and strategy selection"
+        force_strategy:
+          $ref: "#/components/schemas/QueryStrategy"
+          description: "Override LLM strategy selection. If not set, the LLM chooses optimal strategy."
+        force_semantic_mode:
+          $ref: "#/components/schemas/SemanticQueryMode"
+          description: "Override semantic query mode selection."
+        multi_phrase_count:
+          type: integer
+          default: 3
+          minimum: 1
+          maximum: 10
+          description: "Number of alternative query phrasings to generate"
+
+    GenerationStepConfig:
+      type: object
+      description: |
+        Configuration for the generation step. This step generates the final
+        response from retrieved documents using the reasoning as context.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: "Enable generation from retrieved documents"
+        generator:
+          $ref: "#/components/schemas/GeneratorConfig"
+          description: "Generator to use for generation. If not specified, uses the default summarizer."
+        chain:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChainLink"
+          description: "Chain of generators to try in order. Mutually exclusive with 'generator'."
+        system_prompt:
+          type: string
+          description: "Custom system prompt for answer generation"
+        generation_context:
+          type: string
+          description: "Custom guidance for generation tone, detail level, and style"
+          example: "Be concise and technical. Include code examples where relevant."
+
+    FollowupStepConfig:
+      type: object
+      description: |
+        Configuration for generating follow-up questions. Uses a separate generator
+        call which can use a cheaper/faster model.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: "Enable follow-up question generation"
+        generator:
+          $ref: "#/components/schemas/GeneratorConfig"
+          description: "Generator for follow-up questions. If not specified, uses the answer step's generator."
+        chain:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChainLink"
+          description: "Chain of generators to try in order. Mutually exclusive with 'generator'."
+        count:
+          type: integer
+          default: 3
+          minimum: 1
+          maximum: 10
+          description: "Number of follow-up questions to generate"
+        context:
+          type: string
+          description: "Custom guidance for follow-up question focus and style"
+          example: "Focus on implementation details and edge cases"
+
+    ConfidenceStepConfig:
+      type: object
+      description: |
+        Configuration for confidence assessment. Evaluates answer quality and
+        resource relevance. Can use a model calibrated for scoring tasks.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: "Enable confidence scoring"
+        generator:
+          $ref: "#/components/schemas/GeneratorConfig"
+          description: "Generator for confidence assessment. If not specified, uses the answer step's generator."
+        chain:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChainLink"
+          description: "Chain of generators to try in order. Mutually exclusive with 'generator'."
+        context:
+          type: string
+          description: "Custom guidance for confidence assessment approach"
+          example: "Be conservative - only give high confidence if resources directly address the question"
+
+    # Chat Agent Types - Conversational RAG with tool calling
+
+    ChatMessageRole:
+      $ref: "../shared/generating.yaml#/components/schemas/ChatMessageRole"
+
+    ChatMessageContent:
+      $ref: "../shared/generating.yaml#/components/schemas/ChatMessageContent"
+
+    ToolCall:
+      $ref: "../shared/generating.yaml#/components/schemas/ToolCall"
+
+    ToolCallFunction:
+      $ref: "../shared/generating.yaml#/components/schemas/ToolCallFunction"
+
+    ChatMessage:
+      $ref: "../shared/generating.yaml#/components/schemas/ChatMessage"
+
+    ChatToolName:
+      type: string
+      description: |
+        Available tool names for the chat and retrieval agents.
+        - add_filter: Add search filters (field constraints)
+        - ask_clarification: Ask user for clarification
+        - search: Execute semantic searches (legacy, use semantic_search for retrieval)
+        - websearch: Search the web (requires websearch_config)
+        - fetch: Fetch URL content (subject to security controls)
+        - semantic_search: Execute semantic/vector search against an index
+        - full_text_search: Execute full-text BM25 search against an index
+        - tree_search: Execute tree search with beam search navigation
+        - graph_search: Execute graph traversal search
+      enum:
+        - add_filter
+        - ask_clarification
+        - search
+        - websearch
+        - fetch
+        - semantic_search
+        - full_text_search
+        - tree_search
+        - graph_search
+
+    ChatToolsConfig:
+      type: object
+      description: |
+        Configuration for chat agent tools.
+
+        If `enabled_tools` is empty/omitted, defaults to: add_filter, ask_clarification, search.
+
+        For models that don't support native tool calling (e.g., Ollama),
+        a prompt-based fallback is used with structured output parsing.
+      properties:
+        enabled_tools:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatToolName"
+          description: |
+            List of tools to enable. If empty, defaults to filter, clarification, and search.
+          example: ["add_filter", "search", "websearch"]
+        websearch_config:
+          $ref: "websearch.yaml#/components/schemas/WebSearchConfig"
+          description: |
+            Web search provider configuration. Required when websearch tool is enabled.
+            See specs/openapi/antfly/websearch.yaml for provider-specific options.
+        fetch_config:
+          $ref: "websearch.yaml#/components/schemas/FetchConfig"
+          description: |
+            URL fetching configuration. See specs/openapi/antfly/websearch.yaml
+            for available options and security controls.
+        max_tool_iterations:
+          type: integer
+          default: 5
+          minimum: 1
+          maximum: 20
+          description: |
+            Maximum number of tool call iterations per turn.
+            Prevents infinite loops in tool execution.
+
+    ClarificationRequest:
+      type: object
+      description: "A request for clarification from the user"
+      required:
+        - question
+      properties:
+        question:
+          type: string
+          description: "The clarifying question to ask the user"
+        options:
+          type: array
+          items:
+            type: string
+          description: "Optional list of suggested answers for the user to choose from"
+        required:
+          type: boolean
+          default: false
+          description: "Whether the clarification is required before proceeding"
+
+    FilterSpec:
+      type: object
+      description: "A filter specification to apply to search queries"
+      required:
+        - field
+        - operator
+        - value
+      properties:
+        field:
+          type: string
+          description: "Field name to filter on"
+        operator:
+          type: string
+          enum:
+            [
+              "eq",
+              "ne",
+              "gt",
+              "gte",
+              "lt",
+              "lte",
+              "contains",
+              "prefix",
+              "range",
+              "in",
+            ]
+          description: |
+            Filter operator:
+            - eq: Equals
+            - ne: Not equals
+            - gt/gte: Greater than (or equal)
+            - lt/lte: Less than (or equal)
+            - contains: Contains substring
+            - prefix: Starts with
+            - range: Between two values (value should be array [min, max])
+            - in: Value in list (value should be array)
+        value:
+          description: "Filter value (string, number, boolean, or array for range/in operators)"

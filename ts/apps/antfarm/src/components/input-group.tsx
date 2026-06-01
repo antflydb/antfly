@@ -10,7 +10,7 @@ export type InputGroupProps = HTMLAttributes<HTMLDivElement>;
 export const InputGroup = ({ className, ...props }: InputGroupProps) => (
   <div
     className={cn(
-      "flex w-full flex-col rounded-lg border bg-background shadow-xs focus-within:ring-2 focus-within:ring-ring/50",
+      "flex w-full flex-col rounded-none border bg-background shadow-xs focus-within:ring-2 focus-within:ring-ring/50",
       className
     )}
     {...props}

@@ -3,14 +3,14 @@ name: Antfly Operator Container
 on:
   push:
     tags:
-      - "pkg/operator/v*"
+      - "go/pkg/operator/v*"
 
 env:
-  GCP_REGION: us-east5
+  GCP_REGION: us-central1
   GCP_PROJECT: antfly-image-artifacts
-  GCP_REPOSITORY: antfly-labs
+  GCP_REPOSITORY: containers
   IMAGE_NAME: antfly-operator
-  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-east5/workerPools/antfly-container-builders
+  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
 
 jobs:
   publish:
@@ -38,7 +38,7 @@ jobs:
         id: version
         run: |
           TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#pkg/operator/}"
+          VERSION="${TAG#go/pkg/operator/}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Extracted version: ${VERSION}"
 
@@ -68,7 +68,7 @@ jobs:
             --region="${GCP_REGION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=cloudbuild.yaml \
-            --substitutions="_IMAGE_NAME=${IMAGE_NAME},_DOCKERFILE=Dockerfile.antfly-operator,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=${VERSION},_CACHE_TAG=buildcache,_DESCRIPTION=Kubernetes operator for deploying and managing AntflyDB clusters multi-arch image"
+            --substitutions="_IMAGE_NAME=${IMAGE_NAME},_DOCKERFILE=go/pkg/operator/Dockerfile,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=${VERSION},_CACHE_TAG=buildcache,_DESCRIPTION=Kubernetes operator for deploying and managing AntflyDB clusters multi-arch image"
 
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4

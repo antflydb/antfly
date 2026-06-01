@@ -5,7 +5,7 @@
  * maintaining full TypeScript type checking.
  */
 
-import type { components } from "./antfly-api.js";
+import type { components } from "./public-api.js";
 
 type Query = components["schemas"]["Query"];
 type ConjunctionQuery = components["schemas"]["ConjunctionQuery"];

@@ -26,13 +26,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/ajroetker/pdf"
-	antfly "github.com/antflydb/antfly/pkg/client"
-	"github.com/antflydb/antfly/pkg/docsaf"
-	generatingreading "github.com/antflydb/antfly/pkg/generating/reading"
-	libai "github.com/antflydb/antfly/pkg/libaf/ai"
-	libreading "github.com/antflydb/antfly/pkg/libaf/reading"
+	"github.com/antflydb/antfly/go/pkg/docsaf"
+	generatingreading "github.com/antflydb/antfly/go/pkg/generating/reading"
+	libai "github.com/antflydb/antfly/go/pkg/libaf/ai"
+	libreading "github.com/antflydb/antfly/go/pkg/libaf/reading"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
+	inferenceoapi "github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
@@ -58,37 +60,37 @@ type SplitMetadata struct {
 // OCRConfig holds configuration for OCR fallback when text extraction fails.
 type OCRConfig struct {
 	Enabled       bool     // Enable OCR fallback
-	TermiteURL    string   // Termite service URL (e.g., "http://localhost:8082")
+	InferenceURL  string   // Inference service URL (e.g., "http://localhost:8082")
 	Models        []string // OCR models to try in order (e.g., ["trocr-base-printed", "florence-2"])
 	MinContentLen int      // Trigger OCR if extracted text is shorter than this
 	RenderDPI     float64  // DPI for rendering PDF pages to images (default 150)
 }
 
-// OCRClient wraps the Termite client for OCR operations.
+// OCRClient wraps the Inference client for OCR operations.
 type OCRClient struct {
-	readReader    *generatingreading.TermiteReadReader
-	visionReader  *generatingreading.TermiteGenerateReader
+	readReader    *generatingreading.AntflyReadReader
+	visionReader  *generatingreading.AntflyGenerateReader
 	renderDPI     float64
 	lastUsedModel string
 }
 
-// NewOCRClient creates a new OCR client connected to Termite.
-func NewOCRClient(termiteURL string, models []string, renderDPI float64) (*OCRClient, error) {
-	cfg := generatingreading.TermiteConfig{
-		BaseURL:          termiteURL,
+// NewOCRClient creates a new OCR client connected to Inference.
+func NewOCRClient(inferenceURL string, models []string, renderDPI float64) (*OCRClient, error) {
+	cfg := generatingreading.AntflyConfig{
+		BaseURL:          inferenceURL,
 		Models:           models,
 		DefaultMaxTokens: 2048,
 		RenderDPI:        renderDPI,
 	}
 
-	readReader, err := generatingreading.NewTermiteReadReader(cfg)
+	readReader, err := generatingreading.NewAntflyReadReader(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("create termite read reader: %w", err)
+		return nil, fmt.Errorf("create inference read reader: %w", err)
 	}
 
-	visionReader, err := generatingreading.NewTermiteGenerateReader(cfg)
+	visionReader, err := generatingreading.NewAntflyGenerateReader(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("create termite generate reader: %w", err)
+		return nil, fmt.Errorf("create inference generate reader: %w", err)
 	}
 
 	return &OCRClient{
@@ -135,7 +137,7 @@ func (o *OCRClient) LastUsedModel() string {
 	return o.lastUsedModel
 }
 
-// ReadPageWithPrompt renders a single-page PDF and sends to Termite with a custom prompt and model.
+// ReadPageWithPrompt renders a single-page PDF and sends to Inference with a custom prompt and model.
 // Returns (text, model_used, error). The page PDF is expected to be a single-page document
 // (as produced by split-pages mode).
 func (o *OCRClient) ReadPageWithPrompt(ctx context.Context, pdfData []byte, prompt string, maxTokens int) (string, string, error) {
@@ -158,7 +160,7 @@ func (o *OCRClient) ReadPageWithPrompt(ctx context.Context, pdfData []byte, prom
 	return "", "", fmt.Errorf("all models failed to produce text")
 }
 
-// GeneratePageWithPrompt renders a single-page PDF and sends it to Termite's generate
+// GeneratePageWithPrompt renders a single-page PDF and sends it to Inference's generate
 // endpoint (e.g. Gemma 3 vision) instead of the reader endpoint. Used for vision captioning
 // of image pages. Returns (text, model_used, error).
 func (o *OCRClient) GeneratePageWithPrompt(ctx context.Context, pdfData []byte, prompt string, maxTokens int) (string, string, error) {
@@ -185,6 +187,22 @@ var needsOCRFallback = docsaf.NeedsOCRFallback
 
 //go:embed templates/*
 var templatesFS embed.FS
+
+const (
+	DefaultAntflyURL       = "http://localhost:8080/db/v1"
+	DefaultInferenceURL    = "http://localhost:8080"
+	DefaultFullTextIndex   = "full_text_index_v0"
+	DefaultEmbeddingIndex  = "embeddings"
+	DefaultEmbeddingModel  = "antflydb/clipclap"
+	DefaultEmbeddingPull   = "antflydb/clipclap:gguf:Q4_K"
+	DefaultChunkerModel    = "fixed-bert-tokenizer"
+	DefaultOCRModel        = "Xenova/trocr-base-printed"
+	DefaultRecognizerModel = "fastino/gliner2-base-v1"
+	DefaultEntityLabels    = "person,organization,location,date,case,document,facility,aircraft"
+	DefaultRelationLabels  = "associated with,communicated with,traveled to,visited,worked for,represented by,mentioned in,located in"
+	DefaultEntityMaxChars  = 3000
+	DefaultEntityOverlap   = 300
+)
 
 // Archive.org download URLs for Epstein documents
 const (
@@ -228,6 +246,49 @@ func (s *StringSliceFlag) String() string {
 func (s *StringSliceFlag) Set(value string) error {
 	*s = append(*s, value)
 	return nil
+}
+
+func envDefault(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func defaultInferenceURL() string {
+	return envDefault("ANTFLY_INFERENCE_URL", DefaultInferenceURL)
+}
+
+func inferenceMLBaseURL(raw string) (string, error) {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if trimmed == "" {
+		return "", fmt.Errorf("inference URL is required")
+	}
+	if strings.HasSuffix(trimmed, "/ai/v1") {
+		return trimmed, nil
+	}
+	if strings.HasSuffix(trimmed, "/api") {
+		return "", fmt.Errorf("legacy Inference /api URLs are unsupported; use the Antfly root URL or a /ai/v1 URL")
+	}
+	root := strings.TrimRight(antfly.NormalizeBaseURL(trimmed), "/")
+	if root == "" {
+		return "", fmt.Errorf("inference URL is required")
+	}
+	if strings.HasSuffix(root, "/ai/v1") {
+		return root, nil
+	}
+	return root + "/ai/v1", nil
+}
+
+func splitCSV(value string) []string {
+	var out []string
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 // downloadCmd downloads Epstein documents from archive.org
@@ -863,8 +924,8 @@ func prepareCmd(args []string) error {
 
 	// OCR fallback flags
 	enableOCR := fs.Bool("enable-ocr", false, "Enable OCR fallback when text extraction fails or produces poor results")
-	ocrTermiteURL := fs.String("ocr-url", "http://localhost:8082", "Termite URL for OCR")
-	ocrModels := fs.String("ocr-models", "trocr-base-printed,florence-2", "OCR models to try (comma-separated, in order)")
+	ocrInferenceURL := fs.String("ocr-url", defaultInferenceURL(), "Inference URL for OCR")
+	ocrModels := fs.String("ocr-models", DefaultOCRModel, "OCR models to try (comma-separated, in order)")
 	ocrMinContent := fs.Int("ocr-min-content", 50, "Trigger OCR if extracted content is shorter than this")
 	ocrDPI := fs.Float64("ocr-dpi", 150, "DPI for rendering PDF pages to images for OCR")
 
@@ -899,7 +960,7 @@ func prepareCmd(args []string) error {
 	}
 	if *enableOCR {
 		fmt.Printf("OCR fallback: enabled\n")
-		fmt.Printf("OCR Termite URL: %s\n", *ocrTermiteURL)
+		fmt.Printf("OCR Inference URL: %s\n", *ocrInferenceURL)
 		fmt.Printf("OCR models: %s\n", *ocrModels)
 		fmt.Printf("OCR min content: %d chars\n", *ocrMinContent)
 		fmt.Printf("OCR render DPI: %.0f\n", *ocrDPI)
@@ -909,12 +970,9 @@ func prepareCmd(args []string) error {
 	// Initialize OCR client if enabled
 	var ocrClient *OCRClient
 	if *enableOCR {
-		models := strings.Split(*ocrModels, ",")
-		for i := range models {
-			models[i] = strings.TrimSpace(models[i])
-		}
+		models := splitCSV(*ocrModels)
 		var err error
-		ocrClient, err = NewOCRClient(*ocrTermiteURL, models, *ocrDPI)
+		ocrClient, err = NewOCRClient(*ocrInferenceURL, models, *ocrDPI)
 		if err != nil {
 			return fmt.Errorf("failed to create OCR client: %w", err)
 		}
@@ -1329,15 +1387,16 @@ func prepareCmd(args []string) error {
 // loadCmd loads prepared JSON data into Antfly
 func loadCmd(args []string) error {
 	fs := flag.NewFlagSet("load", flag.ExitOnError)
-	antflyURL := fs.String("url", "http://localhost:8080/api/v1", "Antfly API URL")
+	antflyURL := fs.String("url", DefaultAntflyURL, "Antfly API URL")
+	inferenceURL := fs.String("inference-url", defaultInferenceURL(), "Inference API URL for managed chunking")
 	tableName := fs.String("table", "epstein_docs", "Table name to merge into")
 	inputFile := fs.String("input", "epstein-docs.json", "Input JSON file path")
 	dryRun := fs.Bool("dry-run", false, "Preview changes without applying them")
 	createTable := fs.Bool("create-table", false, "Create table if it doesn't exist")
 	numShards := fs.Int("num-shards", 1, "Number of shards for new table")
 	batchSize := fs.Int("batch-size", 25, "Linear merge batch size")
-	embeddingModel := fs.String("embedding-model", "embeddinggemma", "Embedding model to use")
-	chunkerModel := fs.String("chunker-model", "fixed-bert-tokenizer", "Chunker model")
+	embeddingModel := fs.String("embedding-model", DefaultEmbeddingModel, "Embedding model to use")
+	chunkerModel := fs.String("chunker-model", DefaultChunkerModel, "Chunker model")
 	targetTokens := fs.Int("target-tokens", 512, "Target tokens for chunking")
 	overlapTokens := fs.Int("overlap-tokens", 50, "Overlap tokens for chunking")
 
@@ -1355,6 +1414,7 @@ func loadCmd(args []string) error {
 
 	fmt.Printf("=== Epstein Documents Load ===\n")
 	fmt.Printf("Antfly URL: %s\n", *antflyURL)
+	fmt.Printf("Inference URL: %s\n", *inferenceURL)
 	fmt.Printf("Table: %s\n", *tableName)
 	fmt.Printf("Input: %s\n", *inputFile)
 	fmt.Printf("Dry run: %v\n\n", *dryRun)
@@ -1363,16 +1423,18 @@ func loadCmd(args []string) error {
 	if *createTable {
 		fmt.Printf("Creating table '%s' with %d shards...\n", *tableName, *numShards)
 
-		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *chunkerModel, *targetTokens, *overlapTokens)
+		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *inferenceURL, *chunkerModel, *targetTokens, *overlapTokens)
 		if err != nil {
 			return fmt.Errorf("failed to create embedding index config: %w", err)
+		}
+		indexes, err := createSearchTableIndexes(*embeddingIndex)
+		if err != nil {
+			return fmt.Errorf("failed to create search index config: %w", err)
 		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
 			NumShards: uint(*numShards),
-			Indexes: map[string]antfly.IndexConfig{
-				"embeddings": *embeddingIndex,
-			},
+			Indexes:   indexes,
 		})
 		if err != nil {
 			log.Printf("Warning: Failed to create table (may already exist): %v\n", err)
@@ -1415,7 +1477,8 @@ func loadCmd(args []string) error {
 // syncCmd combines download, prepare, and load
 func syncCmd(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
-	antflyURL := fs.String("url", "http://localhost:8080/api/v1", "Antfly API URL")
+	antflyURL := fs.String("url", DefaultAntflyURL, "Antfly API URL")
+	inferenceURL := fs.String("inference-url", defaultInferenceURL(), "Inference API URL for managed chunking")
 	tableName := fs.String("table", "epstein_docs", "Table name")
 	dirPath := fs.String("dir", "./epstein-docs", "Path to PDF directory")
 	baseURL := fs.String("base-url", "", "Base URL for document links")
@@ -1423,8 +1486,8 @@ func syncCmd(args []string) error {
 	createTable := fs.Bool("create-table", false, "Create table if needed")
 	numShards := fs.Int("num-shards", 1, "Number of shards")
 	batchSize := fs.Int("batch-size", 25, "Batch size")
-	embeddingModel := fs.String("embedding-model", "embeddinggemma", "Embedding model")
-	chunkerModel := fs.String("chunker-model", "fixed-bert-tokenizer", "Chunker model")
+	embeddingModel := fs.String("embedding-model", DefaultEmbeddingModel, "Embedding model")
+	chunkerModel := fs.String("chunker-model", DefaultChunkerModel, "Chunker model")
 	targetTokens := fs.Int("target-tokens", 512, "Target tokens")
 	overlapTokens := fs.Int("overlap-tokens", 50, "Overlap tokens")
 	noHeaderFooter := fs.Bool("no-header-footer-detection", false, "Disable header/footer detection (faster)")
@@ -1445,6 +1508,8 @@ func syncCmd(args []string) error {
 	}
 
 	fmt.Printf("=== Epstein Documents Sync ===\n")
+	fmt.Printf("Antfly URL: %s\n", *antflyURL)
+	fmt.Printf("Inference URL: %s\n", *inferenceURL)
 	fmt.Printf("Directory: %s\n", *dirPath)
 	fmt.Printf("Table: %s\n", *tableName)
 	if len(zipPaths) > 0 {
@@ -1459,16 +1524,18 @@ func syncCmd(args []string) error {
 	if *createTable {
 		fmt.Printf("Creating table '%s'...\n", *tableName)
 
-		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *chunkerModel, *targetTokens, *overlapTokens)
+		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *inferenceURL, *chunkerModel, *targetTokens, *overlapTokens)
 		if err != nil {
 			return fmt.Errorf("failed to create embedding index: %w", err)
+		}
+		indexes, err := createSearchTableIndexes(*embeddingIndex)
+		if err != nil {
+			return fmt.Errorf("failed to create search index config: %w", err)
 		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
 			NumShards: uint(*numShards),
-			Indexes: map[string]antfly.IndexConfig{
-				"embeddings": *embeddingIndex,
-			},
+			Indexes:   indexes,
 		})
 		if err != nil {
 			log.Printf("Warning: %v\n", err)
@@ -1598,7 +1665,7 @@ func syncCmd(args []string) error {
 // serveCmd starts a web server with a search interface
 func serveCmd(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	antflyURL := fs.String("url", "http://localhost:8080/api/v1", "Antfly API URL")
+	antflyURL := fs.String("url", "http://localhost:8080/db/v1", "Antfly API URL")
 	tableName := fs.String("table", "epstein_docs", "Table name to search")
 	listenAddr := fs.String("listen", ":3000", "Listen address for web server")
 	pdfDir := fs.String("pdf-dir", "./epstein-docs", "Directory containing PDF files (including pages/ subdirectory)")
@@ -1680,6 +1747,12 @@ type SearchResult struct {
 	FilePath string
 	PageNum  int
 	URL      string
+	Entities []EntityChip
+}
+
+type EntityChip struct {
+	Text  string
+	Label string
 }
 
 // SearchPageData holds data for the search page template
@@ -1709,7 +1782,7 @@ func (s *SearchServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.client.Query(ctx, antfly.QueryRequest{
 		Table:          s.tableName,
 		SemanticSearch: query,
-		Indexes:        []string{"full_text_index", "embeddings"},
+		Indexes:        searchIndexNames(),
 		Limit:          20,
 	})
 
@@ -1747,6 +1820,7 @@ func (s *SearchServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 					if pageNum, ok := metadata["page_number"].(float64); ok {
 						result.PageNum = int(pageNum)
 					}
+					result.Entities = extractEntityChips(metadata["entities"], 12)
 				}
 			}
 
@@ -1769,7 +1843,7 @@ func (s *SearchServer) handleAPISearch(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.client.Query(ctx, antfly.QueryRequest{
 		Table:          s.tableName,
 		SemanticSearch: query,
-		Indexes:        []string{"full_text_index", "embeddings"},
+		Indexes:        searchIndexNames(),
 		Limit:          20,
 	})
 
@@ -1782,24 +1856,63 @@ func (s *SearchServer) handleAPISearch(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+func extractEntityChips(value any, limit int) []EntityChip {
+	items, ok := value.([]any)
+	if !ok || limit <= 0 {
+		return nil
+	}
+
+	seen := map[string]struct{}{}
+	chips := make([]EntityChip, 0, min(limit, len(items)))
+	for _, item := range items {
+		entity, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		text, _ := entity["text"].(string)
+		label, _ := entity["label"].(string)
+		text = strings.TrimSpace(text)
+		label = strings.TrimSpace(label)
+		if text == "" || label == "" {
+			continue
+		}
+		key := strings.ToLower(label + "\x00" + text)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		chips = append(chips, EntityChip{Text: text, Label: label})
+		if len(chips) >= limit {
+			break
+		}
+	}
+	return chips
+}
+
 // Helper functions
 
-func createEmbeddingIndex(embeddingModel, chunkerModel string, targetTokens, overlapTokens int) (*antfly.IndexConfig, error) {
+func createEmbeddingIndex(embeddingModel, inferenceURL, chunkerModel string, targetTokens, overlapTokens int) (*antfly.IndexConfig, error) {
 	embeddingIndexConfig := antfly.IndexConfig{
-		Name: "embeddings",
+		Name: DefaultEmbeddingIndex,
 		Type: antfly.IndexTypeEmbeddings,
 	}
 
-	embedder, err := antfly.NewEmbedderConfig(antfly.OllamaEmbedderConfig{
+	embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model: embeddingModel,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure embedder: %w", err)
 	}
 
+	chunkerURL, err := inferenceMLBaseURL(inferenceURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure chunker URL: %w", err)
+	}
+
 	chunker := antfly.ChunkerConfig{}
-	err = chunker.FromTermiteChunkerConfig(antfly.TermiteChunkerConfig{
-		Model: chunkerModel,
+	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
+		ApiUrl: chunkerURL,
+		Model:  chunkerModel,
 		Text: antfly.TextChunkOptions{
 			TargetTokens:  targetTokens,
 			OverlapTokens: overlapTokens,
@@ -1819,6 +1932,32 @@ func createEmbeddingIndex(embeddingModel, chunkerModel string, targetTokens, ove
 	}
 
 	return &embeddingIndexConfig, nil
+}
+
+func createFullTextIndex() (antfly.IndexConfig, error) {
+	idx := antfly.IndexConfig{
+		Name: DefaultFullTextIndex,
+		Type: antfly.IndexTypeFullText,
+	}
+	if err := idx.FromFullTextIndexConfig(antfly.FullTextIndexConfig{}); err != nil {
+		return antfly.IndexConfig{}, fmt.Errorf("failed to configure full-text index: %w", err)
+	}
+	return idx, nil
+}
+
+func createSearchTableIndexes(embeddingIndex antfly.IndexConfig) (map[string]antfly.IndexConfig, error) {
+	fullTextIndex, err := createFullTextIndex()
+	if err != nil {
+		return nil, err
+	}
+	return map[string]antfly.IndexConfig{
+		DefaultFullTextIndex:  fullTextIndex,
+		DefaultEmbeddingIndex: embeddingIndex,
+	}, nil
+}
+
+func searchIndexNames() []string {
+	return []string{DefaultFullTextIndex, DefaultEmbeddingIndex}
 }
 
 // truncateContent truncates content at a natural boundary (paragraph or sentence)
@@ -2671,14 +2810,14 @@ func extractPageFromZip(zipIndex map[string]*zip.File, sourceFile string, pageNu
 }
 
 // enrichCmd implements the "enrich" subcommand: a second pass over prepare output
-// that re-OCRs low-quality pages using Florence 2 (via Termite).
+// that re-OCRs low-quality pages using Florence 2 (via Inference).
 func enrichCmd(args []string) error {
 	fs := flag.NewFlagSet("enrich", flag.ExitOnError)
 	inputFile := fs.String("input", "epstein-docs.json", "Input JSON file from prepare")
 	outputFile := fs.String("output", "", "Output JSON file (default: {input-base}-enriched.json)")
-	termiteURL := fs.String("termite-url", "http://localhost:11433/api", "Termite service URL")
-	model := fs.String("model", "onnx-community/Florence-2-base-ft", "Reader model for OCR")
-	prompt := fs.String("prompt", "<OCR>", "Florence 2 task prompt")
+	inferenceURL := fs.String("inference-url", defaultInferenceURL(), "Inference service URL")
+	model := fs.String("model", DefaultOCRModel, "Reader model for OCR")
+	prompt := fs.String("prompt", "", "Reader prompt")
 	maxTokens := fs.Int("max-tokens", 4096, "Max generation tokens")
 	dpi := fs.Float64("dpi", 150, "Render DPI for page images")
 	minContentLen := fs.Int("min-content", 50, "Short content threshold (chars)")
@@ -2810,7 +2949,7 @@ func enrichCmd(args []string) error {
 	}
 
 	// Init OCR client
-	ocrClient, err := NewOCRClient(*termiteURL, []string{*model}, *dpi)
+	ocrClient, err := NewOCRClient(*inferenceURL, []string{*model}, *dpi)
 	if err != nil {
 		return fmt.Errorf("create OCR client: %w", err)
 	}
@@ -2989,6 +3128,772 @@ func enrichCmd(args []string) error {
 	return nil
 }
 
+type entityCandidate struct {
+	id           string
+	content      string
+	retryWindows []entityWindowSpan
+}
+
+type entityWindow struct {
+	id      string
+	content string
+	start   int
+	end     int
+}
+
+type entityWindowSpan struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
+}
+
+type entityAccum struct {
+	entities         []inferenceoapi.InferenceRecognizeEntity
+	relations        []inferenceoapi.InferenceRelation
+	failed           []entityWindowSpan
+	windows          int
+	errors           int
+	preserveExisting bool
+}
+
+// entitiesCmd enriches prepared page records with NER metadata from Inference.
+func entitiesCmd(args []string) error {
+	fs := flag.NewFlagSet("entities", flag.ExitOnError)
+	inputFile := fs.String("input", "epstein-docs.json", "Input JSON file from prepare or enrich")
+	outputFile := fs.String("output", "", "Output JSON file (default: {input-base}-entities.json)")
+	inferenceURL := fs.String("inference-url", defaultInferenceURL(), "Inference service URL")
+	model := fs.String("model", DefaultRecognizerModel, "Recognizer model for entity extraction")
+	labelsCSV := fs.String("labels", DefaultEntityLabels, "Entity labels to extract (comma-separated)")
+	relationLabelsCSV := fs.String("relation-labels", DefaultRelationLabels, "Relation labels to extract (comma-separated; pass an empty value to disable)")
+	batchSize := fs.Int("batch-size", 16, "Text windows per Inference recognize request")
+	maxChars := fs.Int("max-chars", DefaultEntityMaxChars, "Maximum characters per recognizer window")
+	overlapChars := fs.Int("overlap-chars", DefaultEntityOverlap, "Characters of overlap between recognizer windows")
+	dryRun := fs.Bool("dry-run", false, "Report candidates only, don't process")
+	reprocess := fs.Bool("reprocess", false, "Re-process records that already have entity metadata")
+
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+	if *batchSize <= 0 {
+		return fmt.Errorf("batch-size must be positive")
+	}
+	if *maxChars <= 0 {
+		return fmt.Errorf("max-chars must be positive")
+	}
+	if *overlapChars < 0 {
+		return fmt.Errorf("overlap-chars must be non-negative")
+	}
+	if *overlapChars >= *maxChars {
+		return fmt.Errorf("overlap-chars must be smaller than max-chars")
+	}
+
+	outPath := *outputFile
+	if outPath == "" {
+		base := strings.TrimSuffix(*inputFile, filepath.Ext(*inputFile))
+		outPath = base + "-entities.json"
+	}
+
+	labels := splitCSV(*labelsCSV)
+	relationLabels := splitCSV(*relationLabelsCSV)
+
+	fmt.Printf("=== Epstein Documents Entities ===\n\n")
+	fmt.Printf("Input:  %s\n", *inputFile)
+	fmt.Printf("Output: %s\n", outPath)
+	fmt.Printf("Inference URL: %s\n", *inferenceURL)
+	fmt.Printf("Model:  %s\n", *model)
+	fmt.Printf("Labels: %s\n", strings.Join(labels, ", "))
+	if len(relationLabels) > 0 {
+		fmt.Printf("Relation labels: %s\n", strings.Join(relationLabels, ", "))
+	}
+	fmt.Printf("Window: %d chars with %d overlap\n", *maxChars, *overlapChars)
+	fmt.Println()
+
+	records, err := readJSONFile[map[string]map[string]any](*inputFile)
+	if err != nil {
+		return fmt.Errorf("failed to read input: %w", err)
+	}
+
+	candidates := entityCandidates(records, *reprocess, *model, labels, relationLabels, *maxChars, *overlapChars)
+	windows, retryOnly := entityWindows(candidates, *maxChars, *overlapChars)
+	fmt.Printf("Total records: %d\n", len(records))
+	fmt.Printf("Entity candidates: %d\n", len(candidates))
+	fmt.Printf("Entity windows: %d\n", len(windows))
+	if *dryRun {
+		fmt.Printf("Dry run complete. Use without -dry-run to process.\n")
+		return nil
+	}
+	if len(candidates) == 0 {
+		return writeJSONSorted(outPath, records)
+	}
+
+	client, err := antfly.NewInferenceClient(*inferenceURL, http.DefaultClient)
+	if err != nil {
+		return fmt.Errorf("create inference client: %w", err)
+	}
+
+	accum := make(map[string]*entityAccum, len(candidates))
+	for _, candidate := range candidates {
+		a := &entityAccum{}
+		if retryOnly[candidate.id] {
+			if meta, ok := records[candidate.id]["metadata"].(map[string]any); ok {
+				a.entities = metadataEntities(meta["entities"])
+				a.relations = metadataRelations(meta["relations"])
+				a.preserveExisting = true
+			}
+		}
+		accum[candidate.id] = a
+	}
+
+	usedModel, processedWindows, failedWindows := recognizeEntityWindows(
+		context.Background(),
+		client,
+		*model,
+		labels,
+		relationLabels,
+		windows,
+		*batchSize,
+		accum,
+	)
+	if usedModel == "" {
+		usedModel = *model
+	}
+
+	var processedRecords, recordsWithErrors, entityCount, relationCount int
+	for _, candidate := range candidates {
+		a := accum[candidate.id]
+		if a == nil {
+			continue
+		}
+		if a.windows == 0 && a.errors == 0 {
+			continue
+		}
+
+		meta := ensureRecordMetadata(records[candidate.id])
+		clearEntityMetadata(meta)
+		if a.windows > 0 || a.preserveExisting {
+			entities := dedupeEntities(a.entities)
+			relations := dedupeRelations(a.relations)
+
+			meta["entities"] = entities
+			meta["entity_model"] = usedModel
+			meta["entity_labels"] = labels
+			meta["entity_window_chars"] = *maxChars
+			meta["entity_overlap_chars"] = *overlapChars
+			entityCount += len(entities)
+			processedRecords++
+
+			if len(relationLabels) > 0 {
+				meta["relations"] = relations
+				meta["relation_labels"] = relationLabels
+				relationCount += len(relations)
+			}
+		}
+		if a.errors > 0 {
+			meta["entity_error_windows"] = a.errors
+			meta["entity_failed_windows"] = a.failed
+			recordsWithErrors++
+		}
+	}
+
+	if err := writeJSONSorted(outPath, records); err != nil {
+		return fmt.Errorf("write output: %w", err)
+	}
+
+	fmt.Printf("\n=== Entities Summary ===\n")
+	fmt.Printf("  Records processed: %d\n", processedRecords)
+	fmt.Printf("  Windows processed: %d\n", processedWindows)
+	fmt.Printf("  Window errors: %d\n", failedWindows)
+	fmt.Printf("  Records with errors: %d\n", recordsWithErrors)
+	fmt.Printf("  Entities extracted: %d\n", entityCount)
+	fmt.Printf("  Relations extracted: %d\n", relationCount)
+	fmt.Printf("\nWrote %s\n", outPath)
+	return nil
+}
+
+func entityCandidates(
+	records map[string]map[string]any,
+	reprocess bool,
+	model string,
+	labels []string,
+	relationLabels []string,
+	maxChars int,
+	overlapChars int,
+) []entityCandidate {
+	ids := make([]string, 0, len(records))
+	for id := range records {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+
+	candidates := make([]entityCandidate, 0, len(records))
+	for _, id := range ids {
+		rec := records[id]
+		content, _ := rec["content"].(string)
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		if !reprocess {
+			if meta, ok := rec["metadata"].(map[string]any); ok {
+				if _, ok := meta["entities"]; ok {
+					if entityMetadataIncomplete(meta) {
+						candidate := entityCandidate{id: id, content: content}
+						if entityMetadataConfigMatches(meta, model, labels, relationLabels, maxChars, overlapChars) {
+							candidate.retryWindows = metadataFailedWindows(meta)
+						}
+						candidates = append(candidates, candidate)
+						continue
+					}
+					continue
+				}
+			}
+		}
+		candidates = append(candidates, entityCandidate{id: id, content: content})
+	}
+	return candidates
+}
+
+func entityMetadataIncomplete(meta map[string]any) bool {
+	return metadataInt(meta["entity_error_windows"]) > 0 || len(metadataFailedWindows(meta)) > 0
+}
+
+func entityMetadataConfigMatches(meta map[string]any, model string, labels []string, relationLabels []string, maxChars, overlapChars int) bool {
+	return metadataString(meta["entity_model"]) == model &&
+		stringSlicesEqual(metadataStringSlice(meta["entity_labels"]), labels) &&
+		stringSlicesEqual(metadataStringSlice(meta["relation_labels"]), relationLabels) &&
+		metadataInt(meta["entity_window_chars"]) == maxChars &&
+		metadataInt(meta["entity_overlap_chars"]) == overlapChars
+}
+
+func metadataFailedWindows(meta map[string]any) []entityWindowSpan {
+	switch value := meta["entity_failed_windows"].(type) {
+	case []entityWindowSpan:
+		return append([]entityWindowSpan(nil), value...)
+	case []any:
+		spans := make([]entityWindowSpan, 0, len(value))
+		for _, item := range value {
+			switch v := item.(type) {
+			case entityWindowSpan:
+				if v.End > v.Start {
+					spans = append(spans, v)
+				}
+			case map[string]any:
+				span := entityWindowSpan{
+					Start: metadataInt(v["start"]),
+					End:   metadataInt(v["end"]),
+				}
+				if span.End > span.Start {
+					spans = append(spans, span)
+				}
+			}
+		}
+		return spans
+	default:
+		return nil
+	}
+}
+
+func clearEntityMetadata(meta map[string]any) {
+	delete(meta, "entities")
+	delete(meta, "entity_model")
+	delete(meta, "entity_labels")
+	delete(meta, "entity_window_chars")
+	delete(meta, "entity_overlap_chars")
+	delete(meta, "relations")
+	delete(meta, "relation_labels")
+	delete(meta, "entity_error_windows")
+	delete(meta, "entity_failed_windows")
+}
+
+func entityWindows(candidates []entityCandidate, maxChars, overlapChars int) ([]entityWindow, map[string]bool) {
+	var windows []entityWindow
+	retryOnly := map[string]bool{}
+	for _, candidate := range candidates {
+		all := splitEntityWindows(candidate, maxChars, overlapChars)
+		if len(candidate.retryWindows) > 0 {
+			selected := filterEntityWindows(all, candidate.retryWindows)
+			if len(selected) > 0 {
+				windows = append(windows, selected...)
+				retryOnly[candidate.id] = true
+				continue
+			}
+		}
+		windows = append(windows, all...)
+	}
+	return windows, retryOnly
+}
+
+func splitEntityWindows(candidate entityCandidate, maxChars, overlapChars int) []entityWindow {
+	runes := []rune(candidate.content)
+	if len(runes) == 0 {
+		return nil
+	}
+	if maxChars <= 0 || len(runes) <= maxChars {
+		return []entityWindow{{id: candidate.id, content: candidate.content, start: 0, end: len(runes)}}
+	}
+	if overlapChars < 0 {
+		overlapChars = 0
+	}
+	if overlapChars >= maxChars {
+		overlapChars = maxChars / 4
+	}
+
+	windows := make([]entityWindow, 0, len(runes)/maxChars+1)
+	for start := 0; start < len(runes); {
+		end := min(start+maxChars, len(runes))
+		if end < len(runes) {
+			end = chooseEntityWindowEnd(runes, start, end)
+		}
+
+		content := string(runes[start:end])
+		if strings.TrimSpace(content) != "" {
+			windows = append(windows, entityWindow{
+				id:      candidate.id,
+				content: content,
+				start:   start,
+				end:     end,
+			})
+		}
+		if end >= len(runes) {
+			break
+		}
+
+		next := end - overlapChars
+		if next <= start {
+			next = end
+		}
+		start = next
+	}
+	return windows
+}
+
+func filterEntityWindows(windows []entityWindow, spans []entityWindowSpan) []entityWindow {
+	if len(spans) == 0 {
+		return windows
+	}
+	wanted := make(map[entityWindowSpan]struct{}, len(spans))
+	for _, span := range spans {
+		wanted[span] = struct{}{}
+	}
+	out := make([]entityWindow, 0, len(spans))
+	for _, window := range windows {
+		if _, ok := wanted[entityWindowSpan{Start: window.start, End: window.end}]; ok {
+			out = append(out, window)
+		}
+	}
+	return out
+}
+
+func chooseEntityWindowEnd(runes []rune, start, hardEnd int) int {
+	minEnd := start + ((hardEnd - start) * 2 / 3)
+	for i := hardEnd - 1; i > minEnd; i-- {
+		if unicode.IsSpace(runes[i]) {
+			return i + 1
+		}
+	}
+	return hardEnd
+}
+
+func recognizeEntityWindows(
+	ctx context.Context,
+	client *antfly.InferenceClient,
+	model string,
+	labels []string,
+	relationLabels []string,
+	windows []entityWindow,
+	batchSize int,
+	accum map[string]*entityAccum,
+) (string, int, int) {
+	var usedModel string
+	var processed, failed int
+	for start := 0; start < len(windows); start += batchSize {
+		end := min(start+batchSize, len(windows))
+		batchModel, batchProcessed, batchFailed := recognizeEntityWindowBatch(ctx, client, model, labels, relationLabels, windows[start:end], accum)
+		if usedModel == "" {
+			usedModel = batchModel
+		}
+		processed += batchProcessed
+		failed += batchFailed
+		fmt.Printf("  Processed %d/%d windows (%d failed)...\n", processed+failed, len(windows), failed)
+	}
+	return usedModel, processed, failed
+}
+
+func recognizeEntityWindowBatch(
+	ctx context.Context,
+	client *antfly.InferenceClient,
+	model string,
+	labels []string,
+	relationLabels []string,
+	windows []entityWindow,
+	accum map[string]*entityAccum,
+) (string, int, int) {
+	if len(windows) == 0 {
+		return "", 0, 0
+	}
+
+	texts := make([]string, len(windows))
+	for i, window := range windows {
+		texts[i] = window.content
+	}
+
+	inputs, err := inferenceExtractionInputs(texts)
+	if err != nil {
+		log.Printf("Warning: entity recognition request build failed: %v", err)
+		return "", 0, len(windows)
+	}
+	relations := make([]inferenceoapi.ExtractionRelationSchema, 0, len(relationLabels))
+	for _, label := range relationLabels {
+		relations = append(relations, inferenceoapi.ExtractionRelationSchema{Type: label})
+	}
+	resp, err := client.Extract(ctx, inferenceoapi.ExtractionRequest{
+		Model:  model,
+		Inputs: inputs,
+		Schema: inferenceoapi.ExtractionSchema{
+			Entities:  labels,
+			Relations: relations,
+		},
+	})
+	if err != nil {
+		if len(windows) > 1 {
+			mid := len(windows) / 2
+			leftModel, leftProcessed, leftFailed := recognizeEntityWindowBatch(ctx, client, model, labels, relationLabels, windows[:mid], accum)
+			rightModel, rightProcessed, rightFailed := recognizeEntityWindowBatch(ctx, client, model, labels, relationLabels, windows[mid:], accum)
+			if leftModel != "" {
+				return leftModel, leftProcessed + rightProcessed, leftFailed + rightFailed
+			}
+			return rightModel, leftProcessed + rightProcessed, leftFailed + rightFailed
+		}
+
+		window := windows[0]
+		if a := accum[window.id]; a != nil {
+			a.errors++
+			a.failed = append(a.failed, entityWindowSpan{Start: window.start, End: window.end})
+		}
+		log.Printf("Warning: entity recognition failed for %s at char %d: %v", window.id, window.start, err)
+		return "", 0, 1
+	}
+
+	usedModel := resp.Model
+	if usedModel == "" {
+		usedModel = model
+	}
+
+	resultsByIndex := make(map[int]inferenceoapi.InferenceRecognizeObject, len(resp.Data))
+	for resultIdx, result := range resp.Data {
+		idx := resultIdx
+		if idx >= 0 && idx < len(windows) {
+			resultsByIndex[idx] = inferenceRecognizeObjectFromExtraction(result)
+		}
+	}
+
+	for i, window := range windows {
+		a := accum[window.id]
+		if a == nil {
+			continue
+		}
+		a.windows++
+
+		result, ok := resultsByIndex[i]
+		if !ok {
+			continue
+		}
+		a.entities = append(a.entities, offsetEntities(result.Entities, window.start)...)
+		a.relations = append(a.relations, offsetRelations(result.Relations, window.start)...)
+	}
+
+	return usedModel, len(windows), 0
+}
+
+func inferenceExtractionInputs(texts []string) ([]inferenceoapi.ExtractionInput, error) {
+	inputs := make([]inferenceoapi.ExtractionInput, len(texts))
+	for i, text := range texts {
+		content, err := json.Marshal(text)
+		if err != nil {
+			return nil, err
+		}
+		inputs[i] = inferenceoapi.ExtractionInput{Content: inferenceoapi.ChatMessageContent(content)}
+	}
+	return inputs, nil
+}
+
+func inferenceRecognizeObjectFromExtraction(item inferenceoapi.ExtractionObject) inferenceoapi.InferenceRecognizeObject {
+	entities := make([]inferenceoapi.InferenceRecognizeEntity, len(item.Entities))
+	for i, entity := range item.Entities {
+		entities[i] = inferenceoapi.InferenceRecognizeEntity{
+			Text:  entity.Text,
+			Label: entity.Label,
+			Score: entity.Score,
+			Start: entity.Start,
+			End:   entity.End,
+		}
+	}
+	relations := make([]inferenceoapi.InferenceRelation, 0, len(item.Relations))
+	for _, relation := range item.Relations {
+		relations = append(relations, inferenceoapi.InferenceRelation{
+			Head:  inferenceRelationEndpointEntity(relation.Source, entities),
+			Label: relation.Type,
+			Score: relation.Score,
+			Tail:  inferenceRelationEndpointEntity(relation.Target, entities),
+		})
+	}
+	return inferenceoapi.InferenceRecognizeObject{
+		Entities:  entities,
+		Object:    inferenceoapi.InferenceRecognizeObjectObjectRecognition,
+		Relations: relations,
+	}
+}
+
+func inferenceRelationEndpointEntity(endpoint inferenceoapi.ExtractionRelationEndpoint, entities []inferenceoapi.InferenceRecognizeEntity) inferenceoapi.InferenceRecognizeEntity {
+	if endpoint.EntityIndex >= 0 && endpoint.EntityIndex < len(entities) {
+		return entities[endpoint.EntityIndex]
+	}
+	if endpoint.Id != "" {
+		for _, entity := range entities {
+			if entity.Text == endpoint.Id {
+				return entity
+			}
+		}
+	}
+	return inferenceoapi.InferenceRecognizeEntity{}
+}
+
+func offsetEntities(entities []inferenceoapi.InferenceRecognizeEntity, base int) []inferenceoapi.InferenceRecognizeEntity {
+	out := make([]inferenceoapi.InferenceRecognizeEntity, len(entities))
+	for i, entity := range entities {
+		out[i] = offsetEntity(entity, base)
+	}
+	return out
+}
+
+func offsetEntity(entity inferenceoapi.InferenceRecognizeEntity, base int) inferenceoapi.InferenceRecognizeEntity {
+	entity.Start += base
+	entity.End += base
+	return entity
+}
+
+func offsetRelations(relations []inferenceoapi.InferenceRelation, base int) []inferenceoapi.InferenceRelation {
+	out := make([]inferenceoapi.InferenceRelation, len(relations))
+	for i, relation := range relations {
+		relation.Head = offsetEntity(relation.Head, base)
+		relation.Tail = offsetEntity(relation.Tail, base)
+		out[i] = relation
+	}
+	return out
+}
+
+func metadataEntities(value any) []inferenceoapi.InferenceRecognizeEntity {
+	items, ok := value.([]any)
+	if !ok {
+		if entities, ok := value.([]inferenceoapi.InferenceRecognizeEntity); ok {
+			return append([]inferenceoapi.InferenceRecognizeEntity(nil), entities...)
+		}
+		return nil
+	}
+	entities := make([]inferenceoapi.InferenceRecognizeEntity, 0, len(items))
+	for _, item := range items {
+		entity, ok := metadataEntity(item)
+		if ok {
+			entities = append(entities, entity)
+		}
+	}
+	return entities
+}
+
+func metadataRelations(value any) []inferenceoapi.InferenceRelation {
+	items, ok := value.([]any)
+	if !ok {
+		if relations, ok := value.([]inferenceoapi.InferenceRelation); ok {
+			return append([]inferenceoapi.InferenceRelation(nil), relations...)
+		}
+		return nil
+	}
+	relations := make([]inferenceoapi.InferenceRelation, 0, len(items))
+	for _, item := range items {
+		relation, ok := metadataRelation(item)
+		if ok {
+			relations = append(relations, relation)
+		}
+	}
+	return relations
+}
+
+func metadataEntity(value any) (inferenceoapi.InferenceRecognizeEntity, bool) {
+	if entity, ok := value.(inferenceoapi.InferenceRecognizeEntity); ok {
+		return entity, true
+	}
+	m, ok := value.(map[string]any)
+	if !ok {
+		return inferenceoapi.InferenceRecognizeEntity{}, false
+	}
+	return inferenceoapi.InferenceRecognizeEntity{
+		Text:  metadataString(m["text"]),
+		Label: metadataString(m["label"]),
+		Start: metadataInt(m["start"]),
+		End:   metadataInt(m["end"]),
+		Score: metadataFloat32(m["score"]),
+	}, true
+}
+
+func metadataRelation(value any) (inferenceoapi.InferenceRelation, bool) {
+	if relation, ok := value.(inferenceoapi.InferenceRelation); ok {
+		return relation, true
+	}
+	m, ok := value.(map[string]any)
+	if !ok {
+		return inferenceoapi.InferenceRelation{}, false
+	}
+	head, headOK := metadataEntity(m["head"])
+	tail, tailOK := metadataEntity(m["tail"])
+	if !headOK || !tailOK {
+		return inferenceoapi.InferenceRelation{}, false
+	}
+	return inferenceoapi.InferenceRelation{
+		Head:  head,
+		Label: metadataString(m["label"]),
+		Score: metadataFloat32(m["score"]),
+		Tail:  tail,
+	}, true
+}
+
+func metadataString(value any) string {
+	s, _ := value.(string)
+	return s
+}
+
+func metadataInt(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return int(n)
+	default:
+		return 0
+	}
+}
+
+func metadataFloat32(value any) float32 {
+	switch v := value.(type) {
+	case float32:
+		return v
+	case float64:
+		return float32(v)
+	case json.Number:
+		n, _ := v.Float64()
+		return float32(n)
+	default:
+		return 0
+	}
+}
+
+func metadataStringSlice(value any) []string {
+	switch v := value.(type) {
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func dedupeEntities(entities []inferenceoapi.InferenceRecognizeEntity) []inferenceoapi.InferenceRecognizeEntity {
+	byKey := make(map[string]inferenceoapi.InferenceRecognizeEntity, len(entities))
+	for _, entity := range entities {
+		key := entityKey(entity)
+		if existing, ok := byKey[key]; !ok || entity.Score > existing.Score {
+			byKey[key] = entity
+		}
+	}
+
+	out := make([]inferenceoapi.InferenceRecognizeEntity, 0, len(byKey))
+	for _, entity := range byKey {
+		out = append(out, entity)
+	}
+	slices.SortFunc(out, func(a, b inferenceoapi.InferenceRecognizeEntity) int {
+		if a.Start != b.Start {
+			return a.Start - b.Start
+		}
+		if a.End != b.End {
+			return a.End - b.End
+		}
+		if c := strings.Compare(a.Label, b.Label); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Text, b.Text)
+	})
+	return out
+}
+
+func dedupeRelations(relations []inferenceoapi.InferenceRelation) []inferenceoapi.InferenceRelation {
+	byKey := make(map[string]inferenceoapi.InferenceRelation, len(relations))
+	for _, relation := range relations {
+		key := relationKey(relation)
+		if existing, ok := byKey[key]; !ok || relation.Score > existing.Score {
+			byKey[key] = relation
+		}
+	}
+
+	out := make([]inferenceoapi.InferenceRelation, 0, len(byKey))
+	for _, relation := range byKey {
+		out = append(out, relation)
+	}
+	slices.SortFunc(out, func(a, b inferenceoapi.InferenceRelation) int {
+		if a.Head.Start != b.Head.Start {
+			return a.Head.Start - b.Head.Start
+		}
+		if a.Tail.Start != b.Tail.Start {
+			return a.Tail.Start - b.Tail.Start
+		}
+		if c := strings.Compare(a.Label, b.Label); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.Head.Text, b.Head.Text); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Tail.Text, b.Tail.Text)
+	})
+	return out
+}
+
+func entityKey(entity inferenceoapi.InferenceRecognizeEntity) string {
+	return fmt.Sprintf("%s\x00%s\x00%d\x00%d", entity.Label, entity.Text, entity.Start, entity.End)
+}
+
+func relationKey(relation inferenceoapi.InferenceRelation) string {
+	return fmt.Sprintf("%s\x00%s\x00%s", relation.Label, entityKey(relation.Head), entityKey(relation.Tail))
+}
+
+func ensureRecordMetadata(rec map[string]any) map[string]any {
+	meta, _ := rec["metadata"].(map[string]any)
+	if meta == nil {
+		meta = map[string]any{}
+		rec["metadata"] = meta
+	}
+	return meta
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "epstein - Epstein Documents Search Tool\n\n")
@@ -3001,10 +3906,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  epstein sync [flags]      - Full pipeline (process + load)\n")
 		fmt.Fprintf(os.Stderr, "  epstein serve [flags]     - Start web search interface\n")
 		fmt.Fprintf(os.Stderr, "  epstein audit [flags]     - Audit parsed documents for errors\n")
-		fmt.Fprintf(os.Stderr, "  epstein enrich [flags]    - Re-OCR low-quality pages with Florence 2\n")
+		fmt.Fprintf(os.Stderr, "  epstein enrich [flags]    - Re-OCR low-quality pages with Antfly inference readers\n")
+		fmt.Fprintf(os.Stderr, "  epstein entities [flags]  - Add Antfly inference entity metadata to prepared JSON\n")
 		fmt.Fprintf(os.Stderr, "\nQuick Start:\n")
-		fmt.Fprintf(os.Stderr, "  # 1. Start Antfly\n")
-		fmt.Fprintf(os.Stderr, "  go run ./cmd/antfly swarm\n\n")
+		fmt.Fprintf(os.Stderr, "  # 1. Build and start Zig Antfly\n")
+		fmt.Fprintf(os.Stderr, "  cd zig && zig build install && ./zig-out/bin/antfly swarm\n\n")
 		fmt.Fprintf(os.Stderr, "  # 2. Download documents (choose dataset)\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset court-2024    # ~23MB, 943 pages\n")
 		fmt.Fprintf(os.Stderr, "  epstein download --dataset doj-complete  # ~4.8GB, 8 datasets (Dec 2025)\n")
@@ -3012,7 +3918,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  # 3. Prepare with page splitting (enables PDF viewing)\n")
 		fmt.Fprintf(os.Stderr, "  epstein prepare --split-pages\n\n")
 		fmt.Fprintf(os.Stderr, "  # 3b. (Optional) Enable OCR for scanned documents\n")
-		fmt.Fprintf(os.Stderr, "  #     Requires Termite running with OCR models\n")
+		fmt.Fprintf(os.Stderr, "  #     Requires Inference running with OCR models\n")
 		fmt.Fprintf(os.Stderr, "  epstein prepare --split-pages --enable-ocr\n\n")
 		fmt.Fprintf(os.Stderr, "  # 4. Index and load\n")
 		fmt.Fprintf(os.Stderr, "  epstein load --create-table\n\n")
@@ -3020,8 +3926,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  epstein serve\n\n")
 		fmt.Fprintf(os.Stderr, "OCR Fallback:\n")
 		fmt.Fprintf(os.Stderr, "  The --enable-ocr flag enables automatic OCR when text extraction fails.\n")
-		fmt.Fprintf(os.Stderr, "  This requires Termite running with OCR models (trocr, florence-2).\n")
-		fmt.Fprintf(os.Stderr, "  Pages are rendered to images and sent to Termite for text recognition.\n")
+		fmt.Fprintf(os.Stderr, "  This requires Inference running with OCR models such as %s.\n", DefaultOCRModel)
+		fmt.Fprintf(os.Stderr, "  Pages are rendered to images and sent to Inference for text recognition.\n")
 		fmt.Fprintf(os.Stderr, "  Useful for scanned documents or PDFs with garbled text extraction.\n\n")
 		fmt.Fprintf(os.Stderr, "Datasets:\n")
 		fmt.Fprintf(os.Stderr, "  court-2024    January 2024 court unsealing (Giuffre v. Maxwell)\n")
@@ -3048,9 +3954,11 @@ func main() {
 		err = auditCmd(os.Args[2:])
 	case "enrich":
 		err = enrichCmd(os.Args[2:])
+	case "entities":
+		err = entitiesCmd(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
-		fmt.Fprintf(os.Stderr, "Valid commands: download, prepare, load, sync, serve, audit, enrich\n")
+		fmt.Fprintf(os.Stderr, "Valid commands: download, prepare, load, sync, serve, audit, enrich, entities\n")
 		os.Exit(1)
 	}
 

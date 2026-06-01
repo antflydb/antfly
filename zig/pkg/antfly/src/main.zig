@@ -14,6 +14,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const antfly = @import("antfly-zig");
 const structlog = @import("structlog");
 const cmd = @import("cmd/mod.zig");
 const httpx = @import("httpx");
@@ -42,12 +43,16 @@ pub fn main(init: std.process.Init) !void {
         printUsage(argv0);
         return;
     }
+    if (std.mem.eql(u8, subcommand, "--version") or std.mem.eql(u8, subcommand, "version")) {
+        printVersion();
+        return;
+    }
 
     // Server-side subcommands
     if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "metadata")) return try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "swarm")) return try cmd.swarm.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "termite")) return try cmd.termite.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
 
     if (std.mem.eql(u8, subcommand, "cloud")) {
@@ -120,7 +125,7 @@ fn printMissingAntflyCloud() void {
 }
 
 fn runCliCommand(allocator: std.mem.Allocator, subcommand: []const u8, args: *std.process.Args.Iterator) !void {
-    // Read global config from env vars (ANTFLY_URL, ANTFLY_BEARER)
+    // Read global config from env vars (ANTFLY_URL, ANTFLY_TOKEN)
     const config = cmd.cli.parseGlobalFlags();
 
     // Initialize IO and HTTP client
@@ -156,7 +161,7 @@ fn printUsage(argv0: []const u8) void {
         \\  data
         \\  metadata
         \\  swarm
-        \\  termite
+        \\  inference
         \\  serverless
         \\
         \\client subcommands:
@@ -174,6 +179,10 @@ fn printUsage(argv0: []const u8) void {
         \\  cloud          Delegate to the separate Antfly Cloud CLI
         \\
     , .{argv0});
+}
+
+fn printVersion() void {
+    std.debug.print("antfly {s} (zig runtime)\n", .{antfly.build_options.antfly_version});
 }
 
 fn runtimeInit(init: std.process.Init) std.process.Init {

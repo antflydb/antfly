@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const platform_time = @import("platform/time.zig");
 const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
 const snappy = @import("encoding/snappy.zig");
@@ -43,6 +44,8 @@ const roaring = @import("encoding/roaring.zig");
 
 const magic: [4]u8 = "AFSM".*; // AntFly SegMent
 const segment_version: u32 = 2; // v2: big-endian footer + CRC32 + Snappy stored fields
+const stored_fields_version_compressed_per_doc: u8 = 2;
+const stored_fields_version_uncompressed_offsets: u8 = 3;
 
 /// Fixed footer size (big-endian, at end of segment):
 ///   [numDocs: u64 BE]           8
@@ -60,7 +63,10 @@ pub const SectionType = enum(u16) {
     synonym = 2,
     columnar_stored = 3,
     typed_doc_values = 4,
+    doc_ordinals = 5,
 };
+
+pub const doc_ordinals_field = "\x00__antfly_doc_ordinals";
 
 // ============================================================================
 // Segment writer
@@ -73,6 +79,7 @@ pub const SegmentWriter = struct {
     stored_fields: std.ArrayListUnmanaged(StoredDoc),
     compression_bytes: std.ArrayListUnmanaged(u8),
     doc_count: u32 = 0,
+    last_stored_compress_ns: u64 = 0,
 
     pub fn init(alloc: Allocator) SegmentWriter {
         return .{
@@ -88,7 +95,7 @@ pub const SegmentWriter = struct {
         self.fields.deinit(self.alloc);
         for (self.stored_fields.items) |*s| {
             self.alloc.free(s.id);
-            self.alloc.free(s.data);
+            if (s.owns_data) self.alloc.free(@constCast(s.data));
         }
         self.stored_fields.deinit(self.alloc);
         self.compression_bytes.deinit(self.alloc);
@@ -106,30 +113,76 @@ pub const SegmentWriter = struct {
 
     /// Attach a section to a field.
     pub fn addSection(self: *SegmentWriter, field_idx: u16, section_type: SectionType, data: []const u8) !void {
+        const owned = try self.alloc.dupe(u8, data);
+        errdefer self.alloc.free(owned);
+        try self.addSectionOwned(field_idx, section_type, owned);
+    }
+
+    /// Attach an owned section buffer to a field.
+    ///
+    /// On success ownership of `data` transfers to the writer and it will be
+    /// freed by `deinit`. On error, the caller still owns `data`.
+    pub fn addSectionOwned(self: *SegmentWriter, field_idx: u16, section_type: SectionType, data: []u8) !void {
         try self.fields.items[field_idx].sections.append(self.alloc, .{
             .section_type = section_type,
-            .data = try self.alloc.dupe(u8, data),
+            .data = data,
         });
     }
 
     /// Store a document's raw data.
     pub fn addStoredDoc(self: *SegmentWriter, doc_id: []const u8, data: []const u8) !void {
+        const owned_id = try self.alloc.dupe(u8, doc_id);
+        errdefer self.alloc.free(owned_id);
+        const owned_data = try self.alloc.dupe(u8, data);
+        errdefer self.alloc.free(owned_data);
         try self.stored_fields.append(self.alloc, .{
-            .id = try self.alloc.dupe(u8, doc_id),
-            .data = try self.alloc.dupe(u8, data),
+            .id = owned_id,
+            .data = owned_data,
             .is_compressed = false,
+            .owns_data = true,
+        });
+        self.doc_count += 1;
+    }
+
+    /// Store a document while borrowing raw data until `build` completes.
+    pub fn addStoredDocBorrowed(self: *SegmentWriter, doc_id: []const u8, data: []const u8) !void {
+        const owned_id = try self.alloc.dupe(u8, doc_id);
+        errdefer self.alloc.free(owned_id);
+        try self.stored_fields.append(self.alloc, .{
+            .id = owned_id,
+            .data = data,
+            .is_compressed = false,
+            .owns_data = false,
         });
         self.doc_count += 1;
     }
 
     /// Store a document with Snappy-compressed data already prepared.
     pub fn addStoredDocCompressed(self: *SegmentWriter, doc_id: []const u8, compressed_data: []const u8) !void {
+        const owned_id = try self.alloc.dupe(u8, doc_id);
+        errdefer self.alloc.free(owned_id);
+        const owned_data = try self.alloc.dupe(u8, compressed_data);
+        errdefer self.alloc.free(owned_data);
         try self.stored_fields.append(self.alloc, .{
-            .id = try self.alloc.dupe(u8, doc_id),
-            .data = try self.alloc.dupe(u8, compressed_data),
+            .id = owned_id,
+            .data = owned_data,
             .is_compressed = true,
+            .owns_data = true,
         });
         self.doc_count += 1;
+    }
+
+    pub fn addDocOrdinals(self: *SegmentWriter, ordinals: []const u32) !void {
+        if (ordinals.len != self.doc_count) return error.InvalidSegment;
+        const data = try encodeDocOrdinalsAlloc(self.alloc, ordinals);
+        errdefer self.alloc.free(data);
+        if (data.len == 0) {
+            self.alloc.free(data);
+            return;
+        }
+
+        const field_idx = try self.addField(doc_ordinals_field);
+        try self.addSectionOwned(field_idx, .doc_ordinals, data);
     }
 
     /// Build the final segment file bytes. Caller owns result.
@@ -142,31 +195,24 @@ pub const SegmentWriter = struct {
     pub fn build(self: *SegmentWriter) ![]u8 {
         var out = std.ArrayListUnmanaged(u8).empty;
         defer out.deinit(self.alloc);
+        try out.ensureTotalCapacity(self.alloc, self.estimatedBuildSize());
 
         // 1. Write stored fields
         const stored_offset: u64 = out.items.len;
         try self.writeStoredFields(&out);
 
         // 2. Write field sections
-        var section_locs = std.ArrayListUnmanaged(SectionLoc).empty;
-        defer section_locs.deinit(self.alloc);
-
-        for (self.fields.items, 0..) |*field, fi| {
-            for (field.sections.items, 0..) |*section, si| {
-                const offset: u64 = out.items.len;
+        for (self.fields.items) |*field| {
+            for (field.sections.items) |*section| {
+                section.offset = out.items.len;
                 try out.appendSlice(self.alloc, section.data);
-                try section_locs.append(self.alloc, .{
-                    .field_idx = @intCast(fi),
-                    .section_idx = @intCast(si),
-                    .offset = offset,
-                    .length = section.data.len,
-                });
+                section.length = section.data.len;
             }
         }
 
         // 3. Write sections index (big-endian)
         const sections_index_offset: u64 = out.items.len;
-        try self.writeSectionIndex(&out, section_locs.items);
+        try self.writeSectionIndex(&out);
 
         // 4. Write footer (big-endian, 40 bytes)
         const footer_start = out.items.len;
@@ -183,21 +229,45 @@ pub const SegmentWriter = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    fn estimatedBuildSize(self: *const SegmentWriter) usize {
+        var total: usize = 1 + 4 + self.stored_fields.items.len * 8;
+        for (self.stored_fields.items) |doc| {
+            total +|= 2 + doc.id.len + 4;
+            total +|= doc.data.len;
+        }
+
+        for (self.fields.items) |field| {
+            total +|= 2 + field.name.len + 2;
+            for (field.sections.items) |section| {
+                total +|= section.data.len;
+                total +|= 2 + 8 + 8;
+            }
+        }
+        total +|= 40;
+        return total;
+    }
+
     fn writeStoredFields(self: *SegmentWriter, out: *std.ArrayListUnmanaged(u8)) !void {
-        // Format v2 (with Snappy compression + offset table for random access):
-        //   [version: u8 = 2]
+        // Format v3 (with uncompressed docs + offset table for random access):
+        //   [version: u8 = 3]
         //   [num_docs: u32 LE]
         //   [offset_0: u64 LE]  — offset from start of stored section to doc 0
         //   [offset_1: u64 LE]
         //   ...
-        //   [doc_0_data]  — per doc: [id_len: u16 LE][id][compressed_len: u32 LE][snappy_data]
+        //   [doc_0_data]  — per doc: [id_len: u16 LE][id][data_len: u32 LE][data]
         //   [doc_1_data]
         //   ...
+        //
+        // Small-document indexing is CPU-bound on per-document compression in
+        // the write path. Lucene/Tantivy-style stored-field compression should
+        // be block oriented; until the format grows block metadata, keep the
+        // random-access offset table and write raw stored docs.
         const num_docs: u32 = @intCast(self.stored_fields.items.len);
         const section_start = out.items.len;
 
         // Write version
-        try out.append(self.alloc, 2);
+        try out.append(self.alloc, stored_fields_version_uncompressed_offsets);
+        self.last_stored_compress_ns = 0;
 
         // Write num_docs
         try appendU32LE(self.alloc, out, num_docs);
@@ -219,21 +289,23 @@ pub const SegmentWriter = struct {
             try appendU16LE(self.alloc, out, @intCast(doc.id.len));
             try out.appendSlice(self.alloc, doc.id);
 
-            // Write data, reusing Snappy-compressed payloads when available.
+            // Write raw stored data. `addStoredDocCompressed` is retained for
+            // old callers; decode once here so v3 remains consistently raw.
             if (doc.is_compressed) {
+                const compress_start = platform_time.monotonicNs();
+                const decoded = try snappy.decode(self.alloc, doc.data);
+                defer self.alloc.free(decoded);
+                self.last_stored_compress_ns +|= platform_time.monotonicNs() - compress_start;
+                try appendU32LE(self.alloc, out, @intCast(decoded.len));
+                try out.appendSlice(self.alloc, decoded);
+            } else {
                 try appendU32LE(self.alloc, out, @intCast(doc.data.len));
                 try out.appendSlice(self.alloc, doc.data);
-            } else {
-                const compressed = try snappy.encodeInto(self.alloc, &self.compression_bytes, doc.data);
-                try appendU32LE(self.alloc, out, @intCast(compressed.len));
-                try out.appendSlice(self.alloc, compressed);
             }
         }
     }
 
-    const SectionLoc = struct { field_idx: u16, section_idx: u16, offset: u64, length: u64 };
-
-    fn writeSectionIndex(self: *SegmentWriter, out: *std.ArrayListUnmanaged(u8), locs: []const SectionLoc) !void {
+    fn writeSectionIndex(self: *SegmentWriter, out: *std.ArrayListUnmanaged(u8)) !void {
         // Sections index format (big-endian):
         //   [num_fields: u16 BE]
         //   For each field:
@@ -244,37 +316,31 @@ pub const SegmentWriter = struct {
         //       [offset: u64 BE]
         //       [length: u64 BE]
         try appendU16BE(self.alloc, out, @intCast(self.fields.items.len));
-        for (self.fields.items, 0..) |*field, fi| {
+        for (self.fields.items) |*field| {
             try appendU16BE(self.alloc, out, @intCast(field.name.len));
             try out.appendSlice(self.alloc, field.name);
             try appendU16BE(self.alloc, out, @intCast(field.sections.items.len));
 
-            for (field.sections.items, 0..) |*section, si| {
+            for (field.sections.items) |*section| {
                 try appendU16BE(self.alloc, out, @intFromEnum(section.section_type));
-                // Find matching location
-                var found = false;
-                for (locs) |loc| {
-                    if (loc.field_idx == @as(u16, @intCast(fi)) and loc.section_idx == @as(u16, @intCast(si))) {
-                        try appendU64BE(self.alloc, out, loc.offset);
-                        try appendU64BE(self.alloc, out, loc.length);
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) return error.MissingSectionLocation;
+                try appendU64BE(self.alloc, out, @intCast(section.offset));
+                try appendU64BE(self.alloc, out, @intCast(section.length));
             }
         }
     }
 
     const StoredDoc = struct {
         id: []u8,
-        data: []u8,
+        data: []const u8,
         is_compressed: bool,
+        owns_data: bool,
     };
 
     const SectionData = struct {
         section_type: SectionType,
         data: []u8,
+        offset: usize = 0,
+        length: usize = 0,
 
         fn deinit(self: *SectionData, alloc: Allocator) void {
             alloc.free(self.data);
@@ -412,8 +478,8 @@ pub const SegmentReader = struct {
 
     pub const StoredDocRef = struct { id: []const u8, data: []const u8 };
 
-    /// Read stored document by index. Returns ID and Snappy-compressed data.
-    /// Use `storedDocDecompressed` for uncompressed data (requires allocation).
+    /// Read stored document by index. v2 segments return Snappy-compressed
+    /// data; v1/v3 segments return raw stored data.
     pub fn storedDoc(self: *const SegmentReader, doc_idx: u32) ?StoredDocRef {
         var pos: usize = @intCast(self.stored_offset);
         const ver = self.data[pos];
@@ -422,8 +488,8 @@ pub const SegmentReader = struct {
         pos += 4;
         if (doc_idx >= num_docs) return null;
 
-        if (ver >= 2) {
-            // v2: offset table for O(1) access
+        if (ver >= stored_fields_version_compressed_per_doc) {
+            // v2/v3: offset table for O(1) access
             const offset_table_start = pos;
             const doc_offset = std.mem.readInt(u64, self.data[offset_table_start + @as(usize, doc_idx) * 8 ..][0..8], .little);
             const abs_pos: usize = @intCast(self.stored_offset + doc_offset);
@@ -461,17 +527,22 @@ pub const SegmentReader = struct {
     pub fn storedDocDecompressed(self: *const SegmentReader, doc_idx: u32) !?struct { id: []const u8, data: []u8 } {
         const raw = self.storedDoc(doc_idx) orelse return null;
         const ver = self.data[@intCast(self.stored_offset)];
-        if (ver >= 2) {
+        if (ver == stored_fields_version_compressed_per_doc) {
             const decompressed = try snappy.decode(self.alloc, raw.data);
             return .{ .id = raw.id, .data = decompressed };
         } else {
-            // v1: data is not compressed, dupe for consistent ownership
+            // v1/v3: data is not compressed, dupe for consistent ownership.
             return .{ .id = raw.id, .data = try self.alloc.dupe(u8, raw.data) };
         }
     }
 
     pub fn storedDocsAreCompressed(self: *const SegmentReader) bool {
-        return self.data[@intCast(self.stored_offset)] >= 2;
+        return self.data[@intCast(self.stored_offset)] == stored_fields_version_compressed_per_doc;
+    }
+
+    pub fn docOrdinal(self: *const SegmentReader, doc_idx: u32) !?u32 {
+        const section = self.getSection(doc_ordinals_field, .doc_ordinals) orelse return null;
+        return try decodeDocOrdinal(section, doc_idx);
     }
 };
 
@@ -662,6 +733,7 @@ pub fn writeMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []
 
     for (inputs) |input| {
         for (input.reader.fields) |*f| {
+            if (std.mem.eql(u8, f.name, doc_ordinals_field)) continue;
             try field_set.put(alloc, f.name, {});
         }
     }
@@ -724,6 +796,14 @@ pub fn writeMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []
         try built_fields.append(alloc, built_field);
     }
 
+    if (try mergeDocOrdinalSectionsAlloc(alloc, inputs, doc_count)) |merged_doc_ordinals| {
+        defer alloc.free(merged_doc_ordinals);
+        var built_field = BuiltField{ .name = doc_ordinals_field };
+        errdefer built_field.deinit(alloc);
+        try appendBuiltSection(alloc, sink, &built_field, .doc_ordinals, merged_doc_ordinals);
+        try built_fields.append(alloc, built_field);
+    }
+
     const sections_index_offset: u64 = @intCast(sink.len());
     try writeMergedSectionIndex(alloc, sink, built_fields.items);
 
@@ -750,7 +830,7 @@ fn countLiveDocs(inputs: []const MergeInput) u32 {
 
 fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_count: u32) !void {
     const section_start = sink.len();
-    try sink.appendByte(2);
+    try sink.appendByte(stored_fields_version_uncompressed_offsets);
     try sinkAppendU32LE(sink, doc_count);
 
     const offset_table_start = sink.len();
@@ -770,13 +850,13 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
             try sink.appendSlice(doc.id);
 
             if (input.reader.storedDocsAreCompressed()) {
+                const decoded = try snappy.decode(alloc, doc.data);
+                defer alloc.free(decoded);
+                try sinkAppendU32LE(sink, @intCast(decoded.len));
+                try sink.appendSlice(decoded);
+            } else {
                 try sinkAppendU32LE(sink, @intCast(doc.data.len));
                 try sink.appendSlice(doc.data);
-            } else {
-                const compressed = try snappy.encode(alloc, doc.data);
-                defer alloc.free(compressed);
-                try sinkAppendU32LE(sink, @intCast(compressed.len));
-                try sink.appendSlice(compressed);
             }
             out_doc_id += 1;
         }
@@ -871,6 +951,58 @@ fn mergeTypedDocValuesSections(
         return try w.build();
     }
     return null;
+}
+
+pub fn encodeDocOrdinalsAlloc(alloc: Allocator, ordinals: []const u32) ![]u8 {
+    var has_ordinal = false;
+    for (ordinals) |ordinal| {
+        if (ordinal != 0) {
+            has_ordinal = true;
+            break;
+        }
+    }
+    if (!has_ordinal) return try alloc.alloc(u8, 0);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, 1);
+    try appendU32BE(alloc, &out, @intCast(ordinals.len));
+    for (ordinals) |ordinal| try appendU32BE(alloc, &out, ordinal);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn decodeDocOrdinal(section: []const u8, doc_idx: u32) !?u32 {
+    if (section.len < 5) return error.InvalidSegment;
+    const version = section[0];
+    if (version != 1) return error.UnsupportedVersion;
+    const count = std.mem.readInt(u32, section[1..5], .big);
+    if (doc_idx >= count) return null;
+    const expected_len = 5 + @as(usize, count) * 4;
+    if (section.len != expected_len) return error.InvalidSegment;
+    const offset = 5 + @as(usize, doc_idx) * 4;
+    const ordinal = std.mem.readInt(u32, section[offset..][0..4], .big);
+    return if (ordinal == 0) null else ordinal;
+}
+
+fn mergeDocOrdinalSectionsAlloc(alloc: Allocator, inputs: []const MergeInput, doc_count: u32) !?[]u8 {
+    if (doc_count == 0) return null;
+    var ordinals = try alloc.alloc(u32, doc_count);
+    defer alloc.free(ordinals);
+
+    var out_doc_id: usize = 0;
+    var has_ordinal = false;
+    for (inputs) |input| {
+        for (0..input.reader.doc_count) |doc_id_usize| {
+            const doc_id: u32 = @intCast(doc_id_usize);
+            if (input.isDeleted(doc_id)) continue;
+            const ordinal = (try input.reader.docOrdinal(doc_id)) orelse 0;
+            ordinals[out_doc_id] = ordinal;
+            has_ordinal = has_ordinal or ordinal != 0;
+            out_doc_id += 1;
+        }
+    }
+    if (!has_ordinal) return null;
+    return try encodeDocOrdinalsAlloc(alloc, ordinals);
 }
 
 // ============================================================================
@@ -1040,6 +1172,48 @@ test "segment merge" {
     try std.testing.expect(reader.storedDoc(1) != null);
     try std.testing.expect(reader.storedDoc(2) != null);
     try std.testing.expect(reader.storedDoc(3) == null);
+}
+
+test "segment doc ordinal sidecar roundtrip and merge preserve live order" {
+    const alloc = std.testing.allocator;
+
+    var sw1 = SegmentWriter.init(alloc);
+    defer sw1.deinit();
+    try sw1.addStoredDoc("a", "{}");
+    try sw1.addStoredDoc("b", "{}");
+    try sw1.addDocOrdinals(&.{ 7, 11 });
+    const seg1 = try sw1.build();
+    defer alloc.free(seg1);
+
+    var sw2 = SegmentWriter.init(alloc);
+    defer sw2.deinit();
+    try sw2.addStoredDoc("c", "{}");
+    try sw2.addDocOrdinals(&.{13});
+    const seg2 = try sw2.build();
+    defer alloc.free(seg2);
+
+    var reader1 = try SegmentReader.init(alloc, seg1);
+    defer reader1.deinit();
+    try std.testing.expectEqual(@as(?u32, 7), try reader1.docOrdinal(0));
+    try std.testing.expectEqual(@as(?u32, 11), try reader1.docOrdinal(1));
+
+    var reader2 = try SegmentReader.init(alloc, seg2);
+    defer reader2.deinit();
+    var deleted = roaring.RoaringBitmap.init(alloc);
+    defer deleted.deinit();
+    try deleted.add(0);
+
+    const merged = try mergeSegmentInputs(alloc, &.{
+        .{ .reader = &reader1, .deleted = deleted },
+        .{ .reader = &reader2 },
+    });
+    defer alloc.free(merged);
+
+    var merged_reader = try SegmentReader.init(alloc, merged);
+    defer merged_reader.deinit();
+    try std.testing.expectEqual(@as(u32, 2), merged_reader.doc_count);
+    try std.testing.expectEqual(@as(?u32, 11), try merged_reader.docOrdinal(0));
+    try std.testing.expectEqual(@as(?u32, 13), try merged_reader.docOrdinal(1));
 }
 
 test "multi-field segment" {

@@ -28,16 +28,43 @@ zig build regen-openapi
 
 Repo-local specs:
 
-- `openapi.yaml`: bundled public Antfly API spec
-- `pkg/antfly/src/metadata/openapi.yaml`: Antfly metadata/table API
-- `pkg/antfly/src/usermgr/openapi.yaml`: Antfly user-management API
-- `pkg/termite/src/api/openapi.yaml`: Termite public API
+- `../openapi.yaml`: bundled public Antfly and inference API spec
+- `../specs/openapi/antfly/metadata.yaml`: Antfly metadata/table API
+- `../specs/openapi/auth/api.yaml`: Antfly authentication/user-management API
+- `../specs/openapi/inference/api.yaml`: inference public API
+- `../specs/openapi/antfly/usermgr.yaml`: Antfly user-management API
+- `../specs/openapi/shared/generating.yaml`: shared provider-neutral generating/chat schemas
 - `specs/openai-openapi.yaml`: vendored OpenAI API schema used for types
 
 Some shared provider/config schemas are still read from the sibling
 `../antfly` checkout when regenerating. The checked-in generated Zig means a
 normal build does not need that sibling checkout, but `make generate` currently
 does.
+
+## Shared Generating Schemas
+
+Antfly services share provider-neutral generating and chat/message schemas from
+`../specs/openapi/shared/generating.yaml`. That spec owns the OpenAI-compatible
+message primitives used across Antfly inference and metadata APIs:
+
+- `ChatMessage`
+- `ChatMessageRole`
+- `ChatMessageContent`
+- `ContentPart`
+- `ToolCall`
+- `ToolCallFunction`
+
+Service specs should reference those schemas instead of redefining local chat
+message objects. The runtime can still use typed Zig structs/unions internally,
+but provider and public API boundaries should serialize to the shared
+OpenAI-compatible shape: `role`, optional string-or-content-parts `content`,
+assistant `tool_calls`, and tool-message `tool_call_id`.
+
+When adding a new shared generating primitive, update `specs/openapi/shared/generating.yaml`,
+then reference it from the owning service spec with an external `$ref`. If the
+reference is used by checked-in Zig generated code, add the matching
+`--import-mapping` in `zig/build.zig` and import the generated shared module
+into the dependent generated module.
 
 ## Generated Modules
 
@@ -47,10 +74,22 @@ Generated Antfly and shared API modules live under:
 pkg/antfly/src/openapi/generated/
 ```
 
-The generated Termite API module lives under:
+The generated inference API module lives under:
 
 ```text
-pkg/termite/src/api/generated/termite_api/
+pkg/inference/src/api/generated/inference_api/
+```
+
+The shared generating module is generated under:
+
+```text
+pkg/antfly/src/openapi/generated/antfly_generating_openapi/
+```
+
+The shared AI extraction module is generated under:
+
+```text
+pkg/antfly/src/openapi/generated/antfly_extraction_openapi/
 ```
 
 Generated files start with:
@@ -68,12 +107,12 @@ Top-level builds import generated modules directly from the checked-in
 directories. This avoids repeatedly converting YAML to JSON and running
 `openapi-zig` during normal builds.
 
-Standalone Termite builds also use the checked-in `termite_api` module by
+Standalone inference builds also use the checked-in `inference_api` module by
 default. For experiments, the old dynamic codegen path remains available:
 
 ```sh
-cd pkg/termite
-zig build -Dtermite-openapi-spec=src/api/openapi.yaml
+cd pkg/inference
+zig build -Dinference-openapi-spec=../../../specs/openapi/inference/api.yaml
 ```
 
 ## Updating An API
@@ -88,10 +127,10 @@ Useful checks:
 ```sh
 zig build root-test
 zig build openapi-root-check
-cd pkg/termite && zig build test
+cd pkg/inference && zig build test
 ```
 
-`openapi-root-check` verifies that the bundled `openapi.yaml` matches the
+`openapi-root-check` verifies that the root `openapi.yaml` matches the
 modular Antfly specs.
 
 ## Runtime Paths
@@ -99,14 +138,14 @@ modular Antfly specs.
 Antfly public APIs are served under:
 
 ```text
-/api/v1/*
+/db/v1/*
 ```
 
-Termite public APIs are served under:
+inference public APIs are served under:
 
 ```text
-/ml/v1/*
+/ai/v1/*
 ```
 
-Termite keeps `/embed` and `/embeddings` as aliases over the same
+Inference keeps `/embed` and `/embeddings` as aliases over the same
 `EmbedRequest` / `EmbedResponse` contract.

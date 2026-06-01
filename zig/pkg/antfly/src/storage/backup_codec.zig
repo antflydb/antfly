@@ -42,6 +42,7 @@ pub const BlockType = enum(u8) {
     chunk_batch = 0x14,
     edge_batch = 0x15,
     transaction_batch = 0x16,
+    doc_identity_batch = 0x17,
     shard_footer = 0xF0,
     file_footer = 0xFF,
     _,
@@ -89,6 +90,11 @@ pub const EdgeEntry = struct {
     source_key: []const u8,
     target_key: []const u8,
     edge_type: []const u8,
+    value: []const u8,
+};
+
+pub const KeyValueEntry = struct {
+    key: []const u8,
     value: []const u8,
 };
 
@@ -274,6 +280,63 @@ pub fn encodeDocumentBatch(alloc: Allocator, entries: []const DocumentEntry) ![]
     }
 
     return buf.toOwnedSlice(alloc);
+}
+
+pub fn encodeKeyValueBatch(alloc: Allocator, entries: []const KeyValueEntry) ![]u8 {
+    var buf: ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+
+    try appendU32LE(&buf, alloc, @intCast(entries.len));
+    for (entries) |e| {
+        try appendU32LE(&buf, alloc, @intCast(e.key.len));
+        try buf.appendSlice(alloc, e.key);
+        try appendU32LE(&buf, alloc, @intCast(e.value.len));
+        try buf.appendSlice(alloc, e.value);
+    }
+
+    return buf.toOwnedSlice(alloc);
+}
+
+pub fn decodeKeyValueBatch(alloc: Allocator, data: []const u8) ![]KeyValueEntry {
+    if (data.len < 4) return error.BatchTooShort;
+
+    const count = std.mem.readInt(u32, data[0..4], .little);
+    var off: usize = 4;
+
+    var entries = try ArrayList(KeyValueEntry).initCapacity(alloc, count);
+    errdefer {
+        for (entries.items) |e| {
+            alloc.free(e.key);
+            alloc.free(e.value);
+        }
+        entries.deinit(alloc);
+    }
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        if (off + 4 > data.len) return error.Truncated;
+        const key_len = std.mem.readInt(u32, data[off..][0..4], .little);
+        off += 4;
+
+        if (off + key_len > data.len) return error.Truncated;
+        const key = try alloc.dupe(u8, data[off..][0..key_len]);
+        off += key_len;
+
+        if (off + 4 > data.len) return error.Truncated;
+        const value_len = std.mem.readInt(u32, data[off..][0..4], .little);
+        off += 4;
+
+        if (off + value_len > data.len) return error.Truncated;
+        const value = try alloc.dupe(u8, data[off..][0..value_len]);
+        off += value_len;
+
+        try entries.append(alloc, .{
+            .key = key,
+            .value = value,
+        });
+    }
+
+    return entries.toOwnedSlice(alloc);
 }
 
 pub fn decodeDocumentBatch(alloc: Allocator, data: []const u8) ![]DocumentEntry {

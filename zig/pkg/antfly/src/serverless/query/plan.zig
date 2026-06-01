@@ -69,6 +69,8 @@ pub fn parseSearchPlanAlloc(
 ) !SearchPlan {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    if (queryBodyHasForbiddenDocIdentityControlFields(parsed.value.object)) return error.InvalidQueryRequest;
 
     if (public_search_request_mod.looksLikePublicSearchRequest(parsed.value)) {
         var public_parsed = parseOwnedPublicQueryRequestAlloc(alloc, body) catch return error.InvalidQueryRequest;
@@ -77,6 +79,23 @@ pub fn parseSearchPlanAlloc(
     }
 
     return try parseLegacySearchPlanAlloc(alloc, body, published_search_sources);
+}
+
+fn queryBodyHasForbiddenDocIdentityControlFields(object: std.json.ObjectMap) bool {
+    return object.get("identity_read_generation") != null or
+        object.get("allow_doc_identity_reassignment") != null or
+        object.get("_identity_read_generation") != null or
+        object.get("native_doc_id_constraints") != null or
+        object.get("_filter_doc_ids") != null or
+        object.get("_filter_doc_ids_positive") != null or
+        object.get("_exclude_doc_ids") != null;
+}
+
+fn rejectForbiddenDocIdentityControlFieldsAlloc(alloc: Allocator, body: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    if (queryBodyHasForbiddenDocIdentityControlFields(parsed.value.object)) return error.InvalidQueryRequest;
 }
 
 fn parseOwnedPublicQueryRequestAlloc(
@@ -351,6 +370,7 @@ fn validateSearchRequest(req: request.QueryRequest) !void {
 }
 
 pub fn parseGraphNeighborsPlanAlloc(alloc: Allocator, body: []const u8) !request.GraphNeighborsRequest {
+    try rejectForbiddenDocIdentityControlFieldsAlloc(alloc, body);
     const Parsed = struct {
         index_name: ?[]const u8 = null,
         doc_id: []const u8,
@@ -372,6 +392,7 @@ pub fn parseGraphNeighborsPlanAlloc(alloc: Allocator, body: []const u8) !request
 }
 
 pub fn parseGraphTraversePlanAlloc(alloc: Allocator, body: []const u8) !request.GraphTraverseRequest {
+    try rejectForbiddenDocIdentityControlFieldsAlloc(alloc, body);
     const Parsed = struct {
         index_name: ?[]const u8 = null,
         start_doc_id: []const u8,
@@ -397,6 +418,7 @@ pub fn parseGraphTraversePlanAlloc(alloc: Allocator, body: []const u8) !request.
 }
 
 pub fn parseGraphShortestPathPlanAlloc(alloc: Allocator, body: []const u8) !request.GraphShortestPathRequest {
+    try rejectForbiddenDocIdentityControlFieldsAlloc(alloc, body);
     const Parsed = struct {
         index_name: ?[]const u8 = null,
         start_doc_id: []const u8,
@@ -546,6 +568,49 @@ test "search plan accepts public dense embeddings map" {
     try std.testing.expectEqual(@as(usize, 1), plan.request.indexes.?.len);
     try std.testing.expectEqualStrings("serverless_chunk", plan.request.indexes.?[0]);
     try std.testing.expectEqualStrings("serverless_chunk", plan.vectorSource().?.index_name);
+}
+
+test "search plan rejects internal doc identity controls" {
+    const alloc = std.testing.allocator;
+    const sources = search_sources.defaultPublishedSearchSources();
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"embeddings\":{\"serverless_chunk\":[1.0,0.0,0.0]},\"identity_read_generation\":7}",
+        sources,
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"embeddings\":{\"serverless_chunk\":[1.0,0.0,0.0]},\"allow_doc_identity_reassignment\":true}",
+        sources,
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"text\":\"alpha\",\"_identity_read_generation\":7}",
+        sources,
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"text\":\"alpha\",\"native_doc_id_constraints\":{\"include_doc_ids\":[\"doc:a\"]}}",
+        sources,
+    ));
+}
+
+test "serverless graph plans reject internal doc identity controls" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphNeighborsPlanAlloc(
+        alloc,
+        "{\"doc_id\":\"doc:a\",\"identity_read_generation\":7}",
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphTraversePlanAlloc(
+        alloc,
+        "{\"start_doc_id\":\"doc:a\",\"allow_doc_identity_reassignment\":true}",
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphShortestPathPlanAlloc(
+        alloc,
+        "{\"start_doc_id\":\"doc:a\",\"end_doc_id\":\"doc:b\",\"native_doc_id_constraints\":{\"include_doc_ids\":[\"doc:a\"]}}",
+    ));
 }
 
 test "search plan preserves public search effort" {

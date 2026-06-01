@@ -21,7 +21,7 @@ import {
   SelectValue,
   Textarea,
 } from "@antfly/design-system";
-import { type EmbedResponse, TermiteClient } from "@antfly/termite-sdk";
+import { type EmbedResponse, InferenceClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ArrowDownUp,
@@ -104,7 +104,7 @@ function EmbeddingSparkline({
     <svg
       width={width}
       height={height}
-      className="shrink-0 rounded"
+      className="shrink-0 rounded-none"
       aria-label="Embedding vector preview"
     >
       <rect width={width} height={height} className="fill-muted/50" rx={2} />
@@ -152,7 +152,7 @@ function SimilarityBar({ score, maxScore }: { score: number; maxScore: number })
 }
 
 const EmbeddingPlaygroundPage: React.FC = () => {
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const [query, setQuery] = useState("");
   const [documents, setDocuments] = useState<string[]>([""]);
   const [selectedModel, setSelectedModel] = useState("");
@@ -167,16 +167,16 @@ const EmbeddingPlaygroundPage: React.FC = () => {
   const [showSparklines, setShowSparklines] = useState(true);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: termiteApiUrl }),
-    [termiteApiUrl]
+  const inferenceClient = useMemo(
+    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
+    [inferenceApiUrl]
   );
 
   // Fetch available embedder models
   useEffect(() => {
     const fetchModels = async () => {
       try {
-        const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/models`);
+        const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/models`);
         if (response.ok) {
           const data: ModelsResponse = await response.json();
           const embedders = Object.keys(data.embedders || {});
@@ -193,7 +193,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
       }
     };
     fetchModels();
-  }, [termiteApiUrl]);
+  }, [inferenceApiUrl]);
 
   const handleEmbed = async () => {
     const nonEmptyDocs = documents.filter((d) => d.trim());
@@ -227,9 +227,11 @@ const EmbeddingPlaygroundPage: React.FC = () => {
     try {
       // Embed query and all documents in one call
       const allTexts = [query, ...nonEmptyDocs];
-      const response: EmbedResponse = await termiteClient.embed(selectedModel, allTexts);
+      const response: EmbedResponse = await inferenceClient.embed(selectedModel, allTexts);
 
-      const embeddings = response.embeddings;
+      const embeddings = response.data
+        .map((item) => item.embedding)
+        .filter((embedding): embedding is number[] => Array.isArray(embedding));
       if (!embeddings || embeddings.length < 2) {
         throw new Error("No embeddings returned");
       }
@@ -256,7 +258,9 @@ const EmbeddingPlaygroundPage: React.FC = () => {
         return;
       }
       setError(
-        err instanceof Error ? err.message : `Failed to connect to Termite at ${termiteApiUrl}`
+        err instanceof Error
+          ? err.message
+          : `Failed to connect to Antfly inference at ${inferenceApiUrl}`
       );
     } finally {
       setIsLoading(false);
@@ -397,7 +401,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -487,7 +491,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
               <div className="max-h-[600px] overflow-y-auto space-y-3">
                 {/* Query embedding preview */}
                 {queryEmbedding && showSparklines && (
-                  <div className="p-3 bg-muted/30 rounded-lg border border-dashed space-y-2">
+                  <div className="p-3 bg-muted/30 rounded-none border border-dashed space-y-2">
                     <div className="flex items-center gap-2">
                       <span className="text-xs font-medium text-muted-foreground">
                         Query vector
@@ -498,7 +502,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
                 )}
 
                 {results.map((doc, rank) => (
-                  <div key={doc.index} className="p-3 bg-muted/30 rounded-lg border space-y-2">
+                  <div key={doc.index} className="p-3 bg-muted/30 rounded-none border space-y-2">
                     <div className="flex items-center gap-2">
                       <span className="flex items-center justify-center w-6 h-6 rounded-full bg-primary/10 text-primary text-xs font-bold shrink-0">
                         {rank + 1}

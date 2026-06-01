@@ -83,7 +83,7 @@ store, not metadata, and the partial-progress snapshot is also finalizer-local.
 ## How This Differs From Go
 
 Go’s top-level join flow in
-[api_join.go](/Users/ajroetker/go/src/github.com/antflydb/antfly/src/metadata/api_join.go)
+[api_join.go](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly/go/pkg/antfly/src/metadata/api_join.go)
 is simpler:
 
 1. run the primary query
@@ -180,14 +180,14 @@ The key is to avoid forcing all joins through the heavy path.
 
 ## File Boundaries
 
-- [json_helpers.zig](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/json_helpers.zig)
+- [json_helpers.zig](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/json_helpers.zig)
   is the generic JSON utility layer used by join code:
   - path extraction
   - clone/deinit
   - JSON equality
   - owned parse/object/path helpers
   - stringify/scalar conversion
-- [join_model.zig](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/join_model.zig)
+- [join_model.zig](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/join_model.zig)
   is the join-specific shared model/helper layer:
   - owned join result shells
   - response/profile shaping
@@ -195,7 +195,7 @@ The key is to avoid forcing all joins through the heavy path.
   - unmatched-right append/build logic
   - simple planner fallback logic
   - shared planner cost/threshold helpers
-- [distributed_join.zig](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/distributed_join.zig)
+- [distributed_join.zig](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/distributed_join.zig)
   owns the genuinely stateful layer:
   - shuffle selection
   - planned execution routing across index-lookup/shuffle/broadcast
@@ -217,7 +217,7 @@ yet a single shared join engine/planner module to center that name around.
 
 The next meaningful join work is no longer more helper extraction. The highest
 value is deeper runtime/engine work in
-[distributed_join.zig](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/distributed_join.zig),
+[distributed_join.zig](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/distributed_join.zig),
 ordered by operational payoff:
 
 1. Strengthen the local stateful shuffle engine boundary.
@@ -262,17 +262,17 @@ ordered by operational payoff:
 
 5. Keep the lane boundaries honest.
 - Prefer moving planner/result-shaping logic into
-  [join_model.zig](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/join_model.zig)
+  [join_model.zig](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/join_model.zig)
   only when the behavior is genuinely shared across lanes.
 - Keep
-  [distributed_join.zig](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/distributed_join.zig)
+  [distributed_join.zig](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/distributed_join.zig)
   focused on truly stateful concerns:
   - distributed shuffle orchestration
   - durable lifecycle
   - lease/handoff/retry behavior
 - Do not force arbitrary stored documents into fake static types. Keep that
   dynamic work behind
-  [json_helpers.zig](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/json_helpers.zig).
+  [json_helpers.zig](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/pkg/antfly/src/api/json_helpers.zig).
 
 ### Explicit Non-Goals
 

@@ -8,10 +8,7 @@ on:
       - 'CHANGELOG.md'
       - 'examples/**'
       - 'docs/**'
-      - 'src/common/openapi.yaml'
-      - 'pkg/operator/docs/**'
-      - 'pkg/termite/openapi.yaml'
-      - 'pkg/termite/registry/index.json'
+      - 'go/pkg/operator/docs/**'
 
 jobs:
   trigger:

@@ -141,6 +141,9 @@ pub const SearchRequest = struct {
     graph_searches: []const NamedGraphQuery = &.{},
     expand_strategy: graph_query.ExpandStrategy = .@"union",
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+    filter_doc_nums: []const u32 = &.{},
+    filter_doc_nums_positive: bool = false,
+    exclude_doc_nums: []const u32 = &.{},
 };
 
 pub const SearchQuery = union(enum) {
@@ -154,6 +157,7 @@ pub const SearchQuery = union(enum) {
     numeric_range: NumericRangeQuery,
     date_range: DateRangeQuery,
     doc_id: DocIdQuery,
+    doc_num: DocNumQuery,
     bool_field: BoolFieldQuery,
     geo_distance: GeoDistanceQuery,
     geo_bbox: GeoBBoxQuery,
@@ -267,6 +271,11 @@ pub const DateRangeQuery = struct {
 
 pub const DocIdQuery = struct {
     ids: []const []const u8,
+    boost: f32 = 1.0,
+};
+
+pub const DocNumQuery = struct {
+    ids: []const u32,
     boost: f32 = 1.0,
 };
 
@@ -450,6 +459,7 @@ pub fn execute(
         .numeric_range => |rq| try executeNumericRange(alloc, snap, rq, request),
         .date_range => |rq| try executeDateRange(alloc, snap, rq, request),
         .doc_id => |dq| try executeDocID(alloc, snap, dq, request),
+        .doc_num => |dq| try executeDocNum(alloc, snap, dq, request),
         .bool_field => |bq| try executeBoolField(alloc, snap, bq, request),
         .geo_distance => |gq| try executeGeoDistance(alloc, snap, gq, request),
         .geo_bbox => |gq| try executeGeoBBox(alloc, snap, gq, request),
@@ -880,6 +890,15 @@ fn executeDocID(
     return executeFilterQuery(alloc, snap, .{ .doc_id = .{ .doc_ids = dq.ids } }, request, dq.boost);
 }
 
+fn executeDocNum(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    dq: DocNumQuery,
+    request: SearchRequest,
+) !SearchResult {
+    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids } }, request, dq.boost);
+}
+
 fn executeBoolField(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
@@ -1221,6 +1240,9 @@ const FastTermState = struct {
 const FastTopK = struct {
     alloc: Allocator,
     k: u32,
+    filter_doc_nums: []const u32 = &.{},
+    filter_doc_nums_positive: bool = false,
+    exclude_doc_nums: []const u32 = &.{},
     hits: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty,
     total_count: u32 = 0,
 
@@ -1229,8 +1251,15 @@ const FastTopK = struct {
     }
 
     fn collect(self: *FastTopK, doc_id: u32, score: f32) !void {
+        if (!self.allows(doc_id)) return;
         self.total_count += 1;
         try scorer_mod.insertTopK(self.alloc, &self.hits, self.k, .{ .doc_id = doc_id, .score = score });
+    }
+
+    fn allows(self: *const FastTopK, doc_id: u32) bool {
+        if (self.filter_doc_nums_positive and !containsSortedU32(self.filter_doc_nums, doc_id)) return false;
+        if (containsSortedU32(self.exclude_doc_nums, doc_id)) return false;
+        return true;
     }
 
     fn finish(self: *FastTopK) ![]scorer_mod.ScoredHit {
@@ -1238,6 +1267,14 @@ const FastTopK = struct {
         return try self.alloc.dupe(scorer_mod.ScoredHit, self.hits.items);
     }
 };
+
+fn containsSortedU32(items: []const u32, value: u32) bool {
+    return std.sort.binarySearch(u32, items, value, compareU32) != null;
+}
+
+fn compareU32(expected: u32, item: u32) std.math.Order {
+    return std.math.order(expected, item);
+}
 
 fn appendSimpleTextTerms(alloc: Allocator, out: *std.ArrayListUnmanaged(SimpleTextTerm), query: SearchQuery) !bool {
     switch (query) {
@@ -1511,7 +1548,13 @@ fn executeSimpleTextBool(
         return .{ .alloc = alloc, .hits = try alloc.alloc(ScoredHit, 0), .total_hits = 0 };
     }
 
-    var collector = FastTopK{ .alloc = alloc, .k = effectiveK(request, snap) };
+    var collector = FastTopK{
+        .alloc = alloc,
+        .k = effectiveK(request, snap),
+        .filter_doc_nums = request.filter_doc_nums,
+        .filter_doc_nums_positive = request.filter_doc_nums_positive,
+        .exclude_doc_nums = request.exclude_doc_nums,
+    };
     defer collector.deinit();
 
     const avg_dl = snap.textAvgDocLen(text_field);
@@ -1657,7 +1700,7 @@ fn executeBool(
     return buildResult(alloc, snap, all_scored, @intCast(all_scored.len), .exact, request);
 }
 
-fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!query_mod.Filter {
+pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!query_mod.Filter {
     return switch (sq) {
         .match_none => .{ .match_none = {} },
         .match_all => .{ .match_all = {} },
@@ -1700,6 +1743,7 @@ fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!query_mo
             .inclusive_end = rq.inclusive_end,
         } },
         .doc_id => |dq| .{ .doc_id = .{ .doc_ids = dq.ids } },
+        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids } },
         .bool_field => |bq| .{ .bool_field = .{ .field = bq.field, .value = bq.value } },
         .geo_distance => |gq| .{ .geo_distance = .{
             .field = gq.field,
@@ -1845,6 +1889,11 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
         },
         .doc_id => |dq| .{
             .filter = .{ .doc_id = .{ .doc_ids = dq.ids } },
+            .duped_terms = &.{},
+            .filter_slice = &.{},
+        },
+        .doc_num => |dq| .{
+            .filter = .{ .doc_num = .{ .doc_nums = dq.ids } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },

@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { useTheme } from "@/components/theme-provider";
+import { getAntfarmRuntimeConfig } from "@/runtime-config";
 import type { TableSchema } from "../api";
 import {
   type BasicField,
@@ -74,7 +75,8 @@ export default function SearchBoxBuilder({
 
   // Get baseUrl from environment
   const baseUrl =
-    import.meta.env.MODE === "development" ? "http://localhost:8080/api/v1" : "/api/v1";
+    getAntfarmRuntimeConfig().apiUrl ??
+    (import.meta.env.MODE === "development" ? "http://localhost:8080/db/v1" : "/db/v1");
   const antflyUrl = `${baseUrl}/tables/${tableName}`;
 
   // Derive effective pagination: pagination is disabled when semantic search is enabled
@@ -322,7 +324,7 @@ export default function SearchBoxBuilder({
                   {/* Thumbnail */}
                   {useThumbnails && thumbnailField && (
                     <div
-                      className={`shrink-0 ${getThumbnailSizeClass()} bg-muted rounded overflow-hidden flex items-center justify-center`}
+                      className={`shrink-0 ${getThumbnailSizeClass()} bg-muted rounded-none overflow-hidden flex items-center justify-center`}
                     >
                       {thumbnailUrl ? (
                         <img
@@ -466,7 +468,7 @@ export default function SearchBoxBuilder({
                       useThumbnails && thumbnailField
                         ? `
                       {/* Thumbnail */}
-                      <div className="shrink-0 ${thumbnailSizeClass} bg-muted rounded overflow-hidden flex items-center justify-center">
+                      <div className="shrink-0 ${thumbnailSizeClass} bg-muted rounded-none overflow-hidden flex items-center justify-center">
                         {thumbnailUrl ? (
                           <img
                             src={String(thumbnailUrl)}
@@ -1324,7 +1326,7 @@ ${facetsCode}${resultsCode}
                         {facets.map((facet) => (
                           <div
                             key={facet.id}
-                            className="flex items-center justify-between p-2 border rounded"
+                            className="flex items-center justify-between p-2 border rounded-none"
                           >
                             <div>
                               <strong>{facet.title}</strong>

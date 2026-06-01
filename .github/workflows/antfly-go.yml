@@ -6,42 +6,22 @@ name: Go
 on:
   push:
     branches: ["main"]
-    paths-ignore:
-      - "*.md"
-      - "docs/**"
-      - "Dockerfile*"
-      - "zig/**"
-      - "ts/**"
-      - "py/**"
-      - "pkg/antfly-proxy/**"
-      - "pkg/operator/**"
-      - "pkg/termite-proxy/**"
-      - ".github/workflows/zig-*.yml"
-      - ".github/workflows/ts-*.yml"
-      - ".github/workflows/py-*.yml"
-      - ".github/workflows/antfly-operator-*.yml"
-      - ".github/workflows/antfly-proxy-*.yml"
-      - ".github/workflows/antfly-container.yml"
-      - ".github/workflows/trigger-docs-build.yml"
+    paths:
+      - "go/**"
+      - "Makefile"
+      - ".github/workflows/antfly-go.yml"
+      - "!go/Dockerfile*"
+      - "!go/pkg/operator/**"
+      - "!go/pkg/proxy/**"
   pull_request:
     branches: ["main"]
-    paths-ignore:
-      - "*.md"
-      - "docs/**"
-      - "Dockerfile*"
-      - "zig/**"
-      - "ts/**"
-      - "py/**"
-      - "pkg/antfly-proxy/**"
-      - "pkg/operator/**"
-      - "pkg/termite-proxy/**"
-      - ".github/workflows/zig-*.yml"
-      - ".github/workflows/ts-*.yml"
-      - ".github/workflows/py-*.yml"
-      - ".github/workflows/antfly-operator-*.yml"
-      - ".github/workflows/antfly-proxy-*.yml"
-      - ".github/workflows/antfly-container.yml"
-      - ".github/workflows/trigger-docs-build.yml"
+    paths:
+      - "go/**"
+      - "Makefile"
+      - ".github/workflows/antfly-go.yml"
+      - "!go/Dockerfile*"
+      - "!go/pkg/operator/**"
+      - "!go/pkg/proxy/**"
   workflow_dispatch:
 
 concurrency:
@@ -59,7 +39,9 @@ jobs:
     # Runs on heavy because the standard runner's 10Gi ephemeral cap was
     # being exhausted by go build + module cache + workspace + Pebble dbs
     # written during "Test swarm startup", leading to silent SIGTERM.
-    # Heavy provides /mnt/cache (50Gi PVC) for GOCACHE/GOMODCACHE.
+    # Heavy provides /mnt/cache (50Gi PVC) for GOCACHE/GOMODCACHE. Inference
+    # omni also runs here so regular Go CI and omni consume one heavy runner
+    # slot instead of two.
     runs-on: arc-antfly-heavy
     env:
       GOCACHE: /mnt/cache/go-build
@@ -70,12 +52,21 @@ jobs:
           set -eux
           mkdir -p "$GOCACHE" "$GOMODCACHE"
 
+      - name: Verify runner image
+        run: |
+          cat /etc/os-release
+          ldd --version
+          sudo -n true
+
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config git ca-certificates curl
 
       - uses: actions/checkout@v6
         with:
           submodules: true
+
+      - name: Configure Git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -83,25 +74,49 @@ jobs:
           go-version: "1.26"
           cache: false
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
       - name: Set Go experiment
-        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+        run: echo "GOEXPERIMENT=simd" >> "$GITHUB_ENV"
 
       - name: Verify Go version
         run: go version
 
       - name: Configure Go for private modules
         run: |
-          echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
-          echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
+          {
+            echo "GONOPROXY=github.com/antflydb/antfly"
+            echo "GOPRIVATE=github.com/antflydb/antfly"
+          } >> "$GITHUB_ENV"
 
       - name: Verify Go module tidiness
         run: make tidy-check
 
       - name: Verify Go modules
-        run: go mod download
+        run: cd go/pkg/antfly && GOWORK=off go mod download
+
+      - name: Verify generated OpenAPI clients
+        run: |
+          make build-docs
+          (cd go/pkg/sdk && GOWORK=off go generate ./...)
+          status="$(git status --porcelain -- \
+            openapi.yaml \
+            go/pkg/sdk/oapi/client.gen.go \
+            go/pkg/sdk/oapi/validate.go \
+            go/pkg/sdk/query/query.gen.go)"
+          if [ -n "$status" ]; then
+            echo "$status"
+            git diff -- \
+              openapi.yaml \
+              go/pkg/sdk/oapi/client.gen.go \
+              go/pkg/sdk/oapi/validate.go \
+              go/pkg/sdk/query/query.gen.go
+            exit 1
+          fi
 
       - name: Build Antfly
-        run: go build -v -o antfly ./cmd/antfly
+        run: cd go/pkg/antfly && GOWORK=off go build -v -o ../../../antfly ./cmd
 
       - name: Test swarm startup
         run: |
@@ -150,31 +165,84 @@ jobs:
         run: |
           packages=()
           while IFS= read -r pkg; do
-            if [ "$pkg" != "github.com/antflydb/antfly/src/sim" ]; then
+            if [ "$pkg" != "github.com/antflydb/antfly/go/pkg/antfly/src/sim" ]; then
               packages+=("$pkg")
             fi
-          done < <(go list ./...)
-          go test -v "${packages[@]}"
+          done < <(cd go/pkg/antfly && GOWORK=off go list ./...)
+          (cd go/pkg/antfly && GOWORK=off go test -v "${packages[@]}")
 
-      - name: Build termite (pure Go)
+      - name: Test SDK (pure Go)
         env:
           CGO_ENABLED: "0"
-        run: |
-          for mod in pkg/termite pkg/termite-client; do
-            (cd $mod && GOWORK=off go build -v ./...)
-          done
+        run: cd go/pkg/sdk && GOWORK=off go test -v ./...
 
-      - name: Test termite (pure Go)
+      - name: Build Go inference runtime (pure Go)
         env:
           CGO_ENABLED: "0"
+        run: cd go/pkg/termite && GOWORK=off go build -v ./...
+
+      - name: Test Go inference runtime (pure Go)
+        env:
+          CGO_ENABLED: "0"
+        run: cd go/pkg/termite && GOWORK=off go test -v ./...
+
+      - name: Download libtokenizers
         run: |
-          for mod in pkg/termite pkg/termite-client; do
-            (cd $mod && GOWORK=off go test -v ./...)
-          done
+          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "amd64")
+          curl -fsSL "https://github.com/daulet/tokenizers/releases/download/v${TOKENIZERS_VERSION}/libtokenizers.linux-${ARCH}.tar.gz" \
+            | sudo tar -xzf - -C /usr/local/lib
+          sudo ldconfig
+
+      - name: Download ONNX Runtime
+        run: |
+          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "aarch64" || echo "x64")
+          mkdir -p "$RUNNER_TEMP/onnxruntime"
+          curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-${ARCH}-${ONNXRUNTIME_VERSION}.tgz" \
+            | tar -xzf - --strip-components=1 -C "$RUNNER_TEMP/onnxruntime"
+          {
+            echo "CGO_CFLAGS=-I$RUNNER_TEMP/onnxruntime/include"
+            echo "CGO_LDFLAGS=-L$RUNNER_TEMP/onnxruntime/lib -lonnxruntime"
+            echo "LD_LIBRARY_PATH=$RUNNER_TEMP/onnxruntime/lib:/usr/local/lib"
+            echo "ORT_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/lib/libonnxruntime.so"
+          } >> "$GITHUB_ENV"
+
+      - name: Download ONNX Runtime GenAI
+        run: |
+          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "x64")
+          mkdir -p "$RUNNER_TEMP/onnxruntime-genai"
+          curl -fsSL "https://github.com/microsoft/onnxruntime-genai/releases/download/v${GENAI_VERSION}/onnxruntime-genai-${GENAI_VERSION}-linux-${ARCH}.tar.gz" \
+            | tar -xzf - --strip-components=1 -C "$RUNNER_TEMP/onnxruntime-genai"
+          cp "$RUNNER_TEMP/onnxruntime-genai/lib"/libonnxruntime-genai*.so* "$RUNNER_TEMP/onnxruntime/lib/" 2>/dev/null || true
+          echo "ORTGENAI_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/lib/libonnxruntime-genai.so" >> "$GITHUB_ENV"
+
+      - name: Download PJRT CPU plugin
+        run: |
+          sudo mkdir -p /usr/local/lib/go-xla
+          curl -fsSL "https://github.com/gomlx/pjrt-cpu-binaries/releases/download/v${PJRT_CPU_VERSION}/pjrt_cpu_linux_amd64.tar.gz" \
+            | sudo tar -xzf - -C /usr/local/lib/go-xla
+          sudo ldconfig
+          {
+            echo "LD_LIBRARY_PATH=/usr/local/lib/go-xla:$RUNNER_TEMP/onnxruntime/lib:/usr/local/lib"
+            echo "GOMLX_BACKEND=xla:cpu"
+          } >> "$GITHUB_ENV"
+
+      - name: Build Go inference runtime (omni)
+        env:
+          CGO_ENABLED: "1"
+        run: cd go/pkg/termite && GOWORK=off go build -v -tags="onnx,ORT,xla,XLA" ./...
+
+      - name: Test Go inference runtime (omni)
+        env:
+          CGO_ENABLED: "1"
+        run: cd go/pkg/termite && GOWORK=off go test -v -tags="onnx,ORT,xla,XLA" ./...
 
   sim-validate:
+    # Temporarily disabled while simulator coverage is migrated/stabilized.
+    # Keep the job definition here so it can be re-enabled without rebuilding
+    # the runner setup from scratch. Set either opt-in variable to true to run it.
+    if: ${{ vars.ENABLE_GO_SIM_CI == 'true' || vars.ENABLE_GO_SIM_VALIDATE == 'true' }}
     runs-on: arc-antfly-heavy
-    # sim-validate runs `go test ./src/sim` under a wrapper; on the 4-cpu
+    # sim-validate runs `go test ./go/pkg/antfly/src/sim` under a wrapper; on the 4-cpu
     # standard runner with no /mnt/cache, it tipped past the 10Gi ephemeral
     # cap (or hit some pod-level cancel) ~3:30 in. Move it to heavy where
     # GOCACHE/GOMODCACHE land on the 50Gi cache PVC and there's enough CPU
@@ -202,15 +270,17 @@ jobs:
           cache: false
 
       - name: Set Go experiment
-        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+        run: echo "GOEXPERIMENT=simd" >> "$GITHUB_ENV"
 
       - name: Configure Go for private modules
         run: |
-          echo "GONOPROXY=github.com/antflydb/antfly" >> $GITHUB_ENV
-          echo "GOPRIVATE=github.com/antflydb/antfly" >> $GITHUB_ENV
+          {
+            echo "GONOPROXY=github.com/antflydb/antfly"
+            echo "GOPRIVATE=github.com/antflydb/antfly"
+          } >> "$GITHUB_ENV"
 
       - name: Verify Go modules
-        run: go mod download
+        run: cd go/pkg/antfly && GOWORK=off go mod download
 
       - name: Simulator Validate
         run: make sim-validate
@@ -219,29 +289,30 @@ jobs:
     runs-on: arc-antfly-heavy
     needs: unit
     # The heavy profile mounts a 50Gi ephemeral PVC at /mnt/cache so large
-    # caches (Go build/module cache, HuggingFace downloads, Termite models)
+    # caches (Go build/module cache, HuggingFace downloads, inference models)
     # live outside the pod's 10Gi Autopilot ephemeral-storage allotment.
     env:
       GOCACHE: /mnt/cache/go-build
       GOMODCACHE: /mnt/cache/go-mod
       HF_HOME: /mnt/cache/huggingface
-      TERMITE_HOME: /mnt/cache/termite-home
+      ANTFLY_INFERENCE_HOME: /mnt/cache/antfly-inference-home
     steps:
       - name: Prepare cache directories
         run: |
           set -eux
-          mkdir -p "$GOCACHE" "$GOMODCACHE" "$HF_HOME" "$TERMITE_HOME"
+          mkdir -p "$GOCACHE" "$GOMODCACHE" "$HF_HOME" "$ANTFLY_INFERENCE_HOME"
           # HuggingFace downloader falls back to $HOME/.cache/huggingface;
           # symlink $HOME/.cache to the cache volume to keep the ~5Gi ONNX
           # downloads off the runner's 10Gi root ephemeral disk.
           mkdir -p /mnt/cache/home-cache
           rm -rf "$HOME/.cache"
           ln -sfn /mnt/cache/home-cache "$HOME/.cache"
-          # Termite copies final models into $HOME/.termite/models by
-          # default; redirect the whole $HOME/.termite onto the cache volume
+          # Antfly inference copies final models into $HOME/.antfly/inference/models by
+          # default; redirect that path onto the cache volume
           # so the copied payload lands there too.
-          rm -rf "$HOME/.termite"
-          ln -sfn "$TERMITE_HOME" "$HOME/.termite"
+          mkdir -p "$HOME/.antfly"
+          rm -rf "$HOME/.antfly/inference"
+          ln -sfn "$ANTFLY_INFERENCE_HOME" "$HOME/.antfly/inference"
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential
@@ -257,7 +328,7 @@ jobs:
           cache: false
 
       - name: Set Go experiment
-        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
+        run: echo "GOEXPERIMENT=simd" >> "$GITHUB_ENV"
 
       - name: Verify Go version
         run: go version
@@ -285,7 +356,7 @@ jobs:
           pg_isready -h 127.0.0.1 -U antfly -d antfly_test
 
       - name: Verify Go modules
-        run: go mod download
+        run: cd go/pkg/antfly && GOWORK=off go mod download
 
       - name: Disk usage before E2E
         run: |
@@ -299,99 +370,3 @@ jobs:
           ANTFLY_E2E_PG_DSN: postgres://antfly:antfly_dev@127.0.0.1:5432/antfly_test?sslmode=disable
         run: |
           make e2e E2E_TIMEOUT=45m
-
-  omni:
-    # Omni combines ONNX (CGO) and XLA (CGO) backends and needs GLIBC 2.38+.
-    # ARC's actions-runner image now runs on Ubuntu 24.04, so this can run
-    # directly on the heavy runner without a kubernetesMode job container.
-    runs-on: arc-antfly-heavy
-    env:
-      GOCACHE: /mnt/cache/go-build
-      GOMODCACHE: /mnt/cache/go-mod
-    steps:
-      - name: Prepare cache directories
-        run: |
-          set -eux
-          mkdir -p "$GOCACHE" "$GOMODCACHE"
-
-      - name: Verify runner image
-        run: |
-          cat /etc/os-release
-          ldd --version
-          sudo -n true
-
-      - name: Install container prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y git ca-certificates curl
-
-      - uses: actions/checkout@v6
-
-      - name: Configure Git safe directory
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: "1.26"
-          cache: false
-
-      - name: Set GOEXPERIMENT
-        run: echo "GOEXPERIMENT=simd" >> $GITHUB_ENV
-
-      - name: Verify Go version
-        run: go version
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config curl git ca-certificates
-
-      - name: Download libtokenizers
-        run: |
-          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "amd64")
-          curl -fsSL "https://github.com/daulet/tokenizers/releases/download/v${TOKENIZERS_VERSION}/libtokenizers.linux-${ARCH}.tar.gz" \
-            | sudo tar -xzf - -C /usr/local/lib
-          sudo ldconfig
-
-      - name: Download ONNX Runtime
-        run: |
-          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "aarch64" || echo "x64")
-          mkdir -p "$RUNNER_TEMP/onnxruntime"
-          curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-${ARCH}-${ONNXRUNTIME_VERSION}.tgz" \
-            | tar -xzf - --strip-components=1 -C "$RUNNER_TEMP/onnxruntime"
-          echo "CGO_CFLAGS=-I$RUNNER_TEMP/onnxruntime/include" >> $GITHUB_ENV
-          echo "CGO_LDFLAGS=-L$RUNNER_TEMP/onnxruntime/lib -lonnxruntime" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/onnxruntime/lib:/usr/local/lib" >> $GITHUB_ENV
-          echo "ORT_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/lib/libonnxruntime.so" >> $GITHUB_ENV
-
-      - name: Download ONNX Runtime GenAI
-        run: |
-          ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "arm64" || echo "x64")
-          mkdir -p "$RUNNER_TEMP/onnxruntime-genai"
-          curl -fsSL "https://github.com/microsoft/onnxruntime-genai/releases/download/v${GENAI_VERSION}/onnxruntime-genai-${GENAI_VERSION}-linux-${ARCH}.tar.gz" \
-            | tar -xzf - --strip-components=1 -C "$RUNNER_TEMP/onnxruntime-genai"
-          cp "$RUNNER_TEMP/onnxruntime-genai/lib"/libonnxruntime-genai*.so* "$RUNNER_TEMP/onnxruntime/lib/" 2>/dev/null || true
-          echo "ORTGENAI_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/lib/libonnxruntime-genai.so" >> $GITHUB_ENV
-
-      - name: Download PJRT CPU plugin
-        run: |
-          sudo mkdir -p /usr/local/lib/go-xla
-          curl -fsSL "https://github.com/gomlx/pjrt-cpu-binaries/releases/download/v${PJRT_CPU_VERSION}/pjrt_cpu_linux_amd64.tar.gz" \
-            | sudo tar -xzf - -C /usr/local/lib/go-xla
-          sudo ldconfig
-          echo "LD_LIBRARY_PATH=/usr/local/lib/go-xla:$RUNNER_TEMP/onnxruntime/lib:/usr/local/lib" >> $GITHUB_ENV
-          echo "GOMLX_BACKEND=xla:cpu" >> $GITHUB_ENV
-
-      - name: Download dependencies
-        run: cd pkg/termite && GOWORK=off go mod download
-
-      - name: Build termite (omni)
-        env:
-          CGO_ENABLED: "1"
-        run: cd pkg/termite && GOWORK=off go build -v -tags="onnx,ORT,xla,XLA" ./...
-
-      - name: Test termite (omni)
-        env:
-          CGO_ENABLED: "1"
-        run: cd pkg/termite && GOWORK=off go test -v -tags="onnx,ORT,xla,XLA" ./...

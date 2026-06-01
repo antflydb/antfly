@@ -702,9 +702,10 @@ else
     };
 
 const NativeStorageState = struct {
-    // Storage handles may be copied into background work. Keep the runtime and
-    // fd cache behind a ref-counted state so late operations never dereference a
-    // NativeStorage wrapper that backend close has already destroyed.
+    // Storage handles are copyable vtable values and do not have a destructor.
+    // Keep the runtime and fd cache behind a ref-counted state, and leave a
+    // closed tombstone behind after final release so stale copied handles fail
+    // with StorageClosed instead of dereferencing freed memory.
     allocator: Allocator,
     refs: std.atomic.Value(usize) = .init(1),
     closing: std.atomic.Value(bool) = .init(false),
@@ -713,15 +714,15 @@ const NativeStorageState = struct {
 
     fn create(allocator: Allocator, kind: RuntimeKind) !*NativeStorageState {
         if (kind != .threaded) return error.UnsupportedEventedIoRuntime;
-        const state = try allocator.create(NativeStorageState);
-        errdefer allocator.destroy(state);
-        var threaded = std.Io.Threaded.init(allocator, .{});
-        errdefer threaded.deinit();
-        state.* = .{
-            .allocator = allocator,
-            .threaded = threaded,
-            .fd_cache = FdCache.init(allocator),
-        };
+        const state = try std.heap.page_allocator.create(NativeStorageState);
+        errdefer std.heap.page_allocator.destroy(state);
+        state.* = undefined;
+        state.allocator = allocator;
+        state.refs = .init(1);
+        state.closing = .init(false);
+        state.threaded = std.Io.Threaded.init(allocator, .{});
+        errdefer state.threaded.deinit();
+        state.fd_cache = FdCache.init(allocator);
         return state;
     }
 
@@ -748,11 +749,9 @@ const NativeStorageState = struct {
 
     fn release(self: *NativeStorageState) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
-        const allocator = self.allocator;
         self.fd_cache.deinit();
         self.threaded.deinit();
-        self.* = undefined;
-        allocator.destroy(self);
+        self.refs.store(0, .release);
     }
 
     fn invalidatePath(self: *NativeStorageState, path: []const u8) void {
@@ -1490,9 +1489,10 @@ fn closeFd(fd: std.posix.fd_t) void {
 fn fileSizeFromFd(fd: std.posix.fd_t) !u64 {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
+        const empty_path: [*:0]const u8 = "";
         while (true) {
             var statx = std.mem.zeroes(linux.Statx);
-            switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &statx))) {
+            switch (linux.errno(linux.statx(fd, empty_path, linux.AT.EMPTY_PATH, .{ .SIZE = true }, &statx))) {
                 .SUCCESS => {
                     if (!statx.mask.SIZE) return error.Unexpected;
                     return statx.size;
@@ -1506,10 +1506,21 @@ fn fileSizeFromFd(fd: std.posix.fd_t) !u64 {
         while (true) {
             const rc = std.posix.system.fstat(fd, &stat);
             switch (std.posix.errno(rc)) {
-                .SUCCESS => return @bitCast(stat.size),
+                .SUCCESS => return @intCast(stat.size),
                 .INTR => continue,
                 else => |err| return posixStatError(err),
             }
+        }
+    }
+}
+
+fn seekFd(fd: std.posix.fd_t, offset: i64, whence: usize) !u64 {
+    while (true) {
+        const rc = std.posix.system.lseek(fd, offset, @intCast(whence));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => |err| return posixStatError(err),
         }
     }
 }
@@ -2118,6 +2129,26 @@ test "native atomic write sink supports patching and crc before finish" {
     const written = try native.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("hello world", written);
+}
+
+test "native copied storage handle fails closed after owner deinit" {
+    if (!supports_native_storage) return error.SkipZigTest;
+
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    const copied = native.storage();
+    const path = "/tmp/antfly-storage-closed-handle-file";
+    try native.storage().writeFileAbsolute(path, "hello");
+    native.deinit();
+
+    try std.testing.expectError(error.StorageClosed, copied.createDirPath("/tmp/antfly-storage-closed-handle"));
+    try std.testing.expectError(error.StorageClosed, copied.readFileAlloc(std.testing.allocator, path, 64));
+    try std.testing.expectError(error.StorageClosed, copied.fileSize(path));
+    try std.testing.expectError(error.StorageClosed, copied.readFileTrailerAlloc(std.testing.allocator, path, 2));
+    try std.testing.expectEqual(@as(u64, 0), copied.nowNs());
+
+    var cleanup_native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer cleanup_native.deinit();
+    cleanup_native.storage().deleteFileAbsolute(path) catch {};
 }
 
 test "native atomic write sink retains invalidation state past storage deinit" {

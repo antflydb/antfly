@@ -71,6 +71,16 @@ pub const State = struct {
         return out;
     }
 
+    pub fn ensureArenaAllocator(self: *State, allocator: Allocator) !Allocator {
+        if (self.arena_owner == null) {
+            const arena = try allocator.create(std.heap.ArenaAllocator);
+            errdefer allocator.destroy(arena);
+            arena.* = std.heap.ArenaAllocator.init(allocator);
+            self.arena_owner = arena;
+        }
+        return self.arena_owner.?.allocator();
+    }
+
     pub fn get(self: *const State, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
         const idx = self.findIndex(namespace, key) orelse return error.NotFound;
         const entry = self.entries.items[idx];
@@ -367,6 +377,24 @@ pub fn initEntry(
     };
 }
 
+pub fn initArenaEntry(
+    allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    value: []const u8,
+    tombstone: bool,
+) !OwnedEntry {
+    return .{
+        .namespace_name = if (namespace.name) |name| try allocator.dupe(u8, name) else null,
+        .namespace_from_arena = true,
+        .key = try allocator.dupe(u8, key),
+        .key_from_arena = true,
+        .value = try allocator.dupe(u8, value),
+        .value_from_arena = true,
+        .tombstone = tombstone,
+    };
+}
+
 pub fn namespaceOf(entry: OwnedEntry) backend_types.Namespace {
     return .{ .name = entry.namespace_name };
 }
@@ -391,7 +419,7 @@ pub fn applyState(target: *State, allocator: Allocator, source: anytype) !void {
 }
 
 pub fn sortStateEntries(state: *State) void {
-    std.mem.sort(OwnedEntry, state.entries.items, {}, struct {
+    std.sort.heap(OwnedEntry, state.entries.items, {}, struct {
         fn lessThan(_: void, a: OwnedEntry, b: OwnedEntry) bool {
             const namespace_order = compareNamespace(namespaceOf(a), namespaceOf(b));
             if (namespace_order != .eq) return namespace_order == .lt;
@@ -483,6 +511,13 @@ pub fn mergeStatesMove(
     older: *State,
     newer: *State,
 ) !State {
+    if (older.arena_owner != null or newer.arena_owner != null) {
+        const merged = try mergeStates(allocator, older, newer);
+        older.deinit(allocator);
+        newer.deinit(allocator);
+        return merged;
+    }
+
     var merged: State = .{};
 
     try merged.entries.ensureTotalCapacity(allocator, older.entries.items.len + newer.entries.items.len);
@@ -537,6 +572,14 @@ pub fn mergeStatesMove(
 
 pub fn applyStateMove(target: *State, allocator: Allocator, source: *State) !void {
     if (source.entries.items.len == 0) return;
+    if (source.arena_owner != null) {
+        for (source.entries.items) |entry| {
+            try target.upsert(allocator, namespaceOf(entry), entry.key, entry.value, entry.tombstone);
+        }
+        source.deinit(allocator);
+        return;
+    }
+
     try target.entries.ensureTotalCapacity(allocator, target.entries.items.len + source.entries.items.len);
 
     for (source.entries.items) |entry| {
@@ -593,6 +636,14 @@ pub fn applyMutableMoveToMutable(target: anytype, allocator: Allocator, source: 
 }
 
 fn applyStateMoveToActive(target: *ActiveMemTable, allocator: Allocator, source: *State) !void {
+    if (source.arena_owner != null) {
+        for (source.entries.items) |entry| {
+            try target.upsert(allocator, namespaceOf(entry), entry.key, entry.value, entry.tombstone);
+        }
+        source.deinit(allocator);
+        return;
+    }
+
     for (source.entries.items) |entry| {
         try target.upsertMove(allocator, entry);
     }
@@ -718,6 +769,44 @@ test "applyStateMove updates active mutable in place and consumes source" {
     try std.testing.expectEqualStrings("doc:c", target.entries.items[2].key);
     try std.testing.expectEqualStrings("C2", target.entries.items[2].value);
     try std.testing.expectEqualStrings("doc:d", target.entries.items[3].key);
+}
+
+test "applyStateMove copies arena backed source into active mutable" {
+    var target: ActiveMemTable = .{};
+    defer target.deinit(std.testing.allocator);
+
+    var source: State = .{};
+    const arena_allocator = try source.ensureArenaAllocator(std.testing.allocator);
+    try source.entries.append(std.testing.allocator, try initArenaEntry(arena_allocator, .{}, "doc:a", "A1", false));
+
+    try applyMutableMoveToMutable(&target, std.testing.allocator, &source);
+
+    try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), target.entries.items.len);
+    try std.testing.expect(!target.entries.items[0].key_from_arena);
+    try std.testing.expect(!target.entries.items[0].value_from_arena);
+    try std.testing.expectEqualStrings("A1", try target.get(.{}, "doc:a"));
+}
+
+test "mergeStatesMove clones arena backed inputs before consuming them" {
+    var older: State = .{};
+    const older_allocator = try older.ensureArenaAllocator(std.testing.allocator);
+    try older.entries.append(std.testing.allocator, try initArenaEntry(older_allocator, .{}, "doc:a", "A1", false));
+
+    var newer: State = .{};
+    const newer_allocator = try newer.ensureArenaAllocator(std.testing.allocator);
+    try newer.entries.append(std.testing.allocator, try initArenaEntry(newer_allocator, .{}, "doc:b", "B1", false));
+
+    var merged = try mergeStatesMove(std.testing.allocator, &older, &newer);
+    defer merged.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), older.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), newer.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), merged.entries.items.len);
+    try std.testing.expect(!merged.entries.items[0].key_from_arena);
+    try std.testing.expect(!merged.entries.items[1].value_from_arena);
+    try std.testing.expectEqualStrings("doc:a", merged.entries.items[0].key);
+    try std.testing.expectEqualStrings("doc:b", merged.entries.items[1].key);
 }
 
 test "ActiveMemTable overwrites by hash index and materializes sorted state" {

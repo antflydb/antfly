@@ -22,7 +22,7 @@ Usage:
 
     # Run stateful tests against an existing server:
     ANTFLY_STATEFUL_URL=http://127.0.0.1:8080 uv run --project e2e/antfly pytest e2e/antfly/test_schema_migration.py
-    # For Go Antfly, also set ANTFLY_STATEFUL_API_ROOT=/api/v1.
+    # For Go Antfly, also set ANTFLY_STATEFUL_API_ROOT=/db/v1.
 
     # Or start the local unified stateful entrypoint automatically:
     ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest e2e/antfly/test_schema_migration.py
@@ -49,9 +49,9 @@ import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
-ANTFLY_PUBLIC_API_ROOT = "/api/v1"
+ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
-TERMITE_PUBLIC_API_ROOT = "/ml/v1"
+INFERENCE_PUBLIC_API_ROOT = "/ai/v1"
 CLIPCLAP_MODEL = "antflydb/clipclap"
 CLIPCLAP_GGUF_FILES = (
     "clipclap-clip.Q4_K.gguf",
@@ -116,8 +116,8 @@ def antfly_internal_api_path(path: str) -> str:
     return prefixed_api_path(ANTFLY_INTERNAL_API_ROOT, path)
 
 
-def termite_public_api_url(base_url: str) -> str:
-    return with_api_root(base_url, TERMITE_PUBLIC_API_ROOT)
+def inference_public_api_url(base_url: str) -> str:
+    return with_api_root(base_url, INFERENCE_PUBLIC_API_ROOT)
 
 
 def find_free_port() -> int:
@@ -191,6 +191,8 @@ def ready_index_status(index_info: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if not isinstance(status, dict):
         return None
+    if status.get("materialization_blocked", False):
+        return None
     if status.get("rebuilding", status.get("backfill_active", False)):
         return None
     if status.get("dense_publish_pending", False):
@@ -199,6 +201,32 @@ def ready_index_status(index_info: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if status.get("catch_up_active", False):
         return None
+    return status
+
+
+def ready_serverless_build_status(status: dict[str, Any]) -> dict[str, Any] | None:
+    if status.get("head_version", 0) < 1 or status.get("published_wal_end_lsn", 0) < 1:
+        return None
+    pending_families = status.get("pending_materialization_families")
+    full_text_pending = isinstance(pending_families, dict) and pending_families.get("full_text", False)
+    chunk_preview_pending = isinstance(pending_families, dict) and pending_families.get("chunk_preview", False)
+    if full_text_pending:
+        return None
+    if status.get("next_publish_reason") is not None:
+        return None
+    for field in (
+        "full_text_index_actions",
+    ):
+        actions = status.get(field)
+        if not isinstance(actions, list):
+            continue
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            if action.get("action") == "rebuild":
+                return None
+            if action.get("chunked_source_count", 0) > 0 and chunk_preview_pending:
+                return None
     return status
 
 
@@ -232,6 +260,15 @@ def _read_log_tail(path: Path, *, limit: int = 20000) -> str:
     if len(data) <= limit:
         return data
     return data[-limit:]
+
+
+def _write_remote_content_e2e_config(root: Path) -> Path:
+    config_path = root / "antfly-e2e.json"
+    config_path.write_text(
+        json.dumps({"remote_content": {"security": {"block_private_ips": False}}}),
+        encoding="utf-8",
+    )
+    return config_path
 
 
 class AntflyServer:
@@ -337,6 +374,8 @@ def _serverless_swarm_command(binary: str, *, host: str, port: int, root: Path) 
             str(port),
             "--tick-ms",
             "5",
+            "--remote-content-block-private-ips",
+            "false",
         ]
     return [
         binary,
@@ -377,10 +416,14 @@ def _swarm_stateful_command(binary: str, *, host: str, port: int, root: Path) ->
     return [
         binary,
         "swarm",
+        "--config",
+        str(_write_remote_content_e2e_config(root)),
         "--host",
         host,
         "--port",
         str(port),
+        "--data-dir",
+        str(root),
         "--tick-ms",
         "5",
         "--replica-root-dir",
@@ -404,6 +447,8 @@ def _metadata_command(binary: str, *, host: str, raft_port: int, admin_port: int
         host,
         "--api-port",
         str(admin_port),
+        "--data-dir",
+        str(root),
         "--tick-ms",
         "5",
         "--replica-root-dir",
@@ -442,6 +487,8 @@ def _data_command(
         "2",
         "--store-id",
         "2",
+        "--data-dir",
+        str(root),
         "--tick-ms",
         "5",
         "--replica-root-dir",
@@ -649,7 +696,7 @@ class SwarmAntflyServer:
             self.tempdir.cleanup()
 
 
-class TermiteRerankerServer:
+class InferenceRerankerServer:
     def __init__(self, host: str = "127.0.0.1"):
         port = find_free_port()
         self.url = f"http://{host}:{port}"
@@ -692,7 +739,7 @@ class TermiteRerankerServer:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         if not wait_for_listener(self.url):
-            raise RuntimeError(f"Termite reranker server failed to start at {self.url}")
+            raise RuntimeError(f"Inference reranker server failed to start at {self.url}")
 
     def stop(self) -> None:
         self._server.shutdown()
@@ -700,7 +747,7 @@ class TermiteRerankerServer:
         self._thread.join(timeout=5)
 
 
-class TermiteGeneratorServer:
+class InferenceGeneratorServer:
     def __init__(self, host: str = "127.0.0.1"):
         port = find_free_port()
         self.url = f"http://{host}:{port}"
@@ -755,7 +802,7 @@ class TermiteGeneratorServer:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         if not wait_for_listener(self.url):
-            raise RuntimeError(f"Termite generator server failed to start at {self.url}")
+            raise RuntimeError(f"Inference generator server failed to start at {self.url}")
 
     def stop(self) -> None:
         self._server.shutdown()
@@ -1053,11 +1100,11 @@ class PacingSensitiveOpenAiEmbeddingServer:
         self._thread.join(timeout=5)
 
 
-class TermiteEmbeddingServer:
+class InferenceEmbeddingServer:
     def __init__(self, host: str = "127.0.0.1"):
         port = find_free_port()
         self.base_url = f"http://{host}:{port}"
-        self.url = termite_public_api_url(self.base_url)
+        self.url = inference_public_api_url(self.base_url)
 
         outer = self
 
@@ -1067,9 +1114,9 @@ class TermiteEmbeddingServer:
                 raw = self.rfile.read(content_length)
                 payload = json.loads(raw.decode("utf-8") or "{}")
 
-                if self.path in ("/chunk", "/api/chunk", f"{TERMITE_PUBLIC_API_ROOT}/chunk"):
+                if self.path in ("/chunk", "/api/chunk", f"{INFERENCE_PUBLIC_API_ROOT}/chunk"):
                     model = payload.get("config", {}).get("model")
-                    if model != "termite-chunker-v1":
+                    if model != "antfly-chunker-v1":
                         self.send_error(400)
                         return
                     input_value = payload.get("input", "")
@@ -1121,8 +1168,8 @@ class TermiteEmbeddingServer:
                     "/embed",
                     "/embeddings",
                     "/api/embed",
-                    f"{TERMITE_PUBLIC_API_ROOT}/embed",
-                    f"{TERMITE_PUBLIC_API_ROOT}/embeddings",
+                    f"{INFERENCE_PUBLIC_API_ROOT}/embed",
+                    f"{INFERENCE_PUBLIC_API_ROOT}/embeddings",
                 ):
                     model = payload.get("model", "")
                     input_value = payload.get("input", [])
@@ -1131,7 +1178,7 @@ class TermiteEmbeddingServer:
                     else:
                         values = [outer._vector_for_text(str(input_value))]
 
-                    if model == "termite-sparse-v1":
+                    if model == "antfly-sparse-v1":
                         data = [
                             {
                                 "object": "embedding",
@@ -1157,7 +1204,7 @@ class TermiteEmbeddingServer:
                         {
                             "object": "list",
                             "data": data,
-                            "model": model or "termite-embed-v1",
+                            "model": model or "antfly-embed-v1",
                             "usage": {
                                 "prompt_tokens": max(1, len(values)),
                                 "total_tokens": max(1, len(values)),
@@ -1183,7 +1230,7 @@ class TermiteEmbeddingServer:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         if not wait_for_listener(self.url):
-            raise RuntimeError(f"Termite embedding server failed to start at {self.url}")
+            raise RuntimeError(f"Inference embedding server failed to start at {self.url}")
 
     @staticmethod
     def _vector_for_text(text: str) -> list[float]:
@@ -1204,7 +1251,7 @@ class TermiteEmbeddingServer:
 
 def _models_dir() -> Path:
     home = os.environ.get("HOME")
-    return Path(home).expanduser() / ".termite" / "models" if home else Path("./models")
+    return Path(home).expanduser() / ".antfly" / "inference" / "models" if home else Path("./models")
 
 
 def _clipclap_model_dir() -> Path:
@@ -1327,8 +1374,15 @@ def serverless_api(serverless_runtime):
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self._check(self.s.delete(f"{self.url}/tables/{table_name}/indexes/{index_name}", timeout=10))
 
-        def build_table(self, table_name: str) -> dict:
-            return self.post(antfly_internal_api_path(f"/tables/{table_name}/build"), {})
+        def build_table(self, table_name: str, *, timeout_s: float = 10.0, interval_s: float = 0.1) -> dict:
+            deadline = time.monotonic() + timeout_s
+            while True:
+                try:
+                    return self.post(antfly_internal_api_path(f"/tables/{table_name}/build"), {})
+                except requests.HTTPError as exc:
+                    if exc.response is None or exc.response.status_code != 409 or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(interval_s)
 
         def table_build_status(self, table_name: str) -> dict:
             return self.get(antfly_internal_api_path(f"/tables/{table_name}/build-status"))
@@ -1383,15 +1437,15 @@ def serverless_api(serverless_runtime):
 
 
 @pytest.fixture(scope="function")
-def termite_reranker():
-    server = TermiteRerankerServer()
+def inference_reranker():
+    server = InferenceRerankerServer()
     yield server.url
     server.stop()
 
 
 @pytest.fixture(scope="function")
-def termite_generator():
-    server = TermiteGeneratorServer()
+def inference_generator():
+    server = InferenceGeneratorServer()
     yield server.url
     server.stop()
 
@@ -1430,8 +1484,8 @@ def strict_pacing_sensitive_openai_embedder():
 
 
 @pytest.fixture(scope="function")
-def termite_embedder():
-    server = TermiteEmbeddingServer()
+def inference_embedder():
+    server = InferenceEmbeddingServer()
     yield server.url
     server.stop()
 
@@ -1451,12 +1505,12 @@ def clipclap_model_available():
         pytest.skip(f"Antfly binary not found for model download: {binary}")
 
     subprocess.run(
-        [binary, "termite", "pull", "hf:antflydb/clipclap:gguf:Q4_K", "--tasks", "embed"],
+        [binary, "inference", "pull", "hf:antflydb/clipclap:gguf:Q4_K", "--tasks", "embed"],
         cwd=REPO_ROOT,
         check=True,
     )
     if not model_dir.exists():
-        raise RuntimeError(f"termite pull finished but did not create {model_dir}")
+        raise RuntimeError(f"antfly inference pull finished but did not create {model_dir}")
     if not _clipclap_gguf_available(model_dir):
         raise RuntimeError(f"ClipClap GGUF files are missing from {model_dir}")
     return model_dir
@@ -1641,12 +1695,12 @@ def stateful_api():
         def query_table(self, table_name: str, payload: dict) -> dict:
             return self.post(f"/tables/{table_name}/query", payload)
 
-        def termite_embed(self, model: str, text: str, *, timeout_s: float = 120.0) -> dict:
+        def inference_embed(self, model: str, text: str, *, timeout_s: float = 120.0) -> dict:
             base_url = self.url.removesuffix(ANTFLY_PUBLIC_API_ROOT)
             try:
                 with self._request_lock:
                     response = self.s.post(
-                        f"{base_url}{TERMITE_PUBLIC_API_ROOT}/embed",
+                        f"{base_url}{INFERENCE_PUBLIC_API_ROOT}/embed",
                         json={"model": model, "input": text},
                         timeout=timeout_s,
                     )
@@ -2092,12 +2146,12 @@ def backup_api():
         def query_table(self, table_name: str, payload: dict) -> dict:
             return self.post(f"/tables/{table_name}/query", payload)
 
-        def termite_embed(self, model: str, text: str, *, timeout_s: float = 120.0) -> dict:
+        def inference_embed(self, model: str, text: str, *, timeout_s: float = 120.0) -> dict:
             base_url = self.url.removesuffix(ANTFLY_PUBLIC_API_ROOT)
             try:
                 with self._request_lock:
                     response = self.s.post(
-                        f"{base_url}{TERMITE_PUBLIC_API_ROOT}/embed",
+                        f"{base_url}{INFERENCE_PUBLIC_API_ROOT}/embed",
                         json={"model": model, "input": text},
                         timeout=timeout_s,
                     )
@@ -2301,17 +2355,18 @@ def table_api(request):
         def publish_table(self, table_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict | None:
             if self.backend == "stateful":
                 return None
-            try:
-                self.raw.build_table(table_name)
-            except requests.HTTPError as exc:
-                assert exc.response is not None
-                if exc.response.status_code != 409:
-                    raise
             deadline = time.monotonic() + timeout_s
             while True:
+                try:
+                    self.raw.build_table(table_name)
+                except requests.HTTPError as exc:
+                    assert exc.response is not None
+                    if exc.response.status_code != 409:
+                        raise
                 status = self.raw.table_build_status(table_name)
-                if status.get("head_version", 0) >= 1 and status.get("published_wal_end_lsn", 0) >= 1:
-                    return status
+                ready = ready_serverless_build_status(status)
+                if ready is not None:
+                    return ready
                 if time.monotonic() >= deadline:
                     return None
                 time.sleep(interval_s)

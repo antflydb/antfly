@@ -23,7 +23,7 @@ import {
   Skeleton,
   Textarea,
 } from "@antfly/design-system";
-import { type Chunk, type ChunkResponse, TermiteClient } from "@antfly/termite-sdk";
+import { type ChunkResponse, InferenceClient } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { Clock, Database, Hash, RotateCcw, Scissors, Zap } from "lucide-react";
 import type React from "react";
@@ -46,9 +46,10 @@ interface ChunkConfig {
   threshold: number;
 }
 
-function isTextChunk(
-  chunk: Chunk
-): chunk is Chunk & { text: string; start_char: number; end_char: number } {
+type ChunkResult = ChunkResponse["data"][number];
+type TextChunkResult = ChunkResult & { text: string; start_char: number; end_char: number };
+
+function isTextChunk(chunk: ChunkResult): chunk is TextChunkResult {
   return "text" in chunk;
 }
 
@@ -123,7 +124,7 @@ The era of modern computing began with a flurry of development before and during
 };
 
 const ChunkingPlaygroundPage: React.FC = () => {
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -153,9 +154,9 @@ const ChunkingPlaygroundPage: React.FC = () => {
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const termiteClient = useMemo(
-    () => new TermiteClient({ baseUrl: termiteApiUrl }),
-    [termiteApiUrl]
+  const inferenceClient = useMemo(
+    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
+    [inferenceApiUrl]
   );
 
   // Persist state to localStorage
@@ -168,7 +169,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/ml/v1/models`, {
+        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -184,7 +185,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
       }
     })();
     return () => controller.abort();
-  }, [termiteApiUrl]);
+  }, [inferenceApiUrl]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
@@ -221,7 +222,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     try {
       const actualSeparator = config.separator.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
 
-      const data = await termiteClient.chunk(
+      const data = await inferenceClient.chunk(
         inputText,
         {
           model: config.model,
@@ -245,12 +246,12 @@ const ChunkingPlaygroundPage: React.FC = () => {
       setError(
         err instanceof Error
           ? err.message
-          : "Failed to connect to Termite. Make sure Termite is running."
+          : "Failed to connect to Antfly inference. Make sure the runtime is running."
       );
     } finally {
       setIsLoading(false);
     }
-  }, [inputText, config, termiteClient]);
+  }, [inputText, config, inferenceClient]);
 
   // Cmd+Enter shortcut
   useEffect(() => {
@@ -285,7 +286,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
 
   // Render text with chunk boundaries highlighted
   const renderHighlightedText = () => {
-    if (!result || result.chunks.length === 0) {
+    if (!result || result.data.length === 0) {
       return (
         <pre className="whitespace-pre-wrap text-sm text-muted-foreground font-mono">
           {inputText || "Enter text and click 'Chunk' to see results"}
@@ -296,7 +297,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     const elements: React.ReactNode[] = [];
     let lastEnd = 0;
 
-    result.chunks.forEach((chunk, index) => {
+    result.data.forEach((chunk, index) => {
       if (!isTextChunk(chunk)) return;
 
       // Add any text before this chunk (gaps)
@@ -312,7 +313,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
       elements.push(
         <span
           key={`chunk-${chunk.id}`}
-          className={`${CHUNK_COLORS[colorIndex]} rounded px-0.5 border`}
+          className={`${CHUNK_COLORS[colorIndex]} rounded-none px-0.5 border`}
           title={`Chunk ${chunk.id}`}
         >
           {inputText.slice(chunk.start_char, chunk.end_char)}
@@ -532,7 +533,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -542,7 +543,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           <Badge variant="secondary" className="gap-1.5">
             <Hash className="h-3 w-3" />
-            {result.chunks.length} chunks
+            {result.data.length} chunks
           </Badge>
           <Badge variant="secondary" className="gap-1.5">
             <Zap className="h-3 w-3" />
@@ -602,7 +603,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
             ) : result ? (
               <div className="h-100 overflow-y-auto space-y-4">
                 {/* Highlighted text view */}
-                <div className="p-3 bg-muted/50 rounded-lg border max-h-37.5 overflow-y-auto">
+                <div className="p-3 bg-muted/50 rounded-none border max-h-37.5 overflow-y-auto">
                   {renderHighlightedText()}
                 </div>
 
@@ -610,12 +611,12 @@ const ChunkingPlaygroundPage: React.FC = () => {
 
                 {/* Chunk list */}
                 <div className="space-y-3">
-                  {result.chunks.filter(isTextChunk).map((chunk, index) => {
+                  {result.data.filter(isTextChunk).map((chunk, index) => {
                     const colorIndex = index % CHUNK_COLORS.length;
                     return (
                       <div
                         key={chunk.id}
-                        className={`p-3 rounded-lg border ${CHUNK_COLORS[colorIndex]}`}
+                        className={`p-3 rounded-none border ${CHUNK_COLORS[colorIndex]}`}
                       >
                         <div className="flex items-center justify-between mb-2">
                           <span

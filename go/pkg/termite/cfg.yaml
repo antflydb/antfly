@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/oapi-codegen/oapi-codegen/HEAD/configuration-schema.json
+package: termite
+generate:
+  std-http-server: true
+  embedded-spec: true
+  models: true
+compatibility:
+  always-prefix-enum-values: true
+output: api.gen.go
+output-options:
+  # to make sure that all types are generated
+  skip-prune: true
+  prefer-skip-optional-pointer: true
+  prefer-skip-optional-pointer-with-omitzero: true
+import-mapping:
+  ../shared/chunking.yaml: github.com/antflydb/antfly/go/pkg/libaf/chunking
+  ../shared/generating.yaml: github.com/antflydb/antfly/go/pkg/generating
+  ../shared/logging.yaml: github.com/antflydb/antfly/go/pkg/libaf/logging
+  ../shared/s3.yaml: github.com/antflydb/antfly/go/pkg/libaf/s3
+  ../shared/scraping.yaml: github.com/antflydb/antfly/go/pkg/libaf/scraping

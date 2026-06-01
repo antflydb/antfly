@@ -152,6 +152,25 @@ pub const Backend = struct {
         immutable_flushes: u64 = 0,
         immutable_flush_entries: u64 = 0,
         immutable_flush_ns: u64 = 0,
+        bulk_append_attempts: u64 = 0,
+        bulk_append_entries: u64 = 0,
+        bulk_append_direct_successes: u64 = 0,
+        bulk_append_direct_entries: u64 = 0,
+        bulk_append_fallback_non_bulk: u64 = 0,
+        bulk_append_fallback_unsupported: u64 = 0,
+        bulk_append_fallback_backend_pending: u64 = 0,
+        bulk_append_fallback_duplicate_keys: u64 = 0,
+        bulk_append_fallback_below_threshold: u64 = 0,
+        bulk_append_fallback_to_mutable_entries: u64 = 0,
+        bulk_append_sort_ns: u64 = 0,
+        direct_bulk_ingest_attempts: u64 = 0,
+        direct_bulk_ingest_entries: u64 = 0,
+        direct_bulk_ingest_successes: u64 = 0,
+        direct_bulk_ingest_entries_direct: u64 = 0,
+        direct_bulk_ingest_fallback_unsupported: u64 = 0,
+        direct_bulk_ingest_fallback_backend_mutable: u64 = 0,
+        direct_bulk_ingest_fallback_below_threshold: u64 = 0,
+        direct_bulk_ingest_sort_ns: u64 = 0,
     };
 
     pub const MaintenanceStats = struct {
@@ -545,7 +564,13 @@ pub const Backend = struct {
     pub const BulkIngestFinishOptions = backend_types.BulkIngestFinishOptions;
 
     pub fn init(allocator: Allocator, options: Options) Backend {
-        return .{
+        var backend: Backend = undefined;
+        initInPlace(&backend, allocator, options);
+        return backend;
+    }
+
+    pub fn initInPlace(self: *Backend, allocator: Allocator, options: Options) void {
+        self.* = .{
             .allocator = allocator,
             .options = options,
             .root_generation = options.root_generation,
@@ -558,6 +583,10 @@ pub const Backend = struct {
 
     pub fn open(allocator: Allocator, root_dir: []const u8, options: Options) !Backend {
         return try recovery_mod.open(Backend, allocator, root_dir, options.backend, options);
+    }
+
+    pub fn openInto(self: *Backend, allocator: Allocator, root_dir: []const u8, options: Options) !void {
+        try recovery_mod.openInto(Backend, self, allocator, root_dir, options.backend, options);
     }
 
     pub fn close(self: *Backend) void {
@@ -896,7 +925,7 @@ pub const Backend = struct {
             self.write_stats.manifest_writes != before_manifest_writes;
     }
 
-    fn activeImmutableMemtableCount(self: *const Backend) usize {
+    pub fn activeImmutableMemtableCount(self: *const Backend) usize {
         std.debug.assert(self.immutable_head <= self.immutable_memtables.items.len);
         return self.immutable_memtables.items.len - self.immutable_head;
     }
@@ -1289,6 +1318,20 @@ pub const Backend = struct {
         var sorted = try self.mutable.toStateMove(self.allocator);
         errdefer sorted.deinit(self.allocator);
         self.mutable_wal_range = .{};
+        try self.ingestOwnedSortedState(&sorted);
+        sorted.deinit(self.allocator);
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+        return true;
+    }
+
+    pub fn drainMutableBeforeBulkAppendDirectIngest(self: *Backend) !bool {
+        if (!self.options.direct_bulk_ingest) return false;
+        if (self.mutable.entries.items.len == 0) return true;
+        if (self.activeImmutableMemtableCount() != 0) return false;
+        self.invalidateMutableReadSnapshot();
+        var sorted = try self.mutable.toStateMove(self.allocator);
+        errdefer sorted.deinit(self.allocator);
+        self.mutable_wal_range = .{};
         try self.ingestSortedState(&sorted);
         sorted.deinit(self.allocator);
         self.syncTrackedInMemoryStateUsageCurrentLocked();
@@ -1614,6 +1657,45 @@ pub const Backend = struct {
         try self.ingestSortedTableEntries(entries);
     }
 
+    pub fn ingestOwnedSortedState(self: *Backend, state: *State) !void {
+        if (self.options.backend.read_only) return error.ReadOnly;
+        if (state.entries.items.len == 0) return;
+        if (self.root_dir != null) {
+            try self.ingestSortedState(state);
+            return;
+        }
+
+        if (self.mutable.entries.items.len > 0) {
+            try self.flushMutable();
+        }
+
+        const start_ns = self.writeStatsNowNs();
+        const target_bytes = @max(@as(usize, 1), @min(self.options.max_run_file_bytes, lsm_table_file.max_entry_data_len));
+        var new_runs: std.ArrayListUnmanaged(Run) = .empty;
+        if (state.arena_owner != null and estimateStateBytes(state) <= target_bytes) {
+            var moved = state.*;
+            state.* = .{};
+            errdefer moved.deinit(self.allocator);
+            try new_runs.ensureUnusedCapacity(self.allocator, 1);
+            const run = try compaction_mod.makeRun(Backend, self, moved);
+            new_runs.appendAssumeCapacity(run);
+        } else if (state.arena_owner != null) {
+            try self.ingestSortedState(state);
+            return;
+        } else {
+            new_runs = try compaction_mod.makeRuns(Backend, self, state);
+        }
+        errdefer {
+            for (new_runs.items) |*run| run.deinit(self.allocator);
+            new_runs.deinit(self.allocator);
+        }
+
+        self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
+        try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+
+        compaction_mod.sortRuns(self.runs.items);
+    }
+
     pub fn shouldDirectIngestBulkState(self: *const Backend, state: *const State) bool {
         if (!self.options.direct_bulk_ingest) return false;
         if (self.activeImmutableMemtableCount() != 0) return false;
@@ -1793,6 +1875,67 @@ pub const Backend = struct {
                 self.recordTableCompressionWriteStats(run.compression_stats);
             }
         }
+    }
+
+    pub fn recordBulkAppendAttempt(self: *Backend, entries: usize) void {
+        self.write_stats.bulk_append_attempts +|= 1;
+        self.write_stats.bulk_append_entries +|= @intCast(entries);
+    }
+
+    pub fn recordBulkAppendFallbackNonBulk(self: *Backend, entries: usize) void {
+        self.write_stats.bulk_append_fallback_non_bulk +|= 1;
+        self.write_stats.bulk_append_fallback_to_mutable_entries +|= @intCast(entries);
+    }
+
+    pub fn recordBulkAppendFallbackUnsupported(self: *Backend, entries: usize) void {
+        self.write_stats.bulk_append_fallback_unsupported +|= 1;
+        self.write_stats.bulk_append_fallback_to_mutable_entries +|= @intCast(entries);
+    }
+
+    pub fn recordBulkAppendFallbackBackendPending(self: *Backend, entries: usize) void {
+        self.write_stats.bulk_append_fallback_backend_pending +|= 1;
+        self.write_stats.bulk_append_fallback_to_mutable_entries +|= @intCast(entries);
+    }
+
+    pub fn recordBulkAppendFallbackDuplicateKeys(self: *Backend, entries: usize, sort_ns: u64) void {
+        self.write_stats.bulk_append_fallback_duplicate_keys +|= 1;
+        self.write_stats.bulk_append_fallback_to_mutable_entries +|= @intCast(entries);
+        self.write_stats.bulk_append_sort_ns +|= sort_ns;
+    }
+
+    pub fn recordBulkAppendFallbackBelowThreshold(self: *Backend, entries: usize, sort_ns: u64) void {
+        self.write_stats.bulk_append_fallback_below_threshold +|= 1;
+        self.write_stats.bulk_append_fallback_to_mutable_entries +|= @intCast(entries);
+        self.write_stats.bulk_append_sort_ns +|= sort_ns;
+    }
+
+    pub fn recordBulkAppendSuccess(self: *Backend, entries: usize, sort_ns: u64) void {
+        self.write_stats.bulk_append_direct_successes +|= 1;
+        self.write_stats.bulk_append_direct_entries +|= @intCast(entries);
+        self.write_stats.bulk_append_sort_ns +|= sort_ns;
+    }
+
+    pub fn recordDirectBulkIngestAttempt(self: *Backend, entries: usize) void {
+        self.write_stats.direct_bulk_ingest_attempts +|= 1;
+        self.write_stats.direct_bulk_ingest_entries +|= @intCast(entries);
+    }
+
+    pub fn recordDirectBulkIngestFallbackUnsupported(self: *Backend) void {
+        self.write_stats.direct_bulk_ingest_fallback_unsupported +|= 1;
+    }
+
+    pub fn recordDirectBulkIngestFallbackBackendMutable(self: *Backend) void {
+        self.write_stats.direct_bulk_ingest_fallback_backend_mutable +|= 1;
+    }
+
+    pub fn recordDirectBulkIngestFallbackBelowThreshold(self: *Backend) void {
+        self.write_stats.direct_bulk_ingest_fallback_below_threshold +|= 1;
+    }
+
+    pub fn recordDirectBulkIngestSuccess(self: *Backend, entries: usize, sort_ns: u64) void {
+        self.write_stats.direct_bulk_ingest_successes +|= 1;
+        self.write_stats.direct_bulk_ingest_entries_direct +|= @intCast(entries);
+        self.write_stats.direct_bulk_ingest_sort_ns +|= sort_ns;
     }
 
     fn recordTableCompressionWriteStats(self: *Backend, stats: lsm_table_file.CompressionStats) void {
@@ -2617,7 +2760,7 @@ pub const BackendHandle = struct {
     pub fn open(allocator: Allocator, root_dir: []const u8, options: Options) !BackendHandle {
         const backend = try allocator.create(Backend);
         errdefer allocator.destroy(backend);
-        backend.* = try Backend.open(allocator, root_dir, options);
+        try backend.openInto(allocator, root_dir, options);
         return .{
             .allocator = allocator,
             .backend = backend,
@@ -6247,7 +6390,7 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
         defer runtime.deinit();
 
-        var txn = try runtime.beginProbe();
+        var txn = try runtime.beginRead();
         defer txn.abort();
 
         const keys = [_][]const u8{ "doc:002", "doc:003", "doc:004", "doc:005" };

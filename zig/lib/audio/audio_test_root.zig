@@ -13,18 +13,18 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite_audio = @import("termite_audio");
+const inference_audio = @import("inference_audio");
 
 const noise_stereo_aac_44k_tns_bytes = @embedFile("testdata/codec-corpus/noise-stereo-44k-tns.aac");
 
 test {
-    std.testing.refAllDecls(termite_audio);
+    std.testing.refAllDecls(inference_audio);
 }
 
 test "zig mp3 backend decodes l3-he_mode smoke vector" {
     const fixture = @embedFile("testdata/mp3-corpus/l3-he_mode.bit");
 
-    const decoded = try termite_audio.mp3.zig_backend.decodeMono(std.testing.allocator, fixture);
+    const decoded = try inference_audio.mp3.zig_backend.decodeMono(std.testing.allocator, fixture);
     defer std.testing.allocator.free(decoded.samples);
 
     try std.testing.expectEqual(@as(u32, 44100), decoded.sample_rate);
@@ -32,7 +32,7 @@ test "zig mp3 backend decodes l3-he_mode smoke vector" {
 }
 
 test "zig aac backend decodes low-bitrate stereo tns cpe fixture" {
-    var decoded = try termite_audio.aac.decodeInterleavedStereoAdtsAlloc(std.testing.allocator, noise_stereo_aac_44k_tns_bytes);
+    var decoded = try inference_audio.aac.decodeInterleavedStereoAdtsAlloc(std.testing.allocator, noise_stereo_aac_44k_tns_bytes);
     defer decoded.deinit();
 
     try std.testing.expectEqual(@as(u32, 44100), decoded.sample_rate);

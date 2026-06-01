@@ -16,12 +16,14 @@
 //
 // Provides a provider-neutral interface for ML inference (embeddings,
 // chat/generation, reranking) with implementations for:
-//   - Termite (local ONNX inference, binary embedding format)
+//   - Local inference (ONNX inference, binary embedding format)
 //   - OpenAI (also works with Ollama, vLLM, and any OpenAI-compatible API)
 
 pub const types = @import("types.zig");
-pub const termite = @import("termite.zig");
+pub const bedrock = @import("bedrock.zig");
+pub const local = @import("local.zig");
 pub const openai = @import("openai.zig");
+pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
 
 pub const Embedder = types.Embedder;
@@ -33,12 +35,30 @@ pub const GenerateResult = types.GenerateResult;
 pub const RerankResult = types.RerankResult;
 pub const ChatMessage = types.ChatMessage;
 pub const Role = types.Role;
+pub const ContentPart = types.ContentPart;
 
 test "inference module compiles" {
     _ = types;
-    _ = termite;
+    _ = bedrock;
+    _ = local;
     _ = openai;
+    _ = vertex;
     _ = managed_embedder;
+}
+
+test "bedrock provider request helpers" {
+    try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();
+    try bedrock.testTitanMultimodalBodyCombinesTextAndRejectsMultipleImages();
+    try bedrock.testTitanMultimodalBodyAcceptsDataUriAndRejectsRemoteUrl();
+    try bedrock.testCohereV4BodyUsesBedrockImageUrlDataUri();
+    try bedrock.testCohereV4BodyAcceptsDataUriAndRejectsRemoteUrl();
+    try bedrock.testSharedCredentialsProfileParser();
+    try bedrock.testMetadataCredentialParsers();
+    try bedrock.testCredentialUrlEncoding();
+    try bedrock.testRequestShapeBatchesByProviderRequest();
+    try bedrock.testBedrockInvokePathEscapesModelId();
+    try bedrock.testBedrockSignerUsesBedrockServiceScope();
+    try bedrock.testEndpointHostIncludesExplicitPort();
 }
 
 test "managed embedder resolves file-backed api key rotation at request time" {

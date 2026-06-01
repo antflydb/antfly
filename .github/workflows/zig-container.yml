@@ -6,15 +6,101 @@ on:
       - "zig/v*"
 
 env:
-  GCP_REGION: us-east5
+  GCP_REGION: us-central1
   GCP_PROJECT: antfly-image-artifacts
-  GCP_REPOSITORY: antfly-labs
-  GAR_REGISTRY: us-east5-docker.pkg.dev
-  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-east5/workerPools/antfly-container-builders
+  GCP_REPOSITORY: containers
+  GAR_REGISTRY: us-central1-docker.pkg.dev
+  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
+  ZIG_ARTIFACT_BUCKET: antfly-image-artifacts-zig-build-artifacts
+  ZIG_VERSION: 0.16.0
 
 jobs:
+  build-artifact:
+    name: Build ${{ matrix.arch }} artifact
+    runs-on: ${{ matrix.runner }}
+    environment: container-publish
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: arc-antfly-publish
+            zig_arch: x86_64
+            zig_target: x86_64-linux-musl
+          - arch: arm64
+            runner: arc-antfly-publish-arm64
+            zig_arch: aarch64
+            zig_target: aarch64-linux-musl
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Verify runner architecture
+        run: |
+          case "$(uname -m)" in
+            x86_64) actual=amd64 ;;
+            aarch64) actual=arm64 ;;
+            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          if [[ "$actual" != "${{ matrix.arch }}" ]]; then
+            echo "expected ${{ matrix.arch }} runner, got ${actual}" >&2
+            exit 1
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates
+
+      - name: Install Zig
+        run: |
+          curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_arch }}-linux-${ZIG_VERSION}.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Build runtime artifact
+        run: |
+          CACHE_ROOT="$RUNNER_TEMP/zig-cache"
+          if [ -d /mnt/cache ] && [ -w /mnt/cache ]; then
+            CACHE_ROOT=/mnt/cache/zig
+          fi
+          mkdir -p "$CACHE_ROOT/global" "$RUNNER_TEMP/zig-out"
+          cd zig
+          zig build \
+            -Dtarget="${{ matrix.zig_target }}" \
+            -Doptimize=ReleaseFast \
+            -Dedition=full \
+            install \
+            --prefix "$RUNNER_TEMP/zig-out" \
+            --global-cache-dir "$CACHE_ROOT/global"
+          test -x "$RUNNER_TEMP/zig-out/bin/antfly"
+          tar -C "$RUNNER_TEMP/zig-out" -czf "$RUNNER_TEMP/antfly-zig-${{ matrix.arch }}.tar.gz" bin share
+
+      - name: Upload runtime artifact to GCS
+        run: |
+          gsutil cp \
+            "$RUNNER_TEMP/antfly-zig-${{ matrix.arch }}.tar.gz" \
+            "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${{ matrix.arch }}.tar.gz"
+
   publish:
     runs-on: arc-antfly-publish
+    needs: build-artifact
     environment: container-publish
     permissions:
       contents: read
@@ -44,7 +130,33 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Extracted version: ${VERSION}"
 
-      - name: Build and push GAR image with Cloud Build
+      - name: Package GAR images with Cloud Build
+        run: |
+          submit_cloud_build() {
+            local attempt sleep_seconds
+            for attempt in 1 2 3; do
+              if gcloud builds submit "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                return 1
+              fi
+              sleep_seconds=$((attempt * 15))
+              echo "gcloud builds submit failed; retrying in ${sleep_seconds}s"
+              sleep "${sleep_seconds}"
+            done
+          }
+          VERSION="${{ steps.version.outputs.version }}"
+          for arch in amd64 arm64; do
+            submit_cloud_build . \
+              --project="${GCP_PROJECT}" \
+              --region="${GCP_REGION}" \
+              --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
+              --config=zig/cloudbuild.runtime.yaml \
+              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=zig-${VERSION}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
+          done
+
+      - name: Create GAR multi-arch manifest with Cloud Build
         run: |
           submit_cloud_build() {
             local attempt sleep_seconds
@@ -65,12 +177,12 @@ jobs:
           if [[ "$VERSION" == *-* ]]; then
             ALIAS_TAG=__skip_alias__
           fi
-          submit_cloud_build zig \
+          submit_cloud_build . \
             --project="${GCP_PROJECT}" \
             --region="${GCP_REGION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
-            --config=zig/cloudbuild.yaml \
-            --substitutions="_IMAGE_NAME=antfly,_DOCKERFILE=Dockerfile,_CONTEXT=.,_ALIAS_TAG=${ALIAS_TAG},_VERSION_TAG=zig-${VERSION},_CACHE_TAG=zig-buildcache,_DESCRIPTION=AntflyDB Zig runtime image"
+            --config=zig/cloudbuild.manifest.yaml \
+            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=zig-${VERSION},_ALIAS_TAG=${ALIAS_TAG},_AMD64_TAG=zig-${VERSION}-amd64,_ARM64_TAG=zig-${VERSION}-arm64"
 
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4

@@ -9,7 +9,7 @@ function Tabs({ className, ...props }: React.ComponentProps<typeof TabsPrimitive
   return (
     <TabsPrimitive.Root
       data-slot="tabs"
-      className={cn("flex flex-col gap-2", className)}
+      className={cn("flex flex-col gap-4", className)}
       {...props}
     />
   );
@@ -19,7 +19,11 @@ function TabsList({ className, ...props }: React.ComponentProps<typeof TabsPrimi
   return (
     <TabsPrimitive.List
       data-slot="tabs-list"
-      className={cn("inline-flex h-fit w-fit items-center justify-center gap-2", className)}
+      // the rail — chassis line that runs under the triggers
+      className={cn(
+        "inline-flex items-end gap-0 border-b-[1.5px] border-border-strong",
+        className
+      )}
       {...props}
     />
   );
@@ -30,7 +34,19 @@ function TabsTrigger({ className, ...props }: React.ComponentProps<typeof TabsPr
     <TabsPrimitive.Trigger
       data-slot="tabs-trigger"
       className={cn(
-        "inline-flex h-[38px] items-center justify-center gap-2 rounded-[calc(var(--radius)-2px)] bg-transparent px-4 py-2 text-sm font-medium text-muted-foreground transition-all hover:bg-primary/10 hover:text-primary focus-visible:ring-ring/50 focus-visible:ring-[3px] focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50 data-[state=active]:bg-primary/10 data-[state=active]:text-primary [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        // mono kicker voice — matches the prototype's nav .eyebrow treatment
+        "font-mono uppercase tracking-[0.1em] text-[11px] font-medium",
+        "inline-flex items-center justify-center gap-2 px-3 py-[10px]",
+        // overlap the rail: the trigger's bottom border sits ON the list's border
+        "-mb-[1.5px] border-b-[1.5px] border-transparent",
+        "text-muted-foreground transition-colors",
+        "hover:text-foreground",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30",
+        "disabled:pointer-events-none disabled:opacity-50",
+        // active: amber underline + foreground text
+        "data-[state=active]:text-foreground data-[state=active]:border-amber-500",
+        "[&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        "[&_svg:not([class*='text-'])]:text-muted-foreground data-[state=active]:[&_svg:not([class*='text-'])]:text-foreground",
         className
       )}
       {...props}

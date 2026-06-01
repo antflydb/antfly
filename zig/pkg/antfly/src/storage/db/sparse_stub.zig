@@ -14,7 +14,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const backend_types = @import("../backend_types.zig");
 const lsm_backend = @import("../lsm_backend/mod.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 
 pub const SparseVector = struct {
     indices: []const u32,
@@ -24,16 +26,20 @@ pub const SparseVector = struct {
 pub const SparseWrite = struct {
     doc_id: []const u8,
     vec: SparseVector,
+    doc_num: ?u32 = null,
 };
 
 pub const SearchResult = struct {
     doc_id: []u8,
+    doc_num: ?u32 = null,
     score: f32,
 };
 
 pub const SearchConstraints = struct {
     filter_doc_ids: []const []const u8 = &.{},
     exclude_doc_ids: []const []const u8 = &.{},
+    filter_doc_nums: []const u32 = &.{},
+    exclude_doc_nums: []const u32 = &.{},
 };
 
 pub const SplitRebuildResult = struct {
@@ -70,14 +76,71 @@ pub const SparseBackend = enum {
 
 pub const BatchOptions = struct {
     defer_term_range_updates: bool = false,
+    backend_batch_options: backend_types.BatchOptions = .{},
+    prefer_bulk_build: bool = false,
+    assume_new_doc_ids: bool = false,
+};
+
+pub const WriteProfile = struct {
+    batch_calls: u64 = 0,
+    incremental_calls: u64 = 0,
+    bulk_append_calls: u64 = 0,
+    bulk_append_fallbacks: u64 = 0,
+    writes: u64 = 0,
+    deletes: u64 = 0,
+    postings: u64 = 0,
+    terms: u64 = 0,
+    reserve_ns: u64 = 0,
+    dedupe_ns: u64 = 0,
+    existence_check_ns: u64 = 0,
+    doc_num_ns: u64 = 0,
+    fwd_rev_put_ns: u64 = 0,
+    posting_collect_ns: u64 = 0,
+    posting_sort_ns: u64 = 0,
+    posting_write_ns: u64 = 0,
+    chunk_read_ns: u64 = 0,
+    chunk_encode_ns: u64 = 0,
+    chunk_put_ns: u64 = 0,
+    range_meta_encode_ns: u64 = 0,
+    range_meta_put_ns: u64 = 0,
+    term_meta_ns: u64 = 0,
+    commit_ns: u64 = 0,
+    incremental_delete_ns: u64 = 0,
+    incremental_insert_ns: u64 = 0,
+    incremental_refresh_ns: u64 = 0,
+    incremental_commit_ns: u64 = 0,
+
+    pub fn delta(after: WriteProfile, before: WriteProfile) WriteProfile {
+        _ = after;
+        _ = before;
+        return .{};
+    }
 };
 
 pub const SparseIndex = struct {
     next_doc_num: u64 = 0,
+    chunk_size: u32 = 1024,
 
     pub const Stats = struct {
         doc_count: u64 = 0,
         term_count: u64 = 0,
+    };
+
+    pub const SegmentCompactionOptions = struct {
+        min_segments: usize = 32,
+        max_segments: usize = 128,
+    };
+
+    pub const SegmentCompactionTask = struct {
+        pub fn deinit(self: *SegmentCompactionTask, _: Allocator) void {
+            self.* = undefined;
+        }
+    };
+
+    pub const SegmentCompactionResult = struct {
+        pub fn deinit(self: *SegmentCompactionResult, _: Allocator) void {
+            self.* = undefined;
+        }
     };
 
     pub fn open(_: Allocator, _: [*:0]const u8, _: SparseIndexOptions) !SparseIndex {
@@ -92,8 +155,32 @@ pub const SparseIndex = struct {
         return error.UnsupportedPlatform;
     }
 
+    pub fn attachResourceManager(_: *SparseIndex, _: *resource_manager_mod.ResourceManager) void {}
+
+    pub fn getWriteProfile(_: *SparseIndex) WriteProfile {
+        return .{};
+    }
+
+    pub fn beginBulkIngestSession(_: *SparseIndex) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn finishBulkIngestSessionWithOptions(_: *SparseIndex, _: backend_types.BulkIngestFinishOptions) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn abortBulkIngestSession(_: *SparseIndex) void {}
+
     pub fn stats(_: *SparseIndex) Stats {
         return .{};
+    }
+
+    pub fn refreshPersistedStatsFromScan(_: *SparseIndex) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn persistBackfillDocCount(_: *SparseIndex, _: u64) !void {
+        return error.UnsupportedPlatform;
     }
 
     pub fn batch(_: *SparseIndex, _: []const SparseWrite, _: []const []const u8) !void {
@@ -104,11 +191,27 @@ pub const SparseIndex = struct {
         return error.UnsupportedPlatform;
     }
 
+    pub fn beginSegmentCompactionTask(_: *SparseIndex, _: Allocator, _: SegmentCompactionOptions) !?SegmentCompactionTask {
+        return null;
+    }
+
+    pub fn executeSegmentCompactionTask(_: Allocator, _: *const SegmentCompactionTask, _: u32) !SegmentCompactionResult {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn finishSegmentCompactionTask(_: *SparseIndex, _: *const SegmentCompactionTask, _: *SegmentCompactionResult) !bool {
+        return error.UnsupportedPlatform;
+    }
+
     pub fn search(_: *SparseIndex, _: Allocator, _: *const SparseVector, _: u32) ![]SearchResult {
         return error.UnsupportedPlatform;
     }
 
     pub fn searchConstrained(_: *SparseIndex, _: Allocator, _: *const SparseVector, _: u32, _: SearchConstraints) ![]SearchResult {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn debugDocNumForDocId(_: *SparseIndex, _: []const u8) !?u32 {
         return error.UnsupportedPlatform;
     }
 

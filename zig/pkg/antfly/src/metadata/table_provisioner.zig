@@ -29,12 +29,14 @@ const tables_api = @import("../api/tables.zig");
 const raft_mod = @import("../raft/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const shard_db_adapter_mod = @import("shard_db_adapter.zig");
+const doc_identity = @import("../storage/db/doc_identity.zig");
 
 pub const ProvisionSummary = struct {
     groups_considered: usize = 0,
     dbs_opened: usize = 0,
     indexes_added: usize = 0,
     indexes_removed: usize = 0,
+    enrichments_added: usize = 0,
 };
 
 pub const ReconcileReplicaRootOptions = struct {
@@ -166,6 +168,7 @@ pub fn reconcileReplicaRootWithOptions(
         const index_summary = try reconcileDbIndexes(alloc, &db, table.indexes_json);
         summary.indexes_removed += index_summary.indexes_removed;
         summary.indexes_added += index_summary.indexes_added;
+        summary.enrichments_added += index_summary.enrichments_added;
     }
     return summary;
 }
@@ -185,8 +188,9 @@ pub fn reconcileDbIndexes(
     indexes_json: []const u8,
 ) !ProvisionSummary {
     const removed = try removeMissingIndexes(alloc, db, indexes_json);
+    const enrichments_added = try ensureEnrichments(alloc, db, indexes_json);
     const added = try ensureIndexes(alloc, db, indexes_json);
-    if (added > 0 or removed > 0) {
+    if (added > 0 or removed > 0 or enrichments_added > 0) {
         const pending = db.pendingWorkStats();
         if (pending.enrichment.error_count == 0) {
             try db.core.index_manager.syncAll(false);
@@ -197,6 +201,7 @@ pub fn reconcileDbIndexes(
         .dbs_opened = 0,
         .indexes_added = added,
         .indexes_removed = removed,
+        .enrichments_added = enrichments_added,
     };
 }
 
@@ -375,7 +380,7 @@ pub fn collectLocalRestoreProgress(
     return try out.toOwnedSlice(alloc);
 }
 
-fn applyRestoreIntentIfNeeded(
+pub fn applyRestoreIntentIfNeeded(
     alloc: std.mem.Allocator,
     path: []const u8,
     group_id: u64,
@@ -383,11 +388,18 @@ fn applyRestoreIntentIfNeeded(
     range: table_manager.RangeRecord,
 ) !void {
     const restore = resolveRestoreIntent(range, table) orelse return;
-    try backup_restore.applyRestoreSnapshotToPath(alloc, path, group_id, .{
+    try backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
         .backup_id = restore.backup_id,
         .location = restore.location,
         .snapshot_path = restore.snapshot_path,
-    }, table.name);
+    }, .{
+        .expected_table_name = table.name,
+        .expected_identity_namespace = doc_identity.Namespace{
+            .table_id = table.table_id,
+            .shard_id = table_manager.rangeDocIdentityShardId(range),
+            .range_id = table_manager.rangeDocIdentityRangeId(range),
+        },
+    });
 }
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -459,6 +471,71 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
         added += 1;
     }
     return added;
+}
+
+fn ensureEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !usize {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+
+    var desired = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
+    defer {
+        for (desired.items) |*cfg| cfg.deinit(alloc);
+        desired.deinit(alloc);
+    }
+    try collectDesiredEnrichments(alloc, parsed.value, &desired);
+
+    if (desired.items.len == 0) return 0;
+
+    const existing = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, existing);
+
+    var added: usize = 0;
+    for (desired.items) |cfg| {
+        if (enrichmentExists(existing, cfg.kind, cfg.name)) continue;
+        try db.addEnrichment(cfg);
+        added += 1;
+    }
+    return added;
+}
+
+fn collectDesiredEnrichments(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
+) !void {
+    switch (value) {
+        .object => |object| {
+            if (object.get("enrichments")) |enrichments| {
+                if (enrichments == .array) {
+                    for (enrichments.array.items) |item| {
+                        if (item != .object) continue;
+                        const parsed = try std.json.parseFromValue(db_mod.types.EnrichmentConfig, alloc, item, .{
+                            .allocate = .alloc_always,
+                            .ignore_unknown_fields = true,
+                        });
+                        errdefer parsed.deinit();
+                        try out.append(alloc, parsed.value);
+                    }
+                }
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                try collectDesiredEnrichments(alloc, entry.value_ptr.*, out);
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| try collectDesiredEnrichments(alloc, item, out);
+        },
+        else => {},
+    }
+}
+
+fn enrichmentExists(existing: []const db_mod.types.EnrichmentConfig, kind: db_mod.types.EnrichmentKind, name: []const u8) bool {
+    for (existing) |cfg| {
+        if (cfg.kind == kind and std.mem.eql(u8, cfg.name, name)) return true;
+    }
+    return false;
 }
 
 fn localRangeHasSchemaVersionIndex(
@@ -764,7 +841,14 @@ test "table provisioner restores local shard data from metadata restore intent" 
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), source_db_path) catch {};
 
-    var source_db = try db_mod.DB.open(std.testing.allocator, source_db_path, .{});
+    const restore_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 2001,
+        .range_id = 2001,
+    };
+    var source_db = try db_mod.DB.open(std.testing.allocator, source_db_path, .{
+        .identity_namespace = restore_namespace,
+    });
     defer {
         source_db.close();
         std.Io.Dir.cwd().deleteTree(io_impl.io(), source_db_path) catch {};
@@ -900,6 +984,100 @@ test "table provisioner restores local shard data from metadata restore intent" 
     defer scan.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, scan.ndjson, "\"doc:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, scan.ndjson, "\"alpha\"") != null);
+}
+
+test "table provisioner restore rejects mismatched doc identity namespace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/table-provisioner-restore-docid-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/table-provisioner-restore-docid-backup", .{tmp.sub_path});
+    defer std.testing.allocator.free(backup_root);
+    const source_db_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/table-provisioner-restore-docid-source", .{tmp.sub_path});
+    defer std.testing.allocator.free(source_db_path);
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), source_db_path) catch {};
+    defer {
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), source_db_path) catch {};
+    }
+
+    const source_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 2001, .range_id = 97001 };
+    {
+        var source_db = try db_mod.DB.open(std.testing.allocator, source_db_path, .{
+            .identity_namespace = source_namespace,
+        });
+        defer source_db.close();
+        try source_db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .timestamp_ns = 1,
+            .sync_level = .full_index,
+        });
+        _ = try source_db.snapshot("snap1-g2001");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, "{s}.snapshots/snap1-g2001", .{source_db_path});
+    defer std.testing.allocator.free(snapshot_root);
+    const dest_root = try backups_api.shardSnapshotPath(std.testing.allocator, backup_root, "snap1", 2001);
+    defer std.testing.allocator.free(dest_root);
+    try backups_api.copyDirectoryRecursive(std.testing.allocator, snapshot_root, dest_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, backup_root });
+    defer std.testing.allocator.free(backup_root_abs);
+    const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
+    defer std.testing.allocator.free(restore_location);
+
+    const manifest = try backups_api.createManifest(
+        std.testing.allocator,
+        "snap1",
+        &.{
+            .table_id = 7,
+            .name = "docs",
+            .description = "docs table",
+            .indexes_json = tables_api.default_indexes_json,
+            .placement_role = "data",
+        },
+        &.{.{
+            .group_id = 2001,
+            .start_key = "doc:a",
+            .end_key = null,
+            .snapshot_path = "snap1/groups/2001",
+        }},
+    );
+    defer {
+        var owned = manifest;
+        owned.deinit(std.testing.allocator);
+    }
+    try backups_api.writeManifest(std.testing.allocator, backup_root, &manifest);
+
+    try std.testing.expectError(error.IdentityNamespaceMismatch, reconcileReplicaRoot(
+        std.testing.allocator,
+        replica_root,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = tables_api.default_indexes_json,
+            .restore_backup_id = "snap1",
+            .restore_location = restore_location,
+            .placement_role = "data",
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 7,
+            .start_key = "doc:a",
+            .end_key = null,
+            .range_id = 2001,
+        }},
+    ));
 }
 
 test "table provisioner removes indexes missing from metadata" {

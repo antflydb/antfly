@@ -22,9 +22,13 @@ const schema_api = @import("../../schema/mod.zig");
 const runtime_schema = @import("../schema.zig");
 const types = @import("types.zig");
 
+pub const schema_less_exact_field_suffix = ".keyword";
+pub const schema_less_exact_max_bytes: usize = 1024;
+
 pub const MapperDoc = struct {
     key: []const u8,
     value: []const u8,
+    doc_ordinal: ?u32 = null,
 };
 
 pub const SparseVectorData = struct {
@@ -44,7 +48,6 @@ pub const ExtractedWrite = struct {
     mentioned_graph_indexes: [][]u8,
     dense_embeddings: []DenseEmbeddingWrite,
     sparse_embeddings: []SparseEmbeddingWrite,
-    summaries: []SummaryWrite,
 
     pub fn deinit(self: *ExtractedWrite, alloc: Allocator) void {
         if (self.cleaned_value) |value| alloc.free(value);
@@ -73,12 +76,6 @@ pub const ExtractedWrite = struct {
             if (embedding.values.len > 0) alloc.free(embedding.values);
         }
         if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
-        for (self.summaries) |summary| {
-            alloc.free(summary.index_name);
-            alloc.free(summary.doc_key);
-            alloc.free(summary.text);
-        }
-        if (self.summaries.len > 0) alloc.free(self.summaries);
         self.* = undefined;
     }
 };
@@ -86,6 +83,7 @@ pub const ExtractedWrite = struct {
 pub const DenseEmbeddingWrite = struct {
     index_name: []u8,
     doc_key: []u8,
+    parent_doc_key: ?[]const u8 = null,
     artifact_key: ?[]u8 = null,
     vector: []f32,
 };
@@ -96,12 +94,6 @@ pub const SparseEmbeddingWrite = struct {
     artifact_key: ?[]u8 = null,
     indices: []u32,
     values: []f32,
-};
-
-pub const SummaryWrite = struct {
-    index_name: []u8,
-    doc_key: []u8,
-    text: []u8,
 };
 
 pub const ObservedFieldAnalyzer = struct {
@@ -128,6 +120,7 @@ pub const default_text_segment_target_bytes: usize = 256 * 1024 * 1024;
 
 pub const BuildTextSegmentsOptions = struct {
     target_segment_bytes: usize = default_text_segment_target_bytes,
+    profile: ?*introducer_mod.BuildTextProfile = null,
 };
 
 pub const BuildTextSegmentsResult = struct {
@@ -158,6 +151,9 @@ pub const TextProjectionSourceDoc = struct {
     root: std.json.Value,
     stored_data: []const u8,
     typed_source: ?std.json.Value,
+    doc_ordinal: ?u32 = null,
+    schema_less_text_fields: []const introducer_mod.TextField = &.{},
+    schema_less_fast_projection: bool = false,
 };
 
 pub const TextProjectionSourceBatch = struct {
@@ -167,12 +163,14 @@ pub const TextProjectionSourceBatch = struct {
 pub const TextProjectionOptions = struct {
     vector_field_paths: []const []const u8 = &.{},
     strip_numeric_array_heuristic: bool = true,
+    schema_less_fast_projection: bool = false,
 };
 
 const ExtractedTextFields = struct {
-    fields: []introducer_mod.TextField,
+    fields: []const introducer_mod.TextField,
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    typed_fields: ?[]const introducer_mod.TypedFieldValue = null,
 };
 
 pub fn buildTextSegmentFromDocuments(
@@ -249,7 +247,9 @@ pub fn buildTextProjectionBatch(
     schema: ?runtime_schema.TableSchema,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
 ) !TextProjectionBatch {
-    const source = try buildTextProjectionSourceBatch(arena, docs);
+    const source = try buildTextProjectionSourceBatchWithOptions(arena, docs, .{
+        .schema_less_fast_projection = schema == null,
+    });
     return try buildTextProjectionBatchFromSource(arena, source.docs, text_analysis, schema, observed_field_analyzers);
 }
 
@@ -269,7 +269,7 @@ pub fn buildTextProjectionSourceBatchWithOptions(
     defer source_docs.deinit(arena);
 
     for (docs) |doc| {
-        try appendTextProjectionSourceDoc(arena, &source_docs, doc.key, doc.value, opts);
+        try appendTextProjectionSourceDoc(arena, &source_docs, doc.key, doc.value, doc.doc_ordinal, opts);
     }
 
     return .{
@@ -293,7 +293,7 @@ pub fn buildTextProjectionSourceBatchFromWritesWithOptions(
     defer source_docs.deinit(arena);
 
     for (writes) |write| {
-        try appendTextProjectionSourceDoc(arena, &source_docs, write.key, write.value, opts);
+        try appendTextProjectionSourceDoc(arena, &source_docs, write.key, write.value, null, opts);
     }
 
     return .{
@@ -306,8 +306,22 @@ fn appendTextProjectionSourceDoc(
     source_docs: *std.ArrayListUnmanaged(TextProjectionSourceDoc),
     key: []const u8,
     value: []const u8,
+    doc_ordinal: ?u32,
     opts: TextProjectionOptions,
 ) !void {
+    if (opts.schema_less_fast_projection and canUseSchemaLessRawTextFastPath(value, opts)) {
+        try source_docs.append(arena, .{
+            .key = key,
+            .root = .null,
+            .stored_data = value,
+            .typed_source = null,
+            .doc_ordinal = doc_ordinal,
+            .schema_less_text_fields = try extractStringFieldsNoSchemaRaw(arena, value, opts),
+            .schema_less_fast_projection = true,
+        });
+        return;
+    }
+
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, value, .{});
     const root = parsed.value;
     const stored_projection = try fullTextStoredProjection(arena, root, value, opts);
@@ -316,6 +330,7 @@ fn appendTextProjectionSourceDoc(
         .root = root,
         .stored_data = stored_projection.stored_data,
         .typed_source = stored_projection.typed_source,
+        .doc_ordinal = doc_ordinal,
     });
 }
 
@@ -330,23 +345,22 @@ pub fn buildTextProjectionBatchFromSource(
     defer text_docs.deinit(arena);
 
     for (source_docs) |doc| {
-        const root = doc.root;
-        const extracted = try extractTextFieldsFromValue(arena, root, text_analysis, schema, observed_field_analyzers);
+        const extraction_root = doc.typed_source orelse doc.root;
+        const extracted = if (schema == null and doc.schema_less_fast_projection)
+            ExtractedTextFields{ .fields = doc.schema_less_text_fields }
+        else
+            try extractTextFieldsFromValue(arena, extraction_root, text_analysis, schema, observed_field_analyzers);
         if (extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0) continue;
 
         try text_docs.append(arena, .{
             .id = doc.key,
             .stored_data = doc.stored_data,
+            .doc_ordinal = doc.doc_ordinal,
             .text_fields = extracted.fields,
             .recursive_typed_fields = extracted.recursive_typed_fields,
             .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,
-            .typed_fields = if (doc.typed_source) |typed_source|
-                try introducer_mod.collectTypedFieldProjection(arena, typed_source, text_analysis, .{
-                    .recursive_typed_fields = extracted.recursive_typed_fields,
-                    .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,
-                })
-            else
-                &.{},
+            .typed_fields = extracted.typed_fields orelse if (doc.typed_source == null) &.{} else null,
+            .typed_source = if (extracted.typed_fields == null) doc.typed_source else null,
         });
     }
 
@@ -362,7 +376,19 @@ pub fn buildTextSegmentFromProjectionBatch(
     text_analysis: introducer_mod.TextAnalysisConfig,
 ) !?[]u8 {
     if (projection_batch.docs.len == 0) return null;
-    return try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, projection_batch.docs, &analysis_mod.default_analyzer, text_analysis, .{});
+    return try buildTextSegmentFromProjectionBatchWithProfile(alloc, projection_batch, text_analysis, null);
+}
+
+fn buildTextSegmentFromProjectionBatchWithProfile(
+    alloc: Allocator,
+    projection_batch: TextProjectionBatch,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    profile: ?*introducer_mod.BuildTextProfile,
+) !?[]u8 {
+    if (projection_batch.docs.len == 0) return null;
+    return try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, projection_batch.docs, &analysis_mod.default_analyzer, text_analysis, .{
+        .profile = profile,
+    });
 }
 
 pub fn buildTextSegmentsFromProjectionBatch(
@@ -387,7 +413,7 @@ pub fn buildTextSegmentsFromProjectionBatch(
             .docs = projection_batch.docs[start..end],
             .observed_field_analyzers = &.{},
         };
-        if (try buildTextSegmentFromProjectionBatch(alloc, chunk, text_analysis)) |segment| {
+        if (try buildTextSegmentFromProjectionBatchWithProfile(alloc, chunk, text_analysis, options.profile)) |segment| {
             try segments.append(alloc, segment);
         }
         start = end;
@@ -519,6 +545,321 @@ pub fn extractSparseVectorField(
     data: []const u8,
     field_name: []const u8,
 ) !?SparseVectorData {
+    return extractSparseVectorFieldRawFast(alloc, data, field_name) catch |raw_err| switch (raw_err) {
+        error.UnsupportedSparseFastPath => return extractSparseVectorFieldFast(alloc, data, field_name) catch |err| switch (err) {
+            error.UnsupportedSparseFastPath => return extractSparseVectorFieldSlow(alloc, data, field_name),
+            else => return err,
+        },
+        else => return raw_err,
+    };
+}
+
+fn extractSparseVectorFieldRawFast(
+    alloc: Allocator,
+    data: []const u8,
+    field_name: []const u8,
+) !?SparseVectorData {
+    var pos: usize = 0;
+    skipJsonWhitespace(data, &pos);
+    if (pos >= data.len or data[pos] != '{') return null;
+    pos += 1;
+
+    while (true) {
+        skipJsonWhitespace(data, &pos);
+        if (pos >= data.len) return error.SyntaxError;
+        if (data[pos] == '}') return null;
+        const key = try parseRawJsonString(data, &pos);
+        skipJsonWhitespace(data, &pos);
+        if (pos >= data.len or data[pos] != ':') return error.SyntaxError;
+        pos += 1;
+        skipJsonWhitespace(data, &pos);
+        if (std.mem.eql(u8, key, field_name)) {
+            if (pos >= data.len or data[pos] != '{') return null;
+            return try parseSparseVectorObjectRawFast(alloc, data, &pos);
+        }
+        try skipRawJsonValue(data, &pos);
+        skipJsonWhitespace(data, &pos);
+        if (pos >= data.len) return error.SyntaxError;
+        if (data[pos] == ',') {
+            pos += 1;
+            continue;
+        }
+        if (data[pos] == '}') return null;
+        return error.SyntaxError;
+    }
+}
+
+fn parseSparseVectorObjectRawFast(alloc: Allocator, data: []const u8, pos: *usize) !SparseVectorData {
+    if (pos.* >= data.len or data[pos.*] != '{') return error.SyntaxError;
+    pos.* += 1;
+
+    var indices: ?[]u32 = null;
+    var values: ?[]f32 = null;
+    var saw_supported_field = false;
+    errdefer {
+        if (indices) |items| alloc.free(items);
+        if (values) |items| alloc.free(items);
+    }
+
+    while (true) {
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == '}') {
+            pos.* += 1;
+            break;
+        }
+        const key = try parseRawJsonString(data, pos);
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len or data[pos.*] != ':') return error.SyntaxError;
+        pos.* += 1;
+        skipJsonWhitespace(data, pos);
+
+        if (std.mem.eql(u8, key, "indices")) {
+            if (indices != null) return error.InvalidSparseVector;
+            indices = try parseRawU32Array(alloc, data, pos);
+            saw_supported_field = true;
+        } else if (std.mem.eql(u8, key, "values")) {
+            if (values != null) return error.InvalidSparseVector;
+            values = try parseRawF32Array(alloc, data, pos);
+            saw_supported_field = true;
+        } else if (saw_supported_field) {
+            try skipRawJsonValue(data, pos);
+        } else {
+            return error.UnsupportedSparseFastPath;
+        }
+
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == ',') {
+            pos.* += 1;
+            continue;
+        }
+        if (data[pos.*] == '}') {
+            pos.* += 1;
+            break;
+        }
+        return error.SyntaxError;
+    }
+
+    const out_indices = indices orelse return error.UnsupportedSparseFastPath;
+    const out_values = values orelse return error.InvalidSparseVector;
+    if (out_indices.len != out_values.len) return error.InvalidSparseVector;
+    indices = null;
+    values = null;
+    return .{
+        .indices = out_indices,
+        .values = out_values,
+    };
+}
+
+fn parseRawU32Array(alloc: Allocator, data: []const u8, pos: *usize) ![]u32 {
+    if (pos.* >= data.len or data[pos.*] != '[') return error.InvalidSparseVector;
+    pos.* += 1;
+    var out = std.ArrayListUnmanaged(u32).empty;
+    errdefer out.deinit(alloc);
+    while (true) {
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == ']') {
+            pos.* += 1;
+            return try out.toOwnedSlice(alloc);
+        }
+        const raw = try parseRawJsonNumber(data, pos);
+        try out.append(alloc, try std.fmt.parseInt(u32, raw, 10));
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == ',') {
+            pos.* += 1;
+            continue;
+        }
+        if (data[pos.*] == ']') {
+            pos.* += 1;
+            return try out.toOwnedSlice(alloc);
+        }
+        return error.SyntaxError;
+    }
+}
+
+fn parseRawF32Array(alloc: Allocator, data: []const u8, pos: *usize) ![]f32 {
+    if (pos.* >= data.len or data[pos.*] != '[') return error.InvalidSparseVector;
+    pos.* += 1;
+    var out = std.ArrayListUnmanaged(f32).empty;
+    errdefer out.deinit(alloc);
+    while (true) {
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == ']') {
+            pos.* += 1;
+            return try out.toOwnedSlice(alloc);
+        }
+        const raw = try parseRawJsonNumber(data, pos);
+        try out.append(alloc, try std.fmt.parseFloat(f32, raw));
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == ',') {
+            pos.* += 1;
+            continue;
+        }
+        if (data[pos.*] == ']') {
+            pos.* += 1;
+            return try out.toOwnedSlice(alloc);
+        }
+        return error.SyntaxError;
+    }
+}
+
+fn parseRawJsonNumber(data: []const u8, pos: *usize) ![]const u8 {
+    const start = pos.*;
+    if (pos.* < data.len and (data[pos.*] == '-' or data[pos.*] == '+')) pos.* += 1;
+    var saw_digit = false;
+    while (pos.* < data.len and std.ascii.isDigit(data[pos.*])) : (pos.* += 1) saw_digit = true;
+    if (pos.* < data.len and data[pos.*] == '.') {
+        pos.* += 1;
+        while (pos.* < data.len and std.ascii.isDigit(data[pos.*])) : (pos.* += 1) saw_digit = true;
+    }
+    if (!saw_digit) return error.InvalidSparseVector;
+    if (pos.* < data.len and (data[pos.*] == 'e' or data[pos.*] == 'E')) {
+        pos.* += 1;
+        if (pos.* < data.len and (data[pos.*] == '-' or data[pos.*] == '+')) pos.* += 1;
+        var saw_exponent_digit = false;
+        while (pos.* < data.len and std.ascii.isDigit(data[pos.*])) : (pos.* += 1) saw_exponent_digit = true;
+        if (!saw_exponent_digit) return error.InvalidSparseVector;
+    }
+    return data[start..pos.*];
+}
+
+fn parseRawJsonString(data: []const u8, pos: *usize) ![]const u8 {
+    if (pos.* >= data.len or data[pos.*] != '"') return error.SyntaxError;
+    pos.* += 1;
+    const start = pos.*;
+    while (pos.* < data.len) : (pos.* += 1) {
+        switch (data[pos.*]) {
+            '"' => {
+                const out = data[start..pos.*];
+                pos.* += 1;
+                return out;
+            },
+            '\\' => return error.UnsupportedSparseFastPath,
+            else => {},
+        }
+    }
+    return error.SyntaxError;
+}
+
+fn skipJsonWhitespace(data: []const u8, pos: *usize) void {
+    while (pos.* < data.len) : (pos.* += 1) {
+        switch (data[pos.*]) {
+            ' ', '\n', '\r', '\t' => {},
+            else => return,
+        }
+    }
+}
+
+fn skipRawJsonValue(data: []const u8, pos: *usize) !void {
+    skipJsonWhitespace(data, pos);
+    if (pos.* >= data.len) return error.SyntaxError;
+    switch (data[pos.*]) {
+        '"' => {
+            _ = try parseRawJsonStringAllowEscapes(data, pos);
+            return;
+        },
+        '{', '[' => {},
+        else => {
+            while (pos.* < data.len) : (pos.* += 1) {
+                switch (data[pos.*]) {
+                    ',', '}', ']', ' ', '\n', '\r', '\t' => return,
+                    else => {},
+                }
+            }
+            return;
+        },
+    }
+
+    var depth: usize = 0;
+    while (pos.* < data.len) {
+        switch (data[pos.*]) {
+            '"' => {
+                _ = try parseRawJsonStringAllowEscapes(data, pos);
+                continue;
+            },
+            '{', '[' => {
+                depth += 1;
+                pos.* += 1;
+            },
+            '}', ']' => {
+                if (depth == 0) return error.SyntaxError;
+                depth -= 1;
+                pos.* += 1;
+                if (depth == 0) return;
+            },
+            else => pos.* += 1,
+        }
+    }
+    return error.SyntaxError;
+}
+
+fn parseRawJsonStringAllowEscapes(data: []const u8, pos: *usize) !void {
+    if (pos.* >= data.len or data[pos.*] != '"') return error.SyntaxError;
+    pos.* += 1;
+    while (pos.* < data.len) : (pos.* += 1) {
+        switch (data[pos.*]) {
+            '"' => {
+                pos.* += 1;
+                return;
+            },
+            '\\' => {
+                pos.* += 1;
+                if (pos.* >= data.len) return error.SyntaxError;
+            },
+            else => {},
+        }
+    }
+    return error.SyntaxError;
+}
+
+fn extractSparseVectorFieldFast(
+    alloc: Allocator,
+    data: []const u8,
+    field_name: []const u8,
+) !?SparseVectorData {
+    var scanner = std.json.Scanner.initCompleteInput(alloc, data);
+    defer scanner.deinit();
+
+    switch (try scanner.next()) {
+        .object_begin => {},
+        else => return null,
+    }
+
+    while (true) {
+        switch (try scanner.peekNextTokenType()) {
+            .object_end => {
+                _ = try scanner.next();
+                return null;
+            },
+            .string => {},
+            else => return null,
+        }
+
+        const key_token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+        defer freeJsonAllocatedToken(alloc, key_token);
+        const key = jsonTokenSlice(key_token) orelse return error.InvalidSparseVector;
+        if (!std.mem.eql(u8, key, field_name)) {
+            try scanner.skipValue();
+            continue;
+        }
+
+        switch (try scanner.peekNextTokenType()) {
+            .object_begin => return try parseSparseVectorObjectFast(alloc, &scanner),
+            else => return null,
+        }
+    }
+}
+
+fn extractSparseVectorFieldSlow(
+    alloc: Allocator,
+    data: []const u8,
+    field_name: []const u8,
+) !?SparseVectorData {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
     defer parsed.deinit();
     const root = parsed.value;
@@ -550,6 +891,144 @@ pub fn extractSparseVectorField(
     };
 }
 
+fn parseSparseVectorObjectFast(alloc: Allocator, scanner: *std.json.Scanner) !SparseVectorData {
+    switch (try scanner.next()) {
+        .object_begin => {},
+        else => return error.InvalidSparseVector,
+    }
+
+    var indices: ?[]u32 = null;
+    var values: ?[]f32 = null;
+    var packed_indices: ?[]u8 = null;
+    var packed_values: ?[]u8 = null;
+    var saw_supported_field = false;
+    errdefer {
+        if (indices) |items| alloc.free(items);
+        if (values) |items| alloc.free(items);
+        if (packed_indices) |items| alloc.free(items);
+        if (packed_values) |items| alloc.free(items);
+    }
+
+    while (true) {
+        switch (try scanner.peekNextTokenType()) {
+            .object_end => {
+                _ = try scanner.next();
+                break;
+            },
+            .string => {},
+            else => return error.InvalidSparseVector,
+        }
+
+        const key_token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+        defer freeJsonAllocatedToken(alloc, key_token);
+        const key = jsonTokenSlice(key_token) orelse return error.InvalidSparseVector;
+        if (std.mem.eql(u8, key, "indices")) {
+            if (indices != null) return error.InvalidSparseVector;
+            indices = try parseSparseU32ArrayFast(alloc, scanner);
+            saw_supported_field = true;
+        } else if (std.mem.eql(u8, key, "values")) {
+            if (values != null) return error.InvalidSparseVector;
+            values = try parseSparseF32ArrayFast(alloc, scanner);
+            saw_supported_field = true;
+        } else if (std.mem.eql(u8, key, "packed_indices")) {
+            if (packed_indices != null) return error.InvalidSparseVector;
+            packed_indices = try parseSparseStringDupFast(alloc, scanner);
+            saw_supported_field = true;
+        } else if (std.mem.eql(u8, key, "packed_values")) {
+            if (packed_values != null) return error.InvalidSparseVector;
+            packed_values = try parseSparseStringDupFast(alloc, scanner);
+            saw_supported_field = true;
+        } else if (saw_supported_field) {
+            try scanner.skipValue();
+        } else {
+            return error.UnsupportedSparseFastPath;
+        }
+    }
+
+    if (packed_indices != null or packed_values != null) {
+        const raw_indices = packed_indices orelse return error.InvalidSparseVector;
+        const raw_values = packed_values orelse return error.InvalidSparseVector;
+        var sparse = vector_codec.decodePackedSparseBase64Alloc(alloc, raw_indices, raw_values) catch return error.InvalidSparseVector;
+        errdefer sparse.deinit(alloc);
+        alloc.free(raw_indices);
+        packed_indices = null;
+        alloc.free(raw_values);
+        packed_values = null;
+        return .{
+            .indices = sparse.indices,
+            .values = sparse.values,
+        };
+    }
+
+    const out_indices = indices orelse return error.UnsupportedSparseFastPath;
+    const out_values = values orelse return error.InvalidSparseVector;
+    if (out_indices.len != out_values.len) return error.InvalidSparseVector;
+    indices = null;
+    values = null;
+    return .{
+        .indices = out_indices,
+        .values = out_values,
+    };
+}
+
+fn parseSparseU32ArrayFast(alloc: Allocator, scanner: *std.json.Scanner) ![]u32 {
+    switch (try scanner.next()) {
+        .array_begin => {},
+        else => return error.InvalidSparseVector,
+    }
+
+    var out = std.ArrayListUnmanaged(u32).empty;
+    errdefer out.deinit(alloc);
+    while (true) {
+        switch (try scanner.peekNextTokenType()) {
+            .array_end => {
+                _ = try scanner.next();
+                return try out.toOwnedSlice(alloc);
+            },
+            .number => {},
+            else => return error.InvalidSparseVector,
+        }
+        const token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+        defer freeJsonAllocatedToken(alloc, token);
+        const raw = jsonTokenSlice(token) orelse return error.InvalidSparseVector;
+        try out.append(alloc, try std.fmt.parseInt(u32, raw, 10));
+    }
+}
+
+fn parseSparseF32ArrayFast(alloc: Allocator, scanner: *std.json.Scanner) ![]f32 {
+    switch (try scanner.next()) {
+        .array_begin => {},
+        else => return error.InvalidSparseVector,
+    }
+
+    var out = std.ArrayListUnmanaged(f32).empty;
+    errdefer out.deinit(alloc);
+    while (true) {
+        switch (try scanner.peekNextTokenType()) {
+            .array_end => {
+                _ = try scanner.next();
+                return try out.toOwnedSlice(alloc);
+            },
+            .number => {},
+            else => return error.InvalidSparseVector,
+        }
+        const token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+        defer freeJsonAllocatedToken(alloc, token);
+        const raw = jsonTokenSlice(token) orelse return error.InvalidSparseVector;
+        try out.append(alloc, try std.fmt.parseFloat(f32, raw));
+    }
+}
+
+fn parseSparseStringDupFast(alloc: Allocator, scanner: *std.json.Scanner) ![]u8 {
+    const token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+    defer freeJsonAllocatedToken(alloc, token);
+    const raw = switch (token) {
+        .string, .allocated_string => jsonTokenSlice(token) orelse return error.InvalidSparseVector,
+        else => return error.InvalidSparseVector,
+    };
+    return try alloc.dupe(u8, raw);
+}
+
 pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !ExtractedWrite {
     if (canUseOpaqueJsonFastPath(data)) {
         try validateJsonDocumentNoAlloc(alloc, data);
@@ -559,7 +1038,6 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
             .mentioned_graph_indexes = &.{},
             .dense_embeddings = &.{},
             .sparse_embeddings = &.{},
-            .summaries = &.{},
         };
     }
 
@@ -578,9 +1056,9 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
             .mentioned_graph_indexes = &.{},
             .dense_embeddings = &.{},
             .sparse_embeddings = &.{},
-            .summaries = &.{},
         };
     }
+    if (root.object.contains("_summaries")) return error.UnsupportedReservedField;
 
     var graph_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
     errdefer {
@@ -614,16 +1092,6 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
         }
         sparse_embeddings.deinit(alloc);
     }
-    var summaries = std.ArrayListUnmanaged(SummaryWrite).empty;
-    errdefer {
-        for (summaries.items) |summary| {
-            alloc.free(summary.index_name);
-            alloc.free(summary.doc_key);
-            alloc.free(summary.text);
-        }
-        summaries.deinit(alloc);
-    }
-
     var mentioned_indexes = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (mentioned_indexes.items) |index_name| alloc.free(index_name);
@@ -710,24 +1178,7 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
         }
     }
 
-    if (root.object.get("_summaries")) |summaries_field| {
-        if (summaries_field != .object) return error.InvalidSummaryField;
-
-        var summary_it = summaries_field.object.iterator();
-        while (summary_it.next()) |summary_entry| {
-            const index_name = summary_entry.key_ptr.*;
-            const summary_value = summary_entry.value_ptr.*;
-            if (summary_value != .string) return error.InvalidSummaryField;
-
-            try summaries.append(alloc, .{
-                .index_name = try alloc.dupe(u8, index_name),
-                .doc_key = try alloc.dupe(u8, key),
-                .text = try alloc.dupe(u8, summary_value.string),
-            });
-        }
-    }
-
-    const has_special_fields = root.object.contains("_edges") or root.object.contains("_embeddings") or root.object.contains("_summaries");
+    const has_special_fields = root.object.contains("_edges") or root.object.contains("_embeddings");
     const has_non_special_fields = hasNonSpecialFields(root);
     const cleaned_value = if (has_special_fields) blk: {
         if (!has_non_special_fields) break :blk null;
@@ -742,7 +1193,6 @@ pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !Extrac
         .mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc),
         .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
         .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
-        .summaries = try summaries.toOwnedSlice(alloc),
     };
 }
 
@@ -796,7 +1246,8 @@ fn extractWriteFastDenseEmbeddingsOnly(alloc: Allocator, key: []const u8, data: 
             saw_embeddings = true;
             continue;
         }
-        if (std.mem.eql(u8, field_name, "_edges") or std.mem.eql(u8, field_name, "_summaries")) return null;
+        if (std.mem.eql(u8, field_name, "_summaries")) return error.UnsupportedReservedField;
+        if (std.mem.eql(u8, field_name, "_edges")) return null;
         if (!(try appendFastScalarField(alloc, &scanner, field_name, &json_writer))) return null;
         has_non_special_fields = true;
     }
@@ -812,7 +1263,6 @@ fn extractWriteFastDenseEmbeddingsOnly(alloc: Allocator, key: []const u8, data: 
         .mentioned_graph_indexes = &.{},
         .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
         .sparse_embeddings = &.{},
-        .summaries = &.{},
     };
 }
 
@@ -999,10 +1449,7 @@ fn extractTextFieldsFromValue(
         };
     }
 
-    return .{
-        .fields = try extractStringFieldsNoSchema(alloc, root.object),
-        .recursive_typed_fields = true,
-    };
+    return try extractSchemaLessTextAndTypedFields(alloc, root.object, text_analysis);
 }
 
 fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
@@ -1123,11 +1570,11 @@ fn collectDynamicSchemaTextFields(
             }
             if (document_schema) |resolved| {
                 if (pathFallsUnderInferTypeDynamicPath(resolved, path)) {
-                    try appendNamedTextField(alloc, fields, path, text, "standard", false, text_analysis);
+                    try appendDynamicSchemaLessStringTextFields(alloc, fields, path, text, text_analysis, observed_field_analyzers);
                     return;
                 }
                 if (pathFallsUnderOpenDynamicPath(resolved, path)) {
-                    try appendNamedTextField(alloc, fields, path, text, "standard", false, text_analysis);
+                    try appendDynamicSchemaLessStringTextFields(alloc, fields, path, text, text_analysis, observed_field_analyzers);
                 }
             }
         },
@@ -1254,11 +1701,280 @@ fn appendNamedTextField(
     }
 }
 
+fn appendDynamicSchemaLessStringTextFields(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    path: []const u8,
+    text: []const u8,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
+) !void {
+    try appendNamedTextField(alloc, fields, path, text, "standard", false, text_analysis);
+    if (observed_field_analyzers) |collector| {
+        try appendObservedFieldAnalyzer(alloc, collector, path, "standard");
+    }
+    if (text.len > schema_less_exact_max_bytes or std.mem.endsWith(u8, path, schema_less_exact_field_suffix)) return;
+
+    const exact_field = try schemaLessExactFieldNameAlloc(alloc, path);
+    defer alloc.free(exact_field);
+    try appendNamedTextField(alloc, fields, exact_field, text, "keyword", false, text_analysis);
+    if (observed_field_analyzers) |collector| {
+        try appendObservedFieldAnalyzer(alloc, collector, exact_field, "keyword");
+    }
+}
+
 fn extractStringFieldsNoSchema(alloc: Allocator, object: std.json.ObjectMap) ![]introducer_mod.TextField {
     var fields = std.ArrayListUnmanaged(introducer_mod.TextField).empty;
     defer fields.deinit(alloc);
     try collectStringFieldsNoSchema(alloc, &fields, .{ .object = object }, "");
     return try alloc.dupe(introducer_mod.TextField, fields.items);
+}
+
+fn extractSchemaLessTextAndTypedFields(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+) !ExtractedTextFields {
+    var text_fields = std.ArrayListUnmanaged(introducer_mod.TextField).empty;
+    defer text_fields.deinit(alloc);
+    var typed_fields = std.ArrayListUnmanaged(introducer_mod.TypedFieldValue).empty;
+    defer typed_fields.deinit(alloc);
+    var path = std.ArrayListUnmanaged(u8).empty;
+    defer path.deinit(alloc);
+
+    try collectSchemaLessTextAndTypedFieldsRecursive(
+        alloc,
+        .{ .object = object },
+        &path,
+        &text_fields,
+        &typed_fields,
+        text_analysis,
+    );
+
+    return .{
+        .fields = if (text_fields.items.len > 0) try alloc.dupe(introducer_mod.TextField, text_fields.items) else &.{},
+        .typed_fields = if (typed_fields.items.len > 0) try alloc.dupe(introducer_mod.TypedFieldValue, typed_fields.items) else &.{},
+    };
+}
+
+fn collectSchemaLessTextAndTypedFieldsRecursive(
+    alloc: Allocator,
+    value: std.json.Value,
+    path: *std.ArrayListUnmanaged(u8),
+    text_fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    typed_fields: *std.ArrayListUnmanaged(introducer_mod.TypedFieldValue),
+    text_analysis: introducer_mod.TextAnalysisConfig,
+) !void {
+    if (path.items.len > 0) {
+        if (try introducer_mod.detectTypedFieldProjectionValue(alloc, path.items, value, text_analysis)) |typed_field| {
+            try typed_fields.append(alloc, typed_field);
+            if (value == .object and typed_field.value_type == .geo_point) return;
+        }
+    }
+
+    switch (value) {
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (entry.key_ptr.*.len > 0 and entry.key_ptr.*[0] == '_') continue;
+                const old_len = try pushProjectionPath(alloc, path, entry.key_ptr.*);
+                defer path.shrinkRetainingCapacity(old_len);
+                try collectSchemaLessTextAndTypedFieldsRecursive(
+                    alloc,
+                    entry.value_ptr.*,
+                    path,
+                    text_fields,
+                    typed_fields,
+                    text_analysis,
+                );
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                try collectSchemaLessTextAndTypedFieldsRecursive(
+                    alloc,
+                    item,
+                    path,
+                    text_fields,
+                    typed_fields,
+                    text_analysis,
+                );
+            }
+        },
+        .string => |text| {
+            if (path.items.len > 0) try appendSchemaLessStringTextFields(alloc, text_fields, path.items, text);
+        },
+        else => {},
+    }
+}
+
+fn canUseSchemaLessRawTextFastPath(data: []const u8, opts: TextProjectionOptions) bool {
+    if (opts.strip_numeric_array_heuristic) return false;
+    if (rawJsonMayContainTypedField(data)) return false;
+    // Raw strings are borrowed from the document. Escapes require JSON string
+    // decoding, so keep those on the full parser path.
+    if (std.mem.indexOfScalar(u8, data, '\\') != null) return false;
+    if (std.mem.indexOf(u8, data, "\"_edges\"") != null) return false;
+    if (std.mem.indexOf(u8, data, "\"_embeddings\"") != null) return false;
+    for (opts.vector_field_paths) |path| {
+        const first = firstProjectionPathSegment(path);
+        if (first.len == 0) continue;
+        if (rawJsonObjectMayContainField(data, first)) return false;
+    }
+    return true;
+}
+
+fn rawJsonMayContainTypedField(data: []const u8) bool {
+    var pos: usize = 0;
+    while (pos < data.len) : (pos += 1) {
+        if (data[pos] != ':') continue;
+        pos += 1;
+        while (pos < data.len and std.ascii.isWhitespace(data[pos])) : (pos += 1) {}
+        if (pos >= data.len) return false;
+        switch (data[pos]) {
+            '-', '0'...'9', 't', 'f', 'n' => return true,
+            '[' => {
+                var scan = pos + 1;
+                while (scan < data.len and std.ascii.isWhitespace(data[scan])) : (scan += 1) {}
+                if (scan < data.len and data[scan] != '"' and data[scan] != ']') return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn firstProjectionPathSegment(path: []const u8) []const u8 {
+    const dot = std.mem.indexOfScalar(u8, path, '.') orelse return path;
+    return path[0..dot];
+}
+
+fn rawJsonObjectMayContainField(data: []const u8, field: []const u8) bool {
+    var pos: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, data, pos, '"')) |start| {
+        pos = start + 1;
+        const end = std.mem.indexOfScalarPos(u8, data, pos, '"') orelse return false;
+        if (std.mem.eql(u8, data[pos..end], field)) return true;
+        pos = end + 1;
+    }
+    return false;
+}
+
+fn extractStringFieldsNoSchemaRaw(
+    alloc: Allocator,
+    data: []const u8,
+    opts: TextProjectionOptions,
+) ![]introducer_mod.TextField {
+    var fields = std.ArrayListUnmanaged(introducer_mod.TextField).empty;
+    defer fields.deinit(alloc);
+    var path = std.ArrayListUnmanaged(u8).empty;
+    defer path.deinit(alloc);
+
+    var pos: usize = 0;
+    skipJsonWhitespace(data, &pos);
+    if (pos >= data.len or data[pos] != '{') return error.SyntaxError;
+    pos += 1;
+    try collectStringFieldsNoSchemaRawObject(alloc, &fields, data, &pos, &path, opts);
+    skipJsonWhitespace(data, &pos);
+    if (pos != data.len) return error.SyntaxError;
+    return try alloc.dupe(introducer_mod.TextField, fields.items);
+}
+
+fn collectStringFieldsNoSchemaRawObject(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    data: []const u8,
+    pos: *usize,
+    path: *std.ArrayListUnmanaged(u8),
+    opts: TextProjectionOptions,
+) anyerror!void {
+    var first = true;
+    while (true) {
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == '}') {
+            pos.* += 1;
+            return;
+        }
+        if (!first) {
+            if (data[pos.*] != ',') return error.SyntaxError;
+            pos.* += 1;
+            skipJsonWhitespace(data, pos);
+        }
+        first = false;
+
+        const key = try parseRawJsonString(data, pos);
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len or data[pos.*] != ':') return error.SyntaxError;
+        pos.* += 1;
+
+        if (key.len > 0 and key[0] == '_') {
+            try skipRawJsonValue(data, pos);
+            continue;
+        }
+
+        const old_len = try pushProjectionPath(alloc, path, key);
+        defer path.shrinkRetainingCapacity(old_len);
+        if (projectionPathMatchesAny(opts.vector_field_paths, path.items)) {
+            try skipRawJsonValue(data, pos);
+            continue;
+        }
+        try collectStringFieldsNoSchemaRawValue(alloc, fields, data, pos, path, opts);
+    }
+}
+
+fn collectStringFieldsNoSchemaRawArray(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    data: []const u8,
+    pos: *usize,
+    path: *std.ArrayListUnmanaged(u8),
+    opts: TextProjectionOptions,
+) anyerror!void {
+    var first = true;
+    while (true) {
+        skipJsonWhitespace(data, pos);
+        if (pos.* >= data.len) return error.SyntaxError;
+        if (data[pos.*] == ']') {
+            pos.* += 1;
+            return;
+        }
+        if (!first) {
+            if (data[pos.*] != ',') return error.SyntaxError;
+            pos.* += 1;
+            skipJsonWhitespace(data, pos);
+        }
+        first = false;
+        try collectStringFieldsNoSchemaRawValue(alloc, fields, data, pos, path, opts);
+    }
+}
+
+fn collectStringFieldsNoSchemaRawValue(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    data: []const u8,
+    pos: *usize,
+    path: *std.ArrayListUnmanaged(u8),
+    opts: TextProjectionOptions,
+) anyerror!void {
+    skipJsonWhitespace(data, pos);
+    if (pos.* >= data.len) return error.SyntaxError;
+    switch (data[pos.*]) {
+        '"' => {
+            const text = try parseRawJsonString(data, pos);
+            if (path.items.len == 0) return;
+            try appendSchemaLessStringTextFields(alloc, fields, path.items, text);
+        },
+        '{' => {
+            pos.* += 1;
+            try collectStringFieldsNoSchemaRawObject(alloc, fields, data, pos, path, opts);
+        },
+        '[' => {
+            pos.* += 1;
+            try collectStringFieldsNoSchemaRawArray(alloc, fields, data, pos, path, opts);
+        },
+        else => try skipRawJsonValue(data, pos),
+    }
 }
 
 fn collectStringFieldsNoSchema(
@@ -1287,13 +2003,33 @@ fn collectStringFieldsNoSchema(
         },
         .string => |text| {
             if (path.len == 0) return;
-            try fields.append(alloc, .{
-                .field_name = try alloc.dupe(u8, path),
-                .text = text,
-            });
+            try appendSchemaLessStringTextFields(alloc, fields, path, text);
         },
         else => {},
     }
+}
+
+fn appendSchemaLessStringTextFields(
+    alloc: Allocator,
+    fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    path: []const u8,
+    text: []const u8,
+) !void {
+    try fields.append(alloc, .{
+        .field_name = try alloc.dupe(u8, path),
+        .text = text,
+    });
+    if (text.len > schema_less_exact_max_bytes or std.mem.endsWith(u8, path, schema_less_exact_field_suffix)) return;
+    const exact_field = try schemaLessExactFieldNameAlloc(alloc, path);
+    try fields.append(alloc, .{
+        .field_name = exact_field,
+        .text = text,
+        .analyzer = &analysis_mod.keyword_analyzer,
+    });
+}
+
+pub fn schemaLessExactFieldNameAlloc(alloc: Allocator, field: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ field, schema_less_exact_field_suffix });
 }
 
 fn resolveFullTextDocument(schema: runtime_schema.TableSchema, root: std.json.ObjectMap) ?runtime_schema.FullTextDocument {
@@ -1674,6 +2410,106 @@ fn cloneWithoutSpecialFields(alloc: Allocator, root: std.json.Value) !std.json.V
     return value;
 }
 
+pub fn stripTopLevelFieldsAlloc(alloc: Allocator, data: []const u8, fields: []const []const u8) !?[]u8 {
+    if (fields.len == 0) return try alloc.dupe(u8, data);
+    fast_path: {
+        const stripped = stripTopLevelFieldsRawFastAlloc(alloc, data, fields) catch |err| switch (err) {
+            error.UnsupportedSparseFastPath => break :fast_path,
+            else => return err,
+        };
+        return stripped;
+    }
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.dupe(u8, data);
+
+    var value = std.json.Value{ .object = std.json.ObjectMap.empty };
+    defer freeJsonValue(alloc, &value);
+
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (containsTopLevelField(fields, entry.key_ptr.*)) continue;
+        try value.object.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try cloneJsonValue(alloc, entry.value_ptr.*));
+    }
+
+    if (value.object.count() == 0) return null;
+    return try std.json.Stringify.valueAlloc(alloc, value, .{});
+}
+
+fn stripTopLevelFieldsRawFastAlloc(alloc: Allocator, data: []const u8, fields: []const []const u8) !?[]u8 {
+    var pos: usize = 0;
+    skipJsonWhitespace(data, &pos);
+    if (pos >= data.len or data[pos] != '{') return try alloc.dupe(u8, data);
+    pos += 1;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var wrote_any = false;
+    var removed_any = false;
+
+    while (true) {
+        skipJsonWhitespace(data, &pos);
+        if (pos >= data.len) return error.SyntaxError;
+        if (data[pos] == '}') {
+            pos += 1;
+            break;
+        }
+
+        const entry_start = pos;
+        const field = try parseRawJsonString(data, &pos);
+        skipJsonWhitespace(data, &pos);
+        if (pos >= data.len or data[pos] != ':') return error.SyntaxError;
+        pos += 1;
+        skipJsonWhitespace(data, &pos);
+        try skipRawJsonValue(data, &pos);
+        const entry_end = pos;
+
+        if (containsTopLevelField(fields, field)) {
+            removed_any = true;
+        } else {
+            if (wrote_any) try out.append(alloc, ',');
+            try out.appendSlice(alloc, data[entry_start..entry_end]);
+            wrote_any = true;
+        }
+
+        skipJsonWhitespace(data, &pos);
+        if (pos >= data.len) return error.SyntaxError;
+        if (data[pos] == ',') {
+            pos += 1;
+            continue;
+        }
+        if (data[pos] == '}') {
+            pos += 1;
+            break;
+        }
+        return error.SyntaxError;
+    }
+
+    skipJsonWhitespace(data, &pos);
+    if (pos != data.len) return error.SyntaxError;
+    if (!removed_any) {
+        out.deinit(alloc);
+        return try alloc.dupe(u8, data);
+    }
+    if (!wrote_any) {
+        out.deinit(alloc);
+        return null;
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn containsTopLevelField(fields: []const []const u8, field: []const u8) bool {
+    for (fields) |item| {
+        if (std.mem.eql(u8, item, field)) return true;
+    }
+    return false;
+}
+
 fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
     return switch (value) {
         .null => .null,
@@ -1730,8 +2566,7 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
 
 fn isSpecialField(field_name: []const u8) bool {
     return std.mem.eql(u8, field_name, "_edges") or
-        std.mem.eql(u8, field_name, "_embeddings") or
-        std.mem.eql(u8, field_name, "_summaries");
+        std.mem.eql(u8, field_name, "_embeddings");
 }
 
 fn appendUniqueString(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), value: []const u8) !void {
@@ -1755,7 +2590,9 @@ test "document mapper builds text segment from top-level string fields" {
 
     try std.testing.expectEqual(@as(u32, 1), reader.doc_count);
     try std.testing.expect((try reader.invertedIndex("title")) != null);
+    try std.testing.expect((try reader.invertedIndex("title.keyword")) != null);
     try std.testing.expect((try reader.invertedIndex("body")) != null);
+    try std.testing.expect((try reader.invertedIndex("body.keyword")) != null);
     try std.testing.expect((try reader.invertedIndex("count")) == null);
 }
 
@@ -1859,6 +2696,55 @@ test "document mapper builds text segment from nested string fields without sche
     try std.testing.expect((try reader.invertedIndex("meta.tags")) != null);
 }
 
+test "document mapper schema-less fast projection indexes nested string fields" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const source_batch = try buildTextProjectionSourceBatchWithOptions(arena, &.{
+        .{ .key = "doc:1", .value = "{\"title\":\"alpha\",\"meta\":{\"summary\":\"beta gamma\",\"tags\":[\"delta\"]}}" },
+    }, .{
+        .strip_numeric_array_heuristic = false,
+        .schema_less_fast_projection = true,
+    });
+    try std.testing.expect(source_batch.docs[0].schema_less_fast_projection);
+
+    const projection_batch = try buildTextProjectionBatchFromSource(arena, source_batch.docs, text_analysis, null, null);
+    const segment = (try buildTextSegmentFromProjectionBatch(alloc, projection_batch, text_analysis)).?;
+    defer alloc.free(segment);
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect((try reader.invertedIndex("title")) != null);
+    try std.testing.expect((try reader.invertedIndex("title.keyword")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.summary")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.summary.keyword")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.tags")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.tags.keyword")) != null);
+}
+
+test "document mapper schema-less projection indexes exact fields with embeddings stripped" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"status\":\"active\",\"tenant\":\"tenanta\",\"_embeddings\":{\"dense_idx\":\"AACAPwAAAEAAAEBA\"}}" },
+    }, text_analysis, null)).?;
+    defer alloc.free(segment);
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect((try reader.invertedIndex("status")) != null);
+    try std.testing.expect((try reader.invertedIndex("status.keyword")) != null);
+    try std.testing.expect((try reader.invertedIndex("tenant")) != null);
+    try std.testing.expect((try reader.invertedIndex("tenant.keyword")) != null);
+    try std.testing.expect((try reader.invertedIndex("_embeddings")) == null);
+}
+
 test "document mapper emits schema-driven search_as_you_type variants" {
     const alloc = std.testing.allocator;
     const text_analysis = introducer_mod.TextAnalysisConfig{};
@@ -1877,13 +2763,23 @@ test "document mapper emits schema-driven search_as_you_type variants" {
                     },
                     .{
                         .path = "name",
-                        .emitted_name = "name__keyword",
+                        .emitted_name = "name.keyword",
                         .analyzer = "keyword",
                     },
                     .{
                         .path = "name",
-                        .emitted_name = "name__2gram",
-                        .analyzer = "search_as_you_type",
+                        .emitted_name = "name._2gram",
+                        .analyzer = "search_as_you_type_2gram",
+                    },
+                    .{
+                        .path = "name",
+                        .emitted_name = "name._3gram",
+                        .analyzer = "search_as_you_type_3gram",
+                    },
+                    .{
+                        .path = "name",
+                        .emitted_name = "name._index_prefix",
+                        .analyzer = "search_as_you_type_index_prefix",
                     },
                 },
             },
@@ -1899,8 +2795,10 @@ test "document mapper emits schema-driven search_as_you_type variants" {
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("name")) != null);
-    try std.testing.expect((try reader.invertedIndex("name__keyword")) != null);
-    try std.testing.expect((try reader.invertedIndex("name__2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("name.keyword")) != null);
+    try std.testing.expect((try reader.invertedIndex("name._2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("name._3gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("name._index_prefix")) != null);
 }
 
 test "document mapper emits Go-style dynamic-template search_as_you_type field" {
@@ -1916,7 +2814,7 @@ test "document mapper emits Go-style dynamic-template search_as_you_type field" 
                 .path_match = "meta.*",
                 .mapping = .{
                     .field_type = .search_as_you_type,
-                    .analyzer = "search_as_you_type",
+                    .analyzer = "search_as_you_type_index_prefix",
                 },
             },
         },
@@ -1931,7 +2829,9 @@ test "document mapper emits Go-style dynamic-template search_as_you_type field" 
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("meta.nickname")) != null);
-    try std.testing.expect((try reader.invertedIndex("meta.nickname__2gram")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.nickname._2gram")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.nickname._3gram")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.nickname._index_prefix")) == null);
 }
 
 test "document mapper honors dynamic-template exclusions and mapping type" {
@@ -2032,8 +2932,16 @@ test "document mapper emits additional-properties search_as_you_type variants" {
                                 .analyzer = "standard",
                             },
                             .{
-                                .suffix = "__2gram",
-                                .analyzer = "search_as_you_type",
+                                .suffix = "._2gram",
+                                .analyzer = "search_as_you_type_2gram",
+                            },
+                            .{
+                                .suffix = "._3gram",
+                                .analyzer = "search_as_you_type_3gram",
+                            },
+                            .{
+                                .suffix = "._index_prefix",
+                                .analyzer = "search_as_you_type_index_prefix",
                             },
                         },
                     },
@@ -2043,7 +2951,7 @@ test "document mapper emits additional-properties search_as_you_type variants" {
     };
 
     const segment = (try buildTextSegmentFromDocuments(alloc, &.{
-        .{ .key = "doc:1", .value = "{\"_type\":\"product\",\"meta\":{\"nickname\":\"Gamma\"}}" },
+        .{ .key = "doc:1", .value = "{\"_type\":\"product\",\"meta\":{\"nickname\":\"Gamma Ray Burst\"}}" },
     }, text_analysis, schema)).?;
     defer alloc.free(segment);
 
@@ -2051,7 +2959,9 @@ test "document mapper emits additional-properties search_as_you_type variants" {
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("meta.nickname")) != null);
-    try std.testing.expect((try reader.invertedIndex("meta.nickname__2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.nickname._2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.nickname._3gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.nickname._index_prefix")) != null);
 }
 
 test "document mapper emits nested additional-properties search_as_you_type variants" {
@@ -2074,8 +2984,16 @@ test "document mapper emits nested additional-properties search_as_you_type vari
                                 .analyzer = "standard",
                             },
                             .{
-                                .suffix = "__2gram",
-                                .analyzer = "search_as_you_type",
+                                .suffix = "._2gram",
+                                .analyzer = "search_as_you_type_2gram",
+                            },
+                            .{
+                                .suffix = "._3gram",
+                                .analyzer = "search_as_you_type_3gram",
+                            },
+                            .{
+                                .suffix = "._index_prefix",
+                                .analyzer = "search_as_you_type_index_prefix",
                             },
                         },
                     },
@@ -2085,7 +3003,7 @@ test "document mapper emits nested additional-properties search_as_you_type vari
     };
 
     const segment = (try buildTextSegmentFromDocuments(alloc, &.{
-        .{ .key = "doc:1", .value = "{\"_type\":\"product\",\"meta\":{\"foo\":{\"title\":\"Gamma\"}}}" },
+        .{ .key = "doc:1", .value = "{\"_type\":\"product\",\"meta\":{\"foo\":{\"title\":\"Gamma Ray Burst\"}}}" },
     }, text_analysis, schema)).?;
     defer alloc.free(segment);
 
@@ -2093,7 +3011,9 @@ test "document mapper emits nested additional-properties search_as_you_type vari
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("meta.foo.title")) != null);
-    try std.testing.expect((try reader.invertedIndex("meta.foo.title__2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.foo.title._2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.foo.title._3gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.foo.title._index_prefix")) != null);
 }
 
 test "document mapper emits pattern-properties search_as_you_type variants" {
@@ -2117,8 +3037,16 @@ test "document mapper emits pattern-properties search_as_you_type variants" {
                                 .analyzer = "standard",
                             },
                             .{
-                                .suffix = "__2gram",
-                                .analyzer = "search_as_you_type",
+                                .suffix = "._2gram",
+                                .analyzer = "search_as_you_type_2gram",
+                            },
+                            .{
+                                .suffix = "._3gram",
+                                .analyzer = "search_as_you_type_3gram",
+                            },
+                            .{
+                                .suffix = "._index_prefix",
+                                .analyzer = "search_as_you_type_index_prefix",
                             },
                         },
                     },
@@ -2128,7 +3056,7 @@ test "document mapper emits pattern-properties search_as_you_type variants" {
     };
 
     const segment = (try buildTextSegmentFromDocuments(alloc, &.{
-        .{ .key = "doc:1", .value = "{\"_type\":\"product\",\"meta\":{\"tag_blue\":{\"title\":\"Gamma\"},\"skip\":{\"title\":\"Nope\"}}}" },
+        .{ .key = "doc:1", .value = "{\"_type\":\"product\",\"meta\":{\"tag_blue\":{\"title\":\"Gamma Ray Burst\"},\"skip\":{\"title\":\"Nope\"}}}" },
     }, text_analysis, schema)).?;
     defer alloc.free(segment);
 
@@ -2136,9 +3064,13 @@ test "document mapper emits pattern-properties search_as_you_type variants" {
     defer reader.deinit();
 
     try std.testing.expect((try reader.invertedIndex("meta.tag_blue.title")) != null);
-    try std.testing.expect((try reader.invertedIndex("meta.tag_blue.title__2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.tag_blue.title._2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.tag_blue.title._3gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.tag_blue.title._index_prefix")) != null);
     try std.testing.expect((try reader.invertedIndex("meta.skip.title")) == null);
-    try std.testing.expect((try reader.invertedIndex("meta.skip.title__2gram")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.skip.title._2gram")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.skip.title._3gram")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.skip.title._index_prefix")) == null);
 }
 
 test "document mapper emits additionalProperties true fallback text fields" {
@@ -2217,7 +3149,9 @@ test "document mapper emits default dynamic schema text fields" {
     try std.testing.expect((try reader.invertedIndex("title")) != null);
     try std.testing.expect((try reader.invertedIndex("body")) != null);
     try std.testing.expect((try reader.invertedIndex("status")) != null);
+    try std.testing.expect((try reader.invertedIndex("status.keyword")) != null);
     try std.testing.expect((try reader.invertedIndex("tenant")) != null);
+    try std.testing.expect((try reader.invertedIndex("tenant.keyword")) != null);
 }
 
 test "document mapper extracts dense vector from configured field" {
@@ -2262,6 +3196,29 @@ test "document mapper extracts sparse vector from configured field" {
     try std.testing.expectEqual(@as(u32, 5), vec.indices[1]);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), vec.values[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), vec.values[1], 0.0001);
+}
+
+test "document mapper strips top-level vector fields with raw fast path" {
+    const alloc = std.testing.allocator;
+
+    const stripped = (try stripTopLevelFieldsAlloc(
+        alloc,
+        "{\"title\":\"alpha\",\"sparse\":{\"indices\":[1],\"values\":[1.0]},\"tail\":true}",
+        &.{"sparse"},
+    )).?;
+    defer alloc.free(stripped);
+
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\",\"tail\":true}", stripped);
+}
+
+test "document mapper strips all selected top-level fields to null document" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect((try stripTopLevelFieldsAlloc(
+        alloc,
+        "{\"sparse\":{\"indices\":[1],\"values\":[1.0]}}",
+        &.{"sparse"},
+    )) == null);
 }
 
 test "document mapper extracts sparse vector from token weight map" {

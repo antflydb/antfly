@@ -33,11 +33,11 @@
  * ```
  */
 
-// Re-export the generated types for advanced users
-export type { components, operations, paths } from "./antfly-api.js";
-export type { components as bleve_components } from "./bleve-query.js";
 // Main client export
 export { AntflyClient } from "./client.js";
+// Re-export the generated types for advanced users
+export type { components, operations, paths } from "./public-api.js";
+export type { components as query_components } from "./query.js";
 // Query helper functions
 export {
   boolean,
@@ -57,6 +57,43 @@ export {
   queryString,
   term,
 } from "./query-helpers.js";
+export { Client, type SDKConfig } from "./sdk.js";
+export { InferenceClient } from "./inference-client.js";
+export { deserializeEmbeddings, serializeEmbeddings } from "./inference-codec.js";
+export type {
+  Chunk,
+  ChunkConfig,
+  ChunkRequest,
+  ChunkResponse,
+  Config as InferenceRuntimeConfig,
+  ContentPart,
+  ContentSecurityConfig,
+  Credentials,
+  EmbedInput,
+  EmbedRequest,
+  EmbedResponse,
+  ExtractClassification,
+  ExtractEntity,
+  ExtractRelation,
+  ExtractRequest,
+  ExtractResponse,
+  ImageURL,
+  ImageURLContentPart,
+  Level,
+  ModelsResponse,
+  RequestOptions,
+  RerankRequest,
+  RerankResponse,
+  RewriteRequest,
+  RewriteResponse,
+  Style,
+  InferenceConfig,
+  InferenceError,
+  TextContentPart,
+  TranscribeRequest,
+  TranscribeResponse,
+} from "./inference-types.js";
+export { logLevels, logStyles } from "./inference-types.js";
 // Type exports
 export type {
   // Chat Agent types
@@ -90,9 +127,7 @@ export type {
   ChatMessage,
   ChatMessageRole,
   ChatStreamCallbacks,
-  ChatToolCall,
   ChatToolName,
-  ChatToolResult,
   ChatToolsConfig,
   // Chat types (used by retrieval agent)
   // Retrieval Agent result types
@@ -182,6 +217,8 @@ export type {
   TableMigration,
   TableSchema,
   TableStatus,
+  ToolCall,
+  ToolCallFunction,
   TraversalResult,
   TraversalRules,
   UpdatePasswordRequest,
@@ -194,5 +231,5 @@ export type {
 export { embedderProviders, generatorProviders } from "./types.js";
 
 // Default export for convenience
-import { AntflyClient } from "./client.js";
-export default AntflyClient;
+import { Client } from "./sdk.js";
+export default Client;

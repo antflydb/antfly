@@ -46,7 +46,7 @@ Each type has its own schema with specific metadata fields. See `schemas.yaml` f
 1. **Antfly running locally**:
    ```bash
    cd /path/to/antfly
-   go run ./cmd/antfly swarm
+   go run ./go/pkg/antfly/cmd swarm
    ```
 
 2. **Build docsaf** (from antfly root):
@@ -101,7 +101,7 @@ Dry run to preview changes:
 
 **Flags:**
 - `--input` - Input JSON file path (default: `docs.json`)
-- `--url` - Antfly API URL (default: `http://localhost:8080/api/v1`)
+- `--url` - Antfly API URL (default: `http://localhost:8080/db/v1`)
 - `--table` - Table name to merge into (default: `docs`)
 - `--create-table` - Create table if it doesn't exist (default: `false`)
 - `--num-shards` - Number of shards for new table (default: `1`)
@@ -125,7 +125,7 @@ Full pipeline - process files and load directly (original behavior):
 
 **Flags:**
 - `--dir` *(required)* - Path to directory containing documentation files
-- `--url` - Antfly API URL (default: `http://localhost:8080/api/v1`)
+- `--url` - Antfly API URL (default: `http://localhost:8080/db/v1`)
 - `--table` - Table name to merge into (default: `docs`)
 - `--base-url` - Base URL for generating document links (e.g., `https://docs.example.com`)
 - `--create-table` - Create table if it doesn't exist (default: `false`)
@@ -248,7 +248,7 @@ Only the **modified sections** are updated!
 This will process:
 - All markdown files (README.md, work-log/*.md, etc.)
 - MDX documentation
-- OpenAPI specs in `src/metadata/api.yaml` and `src/usermgr/api.yaml`
+- OpenAPI specs in `go/pkg/antfly/src/metadata/api.yaml` and `go/pkg/antfly/src/usermgr/api.yaml`
 
 ### 6. Sync www/ Website Documentation (with Wildcards)
 
@@ -400,7 +400,7 @@ Once ingested, you can query by document type:
 ### Search all markdown sections
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/tables/docs/query \
+curl -X POST http://localhost:8080/db/v1/tables/docs/query \
   -H "Content-Type: application/json" \
   -d '{
     "query": {
@@ -415,7 +415,7 @@ curl -X POST http://localhost:8080/api/v1/tables/docs/query \
 ### Search OpenAPI paths
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/tables/docs/query \
+curl -X POST http://localhost:8080/db/v1/tables/docs/query \
   -H "Content-Type: application/json" \
   -d '{
     "query": {
@@ -430,7 +430,7 @@ curl -X POST http://localhost:8080/api/v1/tables/docs/query \
 ### Filter by HTTP method
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/tables/docs/query \
+curl -X POST http://localhost:8080/db/v1/tables/docs/query \
   -H "Content-Type: application/json" \
   -d '{
     "query": {
@@ -447,7 +447,7 @@ curl -X POST http://localhost:8080/api/v1/tables/docs/query \
 ### Get OpenAPI schemas
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/tables/docs/query \
+curl -X POST http://localhost:8080/db/v1/tables/docs/query \
   -H "Content-Type: application/json" \
   -d '{
     "query": {
@@ -613,7 +613,7 @@ This ensures:
 **Connection refused**:
 ```bash
 # Make sure Antfly is running
-go run ./cmd/antfly swarm
+go run ./go/pkg/antfly/cmd swarm
 ```
 
 **No documents found**:
@@ -646,7 +646,7 @@ go run ./cmd/antfly swarm
 ## API Reference
 
 See the full Linear Merge API documentation:
-- OpenAPI spec: `src/metadata/api.yaml` (search for `LinearMerge`)
+- OpenAPI spec: `go/pkg/antfly/src/metadata/api.yaml` (search for `LinearMerge`)
 - [goldmark documentation](https://github.com/yuin/goldmark)
 - [libopenapi documentation](https://github.com/pb33f/libopenapi)
 - [OpenAPI Specification](https://spec.openapis.org/oas/v3.1.0)

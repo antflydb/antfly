@@ -21,7 +21,7 @@ const summarizer = {
 };
 
 const MyApp = () => (
-  <Antfly url="http://localhost:8082/api/v1" table="docs">
+  <Antfly url="http://localhost:8082/db/v1" table="docs">
     <AnswerBox id="question" fields={["content"]} placeholder="Ask a question..." />
 
     <RAGResults id="answer" answerBoxId="question" summarizer={summarizer}>

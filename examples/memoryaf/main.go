@@ -15,10 +15,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/antflydb/antfly/pkg/client"
-	"github.com/antflydb/antfly/pkg/docsaf"
-	"github.com/antflydb/antfly/pkg/libaf/s3"
-	"github.com/antflydb/antfly/pkg/memoryaf"
+	"github.com/antflydb/antfly/go/pkg/docsaf"
+	"github.com/antflydb/antfly/go/pkg/libaf/s3"
+	"github.com/antflydb/antfly/go/pkg/memoryaf"
+	client "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
 )
@@ -254,7 +254,7 @@ func runWatch(args []string) error {
 func parseConfig(name string, args []string) (config, error) {
 	var cfg config
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
-	fs.StringVar(&cfg.antflyURL, "url", "http://localhost:8080/api/v1", "Antfly API URL")
+	fs.StringVar(&cfg.antflyURL, "url", "http://localhost:8080/db/v1", "Antfly API URL")
 	fs.StringVar(&cfg.sourceType, "source", "filesystem", "docsaf source backend: filesystem, git, s3, google-drive, or web")
 	fs.StringVar(&cfg.dir, "dir", "", "Directory to process")
 	fs.StringVar(&cfg.baseURL, "base-url", "", "Base URL for generated section links")

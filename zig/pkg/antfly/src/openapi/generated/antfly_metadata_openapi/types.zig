@@ -5,7 +5,7 @@ const std = @import("std");
 const antfly_usermgr_openapi = @import("antfly_usermgr_openapi");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
-const antfly_ai_openapi = @import("antfly_ai_openapi");
+const antfly_generating_api_openapi = @import("antfly_generating_api_openapi");
 const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
@@ -49,6 +49,75 @@ pub const ClusterHealth = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const ClusterDataNodeStatus = struct {
+    data_id: i64,
+    node_id: i64,
+    api_url: ?[]const u8 = null,
+    raft_url: ?[]const u8 = null,
+    role: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    health_class: ?[]const u8 = null,
+    failure_domain: ?[]const u8 = null,
+    live: ?bool = null,
+    drain_requested: ?bool = null,
+    capacity_bytes: ?i64 = null,
+    available_bytes: ?i64 = null,
+    lease_pressure: ?i64 = null,
+    read_load: ?i64 = null,
+    write_load: ?i64 = null,
+    active_backfills: ?i64 = null,
+};
+
+pub const ClusterDataRangeStatus = struct {
+    group_id: i64,
+    range_id: i64,
+    table_id: i64,
+    table_name: ?[]const u8 = null,
+    start_key: ?[]const u8 = null,
+    end_key: ?[]const u8 = null,
+    doc_identity_shard_id: ?i64 = null,
+    doc_identity_range_id: ?i64 = null,
+    state: ?[]const u8 = null,
+    leader_data_id: ?i64 = null,
+    voter_count: ?i64 = null,
+    doc_count: ?i64 = null,
+    disk_bytes: ?i64 = null,
+    empty: ?bool = null,
+};
+
+pub const ClusterDataReplicaStatus = struct {
+    group_id: i64,
+    data_id: i64,
+    node_id: i64,
+    replica_id: i64,
+    peer_node_ids: ?[]const i64 = null,
+};
+
+pub const ClusterDataGroupStatus = struct {
+    group_id: i64,
+    leader_known: ?bool = null,
+    leader_data_id: ?i64 = null,
+    voter_count_known: ?bool = null,
+    voter_count: ?i64 = null,
+    healthy_voter_reports: ?i64 = null,
+    joint_consensus: ?bool = null,
+    transition_pending: ?bool = null,
+    replay_required: ?bool = null,
+    replay_caught_up: ?bool = null,
+    cutover_ready: ?bool = null,
+    reads_ready_after_cutover: ?bool = null,
+    doc_identity_lifecycle: ?[]const u8 = null,
+    doc_count: ?i64 = null,
+    disk_bytes: ?i64 = null,
+    empty: ?bool = null,
+};
+
+/// Non-secret status for the local secrets file store, when one is available.
+pub const SecretStoreStatus = struct {
+    /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
+    stale: ?bool = null,
 };
 
 /// Source of the secret configuration
@@ -428,7 +497,7 @@ pub const ScanKeysRequest = struct {
     exclusive_to: ?bool = null,
     /// List of fields to include in each result. If not specified, only returns the key. Supports: - Simple fields: "title", "author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings", "_summaries", "_chunks"
     fields: ?[]const []const u8 = null,
-    /// Bleve query to filter documents. Only documents matching this query are included in results. Uses the sear library for efficient per-document matching without requiring a full index. Examples: - Status filtering: `{"query": "status:published"}` - Date ranges: `{"query": "created_at:>2023-01-01"}` - Field matching: `{"query": "category:technology"}`
+    /// Antfly query to filter documents. Only documents matching this query are included in results. Uses the sear library for efficient per-document matching without requiring a full index. Examples: - Status filtering: `{"query": "status:published"}` - Date ranges: `{"query": "created_at:>2023-01-01"}` - Field matching: `{"query": "category:technology"}`
     filter_query: ?std.json.Value = null,
     /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
     limit: ?i64 = null,
@@ -890,15 +959,15 @@ pub const PruneStats = struct {
 /// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
 pub const RetrievalAgentSteps = struct {
     /// Tool configuration for the retrieval agent. Controls which tools are available and their settings. If not specified, tools are automatically determined from the table's available indexes.
-    tools: ?antfly_ai_openapi.ChatToolsConfig = null,
+    tools: ?antfly_generating_api_openapi.ChatToolsConfig = null,
     /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
-    classification: ?antfly_ai_openapi.ClassificationStepConfig = null,
+    classification: ?antfly_generating_api_openapi.ClassificationStepConfig = null,
     /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
-    generation: ?antfly_ai_openapi.GenerationStepConfig = null,
+    generation: ?antfly_generating_api_openapi.GenerationStepConfig = null,
     /// Configuration for generating follow-up questions. Requires steps.generation to be set.
-    followup: ?antfly_ai_openapi.FollowupStepConfig = null,
+    followup: ?antfly_generating_api_openapi.FollowupStepConfig = null,
     /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
-    confidence: ?antfly_ai_openapi.ConfidenceStepConfig = null,
+    confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
     /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
     eval: ?antfly_eval_openapi.EvalConfig = null,
 };
@@ -906,13 +975,13 @@ pub const RetrievalAgentSteps = struct {
 /// DEPRECATED: Use RetrievalAgentSteps instead. Configuration for the answer agent's pipeline steps.
 pub const AnswerAgentSteps = struct {
     /// Configuration for query classification and transformation.
-    classification: ?antfly_ai_openapi.ClassificationStepConfig = null,
+    classification: ?antfly_generating_api_openapi.ClassificationStepConfig = null,
     /// DEPRECATED: Use steps.generation on RetrievalAgentRequest instead. Configuration for answer generation from retrieved documents.
-    answer: ?antfly_ai_openapi.GenerationStepConfig = null,
+    answer: ?antfly_generating_api_openapi.GenerationStepConfig = null,
     /// Configuration for generating follow-up questions.
-    followup: ?antfly_ai_openapi.FollowupStepConfig = null,
+    followup: ?antfly_generating_api_openapi.FollowupStepConfig = null,
     /// Configuration for confidence assessment.
-    confidence: ?antfly_ai_openapi.ConfidenceStepConfig = null,
+    confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
 };
 
 pub const Embedding = std.json.Value;
@@ -991,7 +1060,7 @@ pub const JoinOperator = enum {
 
 /// Filters to apply to a table before joining.
 pub const JoinFilters = struct {
-    /// Bleve query to filter rows before joining.
+    /// Antfly query to filter rows before joining.
     filter_query: ?std.json.Value = null,
     /// Key prefix filter for the table.
     filter_prefix: ?[]const u8 = null,
@@ -1202,6 +1271,14 @@ pub const ReplicationTransformOp = struct {
     value: ?std.json.Value = null,
 };
 
+/// Typed Zig status view for table data topology and range placement.
+pub const ClusterDataStatus = struct {
+    nodes: ?[]const ClusterDataNodeStatus = null,
+    ranges: ?[]const ClusterDataRangeStatus = null,
+    replicas: ?[]const ClusterDataReplicaStatus = null,
+    groups: ?[]const ClusterDataGroupStatus = null,
+};
+
 pub const ClusterStatus = struct {
     health: ClusterHealth,
     /// Optional message providing details about the health status
@@ -1211,12 +1288,6 @@ pub const ClusterStatus = struct {
     /// Indicates whether the cluster is running in single-node swarm mode
     swarm_mode: ?bool = null,
     secret_store: ?SecretStoreStatus = null,
-};
-
-/// Non-secret status for the local secrets file store, when one is available.
-pub const SecretStoreStatus = struct {
-    /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
-    stale: ?bool = null,
 };
 
 pub const SecretEntry = struct {
@@ -1572,6 +1643,18 @@ pub const ReplicationRoute = struct {
     on_delete: ?[]const ReplicationTransformOp = null,
 };
 
+pub const ClusterTopology = struct {
+    health: ClusterHealth,
+    /// Optional message providing details about the health status
+    message: ?[]const u8 = null,
+    /// Indicates whether authentication is enabled for the cluster
+    auth_enabled: ?bool = null,
+    /// Indicates whether the cluster is running in single-node swarm mode
+    swarm_mode: ?bool = null,
+    secret_store: ?SecretStoreStatus = null,
+    data: ClusterDataStatus,
+};
+
 pub const SecretList = struct {
     secrets: []const SecretEntry,
 };
@@ -1631,13 +1714,13 @@ pub const RetrievalAgentResult = struct {
     /// Clarification questions exposed in the shared bounded-agent envelope.
     questions: ?[]const AgentQuestion = null,
     /// Filters that were applied during retrieval
-    applied_filters: ?[]const antfly_ai_openapi.FilterSpec = null,
+    applied_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
     /// Total number of tool calls made during retrieval
     tool_calls_made: ?i64 = null,
     /// Optional conversational context including tool calls and responses. Decisions remain the authoritative continuation input for bounded agent interactions.
-    messages: ?[]const antfly_ai_openapi.ChatMessage = null,
+    messages: ?[]const antfly_generating_openapi.ChatMessage = null,
     /// Query classification and transformation result. Present when steps.classification was configured. Includes strategy, semantic_query, sub_questions (decompose), step_back_query, and reasoning.
-    classification: ?antfly_ai_openapi.ClassificationTransformationResult = null,
+    classification: ?antfly_generating_api_openapi.ClassificationTransformationResult = null,
     /// Generated response in markdown format. Present when steps.generation was configured.
     generation: ?[]const u8 = null,
     /// Confidence in the generated response (requires steps.confidence)
@@ -1723,7 +1806,7 @@ pub const QueryRequest = struct {
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
     query: ?std.json.Value = null,
-    /// Bleve query for full-text search. Supports all Bleve query types. See bleve-query-openapi.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
+    /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
@@ -1733,9 +1816,9 @@ pub const QueryRequest = struct {
     indexes: ?[]const []const u8 = null,
     /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
     filter_prefix: ?[]const u8 = null,
-    /// Bleve query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See bleve-query-openapi.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"`
+    /// Antfly query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"`
     filter_query: ?std.json.Value = null,
-    /// Bleve query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See bleve-query-openapi.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
+    /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
     exclusion_query: ?std.json.Value = null,
     /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
     aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
@@ -1765,7 +1848,7 @@ pub const QueryRequest = struct {
     count: ?bool = null,
     /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
     profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "termite", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
@@ -1830,7 +1913,7 @@ pub const RetrievalQueryRequest = struct {
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
     query: ?std.json.Value = null,
-    /// Bleve query for full-text search. Supports all Bleve query types. See bleve-query-openapi.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
+    /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
@@ -1840,9 +1923,9 @@ pub const RetrievalQueryRequest = struct {
     indexes: ?[]const []const u8 = null,
     /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
     filter_prefix: ?[]const u8 = null,
-    /// Bleve query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See bleve-query-openapi.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"`
+    /// Antfly query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"`
     filter_query: ?std.json.Value = null,
-    /// Bleve query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See bleve-query-openapi.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
+    /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
     exclusion_query: ?std.json.Value = null,
     /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
     aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
@@ -1872,7 +1955,7 @@ pub const RetrievalQueryRequest = struct {
     count: ?bool = null,
     /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
     profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "termite", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
@@ -1973,11 +2056,11 @@ pub const RetrievalAgentRequest = struct {
     /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available.
     queries: []const RetrievalQueryRequest,
     /// Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
-    messages: ?[]const antfly_ai_openapi.ChatMessage = null,
+    messages: ?[]const antfly_generating_openapi.ChatMessage = null,
     /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
     agent_knowledge: ?[]const u8 = null,
     /// Pre-applied filters from prior interactions. These are applied to all search tool invocations.
-    accumulated_filters: ?[]const antfly_ai_openapi.FilterSpec = null,
+    accumulated_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
     /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
     session_id: ?[]const u8 = null,
     /// Structured answers provided by the user as part of client-carried continuation.
@@ -2061,7 +2144,7 @@ pub const AnswerAgentResult = struct {
     /// Relevance of retrieved documents to the query
     context_relevance: ?f32 = null,
     /// DEPRECATED: Use classification on RetrievalAgentResult instead. Query classification and transformation result.
-    classification_transformation: ?antfly_ai_openapi.ClassificationTransformationResult = null,
+    classification_transformation: ?antfly_generating_api_openapi.ClassificationTransformationResult = null,
     /// DEPRECATED: Use hits on RetrievalAgentResult instead. Query results grouped by table.
     query_results: ?[]const QueryResult = null,
     /// Suggested follow-up questions

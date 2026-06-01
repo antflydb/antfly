@@ -39,7 +39,7 @@ All RAG queries now automatically render documents using TOON format. No configu
 
 ```bash
 # RAG query will use TOON format by default
-curl -X POST http://localhost:8080/api/v1/rag \
+curl -X POST http://localhost:8080/db/v1/rag \
   -H "Content-Type: application/json" \
   -d '{
     "queries": [{
@@ -144,8 +144,8 @@ To use the previous key-value format, specify it explicitly:
 
 ## Implementation Details
 
-- **Default template**: Changed in `lib/ai/genkit.go:320`
-- **Helper function**: Implemented in `lib/template/template.go:103-136`
+- **Default template**: Changed in `go/pkg/antfly/lib/ai/genkit.go:320`
+- **Helper function**: Implemented in `go/pkg/antfly/lib/template/template.go:103-136`
 - **Powered by**: [github.com/alpkeskin/gotoon](https://github.com/alpkeskin/gotoon)
 
 ## See Also

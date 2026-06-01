@@ -154,7 +154,7 @@ function SwitcherItem({
       <span
         aria-hidden
         className={cn(
-          "size-1.5 shrink-0 rounded-full",
+          "size-1.5 shrink-0",
           selected ? "bg-primary" : "bg-transparent",
         )}
       />

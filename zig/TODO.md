@@ -10,10 +10,10 @@ Observed on 2026-05-11:
 
 Latest full-suite status:
 
-- Termite E2E is green:
-  - command: `bash pkg/termite/scripts/debug_metal_command.sh command --timeout 1800 -- e2e/termite/.venv/bin/pytest -q -s e2e/termite`
+- Antfly inference E2E is green:
+  - command: `bash go/pkg/termite/scripts/debug_metal_command.sh command --timeout 1800 -- e2e/inference/.venv/bin/pytest -q -s e2e/inference`
   - result: `63 passed, 31 skipped in 825.24s (0:13:45)`
-  - debug bundle: `pkg/termite/.debug/metal-command-20260510-195358`
+  - debug bundle: `go/pkg/termite/.debug/metal-command-20260510-195358`
 - Antfly Python E2E is green:
   - command: `UV_CACHE_DIR=/tmp/uv-cache ANTFLY_E2E_PRESERVE_ROOT=1 uv run --project e2e/antfly pytest -q e2e/antfly`
   - result: `192 passed, 10 skipped in 1256.92s (0:20:56)`
@@ -82,7 +82,7 @@ Passing / skipped Antfly E2E areas in the latest full run:
 - Full `zig build test` is nightly/manual.
 - Antfly Python E2E is not currently part of the GitHub workflows found in
   `.github/workflows`.
-- Termite standalone and Python E2E coverage is not part of normal PR CI.
+- Antfly inference standalone and Python E2E coverage is not part of normal PR CI.
 - Full OpenAPI codegen drift (`make openapi-check`) is still not suitable for
   CI until all OpenAPI source specs are local to this repository. The safe check
   today is `zig build openapi-root-check`.
@@ -214,7 +214,7 @@ Passing / skipped Antfly E2E areas in the latest full run:
   while keeping handwritten routing where behavior is still moving.
 - [ ] Keep `openapi_contract.zig` as the bundled compatibility/codegen smoke
   test for stable contract slices.
-- [ ] Extend `lib/jsonschema` with deeper semantics such as composition
+- [ ] Extend `go/pkg/antfly/lib/jsonschema` with deeper semantics such as composition
   keywords and advanced constraints.
 - [ ] Finish remaining common-config parity seams:
   - [ ] add typed speech-to-text provider/default handling where it makes sense
@@ -234,7 +234,7 @@ longer tracked as open bring-up work:
 
 - Query-builder API: implemented in `pkg/antfly/src/api/query_builder_agent.zig`
   with HTTP route/client/test coverage.
-- TOON support: implemented under `lib/toon` and exposed through generated
+- TOON support: implemented under `go/pkg/antfly/lib/toon` and exposed through generated
   OpenAPI/template helpers.
 - Full-text schema mapping: runtime schema, dynamic template, and analyzer
   binding work is implemented; only the active migration rebuild bug remains.

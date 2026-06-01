@@ -2,34 +2,46 @@ import { AntflyClient } from "@antfly/sdk";
 import type { ReactNode } from "react";
 import { useState } from "react";
 import { ApiConfigContext } from "@/contexts/api-config-context";
+import { getAntfarmRuntimeConfig } from "@/runtime-config";
 
 const getDefaultApiUrl = () => {
-  return "/api/v1";
+  const configured = getAntfarmRuntimeConfig().apiUrl;
+  if (configured) return configured;
+  return "/db/v1";
 };
 
-const getDefaultTermiteApiUrl = () => {
-  // Termite is served same-origin at /ml/v1 in both the Antfly and Termite views.
+const getDefaultInferenceApiUrl = () => {
+  const configured = getAntfarmRuntimeConfig().inferenceApiUrl;
+  if (configured) return configured;
+  // Antfly inference is served same-origin at /ai/v1 in both dashboard workspaces.
   return "";
 };
 
 const STORAGE_KEY = "antfarm-api-url";
-const TERMITE_STORAGE_KEY = "antfarm-termite-api-url";
+const INFERENCE_STORAGE_KEY = "antfarm-inference-api-url";
 
 export function ApiConfigProvider({ children }: { children: ReactNode }) {
+  const runtimeConfig = getAntfarmRuntimeConfig();
+  const hasRuntimeApiUrl = Boolean(runtimeConfig.apiUrl);
+  const hasRuntimeInferenceApiUrl = Boolean(runtimeConfig.inferenceApiUrl);
+
   // Try to load from localStorage, fallback to default
   const [apiUrl, setApiUrlState] = useState<string>(() => {
+    if (hasRuntimeApiUrl) return getDefaultApiUrl();
     const stored = localStorage.getItem(STORAGE_KEY);
     return stored || getDefaultApiUrl();
   });
 
-  const [termiteApiUrl, setTermiteApiUrlState] = useState<string>(() => {
-    const stored = localStorage.getItem(TERMITE_STORAGE_KEY);
-    return stored || getDefaultTermiteApiUrl();
+  const [inferenceApiUrl, setInferenceApiUrlState] = useState<string>(() => {
+    if (hasRuntimeInferenceApiUrl) return getDefaultInferenceApiUrl();
+    const stored = localStorage.getItem(INFERENCE_STORAGE_KEY);
+    return stored || getDefaultInferenceApiUrl();
   });
 
   const [client, setClient] = useState<AntflyClient>(() => new AntflyClient({ baseUrl: apiUrl }));
 
   const setApiUrl = (url: string) => {
+    if (hasRuntimeApiUrl) return;
     const trimmedUrl = url.trim();
     setApiUrlState(trimmedUrl);
     localStorage.setItem(STORAGE_KEY, trimmedUrl);
@@ -45,16 +57,17 @@ export function ApiConfigProvider({ children }: { children: ReactNode }) {
     setClient(new AntflyClient({ baseUrl: defaultUrl }));
   };
 
-  const setTermiteApiUrl = (url: string) => {
+  const setInferenceApiUrl = (url: string) => {
+    if (hasRuntimeInferenceApiUrl) return;
     const trimmedUrl = url.trim();
-    setTermiteApiUrlState(trimmedUrl);
-    localStorage.setItem(TERMITE_STORAGE_KEY, trimmedUrl);
+    setInferenceApiUrlState(trimmedUrl);
+    localStorage.setItem(INFERENCE_STORAGE_KEY, trimmedUrl);
   };
 
-  const resetTermiteApiUrl = () => {
-    const defaultUrl = getDefaultTermiteApiUrl();
-    setTermiteApiUrlState(defaultUrl);
-    localStorage.removeItem(TERMITE_STORAGE_KEY);
+  const resetInferenceApiUrl = () => {
+    const defaultUrl = getDefaultInferenceApiUrl();
+    setInferenceApiUrlState(defaultUrl);
+    localStorage.removeItem(INFERENCE_STORAGE_KEY);
   };
 
   return (
@@ -64,9 +77,9 @@ export function ApiConfigProvider({ children }: { children: ReactNode }) {
         setApiUrl,
         client,
         resetToDefault,
-        termiteApiUrl,
-        setTermiteApiUrl,
-        resetTermiteApiUrl,
+        inferenceApiUrl,
+        setInferenceApiUrl,
+        resetInferenceApiUrl,
       }}
     >
       {children}

@@ -19,6 +19,7 @@ const shard_state_store = @import("shard_state_store.zig");
 const internal_keys = @import("../../storage/internal_keys.zig");
 const shard_mod = @import("../../storage/shard.zig");
 const db_mod = @import("../../storage/db/db.zig");
+const doc_identity = @import("../../storage/db/doc_identity.zig");
 const db_types = @import("../../storage/db/types.zig");
 const range_state = @import("../../storage/db/range_state.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
@@ -48,6 +49,7 @@ pub fn observeSplitStatus(alloc: std.mem.Allocator, cfg: SyncConfig) !SplitSyncS
     dest_opts.start_index_workers = false;
     var dest_db = try db_mod.DB.open(alloc, cfg.dest_root_dir, dest_opts);
     defer dest_db.close();
+    try validateConfiguredDestinationIdentityNamespace(dest_opts.identity_namespace, &dest_db);
 
     const dest_range = dest_db.getRange();
     const bootstrapped = dest_range.start.len > 0 or dest_range.end.len > 0;
@@ -73,6 +75,11 @@ pub fn observeSplitStatus(alloc: std.mem.Allocator, cfg: SyncConfig) !SplitSyncS
     };
 }
 
+fn validateConfiguredDestinationIdentityNamespace(expected: ?doc_identity.Namespace, db: *const db_mod.DB) !void {
+    const namespace = expected orelse return;
+    if (!db.core.identity_namespace.eql(namespace)) return error.DocIdentityNamespaceMismatch;
+}
+
 pub const MergeConfig = struct {
     donor_root_dir: []const u8,
     receiver_root_dir: []const u8,
@@ -80,6 +87,7 @@ pub const MergeConfig = struct {
     receiver_group_id: u64,
     donor: data_store.RaftApplyStoreConfig = .{ .root_dir = "" },
     receiver: DestinationConfig = .{ .root_dir = "" },
+    receiver_identity_reassignment_namespace: ?doc_identity.Namespace = null,
 };
 
 const merge_state_key = "raftmerge:state";
@@ -97,6 +105,8 @@ const PersistedMergeState = struct {
     receiver_group_id: u64,
     phase: MergeLifecyclePhase,
     receiver_base_range: db_types.ByteRange,
+    allow_doc_identity_reassignment: bool = false,
+    receiver_identity_reassignment_namespace: ?doc_identity.Namespace = null,
 };
 
 pub const SplitTransitionPhase = range_transition.TransitionPhase;
@@ -559,6 +569,8 @@ pub const MergeCoordinator = struct {
     receiver_accepts_donor_range: bool,
     receiver_base_range: db_types.ByteRange,
     merge_phase: MergeLifecyclePhase,
+    allow_doc_identity_reassignment: bool,
+    receiver_identity_reassignment_namespace: ?doc_identity.Namespace,
 
     pub fn init(alloc: std.mem.Allocator, cfg: MergeConfig) !MergeCoordinator {
         const donor_root_dir = try alloc.dupe(u8, cfg.donor_root_dir);
@@ -606,6 +618,11 @@ pub const MergeCoordinator = struct {
                 false,
             .receiver_base_range = base_range,
             .merge_phase = if (persisted) |state| state.phase else .none,
+            .allow_doc_identity_reassignment = if (persisted) |state| state.allow_doc_identity_reassignment else false,
+            .receiver_identity_reassignment_namespace = cfg.receiver_identity_reassignment_namespace orelse if (persisted) |state|
+                state.receiver_identity_reassignment_namespace
+            else
+                null,
         };
     }
 
@@ -629,12 +646,31 @@ pub const MergeCoordinator = struct {
     }
 
     pub fn acceptDonorRange(self: *MergeCoordinator) !void {
+        try self.requireConfiguredReceiverIdentityReassignmentOptIn();
         self.receiver_accepts_donor_range = true;
         self.merge_phase = .accepting;
         try self.persistMergeState();
     }
 
+    pub fn recordDocIdentityReassignmentOptIn(self: *MergeCoordinator) !void {
+        const was_allowed = self.allow_doc_identity_reassignment;
+        self.allow_doc_identity_reassignment = true;
+        if (self.receiver_identity_reassignment_namespace) |namespace| {
+            self.reassignReceiverIdentityNamespace(namespace) catch |err| {
+                if (!was_allowed) self.allow_doc_identity_reassignment = false;
+                return err;
+            };
+        }
+        if (!was_allowed and self.merge_phase != .none) try self.persistMergeState();
+    }
+
+    pub fn reassignReceiverIdentityNamespace(self: *MergeCoordinator, namespace: doc_identity.Namespace) !void {
+        if (!self.allow_doc_identity_reassignment) return error.DocIdentityReassignmentNotAllowed;
+        try self.receiver.db.reassignIdentityNamespaceForInternalTransition(namespace);
+    }
+
     pub fn ensureReceiverBootstrapped(self: *MergeCoordinator) !bool {
+        try self.requireConfiguredReceiverIdentityReassignmentOptIn();
         if (!self.receiver_accepts_donor_range or self.merge_phase == .rolled_back) return false;
         const donor_range = try self.donor.currentRange(self.alloc, self.donor_group_id);
         defer range_state.freeRange(self.alloc, donor_range);
@@ -652,6 +688,7 @@ pub const MergeCoordinator = struct {
     }
 
     pub fn catchUp(self: *MergeCoordinator) !usize {
+        try self.requireConfiguredReceiverIdentityReassignmentOptIn();
         if (!self.receiver_accepts_donor_range or self.merge_phase != .accepting) return 0;
 
         const donor_range = try self.donor.currentRange(self.alloc, self.donor_group_id);
@@ -704,7 +741,7 @@ pub const MergeCoordinator = struct {
             !rangesEqual(receiver_range, self.receiver_base_range);
         const donor_seq = try self.donorAppliedIndex();
         const receiver_seq = try self.receiver.appliedDeltaSequence(self.alloc);
-        return range_transition.deriveMergeStatus(
+        var merge_status = range_transition.deriveMergeStatus(
             self.donor_group_id,
             self.receiver_group_id,
             self.receiver_accepts_donor_range,
@@ -715,6 +752,13 @@ pub const MergeCoordinator = struct {
             self.merge_phase == .finalized,
             self.merge_phase == .rolled_back,
         );
+        merge_status.allow_doc_identity_reassignment = self.allow_doc_identity_reassignment;
+        if (self.receiver_identity_reassignment_namespace) |namespace| {
+            merge_status.receiver_identity_reassignment_namespace_table_id = namespace.table_id;
+            merge_status.receiver_identity_reassignment_namespace_shard_id = namespace.shard_id;
+            merge_status.receiver_identity_reassignment_namespace_range_id = namespace.range_id;
+        }
+        return merge_status;
     }
 
     pub fn syncOnce(self: *MergeCoordinator) !range_transition.MergeStatus {
@@ -724,6 +768,7 @@ pub const MergeCoordinator = struct {
     }
 
     pub fn finalizeMerge(self: *MergeCoordinator) !bool {
+        try self.requireConfiguredReceiverIdentityReassignmentOptIn();
         const transition_status = try self.status();
         if (transition_status.phase != .cutover_ready) return false;
         self.merge_phase = .finalized;
@@ -732,6 +777,7 @@ pub const MergeCoordinator = struct {
     }
 
     pub fn rollbackMerge(self: *MergeCoordinator) !bool {
+        if (self.allow_doc_identity_reassignment) try self.requireConfiguredReceiverIdentityReassignmentOptIn();
         const transition_status = try self.status();
         switch (transition_status.phase) {
             .prepare, .bootstrap_peer, .replay_deltas, .cutover_ready => {},
@@ -772,7 +818,16 @@ pub const MergeCoordinator = struct {
                 .start = self.receiver_base_range.start,
                 .end = self.receiver_base_range.end,
             },
+            .allow_doc_identity_reassignment = self.allow_doc_identity_reassignment,
+            .receiver_identity_reassignment_namespace = self.receiver_identity_reassignment_namespace,
         });
+    }
+
+    fn requireConfiguredReceiverIdentityReassignmentOptIn(self: *MergeCoordinator) !void {
+        if (self.receiver_identity_reassignment_namespace) |namespace| {
+            if (!self.allow_doc_identity_reassignment) return error.DocIdentityReassignmentNotAllowed;
+            try self.reassignReceiverIdentityNamespace(namespace);
+        }
     }
 };
 
@@ -853,6 +908,15 @@ fn encodeMergeState(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator,
     const end_len: u32 = @intCast(state.receiver_base_range.end.len);
     try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u32, end_len)));
     try list.appendSlice(alloc, state.receiver_base_range.end);
+    try list.append(alloc, if (state.allow_doc_identity_reassignment) 1 else 0);
+    if (state.receiver_identity_reassignment_namespace) |namespace| {
+        try list.append(alloc, 1);
+        try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, namespace.table_id)));
+        try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, namespace.shard_id)));
+        try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, namespace.range_id)));
+    } else {
+        try list.append(alloc, 0);
+    }
 }
 
 fn decodeMergeStateAlloc(alloc: std.mem.Allocator, data: []const u8) !PersistedMergeState {
@@ -874,6 +938,25 @@ fn decodeMergeStateAlloc(alloc: std.mem.Allocator, data: []const u8) !PersistedM
     pos += 4;
     if (pos + end_len > data.len) return error.InvalidMergeState;
     const end = try alloc.dupe(u8, data[pos .. pos + end_len]);
+    pos += end_len;
+    const allow_doc_identity_reassignment = if (pos < data.len) blk: {
+        const allowed = data[pos] != 0;
+        pos += 1;
+        break :blk allowed;
+    } else false;
+    const receiver_identity_reassignment_namespace: ?doc_identity.Namespace = if (pos < data.len) blk: {
+        const has_namespace = data[pos] != 0;
+        pos += 1;
+        if (!has_namespace) break :blk null;
+        if (pos + 24 > data.len) return error.InvalidMergeState;
+        const table_id = std.mem.readInt(u64, data[pos..][0..8], .little);
+        pos += 8;
+        const shard_id = std.mem.readInt(u64, data[pos..][0..8], .little);
+        pos += 8;
+        const range_id = std.mem.readInt(u64, data[pos..][0..8], .little);
+        pos += 8;
+        break :blk .{ .table_id = table_id, .shard_id = shard_id, .range_id = range_id };
+    } else null;
     return .{
         .donor_group_id = donor_group_id,
         .receiver_group_id = receiver_group_id,
@@ -882,6 +965,8 @@ fn decodeMergeStateAlloc(alloc: std.mem.Allocator, data: []const u8) !PersistedM
             .start = start,
             .end = end,
         },
+        .allow_doc_identity_reassignment = allow_doc_identity_reassignment,
+        .receiver_identity_reassignment_namespace = receiver_identity_reassignment_namespace,
     };
 }
 
@@ -1131,6 +1216,111 @@ test "db split sync coordinator resumes catch-up across source and destination r
         try std.testing.expectEqualStrings("{\"v\":\"right-2\"}", x);
         try std.testing.expect((try coord.dest.get(std.testing.allocator, "doc:c")) == null);
     }
+}
+
+test "db split sync coordinator allocates destination identity namespace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-identity-src", .{tmp.sub_path});
+    defer std.testing.allocator.free(src_root);
+    const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-identity-dst", .{tmp.sub_path});
+    defer std.testing.allocator.free(dst_root);
+
+    {
+        var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+        defer source.deinit();
+        const setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
+            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_start:7022:doc:m") },
+        });
+        defer std.testing.allocator.free(setup);
+        try source.snapshotBuilder().applyBatch(.{
+            .group_id = 7021,
+            .commit_index = 4,
+            .entries_bytes = setup,
+        });
+    }
+
+    const destination_namespace = doc_identity.Namespace{
+        .table_id = 70,
+        .shard_id = 7022,
+        .range_id = 9102,
+    };
+    var coord = try SyncCoordinator.init(std.testing.allocator, .{
+        .source_root_dir = src_root,
+        .dest_root_dir = dst_root,
+        .source_group_id = 7021,
+        .dest_group_id = 7022,
+        .dest = .{ .root_dir = dst_root, .db = .{ .identity_namespace = destination_namespace } },
+    });
+    defer coord.deinit();
+
+    const result = try coord.syncOnce();
+    try std.testing.expect(result.bootstrapped);
+    const value = (try coord.dest.get(std.testing.allocator, "doc:t")) orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("{\"v\":\"right-0\"}", value);
+
+    const stats = try coord.dest.db.stats(std.testing.allocator);
+    try std.testing.expectEqual(destination_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(destination_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(destination_namespace.range_id, stats.doc_identity.namespace_range_id);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.allocated_ordinals);
+    try std.testing.expect(!stats.doc_identity.rebuild_required);
+}
+
+test "db split status rejects stale destination identity namespace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-stale-identity-src", .{tmp.sub_path});
+    defer std.testing.allocator.free(src_root);
+    const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-stale-identity-dst", .{tmp.sub_path});
+    defer std.testing.allocator.free(dst_root);
+
+    {
+        var source = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = src_root });
+        defer source.deinit();
+    }
+
+    const stale_namespace = doc_identity.Namespace{
+        .table_id = 70,
+        .shard_id = 7022,
+        .range_id = 9101,
+    };
+    const expected_namespace = doc_identity.Namespace{
+        .table_id = 70,
+        .shard_id = 7022,
+        .range_id = 9102,
+    };
+    {
+        var dest = try Destination.init(std.testing.allocator, .{
+            .root_dir = dst_root,
+            .db = .{ .identity_namespace = stale_namespace },
+        });
+        defer dest.deinit();
+        try dest.db.batch(.{
+            .writes = &.{.{ .key = "doc:t", .value = "{\"v\":\"right-0\"}" }},
+        });
+    }
+
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, observeSplitStatus(std.testing.allocator, .{
+        .source_root_dir = src_root,
+        .dest_root_dir = dst_root,
+        .source_group_id = 7021,
+        .dest_group_id = 7022,
+        .source = .{ .root_dir = src_root },
+        .dest = .{
+            .root_dir = dst_root,
+            .db = .{
+                .identity_namespace = expected_namespace,
+                .prefer_existing_identity_namespace = true,
+            },
+        },
+    }));
 }
 
 test "db split sync coordinator tracks explicit split transition phases" {
@@ -1465,6 +1655,7 @@ test "db merge coordinator finalize persists across reopen" {
         });
         defer coord.deinit();
 
+        try coord.recordDocIdentityReassignmentOptIn();
         try coord.acceptDonorRange();
         _ = try coord.syncOnce();
         try std.testing.expect(try coord.finalizeMerge());
@@ -1481,7 +1672,295 @@ test "db merge coordinator finalize persists across reopen" {
         const status = try reopened.status();
         try std.testing.expectEqual(range_transition.TransitionPhase.finalized, status.phase);
         try std.testing.expect(status.receiver_ready_for_reads);
+        try std.testing.expect(reopened.allow_doc_identity_reassignment);
+        try std.testing.expect(status.allow_doc_identity_reassignment);
     }
+}
+
+test "db merge coordinator reassigns receiver identity namespace only after opt-in" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-reassign-donor", .{tmp.sub_path});
+    defer std.testing.allocator.free(donor_root);
+    const receiver_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-reassign-receiver", .{tmp.sub_path});
+    defer std.testing.allocator.free(receiver_root);
+
+    var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
+    defer donor.deinit();
+
+    const old_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 191,
+        .range_id = 9001,
+    };
+    const new_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 191,
+        .range_id = 9002,
+    };
+    const receiver_db_options = db_mod.OpenOptions{ .identity_namespace = old_namespace };
+
+    {
+        var receiver = try Destination.init(std.testing.allocator, .{
+            .root_dir = receiver_root,
+            .db = receiver_db_options,
+        });
+        defer receiver.deinit();
+        try receiver.db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:b", .value = "{\"v\":\"receiver\"}" },
+            },
+        });
+    }
+
+    var coord = try MergeCoordinator.init(std.testing.allocator, .{
+        .donor_root_dir = donor_root,
+        .receiver_root_dir = receiver_root,
+        .donor_group_id = 190,
+        .receiver_group_id = 191,
+        .receiver = .{
+            .root_dir = receiver_root,
+            .db = receiver_db_options,
+        },
+    });
+    defer coord.deinit();
+
+    try std.testing.expectError(error.DocIdentityReassignmentNotAllowed, coord.reassignReceiverIdentityNamespace(new_namespace));
+
+    try coord.recordDocIdentityReassignmentOptIn();
+    try coord.reassignReceiverIdentityNamespace(new_namespace);
+
+    const stats = try coord.receiver.db.runtimeStatusStatsConsistent(std.testing.allocator);
+    try std.testing.expectEqual(new_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(new_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(new_namespace.range_id, stats.doc_identity.namespace_range_id);
+
+    var txn = try coord.receiver.db.core.store.beginProbeTxn();
+    defer txn.abort();
+    const ordinal = (try doc_identity.lookupOrdinalTxn(std.testing.allocator, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+    const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:b"), state.canonical_doc_id);
+}
+
+test "db merge coordinator opt-in applies configured receiver identity namespace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-reassign-target-donor", .{tmp.sub_path});
+    defer std.testing.allocator.free(donor_root);
+    const receiver_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-reassign-target-receiver", .{tmp.sub_path});
+    defer std.testing.allocator.free(receiver_root);
+
+    var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
+    defer donor.deinit();
+
+    const old_namespace = doc_identity.Namespace{
+        .table_id = 8,
+        .shard_id = 291,
+        .range_id = 9101,
+    };
+    const target_namespace = doc_identity.Namespace{
+        .table_id = 8,
+        .shard_id = 291,
+        .range_id = 9102,
+    };
+    const receiver_db_options = db_mod.OpenOptions{ .identity_namespace = old_namespace };
+
+    {
+        var receiver = try Destination.init(std.testing.allocator, .{
+            .root_dir = receiver_root,
+            .db = receiver_db_options,
+        });
+        defer receiver.deinit();
+        try receiver.db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:b", .value = "{\"v\":\"receiver\"}" },
+            },
+        });
+    }
+
+    var coord = try MergeCoordinator.init(std.testing.allocator, .{
+        .donor_root_dir = donor_root,
+        .receiver_root_dir = receiver_root,
+        .donor_group_id = 290,
+        .receiver_group_id = 291,
+        .receiver = .{
+            .root_dir = receiver_root,
+            .db = receiver_db_options,
+        },
+        .receiver_identity_reassignment_namespace = target_namespace,
+    });
+    defer coord.deinit();
+
+    try std.testing.expectError(error.DocIdentityReassignmentNotAllowed, coord.acceptDonorRange());
+    try std.testing.expect(!coord.allow_doc_identity_reassignment);
+
+    try coord.recordDocIdentityReassignmentOptIn();
+
+    const stats = try coord.receiver.db.runtimeStatusStatsConsistent(std.testing.allocator);
+    try std.testing.expectEqual(target_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(target_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(target_namespace.range_id, stats.doc_identity.namespace_range_id);
+    try std.testing.expect(coord.allow_doc_identity_reassignment);
+
+    var txn = try coord.receiver.db.core.store.beginProbeTxn();
+    defer txn.abort();
+    const ordinal = (try doc_identity.lookupOrdinalTxn(std.testing.allocator, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+    const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:b"), state.canonical_doc_id);
+
+    try coord.acceptDonorRange();
+    const status = try coord.status();
+    try std.testing.expect(status.allow_doc_identity_reassignment);
+    try std.testing.expectEqual(target_namespace.table_id, status.receiver_identity_reassignment_namespace_table_id);
+    try std.testing.expectEqual(target_namespace.shard_id, status.receiver_identity_reassignment_namespace_shard_id);
+    try std.testing.expectEqual(target_namespace.range_id, status.receiver_identity_reassignment_namespace_range_id);
+    {
+        var reopened = try MergeCoordinator.init(std.testing.allocator, .{
+            .donor_root_dir = donor_root,
+            .receiver_root_dir = receiver_root,
+            .donor_group_id = 290,
+            .receiver_group_id = 291,
+            .receiver = .{
+                .root_dir = receiver_root,
+                .db = .{
+                    .identity_namespace = target_namespace,
+                    .prefer_existing_identity_namespace = true,
+                },
+            },
+            .receiver_identity_reassignment_namespace = target_namespace,
+        });
+        defer reopened.deinit();
+        try std.testing.expect(reopened.allow_doc_identity_reassignment);
+        const reopened_stats = try reopened.receiver.db.runtimeStatusStatsConsistent(std.testing.allocator);
+        try std.testing.expectEqual(target_namespace.table_id, reopened_stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(target_namespace.shard_id, reopened_stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(target_namespace.range_id, reopened_stats.doc_identity.namespace_range_id);
+    }
+
+    {
+        var reopened = try MergeCoordinator.init(std.testing.allocator, .{
+            .donor_root_dir = donor_root,
+            .receiver_root_dir = receiver_root,
+            .donor_group_id = 290,
+            .receiver_group_id = 291,
+            .receiver = .{
+                .root_dir = receiver_root,
+                .db = .{
+                    .identity_namespace = old_namespace,
+                    .prefer_existing_identity_namespace = true,
+                },
+            },
+        });
+        defer reopened.deinit();
+        try std.testing.expect(reopened.allow_doc_identity_reassignment);
+        const reopened_status = try reopened.status();
+        try std.testing.expect(reopened_status.allow_doc_identity_reassignment);
+        try std.testing.expectEqual(target_namespace.table_id, reopened_status.receiver_identity_reassignment_namespace_table_id);
+        try std.testing.expectEqual(target_namespace.shard_id, reopened_status.receiver_identity_reassignment_namespace_shard_id);
+        try std.testing.expectEqual(target_namespace.range_id, reopened_status.receiver_identity_reassignment_namespace_range_id);
+        const recovered_namespace = reopened.receiver_identity_reassignment_namespace orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(target_namespace.table_id, recovered_namespace.table_id);
+        try std.testing.expectEqual(target_namespace.shard_id, recovered_namespace.shard_id);
+        try std.testing.expectEqual(target_namespace.range_id, recovered_namespace.range_id);
+    }
+}
+
+test "db merge coordinator allocates donor docs in receiver identity namespace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-identity-donor", .{tmp.sub_path});
+    defer std.testing.allocator.free(donor_root);
+    const receiver_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-identity-receiver", .{tmp.sub_path});
+    defer std.testing.allocator.free(receiver_root);
+
+    var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
+    defer donor.deinit();
+    const donor_setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"donor\"}") },
+    });
+    defer std.testing.allocator.free(donor_setup);
+    try donor.snapshotBuilder().applyBatch(.{
+        .group_id = 171,
+        .commit_index = 2,
+        .entries_bytes = donor_setup,
+    });
+
+    const receiver_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 172,
+        .range_id = 9002,
+    };
+    const receiver_db_options = db_mod.OpenOptions{ .identity_namespace = receiver_namespace };
+
+    {
+        var receiver = try Destination.init(std.testing.allocator, .{
+            .root_dir = receiver_root,
+            .db = receiver_db_options,
+        });
+        defer receiver.deinit();
+        try receiver.db.updateRange(.{ .start = "doc:a", .end = "doc:m" });
+        try receiver.db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:b", .value = "{\"v\":\"receiver\"}" },
+            },
+        });
+    }
+
+    var coord = try MergeCoordinator.init(std.testing.allocator, .{
+        .donor_root_dir = donor_root,
+        .receiver_root_dir = receiver_root,
+        .donor_group_id = 171,
+        .receiver_group_id = 172,
+        .receiver = .{
+            .root_dir = receiver_root,
+            .db = receiver_db_options,
+        },
+    });
+    defer coord.deinit();
+
+    try coord.acceptDonorRange();
+    _ = try coord.syncOnce();
+
+    const stats = try coord.receiver.db.runtimeStatusStatsConsistent(std.testing.allocator);
+    try std.testing.expectEqual(receiver_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(receiver_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(receiver_namespace.range_id, stats.doc_identity.namespace_range_id);
+
+    var txn = try coord.receiver.db.core.store.beginProbeTxn();
+    defer txn.abort();
+    const donor_ordinal = (try doc_identity.lookupOrdinalTxn(std.testing.allocator, &txn, "doc:t")) orelse return error.TestUnexpectedResult;
+    const donor_state = (try doc_identity.lookupStateTxn(&txn, donor_ordinal)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(receiver_namespace, "doc:t"), donor_state.canonical_doc_id);
+    try std.testing.expect(donor_state.isLive());
+
+    const receiver_ordinal = (try doc_identity.lookupOrdinalTxn(std.testing.allocator, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(receiver_ordinal != donor_ordinal);
+
+    var filtered = try coord.receiver.db.search(std.testing.allocator, .{
+        .query = .{ .match_all = {} },
+        .filter_doc_ids = &.{"doc:t"},
+        .filter_doc_ids_positive = true,
+        .limit = 10,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqualStrings("doc:t", filtered.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, donor_ordinal), filtered.hits[0].doc_ordinal);
+
+    var receiver_filtered = try coord.receiver.db.search(std.testing.allocator, .{
+        .query = .{ .match_all = {} },
+        .filter_doc_ids = &.{"doc:b"},
+        .filter_doc_ids_positive = true,
+        .limit = 10,
+    });
+    defer receiver_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), receiver_filtered.total_hits);
+    try std.testing.expectEqualStrings("doc:b", receiver_filtered.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, receiver_ordinal), receiver_filtered.hits[0].doc_ordinal);
 }
 
 test "db merge coordinator rollback restores receiver base range" {
@@ -1554,5 +2033,118 @@ test "db merge coordinator rollback restores receiver base range" {
         try std.testing.expectEqual(range_transition.TransitionPhase.rolled_back, status.phase);
         try std.testing.expectEqualStrings("doc:a", reopened.receiver.getRange().start);
         try std.testing.expectEqualStrings("doc:m", reopened.receiver.getRange().end);
+    }
+}
+
+test "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-rollback-reassign-donor", .{tmp.sub_path});
+    defer std.testing.allocator.free(donor_root);
+    const receiver_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-rollback-reassign-receiver", .{tmp.sub_path});
+    defer std.testing.allocator.free(receiver_root);
+
+    const old_namespace = doc_identity.Namespace{
+        .table_id = 10,
+        .shard_id = 262,
+        .range_id = 9201,
+    };
+    const target_namespace = doc_identity.Namespace{
+        .table_id = 10,
+        .shard_id = 262,
+        .range_id = 9202,
+    };
+
+    var donor = try data_store.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
+    defer donor.deinit();
+    const donor_setup = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"donor\"}") },
+    });
+    defer std.testing.allocator.free(donor_setup);
+    try donor.snapshotBuilder().applyBatch(.{
+        .group_id = 261,
+        .commit_index = 2,
+        .entries_bytes = donor_setup,
+    });
+
+    {
+        var receiver = try Destination.init(std.testing.allocator, .{
+            .root_dir = receiver_root,
+            .db = .{ .identity_namespace = old_namespace },
+        });
+        defer receiver.deinit();
+        try receiver.db.updateRange(.{ .start = "doc:a", .end = "doc:m" });
+        try receiver.db.batch(.{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"v\":\"receiver\"}" }},
+        });
+    }
+
+    {
+        var coord = try MergeCoordinator.init(std.testing.allocator, .{
+            .donor_root_dir = donor_root,
+            .receiver_root_dir = receiver_root,
+            .donor_group_id = 261,
+            .receiver_group_id = 262,
+            .receiver = .{
+                .root_dir = receiver_root,
+                .db = .{
+                    .identity_namespace = old_namespace,
+                    .prefer_existing_identity_namespace = true,
+                },
+            },
+            .receiver_identity_reassignment_namespace = target_namespace,
+        });
+        defer coord.deinit();
+
+        try coord.recordDocIdentityReassignmentOptIn();
+        try coord.acceptDonorRange();
+        _ = try coord.syncOnce();
+    }
+
+    {
+        var reopened = try MergeCoordinator.init(std.testing.allocator, .{
+            .donor_root_dir = donor_root,
+            .receiver_root_dir = receiver_root,
+            .donor_group_id = 261,
+            .receiver_group_id = 262,
+            .receiver = .{
+                .root_dir = receiver_root,
+                .db = .{
+                    .identity_namespace = old_namespace,
+                    .prefer_existing_identity_namespace = true,
+                },
+            },
+        });
+        defer reopened.deinit();
+
+        try std.testing.expect(reopened.allow_doc_identity_reassignment);
+        const recovered_namespace = reopened.receiver_identity_reassignment_namespace orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(target_namespace.table_id, recovered_namespace.table_id);
+        try std.testing.expectEqual(target_namespace.shard_id, recovered_namespace.shard_id);
+        try std.testing.expectEqual(target_namespace.range_id, recovered_namespace.range_id);
+        try std.testing.expect(try reopened.rollbackMerge());
+
+        const status = try reopened.status();
+        try std.testing.expectEqual(range_transition.TransitionPhase.rolled_back, status.phase);
+        try std.testing.expectEqualStrings("doc:a", reopened.receiver.getRange().start);
+        try std.testing.expectEqualStrings("doc:m", reopened.receiver.getRange().end);
+        try std.testing.expect((try reopened.receiver.get(std.testing.allocator, "doc:t")) == null);
+
+        const receiver_doc = (try reopened.receiver.get(std.testing.allocator, "doc:b")) orelse return error.TestExpectedEqual;
+        defer std.testing.allocator.free(receiver_doc);
+        try std.testing.expectEqualStrings("{\"v\":\"receiver\"}", receiver_doc);
+
+        const stats = try reopened.receiver.db.runtimeStatusStatsConsistent(std.testing.allocator);
+        try std.testing.expectEqual(target_namespace.table_id, stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(target_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(target_namespace.range_id, stats.doc_identity.namespace_range_id);
+
+        var txn = try reopened.receiver.db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(std.testing.allocator, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:b"), state.canonical_doc_id);
     }
 }

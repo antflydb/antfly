@@ -4,7 +4,7 @@
  */
 
 import createClient, { type Client } from "openapi-fetch";
-import type { paths } from "./antfly-api.js";
+import type { paths } from "./public-api.js";
 import type {
   AntflyAuth,
   AntflyConfig,
@@ -30,14 +30,76 @@ import type {
   RetrievalAgentStreamCallbacks,
   ScanKeysRequest,
   TableSchema,
+  User,
 } from "./types.js";
+
+type UserOperations = {
+  getCurrentUser: () => Promise<CurrentUser | undefined>;
+  list: () => Promise<UserSummary[] | undefined>;
+  get: (userName: string) => Promise<User | undefined>;
+  create: (userName: string, request: CreateUserRequest) => Promise<User | undefined>;
+  delete: (userName: string) => Promise<boolean>;
+  updatePassword: (userName: string, newPassword: string) => Promise<SuccessMessage | undefined>;
+  getPermissions: (userName: string) => Promise<Permission[] | undefined>;
+  addPermission: (userName: string, permission: Permission) => Promise<SuccessMessage | undefined>;
+  removePermission: (
+    userName: string,
+    resource: string,
+    resourceType: ResourceType
+  ) => Promise<boolean>;
+};
+
+type CurrentUser = {
+  username?: string;
+  permissions?: Permission[];
+  metadata?: Record<string, unknown> | null;
+};
+
+type UserSummary = {
+  username?: string;
+};
+
+type SuccessMessage = {
+  message?: string;
+};
+
+type ClusterTopology = paths["/db/v1/cluster"]["get"]["responses"][200]["content"]["application/json"];
+
+function apiErrorMessage(error: unknown, fallback = "unknown error"): string {
+  if (!error) return fallback;
+  if (typeof error === "string") return error.trim() || fallback;
+  if (error && typeof error === "object") {
+    const fields = error as {
+      error?: unknown;
+      detail?: unknown;
+      message?: unknown;
+      title?: unknown;
+    };
+    for (const value of [fields.error, fields.detail, fields.message, fields.title]) {
+      if (typeof value === "string" && value.trim()) return value;
+    }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return fallback;
+    }
+  }
+  return String(error);
+}
+
+function errorMessage(error: unknown): string {
+  return apiErrorMessage(error);
+}
 
 export class AntflyClient {
   private client: Client<paths>;
   private config: AntflyConfig;
 
   constructor(config: AntflyConfig) {
-    this.config = config;
+    this.config = {
+      ...config,
+      baseUrl: normalizeBaseUrl(config.baseUrl),
+    };
     this.client = this.buildClient();
   }
 
@@ -55,7 +117,7 @@ export class AntflyClient {
           return `Basic ${btoa(`${auth.username}:${auth.password}`)}`;
         case "apiKey":
           return `ApiKey ${btoa(`${auth.keyId}:${auth.keySecret}`)}`;
-        case "bearer":
+        case "token":
           return `Bearer ${auth.token}`;
       }
     }
@@ -79,7 +141,7 @@ export class AntflyClient {
     }
 
     return createClient<paths>({
-      baseUrl: this.config.baseUrl,
+      baseUrl: normalizeBaseUrl(this.config.baseUrl),
       headers,
       bodySerializer: (body) => {
         if (typeof body === "string") {
@@ -92,7 +154,7 @@ export class AntflyClient {
 
   /**
    * Update authentication credentials.
-   * Accepts any auth type: basic (username/password), apiKey, or bearer.
+   * Accepts any auth type: basic (username/password), apiKey, or token.
    * For backwards compat, calling setAuth(username, password) still works.
    */
   setAuth(auth: AntflyAuth): void;
@@ -110,8 +172,17 @@ export class AntflyClient {
    * Get cluster status
    */
   async getStatus() {
-    const { data, error } = await this.client.GET("/status");
-    if (error) throw new Error(`Failed to get status: ${error.error}`);
+    const { data, error } = await this.client.GET("/db/v1/status");
+    if (error) throw new Error(`Failed to get status: ${errorMessage(error)}`);
+    return data;
+  }
+
+  /**
+   * Get cluster topology and data placement status.
+   */
+  async getClusterStatus(): Promise<ClusterTopology | undefined> {
+    const { data, error } = await this.client.GET("/db/v1/cluster");
+    if (error) throw new Error(`Failed to get cluster: ${errorMessage(error)}`);
     return data;
   }
 
@@ -119,19 +190,19 @@ export class AntflyClient {
    * Private helper for query requests to avoid code duplication
    */
   private async performQuery(
-    path: "/query" | "/tables/{tableName}/query",
+    path: "/db/v1/query" | "/db/v1/tables/{tableName}/query",
     request: QueryRequest,
     tableName?: string
   ): Promise<QueryResponses | undefined> {
-    if (path === "/tables/{tableName}/query" && tableName) {
-      const { data, error } = await this.client.POST("/tables/{tableName}/query", {
+    if (path === "/db/v1/tables/{tableName}/query" && tableName) {
+      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName } },
         body: request,
       });
       if (error) throw new Error(`Table query failed: ${error.error}`);
       return data;
     } else {
-      const { data, error } = await this.client.POST("/query", {
+      const { data, error } = await this.client.POST("/db/v1/query", {
         body: request,
       });
       if (error) throw new Error(`Query failed: ${error.error}`);
@@ -143,14 +214,14 @@ export class AntflyClient {
    * Private helper for multiquery requests to avoid code duplication
    */
   private async performMultiquery(
-    path: "/query" | "/tables/{tableName}/query",
+    path: "/db/v1/query" | "/db/v1/tables/{tableName}/query",
     requests: QueryRequest[],
     tableName?: string
   ): Promise<QueryResponses | undefined> {
     const ndjson = `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`;
 
-    if (path === "/tables/{tableName}/query" && tableName) {
-      const { data, error } = await this.client.POST("/tables/{tableName}/query", {
+    if (path === "/db/v1/tables/{tableName}/query" && tableName) {
+      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName } },
         body: ndjson,
         headers: {
@@ -160,7 +231,7 @@ export class AntflyClient {
       if (error) throw new Error(`Table multi-query failed: ${error.error}`);
       return data;
     } else {
-      const { data, error } = await this.client.POST("/query", {
+      const { data, error } = await this.client.POST("/db/v1/query", {
         body: ndjson,
         headers: {
           "Content-Type": "application/x-ndjson",
@@ -175,7 +246,7 @@ export class AntflyClient {
    * Global query operations
    */
   async query(request: QueryRequest): Promise<QueryResult | undefined> {
-    const data = await this.performQuery("/query", request);
+    const data = await this.performQuery("/db/v1/query", request);
     // The global query returns QueryResponses, extract the first result
     return data?.responses?.[0];
   }
@@ -184,7 +255,7 @@ export class AntflyClient {
    * Execute multiple queries in a single request
    */
   async multiquery(requests: QueryRequest[]): Promise<QueryResponses | undefined> {
-    return this.performMultiquery("/query", requests);
+    return this.performMultiquery("/db/v1/query", requests);
   }
 
   /**
@@ -209,12 +280,15 @@ export class AntflyClient {
     Object.assign(headers, this.config.headers);
 
     const abortController = new AbortController();
-    const response = await fetch(`${this.config.baseUrl}/agents/retrieval`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(request),
-      signal: abortController.signal,
-    });
+    const response = await fetch(
+      `${normalizeBaseUrl(this.config.baseUrl)}/db/v1/agents/retrieval`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request),
+        signal: abortController.signal,
+      }
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -476,12 +550,12 @@ export class AntflyClient {
    * @returns Promise with QueryBuilderResult containing the generated query, explanation, and confidence
    */
   async queryBuilderAgent(request: QueryBuilderRequest): Promise<QueryBuilderResult> {
-    const { data, error } = await this.client.POST("/agents/query-builder", {
+    const { data, error } = await this.client.POST("/db/v1/agents/query-builder", {
       body: request,
     });
     if (error) throw new Error(`Query builder agent failed: ${error.error}`);
     // biome-ignore lint/style/noNonNullAssertion: data is guaranteed defined after error check
-    return data!;
+    return data! as unknown as QueryBuilderResult;
   }
 
   /**
@@ -492,7 +566,7 @@ export class AntflyClient {
      * List all tables
      */
     list: async (params?: { prefix?: string; pattern?: string }) => {
-      const { data, error } = await this.client.GET("/tables", {
+      const { data, error } = await this.client.GET("/db/v1/tables", {
         params: params ? { query: params } : undefined,
       });
       if (error) throw new Error(`Failed to list tables: ${error.error}`);
@@ -503,7 +577,7 @@ export class AntflyClient {
      * Get table details and status
      */
     get: async (tableName: string) => {
-      const { data, error } = await this.client.GET("/tables/{tableName}", {
+      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });
       if (error) throw new Error(`Failed to get table: ${error.error}`);
@@ -514,11 +588,13 @@ export class AntflyClient {
      * Create a new table
      */
     create: async (tableName: string, config: CreateTableRequest = {}) => {
-      const { data, error } = await this.client.POST("/tables/{tableName}", {
+      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
         body: config,
       });
-      if (error) throw new Error(`Failed to create table: ${error.error}`);
+      if (error) {
+        throw new Error(`Failed to create table: ${apiErrorMessage(error, "unknown error")}`);
+      }
       return data;
     },
 
@@ -526,7 +602,7 @@ export class AntflyClient {
      * Drop a table
      */
     drop: async (tableName: string) => {
-      const { error } = await this.client.DELETE("/tables/{tableName}", {
+      const { error } = await this.client.DELETE("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });
       if (error) throw new Error(`Failed to drop table: ${error.error}`);
@@ -537,7 +613,7 @@ export class AntflyClient {
      * Update schema for a table
      */
     updateSchema: async (tableName: string, config: TableSchema) => {
-      const { data, error } = await this.client.PUT("/tables/{tableName}/schema", {
+      const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
         params: { path: { tableName } },
         body: config,
       });
@@ -549,21 +625,21 @@ export class AntflyClient {
      * Query a specific table
      */
     query: async (tableName: string, request: QueryRequest) => {
-      return this.performQuery("/tables/{tableName}/query", request, tableName);
+      return this.performQuery("/db/v1/tables/{tableName}/query", request, tableName);
     },
 
     /**
      * Execute multiple queries on a specific table
      */
     multiquery: async (tableName: string, requests: QueryRequest[]) => {
-      return this.performMultiquery("/tables/{tableName}/query", requests, tableName);
+      return this.performMultiquery("/db/v1/tables/{tableName}/query", requests, tableName);
     },
 
     /**
      * Perform batch operations on a table
      */
     batch: async (tableName: string, request: BatchRequest) => {
-      const { data, error } = await this.client.POST("/tables/{tableName}/batch", {
+      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/batch", {
         params: { path: { tableName } },
         // @ts-expect-error Our BatchRequest type allows any object shape for inserts
         body: request,
@@ -576,7 +652,7 @@ export class AntflyClient {
      * Backup a table
      */
     backup: async (tableName: string, request: BackupRequest) => {
-      const { data, error } = await this.client.POST("/tables/{tableName}/backup", {
+      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/backup", {
         params: { path: { tableName } },
         body: request,
       });
@@ -588,7 +664,7 @@ export class AntflyClient {
      * Restore a table from backup
      */
     restore: async (tableName: string, request: RestoreRequest) => {
-      const { data, error } = await this.client.POST("/tables/{tableName}/restore", {
+      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/restore", {
         params: { path: { tableName } },
         body: request,
       });
@@ -604,7 +680,7 @@ export class AntflyClient {
      * @param options.fields - Comma-separated list of fields to include (e.g., "title,author,metadata.tags")
      */
     lookup: async (tableName: string, key: string, options?: { fields?: string }) => {
-      const { data, error } = await this.client.GET("/tables/{tableName}/lookup/{key}", {
+      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}/lookup/{key}", {
         params: {
           path: { tableName, key },
           query: options?.fields ? { fields: options.fields } : undefined,
@@ -642,11 +718,14 @@ export class AntflyClient {
         // Merge with any additional headers
         Object.assign(headers, config.headers);
 
-        const response = await fetch(`${config.baseUrl}/tables/${tableName}/lookup`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(request || {}),
-        });
+        const response = await fetch(
+          `${normalizeBaseUrl(config.baseUrl)}/db/v1/tables/${tableName}/lookup`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify(request || {}),
+          }
+        );
 
         if (!response.ok) {
           const errorText = await response.text();
@@ -712,7 +791,7 @@ export class AntflyClient {
      * List all indexes for a table
      */
     list: async (tableName: string) => {
-      const { data, error } = await this.client.GET("/tables/{tableName}/indexes", {
+      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}/indexes", {
         params: { path: { tableName } },
       });
       if (error) throw new Error(`Failed to list indexes: ${error.error}`);
@@ -723,9 +802,12 @@ export class AntflyClient {
      * Get index details
      */
     get: async (tableName: string, indexName: string) => {
-      const { data, error } = await this.client.GET("/tables/{tableName}/indexes/{indexName}", {
-        params: { path: { tableName, indexName } },
-      });
+      const { data, error } = await this.client.GET(
+        "/db/v1/tables/{tableName}/indexes/{indexName}",
+        {
+          params: { path: { tableName, indexName } },
+        }
+      );
       if (error) throw new Error(`Failed to get index: ${error.error}`);
       return data;
     },
@@ -734,7 +816,7 @@ export class AntflyClient {
      * Create a new index
      */
     create: async (tableName: string, config: IndexConfig) => {
-      const { error } = await this.client.POST("/tables/{tableName}/indexes/{indexName}", {
+      const { error } = await this.client.POST("/db/v1/tables/{tableName}/indexes/{indexName}", {
         params: { path: { tableName, indexName: config.name } },
         body: config,
       });
@@ -746,7 +828,7 @@ export class AntflyClient {
      * Drop an index
      */
     drop: async (tableName: string, indexName: string) => {
-      const { error } = await this.client.DELETE("/tables/{tableName}/indexes/{indexName}", {
+      const { error } = await this.client.DELETE("/db/v1/tables/{tableName}/indexes/{indexName}", {
         params: { path: { tableName, indexName } },
       });
       if (error) throw new Error(`Failed to drop index: ${error.error}`);
@@ -757,12 +839,12 @@ export class AntflyClient {
   /**
    * User management operations
    */
-  users = {
+  users: UserOperations = {
     /**
      * Get current authenticated user
      */
     getCurrentUser: async () => {
-      const { data, error } = await this.client.GET("/users/me");
+      const { data, error } = await this.client.GET("/auth/v1/me");
       if (error) throw new Error(`Failed to get current user: ${error.error}`);
       return data;
     },
@@ -771,7 +853,7 @@ export class AntflyClient {
      * List all users
      */
     list: async () => {
-      const { data, error } = await this.client.GET("/users");
+      const { data, error } = await this.client.GET("/auth/v1/users");
       if (error) throw new Error(`Failed to list users: ${error.error}`);
       return data;
     },
@@ -780,7 +862,7 @@ export class AntflyClient {
      * Get user details
      */
     get: async (userName: string) => {
-      const { data, error } = await this.client.GET("/users/{userName}", {
+      const { data, error } = await this.client.GET("/auth/v1/users/{userName}", {
         params: { path: { userName } },
       });
       if (error) throw new Error(`Failed to get user: ${error.error}`);
@@ -791,7 +873,7 @@ export class AntflyClient {
      * Create a new user
      */
     create: async (userName: string, request: CreateUserRequest) => {
-      const { data, error } = await this.client.POST("/users/{userName}", {
+      const { data, error } = await this.client.POST("/auth/v1/users/{userName}", {
         params: { path: { userName } },
         body: request,
       });
@@ -803,7 +885,7 @@ export class AntflyClient {
      * Delete a user
      */
     delete: async (userName: string) => {
-      const { error } = await this.client.DELETE("/users/{userName}", {
+      const { error } = await this.client.DELETE("/auth/v1/users/{userName}", {
         params: { path: { userName } },
       });
       if (error) throw new Error(`Failed to delete user: ${error.error}`);
@@ -814,7 +896,7 @@ export class AntflyClient {
      * Update user password
      */
     updatePassword: async (userName: string, newPassword: string) => {
-      const { data, error } = await this.client.PUT("/users/{userName}/password", {
+      const { data, error } = await this.client.PUT("/auth/v1/users/{userName}/password", {
         params: { path: { userName } },
         body: { new_password: newPassword },
       });
@@ -826,7 +908,7 @@ export class AntflyClient {
      * Get user permissions
      */
     getPermissions: async (userName: string) => {
-      const { data, error } = await this.client.GET("/users/{userName}/permissions", {
+      const { data, error } = await this.client.GET("/auth/v1/users/{userName}/permissions", {
         params: { path: { userName } },
       });
       if (error) throw new Error(`Failed to get permissions: ${error.error}`);
@@ -837,7 +919,7 @@ export class AntflyClient {
      * Add permission to user
      */
     addPermission: async (userName: string, permission: Permission) => {
-      const { data, error } = await this.client.POST("/users/{userName}/permissions", {
+      const { data, error } = await this.client.POST("/auth/v1/users/{userName}/permissions", {
         params: { path: { userName } },
         body: permission,
       });
@@ -849,7 +931,7 @@ export class AntflyClient {
      * Remove permission from user
      */
     removePermission: async (userName: string, resource: string, resourceType: ResourceType) => {
-      const { error } = await this.client.DELETE("/users/{userName}/permissions", {
+      const { error } = await this.client.DELETE("/auth/v1/users/{userName}/permissions", {
         params: {
           path: { userName },
           query: { resource, resourceType },
@@ -869,7 +951,7 @@ export class AntflyClient {
   async evaluate(
     request: import("./types.js").EvalRequest
   ): Promise<import("./types.js").EvalResult> {
-    const { data, error } = await this.client.POST("/eval", {
+    const { data, error } = await this.client.POST("/db/v1/eval", {
       body: request,
     });
     if (error) throw new Error(`Evaluation failed: ${error.error}`);
@@ -882,4 +964,13 @@ export class AntflyClient {
   getRawClient() {
     return this.client;
   }
+}
+
+export function normalizeBaseUrl(baseUrl: string): string {
+  return baseUrl
+    .trim()
+    .replace(/\/$/, "")
+    .replace(/\/db\/v1$/, "")
+    .replace(/\/auth\/v1$/, "")
+    .replace(/\/ai\/v1$/, "");
 }
