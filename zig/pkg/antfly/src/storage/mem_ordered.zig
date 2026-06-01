@@ -61,6 +61,13 @@ pub fn compareKeys(a_name: ?[]const u8, a_key: []const u8, b_name: ?[]const u8, 
 }
 
 const Node = struct {
+    // Atomic: nodes are shared across snapshots, and the backend mutates these
+    // refcounts off the backend mutex — a writer `retain`s shared path nodes
+    // during an unlocked `put` while a concurrent reader `releaseNode`s the same
+    // nodes on abort/commit. A non-atomic counter loses updates here, dropping
+    // refs to zero early (use-after-free) or underflowing (the `-= 1` overflow
+    // panic). The node *contents* stay immutable after makeNode (copy-on-write),
+    // so only this counter needs synchronization.
     refs: usize,
     name: ?[]const u8,
     key: []const u8,
@@ -75,14 +82,20 @@ const Node = struct {
 };
 
 fn retain(node: ?*Node) ?*Node {
-    if (node) |present| present.refs += 1;
+    // Monotonic suffices: a retain races only with other refcount ops, and the
+    // caller already holds a live reference to `node`, so no ordering against the
+    // node's contents is needed.
+    if (node) |present| _ = @atomicRmw(usize, &present.refs, .Add, 1, .monotonic);
     return node;
 }
 
 fn releaseNode(alloc: Allocator, node: ?*Node) void {
     const present = node orelse return;
-    present.refs -= 1;
-    if (present.refs > 0) return;
+    // acq_rel on the decrement: the release half publishes this thread's prior
+    // uses of the node before the drop, and the acquire half makes the thread
+    // that wins the final decrement observe every other thread's uses before it
+    // frees — so the destroy below can't race a still-in-flight reader.
+    if (@atomicRmw(usize, &present.refs, .Sub, 1, .acq_rel) > 1) return;
     releaseNode(alloc, present.left);
     releaseNode(alloc, present.right);
     if (present.name) |namespace| alloc.free(namespace);
@@ -593,4 +606,59 @@ test "randomized operations match a reference map without leaking" {
     while (it.next()) |kv| {
         try expectGet(tree, null, kv.key_ptr.*, kv.value_ptr.*);
     }
+}
+
+// Regression: node refcounts are shared across snapshots and mutated off any
+// lock — the backend `retain`s shared path nodes during an unlocked write while
+// other threads release their own snapshots of the same nodes. A non-atomic
+// counter loses updates under that interleaving and underflows on the next
+// decrement (the `present.refs -= 1` overflow panic seen in derived-replay
+// worker teardown). With an atomic refcount the snapshot/release churn below is
+// clean; the GeneralPurposeAllocator's leak/double-free checks catch a refcount
+// that drops early. The shared base stays read-only, so no data races on
+// contents — only the counter is contended.
+test "concurrent snapshot retain/release does not corrupt the refcount" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var base: Tree = .empty;
+    defer base.release(alloc);
+    var key_buf: [4]u8 = undefined;
+    for (0..256) |i| {
+        const key = std.fmt.bufPrint(&key_buf, "{d:0>3}", .{i}) catch unreachable;
+        const t = try base.put(alloc, null, key, "v");
+        base.release(alloc);
+        base = t;
+    }
+
+    const Worker = struct {
+        shared: *const Tree,
+        gpa: Allocator,
+        ok: bool = true,
+
+        fn run(self: *@This()) void {
+            // Each iteration takes an O(1) snapshot (retaining the shared root)
+            // and releases it, racing every other worker on the same nodes'
+            // refcounts. A lost update would either free a still-shared node
+            // (allocator double-free) or wrap the counter (overflow panic).
+            for (0..2000) |_| {
+                var snap = self.shared.snapshot();
+                if (snap.get(null, "128") == null) self.ok = false;
+                snap.release(self.gpa);
+            }
+        }
+    };
+
+    var workers: [8]Worker = undefined;
+    for (&workers) |*w| w.* = .{ .shared = &base, .gpa = alloc };
+    var threads: [8]std.Thread = undefined;
+    for (&threads, &workers) |*t, *w| t.* = try std.Thread.spawn(.{}, Worker.run, .{w});
+    for (&threads) |t| t.join();
+
+    for (&workers) |w| try testing.expect(w.ok);
+    // The base must survive with exactly its original single reference: every
+    // worker snapshot was released, so a corrupted count would have freed nodes
+    // out from under `base` (caught by the allocator on the final release).
+    try expectGet(base, null, "128", "v");
+    try testing.expectEqual(@as(usize, 256), base.count());
 }
