@@ -120,6 +120,9 @@ Current PR progress:
   planning sample collectors now decode stored document rows through the unified
   primary-or-relational row key helper and materialize relational row values
   before document extraction.
+- relational read/backfill seams now treat relational row keys strictly: a
+  relational row must decode as a typed row, and stale generic primary document
+  rows are ignored instead of serving as a compatibility fallback.
 
 ## Implementation Phases
 

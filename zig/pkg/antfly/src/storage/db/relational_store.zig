@@ -94,7 +94,8 @@ pub fn getRawAlloc(alloc: Allocator, store: *docstore_mod.DocStore, doc_key: []c
 
 pub fn getMaterializedAlloc(alloc: Allocator, store: *docstore_mod.DocStore, doc_key: []const u8) !?[]u8 {
     const raw = try getRawAlloc(alloc, store, doc_key) orelse return null;
-    return try relational_row_codec.materializeOwnedDocumentValueAlloc(alloc, raw);
+    defer alloc.free(raw);
+    return try relational_row_codec.reconstructValueAlloc(alloc, raw);
 }
 
 pub fn freeRows(alloc: Allocator, rows: []OwnedRow) void {

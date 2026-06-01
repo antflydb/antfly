@@ -4626,18 +4626,26 @@ pub const IndexManager = struct {
         try self.applySparseEmbeddingWritesEntry(store, entry, writes, batch_options);
     }
 
-    /// Reconstruct any relational typed-row values in a freshly scanned set of
-    /// document rows into canonical JSON, in place. Backfill scans read the raw
-    /// stored value (a typed row for relational tables); rewriting each row's
-    /// value to JSON here means every downstream consumer (text segment build,
-    /// dense/sparse vector field extraction) sees a document exactly as in
-    /// document mode, with no further per-consumer changes. Non-document and
-    /// JSON-blob rows are left untouched. The pair's `value` is owned, so the old
-    /// buffer is freed and replaced with the reconstructed bytes.
+    fn visibleBaseDocumentRowKey(self: *const IndexManager, key: []const u8) bool {
+        return if (self.relational_base_rows)
+            internal_keys.isRelationalRowKey(key)
+        else
+            internal_keys.isPrimaryDocumentKey(key);
+    }
+
+    /// Reconstruct relational typed-row values in a freshly scanned set of
+    /// document rows into canonical JSON, in place. Relational mode is strict:
+    /// only relational row keys are materialized, and the value under that
+    /// keyspace must be a typed row. Stale generic primary document rows are not
+    /// a supported relational fallback and are filtered by backfill consumers.
     fn materializeScannedDocumentRows(self: *IndexManager, rows: []backend_scan.OwnedKVPair) !void {
         for (rows) |*row| {
-            if (!mapper.isRelationalRowValue(row.value)) continue;
-            row.value = try mapper.materializeOwnedDocumentValueAlloc(self.alloc, row.value);
+            if (self.relational_base_rows) {
+                if (!internal_keys.isRelationalRowKey(row.key)) continue;
+                row.value = try mapper.materializeOwnedRelationalRowValueAlloc(self.alloc, row.value);
+            } else if (mapper.isRelationalRowValue(row.value)) {
+                row.value = try mapper.materializeOwnedDocumentValueAlloc(self.alloc, row.value);
+            }
         }
     }
 
@@ -4704,6 +4712,7 @@ pub const IndexManager = struct {
 
         for (docs) |doc| {
             if (isMetadataKey(doc.key)) continue;
+            if (!self.visibleBaseDocumentRowKey(doc.key)) continue;
             const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
             errdefer self.alloc.free(doc_id);
             if (!self.keyInRange(doc_id)) {
@@ -5938,6 +5947,7 @@ pub const IndexManager = struct {
         errdefer mapping_batch.abort();
 
         for (docs) |doc| {
+            if (!self.visibleBaseDocumentRowKey(doc.key)) continue;
             const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
             defer self.alloc.free(raw_key);
             if (!self.keyInRange(raw_key)) continue;
@@ -6026,6 +6036,7 @@ pub const IndexManager = struct {
 
         const backfill_batch_size = if (builtin.is_test) test_sparse_backfill_batch_size orelse sparse_backfill_batch_size else sparse_backfill_batch_size;
         for (docs) |doc| {
+            if (!self.visibleBaseDocumentRowKey(doc.key)) continue;
             if (resume_from) |resume_key| {
                 if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) continue;
             }
@@ -9009,7 +9020,7 @@ pub const IndexManager = struct {
 
     fn materializeDenseSourceDocumentValueAlloc(self: *const IndexManager, alloc: Allocator, doc_key: []const u8, raw: []const u8) ![]const u8 {
         if (!self.relational_base_rows or internal_keys.isInternalUserKey(doc_key)) return raw;
-        return try mapper.materializeDocumentValueAlloc(alloc, raw);
+        return try mapper.materializeRelationalRowValueAlloc(alloc, raw);
     }
 
     fn loadDenseEmbeddingArtifactVectorWithSession(
@@ -9864,6 +9875,13 @@ fn isMetadataKey(key: []const u8) bool {
 fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManager.TextIndex, key: []const u8) !bool {
     if (entry.chunk_name) |chunk_name| {
         return internal_keys.matchesChunkArtifactName(key, chunk_name);
+    }
+    if (self.relational_base_rows) {
+        if (internal_keys.isRelationalRowKey(key)) return true;
+        if (internal_keys.isPrimaryDocumentKey(key)) return false;
+        if (internal_keys.isInternalUserKey(key)) return false;
+        if (docstore_mod.KeyEncoder.parseEdgeKey(key) != null) return false;
+        return true;
     }
     if (isPrimaryDocumentCandidate(key)) return true;
     if (!internal_keys.isChunkArtifactRecordKey(key)) return false;

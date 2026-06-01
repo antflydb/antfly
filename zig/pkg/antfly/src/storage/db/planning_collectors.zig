@@ -25,6 +25,18 @@ const query_search = @import("query/search_exec.zig");
 const distributed_stats = @import("../../search/distributed_stats.zig");
 const types = @import("types.zig");
 
+fn coreUsesRelationalBaseRows(core: *db_core.DBCore) bool {
+    const schema = core.schema orelse return false;
+    return schema.storage_mode == .relational and schema.relational_columns.len > 0;
+}
+
+fn visibleBaseDocumentRowKey(relational_base_rows: bool, key: []const u8) bool {
+    return if (relational_base_rows)
+        internal_keys.isRelationalRowKey(key)
+    else
+        internal_keys.isPrimaryDocumentKey(key);
+}
+
 pub fn resolveTextIndexEstimate(
     core: *db_core.DBCore,
     alloc: Allocator,
@@ -51,18 +63,20 @@ fn scanPrimaryDocCount(core: *db_core.DBCore) !u64 {
     defer if (upper) |buf| core.alloc.free(buf);
 
     var doc_count: u64 = 0;
+    const relational_base_rows = coreUsesRelationalBaseRows(core);
     const CountState = struct {
+        relational_base_rows: bool,
         doc_count: *u64,
 
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             _ = value;
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            if (internal_keys.isStoredDocumentRowKey(key)) state.doc_count.* += 1;
+            if (visibleBaseDocumentRowKey(state.relational_base_rows, key)) state.doc_count.* += 1;
             return .@"continue";
         }
     };
 
-    var state = CountState{ .doc_count = &doc_count };
+    var state = CountState{ .relational_base_rows = relational_base_rows, .doc_count = &doc_count };
     try core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, CountState.scanEntry);
     return doc_count;
 }
@@ -173,11 +187,15 @@ pub fn estimateStructuredFilterSample(
 
     var sampled: u32 = 0;
     var matched: u64 = 0;
+    const relational_base_rows = coreUsesRelationalBaseRows(core);
     for (docs) |doc| {
-        if (!internal_keys.isStoredDocumentRowKey(doc.key)) continue;
+        if (!visibleBaseDocumentRowKey(relational_base_rows, doc.key)) continue;
         const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
         defer alloc.free(raw_key);
-        const doc_json = try mapper.materializeDocumentValueAlloc(alloc, doc.value);
+        const doc_json = if (relational_base_rows)
+            try mapper.materializeRelationalRowValueAlloc(alloc, doc.value)
+        else
+            try mapper.materializeDocumentValueAlloc(alloc, doc.value);
         defer alloc.free(doc_json);
         sampled += 1;
         if (try graph_exec.storedDocMatchesPatternFilter(alloc, raw_key, doc_json, filter_query_json)) {

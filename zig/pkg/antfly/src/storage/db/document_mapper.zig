@@ -1516,6 +1516,20 @@ pub fn reconstructRelationalRowDocumentAlloc(alloc: Allocator, row_value: []cons
     return try relational_row_codec.reconstructDocumentAlloc(alloc, row.cells);
 }
 
+/// Materialize a relational base-row value as canonical JSON. Unlike
+/// `materializeDocumentValueAlloc`, this is intentionally strict: relational
+/// mode has no supported generic JSON KV fallback, so a non-row value under the
+/// relational row keyspace is corrupt input and should fail at the read seam.
+pub fn materializeRelationalRowValueAlloc(alloc: Allocator, row_value: []const u8) ![]u8 {
+    return try relational_row_codec.reconstructValueAlloc(alloc, row_value);
+}
+
+/// As `materializeRelationalRowValueAlloc`, but takes ownership of `row_value`.
+pub fn materializeOwnedRelationalRowValueAlloc(alloc: Allocator, row_value: []u8) ![]u8 {
+    defer alloc.free(row_value);
+    return try materializeRelationalRowValueAlloc(alloc, row_value);
+}
+
 /// True if `value` is a serialized relational typed row (vs. a JSON blob).
 pub fn isRelationalRowValue(value: []const u8) bool {
     return relational_row_codec.looksLikeRow(value);

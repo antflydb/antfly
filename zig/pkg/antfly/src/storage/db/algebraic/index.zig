@@ -3223,10 +3223,8 @@ pub const Index = struct {
         for (batch.documents) |doc| {
             if (doc.action != .upsert) continue;
             // When the batch carries no cleaned value, the document body is read
-            // straight from the store. For relational tables that stored value is
-            // a typed row, not JSON, so route it through the relational row codec
-            // (a JSON blob passes through unchanged) before indexing -- otherwise
-            // every relational row fails to parse and nothing is materialized.
+            // straight from the store. Relational reads are strict: the row
+            // keyspace must contain a typed row, not a generic JSON fallback.
             var materialized_value: ?[]u8 = null;
             defer if (materialized_value) |buf| self.alloc.free(buf);
             const value = doc.cleaned_value orelse blk: {
@@ -3236,7 +3234,10 @@ pub const Index = struct {
                     error.NotFound => continue,
                     else => return err,
                 };
-                const owned = try relational_row_codec.materializeDocumentValueAlloc(self.alloc, raw);
+                const owned = if (self.relational_base_rows and !internal_keys.isInternalUserKey(doc.key))
+                    try relational_row_codec.reconstructValueAlloc(self.alloc, raw)
+                else
+                    try relational_row_codec.materializeDocumentValueAlloc(self.alloc, raw);
                 materialized_value = owned;
                 break :blk owned;
             };
