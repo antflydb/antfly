@@ -210,6 +210,9 @@ Large-ingest guardrails:
      persisted LSM merge cursors stop before that bound and skip later table
      blocks whose smallest key is already outside the scan range.
 8. [ ] Add sequential scan readahead/prefetch hints for full-run scans.
+   - [x] First slice: persisted merge cursors warm the next table block in
+     the shared cache after loading the current block, while respecting scan
+     upper bounds.
 
 ### Point Read Work
 

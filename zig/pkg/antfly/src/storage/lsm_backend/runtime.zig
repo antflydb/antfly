@@ -58,6 +58,10 @@ fn recordPointValueCopy(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointValueCopy")) backend.recordPointValueCopy();
 }
 
+fn recordCursorBlockReadahead(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "recordCursorBlockReadahead")) backend.recordCursorBlockReadahead();
+}
+
 fn compareTableEntryTo(entry: lsm_table_file.Entry, namespace: backend_types.Namespace, key: []const u8) std.math.Order {
     const namespace_order = compareNamespace(.{ .name = entry.namespace_name }, namespace);
     if (namespace_order != .eq) return namespace_order;
@@ -1183,11 +1187,12 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             index: *const lsm_table_file.TableIndex,
             entry_index: usize,
         ) !SourceEntry {
-            const window = if (index.findBlockIndexForEntry(entry_index)) |block_index|
+            const maybe_block_index = index.findBlockIndexForEntry(entry_index);
+            const window = if (maybe_block_index) |block_index|
                 index.blockWindow(block_index)
             else
                 index.entryDataWindow(entry_index, cache_mod.DefaultTableBlockSize);
-            const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window);
+            const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, maybe_block_index);
             const relative_offset: usize = @intCast(index.entryStart(entry_index) - window.relative_offset);
             const entry = try parseEntryAtWithStats(self.backend, bytes, relative_offset);
             return .{
@@ -1204,6 +1209,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             run: *Run,
             index: *const lsm_table_file.TableIndex,
             window: lsm_table_file.EntryDataWindow,
+            maybe_block_index: ?usize,
         ) ![]const u8 {
             if (self.source_block_indices[source_index]) |loaded_index| {
                 if (loaded_index == window.relative_offset) {
@@ -1229,7 +1235,32 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             );
             self.source_block_bytes[source_index] = bytes;
             self.source_block_indices[source_index] = window.relative_offset;
+            if (maybe_block_index) |block_index| try self.prefetchNextSourceBlock(source_index, run, index, block_index);
             return bytes;
+        }
+
+        fn prefetchNextSourceBlock(
+            self: *@This(),
+            source_index: usize,
+            run: *Run,
+            index: *const lsm_table_file.TableIndex,
+            block_index: usize,
+        ) !void {
+            if (self.backend.options.cache == null) return;
+            if (index.blockCount() == 0) return;
+
+            const next_block_index = block_index + 1;
+            if (next_block_index >= index.blockCount()) return;
+            const next_block = index.blocks[next_block_index];
+            if (self.blockStartsAtOrPastUpper(next_block)) return;
+
+            const next_window = index.blockWindow(next_block_index);
+            if (self.source_block_indices[source_index]) |loaded_index| {
+                if (loaded_index == next_window.relative_offset) return;
+            }
+            var handle = try loadRunTableBlockHandle(self.backend, run, index, next_window);
+            defer handle.release();
+            recordCursorBlockReadahead(self.backend);
         }
 
         fn sourceLastKeyFromLocalIndex(
@@ -1301,7 +1332,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     if (blockBeforeScanLower(block, self.namespace, target)) continue;
                     if (self.blockStartsAtOrPastUpper(block)) return null;
                     const window = index.blockWindow(block_index);
-                    const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window);
+                    const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, block_index);
                     if (try lsm_table_file.lowerBoundPositionInBlock(
                         index,
                         bytes,
@@ -1380,7 +1411,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 if (self.blockStartsAtOrPastUpper(block)) return null;
 
                 const window = index.blockWindow(block_index);
-                const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window);
+                const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, block_index);
                 var probe = idx;
                 while (probe <= block.lastEntryIndex()) : (probe += 1) {
                     const relative_offset: usize = @intCast(index.entryStart(probe) - window.relative_offset);
