@@ -88,20 +88,16 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func jsonBodyReader(v any, maxBytes int64) (*io.PipeReader, func()) {
-	pr, pw := io.Pipe()
-	go func() {
-		w := io.Writer(pw)
-		if maxBytes > 0 {
-			w = &limitedWriter{w: pw, max: maxBytes}
-		}
-		if err := json.NewEncoder(w).Encode(v); err != nil {
-			_ = pw.CloseWithError(err)
-			return
-		}
-		_ = pw.Close()
-	}()
-	return pr, func() { _ = pr.Close() }
+func boundedJSONBody(v any, maxBytes int64) (*bytes.Buffer, error) {
+	var body bytes.Buffer
+	w := io.Writer(&body)
+	if maxBytes > 0 {
+		w = &limitedWriter{w: &body, max: maxBytes}
+	}
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		return nil, err
+	}
+	return &body, nil
 }
 
 // readSSEEvents reads SSE events from a reader and yields (eventType, data) pairs.
@@ -186,8 +182,10 @@ func (c *AntflyClient) Batch(ctx context.Context, tableName string, request Batc
 // response size bounds.
 func (c *AntflyClient) BatchWithOptions(ctx context.Context, tableName string, request BatchRequest, opts WriteOptions) (*BatchResult, error) {
 	opts = normalizeWriteOptions(opts)
-	batchBody, closeBody := jsonBodyReader(request, opts.MaxRequestBytes)
-	defer closeBody()
+	batchBody, err := boundedJSONBody(request, opts.MaxRequestBytes)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling batch request: %w", err)
+	}
 
 	resp, err := c.client.BatchWriteWithBody(ctx, tableName, "application/json", batchBody)
 	if err != nil {
@@ -241,8 +239,10 @@ func (c *AntflyClient) LinearMerge(ctx context.Context, tableName string, reques
 // response size bounds.
 func (c *AntflyClient) LinearMergeWithOptions(ctx context.Context, tableName string, request LinearMergeRequest, opts WriteOptions) (*LinearMergeResult, error) {
 	opts = normalizeWriteOptions(opts)
-	body, closeBody := jsonBodyReader(request, opts.MaxRequestBytes)
-	defer closeBody()
+	body, err := boundedJSONBody(request, opts.MaxRequestBytes)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling linear merge request: %w", err)
+	}
 
 	resp, err := c.client.LinearMergeWithBody(ctx, tableName, "application/json", body)
 	if err != nil {
@@ -692,8 +692,10 @@ func (c *AntflyClient) MultiBatch(ctx context.Context, request MultiBatchRequest
 // request and response size bounds.
 func (c *AntflyClient) MultiBatchWithOptions(ctx context.Context, request MultiBatchRequest, opts WriteOptions) (*MultiBatchResult, error) {
 	opts = normalizeWriteOptions(opts)
-	batchBody, closeBody := jsonBodyReader(request, opts.MaxRequestBytes)
-	defer closeBody()
+	batchBody, err := boundedJSONBody(request, opts.MaxRequestBytes)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling multi-batch request: %w", err)
+	}
 
 	resp, err := c.client.MultiBatchWriteWithBody(ctx, "application/json", batchBody)
 	if err != nil {

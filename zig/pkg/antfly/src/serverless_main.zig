@@ -16,7 +16,7 @@ const std = @import("std");
 const antfly = @import("antfly-zig");
 
 const serverless = antfly.serverless;
-const serverless_default_max_request_bytes: usize = antfly.raft.transport.std_http_listener.default_max_request_bytes;
+const serverless_default_max_request_bytes: usize = antfly.public_api.http_server.public_api_max_request_body_bytes;
 
 const CliConfig = struct {
     artifacts_uri: ?[]const u8 = null,
@@ -529,12 +529,12 @@ test "serverless main enables listener only for query-serving roles" {
     try std.testing.expect(!listenerEnabledForRole(.maintenance_only));
 }
 
-test "serverless main listener config defaults request limit to 32 MiB" {
+test "serverless main listener config defaults request limit to public API limit" {
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
 
     const cfg = serverless_serverConfigFromEnv(&env_map, .{});
-    try std.testing.expectEqual(serverless_default_max_request_bytes, cfg.max_request_bytes);
+    try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
 }
 
 test "serverless main listener config allows env and cli request limit overrides" {

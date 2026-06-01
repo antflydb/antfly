@@ -169,11 +169,13 @@ func TestReadSSEEventsEarlyTermination(t *testing.T) {
 	}
 }
 
-func TestBatchStreamsRequestAndParsesResponse(t *testing.T) {
+func TestBatchSendsContentLengthRequestAndParsesResponse(t *testing.T) {
 	var gotPath string
 	var gotBody string
+	var gotContentLength int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
+		gotContentLength = r.ContentLength
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("ReadAll request body: %v", err)
@@ -205,6 +207,9 @@ func TestBatchStreamsRequestAndParsesResponse(t *testing.T) {
 	}
 	if gotPath != "/db/v1/tables/files/batch" {
 		t.Fatalf("path = %q, want /db/v1/tables/files/batch", gotPath)
+	}
+	if gotContentLength <= 0 {
+		t.Fatalf("ContentLength = %d, want fixed positive content length", gotContentLength)
 	}
 	if !strings.Contains(gotBody, `"doc-1"`) || !strings.Contains(gotBody, `"title":"hello"`) {
 		t.Fatalf("request body = %q, want encoded insert", gotBody)
@@ -267,11 +272,40 @@ func TestReadErrorResponseCapsBody(t *testing.T) {
 	}
 }
 
-func TestLinearMergeStreamsRequestAndParsesResponse(t *testing.T) {
+func TestBatchRejectsOversizedRequestBeforeSending(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.BatchWithOptions(context.Background(), "files", BatchRequest{
+		Inserts: map[string]any{"doc-1": map[string]any{"title": strings.Repeat("x", 128)}},
+	}, WriteOptions{
+		MaxRequestBytes:  64,
+		MaxResponseBytes: 1024,
+	})
+	if err == nil || !strings.Contains(err.Error(), "encoded request exceeded 64 bytes") {
+		t.Fatalf("BatchWithOptions error = %v, want request limit error", err)
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want no request sent after local request limit failure", requests)
+	}
+}
+
+func TestLinearMergeSendsContentLengthRequestAndParsesResponse(t *testing.T) {
 	var gotPath string
 	var gotBody string
+	var gotContentLength int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
+		gotContentLength = r.ContentLength
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("ReadAll request body: %v", err)
@@ -303,6 +337,9 @@ func TestLinearMergeStreamsRequestAndParsesResponse(t *testing.T) {
 	}
 	if gotPath != "/db/v1/tables/files/merge" {
 		t.Fatalf("path = %q, want /db/v1/tables/files/merge", gotPath)
+	}
+	if gotContentLength <= 0 {
+		t.Fatalf("ContentLength = %d, want fixed positive content length", gotContentLength)
 	}
 	if !strings.Contains(gotBody, `"doc-1"`) || !strings.Contains(gotBody, `"title":"hello"`) {
 		t.Fatalf("request body = %q, want encoded record", gotBody)
