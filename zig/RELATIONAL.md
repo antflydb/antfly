@@ -12,9 +12,10 @@ join planner, and the algebraic fold runtime — but changes two things:
 1. **Schema is required and closed.** Documents in a relational table must
    match a declared document type; unknown/unbounded fields are rejected
    rather than dynamically indexed.
-2. **Typed columns are first-class.** Every declared scalar property maps to a
-   typed column (`section/typed_doc_values.zig`) so predicates, sorts, and
-   aggregations can be served columnar instead of reconstructed from JSON.
+2. **Typed cells are first-class.** Every declared scalar property maps to a
+   typed relational cell, with document-scoped column entries maintained in the
+   relational base store so predicates and aggregations read committed table
+   data instead of re-parsing JSON or consulting derived search segments.
 
 `json` is itself a column type: a `json` column stores an opaque subtree and is
 indexed exactly the way documents are indexed today (path-fact projection plus
@@ -30,9 +31,9 @@ The substrate already exists:
 
 - **Typed scalars** — `storage/db/algebraic/value.zig` (`Kind`:
   string/integer/number/boolean/datetime/bytes, canonical encodings).
-- **Typed column store** — `section/typed_doc_values.zig`
-  (`u64`/`f64`/`bytes`/`bool`/`geo_point`, chunked, SIMD bulk reads, range
-  scans).
+- **Typed value encodings** — `section/typed_doc_values.zig`
+  (`u64`/`f64`/`bytes`/`bool`/`geo_point`) supply the physical scalar value
+  kinds reused by relational row cells and column entries.
 - **Per-field columnar blob with projection pushdown and null backfill** —
   `columnar.zig`.
 - **Schema → indexable-field analysis** —
@@ -49,23 +50,18 @@ Relational mode is therefore mostly *wiring and a required-schema contract*
 over things that are already built, plus one genuinely new query operator
 (the columnar table scan).
 
-## The pivotal decision: authoritative columns
+## The pivotal decision: one relational base store
 
-There are two storage layouts, and relational mode is designed so the first is
-a strict subset of the second:
+Relational mode uses the relational base-store keyspace as the source of truth.
+Incoming JSON is validated against the closed schema, projected into typed
+cells, and written through the relational participant. The store maintains both
+the packed row entry used for point reads/reconstruction and document-scoped
+column entries used for scalar scans. There is no legacy JSON primary-row mode
+for relational tables in this feature set.
 
-- **Phase A — guaranteed-complete secondary columns.** The zstd JSON blob stays
-  the source of truth, but relational mode *guarantees* every declared scalar
-  column is populated into typed columns at write time. Reads still reconstruct
-  documents from the blob; predicate pushdown and aggregation are served from
-  columns. Low risk, reuses everything, double-writes.
-- **Phase B — authoritative columns.** Typed columns become the store. Non-JSON
-  columns no longer keep a blob; documents are *reconstructed* from columns on
-  read via `ColumnarReader.readDoc(projection)`. Only `json` columns keep a
-  byte payload. Smaller storage, true columnar scans, no double-write.
-
-Ship Phase A first. Phase B is an internal storage swap behind the same
-contract and query surface.
+Full-text, dense, sparse, graph, and algebraic indexes remain derived artifacts.
+They can be rebuilt from the relational base store, but they are not the
+authoritative column store.
 
 ## Public contract
 
@@ -236,12 +232,13 @@ number) is additive where the physical type is compatible.
   as serialized typed columns, so reconstruction-on-read stays fully synchronous
   without relying on async segment reconstruction.
 
-  - **Storage format.** A relational document is stored as one packed
-    `relational_row_codec` value (magic `AROW`), not a JSON blob and not a
-    key-range of per-column pairs. One relational row pair per document keeps
-    point lookups / read-modify-write transforms a single atomic op and shard
-    splits boundary-agnostic; the columnar predicate-pushdown tier stays in the
-    search segments. The row is self-describing (each cell carries path + physical
+  - **Storage format.** A relational document is stored as a packed
+    `relational_row_codec` value (magic `AROW`) under the relational row
+    keyspace, with one document-scoped column entry per committed cell. The row
+    entry keeps point lookups / read-modify-write transforms a single atomic
+    document operation; the column entries make scalar scans independent from
+    derived segment doc-values and move with the document range during
+    split/merge. The row is self-describing (each cell carries path + physical
     `typed_doc_values` type + `is_json`), so reconstruction needs no schema
     lookup. Round-trip is *canonical*, not byte-exact (schema field order,
     numbers/datetime normalized) — acceptable because relational tables are
@@ -262,12 +259,13 @@ number) is additive where the physical type is compatible.
     carry the original JSON (`cleaned_value`/`write.value`) and never re-read the
     store. Routed reader-first, write-flipped last, so each step stayed green.
 
-  - **Seam B — typed-column fast path.** Where a consumer genuinely wants one
-    field (the enrichment `source_field` case), `relational_row_codec.findCellByPath`
-    reads that single column straight from the row, skipping full reconstruction
-    + re-parse. Consumers that legitimately need the whole document (templates,
-    algebraic fact-projection, `db.get`) keep Seam A — that is the correct and
-    final answer for them, not a compromise.
+  - **Seam B — typed-column scan path.** Predicate filters and scan-based
+    aggregations read document-scoped relational column entries. Where a
+    consumer genuinely wants one source field (the enrichment `source_field`
+    case), `relational_row_codec.findCellByPath` can read that cell straight
+    from the row, skipping full reconstruction + re-parse. Consumers that need
+    the whole document (templates, algebraic fact-projection, `db.get`) keep
+    Seam A.
 
   Document-mode tables are unchanged throughout: their KV value stays a JSON
   blob, and the seam is a pure passthrough (the row magic never matches a JSON
@@ -282,17 +280,17 @@ from the synchronous base-row store, not from search segments. Search segments
 are columnar, but they are built asynchronously; a transform or point lookup
 immediately after a write must see the just-written document without waiting for
 segment materialization. The existing two-phase commit machinery gives us the
-right commit boundary, but the columnar storage still needs to become a
-first-class synchronous participant before it can replace the generic relational
-KV row.
+right commit boundary; the relational participant uses that boundary for both
+row reconstruction and column-entry maintenance.
 
 The landed design keeps the DocStore transaction boundary as the synchronous
-source of truth while moving relational documents to a dedicated relational row
-key:
+source of truth while moving relational documents to dedicated relational row
+and column keys:
 
 - **Chosen:** one packed typed-row value per document, detected by the `AROW`
   magic prefix and stored under the relational row keyspace rather than the
-  generic primary document key. This keeps `DB.get`, transforms, lookup, vector
+  generic primary document key, plus document-scoped column entries maintained
+  by the same participant. This keeps `DB.get`, transforms, lookup, vector
   `include_stored`, backfill, and enrichment readers synchronous while removing
   the relational JSON blob and avoiding a second base-row copy. The row carries
   enough path/type metadata that generic store-value readers can reconstruct JSON
@@ -337,8 +335,8 @@ This keeps the physical model simple:
 - **Point and mutation reads**: `DB.get`, transforms, update/delete validation,
   vector `include_stored`, and lookup/enrichment paths read the packed base row.
 - **Query reads**: structured relational predicates resolve document ids from
-  base rows, then full-text ranking/materialization hydrates from those same
-  base rows before returning public stored data.
+  base-store column entries, then full-text ranking/materialization hydrates
+  from the base row before returning public stored data.
 - **Merge / compaction / split**: segment data movement remains schema-less
   because it only moves derived text-index state. It does not need a relational
   column catalog, and it cannot become a second source of truth for row values.
