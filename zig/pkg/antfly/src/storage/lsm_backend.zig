@@ -6783,6 +6783,54 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
     try std.testing.expectEqual(@as(usize, 0), ctx.run_file_size_reads);
 }
 
+test "lsm backend prefix bloom skips bounded scan blocks" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-prefix-bloom-scan-skip";
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = 2,
+        });
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginWrite();
+        try txn.put("tenant-a:001", "a");
+        try txn.put("tenant-c:001", "c");
+        try txn.commit();
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = 2,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var txn = try runtime.beginRead();
+    defer txn.abort();
+    var cur = try txn.openCursor();
+    defer cur.close();
+    cur.setUpperBound("tenant-b;");
+
+    try std.testing.expect((try cur.seekAtOrAfter("tenant-b:")) == null);
+
+    const read_stats = backend.snapshotReadStats();
+    try std.testing.expect(read_stats.bloom_negatives > 0);
+    try std.testing.expectEqual(@as(u64, 0), read_stats.cursor_block_loads);
+    try std.testing.expectEqual(@as(u64, 0), read_stats.table_block_loads);
+}
+
 test "lsm backend block filter avoids candidate block read on run-bloom false positive" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);

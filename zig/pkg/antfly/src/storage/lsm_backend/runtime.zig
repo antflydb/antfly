@@ -1325,12 +1325,25 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             target: []const u8,
             inclusive: bool,
         ) !?usize {
+            const scan_prefix = self.boundedScanPrefix(index, target);
+            if (scan_prefix) |prefix| {
+                if (!index.maybeContainsPrefix(self.namespace.name, prefix)) {
+                    self.backend.recordBloomNegative();
+                    return null;
+                }
+            }
             if (index.blockCount() > 0) {
                 var block_index = index.findBlockIndex(self.namespace.name, target) orelse return null;
                 while (block_index < index.blockCount()) : (block_index += 1) {
                     const block = index.blocks[block_index];
                     if (blockBeforeScanLower(block, self.namespace, target)) continue;
                     if (self.blockStartsAtOrPastUpper(block)) return null;
+                    if (scan_prefix) |prefix| {
+                        if (!block.maybeContainsPrefix(self.namespace.name, prefix)) {
+                            self.backend.recordBloomNegative();
+                            continue;
+                        }
+                    }
                     const window = index.blockWindow(block_index);
                     const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, block_index);
                     if (try lsm_table_file.lowerBoundPositionInBlock(
@@ -1389,6 +1402,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         ) !?usize {
             const index = try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
             if (current + 1 >= index.entryCount()) return null;
+            const scan_prefix = if (self.source_entries[source_index]) |entry|
+                self.boundedScanPrefix(index, entry.key)
+            else
+                null;
 
             if (index.blockCount() == 0) {
                 var idx = current + 1;
@@ -1409,6 +1426,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 if (idx > block.lastEntryIndex()) continue;
                 if (blockBeforeScanLower(block, self.namespace, "")) continue;
                 if (self.blockStartsAtOrPastUpper(block)) return null;
+                if (scan_prefix) |prefix| {
+                    if (!block.maybeContainsPrefix(self.namespace.name, prefix)) {
+                        self.backend.recordBloomNegative();
+                        idx = block.lastEntryIndex() + 1;
+                        continue;
+                    }
+                }
 
                 const window = index.blockWindow(block_index);
                 const bytes = try self.ensureSourceBlockLoaded(source_index, run, index, window, block_index);
@@ -1431,6 +1455,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         fn keyBeforeUpper(self: *const @This(), key: []const u8) bool {
             const upper = self.upper_bound orelse return true;
             return std.mem.order(u8, key, upper) == .lt;
+        }
+
+        fn boundedScanPrefix(self: *const @This(), index: *const lsm_table_file.TableIndex, key: []const u8) ?[]const u8 {
+            const upper = self.upper_bound orelse return null;
+            const prefix = lsm_table_file.extractKeyPrefix(index.prefix_extractor, key) orelse return null;
+            if (!lsm_table_file.upperBoundWithinPrefix(prefix, upper)) return null;
+            return prefix;
         }
 
         fn blockStartsAtOrPastUpper(self: *const @This(), block: lsm_table_file.TableIndex.BlockMeta) bool {

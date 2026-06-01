@@ -215,6 +215,12 @@ Large-ingest guardrails:
    - [x] First slice: persisted merge cursors warm the next table block in
      the shared cache after loading the current block, while respecting scan
      upper bounds.
+9. [x] Add prefix extractor and prefix bloom metadata for structured key
+   families.
+   - Table codec version 8 now records a first-separator prefix extractor,
+     run-level prefix bloom, and per-block prefix blooms.
+   - Persisted forward scans use prefix blooms to skip block loads when the
+     scan upper bound proves the cursor cannot leave the extracted prefix.
 
 ### Point Read Work
 

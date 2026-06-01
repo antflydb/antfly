@@ -21,7 +21,7 @@ pub const footer_magic = "ALSMIDX1";
 pub const header_len = magic.len + 12;
 pub const footer_len = footer_magic.len + @sizeOf(u64) * 2 + @sizeOf(u32) * 2;
 pub const default_block_size: usize = 32 * 1024;
-pub const version: u32 = 7;
+pub const version: u32 = 8;
 pub const max_entry_data_len: usize = std.math.maxInt(u32);
 pub const max_entry_count: usize = std.math.maxInt(u32);
 pub const default_filter_config: bloom.Config = .{ .bits_per_key = 14 };
@@ -30,6 +30,13 @@ const min_compress_block_bytes: usize = 1024;
 const compression_savings_denominator: usize = 8;
 const prefix_block_magic = "ALSMPFX1";
 const prefix_restart_interval: usize = 16;
+
+pub const PrefixExtractor = enum(u32) {
+    none = 0,
+    first_separator = 1,
+};
+
+pub const default_prefix_extractor: PrefixExtractor = .first_separator;
 
 pub const BlockCompression = enum(u32) {
     none = 0,
@@ -77,6 +84,7 @@ pub fn blockCompressionCodecMask(codec: BlockCompression) u64 {
 
 pub const EncodeOptions = struct {
     block_compression: CompressionPolicy = .snappy_adaptive,
+    prefix_extractor: PrefixExtractor = default_prefix_extractor,
     compression_stats: ?*CompressionStats = null,
 };
 
@@ -127,6 +135,7 @@ pub const TableIndex = struct {
         largest_namespace_name: ?[]u8 = null,
         largest_key: []u8,
         filter: ?bloom.OwnedFilter = null,
+        prefix_filter: ?bloom.OwnedFilter = null,
         hash_slots: []u32 = &.{},
 
         pub fn deinit(self: *BlockMeta, allocator: std.mem.Allocator) void {
@@ -135,6 +144,7 @@ pub const TableIndex = struct {
             if (self.largest_namespace_name) |name| allocator.free(name);
             allocator.free(self.largest_key);
             if (self.filter) |*filter| filter.deinit(allocator);
+            if (self.prefix_filter) |*filter| filter.deinit(allocator);
             allocator.free(self.hash_slots);
             self.* = undefined;
         }
@@ -150,6 +160,8 @@ pub const TableIndex = struct {
             errdefer allocator.free(largest_key);
             const filter = if (self.filter) |owned_filter| try owned_filter.clone(allocator) else null;
             errdefer if (filter) |*owned_filter| owned_filter.deinit(allocator);
+            const prefix_filter = if (self.prefix_filter) |owned_filter| try owned_filter.clone(allocator) else null;
+            errdefer if (prefix_filter) |*owned_filter| owned_filter.deinit(allocator);
             const hash_slots = try allocator.dupe(u32, self.hash_slots);
             errdefer allocator.free(hash_slots);
             return .{
@@ -165,6 +177,7 @@ pub const TableIndex = struct {
                 .largest_namespace_name = largest_namespace_name,
                 .largest_key = largest_key,
                 .filter = filter,
+                .prefix_filter = prefix_filter,
                 .hash_slots = hash_slots,
             };
         }
@@ -176,6 +189,14 @@ pub const TableIndex = struct {
         pub fn maybeContains(self: *const BlockMeta, namespace_name: ?[]const u8, key: []const u8) bool {
             if (self.filter) |filter| {
                 const hashes = entryHashes(namespace_name, key);
+                return filter.maybeContainsHashes(hashes[0], hashes[1]);
+            }
+            return true;
+        }
+
+        pub fn maybeContainsPrefix(self: *const BlockMeta, namespace_name: ?[]const u8, prefix: []const u8) bool {
+            if (self.prefix_filter) |filter| {
+                const hashes = prefixHashes(namespace_name, prefix);
                 return filter.maybeContainsHashes(hashes[0], hashes[1]);
             }
             return true;
@@ -214,6 +235,8 @@ pub const TableIndex = struct {
     entry_data_start: usize,
     entry_data_len: usize,
     filter: bloom.OwnedFilter,
+    prefix_extractor: PrefixExtractor = .none,
+    prefix_filter: ?bloom.OwnedFilter = null,
     blocks: []BlockMeta = &.{},
 
     pub fn deinit(self: *TableIndex, allocator: std.mem.Allocator) void {
@@ -221,6 +244,7 @@ pub const TableIndex = struct {
         for (self.blocks) |*block| block.deinit(allocator);
         allocator.free(self.blocks);
         self.filter.deinit(allocator);
+        if (self.prefix_filter) |*filter| filter.deinit(allocator);
         self.* = undefined;
     }
 
@@ -240,6 +264,8 @@ pub const TableIndex = struct {
             .entry_data_start = self.entry_data_start,
             .entry_data_len = self.entry_data_len,
             .filter = try self.filter.clone(allocator),
+            .prefix_extractor = self.prefix_extractor,
+            .prefix_filter = if (self.prefix_filter) |filter| try filter.clone(allocator) else null,
             .blocks = blocks,
         };
     }
@@ -250,6 +276,14 @@ pub const TableIndex = struct {
             .bit_count = self.filter.bit_count,
             .hash_count = self.filter.hash_count,
         };
+    }
+
+    pub fn maybeContainsPrefix(self: *const TableIndex, namespace_name: ?[]const u8, prefix: []const u8) bool {
+        if (self.prefix_filter) |filter| {
+            const hashes = prefixHashes(namespace_name, prefix);
+            return filter.maybeContainsHashes(hashes[0], hashes[1]);
+        }
+        return true;
     }
 
     pub fn entryCount(self: *const TableIndex) usize {
@@ -588,6 +622,7 @@ const EncodedBlockMeta = struct {
     largest_namespace_name: ?[]const u8,
     largest_key: []const u8,
     filter: bloom.OwnedFilter,
+    prefix_filter: ?bloom.OwnedFilter,
     hash_slots: []u32,
 };
 
@@ -604,6 +639,7 @@ const OwnedEncodedBlockMeta = struct {
     largest_namespace_name: ?[]u8 = null,
     largest_key: []u8,
     filter: bloom.OwnedFilter,
+    prefix_filter: ?bloom.OwnedFilter = null,
     hash_slots: []u32,
 
     fn deinit(self: *OwnedEncodedBlockMeta, allocator: std.mem.Allocator) void {
@@ -612,6 +648,7 @@ const OwnedEncodedBlockMeta = struct {
         if (self.largest_namespace_name) |name| allocator.free(name);
         allocator.free(self.largest_key);
         self.filter.deinit(allocator);
+        if (self.prefix_filter) |*filter| filter.deinit(allocator);
         allocator.free(self.hash_slots);
         self.* = undefined;
     }
@@ -746,6 +783,10 @@ pub fn encodeWithFilterToSinkOptions(
     var encoded_filter_bytes = std.ArrayListUnmanaged(u8).empty;
     defer encoded_filter_bytes.deinit(allocator);
     const encoded_filter = try filter.encodeInto(allocator, &encoded_filter_bytes);
+    var prefix_filter = try buildPrefixFilterAlloc(allocator, entries, options.prefix_extractor, default_filter_config);
+    defer prefix_filter.deinit(allocator);
+    const encoded_prefix_filter = try prefix_filter.encodeAlloc(allocator);
+    defer allocator.free(encoded_prefix_filter);
 
     var entry_offsets = std.ArrayListUnmanaged(u32).empty;
     defer entry_offsets.deinit(allocator);
@@ -755,6 +796,7 @@ pub fn encodeWithFilterToSinkOptions(
     defer {
         for (blocks.items) |*block| {
             block.filter.deinit(allocator);
+            if (block.prefix_filter) |*prefix_filter_ptr| prefix_filter_ptr.deinit(allocator);
             allocator.free(block.hash_slots);
         }
         blocks.deinit(allocator);
@@ -809,6 +851,7 @@ pub fn encodeWithFilterToSinkOptions(
                 block_largest_namespace_name,
                 block_largest_key,
                 options.block_compression,
+                options.prefix_extractor,
                 &compression_bytes,
             );
             block_start = entry_start;
@@ -845,6 +888,7 @@ pub fn encodeWithFilterToSinkOptions(
             block_largest_namespace_name,
             block_largest_key,
             options.block_compression,
+            options.prefix_extractor,
             &compression_bytes,
         );
     }
@@ -892,6 +936,18 @@ pub fn encodeWithFilterToSinkOptions(
         if (block.smallest_namespace_name) |name| try sink.appendSlice(name);
         try sink.appendSlice(block.smallest_key);
     }
+    try sinkAppendU32(sink, @intFromEnum(options.prefix_extractor));
+    try sinkAppendU32(sink, try checkedU32(encoded_prefix_filter.len));
+    try sink.appendSlice(encoded_prefix_filter);
+    try sinkAppendU32(sink, try checkedU32(blocks.items.len));
+    for (blocks.items) |block| {
+        const encoded_block_prefix_filter = if (block.prefix_filter) |block_prefix_filter|
+            try block_prefix_filter.encodeInto(allocator, &encoded_filter_bytes)
+        else
+            "";
+        try sinkAppendU32(sink, try checkedU32(encoded_block_prefix_filter.len));
+        try sink.appendSlice(encoded_block_prefix_filter);
+    }
     const metadata_len = sink.len() - metadata_offset;
 
     try sink.appendSlice(footer_magic);
@@ -910,6 +966,7 @@ pub fn encodeWithFilterToSinkOptions(
 pub const StreamingEncoderOptions = struct {
     block_compression: CompressionPolicy = .snappy_adaptive,
     bloom_config: bloom.Config = default_filter_config,
+    prefix_extractor: PrefixExtractor = default_prefix_extractor,
     compression_stats: ?*CompressionStats = null,
 };
 
@@ -924,15 +981,19 @@ pub const StreamingEncoder = struct {
     allocator: std.mem.Allocator,
     sink: *TableSink,
     compression_policy: CompressionPolicy,
+    prefix_extractor: PrefixExtractor,
     compression_stats_out: ?*CompressionStats,
     filter_builder: bloom.Builder,
     filter_builder_active: bool = true,
+    prefix_filter_builder: bloom.Builder,
+    prefix_filter_builder_active: bool = true,
     entry_offsets: std.ArrayListUnmanaged(u32) = .empty,
     blocks: std.ArrayListUnmanaged(OwnedEncodedBlockMeta) = .empty,
     block_bytes: std.ArrayListUnmanaged(u8) = .empty,
     compression_bytes: std.ArrayListUnmanaged(u8) = .empty,
     encoded_filter_bytes: std.ArrayListUnmanaged(u8) = .empty,
     block_hashes: std.ArrayListUnmanaged([2]u64) = .empty,
+    block_prefix_hashes: std.ArrayListUnmanaged([2]u64) = .empty,
     entry_count_offset: usize,
     entry_data_len_offset: usize,
     entry_data_start: usize,
@@ -956,6 +1017,8 @@ pub const StreamingEncoder = struct {
         if (expected_entries > max_entry_count) return error.TableFileTooLarge;
         var filter_builder = try bloom.Builder.init(allocator, expected_entries, options.bloom_config);
         errdefer filter_builder.deinit();
+        var prefix_filter_builder = try bloom.Builder.init(allocator, expected_entries, options.bloom_config);
+        errdefer prefix_filter_builder.deinit();
 
         try sink.appendSlice(magic);
         try sinkAppendU32(sink, version);
@@ -969,8 +1032,10 @@ pub const StreamingEncoder = struct {
             .allocator = allocator,
             .sink = sink,
             .compression_policy = options.block_compression,
+            .prefix_extractor = options.prefix_extractor,
             .compression_stats_out = options.compression_stats,
             .filter_builder = filter_builder,
+            .prefix_filter_builder = prefix_filter_builder,
             .entry_count_offset = entry_count_offset,
             .entry_data_len_offset = entry_data_len_offset,
             .entry_data_start = entry_data_start,
@@ -979,6 +1044,7 @@ pub const StreamingEncoder = struct {
 
     pub fn deinit(self: *StreamingEncoder) void {
         if (self.filter_builder_active) self.filter_builder.deinit();
+        if (self.prefix_filter_builder_active) self.prefix_filter_builder.deinit();
         self.entry_offsets.deinit(self.allocator);
         for (self.blocks.items) |*block| block.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
@@ -986,6 +1052,7 @@ pub const StreamingEncoder = struct {
         self.compression_bytes.deinit(self.allocator);
         self.encoded_filter_bytes.deinit(self.allocator);
         self.block_hashes.deinit(self.allocator);
+        self.block_prefix_hashes.deinit(self.allocator);
         self.clearBlockSmallest();
         self.clearBlockLargest();
         self.* = undefined;
@@ -1022,6 +1089,10 @@ pub const StreamingEncoder = struct {
         const hashes = entryHashes(entry.namespace_name, entry.key);
         self.filter_builder.addHashes(hashes[0], hashes[1]);
         try self.block_hashes.append(self.allocator, hashes);
+        if (entryPrefixHashes(self.prefix_extractor, entry.namespace_name, entry.key)) |prefix_hashes| {
+            self.prefix_filter_builder.addHashes(prefix_hashes[0], prefix_hashes[1]);
+            try self.block_prefix_hashes.append(self.allocator, prefix_hashes);
+        }
         try self.setBlockLargest(entry);
     }
 
@@ -1040,6 +1111,11 @@ pub const StreamingEncoder = struct {
         self.filter_builder_active = false;
         errdefer filter.deinit(self.allocator);
         const encoded_filter = try filter.encodeInto(self.allocator, &self.encoded_filter_bytes);
+        var prefix_filter = self.prefix_filter_builder.finish();
+        self.prefix_filter_builder_active = false;
+        defer prefix_filter.deinit(self.allocator);
+        const encoded_prefix_filter = try prefix_filter.encodeAlloc(self.allocator);
+        defer self.allocator.free(encoded_prefix_filter);
 
         const metadata_offset = self.sink.len();
         for (self.entry_offsets.items) |offset| try sinkAppendU32(self.sink, offset);
@@ -1079,6 +1155,18 @@ pub const StreamingEncoder = struct {
             try sinkAppendU32(self.sink, try checkedU32(block.smallest_key.len));
             if (block.smallest_namespace_name) |name| try self.sink.appendSlice(name);
             try self.sink.appendSlice(block.smallest_key);
+        }
+        try sinkAppendU32(self.sink, @intFromEnum(self.prefix_extractor));
+        try sinkAppendU32(self.sink, try checkedU32(encoded_prefix_filter.len));
+        try self.sink.appendSlice(encoded_prefix_filter);
+        try sinkAppendU32(self.sink, try checkedU32(self.blocks.items.len));
+        for (self.blocks.items) |block| {
+            const encoded_block_prefix_filter = if (block.prefix_filter) |block_prefix_filter|
+                try block_prefix_filter.encodeInto(self.allocator, &self.encoded_filter_bytes)
+            else
+                "";
+            try sinkAppendU32(self.sink, try checkedU32(encoded_block_prefix_filter.len));
+            try self.sink.appendSlice(encoded_block_prefix_filter);
         }
         const metadata_len = self.sink.len() - metadata_offset;
 
@@ -1137,6 +1225,8 @@ pub const StreamingEncoder = struct {
 
         var block_filter = try buildFilterFromHashesAlloc(self.allocator, self.block_hashes.items, block_filter_config);
         errdefer block_filter.deinit(self.allocator);
+        var block_prefix_filter = try buildFilterFromHashesAlloc(self.allocator, self.block_prefix_hashes.items, block_filter_config);
+        errdefer block_prefix_filter.deinit(self.allocator);
         const hash_slots = try buildBlockHashSlotsFromHashesAlloc(self.allocator, self.block_hashes.items, self.block_first_entry_index);
         errdefer self.allocator.free(hash_slots);
 
@@ -1168,11 +1258,13 @@ pub const StreamingEncoder = struct {
             .largest_namespace_name = largest_namespace_name,
             .largest_key = largest_key,
             .filter = block_filter,
+            .prefix_filter = block_prefix_filter,
             .hash_slots = hash_slots,
         });
 
         self.block_bytes.clearRetainingCapacity();
         self.block_hashes.clearRetainingCapacity();
+        self.block_prefix_hashes.clearRetainingCapacity();
         self.block_start = null;
         self.block_entry_count = 0;
     }
@@ -1237,6 +1329,7 @@ fn flushEncodedBlock(
     block_largest_namespace_name: ?[]const u8,
     block_largest_key: []const u8,
     compression_policy: CompressionPolicy,
+    prefix_extractor: PrefixExtractor,
     compression_bytes: *std.ArrayListUnmanaged(u8),
 ) !void {
     if (block_entry_count == 0) return;
@@ -1249,6 +1342,8 @@ fn flushEncodedBlock(
 
     var block_filter = try buildFilterAlloc(allocator, entries[block_first_entry_index .. block_first_entry_index + block_entry_count], block_filter_config);
     errdefer block_filter.deinit(allocator);
+    var block_prefix_filter = try buildPrefixFilterAlloc(allocator, entries[block_first_entry_index .. block_first_entry_index + block_entry_count], prefix_extractor, block_filter_config);
+    errdefer block_prefix_filter.deinit(allocator);
     const hash_slots = try buildBlockHashSlotsAlloc(allocator, entries[block_first_entry_index .. block_first_entry_index + block_entry_count], block_first_entry_index);
     errdefer allocator.free(hash_slots);
     try blocks.append(allocator, .{
@@ -1264,6 +1359,7 @@ fn flushEncodedBlock(
         .largest_namespace_name = block_largest_namespace_name,
         .largest_key = block_largest_key,
         .filter = block_filter,
+        .prefix_filter = block_prefix_filter,
         .hash_slots = hash_slots,
     });
     block_bytes.clearRetainingCapacity();
@@ -1300,6 +1396,22 @@ pub fn buildFilterAlloc(
     return builder.finish();
 }
 
+pub fn buildPrefixFilterAlloc(
+    allocator: std.mem.Allocator,
+    entries: []const Entry,
+    extractor: PrefixExtractor,
+    config: bloom.Config,
+) !bloom.OwnedFilter {
+    var builder = try bloom.Builder.init(allocator, entries.len, config);
+    errdefer builder.deinit();
+    for (entries) |entry| {
+        if (entryPrefixHashes(extractor, entry.namespace_name, entry.key)) |hashes| {
+            builder.addHashes(hashes[0], hashes[1]);
+        }
+    }
+    return builder.finish();
+}
+
 fn buildFilterFromHashesAlloc(
     allocator: std.mem.Allocator,
     hashes: []const [2]u64,
@@ -1309,6 +1421,42 @@ fn buildFilterFromHashesAlloc(
     errdefer builder.deinit();
     for (hashes) |entry_hashes| builder.addHashes(entry_hashes[0], entry_hashes[1]);
     return builder.finish();
+}
+
+pub fn extractKeyPrefix(extractor: PrefixExtractor, key: []const u8) ?[]const u8 {
+    return switch (extractor) {
+        .none => null,
+        .first_separator => firstSeparatorPrefix(key),
+    };
+}
+
+fn firstSeparatorPrefix(key: []const u8) ?[]const u8 {
+    for (key, 0..) |byte, i| {
+        if (byte == ':' or byte == '/') return key[0 .. i + 1];
+    }
+    return null;
+}
+
+pub fn upperBoundWithinPrefix(prefix: []const u8, upper: []const u8) bool {
+    if (std.mem.startsWith(u8, upper, prefix)) return true;
+    var pivot = prefix.len;
+    while (pivot > 0) {
+        pivot -= 1;
+        if (prefix[pivot] == 0xff) continue;
+        return compareBytesToPrefixSuccessor(upper, prefix, pivot) != .gt;
+    }
+    return false;
+}
+
+fn compareBytesToPrefixSuccessor(bytes: []const u8, prefix: []const u8, pivot: usize) std.math.Order {
+    var i: usize = 0;
+    while (i < bytes.len and i <= pivot) : (i += 1) {
+        const rhs = if (i == pivot) prefix[i] + 1 else prefix[i];
+        if (bytes[i] < rhs) return .lt;
+        if (bytes[i] > rhs) return .gt;
+    }
+    if (bytes.len <= pivot) return .lt;
+    return .eq;
 }
 
 fn buildBlockHashSlotsAlloc(
@@ -1385,6 +1533,10 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !Decoded {
 pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !BorrowedDecoded {
     var index = try decodeIndexAlloc(allocator, raw);
     errdefer index.deinit(allocator);
+    if (index.prefix_filter) |*filter| {
+        filter.deinit(allocator);
+        index.prefix_filter = null;
+    }
 
     if (indexHasCompressedBlocks(&index)) {
         const logical_raw = try materializeLogicalEntryDataRawAlloc(allocator, raw, &index);
@@ -1799,7 +1951,7 @@ pub fn decodeIndexAlloc(allocator: std.mem.Allocator, raw: []const u8) !TableInd
     return switch (header.version) {
         2 => decodeV2IndexAlloc(allocator, raw, cursor, header.entry_count),
         3 => decodeV3IndexAlloc(allocator, raw, cursor, header),
-        4, 5, 6, 7 => decodeV4IndexAlloc(allocator, raw, header),
+        4, 5, 6, 7, 8 => decodeV4IndexAlloc(allocator, raw, header),
         else => error.UnsupportedVersion,
     };
 }
@@ -1830,7 +1982,7 @@ pub fn decodeHeader(raw: []const u8, cursor: *usize) !Header {
                 .entry_data_start = entry_offsets_start + entry_count * @sizeOf(u32),
             };
         },
-        4, 5, 6, 7 => blk: {
+        4, 5, 6, 7, 8 => blk: {
             const entry_data_len: usize = @intCast(try readU32(raw, cursor));
             const entry_data_start = cursor.*;
             break :blk .{
@@ -2103,6 +2255,17 @@ fn decodeFooterMetadataAlloc(
     if (cursor < metadata.len) {
         try decodeBlockSmallestKeysAlloc(allocator, metadata, &cursor, blocks);
     }
+    var prefix_extractor: PrefixExtractor = .none;
+    var prefix_filter: ?bloom.OwnedFilter = null;
+    errdefer if (prefix_filter) |*filter_ptr| filter_ptr.deinit(allocator);
+    if (cursor < metadata.len) {
+        prefix_extractor = try decodePrefixExtractor(try readU32(metadata, &cursor));
+        const prefix_filter_len: usize = @intCast(try readU32(metadata, &cursor));
+        if (prefix_filter_len > 0) {
+            prefix_filter = try bloom.OwnedFilter.decodeAlloc(allocator, try readSlice(metadata, &cursor, prefix_filter_len));
+        }
+        try decodeBlockPrefixFiltersAlloc(allocator, metadata, &cursor, blocks);
+    }
     if (cursor != metadata.len) return error.InvalidTableFile;
 
     return .{
@@ -2110,6 +2273,8 @@ fn decodeFooterMetadataAlloc(
         .entry_data_start = entry_data_start,
         .entry_data_len = entry_data_len,
         .filter = filter,
+        .prefix_extractor = prefix_extractor,
+        .prefix_filter = prefix_filter,
         .blocks = blocks,
     };
 }
@@ -2268,6 +2433,32 @@ fn decodeBlockSmallestKeysAlloc(
     }
 }
 
+fn decodePrefixExtractor(raw: u32) !PrefixExtractor {
+    return switch (raw) {
+        @intFromEnum(PrefixExtractor.none) => .none,
+        @intFromEnum(PrefixExtractor.first_separator) => .first_separator,
+        else => error.InvalidTableFile,
+    };
+}
+
+fn decodeBlockPrefixFiltersAlloc(
+    allocator: std.mem.Allocator,
+    metadata: []const u8,
+    cursor: *usize,
+    blocks: []TableIndex.BlockMeta,
+) !void {
+    const filter_count: usize = @intCast(try readU32(metadata, cursor));
+    if (filter_count != blocks.len) return error.InvalidTableFile;
+    for (blocks) |*block| {
+        const filter_len: usize = @intCast(try readU32(metadata, cursor));
+        if (filter_len == 0) {
+            block.prefix_filter = null;
+            continue;
+        }
+        block.prefix_filter = try bloom.OwnedFilter.decodeAlloc(allocator, try readSlice(metadata, cursor, filter_len));
+    }
+}
+
 fn decodeV3EntryOffsets(
     allocator: std.mem.Allocator,
     raw: []const u8,
@@ -2364,6 +2555,18 @@ fn entryHashes(namespace_name: ?[]const u8, key: []const u8) [2]u64 {
     return .{
         hashEntryWithSeed(0x243f6a8885a308d3, namespace_name, key),
         hashEntryWithSeed(0x13198a2e03707344, namespace_name, key),
+    };
+}
+
+fn entryPrefixHashes(extractor: PrefixExtractor, namespace_name: ?[]const u8, key: []const u8) ?[2]u64 {
+    const prefix = extractKeyPrefix(extractor, key) orelse return null;
+    return prefixHashes(namespace_name, prefix);
+}
+
+fn prefixHashes(namespace_name: ?[]const u8, prefix: []const u8) [2]u64 {
+    return .{
+        hashEntryWithSeed(0x452821e638d01377, namespace_name, prefix),
+        hashEntryWithSeed(0xbe5466cf34e90c6c, namespace_name, prefix),
     };
 }
 
@@ -2536,6 +2739,35 @@ test "table file footer metadata includes block bounds for point reads" {
     try std.testing.expect(positioned != null);
     try std.testing.expectEqual(@as(usize, 4), positioned.?.index);
     try std.testing.expectEqualStrings("doc:004", positioned.?.entry.key);
+}
+
+test "table file footer metadata includes prefix bloom filters" {
+    const allocator = std.testing.allocator;
+    var entries = [_]Entry{
+        .{ .namespace_name = "docs", .key = "tenant-a:001", .value = "a" },
+        .{ .namespace_name = "docs", .key = "tenant-a:002", .value = "b" },
+        .{ .namespace_name = "docs", .key = "tenant-c:001", .value = "c" },
+    };
+
+    const encoded = try encodeAlloc(allocator, &entries);
+    defer allocator.free(encoded);
+
+    var index = try decodeIndexAlloc(allocator, encoded);
+    defer index.deinit(allocator);
+
+    var header_cursor: usize = 0;
+    try std.testing.expectEqual(@as(u32, version), (try decodeHeader(encoded, &header_cursor)).version);
+    try std.testing.expectEqual(PrefixExtractor.first_separator, index.prefix_extractor);
+    try std.testing.expect(index.prefix_filter != null);
+    try std.testing.expect(index.maybeContainsPrefix("docs", "tenant-a:"));
+    try std.testing.expect(index.maybeContainsPrefix("docs", "tenant-c:"));
+    try std.testing.expect(!index.maybeContainsPrefix("docs", "tenant-b:"));
+    try std.testing.expect(index.blocks.len > 0);
+    try std.testing.expect(index.blocks[0].prefix_filter != null);
+    try std.testing.expect(index.blocks[0].maybeContainsPrefix("docs", "tenant-a:"));
+    try std.testing.expect(!index.blocks[0].maybeContainsPrefix("docs", "tenant-b:"));
+    try std.testing.expectEqualStrings("tenant-a:", extractKeyPrefix(default_prefix_extractor, "tenant-a:001").?);
+    try std.testing.expect(upperBoundWithinPrefix("tenant-a:", "tenant-a;"));
 }
 
 test "table file adaptive snappy compression round trips repetitive blocks" {
