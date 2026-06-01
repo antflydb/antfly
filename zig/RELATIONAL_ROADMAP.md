@@ -84,7 +84,10 @@ Current PR progress:
   recognize relational row keys as document rows;
 - `relational_store.scanRowsAlloc` and `scanColumnAlloc` expose row and column
   scans over the packed base-row encoding, so query consumers can start moving
-  off segment doc-values before the physical column layout changes.
+  off segment doc-values before the physical column layout changes;
+- relational full-text `include_stored` now reconstructs returned rows from the
+  relational base-row store, while the inverted index remains responsible only
+  for term matching and scoring.
 
 ## Implementation Phases
 
@@ -209,21 +212,24 @@ Acceptance:
 - derived indexes can be dropped and rebuilt from relational base rows;
 - range ownership fencing prevents stale relational rows from serving reads.
 
-### Phase 7 - Compatibility and Migration
+### Phase 7 - Removal Gate
 
-This PR can avoid legacy relational on-disk migration if relational mode has not
-shipped, but the code should still handle mixed local state during development:
+Relational mode has not shipped as a durable public format, so this work should
+not add legacy migration support for older experimental relational encodings.
+Instead, use the final phase as a removal and invariant gate:
 
-- detect old relational `AROW` generic KV values and migrate them into the
-  relational participant on open or first write;
-- reject mixed base-store/old-KV states that cannot be made safe;
+- remove the remaining generic relational `AROW` write/read fallbacks once all
+  readers use the relational base store;
+- assert or fail fast in tests when relational tables attempt to read a generic
+  document KV value;
+- keep development fixtures and tests on the current base-row format only;
 - preserve document-mode KV values exactly.
 
 Acceptance:
 
-- clean upgrade path for existing PR test data;
+- tests and fixtures only exercise the current relational base-row format;
 - no accidental interpretation of document-mode JSON blobs as relational rows;
-- explicit version/capability marker for one-store relational tables.
+- explicit format/capability marker prevents ambiguous relational table state.
 
 ## Code Areas
 

@@ -8700,6 +8700,7 @@ pub const DB = struct {
             .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
+            .load_projected_document = loadProjectedSearchDocumentCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
@@ -40370,7 +40371,7 @@ fn loadStoredSearchDocumentManyCallback(
     return try loadStoredSearchDocumentsMany(self, alloc, keys);
 }
 
-test "relational table full-text search reconstructs stored_data from columns" {
+test "relational table full-text search loads stored_data from base rows" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
@@ -40407,6 +40408,15 @@ test "relational table full-text search reconstructs stored_data from columns" {
         .sync_level = .full_index,
     });
 
+    const replacement_json =
+        \\{"title":"base row wins","amount":77.25,"active":false}
+    ;
+    const replacement_row = try mapper.buildRelationalRowValueAlloc(alloc, replacement_json, runtime_schema.relational_columns);
+    defer alloc.free(replacement_row);
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:a");
+    defer alloc.free(relational_key);
+    try db.core.store.put(relational_key, replacement_row);
+
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
         .query = .{ .match = .{ .field = "title", .text = "hello" } },
@@ -40417,17 +40427,19 @@ test "relational table full-text search reconstructs stored_data from columns" {
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expect(result.hits[0].stored_data != null);
 
-    // stored_data was reconstructed from the persisted typed columns.
+    // Search still matches the full-text segment, but stored_data comes from the
+    // relational base row. If this path reads segment typed_doc_values, these
+    // assertions see the original 42.5/true row instead.
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.hits[0].stored_data.?, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
-    try std.testing.expectEqualStrings("hello world", obj.get("title").?.string);
+    try std.testing.expectEqualStrings("base row wins", obj.get("title").?.string);
     const amount = obj.get("amount").?;
     const amount_num: f64 = switch (amount) {
         .float => |f| f,
         .integer => |n| @floatFromInt(n),
         else => unreachable,
     };
-    try std.testing.expectEqual(@as(f64, 42.5), amount_num);
-    try std.testing.expect(obj.get("active").?.bool);
+    try std.testing.expectEqual(@as(f64, 77.25), amount_num);
+    try std.testing.expect(!obj.get("active").?.bool);
 }
