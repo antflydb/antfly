@@ -29,7 +29,7 @@ const roaring = @import("encoding/roaring.zig");
 
 /// Merge policy configuration.
 pub const MergePolicy = struct {
-    max_segments_per_tier: u32 = 8,
+    max_segments_per_tier: u32 = 10,
     max_merge_at_once: u32 = 10,
     max_segment_size: u64 = 5 * 1024 * 1024 * 1024,
     floor_segment_size: u64 = 16 * 1024 * 1024,

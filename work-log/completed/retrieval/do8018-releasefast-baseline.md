@@ -17,6 +17,7 @@ Repeated on 2026-05-31 from worktree commit `12e7e4cb4` to check whether the cor
 Repeated on 2026-05-31 from worktree commit `1786a764e2f0` after keeping active mmap-backed text segments warm while still discarding retired merge source pages.
 Updated on 2026-06-01 from worktree commit `bd00912c6bce` plus the pending file-backed text-merge accounting patch. `full_text_pending_segments` now accounts heap-backed pending bytes only, while text merge diagnostics split total pending bytes into heap-backed and mmap-backed debt.
 Updated on 2026-06-01 from worktree commit `b33c0add4c34` after adding text merge input/output byte accounting. This run shows final process footprint and mapped-file residency remain low, while completed merges rewrite about 1.45-1.58 GiB to produce about 389-401 MiB of final segment bytes.
+Updated on 2026-06-01 from worktree commit `f4382b40fa56` after removing floor-only text segment merges. Metrics-off improved from 66.55s to 55.96s and text merge input bytes dropped from 1.58 GiB to 1.32 GiB. Metrics-on also dropped merge input bytes, but a larger final merge increased catch-up time in that sample.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -77,6 +78,98 @@ File-backed pending-accounting artifacts:
 Merge IO accounting artifacts:
 
 `work-log/do8018/releasefast-baseline-20260601-113126/`
+
+No floor-only merge artifacts:
+
+`work-log/do8018/releasefast-baseline-20260601-114808/`
+
+## Latest No Floor-Only Merge Metrics Off
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Load time: 44.251868709s
+- Async catch-up time: 11.705328708s
+- Total measured time: 55.957249417s
+- Catch-up complete: true
+- Throughput: 1,595.53 records/sec, 4.87 MiB/sec
+- `ps` RSS: 626,147,328 bytes
+- Peak `ps` RSS: 955,678,720 bytes
+- Process footprint metric: 127,852,536 bytes
+- Peak process footprint metric: 383,491,848 bytes
+- Live malloc metric: 73,699,824 bytes
+- Peak live malloc metric: 219,597,440 bytes
+- vmmap footprint: 128,555,417 bytes
+- vmmap peak footprint: 708,313,088 bytes
+- vmmap mapped-file resident: 31,876,710 bytes
+- vmmap malloc allocated: 24,326,963 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 400,120,004
+- Stored fields bytes: 127,745,079
+- Inverted bytes: 268,273,465
+- Inverted norms bytes: 13,892,189
+- Inverted postings bytes: 145,582,295
+- Inverted term dictionary bytes: 102,365,046
+- Term block bytes: 96,604,256
+- Term index bytes: 2,902,401
+- Term FST bytes: 2,784,009
+- Typed doc values bytes: 3,445,803
+- Doc ordinal bytes: 282,460
+- Section index bytes: 372,877
+- Text merges completed: 143
+- Text merge input bytes total: 1,316,062,262
+- Text merge output bytes total: 1,293,834,104
+- Last text merge input/output bytes: 53,755,649 / 51,312,835
+- Full-text build peak bytes: 143,656,816
+- Full-text pending heap peak bytes: 0
+- Text merge buffer peak bytes: 66,521,273
+- LSM compaction peak bytes: 67,850,304
+- LSM in-memory state peak bytes: 20,301,749
+- LSM mutable snapshot clone calls/bytes/peak: 13 / 5,359 / 630
+- LSM read snapshot mutable rotations/bytes/peak: 175 / 292,006,906 / 20,217,503
+
+## Latest No Floor-Only Merge Metrics On
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Load time: 45.874382s
+- Async catch-up time: 20.360595s
+- Total measured time: 1m6.235041041s
+- Catch-up complete: true
+- Throughput: 1,539.09 records/sec, 4.70 MiB/sec
+- `ps` RSS: 701,661,184 bytes
+- Peak `ps` RSS: 1,194,901,504 bytes
+- Process footprint metric: 165,421,048 bytes
+- Peak process footprint metric: 540,712,376 bytes
+- Live malloc metric: 86,042,528 bytes
+- Peak live malloc metric: 261,040,240 bytes
+- vmmap footprint: 166,094,438 bytes
+- vmmap peak footprint: 775,107,379 bytes
+- vmmap mapped-file resident: 30,618,419 bytes
+- vmmap malloc allocated: 33,764,147 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 399,048,103
+- Stored fields bytes: 127,738,448
+- Inverted bytes: 267,199,341
+- Inverted norms bytes: 15,325,473
+- Inverted postings bytes: 145,652,240
+- Inverted term dictionary bytes: 100,332,303
+- Term block bytes: 94,670,541
+- Term index bytes: 2,850,255
+- Term FST bytes: 2,736,287
+- Typed doc values bytes: 3,448,466
+- Doc ordinal bytes: 282,460
+- Section index bytes: 379,068
+- Text merges completed: 135
+- Text merge input bytes total: 1,333,005,066
+- Text merge output bytes total: 1,315,374,090
+- Last text merge input/output bytes: 165,465,501 / 164,573,558
+- Full-text build peak bytes: 148,071,622
+- Full-text pending heap peak bytes: 0
+- Text merge buffer peak bytes: 111,583,605
+- LSM compaction peak bytes: 67,580,832
+- LSM in-memory state peak bytes: 28,696,910
+- LSM mutable snapshot clone calls/bytes/peak: 15 / 11,165 / 6,260
+- LSM read snapshot mutable rotations/bytes/peak: 174 / 292,003,686 / 28,614,372
 
 ## Latest Merge IO Accounting Metrics Off
 

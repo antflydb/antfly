@@ -90,7 +90,7 @@ var text_segment_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var text_projection_source_build_target_bytes_cache: std.atomic.Value(usize) = .init(0);
 var sparse_replay_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
 const default_merge_policy = merger_mod.MergePolicy{
-    .max_segments_per_tier = 8,
+    .max_segments_per_tier = 10,
     .max_segment_size = 5 * 1024 * 1024 * 1024,
     .floor_segment_size = 16 * 1024 * 1024,
 };
