@@ -120,7 +120,7 @@ pub const Options = struct {
     wal_segment_bytes: u64 = 64 * 1024 * 1024,
     root_generation: u64 = 0,
     obsolete_retention_ns: u64 = 5 * std.time.ns_per_min,
-    read_snapshot_rotate_mutable_bytes: u64 = 1 * 1024 * 1024,
+    read_snapshot_rotate_mutable_bytes: u64 = 256 * 1024,
 };
 
 pub const IoRuntime = storage_io.RuntimeKind;
@@ -209,6 +209,9 @@ pub const Backend = struct {
         mutable_snapshot_clone_bytes_total: u64 = 0,
         mutable_snapshot_clone_peak_bytes: u64 = 0,
         mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+        read_snapshot_mutable_rotations: u64 = 0,
+        read_snapshot_mutable_rotation_bytes_total: u64 = 0,
+        read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
         immutable_memtables: u64 = 0,
         immutable_entries: u64 = 0,
         immutable_bytes: u64 = 0,
@@ -268,6 +271,9 @@ pub const Backend = struct {
             dst_reason.bytes_total +|= src_reason.bytes_total;
             dst_reason.peak_bytes = @max(dst_reason.peak_bytes, src_reason.peak_bytes);
         }
+        dst.read_snapshot_mutable_rotations +|= src.read_snapshot_mutable_rotations;
+        dst.read_snapshot_mutable_rotation_bytes_total +|= src.read_snapshot_mutable_rotation_bytes_total;
+        dst.read_snapshot_mutable_rotation_peak_bytes = @max(dst.read_snapshot_mutable_rotation_peak_bytes, src.read_snapshot_mutable_rotation_peak_bytes);
         dst.immutable_memtables +|= src.immutable_memtables;
         dst.immutable_entries +|= src.immutable_entries;
         dst.immutable_bytes +|= src.immutable_bytes;
@@ -580,6 +586,9 @@ pub const Backend = struct {
     mutable_snapshot_clone_bytes_total: u64 = 0,
     mutable_snapshot_clone_peak_bytes: u64 = 0,
     mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+    read_snapshot_mutable_rotations: u64 = 0,
+    read_snapshot_mutable_rotation_bytes_total: u64 = 0,
+    read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
     active_bulk_ingest_batches: usize = 0,
     mutable: ActiveMemTable = .{},
     mutable_wal_range: WalSegmentRange = .{},
@@ -682,6 +691,9 @@ pub const Backend = struct {
             .mutable_snapshot_clone_bytes_total = self.mutable_snapshot_clone_bytes_total,
             .mutable_snapshot_clone_peak_bytes = self.mutable_snapshot_clone_peak_bytes,
             .mutable_snapshot_clone_by_reason = self.mutable_snapshot_clone_by_reason,
+            .read_snapshot_mutable_rotations = self.read_snapshot_mutable_rotations,
+            .read_snapshot_mutable_rotation_bytes_total = self.read_snapshot_mutable_rotation_bytes_total,
+            .read_snapshot_mutable_rotation_peak_bytes = self.read_snapshot_mutable_rotation_peak_bytes,
             .immutable_memtables = @intCast(self.activeImmutableMemtableCount()),
             .total_runs = @intCast(self.runs.items.len),
             .obsolete_paths = @intCast(self.obsolete_paths.items.len),
@@ -990,6 +1002,9 @@ pub const Backend = struct {
         if (mutable_bytes < self.options.read_snapshot_rotate_mutable_bytes) return;
 
         try self.rotateMutableToImmutable();
+        self.read_snapshot_mutable_rotations +|= 1;
+        self.read_snapshot_mutable_rotation_bytes_total +|= mutable_bytes;
+        self.read_snapshot_mutable_rotation_peak_bytes = @max(self.read_snapshot_mutable_rotation_peak_bytes, mutable_bytes);
         if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
         self.notePotentialMaintenanceDebt();
     }
@@ -7273,6 +7288,10 @@ test "lsm backend rotates large mutable state for read snapshots instead of clon
     try std.testing.expectEqual(@as(?*State, null), backend.mutable_read_snapshot);
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
     try std.testing.expectEqual(@as(u64, 0), backend.mutable_snapshot_clone_calls);
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 1), maintenance.read_snapshot_mutable_rotations);
+    try std.testing.expect(maintenance.read_snapshot_mutable_rotation_bytes_total > 0);
+    try std.testing.expectEqual(maintenance.read_snapshot_mutable_rotation_bytes_total, maintenance.read_snapshot_mutable_rotation_peak_bytes);
 }
 
 test "lsm backend attributes mutable snapshot clones by reader class" {

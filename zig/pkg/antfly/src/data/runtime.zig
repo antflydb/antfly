@@ -465,6 +465,9 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_calls_total", "counter", "LSM mutable snapshot clone calls issued by snapshot reads", stats.mutable_snapshot_clone_calls);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_bytes_total", "counter", "Total bytes cloned into LSM mutable snapshot reads", stats.mutable_snapshot_clone_bytes_total);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_peak_bytes", "gauge", "Peak bytes cloned for a single LSM mutable snapshot read", stats.mutable_snapshot_clone_peak_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotations_total", "counter", "LSM mutable memtable rotations triggered to serve broad read snapshots without cloning", stats.read_snapshot_mutable_rotations);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotation_bytes_total", "counter", "Mutable memtable bytes rotated into immutable state for broad read snapshots", stats.read_snapshot_mutable_rotation_bytes_total);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotation_peak_bytes", "gauge", "Peak mutable memtable bytes rotated for one broad read snapshot", stats.read_snapshot_mutable_rotation_peak_bytes);
     try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_calls_total", "counter", "LSM mutable snapshot clone calls by reader class");
     for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
         const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);

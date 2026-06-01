@@ -139,6 +139,9 @@ type diagSnapshot struct {
 	LSMMutableSnapshotCloneCalls         int64          `json:"lsm_mutable_snapshot_clone_calls,omitempty"`
 	LSMMutableSnapshotCloneBytesTotal    int64          `json:"lsm_mutable_snapshot_clone_bytes_total,omitempty"`
 	LSMMutableSnapshotClonePeakBytes     int64          `json:"lsm_mutable_snapshot_clone_peak_bytes,omitempty"`
+	LSMReadSnapshotMutableRotations      int64          `json:"lsm_read_snapshot_mutable_rotations,omitempty"`
+	LSMReadSnapshotMutableRotationBytes  int64          `json:"lsm_read_snapshot_mutable_rotation_bytes_total,omitempty"`
+	LSMReadSnapshotMutableRotationPeak   int64          `json:"lsm_read_snapshot_mutable_rotation_peak_bytes,omitempty"`
 	LSMMutableSnapshotBoundReadTxnCalls  int64          `json:"lsm_mutable_snapshot_clone_bound_read_txn_calls,omitempty"`
 	LSMMutableSnapshotBoundReadTxnBytes  int64          `json:"lsm_mutable_snapshot_clone_bound_read_txn_bytes_total,omitempty"`
 	LSMMutableSnapshotNamespaceTxnCalls  int64          `json:"lsm_mutable_snapshot_clone_namespace_read_txn_calls,omitempty"`
@@ -441,7 +444,7 @@ func main() {
 		finalDiag.FullTextDocOrdinalsBytes,
 		finalDiag.FullTextSectionIndexBytes,
 	)
-	fmt.Printf("merge_and_resource_diagnostics text_merge_pending_segments=%d text_merge_pending_bytes=%d text_merge_completed_total=%d text_merge_failed_total=%d full_text_build_peak_bytes=%d full_text_pending_peak_bytes=%d text_merge_buffer_peak_bytes=%d lsm_cache_peak_bytes=%d lsm_compaction_peak_bytes=%d lsm_state_peak_bytes=%d lsm_mutable_snapshot_clone_calls=%d lsm_mutable_snapshot_clone_bytes_total=%d lsm_mutable_snapshot_clone_peak_bytes=%d lsm_mutable_snapshot_clone_bound_read_txn_calls=%d lsm_mutable_snapshot_clone_namespace_read_txn_calls=%d lsm_mutable_snapshot_clone_other_calls=%d\n",
+	fmt.Printf("merge_and_resource_diagnostics text_merge_pending_segments=%d text_merge_pending_bytes=%d text_merge_completed_total=%d text_merge_failed_total=%d full_text_build_peak_bytes=%d full_text_pending_peak_bytes=%d text_merge_buffer_peak_bytes=%d lsm_cache_peak_bytes=%d lsm_compaction_peak_bytes=%d lsm_state_peak_bytes=%d lsm_mutable_snapshot_clone_calls=%d lsm_mutable_snapshot_clone_bytes_total=%d lsm_mutable_snapshot_clone_peak_bytes=%d lsm_read_snapshot_mutable_rotations=%d lsm_read_snapshot_mutable_rotation_bytes_total=%d lsm_read_snapshot_mutable_rotation_peak_bytes=%d lsm_mutable_snapshot_clone_bound_read_txn_calls=%d lsm_mutable_snapshot_clone_namespace_read_txn_calls=%d lsm_mutable_snapshot_clone_other_calls=%d\n",
 		finalDiag.TextMergePendingSegments,
 		finalDiag.TextMergePendingBytes,
 		finalDiag.TextMergeCompletedTotal,
@@ -455,6 +458,9 @@ func main() {
 		finalDiag.LSMMutableSnapshotCloneCalls,
 		finalDiag.LSMMutableSnapshotCloneBytesTotal,
 		finalDiag.LSMMutableSnapshotClonePeakBytes,
+		finalDiag.LSMReadSnapshotMutableRotations,
+		finalDiag.LSMReadSnapshotMutableRotationBytes,
+		finalDiag.LSMReadSnapshotMutableRotationPeak,
 		finalDiag.LSMMutableSnapshotBoundReadTxnCalls,
 		finalDiag.LSMMutableSnapshotNamespaceTxnCalls,
 		finalDiag.LSMMutableSnapshotOtherCalls,
@@ -633,6 +639,9 @@ func collectDiagnostics(pid int, healthURL, dataDir string, elapsed time.Duratio
 			out.LSMMutableSnapshotCloneCalls = int64(promValue(metrics, "antfly_lsm_mutable_snapshot_clone_calls_total", nil))
 			out.LSMMutableSnapshotCloneBytesTotal = int64(promValue(metrics, "antfly_lsm_mutable_snapshot_clone_bytes_total", nil))
 			out.LSMMutableSnapshotClonePeakBytes = int64(promValue(metrics, "antfly_lsm_mutable_snapshot_clone_peak_bytes", nil))
+			out.LSMReadSnapshotMutableRotations = int64(promValue(metrics, "antfly_lsm_read_snapshot_mutable_rotations_total", nil))
+			out.LSMReadSnapshotMutableRotationBytes = int64(promValue(metrics, "antfly_lsm_read_snapshot_mutable_rotation_bytes_total", nil))
+			out.LSMReadSnapshotMutableRotationPeak = int64(promValue(metrics, "antfly_lsm_read_snapshot_mutable_rotation_peak_bytes", nil))
 			out.LSMMutableSnapshotBoundReadTxnCalls = int64(promValue(metrics, "antfly_lsm_mutable_snapshot_clone_reason_calls_total", map[string]string{"reason": "bound_read_txn"}))
 			out.LSMMutableSnapshotBoundReadTxnBytes = int64(promValue(metrics, "antfly_lsm_mutable_snapshot_clone_reason_bytes_total", map[string]string{"reason": "bound_read_txn"}))
 			out.LSMMutableSnapshotNamespaceTxnCalls = int64(promValue(metrics, "antfly_lsm_mutable_snapshot_clone_reason_calls_total", map[string]string{"reason": "namespace_read_txn"}))

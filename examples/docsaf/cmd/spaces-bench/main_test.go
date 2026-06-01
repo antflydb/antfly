@@ -87,6 +87,12 @@ antfly_lsm_mutable_snapshot_clone_calls_total 7
 antfly_lsm_mutable_snapshot_clone_bytes_total 8192
 # TYPE antfly_lsm_mutable_snapshot_clone_peak_bytes gauge
 antfly_lsm_mutable_snapshot_clone_peak_bytes 4096
+# TYPE antfly_lsm_read_snapshot_mutable_rotations_total counter
+antfly_lsm_read_snapshot_mutable_rotations_total 3
+# TYPE antfly_lsm_read_snapshot_mutable_rotation_bytes_total counter
+antfly_lsm_read_snapshot_mutable_rotation_bytes_total 16384
+# TYPE antfly_lsm_read_snapshot_mutable_rotation_peak_bytes gauge
+antfly_lsm_read_snapshot_mutable_rotation_peak_bytes 12288
 # TYPE antfly_lsm_mutable_snapshot_clone_reason_calls_total counter
 antfly_lsm_mutable_snapshot_clone_reason_calls_total{reason="bound_read_txn"} 5
 antfly_lsm_mutable_snapshot_clone_reason_calls_total{reason="namespace_read_txn"} 2
@@ -111,6 +117,15 @@ antfly_lsm_mutable_snapshot_clone_reason_bytes_total{reason="other"} 0
 	}
 	if diag.LSMMutableSnapshotClonePeakBytes != 4096 {
 		t.Fatalf("LSMMutableSnapshotClonePeakBytes=%d", diag.LSMMutableSnapshotClonePeakBytes)
+	}
+	if diag.LSMReadSnapshotMutableRotations != 3 {
+		t.Fatalf("LSMReadSnapshotMutableRotations=%d", diag.LSMReadSnapshotMutableRotations)
+	}
+	if diag.LSMReadSnapshotMutableRotationBytes != 16384 {
+		t.Fatalf("LSMReadSnapshotMutableRotationBytes=%d", diag.LSMReadSnapshotMutableRotationBytes)
+	}
+	if diag.LSMReadSnapshotMutableRotationPeak != 12288 {
+		t.Fatalf("LSMReadSnapshotMutableRotationPeak=%d", diag.LSMReadSnapshotMutableRotationPeak)
 	}
 	if diag.LSMMutableSnapshotBoundReadTxnCalls != 5 || diag.LSMMutableSnapshotBoundReadTxnBytes != 6144 {
 		t.Fatalf("bound read txn clone stats calls=%d bytes=%d", diag.LSMMutableSnapshotBoundReadTxnCalls, diag.LSMMutableSnapshotBoundReadTxnBytes)
