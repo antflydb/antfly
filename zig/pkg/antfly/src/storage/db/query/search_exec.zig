@@ -576,6 +576,7 @@ pub const MatchAllExecutor = struct {
 
 pub const MatchAllCandidateCollector = struct {
     ctx: ?*anyopaque,
+    relational_base_rows: bool = false,
     scan_store_range: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -594,6 +595,13 @@ pub const MatchAllCandidateCollector = struct {
         generation: ?u64,
     ) anyerror!?doc_set.DocOrdinal = null,
 };
+
+fn visibleBaseDocumentRowKey(relational_base_rows: bool, key: []const u8) bool {
+    return if (relational_base_rows)
+        internal_keys.isRelationalRowKey(key)
+    else
+        internal_keys.isPrimaryDocumentKey(key);
+}
 
 pub const ComposedSearchExecutor = struct {
     ctx: ?*anyopaque,
@@ -5395,7 +5403,7 @@ pub fn collectMatchAllCandidates(
     }
 
     for (docs) |doc| {
-        if (!internal_keys.isStoredDocumentRowKey(doc.key)) continue;
+        if (!visibleBaseDocumentRowKey(collector.relational_base_rows, doc.key)) continue;
         const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
         errdefer alloc.free(raw_key);
         if (try collector.is_expired_key(collector.ctx, alloc, raw_key)) {

@@ -3637,21 +3637,27 @@ fn storeGetAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
     return try runtime.alloc.dupe(u8, raw);
 }
 
-/// Read a DOCUMENT store value and materialize it as JSON. For a relational
-/// table the stored value is a serialized typed row; this reconstructs the
-/// document's canonical JSON so the enrichment input resolvers (source_field /
-/// source_template rendering) operate on a document exactly as in document mode.
-/// For document-mode tables the JSON blob passes through unchanged.
+fn runtimeUsesRelationalBaseRows(runtime: *EnrichmentRuntime) bool {
+    return if (comptime builtin.os.tag == .freestanding)
+        runtime.relational_base_rows
+    else
+        runtime.relational_base_rows.load(.monotonic);
+}
+
+/// Read a DOCUMENT store value and materialize it as JSON. Relational tables
+/// read from the relational row keyspace and require a typed row there; there
+/// is no supported JSON blob fallback for this new storage mode.
 fn storeGetDocumentAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
     const raw = try storeGetAlloc(runtime, key);
+    if (runtimeUsesRelationalBaseRows(runtime)) {
+        defer runtime.alloc.free(raw);
+        return try relational_row_codec.reconstructValueAlloc(runtime.alloc, raw);
+    }
     return try relational_row_codec.materializeOwnedDocumentValueAlloc(runtime.alloc, raw);
 }
 
 fn documentSourceStoreKeyAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8) ![]u8 {
-    const relational_base_rows = if (comptime builtin.os.tag == .freestanding)
-        runtime.relational_base_rows
-    else
-        runtime.relational_base_rows.load(.monotonic);
+    const relational_base_rows = runtimeUsesRelationalBaseRows(runtime);
     return if (relational_base_rows)
         try internal_keys.relationalRowKeyAlloc(runtime.alloc, doc_key)
     else

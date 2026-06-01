@@ -10401,6 +10401,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try db_query_search.collectMatchAllCandidates(alloc, req, .{
             .ctx = self,
+            .relational_base_rows = self.relationalColumnsForStore() != null,
             .scan_store_range = scanStoreRangeCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalCallback,
