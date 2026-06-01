@@ -155,6 +155,11 @@ Write path:
 - `zig build lsm-write-bench-compare -- --before /tmp/lsm-write-before.jsonl --after /tmp/lsm-write-after.jsonl`
 - Add `--wal-sync-on-commit` when measuring WAL sync latency and retention
   behavior under durable commit pressure.
+- Add `--compact-threshold-runs`, `--l0-soft-limit-runs`,
+  `--l0-hard-limit-runs`, `--l0-soft-limit-bytes`,
+  `--l0-hard-limit-bytes`, `--max-run-file-bytes`,
+  `--max-compaction-input-bytes`, and `--background-io-budget-bytes`
+  when measuring RocksDB-like compaction and write-stall policy changes.
 
 Large-ingest guardrails:
 
@@ -292,6 +297,10 @@ Large-ingest guardrails:
      `max_compaction_input_bytes` cap. Plan selection can skip oversized
      compactions and choose eligible smaller work instead of repeatedly
      admitting or remembering a plan larger than the configured policy budget.
+   - [x] Benchmark slice: `lsm-write-bench` can now drive and emit compaction
+     trigger/limit/background-IO policy knobs, and the comparator reports L0
+     debt, level overflow, scheduler pressure, and background IO admission
+     counters for before/after tuning.
 7. [ ] Consider memtable structure changes after byte-budgeted WAL/flush and
    recovery allocation work are measured; the current active memtable appends
    plus hash-indexes writes and sorts on freeze/flush, so the main costs are

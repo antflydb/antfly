@@ -41,10 +41,18 @@ const Config = struct {
     flush_threshold_bytes: u64 = 64 * 1024 * 1024,
     bulk_ingest_flush_threshold_multiplier: usize = 8,
     compact_threshold_runs: usize = 16,
+    l0_soft_limit_runs: usize = 0,
+    l0_hard_limit_runs: usize = 0,
+    l0_soft_limit_bytes: u64 = 0,
+    l0_hard_limit_bytes: u64 = 0,
     level_target_runs_base: usize = 4,
     level_target_runs_multiplier: usize = 4,
     level_target_bytes_base: usize = 128 * 1024,
     level_target_bytes_multiplier: usize = 8,
+    max_run_file_bytes: usize = 512 * 1024 * 1024,
+    max_compaction_input_bytes: u64 = 0,
+    background_io_budget_bytes: u64 = 0,
+    background_io_allow_oversized_single_job: bool = true,
     bloom_bits_per_key: usize = 10,
     bloom_min_bits: usize = 64,
     lsm_io_runtime: antfly.lsm_backend.IoRuntime = .threaded,
@@ -405,10 +413,18 @@ const Scenario = struct {
             .flush_threshold_bytes = cfg.flush_threshold_bytes,
             .bulk_ingest_flush_threshold_multiplier = cfg.bulk_ingest_flush_threshold_multiplier,
             .compact_threshold_runs = cfg.compact_threshold_runs,
+            .l0_soft_limit_runs = cfg.l0_soft_limit_runs,
+            .l0_hard_limit_runs = cfg.l0_hard_limit_runs,
+            .l0_soft_limit_bytes = cfg.l0_soft_limit_bytes,
+            .l0_hard_limit_bytes = cfg.l0_hard_limit_bytes,
             .level_target_runs_base = cfg.level_target_runs_base,
             .level_target_runs_multiplier = cfg.level_target_runs_multiplier,
             .level_target_bytes_base = cfg.level_target_bytes_base,
             .level_target_bytes_multiplier = cfg.level_target_bytes_multiplier,
+            .max_run_file_bytes = cfg.max_run_file_bytes,
+            .max_compaction_input_bytes = cfg.max_compaction_input_bytes,
+            .background_io_budget_bytes = cfg.background_io_budget_bytes,
+            .background_io_allow_oversized_single_job = cfg.background_io_allow_oversized_single_job,
             .bloom = bloomConfig(cfg),
             .io_runtime = cfg.lsm_io_runtime,
             .wal_sync_on_commit = cfg.wal_sync_on_commit,
@@ -502,7 +518,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     try out.print(
-        "lsm write bench samples={d} keys={d} hot_keys={d} overwrite_rounds={d} value_size={d} value_pattern={s} batch_size={d} update_stride={d} delete_stride={d} flush_threshold={d} flush_threshold_bytes={d} wal_sync_on_commit={} readers={d} storage={s} mode={s} workload_set={s}\n",
+        "lsm write bench samples={d} keys={d} hot_keys={d} overwrite_rounds={d} value_size={d} value_pattern={s} batch_size={d} update_stride={d} delete_stride={d} flush_threshold={d} flush_threshold_bytes={d} compact_threshold_runs={d} l0_soft_limit_runs={d} l0_hard_limit_runs={d} l0_soft_limit_bytes={d} l0_hard_limit_bytes={d} max_run_file_bytes={d} max_compaction_input_bytes={d} background_io_budget_bytes={d} background_io_allow_oversized_single_job={} wal_sync_on_commit={} readers={d} storage={s} mode={s} workload_set={s}\n",
         .{
             cfg.samples,
             cfg.keys,
@@ -515,6 +531,15 @@ pub fn main(init: std.process.Init) !void {
             cfg.delete_stride,
             cfg.flush_threshold,
             cfg.flush_threshold_bytes,
+            cfg.compact_threshold_runs,
+            cfg.l0_soft_limit_runs,
+            cfg.l0_hard_limit_runs,
+            cfg.l0_soft_limit_bytes,
+            cfg.l0_hard_limit_bytes,
+            cfg.max_run_file_bytes,
+            cfg.max_compaction_input_bytes,
+            cfg.background_io_budget_bytes,
+            cfg.background_io_allow_oversized_single_job,
             cfg.wal_sync_on_commit,
             cfg.readers,
             @tagName(cfg.storage_mode),
@@ -900,7 +925,7 @@ fn printResult(
     const writer_ns = ns - finalize_ns;
 
     try writer.print(
-        "{{\"scenario\":\"{s}\",\"storage\":\"{s}\",\"mode\":\"{s}\",\"sample\":{d},\"workload\":\"{s}\",\"ops\":{d},\"logical_value_write_bytes\":{d},\"ns\":{d},\"writer_ns\":{d},\"finalize_ns\":{d},\"ops_per_sec\":{d:.2},\"ns_per_op\":{d:.2}",
+        "{{\"scenario\":\"{s}\",\"storage\":\"{s}\",\"mode\":\"{s}\",\"sample\":{d},\"workload\":\"{s}\",\"ops\":{d},\"logical_value_write_bytes\":{d},\"ns\":{d},\"writer_ns\":{d},\"finalize_ns\":{d},\"ops_per_sec\":{d:.2},\"ns_per_op\":{d:.2},\"config_compact_threshold_runs\":{d},\"config_l0_soft_limit_runs\":{d},\"config_l0_hard_limit_runs\":{d},\"config_l0_soft_limit_bytes\":{d},\"config_l0_hard_limit_bytes\":{d},\"config_level_target_runs_base\":{d},\"config_level_target_runs_multiplier\":{d},\"config_level_target_bytes_base\":{d},\"config_level_target_bytes_multiplier\":{d},\"config_max_run_file_bytes\":{d},\"config_max_compaction_input_bytes\":{d},\"config_background_io_budget_bytes\":{d},\"config_background_io_allow_oversized_single_job\":{}",
         .{
             scenario.label,
             @tagName(scenario.storage_kind),
@@ -914,6 +939,19 @@ fn printResult(
             finalize_ns,
             ops_per_sec,
             ns_per_op,
+            scenario.cfg.compact_threshold_runs,
+            scenario.cfg.l0_soft_limit_runs,
+            scenario.cfg.l0_hard_limit_runs,
+            scenario.cfg.l0_soft_limit_bytes,
+            scenario.cfg.l0_hard_limit_bytes,
+            scenario.cfg.level_target_runs_base,
+            scenario.cfg.level_target_runs_multiplier,
+            scenario.cfg.level_target_bytes_base,
+            scenario.cfg.level_target_bytes_multiplier,
+            scenario.cfg.max_run_file_bytes,
+            scenario.cfg.max_compaction_input_bytes,
+            scenario.cfg.background_io_budget_bytes,
+            scenario.cfg.background_io_allow_oversized_single_job,
         },
     );
     try writer.print(
@@ -977,7 +1015,7 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"compactions\":{d},\"compaction_input_runs\":{d},\"compaction_input_bytes\":{d},\"compaction_output_bytes\":{d},\"compaction_ns\":{d},\"runs_after\":{d},\"l0_runs_after\":{d},\"overlapping_l0_runs_after\":{d},\"max_level_after\":{d},\"run_bytes_after\":{d},\"run_entries_after\":{d},\"obsolete_paths_after\":{d},\"mutable_entries_after\":{d},\"wal_retained_segments_after\":{d},\"wal_retained_bytes_after\":{d},\"wal_checkpoint_lag_segments_after\":{d},\"wal_replay_retained_segments_after\":{d},\"wal_replay_retained_bytes_after\":{d},\"compaction_scheduler_grants_after\":{d},\"compaction_scheduler_denied_capacity_after\":{d},\"compaction_scheduler_denied_resource_pressure_after\":{d},\"compaction_scheduler_remembered_pending_after\":{d},\"compaction_scheduler_remembered_candidates_after\":{d},\"compaction_scheduler_remembered_retries_after\":{d},\"compaction_scheduler_remembered_hits_after\":{d},\"compaction_scheduler_remembered_stale_after\":{d},\"compaction_scheduler_conflict_denials_after\":{d}}}\n",
+        ",\"compactions\":{d},\"compaction_input_runs\":{d},\"compaction_input_bytes\":{d},\"compaction_output_bytes\":{d},\"compaction_ns\":{d},\"runs_after\":{d},\"l0_runs_after\":{d},\"overlapping_l0_runs_after\":{d},\"compactable_l0_runs_after\":{d},\"l0_bytes_after\":{d},\"level_overflow_runs_after\":{d},\"level_overflow_bytes_after\":{d},\"max_level_after\":{d},\"run_bytes_after\":{d},\"run_entries_after\":{d},\"obsolete_paths_after\":{d},\"mutable_entries_after\":{d}",
         .{
             compaction_delta.compactions,
             compaction_delta.input_runs,
@@ -987,11 +1025,20 @@ fn printResult(
             after.runs.count,
             after.runs.l0_count,
             after.maintenance.overlapping_l0_runs,
+            after.maintenance.compactable_l0_runs,
+            after.maintenance.l0_bytes,
+            after.maintenance.level_overflow_runs,
+            after.maintenance.level_overflow_bytes,
             after.runs.max_level,
             after.runs.bytes,
             after.runs.entries,
             after.obsolete_paths,
             after.mutable_entries,
+        },
+    );
+    try writer.print(
+        ",\"wal_retained_segments_after\":{d},\"wal_retained_bytes_after\":{d},\"wal_checkpoint_lag_segments_after\":{d},\"wal_replay_retained_segments_after\":{d},\"wal_replay_retained_bytes_after\":{d},\"compaction_scheduler_grants_after\":{d},\"compaction_scheduler_denied_capacity_after\":{d},\"compaction_scheduler_denied_resource_pressure_after\":{d},\"compaction_scheduler_remembered_pending_after\":{d},\"compaction_scheduler_remembered_candidates_after\":{d},\"compaction_scheduler_remembered_retries_after\":{d},\"compaction_scheduler_remembered_hits_after\":{d},\"compaction_scheduler_remembered_stale_after\":{d},\"compaction_scheduler_conflict_denials_after\":{d}",
+        .{
             after.maintenance.wal_retained_segments,
             after.maintenance.wal_retained_bytes,
             after.maintenance.wal_checkpoint_lag_segments,
@@ -1006,6 +1053,15 @@ fn printResult(
             after.maintenance.compaction_scheduler_remembered_hits,
             after.maintenance.compaction_scheduler_remembered_stale,
             after.maintenance.compaction_scheduler_conflict_denials,
+        },
+    );
+    try writer.print(
+        ",\"background_io_budget_bytes_after\":{d},\"background_io_reserved_bytes_after\":{d},\"background_io_denied_jobs_after\":{d},\"background_io_oversized_jobs_after\":{d}}}\n",
+        .{
+            after.maintenance.background_io_budget_bytes,
+            after.maintenance.background_io_reserved_bytes,
+            after.maintenance.background_io_denied_jobs,
+            after.maintenance.background_io_oversized_jobs,
         },
     );
 }
@@ -1130,6 +1186,14 @@ fn parseArgs(alloc: Allocator, proc_args: std.process.Args) !Config {
             cfg.bulk_ingest_flush_threshold_multiplier = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--compact-threshold-runs")) {
             cfg.compact_threshold_runs = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--l0-soft-limit-runs")) {
+            cfg.l0_soft_limit_runs = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--l0-hard-limit-runs")) {
+            cfg.l0_hard_limit_runs = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--l0-soft-limit-bytes")) {
+            cfg.l0_soft_limit_bytes = try parseNextU64(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--l0-hard-limit-bytes")) {
+            cfg.l0_hard_limit_bytes = try parseNextU64(&args, arg);
         } else if (std.mem.eql(u8, arg, "--level-target-runs-base")) {
             cfg.level_target_runs_base = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--level-target-runs-multiplier")) {
@@ -1138,6 +1202,14 @@ fn parseArgs(alloc: Allocator, proc_args: std.process.Args) !Config {
             cfg.level_target_bytes_base = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--level-target-bytes-multiplier")) {
             cfg.level_target_bytes_multiplier = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-run-file-bytes")) {
+            cfg.max_run_file_bytes = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--max-compaction-input-bytes")) {
+            cfg.max_compaction_input_bytes = try parseNextU64(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--background-io-budget-bytes")) {
+            cfg.background_io_budget_bytes = try parseNextU64(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--background-io-disallow-oversized-single-job")) {
+            cfg.background_io_allow_oversized_single_job = false;
         } else if (std.mem.eql(u8, arg, "--bloom-bits-per-key")) {
             cfg.bloom_bits_per_key = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--bloom-min-bits")) {

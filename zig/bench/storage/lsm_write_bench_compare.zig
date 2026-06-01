@@ -67,6 +67,10 @@ const Record = struct {
     compaction_ns: u64 = 0,
     runs_after: u64 = 0,
     l0_runs_after: u64 = 0,
+    compactable_l0_runs_after: u64 = 0,
+    l0_bytes_after: u64 = 0,
+    level_overflow_runs_after: u64 = 0,
+    level_overflow_bytes_after: u64 = 0,
     max_level_after: u64 = 0,
     run_bytes_after: u64 = 0,
     run_entries_after: u64 = 0,
@@ -77,6 +81,19 @@ const Record = struct {
     wal_checkpoint_lag_segments_after: u64 = 0,
     wal_replay_retained_segments_after: u64 = 0,
     wal_replay_retained_bytes_after: u64 = 0,
+    compaction_scheduler_grants_after: u64 = 0,
+    compaction_scheduler_denied_capacity_after: u64 = 0,
+    compaction_scheduler_denied_resource_pressure_after: u64 = 0,
+    compaction_scheduler_remembered_pending_after: u64 = 0,
+    compaction_scheduler_remembered_candidates_after: u64 = 0,
+    compaction_scheduler_remembered_retries_after: u64 = 0,
+    compaction_scheduler_remembered_hits_after: u64 = 0,
+    compaction_scheduler_remembered_stale_after: u64 = 0,
+    compaction_scheduler_conflict_denials_after: u64 = 0,
+    background_io_budget_bytes_after: u64 = 0,
+    background_io_reserved_bytes_after: u64 = 0,
+    background_io_denied_jobs_after: u64 = 0,
+    background_io_oversized_jobs_after: u64 = 0,
 };
 
 const Config = struct {
@@ -143,6 +160,10 @@ const GroupAgg = struct {
     compaction_output_bytes: MetricSeries = .{},
     compaction_ns: MetricSeries = .{},
     l0_runs_after: MetricSeries = .{},
+    compactable_l0_runs_after: MetricSeries = .{},
+    l0_bytes_after: MetricSeries = .{},
+    level_overflow_runs_after: MetricSeries = .{},
+    level_overflow_bytes_after: MetricSeries = .{},
     run_bytes_after: MetricSeries = .{},
     obsolete_paths_after: MetricSeries = .{},
     wal_retained_segments_after: MetricSeries = .{},
@@ -150,6 +171,18 @@ const GroupAgg = struct {
     wal_checkpoint_lag_segments_after: MetricSeries = .{},
     wal_replay_retained_segments_after: MetricSeries = .{},
     wal_replay_retained_bytes_after: MetricSeries = .{},
+    compaction_scheduler_grants_after: MetricSeries = .{},
+    compaction_scheduler_denied_capacity_after: MetricSeries = .{},
+    compaction_scheduler_denied_resource_pressure_after: MetricSeries = .{},
+    compaction_scheduler_remembered_pending_after: MetricSeries = .{},
+    compaction_scheduler_remembered_candidates_after: MetricSeries = .{},
+    compaction_scheduler_remembered_retries_after: MetricSeries = .{},
+    compaction_scheduler_remembered_hits_after: MetricSeries = .{},
+    compaction_scheduler_remembered_stale_after: MetricSeries = .{},
+    compaction_scheduler_conflict_denials_after: MetricSeries = .{},
+    background_io_reserved_bytes_after: MetricSeries = .{},
+    background_io_denied_jobs_after: MetricSeries = .{},
+    background_io_oversized_jobs_after: MetricSeries = .{},
 
     fn init(allocator: Allocator, scenario: []const u8, workload: []const u8) !GroupAgg {
         return .{
@@ -192,6 +225,10 @@ const GroupAgg = struct {
         self.compaction_output_bytes.deinit(allocator);
         self.compaction_ns.deinit(allocator);
         self.l0_runs_after.deinit(allocator);
+        self.compactable_l0_runs_after.deinit(allocator);
+        self.l0_bytes_after.deinit(allocator);
+        self.level_overflow_runs_after.deinit(allocator);
+        self.level_overflow_bytes_after.deinit(allocator);
         self.run_bytes_after.deinit(allocator);
         self.obsolete_paths_after.deinit(allocator);
         self.wal_retained_segments_after.deinit(allocator);
@@ -199,6 +236,18 @@ const GroupAgg = struct {
         self.wal_checkpoint_lag_segments_after.deinit(allocator);
         self.wal_replay_retained_segments_after.deinit(allocator);
         self.wal_replay_retained_bytes_after.deinit(allocator);
+        self.compaction_scheduler_grants_after.deinit(allocator);
+        self.compaction_scheduler_denied_capacity_after.deinit(allocator);
+        self.compaction_scheduler_denied_resource_pressure_after.deinit(allocator);
+        self.compaction_scheduler_remembered_pending_after.deinit(allocator);
+        self.compaction_scheduler_remembered_candidates_after.deinit(allocator);
+        self.compaction_scheduler_remembered_retries_after.deinit(allocator);
+        self.compaction_scheduler_remembered_hits_after.deinit(allocator);
+        self.compaction_scheduler_remembered_stale_after.deinit(allocator);
+        self.compaction_scheduler_conflict_denials_after.deinit(allocator);
+        self.background_io_reserved_bytes_after.deinit(allocator);
+        self.background_io_denied_jobs_after.deinit(allocator);
+        self.background_io_oversized_jobs_after.deinit(allocator);
         self.* = undefined;
     }
 
@@ -235,6 +284,10 @@ const GroupAgg = struct {
         try self.compaction_output_bytes.append(allocator, @floatFromInt(record.compaction_output_bytes));
         try self.compaction_ns.append(allocator, @floatFromInt(record.compaction_ns));
         try self.l0_runs_after.append(allocator, @floatFromInt(record.l0_runs_after));
+        try self.compactable_l0_runs_after.append(allocator, @floatFromInt(record.compactable_l0_runs_after));
+        try self.l0_bytes_after.append(allocator, @floatFromInt(record.l0_bytes_after));
+        try self.level_overflow_runs_after.append(allocator, @floatFromInt(record.level_overflow_runs_after));
+        try self.level_overflow_bytes_after.append(allocator, @floatFromInt(record.level_overflow_bytes_after));
         try self.run_bytes_after.append(allocator, @floatFromInt(record.run_bytes_after));
         try self.obsolete_paths_after.append(allocator, @floatFromInt(record.obsolete_paths_after));
         try self.wal_retained_segments_after.append(allocator, @floatFromInt(record.wal_retained_segments_after));
@@ -242,6 +295,18 @@ const GroupAgg = struct {
         try self.wal_checkpoint_lag_segments_after.append(allocator, @floatFromInt(record.wal_checkpoint_lag_segments_after));
         try self.wal_replay_retained_segments_after.append(allocator, @floatFromInt(record.wal_replay_retained_segments_after));
         try self.wal_replay_retained_bytes_after.append(allocator, @floatFromInt(record.wal_replay_retained_bytes_after));
+        try self.compaction_scheduler_grants_after.append(allocator, @floatFromInt(record.compaction_scheduler_grants_after));
+        try self.compaction_scheduler_denied_capacity_after.append(allocator, @floatFromInt(record.compaction_scheduler_denied_capacity_after));
+        try self.compaction_scheduler_denied_resource_pressure_after.append(allocator, @floatFromInt(record.compaction_scheduler_denied_resource_pressure_after));
+        try self.compaction_scheduler_remembered_pending_after.append(allocator, @floatFromInt(record.compaction_scheduler_remembered_pending_after));
+        try self.compaction_scheduler_remembered_candidates_after.append(allocator, @floatFromInt(record.compaction_scheduler_remembered_candidates_after));
+        try self.compaction_scheduler_remembered_retries_after.append(allocator, @floatFromInt(record.compaction_scheduler_remembered_retries_after));
+        try self.compaction_scheduler_remembered_hits_after.append(allocator, @floatFromInt(record.compaction_scheduler_remembered_hits_after));
+        try self.compaction_scheduler_remembered_stale_after.append(allocator, @floatFromInt(record.compaction_scheduler_remembered_stale_after));
+        try self.compaction_scheduler_conflict_denials_after.append(allocator, @floatFromInt(record.compaction_scheduler_conflict_denials_after));
+        try self.background_io_reserved_bytes_after.append(allocator, @floatFromInt(record.background_io_reserved_bytes_after));
+        try self.background_io_denied_jobs_after.append(allocator, @floatFromInt(record.background_io_denied_jobs_after));
+        try self.background_io_oversized_jobs_after.append(allocator, @floatFromInt(record.background_io_oversized_jobs_after));
     }
 };
 
@@ -407,6 +472,10 @@ fn printComparison(
     try printMetric(writer, allocator, "  compaction_output_bytes", before.compaction_output_bytes, after.compaction_output_bytes);
     try printMetric(writer, allocator, "  compaction_ns", before.compaction_ns, after.compaction_ns);
     try printMetric(writer, allocator, "  l0_runs_after", before.l0_runs_after, after.l0_runs_after);
+    try printMetric(writer, allocator, "  compactable_l0_runs_after", before.compactable_l0_runs_after, after.compactable_l0_runs_after);
+    try printMetric(writer, allocator, "  l0_bytes_after", before.l0_bytes_after, after.l0_bytes_after);
+    try printMetric(writer, allocator, "  level_overflow_runs_after", before.level_overflow_runs_after, after.level_overflow_runs_after);
+    try printMetric(writer, allocator, "  level_overflow_bytes_after", before.level_overflow_bytes_after, after.level_overflow_bytes_after);
     try printMetric(writer, allocator, "  run_bytes_after", before.run_bytes_after, after.run_bytes_after);
     try printMetric(writer, allocator, "  obsolete_paths_after", before.obsolete_paths_after, after.obsolete_paths_after);
     try printMetric(writer, allocator, "  wal_retained_segments_after", before.wal_retained_segments_after, after.wal_retained_segments_after);
@@ -414,6 +483,18 @@ fn printComparison(
     try printMetric(writer, allocator, "  wal_checkpoint_lag_segments_after", before.wal_checkpoint_lag_segments_after, after.wal_checkpoint_lag_segments_after);
     try printMetric(writer, allocator, "  wal_replay_retained_segments_after", before.wal_replay_retained_segments_after, after.wal_replay_retained_segments_after);
     try printMetric(writer, allocator, "  wal_replay_retained_bytes_after", before.wal_replay_retained_bytes_after, after.wal_replay_retained_bytes_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_grants_after", before.compaction_scheduler_grants_after, after.compaction_scheduler_grants_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_denied_capacity_after", before.compaction_scheduler_denied_capacity_after, after.compaction_scheduler_denied_capacity_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_denied_resource_pressure_after", before.compaction_scheduler_denied_resource_pressure_after, after.compaction_scheduler_denied_resource_pressure_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_remembered_pending_after", before.compaction_scheduler_remembered_pending_after, after.compaction_scheduler_remembered_pending_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_remembered_candidates_after", before.compaction_scheduler_remembered_candidates_after, after.compaction_scheduler_remembered_candidates_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_remembered_retries_after", before.compaction_scheduler_remembered_retries_after, after.compaction_scheduler_remembered_retries_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_remembered_hits_after", before.compaction_scheduler_remembered_hits_after, after.compaction_scheduler_remembered_hits_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_remembered_stale_after", before.compaction_scheduler_remembered_stale_after, after.compaction_scheduler_remembered_stale_after);
+    try printMetric(writer, allocator, "  compaction_scheduler_conflict_denials_after", before.compaction_scheduler_conflict_denials_after, after.compaction_scheduler_conflict_denials_after);
+    try printMetric(writer, allocator, "  background_io_reserved_bytes_after", before.background_io_reserved_bytes_after, after.background_io_reserved_bytes_after);
+    try printMetric(writer, allocator, "  background_io_denied_jobs_after", before.background_io_denied_jobs_after, after.background_io_denied_jobs_after);
+    try printMetric(writer, allocator, "  background_io_oversized_jobs_after", before.background_io_oversized_jobs_after, after.background_io_oversized_jobs_after);
 }
 
 fn printMetric(writer: anytype, allocator: Allocator, label: []const u8, before: MetricSeries, after: MetricSeries) !void {
