@@ -115,6 +115,8 @@ pub const Options = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     background_executor: ?*const BackgroundExecutor = null,
     compaction_scheduler: compaction_scheduler_mod.Options = .{},
+    background_io_budget_bytes: u64 = 0,
+    background_io_allow_oversized_single_job: bool = true,
     wal_enabled: bool = true,
     wal_sync_on_commit: bool = false,
     wal_segment_bytes: u64 = 64 * 1024 * 1024,
@@ -266,6 +268,10 @@ pub const Backend = struct {
         compaction_scheduler_remembered_stale: u64 = 0,
         compaction_scheduler_conflict_denials: u64 = 0,
         compaction_scheduler_remembered_pending: u64 = 0,
+        background_io_budget_bytes: u64 = 0,
+        background_io_reserved_bytes: u64 = 0,
+        background_io_denied_jobs: u64 = 0,
+        background_io_oversized_jobs: u64 = 0,
         backend_lock_waits: u64 = 0,
         backend_lock_wait_ns: u64 = 0,
         backend_lock_max_wait_ns: u64 = 0,
@@ -339,6 +345,10 @@ pub const Backend = struct {
         dst.compaction_scheduler_remembered_stale +|= src.compaction_scheduler_remembered_stale;
         dst.compaction_scheduler_conflict_denials +|= src.compaction_scheduler_conflict_denials;
         dst.compaction_scheduler_remembered_pending +|= src.compaction_scheduler_remembered_pending;
+        dst.background_io_budget_bytes +|= src.background_io_budget_bytes;
+        dst.background_io_reserved_bytes +|= src.background_io_reserved_bytes;
+        dst.background_io_denied_jobs +|= src.background_io_denied_jobs;
+        dst.background_io_oversized_jobs +|= src.background_io_oversized_jobs;
         dst.backend_lock_waits +|= src.backend_lock_waits;
         dst.backend_lock_wait_ns +|= src.backend_lock_wait_ns;
         dst.backend_lock_max_wait_ns = @max(dst.backend_lock_max_wait_ns, src.backend_lock_max_wait_ns);
@@ -612,6 +622,10 @@ pub const Backend = struct {
     background_executor: BackgroundExecutor = BackgroundExecutor.initInline(0),
     immutable_flush_job_in_flight: bool = false,
     immutable_flush_build_in_flight: bool = false,
+    maintenance_io_budget_remaining: ?u64 = null,
+    background_io_reserved_bytes: u64 = 0,
+    background_io_denied_jobs: u64 = 0,
+    background_io_oversized_jobs: u64 = 0,
     remembered_compaction: ?compaction_mod.RememberedCompaction = null,
     write_stats: WriteStats = .{},
     read_stats: AtomicReadStats = .{},
@@ -801,6 +815,10 @@ pub const Backend = struct {
         stats.compaction_scheduler_remembered_stale = scheduler_stats.remembered_stale;
         stats.compaction_scheduler_conflict_denials = scheduler_stats.conflict_denials;
         stats.compaction_scheduler_remembered_pending = if (self.remembered_compaction != null) 1 else 0;
+        stats.background_io_budget_bytes = self.options.background_io_budget_bytes;
+        stats.background_io_reserved_bytes = self.background_io_reserved_bytes;
+        stats.background_io_denied_jobs = self.background_io_denied_jobs;
+        stats.background_io_oversized_jobs = self.background_io_oversized_jobs;
         stats.backend_lock_waits = self.backend_lock_waits.load(.monotonic);
         stats.backend_lock_wait_ns = self.backend_lock_wait_ns.load(.monotonic);
         stats.backend_lock_max_wait_ns = self.backend_lock_max_wait_ns.load(.monotonic);
@@ -970,11 +988,43 @@ pub const Backend = struct {
     }
 
     pub fn acquireCompactionGrant(self: *Backend, work: anytype) ?compaction_scheduler_mod.Grant {
-        return self.compaction_scheduler.tryAcquire(.{
+        const io_bytes = if (@hasField(@TypeOf(work), "io_bytes")) work.io_bytes else work.input_bytes;
+        if (!self.canReserveMaintenanceIoBudget(io_bytes)) return null;
+        const grant = self.compaction_scheduler.tryAcquire(.{
             .score = work.score,
             .input_runs = work.input_runs,
             .input_bytes = work.input_bytes,
-        }, self.options.resource_manager);
+        }, self.options.resource_manager) orelse return null;
+        self.reserveMaintenanceIoBudgetAssumeAdmitted(io_bytes);
+        return grant;
+    }
+
+    fn canReserveMaintenanceIoBudget(self: *Backend, io_bytes: u64) bool {
+        const remaining = self.maintenance_io_budget_remaining orelse return true;
+        if (io_bytes == 0 or io_bytes <= remaining) return true;
+        const budget = self.options.background_io_budget_bytes;
+        if (self.options.background_io_allow_oversized_single_job and remaining == budget) return true;
+        self.background_io_denied_jobs +|= 1;
+        return false;
+    }
+
+    fn reserveMaintenanceIoBudgetAssumeAdmitted(self: *Backend, io_bytes: u64) void {
+        if (io_bytes == 0) return;
+        const remaining = self.maintenance_io_budget_remaining orelse return;
+        if (io_bytes <= remaining) {
+            self.maintenance_io_budget_remaining = remaining - io_bytes;
+            self.background_io_reserved_bytes +|= io_bytes;
+            return;
+        }
+        self.maintenance_io_budget_remaining = 0;
+        self.background_io_reserved_bytes +|= io_bytes;
+        self.background_io_oversized_jobs +|= 1;
+    }
+
+    fn tryReserveMaintenanceIoBudget(self: *Backend, io_bytes: u64) bool {
+        if (!self.canReserveMaintenanceIoBudget(io_bytes)) return false;
+        self.reserveMaintenanceIoBudgetAssumeAdmitted(io_bytes);
+        return true;
     }
 
     pub fn runMaintenanceStep(self: *Backend) !bool {
@@ -992,6 +1042,11 @@ pub const Backend = struct {
 
     fn runMaintenanceStepLocked(self: *Backend) !bool {
         if (self.options.backend.read_only or self.bulkIngestActive()) return false;
+        self.maintenance_io_budget_remaining = if (self.options.background_io_budget_bytes > 0)
+            self.options.background_io_budget_bytes
+        else
+            null;
+        defer self.maintenance_io_budget_remaining = null;
         const before_compactions = self.compaction_stats.compactions;
         const before_manifest_writes = self.write_stats.manifest_writes;
 
@@ -1180,6 +1235,11 @@ pub const Backend = struct {
             total += @sizeOf(state_mod.OwnedEntry);
         }
         return total;
+    }
+
+    fn estimatedFlushIoBytes(state: *const State) u64 {
+        const bytes = estimateStateBytes(state);
+        return bytes +| bytes;
     }
 
     fn maintenanceLevelRunTarget(level: u32, base: usize, multiplier: usize) usize {
@@ -1503,11 +1563,12 @@ pub const Backend = struct {
 
     fn flushOldestImmutableMemtable(self: *Backend) !bool {
         if (self.activeImmutableMemtableCount() == 0) return false;
+        const state = self.immutable_memtables.items[self.immutable_head];
+        if (!self.tryReserveMaintenanceIoBudget(estimatedFlushIoBytes(state))) return false;
         if (self.root_dir != null and self.storage != null) {
             return try self.flushOldestImmutableMemtableUnlockedBuild();
         }
         const start_ns = self.writeStatsNowNs();
-        const state = self.immutable_memtables.items[self.immutable_head];
         const input_entries = state.entries.items.len;
 
         var new_runs = try compaction_mod.makeRunsFromStateBorrowed(Backend, self, state);
@@ -4800,6 +4861,78 @@ test "lsm backend compaction scheduler denies and later grants capacity" {
     try std.testing.expectEqual(maintenance.compaction_scheduler_grants, maintenance.compaction_scheduler_completions);
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_remembered_pending);
     try std.testing.expect(maintenance.compaction_scheduler_remembered_hits > 0);
+    try std.testing.expect(backend.compaction_stats.compactions > 0);
+}
+
+test "lsm backend background io budget defers immutable flush" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "background-io-flush-budget");
+    defer repository_mod.cleanupTmp(path);
+    const root_dir = std.mem.span(path);
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .background_io_budget_bytes = 1,
+        .background_io_allow_oversized_single_job = false,
+    });
+    defer backend.close();
+
+    var txn = try backend.beginWrite();
+    try txn.put(.{ .name = "docs" }, "doc:1", "value large enough for a non-zero flush estimate");
+    try txn.commit();
+
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expect(!try backend.runMaintenanceStep());
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 1), maintenance.background_io_budget_bytes);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.background_io_reserved_bytes);
+    try std.testing.expect(maintenance.background_io_denied_jobs > 0);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+
+    backend.options.background_io_budget_bytes = 1024 * 1024;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(maintenance.background_io_reserved_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+}
+
+test "lsm backend background io budget defers scheduled compaction" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 2,
+        .l0_hard_limit_runs = 100,
+        .background_io_budget_bytes = 1,
+        .background_io_allow_oversized_single_job = false,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 64;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, value[0..]);
+        try txn.commit();
+    }
+
+    try backend.finalizeDeferredStorageWork();
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expect(!try backend.runMaintenanceStep());
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
+    try std.testing.expect(maintenance.background_io_denied_jobs > 0);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.compaction_scheduler_remembered_pending);
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+
+    backend.options.background_io_budget_bytes = 1024 * 1024;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(maintenance.background_io_reserved_bytes > 0);
+    try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
     try std.testing.expect(backend.compaction_stats.compactions > 0);
 }
 

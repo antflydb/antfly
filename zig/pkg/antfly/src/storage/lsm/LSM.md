@@ -278,14 +278,19 @@ Large-ingest guardrails:
      per read and retaining those chunks until segment replay exits.
 4. [ ] Add final-state HBC bulk publication for sustained ingest so large loads
    avoid persisting every intermediate online mutation.
-5. [ ] Raise compaction concurrency only after the scheduler can prove selected
+5. [x] Add background IO admission budgeting for maintenance work.
+   - First slice: immutable flushes and scheduled compactions now reserve from
+     a per-step background IO byte budget, can defer when the budget is
+     exhausted, and expose budget/reserved/denied/oversized counters in
+     maintenance stats.
+6. [ ] Raise compaction concurrency only after the scheduler can prove selected
    jobs are non-overlapping or otherwise safe to run in parallel.
-6. [ ] Consider memtable structure changes after byte-budgeted WAL/flush and
+7. [ ] Consider memtable structure changes after byte-budgeted WAL/flush and
    recovery allocation work are measured; the current active memtable appends
    plus hash-indexes writes and sorts on freeze/flush, so the main costs are
    flush sort, range iteration, immutable lookup, and memory layout rather than
    ordered-insert shifts.
-7. [ ] Add table key-prefix compression with restart points after the scan and
+8. [ ] Add table key-prefix compression with restart points after the scan and
    WAL/flush bottlenecks are under control, because it is a table-format change.
    - [x] First slice: table blocks can now be stored as prefix-compressed key
      deltas with restart offsets, optionally followed by Snappy. The current

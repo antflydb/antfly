@@ -194,7 +194,7 @@ pub fn compactAllRuns(comptime BackendType: type, backend: *BackendType) !void {
     }
 }
 
-fn compactionWorkForPlan(runs: []const Run, plan: CompactionPlan, score: u64) struct { score: u64, input_runs: usize, input_bytes: u64 } {
+fn compactionWorkForPlan(runs: []const Run, plan: CompactionPlan, score: u64) struct { score: u64, input_runs: usize, input_bytes: u64, io_bytes: u64 } {
     var input_runs: usize = 0;
     var input_bytes: u64 = 0;
     for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
@@ -209,6 +209,7 @@ fn compactionWorkForPlan(runs: []const Run, plan: CompactionPlan, score: u64) st
         .score = score,
         .input_runs = input_runs,
         .input_bytes = input_bytes,
+        .io_bytes = input_bytes +| input_bytes,
     };
 }
 
