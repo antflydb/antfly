@@ -1055,6 +1055,19 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             self.mutable_source_entry_bytes = null;
         }
 
+        fn mutableSourceEntryScratch(self: *@This(), needed: usize) ![]u8 {
+            if (self.mutable_source_entry_bytes) |bytes| {
+                if (bytes.len >= needed) {
+                    return bytes[0..needed];
+                }
+                self.allocator.free(bytes);
+                self.mutable_source_entry_bytes = null;
+            }
+            const bytes = try self.allocator.alloc(u8, needed);
+            self.mutable_source_entry_bytes = bytes;
+            return bytes[0..needed];
+        }
+
         fn mutableSourceLock(self: *@This()) bool {
             if (comptime MutableType == ActiveMemTable) {
                 if (!self.backend_locked) return lockBackend(BackendType, self.backend);
@@ -1072,8 +1085,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const entry = self.mutable.entries.items[idx];
             const namespace_name = namespaceOf(entry).name;
             const namespace_len = if (namespace_name) |name| name.len else 0;
-            const bytes = try self.allocator.alloc(u8, namespace_len + entry.key.len + entry.value.len);
-            errdefer self.allocator.free(bytes);
+            const bytes = try self.mutableSourceEntryScratch(namespace_len + entry.key.len + entry.value.len);
             var offset: usize = 0;
             const copied_namespace = if (namespace_name) |name| blk: {
                 @memcpy(bytes[offset..][0..name.len], name);
@@ -1087,8 +1099,6 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             @memcpy(bytes[offset..][0..entry.value.len], entry.value);
             const copied_value = bytes[offset..][0..entry.value.len];
 
-            self.clearMutableSourceEntryBytes();
-            self.mutable_source_entry_bytes = bytes;
             return .{
                 .namespace_name = copied_namespace,
                 .key = copied_key,
