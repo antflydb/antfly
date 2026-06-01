@@ -193,7 +193,7 @@ func TestBatchStreamsRequestAndParsesResponse(t *testing.T) {
 
 	result, err := client.BatchWithOptions(context.Background(), "files", BatchRequest{
 		Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}},
-	}, BatchOptions{
+	}, WriteOptions{
 		MaxRequestBytes:  1024,
 		MaxResponseBytes: 1024,
 	})
@@ -225,7 +225,7 @@ func TestBatchRejectsOversizedSuccessResponse(t *testing.T) {
 
 	_, err = client.BatchWithOptions(context.Background(), "files", BatchRequest{
 		Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}},
-	}, BatchOptions{
+	}, WriteOptions{
 		MaxRequestBytes:  1024,
 		MaxResponseBytes: 16,
 	})
@@ -248,7 +248,7 @@ func TestReadErrorResponseCapsBody(t *testing.T) {
 
 	_, err = client.BatchWithOptions(context.Background(), "files", BatchRequest{
 		Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}},
-	}, BatchOptions{
+	}, WriteOptions{
 		MaxRequestBytes:  1024,
 		MaxResponseBytes: 1024,
 	})
@@ -264,5 +264,70 @@ func TestReadErrorResponseCapsBody(t *testing.T) {
 	}
 	if len(apiErr.Message) > int(maxErrorResponseBytes)+128 {
 		t.Fatalf("APIError.Message length = %d, want capped message", len(apiErr.Message))
+	}
+}
+
+func TestLinearMergeStreamsRequestAndParsesResponse(t *testing.T) {
+	var gotPath string
+	var gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll request body: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"upserted":1,"status":"success"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	result, err := client.LinearMergeWithOptions(context.Background(), "files", LinearMergeRequest{
+		Records: map[string]any{"doc-1": map[string]any{"title": "hello"}},
+	}, WriteOptions{
+		MaxRequestBytes:  1024,
+		MaxResponseBytes: 1024,
+	})
+	if err != nil {
+		t.Fatalf("LinearMergeWithOptions: %v", err)
+	}
+	if result.Upserted != 1 {
+		t.Fatalf("Upserted = %d, want 1", result.Upserted)
+	}
+	if gotPath != "/db/v1/tables/files/merge" {
+		t.Fatalf("path = %q, want /db/v1/tables/files/merge", gotPath)
+	}
+	if !strings.Contains(gotBody, `"doc-1"`) || !strings.Contains(gotBody, `"title":"hello"`) {
+		t.Fatalf("request body = %q, want encoded record", gotBody)
+	}
+}
+
+func TestLinearMergeRejectsOversizedSuccessResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = w.Write([]byte(strings.Repeat("x", 17)))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.LinearMergeWithOptions(context.Background(), "files", LinearMergeRequest{
+		Records: map[string]any{"doc-1": map[string]any{"title": "hello"}},
+	}, WriteOptions{
+		MaxRequestBytes:  1024,
+		MaxResponseBytes: 16,
+	})
+	if err == nil || !strings.Contains(err.Error(), "linear merge response exceeded 16 bytes") {
+		t.Fatalf("LinearMergeWithOptions error = %v, want response limit error", err)
 	}
 }
