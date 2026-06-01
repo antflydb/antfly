@@ -640,6 +640,7 @@ pub const Backend = struct {
     write_stats: WriteStats = .{},
     read_stats: AtomicReadStats = .{},
     tracked_in_memory_state_bytes: u64 = 0,
+    tracked_wal_retention_bytes: u64 = 0,
     backend_lock_waits: CounterU64 = .init(0),
     backend_lock_wait_ns: CounterU64 = .init(0),
     backend_lock_max_wait_ns: CounterU64 = .init(0),
@@ -847,6 +848,7 @@ pub const Backend = struct {
             stats.wal_replay_retained_segments = replay_retention.segments;
             stats.wal_replay_retained_bytes = replay_retention.bytes;
             stats.wal_replay_current_segment = replay_retention.current_segment;
+            self.syncTrackedWalRetentionUsageLocked(stats.wal_retained_bytes);
         }
         self.syncTrackedInMemoryStateUsageLocked(stats);
         return stats;
@@ -984,6 +986,18 @@ pub const Backend = struct {
         );
     }
 
+    fn syncTrackedWalRetentionUsageCurrentLocked(self: *Backend) void {
+        if (!self.options.wal_enabled or self.root_dir == null) return;
+        const retention = wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?) catch wal_mod.RetentionStats{};
+        const replay_retention = wal_mod.snapshotReplayRetention(self.storage.?, self.allocator, self.root_dir.?) catch wal_mod.RetentionStats{};
+        self.syncTrackedWalRetentionUsageLocked(retention.bytes +| replay_retention.bytes);
+    }
+
+    fn syncTrackedWalRetentionUsageLocked(self: *Backend, bytes: u64) void {
+        const manager = self.options.resource_manager orelse return;
+        manager.observeUsage(.lsm_wal_retention, &self.tracked_wal_retention_bytes, bytes);
+    }
+
     fn estimateInMemoryStateBytesLocked(self: *const Backend) u64 {
         var bytes = estimateStateBytes(&self.mutable);
         for (self.activeImmutableMemtables()) |state| {
@@ -995,6 +1009,7 @@ pub const Backend = struct {
     fn releaseTrackedResourceUsage(self: *Backend) void {
         const manager = self.options.resource_manager orelse return;
         manager.observeUsage(.lsm_in_memory_state, &self.tracked_in_memory_state_bytes, 0);
+        manager.observeUsage(.lsm_wal_retention, &self.tracked_wal_retention_bytes, 0);
     }
 
     pub fn acquireCompactionGrant(self: *Backend, work: anytype) ?compaction_scheduler_mod.Grant {
@@ -1234,6 +1249,7 @@ pub const Backend = struct {
         const oldest_active = self.oldestActiveWalSegment() orelse return;
         if (oldest_active <= 1) return;
         try wal_mod.retireCoveredSegments(self.storage.?, self.allocator, self.root_dir.?, oldest_active - 1);
+        self.syncTrackedWalRetentionUsageCurrentLocked();
     }
 
     fn estimateStateBytes(state: anytype) u64 {
@@ -1954,6 +1970,7 @@ pub const Backend = struct {
             .{ .segment_bytes = self.options.wal_segment_bytes },
         );
         self.noteMutableWalSegment(try wal_mod.currentSegment(self.storage.?, self.allocator, self.root_dir.?));
+        self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_append_records += 1;
         self.write_stats.wal_append_entries += @intCast(state.entries.items.len);
         self.write_stats.wal_append_bytes += bytes;
@@ -1998,6 +2015,7 @@ pub const Backend = struct {
                 .first = retention.oldest_retained_segment,
                 .last = retention.current_segment,
             };
+        self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_replay_records += stats.records;
         self.write_stats.wal_replay_entries += stats.entries;
         self.write_stats.wal_replay_bytes += stats.bytes;
@@ -2022,6 +2040,7 @@ pub const Backend = struct {
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
         const start_ns = self.writeStatsNowNs();
         try wal_mod.reset(self.storage.?, self.allocator, self.root_dir.?);
+        self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_resets += 1;
         self.write_stats.wal_reset_ns += self.writeStatsElapsedNs(start_ns);
     }
@@ -4001,6 +4020,47 @@ test "lsm backend eagerly accounts mutable state and wal write working set" {
     const wal_stats = manager.sliceStats(.lsm_wal_write_working_set);
     try std.testing.expectEqual(@as(u64, 0), wal_stats.used_bytes);
     try std.testing.expect(wal_stats.peak_bytes > 0);
+}
+
+test "lsm backend accounts retained wal bytes in the resource manager" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    const root_dir = "/lsm-wal-retention-resource-accounting";
+    const options = Options{
+        .flush_threshold = 1024,
+        .storage = storage.storage(),
+        .resource_manager = &manager,
+    };
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+        try txn.commit();
+    }
+
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(maintenance.wal_retained_bytes > 0);
+    try std.testing.expectEqual(maintenance.wal_retained_bytes, manager.sliceStats(.lsm_wal_retention).used_bytes);
+
+    try backend.finalizeDeferredStorageWork();
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_wal_retention).used_bytes);
+
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:b", "beta");
+        try txn.commit();
+    }
+    try std.testing.expect(manager.sliceStats(.lsm_wal_retention).used_bytes > 0);
+
+    backend.close();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_wal_retention).used_bytes);
 }
 
 test "lsm backend retires covered wal segments after durable manifest publish" {

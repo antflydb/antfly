@@ -30,6 +30,7 @@ pub const Slice = enum(u8) {
     lsm_compaction_work,
     lsm_in_memory_state,
     lsm_wal_write_working_set,
+    lsm_wal_retention,
     hbc_node_metadata_cache,
     dense_search_working_set,
     dense_apply_working_set,
@@ -48,6 +49,7 @@ pub const Slice = enum(u8) {
             .lsm_compaction_work => "lsm.compaction_work",
             .lsm_in_memory_state => "lsm.in_memory_state",
             .lsm_wal_write_working_set => "lsm.wal_write_working_set",
+            .lsm_wal_retention => "lsm.wal_retention",
             .hbc_node_metadata_cache => "hbc.node_metadata_cache",
             .dense_search_working_set => "dense.search_working_set",
             .dense_apply_working_set => "dense.apply_working_set",
@@ -63,7 +65,7 @@ pub const Slice = enum(u8) {
     }
 };
 
-pub const slice_count: usize = 15;
+pub const slice_count: usize = @typeInfo(Slice).@"enum".fields.len;
 
 pub const Budget = struct {
     soft_limit_bytes: u64 = 0,
@@ -109,6 +111,7 @@ pub const Options = struct {
             .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
             .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
             .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 1024 * 1024 * 1024 },
             .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
             .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
@@ -127,6 +130,7 @@ pub const Options = struct {
         return .{
             .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .{ .soft_action = .report, .hard_action = .throttle_writes },
             .{ .soft_action = .report, .hard_action = .throttle_writes },
             .{ .soft_action = .report, .hard_action = .throttle_writes },
             .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
@@ -271,7 +275,7 @@ pub const ResourceManager = struct {
         defer self.mutex.unlock();
 
         var stats: [slice_count]SliceStats = undefined;
-        inline for (.{ Slice.lsm_block_table_cache, Slice.lsm_compaction_work, Slice.lsm_in_memory_state, Slice.lsm_wal_write_working_set, Slice.hbc_node_metadata_cache, Slice.dense_search_working_set, Slice.dense_apply_working_set, Slice.dense_routing_working_set, Slice.derived_replay_window, Slice.full_text_pending_segments, Slice.full_text_build_working_set, Slice.derived_backlog, Slice.text_merge_buffers, Slice.algebraic_tensor_accumulators, Slice.sparse_apply_working_set }, 0..) |slice, i| {
+        inline for (.{ Slice.lsm_block_table_cache, Slice.lsm_compaction_work, Slice.lsm_in_memory_state, Slice.lsm_wal_write_working_set, Slice.lsm_wal_retention, Slice.hbc_node_metadata_cache, Slice.dense_search_working_set, Slice.dense_apply_working_set, Slice.dense_routing_working_set, Slice.derived_replay_window, Slice.full_text_pending_segments, Slice.full_text_build_working_set, Slice.derived_backlog, Slice.text_merge_buffers, Slice.algebraic_tensor_accumulators, Slice.sparse_apply_working_set }, 0..) |slice, i| {
             const state = self.slices[i];
             stats[i] = .{
                 .name = slice.name(),

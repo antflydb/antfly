@@ -972,8 +972,9 @@ startup replay tax if it retains large WAL segments between runs.
      - hard WAL pressure forces foreground rotate/flush/checkpoint work on the
        commit path so retained WAL segments are retired without waiting for a
        later maintenance pass.
-   - Remaining:
-     - resource-manager pressure integration
+     - retained WAL bytes are accounted in the ResourceManager under
+       `lsm.wal_retention`, so pressure snapshots distinguish durable WAL debt
+       from transient WAL write buffers.
 
 ### Remaining work
 
