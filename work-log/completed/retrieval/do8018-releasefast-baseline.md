@@ -10,6 +10,7 @@ Updated on 2026-05-29 after moving the segment container to v3 with a zero check
 Updated on 2026-05-29 from worktree commit `cf09767718c1` with a post-v3 ReleaseFast baseline. Final mapped-file resident dropped from about 519-534 MiB to about 32-33 MiB while final segment bytes stayed about 528-532 MiB; final `ps` RSS dropped from about 1.17-1.19 GiB to about 684-700 MiB.
 Updated on 2026-05-31 from worktree commit `a2dfe4cec46a` after the v18 varint postings header codec change. The baseline script now builds with `zig build install -Doptimize=ReleaseFast`.
 Updated on 2026-05-31 from worktree commit `eb338f2fdbca` after the v19 sparse block-max codec change.
+Updated on 2026-05-31 from worktree commit `629ad9cdecd2` after the v20 compact tagged term-block value codec change.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -42,6 +43,10 @@ Latest v18 artifacts:
 Latest v19 artifacts:
 
 `work-log/do8018/releasefast-baseline-20260531-163822/`
+
+Latest v20 artifacts:
+
+`work-log/do8018/releasefast-baseline-20260531-165023/`
 
 ## Latest Segment-v3 Metrics Off
 
@@ -796,3 +801,97 @@ Artifacts: `work-log/do8018/releasefast-baseline-20260531-163822/`.
 The v19 codec stores block-max records only for posting chunks that contain hits. It removes the dense `first_chunk_id + num_doc_chunks` header fields and aligns each 6-byte block-max record with the compact chunk metadata entry. `BlockMaxInfo.maxImpact` now returns zero for chunks absent from the postings chunk list.
 
 Compared with the v18 baseline, v19 reduced final segment bytes from ~429-431 MiB to ~408-425 MiB and postings from ~172 MiB to ~159-164 MiB. The committed metrics-on run is the best apples-to-apples final state: RSS 646 MiB, footprint 145 MiB, live malloc 104 MiB, mapped-file resident 30 MiB, and final segment bytes 408 MiB. The remaining large on-disk components are stored fields (~127.7 MiB), term blocks (~95-102 MiB), and postings (~159-164 MiB).
+
+## Latest v20 Metrics Off
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260531-165023/`.
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Payload bytes: 246,859,144
+- Load time: 40.963688167s
+- Async catch-up time: 15.834332875s
+- Catch-up complete: true
+- Throughput: 1,723.60 records/sec, 5.26 MiB/sec
+- `ps` RSS: 750,108,672 bytes
+- Process resident metric: 750,108,672 bytes
+- Process footprint metric: 120,167,096 bytes
+- Live malloc metric: 87,823,056 bytes
+- Malloc zone metric: 146,882,560 bytes
+- vmmap footprint: 120,166,809 bytes
+- vmmap peak footprint: 834,247,065 bytes
+- vmmap mapped-file resident: 30,932,992 bytes
+- vmmap malloc allocated: 24,326,963 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 422,375,811
+- Final mapped segment bytes: 422,375,811
+- Max segment bytes: 142,677,080
+- Stored fields bytes: 127,826,216
+- Inverted bytes: 290,464,462
+- Inverted header bytes: 114,378
+- Inverted norms bytes: 11,660,539
+- Inverted postings bytes: 164,406,911
+- Inverted term dictionary bytes: 107,807,270
+- Term block bytes: 102,335,005
+- Term index bytes: 2,760,822
+- Term FST bytes: 2,642,123
+- Bloom bytes: 6,475,364
+- Typed doc values bytes: 3,448,452
+- Doc ordinal bytes: 282,460
+- Section index bytes: 353,901
+- Text merges completed: 138
+- Full-text build peak bytes: 168,161,365
+- Full-text pending peak bytes: 426,531,368
+- Text merge buffer peak bytes: 141,617,453
+- LSM compaction peak bytes: 67,854,840
+- LSM in-memory state peak bytes: 30,797,518
+
+## Latest v20 Metrics On
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260531-165023/`.
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Payload bytes: 246,859,144
+- Load time: 43.950323209s
+- Async catch-up time: 18.380947833s
+- Catch-up complete: true
+- Throughput: 1,606.47 records/sec, 4.90 MiB/sec
+- `ps` RSS: 625,737,728 bytes
+- Process resident metric: 625,737,728 bytes
+- Process footprint metric: 133,143,176 bytes
+- Live malloc metric: 86,033,136 bytes
+- Malloc zone metric: 137,822,208 bytes
+- vmmap footprint: 133,169,152 bytes
+- vmmap peak footprint: 750,570,700 bytes
+- vmmap mapped-file resident: 30,513,561 bytes
+- vmmap malloc allocated: 23,278,387 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 430,172,164
+- Final mapped segment bytes: 430,172,164
+- Max segment bytes: 134,725,738
+- Stored fields bytes: 127,649,232
+- Inverted bytes: 298,433,973
+- Inverted header bytes: 117,084
+- Inverted norms bytes: 11,562,392
+- Inverted postings bytes: 166,685,030
+- Inverted term dictionary bytes: 113,726,459
+- Term block bytes: 107,955,444
+- Term index bytes: 2,912,120
+- Term FST bytes: 2,787,935
+- Bloom bytes: 6,343,008
+- Typed doc values bytes: 3,445,666
+- Doc ordinal bytes: 282,460
+- Section index bytes: 360,513
+- Text merges completed: 149
+- Full-text build peak bytes: 149,952,960
+- Full-text pending peak bytes: 432,669,698
+- Text merge buffer peak bytes: 136,904,324
+- LSM compaction peak bytes: 67,312,032
+- LSM in-memory state peak bytes: 19,961,332
+
+## v20 Read
+
+The v20 codec tags in-block term dictionary values as `(postings_offset << 1)` or `(doc_num << 1) | 1` for one-hit terms, so one-hit dictionary values no longer serialize as 10-byte high-bit `u64` varints. This is a clean codec break (`BTD4`) and leaves the external lookup representation unchanged.
+
+The DO8018 baseline did not show a segment-size win from this change. Final segment bytes landed at ~422-430 MiB and term blocks at ~102-108 MiB, versus v19's ~408-425 MiB and ~95-102 MiB. Because merge composition varies between runs and detailed per-term layout was not enabled for this baseline, the strongest conclusion is that DO8018 is not dominated by one-hit term-block value bytes. The next term-dictionary work should target suffix bytes/block layout directly, or move to stored fields/postings, rather than assuming one-hit value varints are the root cause.
