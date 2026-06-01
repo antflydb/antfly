@@ -724,7 +724,9 @@ pub const IndexWriter = struct {
                 }
             }
         }
-        for (new_segments) |*seg| seg.data.madviseDiscardCleanPages();
+        // Keep active mmap-backed segments warm once they are published. The
+        // cleanup path below still drops retired source pages before those old
+        // mappings are released.
         for (retired) |*seg| seg.data.madviseDiscardCleanPages();
 
         const new_snap = try self.alloc.create(IndexSnapshot);
@@ -828,7 +830,6 @@ pub const IndexWriter = struct {
         var global_field_lens = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
         errdefer global_field_lens.deinit(self.alloc);
         try addSegmentFieldLens(self.alloc, &global_field_lens, &reader);
-        owned.?.madviseDiscardCleanPages();
 
         const new_snap = try self.alloc.create(IndexSnapshot);
         errdefer self.alloc.destroy(new_snap);
