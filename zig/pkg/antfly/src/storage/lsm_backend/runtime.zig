@@ -62,6 +62,14 @@ fn recordCursorBlockReadahead(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorBlockReadahead")) backend.recordCursorBlockReadahead();
 }
 
+fn recordCursorTableIndexHit(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "recordCursorTableIndexHit")) backend.recordCursorTableIndexHit();
+}
+
+fn recordCursorTableIndexMiss(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "recordCursorTableIndexMiss")) backend.recordCursorTableIndexMiss();
+}
+
 fn compareTableEntryTo(entry: lsm_table_file.Entry, namespace: backend_types.Namespace, key: []const u8) std.math.Order {
     const namespace_order = compareNamespace(.{ .name = entry.namespace_name }, namespace);
     if (namespace_order != .eq) return namespace_order;
@@ -353,7 +361,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         };
         const cursor_storage_alignment = @max(
             @max(@alignOf(?usize), @alignOf(?SourceEntry)),
-            @max(@max(@alignOf(?[]const u8), @alignOf(?cache_mod.Handle)), @alignOf(usize)),
+            @max(@max(@alignOf(?[]const u8), @alignOf(?cache_mod.Handle)), @max(@alignOf(?*const lsm_table_file.TableIndex), @alignOf(usize))),
         );
 
         allocator: Allocator,
@@ -369,6 +377,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         source_block_bytes: []?[]const u8,
         source_block_handles: []?cache_mod.Handle,
         source_block_indices: []?usize,
+        source_table_indices: []?*const lsm_table_file.TableIndex,
         advance_sources: []usize,
         source_heap: []usize,
         source_heap_positions: []?usize,
@@ -388,6 +397,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             cursorStorageAdvance(?[]const u8, &offset, source_count);
             cursorStorageAdvance(?cache_mod.Handle, &offset, source_count);
             cursorStorageAdvance(?usize, &offset, source_count);
+            cursorStorageAdvance(?*const lsm_table_file.TableIndex, &offset, source_count);
             cursorStorageAdvance(usize, &offset, source_count);
             cursorStorageAdvance(usize, &offset, source_count);
             cursorStorageAdvance(?usize, &offset, source_count);
@@ -444,6 +454,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             @memset(source_block_handles, null);
             const source_block_indices = cursorStorageSlice(?usize, storage, &offset, source_count);
             @memset(source_block_indices, null);
+            const source_table_indices = cursorStorageSlice(?*const lsm_table_file.TableIndex, storage, &offset, source_count);
+            @memset(source_table_indices, null);
             const advance_sources = cursorStorageSlice(usize, storage, &offset, source_count);
             const source_heap = cursorStorageSlice(usize, storage, &offset, source_count);
             const source_heap_positions = cursorStorageSlice(?usize, storage, &offset, source_count);
@@ -463,6 +475,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .source_block_bytes = source_block_bytes,
                 .source_block_handles = source_block_handles,
                 .source_block_indices = source_block_indices,
+                .source_table_indices = source_table_indices,
                 .advance_sources = advance_sources,
                 .source_heap = source_heap,
                 .source_heap_positions = source_heap_positions,
@@ -483,6 +496,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 self.allocator.free(self.source_block_bytes);
                 self.allocator.free(self.source_entries);
                 self.allocator.free(self.positions);
+                self.allocator.free(self.source_table_indices);
                 self.allocator.free(self.advance_sources);
                 self.allocator.free(self.source_heap);
                 self.allocator.free(self.source_heap_positions);
@@ -771,6 +785,17 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             return &self.runs[run_index];
         }
 
+        fn tableIndexForRunSource(self: *@This(), source_index: usize, run: *Run) !*const lsm_table_file.TableIndex {
+            if (self.source_table_indices[source_index]) |index| {
+                recordCursorTableIndexHit(self.backend);
+                return index;
+            }
+            const index = try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
+            self.source_table_indices[source_index] = index;
+            recordCursorTableIndexMiss(self.backend);
+            return index;
+        }
+
         fn sourceEntryAt(self: *@This(), source_index: usize, idx: usize) !SourceEntry {
             if (source_index == 0) {
                 if (comptime MutableType == ActiveMemTable) return try self.copyMutableSourceEntryAt(idx);
@@ -789,7 +814,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             }
 
             if (run.path != null) {
-                const index = try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
+                const index = try self.tableIndexForRunSource(source_index, run);
                 return try self.sourceEntryAtFromLocalIndex(source_index, run, index, idx);
             }
 
@@ -808,7 +833,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             if (run.state) |*state| return nextStateIndex(state, self.namespace, target, inclusive);
 
             if (run.path != null) {
-                const index = try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
+                const index = try self.tableIndexForRunSource(source_index, run);
                 return try self.sourceLowerBoundFromLocalIndex(source_index, run, index, target, inclusive);
             }
 
@@ -1278,7 +1303,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             source_index: usize,
             run: *Run,
         ) !?[]const u8 {
-            const index = try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
+            const index = try self.tableIndexForRunSource(source_index, run);
             var idx = index.entryCount();
             while (idx > 0) {
                 idx -= 1;
@@ -1297,7 +1322,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             target: []const u8,
             inclusive: bool,
         ) !?[]const u8 {
-            const index = try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
+            const index = try self.tableIndexForRunSource(source_index, run);
             var lo: usize = 0;
             var hi: usize = index.entryCount();
             while (lo < hi) {
@@ -1410,7 +1435,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             run: *Run,
             current: usize,
         ) !?usize {
-            const index = try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
+            const index = try self.tableIndexForRunSource(source_index, run);
             if (current + 1 >= index.entryCount()) return null;
             const scan_prefix = if (self.source_entries[source_index]) |entry|
                 self.boundedScanPrefix(index, entry.key)
@@ -5380,6 +5405,9 @@ test "lsm merge cursor frees loaded blocks with backend allocator" {
     const source_block_indices = try cursor_alloc.alloc(?usize, 1);
     defer cursor_alloc.free(source_block_indices);
     source_block_indices[0] = 0;
+    const source_table_indices = try cursor_alloc.alloc(?*const lsm_table_file.TableIndex, 1);
+    defer cursor_alloc.free(source_table_indices);
+    source_table_indices[0] = null;
     const advance_sources = try cursor_alloc.alloc(usize, 1);
     defer cursor_alloc.free(advance_sources);
     const source_heap = try cursor_alloc.alloc(usize, 1);
@@ -5402,6 +5430,7 @@ test "lsm merge cursor frees loaded blocks with backend allocator" {
         .source_block_bytes = source_block_bytes,
         .source_block_handles = source_block_handles,
         .source_block_indices = source_block_indices,
+        .source_table_indices = source_table_indices,
         .advance_sources = advance_sources,
         .source_heap = source_heap,
         .source_heap_positions = source_heap_positions,

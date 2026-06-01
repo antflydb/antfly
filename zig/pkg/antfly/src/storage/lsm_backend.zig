@@ -393,6 +393,8 @@ pub const Backend = struct {
         cursor_block_reuses: u64 = 0,
         cursor_block_loads: u64 = 0,
         cursor_block_readaheads: u64 = 0,
+        cursor_table_index_hits: u64 = 0,
+        cursor_table_index_misses: u64 = 0,
         cursor_value_borrows: u64 = 0,
         cursor_value_copies: u64 = 0,
         point_value_borrows: u64 = 0,
@@ -439,6 +441,8 @@ pub const Backend = struct {
         cursor_block_reuses: CounterU64 = .init(0),
         cursor_block_loads: CounterU64 = .init(0),
         cursor_block_readaheads: CounterU64 = .init(0),
+        cursor_table_index_hits: CounterU64 = .init(0),
+        cursor_table_index_misses: CounterU64 = .init(0),
         cursor_value_borrows: CounterU64 = .init(0),
         cursor_value_copies: CounterU64 = .init(0),
         point_value_borrows: CounterU64 = .init(0),
@@ -485,6 +489,8 @@ pub const Backend = struct {
                 .cursor_block_reuses = self.cursor_block_reuses.load(.monotonic),
                 .cursor_block_loads = self.cursor_block_loads.load(.monotonic),
                 .cursor_block_readaheads = self.cursor_block_readaheads.load(.monotonic),
+                .cursor_table_index_hits = self.cursor_table_index_hits.load(.monotonic),
+                .cursor_table_index_misses = self.cursor_table_index_misses.load(.monotonic),
                 .cursor_value_borrows = self.cursor_value_borrows.load(.monotonic),
                 .cursor_value_copies = self.cursor_value_copies.load(.monotonic),
                 .point_value_borrows = self.point_value_borrows.load(.monotonic),
@@ -2316,6 +2322,14 @@ pub const Backend = struct {
 
     pub fn recordCursorBlockReadahead(self: *Backend) void {
         _ = self.read_stats.cursor_block_readaheads.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordCursorTableIndexHit(self: *Backend) void {
+        _ = self.read_stats.cursor_table_index_hits.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordCursorTableIndexMiss(self: *Backend) void {
+        _ = self.read_stats.cursor_table_index_misses.fetchAdd(1, .monotonic);
     }
 
     pub fn recordCursorValueBorrow(self: *Backend) void {
@@ -6948,6 +6962,8 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         try std.testing.expect(read_stats.cursor_block_loads > 0);
         try std.testing.expect(read_stats.cursor_block_reuses > 0);
         try std.testing.expect(read_stats.cursor_block_readaheads > 0);
+        try std.testing.expectEqual(@as(u64, 1), read_stats.cursor_table_index_misses);
+        try std.testing.expect(read_stats.cursor_table_index_hits > read_stats.cursor_table_index_misses);
     }
 
     {

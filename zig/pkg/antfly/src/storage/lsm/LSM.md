@@ -215,6 +215,9 @@ Large-ingest guardrails:
      the active source layout once per batch and reuse it across backend-lock
      chunks, avoiding repeated run/L0/level reconstruction for the same live
      read view.
+   - [x] Persisted scan cursors now cache each run source's table index pointer
+     inside the cursor, so block-window movement no longer reacquires the table
+     index through the backend cache on every `next()`.
 7. [ ] Add table block smallest-key metadata and use block min/max bounds to
    skip non-overlapping range-scan blocks.
    - [x] First slice: table footer metadata now records per-block smallest
