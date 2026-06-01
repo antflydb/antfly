@@ -288,6 +288,10 @@ Large-ingest guardrails:
      maintenance stats.
 6. [ ] Raise compaction concurrency only after the scheduler can prove selected
    jobs are non-overlapping or otherwise safe to run in parallel.
+   - [x] Policy slice: scheduled maintenance now has a default-off
+     `max_compaction_input_bytes` cap. Plan selection can skip oversized
+     compactions and choose eligible smaller work instead of repeatedly
+     admitting or remembering a plan larger than the configured policy budget.
 7. [ ] Consider memtable structure changes after byte-budgeted WAL/flush and
    recovery allocation work are measured; the current active memtable appends
    plus hash-indexes writes and sorts on freeze/flush, so the main costs are
