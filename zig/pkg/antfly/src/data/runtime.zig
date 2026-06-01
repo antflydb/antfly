@@ -552,6 +552,8 @@ fn writeTextMergeMetrics(writer: *std.Io.Writer, stats: antfly.db.types.TextMerg
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_indexes", "gauge", "Cached write full-text indexes with pending merge debt", stats.pending_indexes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_segments", "gauge", "Cached write full-text segments in pending merge debt", stats.pending_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_bytes", "gauge", "Cached write full-text segment bytes in pending merge debt", stats.pending_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_heap_bytes", "gauge", "Heap-backed full-text segment bytes in pending merge debt", stats.pending_heap_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_mmap_bytes", "gauge", "Mmap-backed full-text segment bytes in pending merge debt", stats.pending_mmap_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_in_flight_merges", "gauge", "Cached write full-text merges currently in flight", stats.in_flight_merges);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_in_flight_segments", "gauge", "Cached write full-text source segments currently in flight", stats.in_flight_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_completed_total", "counter", "Cached write full-text merges completed", stats.completed_merges);
@@ -12295,6 +12297,8 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .pending_indexes = 1,
         .pending_segments = 3,
         .pending_bytes = 4096,
+        .pending_heap_bytes = 1024,
+        .pending_mmap_bytes = 3072,
         .in_flight_merges = 1,
         .completed_merges = 2,
         .deferred_for_pressure = 4,
@@ -12303,6 +12307,8 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     const text_merge_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_enabled 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_pending_bytes 4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_pending_heap_bytes 1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_pending_mmap_bytes 3072") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_completed_total 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_deferred_for_pressure_total 4") != null);
 }

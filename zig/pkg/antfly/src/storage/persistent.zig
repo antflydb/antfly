@@ -641,6 +641,11 @@ pub const PersistentIndex = struct {
 
     pub const SegmentSinkBuildFn = *const fn (*anyopaque, *segment_mod.SegmentSink) anyerror!void;
 
+    pub fn supportsFileBackedSegmentArtifacts(self: *const PersistentIndex) bool {
+        const store = self.segment_files orelse return false;
+        return store.storage_owner != null;
+    }
+
     const MainTxn = struct {
         read: ?backend_erased.NamespaceReadTxn = null,
         write: ?backend_erased.NamespaceWriteTxn = null,

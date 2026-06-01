@@ -134,3 +134,34 @@ antfly_lsm_mutable_snapshot_clone_reason_bytes_total{reason="other"} 0
 		t.Fatalf("namespace txn clone stats calls=%d bytes=%d", diag.LSMMutableSnapshotNamespaceTxnCalls, diag.LSMMutableSnapshotNamespaceTxnBytes)
 	}
 }
+
+func TestCollectDiagnosticsIncludesTextMergePendingSplit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`
+# TYPE antfly_text_merge_pending_bytes gauge
+antfly_text_merge_pending_bytes 4096
+# TYPE antfly_text_merge_pending_heap_bytes gauge
+antfly_text_merge_pending_heap_bytes 1024
+# TYPE antfly_text_merge_pending_mmap_bytes gauge
+antfly_text_merge_pending_mmap_bytes 3072
+# TYPE antfly_text_merge_max_pending_bytes gauge
+antfly_text_merge_max_pending_bytes 8192
+`))
+	}))
+	defer server.Close()
+
+	diag := collectDiagnostics(0, server.URL, "", time.Second)
+	if diag.TextMergePendingBytes != 4096 {
+		t.Fatalf("TextMergePendingBytes=%d", diag.TextMergePendingBytes)
+	}
+	if diag.TextMergePendingHeapBytes != 1024 {
+		t.Fatalf("TextMergePendingHeapBytes=%d", diag.TextMergePendingHeapBytes)
+	}
+	if diag.TextMergePendingMmapBytes != 3072 {
+		t.Fatalf("TextMergePendingMmapBytes=%d", diag.TextMergePendingMmapBytes)
+	}
+	if diag.TextMergeMaxPendingBytes != 8192 {
+		t.Fatalf("TextMergeMaxPendingBytes=%d", diag.TextMergeMaxPendingBytes)
+	}
+}

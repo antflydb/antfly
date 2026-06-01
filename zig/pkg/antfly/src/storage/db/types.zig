@@ -1227,6 +1227,8 @@ pub const TextMergeStats = struct {
     pending_indexes: u64 = 0,
     pending_segments: u64 = 0,
     pending_bytes: u64 = 0,
+    pending_heap_bytes: u64 = 0,
+    pending_mmap_bytes: u64 = 0,
     in_flight_merges: u64 = 0,
     in_flight_segments: u64 = 0,
     completed_merges: u64 = 0,
@@ -1248,6 +1250,8 @@ pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void 
     dst.pending_indexes +|= src.pending_indexes;
     dst.pending_segments +|= src.pending_segments;
     dst.pending_bytes +|= src.pending_bytes;
+    dst.pending_heap_bytes +|= src.pending_heap_bytes;
+    dst.pending_mmap_bytes +|= src.pending_mmap_bytes;
     dst.in_flight_merges +|= src.in_flight_merges;
     dst.in_flight_segments +|= src.in_flight_segments;
     dst.completed_merges +|= src.completed_merges;

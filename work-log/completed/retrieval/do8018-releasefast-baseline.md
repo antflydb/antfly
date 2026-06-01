@@ -15,6 +15,7 @@ Updated on 2026-05-31 from worktree commit `7f83fe7b7904` after the v21 bit-pack
 Updated on 2026-05-31 from worktree commit `312fc58f215c` after fixing idle derived-backlog release and making the DO8018 wait gate full-text scoped. Metrics-on no longer hits the 300s catch-up ceiling.
 Repeated on 2026-05-31 from worktree commit `12e7e4cb4` to check whether the corrected baseline represented a real slowdown or run noise.
 Repeated on 2026-05-31 from worktree commit `1786a764e2f0` after keeping active mmap-backed text segments warm while still discarding retired merge source pages.
+Updated on 2026-06-01 from worktree commit `bd00912c6bce` plus the pending file-backed text-merge accounting patch. `full_text_pending_segments` now accounts heap-backed pending bytes only, while text merge diagnostics split total pending bytes into heap-backed and mmap-backed debt.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -67,6 +68,92 @@ Corrected v21 repeat artifacts:
 Post active-mmap-advice artifacts:
 
 `work-log/do8018/releasefast-baseline-20260531-220831/`
+
+File-backed pending-accounting artifacts:
+
+`work-log/do8018/releasefast-baseline-20260601-110623/`
+
+## Latest File-Backed Pending Accounting Metrics Off
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Load time: 44.098392375s
+- Async catch-up time: 11.232098125s
+- Total measured time: 55.330550791s
+- Catch-up complete: true
+- Throughput: 1,601.08 records/sec, 4.88 MiB/sec
+- `ps` RSS: 646,889,472 bytes
+- Peak `ps` RSS: 913,571,840 bytes
+- Process footprint metric: 137,453,320 bytes
+- Peak process footprint metric: 469,015,848 bytes
+- Live malloc metric: 81,241,920 bytes
+- Peak live malloc metric: 226,625,712 bytes
+- vmmap footprint: 137,468,313 bytes
+- vmmap peak footprint: 824,705,024 bytes
+- vmmap mapped-file resident: 29,569,843 bytes
+- vmmap malloc allocated: 23,697,817 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 388,040,112
+- Stored fields bytes: 127,802,128
+- Inverted bytes: 256,146,367
+- Inverted norms bytes: 15,642,121
+- Inverted postings bytes: 140,466,870
+- Inverted term dictionary bytes: 94,455,368
+- Term block bytes: 89,142,032
+- Term index bytes: 2,671,043
+- Term FST bytes: 2,569,973
+- Typed doc values bytes: 3,446,704
+- Doc ordinal bytes: 282,460
+- Section index bytes: 362,133
+- Text merges completed: 143
+- Full-text build peak bytes: 167,848,491
+- Full-text pending heap peak bytes: 0
+- Text merge buffer peak bytes: 101,758,240
+- LSM compaction peak bytes: 67,783,944
+- LSM in-memory state peak bytes: 15,809,917
+- LSM mutable snapshot clone calls/bytes/peak: 11 / 6,125 / 1,850
+- LSM read snapshot mutable rotations/bytes/peak: 185 / 292,016,026 / 15,721,297
+
+## Latest File-Backed Pending Accounting Metrics On
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Load time: 43.566184083s
+- Async catch-up time: 12.231821917s
+- Total measured time: 55.798085458s
+- Catch-up complete: true
+- Throughput: 1,620.64 records/sec, 4.94 MiB/sec
+- `ps` RSS: 639,401,984 bytes
+- Peak `ps` RSS: 1,054,998,528 bytes
+- Process footprint metric: 123,198,976 bytes
+- Peak process footprint metric: 612,605,296 bytes
+- Live malloc metric: 84,558,176 bytes
+- Peak live malloc metric: 257,412,256 bytes
+- vmmap footprint: 123,207,680 bytes
+- vmmap peak footprint: 746,166,681 bytes
+- vmmap mapped-file resident: 30,408,704 bytes
+- vmmap malloc allocated: 35,127,296 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 398,038,071
+- Stored fields bytes: 127,794,516
+- Inverted bytes: 266,146,533
+- Inverted norms bytes: 10,950,466
+- Inverted postings bytes: 146,568,217
+- Inverted term dictionary bytes: 102,179,793
+- Term block bytes: 96,460,005
+- Term index bytes: 2,883,165
+- Term FST bytes: 2,763,483
+- Typed doc values bytes: 3,444,919
+- Doc ordinal bytes: 282,460
+- Section index bytes: 369,323
+- Text merges completed: 139
+- Full-text build peak bytes: 149,692,965
+- Full-text pending heap peak bytes: 0
+- Text merge buffer peak bytes: 52,055,831
+- LSM compaction peak bytes: 67,244,496
+- LSM in-memory state peak bytes: 24,737,256
+- LSM mutable snapshot clone calls/bytes/peak: 13 / 14,105 / 6,680
+- LSM read snapshot mutable rotations/bytes/peak: 168 / 291,999,806 / 24,655,666
 
 ## Latest Segment-v3 Metrics Off
 

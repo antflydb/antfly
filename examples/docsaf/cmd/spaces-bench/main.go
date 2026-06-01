@@ -116,6 +116,8 @@ type diagSnapshot struct {
 	TextMergePendingIndexes              int64          `json:"text_merge_pending_indexes,omitempty"`
 	TextMergePendingSegments             int64          `json:"text_merge_pending_segments,omitempty"`
 	TextMergePendingBytes                int64          `json:"text_merge_pending_bytes,omitempty"`
+	TextMergePendingHeapBytes            int64          `json:"text_merge_pending_heap_bytes,omitempty"`
+	TextMergePendingMmapBytes            int64          `json:"text_merge_pending_mmap_bytes,omitempty"`
 	TextMergeInFlightMerges              int64          `json:"text_merge_in_flight_merges,omitempty"`
 	TextMergeInFlightSegments            int64          `json:"text_merge_in_flight_segments,omitempty"`
 	TextMergeCompletedTotal              int64          `json:"text_merge_completed_total,omitempty"`
@@ -444,9 +446,11 @@ func main() {
 		finalDiag.FullTextDocOrdinalsBytes,
 		finalDiag.FullTextSectionIndexBytes,
 	)
-	fmt.Printf("merge_and_resource_diagnostics text_merge_pending_segments=%d text_merge_pending_bytes=%d text_merge_completed_total=%d text_merge_failed_total=%d full_text_build_peak_bytes=%d full_text_pending_peak_bytes=%d text_merge_buffer_peak_bytes=%d lsm_cache_peak_bytes=%d lsm_compaction_peak_bytes=%d lsm_state_peak_bytes=%d lsm_mutable_snapshot_clone_calls=%d lsm_mutable_snapshot_clone_bytes_total=%d lsm_mutable_snapshot_clone_peak_bytes=%d lsm_read_snapshot_mutable_rotations=%d lsm_read_snapshot_mutable_rotation_bytes_total=%d lsm_read_snapshot_mutable_rotation_peak_bytes=%d lsm_mutable_snapshot_clone_bound_read_txn_calls=%d lsm_mutable_snapshot_clone_namespace_read_txn_calls=%d lsm_mutable_snapshot_clone_other_calls=%d\n",
+	fmt.Printf("merge_and_resource_diagnostics text_merge_pending_segments=%d text_merge_pending_bytes=%d text_merge_pending_heap_bytes=%d text_merge_pending_mmap_bytes=%d text_merge_completed_total=%d text_merge_failed_total=%d full_text_build_peak_bytes=%d full_text_pending_peak_bytes=%d text_merge_buffer_peak_bytes=%d lsm_cache_peak_bytes=%d lsm_compaction_peak_bytes=%d lsm_state_peak_bytes=%d lsm_mutable_snapshot_clone_calls=%d lsm_mutable_snapshot_clone_bytes_total=%d lsm_mutable_snapshot_clone_peak_bytes=%d lsm_read_snapshot_mutable_rotations=%d lsm_read_snapshot_mutable_rotation_bytes_total=%d lsm_read_snapshot_mutable_rotation_peak_bytes=%d lsm_mutable_snapshot_clone_bound_read_txn_calls=%d lsm_mutable_snapshot_clone_namespace_read_txn_calls=%d lsm_mutable_snapshot_clone_other_calls=%d\n",
 		finalDiag.TextMergePendingSegments,
 		finalDiag.TextMergePendingBytes,
+		finalDiag.TextMergePendingHeapBytes,
+		finalDiag.TextMergePendingMmapBytes,
 		finalDiag.TextMergeCompletedTotal,
 		finalDiag.TextMergeFailedTotal,
 		finalDiag.FullTextBuildPeakBytes,
@@ -616,6 +620,8 @@ func collectDiagnostics(pid int, healthURL, dataDir string, elapsed time.Duratio
 			out.TextMergePendingIndexes = int64(promValue(metrics, "antfly_text_merge_pending_indexes", nil))
 			out.TextMergePendingSegments = int64(promValue(metrics, "antfly_text_merge_pending_segments", nil))
 			out.TextMergePendingBytes = int64(promValue(metrics, "antfly_text_merge_pending_bytes", nil))
+			out.TextMergePendingHeapBytes = int64(promValue(metrics, "antfly_text_merge_pending_heap_bytes", nil))
+			out.TextMergePendingMmapBytes = int64(promValue(metrics, "antfly_text_merge_pending_mmap_bytes", nil))
 			out.TextMergeInFlightMerges = int64(promValue(metrics, "antfly_text_merge_in_flight_merges", nil))
 			out.TextMergeInFlightSegments = int64(promValue(metrics, "antfly_text_merge_in_flight_segments", nil))
 			out.TextMergeCompletedTotal = int64(promValue(metrics, "antfly_text_merge_completed_total", nil))

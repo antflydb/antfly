@@ -4298,9 +4298,17 @@ pub const IndexManager = struct {
             stats.pending_indexes += 1;
             const snap = entry.persistent.snapshot();
             stats.pending_segments += snap.segments.len;
-            for (snap.segments) |seg| stats.pending_bytes += seg.data.bytes().len;
+            for (snap.segments) |seg| {
+                const segment_bytes: u64 = @intCast(seg.data.bytes().len);
+                stats.pending_bytes +|= segment_bytes;
+                if (seg.data.isFileBacked()) {
+                    stats.pending_mmap_bytes +|= segment_bytes;
+                } else {
+                    stats.pending_heap_bytes +|= segment_bytes;
+                }
+            }
         }
-        self.accountFullTextPendingBytes(stats.pending_bytes) catch {};
+        self.accountFullTextPendingBytes(stats.pending_heap_bytes) catch {};
         return stats;
     }
 
@@ -4334,7 +4342,15 @@ pub const IndexManager = struct {
             stats.pending_indexes = 1;
             const snap = entry.persistent.snapshot();
             stats.pending_segments = snap.segments.len;
-            for (snap.segments) |seg| stats.pending_bytes += seg.data.bytes().len;
+            for (snap.segments) |seg| {
+                const segment_bytes: u64 = @intCast(seg.data.bytes().len);
+                stats.pending_bytes +|= segment_bytes;
+                if (seg.data.isFileBacked()) {
+                    stats.pending_mmap_bytes +|= segment_bytes;
+                } else {
+                    stats.pending_heap_bytes +|= segment_bytes;
+                }
+            }
         }
         return stats;
     }
@@ -5790,7 +5806,7 @@ pub const IndexManager = struct {
             const snap = index.snapshot();
             const planned = (try text_index_maintenance.planPolicyMergeAlloc(self.alloc, snap, policy)) orelse return;
             defer self.alloc.free(planned);
-            var reservation = try self.reserveTextMergeBuffers(snap, planned);
+            var reservation = try self.reserveTextMergeBuffers(index, snap, planned);
             defer if (reservation) |*active| active.release();
 
             try text_index_maintenance.applyPlannedMerge(
@@ -5959,7 +5975,7 @@ pub const IndexManager = struct {
         const owned_index_name = try self.alloc.dupe(u8, index_name);
         errdefer self.alloc.free(owned_index_name);
 
-        var buffer_reservation = try self.reserveTextMergeBuffers(snap, planned);
+        var buffer_reservation = try self.reserveTextMergeBuffers(persistent, snap, planned);
         errdefer if (buffer_reservation) |*reservation| reservation.release();
 
         const source = try self.alloc.alloc(TextMergeSourceSegment, planned.len);
@@ -5992,18 +6008,39 @@ pub const IndexManager = struct {
         };
     }
 
-    fn reserveTextMergeBuffers(self: *IndexManager, snap: *const index_mod.IndexSnapshot, planned: []const usize) !?resource_manager_mod.Reservation {
+    fn reserveTextMergeBuffers(
+        self: *IndexManager,
+        persistent: *const persistent_mod.PersistentIndex,
+        snap: *const index_mod.IndexSnapshot,
+        planned: []const usize,
+    ) !?resource_manager_mod.Reservation {
         const manager = self.resource_manager orelse return null;
 
         var source_bytes: u64 = 0;
+        var section_heap_bytes: u64 = 0;
+        const file_backed_merge = persistent.supportsFileBackedSegmentArtifacts();
         for (planned) |seg_idx| {
             const seg = &snap.segments[seg_idx];
             source_bytes = std.math.add(u64, source_bytes, @as(u64, @intCast(seg.data.bytes().len))) catch return error.ResourceBudgetExceeded;
+            if (file_backed_merge) {
+                section_heap_bytes = std.math.add(u64, section_heap_bytes, estimateFileBackedMergeSectionHeapBytes(seg)) catch return error.ResourceBudgetExceeded;
+            }
         }
 
         const segment_overhead = std.math.mul(u64, @as(u64, @intCast(planned.len)), 1024) catch return error.ResourceBudgetExceeded;
-        const reservation_bytes = std.math.add(u64, source_bytes, segment_overhead) catch return error.ResourceBudgetExceeded;
+        const reservation_base = if (file_backed_merge) section_heap_bytes else source_bytes;
+        const reservation_bytes = std.math.add(u64, reservation_base, segment_overhead) catch return error.ResourceBudgetExceeded;
         return try manager.reserve(.text_merge_buffers, reservation_bytes);
+    }
+
+    fn estimateFileBackedMergeSectionHeapBytes(seg: *const index_mod.SegmentEntry) u64 {
+        var bytes: u64 = 0;
+        for (seg.reader.fields) |*field| {
+            for (field.sections) |*section| {
+                bytes +|= section.length;
+            }
+        }
+        return bytes;
     }
 
     fn shouldDeferTextMergeForResourcePressure(self: *IndexManager) bool {
@@ -6064,7 +6101,7 @@ pub const IndexManager = struct {
 
             const planned = try text_index_maintenance.planForceCompactAlloc(self.alloc, snap, force_merge_max_segments_at_once);
             defer self.alloc.free(planned);
-            var reservation = self.reserveTextMergeBuffers(snap, planned) catch |err| switch (err) {
+            var reservation = self.reserveTextMergeBuffers(&entry.persistent, snap, planned) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
             };
             defer if (reservation) |*active| active.release();
@@ -16321,9 +16358,12 @@ test "text merge resource manager accounts pending bytes and active buffers" {
 
     const merge_stats = manager.textMergeStats();
     try std.testing.expect(merge_stats.pending_bytes > 0);
+    try std.testing.expectEqual(merge_stats.pending_bytes, merge_stats.pending_heap_bytes + merge_stats.pending_mmap_bytes);
     var resource_stats = resource_manager.snapshot();
-    try std.testing.expectEqual(merge_stats.pending_bytes, resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes);
-    try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].soft_limit_events > 0);
+    try std.testing.expectEqual(merge_stats.pending_heap_bytes, resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes);
+    if (merge_stats.pending_heap_bytes > 1) {
+        try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].soft_limit_events > 0);
+    }
 
     {
         var task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;

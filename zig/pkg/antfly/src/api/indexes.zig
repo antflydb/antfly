@@ -856,6 +856,8 @@ fn aggregateTextMergeStats(dst: *db_mod.types.TextMergeStats, src: db_mod.types.
     dst.pending_indexes += src.pending_indexes;
     dst.pending_segments += src.pending_segments;
     dst.pending_bytes += src.pending_bytes;
+    dst.pending_heap_bytes += src.pending_heap_bytes;
+    dst.pending_mmap_bytes += src.pending_mmap_bytes;
     dst.in_flight_merges += src.in_flight_merges;
     dst.in_flight_segments += src.in_flight_segments;
     dst.completed_merges += src.completed_merges;
@@ -1551,6 +1553,10 @@ fn appendTextMergeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(
     try appendIntValue(alloc, out, stats.pending_segments);
     try out.appendSlice(alloc, ",\"pending_bytes\":");
     try appendIntValue(alloc, out, stats.pending_bytes);
+    try out.appendSlice(alloc, ",\"pending_heap_bytes\":");
+    try appendIntValue(alloc, out, stats.pending_heap_bytes);
+    try out.appendSlice(alloc, ",\"pending_mmap_bytes\":");
+    try appendIntValue(alloc, out, stats.pending_mmap_bytes);
     try out.appendSlice(alloc, ",\"in_flight_merges\":");
     try appendIntValue(alloc, out, stats.in_flight_merges);
     try out.appendSlice(alloc, ",\"failed_merges\":");
