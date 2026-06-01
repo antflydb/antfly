@@ -257,13 +257,21 @@ export class AntflyClient {
     path: string,
     body: unknown,
     options: WriteOptions | undefined,
-    errorPrefix: string
+    errorPrefix: string,
+    marshalErrorPrefix: string
   ): Promise<{ data?: T; text: string }> {
     const opts = normalizedWriteOptions(options);
+    let encodedBody: string;
+    try {
+      encodedBody = encodeBoundedJSON(body, opts.maxRequestBytes);
+    } catch (error) {
+      throw new Error(`${marshalErrorPrefix}: ${(error as Error).message}`);
+    }
+
     const response = await fetch(this.url(path), {
       method: "POST",
       headers: this.requestHeaders(),
-      body: encodeBoundedJSON(body, opts.maxRequestBytes),
+      body: encodedBody,
       signal: opts.signal,
     });
 
@@ -715,7 +723,8 @@ export class AntflyClient {
       "/db/v1/batch",
       request,
       options,
-      "Multi-batch operation failed"
+      "Multi-batch operation failed",
+      "marshalling multi-batch request"
     );
     return data ?? {};
   }
@@ -739,7 +748,8 @@ export class AntflyClient {
       `/db/v1/tables/${encodeURIComponent(tableName)}/merge`,
       request,
       options,
-      "Linear merge operation failed"
+      "Linear merge operation failed",
+      "marshalling linear merge request"
     );
     if (!data) throw new Error("Linear merge operation failed: unexpected empty response");
     return data;
@@ -841,7 +851,8 @@ export class AntflyClient {
         `/db/v1/tables/${encodeURIComponent(tableName)}/batch`,
         request,
         options,
-        "Batch operation failed"
+        "Batch operation failed",
+        "marshalling batch request"
       );
       return (
         data ?? {

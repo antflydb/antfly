@@ -266,6 +266,9 @@ describe("AntflyClient", () => {
       );
 
       expect(result).toEqual({ inserted: 1 });
+      const requestBody = mockFetch.mock.calls[0]?.[1]?.body;
+      expect(typeof requestBody).toBe("string");
+      expect(new TextEncoder().encode(requestBody as string).byteLength).toBeGreaterThan(0);
       expect(mockFetch).toHaveBeenCalledWith(
         "http://localhost:8080/db/v1/tables/products/batch",
         expect.objectContaining({
@@ -294,7 +297,7 @@ describe("AntflyClient", () => {
           },
           { maxRequestBytes: 8 }
         )
-      ).rejects.toThrow("encoded request exceeded 8 bytes");
+      ).rejects.toThrow("marshalling batch request: encoded request exceeded 8 bytes");
 
       expect(mockFetch).not.toHaveBeenCalled();
       mockFetch.mockRestore();
@@ -339,6 +342,9 @@ describe("AntflyClient", () => {
       );
 
       expect(result).toEqual(mockResponse);
+      const requestBody = mockFetch.mock.calls[0]?.[1]?.body;
+      expect(typeof requestBody).toBe("string");
+      expect(new TextEncoder().encode(requestBody as string).byteLength).toBeGreaterThan(0);
       expect(mockFetch).toHaveBeenCalledWith(
         "http://localhost:8080/db/v1/tables/products/merge",
         expect.objectContaining({
@@ -351,6 +357,47 @@ describe("AntflyClient", () => {
         })
       );
 
+      mockFetch.mockRestore();
+    });
+
+    it("should reject oversized linear merge requests before sending", async () => {
+      const mockFetch = vi.spyOn(globalThis, "fetch");
+
+      await expect(
+        client.linearMergeWithOptions(
+          "products",
+          {
+            records: {
+              "prod:1": { title: "x".repeat(128) },
+            },
+          },
+          { maxRequestBytes: 64 }
+        )
+      ).rejects.toThrow("marshalling linear merge request: encoded request exceeded 64 bytes");
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      mockFetch.mockRestore();
+    });
+
+    it("should reject oversized multi-batch requests before sending", async () => {
+      const mockFetch = vi.spyOn(globalThis, "fetch");
+
+      await expect(
+        client.multiBatchWithOptions(
+          {
+            tables: {
+              products: {
+                inserts: {
+                  "prod:1": { title: "x".repeat(128) },
+                },
+              },
+            },
+          },
+          { maxRequestBytes: 64 }
+        )
+      ).rejects.toThrow("marshalling multi-batch request: encoded request exceeded 64 bytes");
+
+      expect(mockFetch).not.toHaveBeenCalled();
       mockFetch.mockRestore();
     });
 
