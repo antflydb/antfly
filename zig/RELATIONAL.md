@@ -379,8 +379,10 @@ The important design decision is that relational KV reads are still served from
 the synchronous KV store, not from search segments. Search segments are
 columnar, but they are built asynchronously; a transform or point lookup
 immediately after a write must see the just-written document without waiting for
-segment materialization. That rules out treating segments as the only document
-store without a larger consistency-model redesign.
+segment materialization. The existing two-phase commit machinery gives us the
+right commit boundary, but the columnar storage still needs to become a
+first-class synchronous participant before it can replace the generic relational
+KV row.
 
 The landed design keeps the KV store as the synchronous source of truth while
 changing the relational document value from JSON text to a self-describing typed
@@ -392,10 +394,10 @@ row:
   synchronous path while removing the relational JSON blob. The row carries
   enough path/type metadata that generic store-value readers can reconstruct
   JSON without looking up live schema.
-- **Rejected for now:** making search segments the single physical document
-  store. That would remove the remaining physical duplication between the KV row
-  and segment doc-values, but it would require a synchronous columnar memtable
-  and a broader rewrite of the write/index consistency model.
+- **Target:** make relational typed storage the single physical base store,
+  with point reads, transforms, predicate scans, recovery, split/merge, and
+  derived-index backfill reading the same committed representation. The concrete
+  work is tracked in [RELATIONAL_ROADMAP.md](RELATIONAL_ROADMAP.md).
 
 The value-level magic check is intentional because `DB.get` is generic and also
 serves non-document internal keys. Document-mode JSON blobs and internal store
