@@ -6982,7 +6982,7 @@ pub const IndexManager = struct {
                         .resource_manager = self.resource_manager,
                         .build_memory_target_bytes = target_build_memory_bytes,
                         .doc_scratch_retained_bytes = doc_scratch_retained_bytes,
-                        .profile_timings = detailed_profile_enabled,
+                        .profile_timings = metrics_enabled,
                         .profile_working_set = detailed_profile_enabled,
                     };
                     var segment_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
