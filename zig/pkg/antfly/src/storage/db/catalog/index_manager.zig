@@ -4694,17 +4694,24 @@ pub const IndexManager = struct {
 
         for (docs) |doc| {
             if (isMetadataKey(doc.key)) continue;
-            if (!self.keyInRange(doc.key)) continue;
-            if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
+            const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
+            errdefer self.alloc.free(doc_id);
+            if (!self.keyInRange(doc_id)) {
+                self.alloc.free(doc_id);
+                continue;
+            }
+            if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) {
+                self.alloc.free(doc_id);
+                continue;
+            }
             if (resume_from) |resume_key| {
-                if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) continue;
+                if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) {
+                    self.alloc.free(doc_id);
+                    continue;
+                }
             }
 
             saw_visible_doc = true;
-            const doc_id = if (internal_keys.isPrimaryDocumentKey(doc.key))
-                (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, doc.key)) orelse continue
-            else
-                try self.alloc.dupe(u8, doc.key);
             try owned_doc_ids.append(self.alloc, doc_id);
             try mapped_docs.append(self.alloc, .{
                 .key = doc_id,
@@ -5920,8 +5927,7 @@ pub const IndexManager = struct {
         errdefer mapping_batch.abort();
 
         for (docs) |doc| {
-            if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, doc.key)) orelse continue;
+            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
             defer self.alloc.free(raw_key);
             if (!self.keyInRange(raw_key)) continue;
             const vector_values = (try mapper.extractDenseVectorField(self.alloc, doc.value, entry.field_name, entry.dims)) orelse continue;
@@ -6009,11 +6015,10 @@ pub const IndexManager = struct {
 
         const backfill_batch_size = if (builtin.is_test) test_sparse_backfill_batch_size orelse sparse_backfill_batch_size else sparse_backfill_batch_size;
         for (docs) |doc| {
-            if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
             if (resume_from) |resume_key| {
                 if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) continue;
             }
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, doc.key)) orelse continue;
+            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
             defer self.alloc.free(raw_key);
             if (!self.keyInRange(raw_key)) continue;
             var sparse_vec = (try mapper.extractSparseVectorField(self.alloc, doc.value, entry.field_name)) orelse continue;
@@ -9842,6 +9847,7 @@ fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManag
 
 fn isPrimaryDocumentCandidate(key: []const u8) bool {
     if (internal_keys.isPrimaryDocumentKey(key)) return true;
+    if (internal_keys.isRelationalRowKey(key)) return true;
     if (internal_keys.isInternalUserKey(key)) return false;
     if (docstore_mod.KeyEncoder.parseEdgeKey(key) != null) return false;
     return true;

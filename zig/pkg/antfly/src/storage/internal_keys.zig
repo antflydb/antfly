@@ -22,6 +22,7 @@ pub const replay_all_kind: u8 = 0xfe;
 
 pub const primary_kind: u8 = 0x10;
 pub const ttl_kind: u8 = 0x11;
+pub const relational_row_kind: u8 = 0x12;
 pub const artifact_kind: u8 = 0x20;
 pub const chunk_record_kind: u8 = 0x30;
 pub const derived_embedding_kind: u8 = 0x31;
@@ -168,6 +169,14 @@ pub fn ttlKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     defer list.deinit(alloc);
     try appendDocumentPrefix(&list, alloc, doc_key);
     try list.append(alloc, ttl_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalRowKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, relational_row_kind);
     return try list.toOwnedSlice(alloc);
 }
 
@@ -366,8 +375,30 @@ pub fn isTtlKey(key: []const u8) bool {
     return term + 3 == key.len and key[term + 2] == ttl_kind;
 }
 
+pub fn isRelationalRowKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    return term + 3 == key.len and key[term + 2] == relational_row_kind;
+}
+
+pub fn isStoredDocumentRowKey(key: []const u8) bool {
+    return isPrimaryDocumentKey(key) or isRelationalRowKey(key);
+}
+
 pub fn decodePrimaryDocumentKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
     if (!isPrimaryDocumentKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    return try decodeBodyAlloc(alloc, key[1..term]);
+}
+
+pub fn decodeRelationalRowKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!isRelationalRowKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    return try decodeBodyAlloc(alloc, key[1..term]);
+}
+
+pub fn decodeStoredDocumentRowKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!isStoredDocumentRowKey(key)) return null;
     const term = findComponentTerminator(key, 1).?;
     return try decodeBodyAlloc(alloc, key[1..term]);
 }
@@ -833,6 +864,30 @@ test "internal key round trips adversarial document ids" {
         defer alloc.free(decoded);
         try std.testing.expectEqualSlices(u8, raw, decoded);
     }
+}
+
+test "relational row key shares document range but is not primary" {
+    const alloc = std.testing.allocator;
+    const raw = "doc\x00a";
+
+    const primary = try documentKeyAlloc(alloc, raw);
+    defer alloc.free(primary);
+    const relational = try relationalRowKeyAlloc(alloc, raw);
+    defer alloc.free(relational);
+    const lower = try documentRangeLowerAlloc(alloc, "doc");
+    defer alloc.free(lower);
+    const upper = (try documentRangeUpperAlloc(alloc, "doc")).?;
+    defer alloc.free(upper);
+
+    try std.testing.expect(isPrimaryDocumentKey(primary));
+    try std.testing.expect(!isPrimaryDocumentKey(relational));
+    try std.testing.expect(isRelationalRowKey(relational));
+    try std.testing.expect(isStoredDocumentRowKey(relational));
+    const decoded_relational = (try decodeStoredDocumentRowKeyAlloc(alloc, relational)).?;
+    defer alloc.free(decoded_relational);
+    try std.testing.expectEqualSlices(u8, raw, decoded_relational);
+    try std.testing.expect(std.mem.order(u8, lower, relational) != .gt);
+    try std.testing.expect(std.mem.order(u8, relational, upper) == .lt);
 }
 
 test "internal key binary prefix bounds select only matching document ids" {

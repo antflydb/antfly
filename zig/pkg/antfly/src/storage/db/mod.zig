@@ -51,6 +51,7 @@ pub const ttl_runtime = @import("maintenance/ttl_runtime.zig");
 pub const transaction_runtime = @import("maintenance/transaction_runtime.zig");
 pub const document_query = @import("document_query.zig");
 pub const document_mapper = @import("document_mapper.zig");
+pub const relational_store = @import("relational_store.zig");
 pub const DocIdentityNamespace = doc_identity_mod.Namespace;
 pub const doc_filter_wire = @import("doc_filter_wire.zig");
 pub const artifact_ids = @import("artifact_ids.zig");
@@ -130,6 +131,7 @@ test {
     _ = transaction_runtime;
     _ = document_query;
     _ = document_mapper;
+    _ = relational_store;
     _ = DocIdentityNamespace;
     _ = doc_filter_wire;
     _ = artifact_ids;

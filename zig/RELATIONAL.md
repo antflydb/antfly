@@ -326,30 +326,29 @@ number) is additive where the physical type is compatible.
   self-describing per-segment manifest carried through merge and shard split.
   See "Blob-write removal" below.
 
-- **Phase 6 — authoritative KV columns (done).** The remaining document copy,
-  the **KV-store value** (`db.get` / `getStoreValue`, keyed by doc key, the
-  synchronous source of truth), is now also column-derived for relational
-  tables. This is *not* reconstruction-from-async-segments (which could not
-  satisfy a synchronous transform read); instead the **KV value itself is the
-  serialized typed columns**, so reconstruction-on-read stays fully synchronous.
+- **Phase 6 — authoritative relational base row (done).** The remaining
+  document copy is no longer a generic primary document value for relational
+  tables. Relational rows are stored under the dedicated relational row keyspace
+  as serialized typed columns, so reconstruction-on-read stays fully synchronous
+  without relying on async segment reconstruction.
 
   - **Storage format.** A relational document is stored as one packed
     `relational_row_codec` value (magic `AROW`), not a JSON blob and not a
-    key-range of per-column pairs. One KV pair per document keeps point
-    lookups / read-modify-write transforms a single atomic op and shard splits
-    boundary-agnostic; the columnar predicate-pushdown tier stays in the search
-    segments. The row is self-describing (each cell carries path + physical
+    key-range of per-column pairs. One relational row pair per document keeps
+    point lookups / read-modify-write transforms a single atomic op and shard
+    splits boundary-agnostic; the columnar predicate-pushdown tier stays in the
+    search segments. The row is self-describing (each cell carries path + physical
     `typed_doc_values` type + `is_json`), so reconstruction needs no schema
     lookup. Round-trip is *canonical*, not byte-exact (schema field order,
     numbers/datetime normalized) — acceptable because relational tables are
     closed-schema, so every referenceable field is a declared column.
 
   - **One formatter, two read paths.** `relational_row_codec.appendCellValue` is
-    the single canonical-JSON per-value formatter, shared by the KV read path and
-    the segment read path (`document_mapper.appendReconstructedColumn` delegates
-    to it), so a document reconstructs *byte-for-byte identically* whether served
-    from a segment (full-text reads) or the KV store (point/transform/vector
-    reads).
+    the single canonical-JSON per-value formatter, shared by the relational
+    base-row read path and the segment read path
+    (`document_mapper.appendReconstructedColumn` delegates to it), so a document
+    reconstructs *byte-for-byte identically* whether served from a segment
+    (full-text reads) or the relational row store (point/transform/vector reads).
 
   - **Seam A — materialize to JSON.** `materializeDocumentValueAlloc` is the one
     decode point every document-value reader routes through. The synchronous
@@ -384,16 +383,17 @@ right commit boundary, but the columnar storage still needs to become a
 first-class synchronous participant before it can replace the generic relational
 KV row.
 
-The landed design keeps the KV store as the synchronous source of truth while
-changing the relational document value from JSON text to a self-describing typed
-row:
+The landed design keeps the DocStore transaction boundary as the synchronous
+source of truth while moving relational documents to a dedicated relational row
+key:
 
-- **Chosen:** one packed typed-row KV value per document, detected by the `AROW`
-  magic prefix. This keeps `DB.get`, transforms, lookup, vector
-  `include_stored`, backfill, and enrichment readers on their existing
-  synchronous path while removing the relational JSON blob. The row carries
-  enough path/type metadata that generic store-value readers can reconstruct
-  JSON without looking up live schema.
+- **Chosen:** one packed typed-row value per document, detected by the `AROW`
+  magic prefix and stored under the relational row keyspace rather than the
+  generic primary document key. This keeps `DB.get`, transforms, lookup, vector
+  `include_stored`, backfill, and enrichment readers synchronous while removing
+  the relational JSON blob and avoiding a second base-row copy. The row carries
+  enough path/type metadata that generic store-value readers can reconstruct JSON
+  without looking up live schema.
 - **Target:** make relational typed storage the single physical base store,
   with point reads, transforms, predicate scans, recovery, split/merge, and
   derived-index backfill reading the same committed representation. The concrete

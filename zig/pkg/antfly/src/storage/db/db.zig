@@ -88,6 +88,7 @@ const paths_mod = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
 const mapper = @import("document_mapper.zig");
+const relational_store_mod = @import("relational_store.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
 const planning_stats_mod = @import("planning_stats.zig");
@@ -238,6 +239,7 @@ const AsyncContext = struct {
     dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
+    relational_base_rows: bool = false,
     applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
     stats: AsyncContentionStats = .{},
 
@@ -655,6 +657,7 @@ const BatchExecutionContext = struct {
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
     async_context: ?*AsyncContext = null,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
+    relational_base_rows: bool = false,
 };
 
 const ReplayApplyContext = struct {
@@ -2277,6 +2280,7 @@ pub const DB = struct {
             .io = self.backend_runtime.io(),
             .enrichment_runtime = self.enrichment_runtime,
             .async_context = self.async_context,
+            .relational_base_rows = self.relationalColumnsForStore() != null,
         };
     }
 
@@ -2546,6 +2550,7 @@ pub const DB = struct {
             .io = self.backend_runtime.io(),
             .query_visibility_hook = null,
             .text_merge_runtime = null,
+            .relational_base_rows = self.relationalColumnsForStore() != null,
         };
         self.executor.* = try derived_executor_mod.init(
             self.runtime_alloc,
@@ -3375,13 +3380,13 @@ pub const DB = struct {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_artifacts_ns, graph_artifacts_start_ns);
             if (extracted[i].cleaned_value) |cleaned| {
                 const strip_store_value_start_ns = monotonicTimeNs();
-                // Relational tables make the typed columns the authoritative KV
-                // value: store the serialized typed row instead of the JSON
-                // blob. Every reader (sync DB.get and the async index/derived/
-                // enrichment readers) routes through the materialization seam to
-                // reconstruct canonical JSON. Document-mode tables keep the blob.
-                const store_value = if (self.relationalColumnsForStore()) |relational_columns|
-                    try relationalStoreRowValueAlloc(self.alloc, cleaned, relational_columns, &owned_store_values)
+                // Relational tables project the document once into a typed row
+                // and store that row as the table's only base document record.
+                // Document-mode tables keep the JSON blob under the primary
+                // document key.
+                const relational_columns = self.relationalColumnsForStore();
+                const store_value = if (relational_columns) |columns|
+                    try relationalStoreRowValueAlloc(self.alloc, cleaned, columns, &owned_store_values)
                 else
                     try strippedStoredDocumentValueAlloc(
                         self.alloc,
@@ -3390,7 +3395,10 @@ pub const DB = struct {
                         &owned_store_values,
                     );
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
-                const store_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
+                const store_key = if (relational_columns != null)
+                    try relational_store_mod.rowKeyAlloc(self.alloc, write.key)
+                else
+                    try internal_keys.documentKeyAlloc(self.alloc, write.key);
                 try owned_store_keys.append(self.alloc, store_key);
                 try overwrite_probe_entries.append(self.alloc, .{
                     .key = store_key,
@@ -3497,9 +3505,13 @@ pub const DB = struct {
             try appendUniqueOwnedKey(self.alloc, &changed_graph_artifact_keys, artifact_key);
         }
         for (effective_req.deletes) |key| {
-            const store_key = try internal_keys.documentKeyAlloc(self.alloc, key);
-            try owned_delete_keys.append(self.alloc, store_key);
-            try delete_keys.append(self.alloc, store_key);
+            if (self.relationalColumnsForStore() != null) {
+                try relational_store_mod.appendDelete(self.alloc, &delete_keys, &owned_delete_keys, key);
+            } else {
+                const store_key = try internal_keys.documentKeyAlloc(self.alloc, key);
+                try owned_delete_keys.append(self.alloc, store_key);
+                try delete_keys.append(self.alloc, store_key);
+            }
             if (shouldWriteTimestamp(key)) {
                 const timestamp_key = try makeTimestampKey(self.alloc, key);
                 try timestamp_delete_keys.append(self.alloc, timestamp_key);
@@ -4238,15 +4250,12 @@ pub const DB = struct {
     }
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
+        if (self.relationalColumnsForStore() != null and !isMetadataKey(key) and !internal_keys.isInternalUserKey(key)) {
+            return try relational_store_mod.getMaterializedAlloc(alloc, self.core.store, key);
+        }
         const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
         defer alloc.free(store_key);
         const value = try self.core.getStoreValue(alloc, store_key) orelse return null;
-        // Relational tables store the authoritative typed row; reconstruct the
-        // document's canonical JSON here so every consumer (point lookup,
-        // read-modify-write transform, vector include_stored) sees a document.
-        // The row is self-describing and magic-tagged, so detection needs no
-        // schema and never collides with a real JSON document. A document-mode
-        // blob is returned unchanged (in place).
         return try mapper.materializeOwnedDocumentValueAlloc(alloc, value);
     }
 
@@ -4838,11 +4847,12 @@ pub const DB = struct {
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
         try self.core.setSchema(table_schema);
+        self.async_context.relational_base_rows = self.relationalColumnsForStore() != null;
     }
 
     /// Returns the relational column catalog when the table is in relational
-    /// storage mode (so document writes store the typed row as the authoritative
-    /// KV value), or null for document-mode tables (which keep the JSON blob).
+    /// storage mode (so document writes store a dedicated relational base row),
+    /// or null for document-mode tables (which keep the JSON blob).
     fn relationalColumnsForStore(self: *DB) ?[]const schema_mod.RelationalColumn {
         const schema = self.core.schema orelse return null;
         if (schema.storage_mode != .relational) return null;
@@ -10356,8 +10366,15 @@ pub const DB = struct {
         return try self.loadProjectedSearchDocumentMany(alloc, req, keys);
     }
 
+    fn encodeBaseDocumentLookupKeyAlloc(self: *DB, alloc: Allocator, key: []const u8) ![]u8 {
+        if (self.relationalColumnsForStore() != null and !isMetadataKey(key) and !internal_keys.isInternalUserKey(key)) {
+            return try relational_store_mod.rowKeyAlloc(alloc, key);
+        }
+        return try encodeStoreLookupKeyAlloc(alloc, key);
+    }
+
     fn loadStoredSearchDocumentProbe(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
-        const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
+        const store_key = try self.encodeBaseDocumentLookupKeyAlloc(alloc, key);
         defer alloc.free(store_key);
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
@@ -10365,7 +10382,8 @@ pub const DB = struct {
             error.NotFound => return null,
             else => return err,
         };
-        return try alloc.dupe(u8, raw);
+        const owned = try alloc.dupe(u8, raw);
+        return try mapper.materializeOwnedDocumentValueAlloc(alloc, owned);
     }
 
     fn loadProjectedSearchDocumentMany(
@@ -10885,7 +10903,7 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
     for (keys, 0..) |key, i| {
         try pending.append(alloc, .{
             .original_index = i,
-            .store_key = try encodeStoreLookupKeyAlloc(alloc, key),
+            .store_key = try self.encodeBaseDocumentLookupKeyAlloc(alloc, key),
         });
     }
     if (bench_profile) key_ns = platform_time.monotonicNs() - key_start_ns;
@@ -10917,7 +10935,8 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
     const dupe_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
-        loaded[item.original_index] = try alloc.dupe(u8, value);
+        const owned = try alloc.dupe(u8, value);
+        loaded[item.original_index] = try mapper.materializeOwnedDocumentValueAlloc(alloc, owned);
     }
     if (bench_profile) dupe_ns = platform_time.monotonicNs() - dupe_start_ns;
     if (bench_profile) {
@@ -11049,7 +11068,7 @@ fn isMetadataKey(key: []const u8) bool {
 }
 
 fn isPrimaryDocumentStoreKey(key: []const u8) bool {
-    return internal_keys.isPrimaryDocumentKey(key);
+    return internal_keys.isStoredDocumentRowKey(key);
 }
 
 fn skipNonPrimaryMedianKey(key: []const u8) bool {
@@ -14765,7 +14784,10 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 index_ref.name,
                 ctx.index_manager.byte_range,
                 delete_keys,
-                .{ .prefer_inline_when_store_tip_matches_sequence = batch.sequence },
+                .{
+                    .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
+                    .relational_base_rows = ctx.relational_base_rows,
+                },
                 text_replay_options,
             );
             if (missing_required != 0) return error.ReplayDocumentNotVisible;
@@ -14805,7 +14827,10 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 ctx.store,
                 batch.documents,
                 ctx.index_manager.byte_range,
-                .{ .skip_doc_keys = &dense_embedding_doc_keys },
+                .{
+                    .skip_doc_keys = &dense_embedding_doc_keys,
+                    .relational_base_rows = ctx.relational_base_rows,
+                },
                 null,
             );
             defer index_writes.deinit();
@@ -14872,6 +14897,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                     .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
                     .prefer_available_inline_values = true,
                     .skip_doc_keys = &sparse_embedding_doc_keys,
+                    .relational_base_rows = ctx.relational_base_rows,
                 },
                 if (emit_sparse_write_profile) &collect_doc_profile else null,
             );
@@ -15146,17 +15172,21 @@ const OwnedSparseEmbeddingWrites = struct {
 
 const CollectTextDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
+    relational_base_rows: bool = false,
 };
 
 const CollectDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
     prefer_available_inline_values: bool = false,
     skip_doc_keys: ?*const std.StringHashMapUnmanaged(void) = null,
+    relational_base_rows: bool = false,
 };
 
-fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8, relational_base_rows: bool) ![]u8 {
     return if (internal_keys.isInternalUserKey(key))
         try alloc.dupe(u8, key)
+    else if (relational_base_rows)
+        try relational_store_mod.rowKeyAlloc(alloc, key)
     else
         try internal_keys.documentKeyAlloc(alloc, key);
 }
@@ -15249,7 +15279,7 @@ fn collectSparseFieldWritesProfiled(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
+            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -15397,7 +15427,7 @@ fn collectDocumentWritesProfiled(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
+            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -15578,7 +15608,7 @@ fn applyTextDocumentsForIndex(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
+            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -17038,8 +17068,8 @@ fn collectSplitFrontierDocKeys(alloc: Allocator, store: *docstore_mod.DocStore, 
     }
 
     for (scanned) |entry| {
-        if (!isPrimaryDocumentStoreKey(entry.key)) continue;
-        const raw = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+        if (!internal_keys.isStoredDocumentRowKey(entry.key)) continue;
+        const raw = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, entry.key)) orelse continue;
         try keys.append(alloc, raw);
     }
 
@@ -17157,14 +17187,24 @@ fn putIndexedSplitBatchDirect(
         for (owned_keys.items) |key| dest_indexes.alloc.free(key);
         owned_keys.deinit(dest_indexes.alloc);
     }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| dest_indexes.alloc.free(value);
+        owned_values.deinit(dest_indexes.alloc);
+    }
 
     for (writes, 0..) |write, i| {
-        if (internal_keys.isPrimaryDocumentKey(write.key)) {
-            const raw = (try internal_keys.decodePrimaryDocumentKeyAlloc(dest_indexes.alloc, write.key)) orelse return error.InvalidInternalUserKey;
+        if (internal_keys.isStoredDocumentRowKey(write.key)) {
+            const raw = (try internal_keys.decodeStoredDocumentRowKeyAlloc(dest_indexes.alloc, write.key)) orelse return error.InvalidInternalUserKey;
             try owned_keys.append(dest_indexes.alloc, raw);
+            const value = if (mapper.isRelationalRowValue(write.value)) blk: {
+                const materialized = try mapper.materializeDocumentValueAlloc(dest_indexes.alloc, write.value);
+                try owned_values.append(dest_indexes.alloc, materialized);
+                break :blk materialized;
+            } else write.value;
             logical_writes[i] = .{
                 .key = raw,
-                .value = write.value,
+                .value = value,
             };
         } else {
             logical_writes[i] = write;
@@ -17773,8 +17813,10 @@ fn densePrimaryVectorTargetCountForIndexContext(ctx: *AsyncContext, index_name: 
 
         fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
-            if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
-            if (try mapper.extractDenseVectorField(state.alloc, value, state.field_name, state.dims)) |vector| {
+            if (!internal_keys.isStoredDocumentRowKey(key)) return .@"continue";
+            const doc_value = if (mapper.isRelationalRowValue(value)) try mapper.materializeDocumentValueAlloc(state.alloc, value) else value;
+            defer if (doc_value.ptr != value.ptr) state.alloc.free(doc_value);
+            if (try mapper.extractDenseVectorField(state.alloc, doc_value, state.field_name, state.dims)) |vector| {
                 state.alloc.free(vector);
                 state.count += 1;
             }
@@ -17850,16 +17892,20 @@ fn rebuildDenseIndexFromPrimaryVectorsContext(
 
         fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
-            if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
-            if (try mapper.extractDenseVectorField(state.ctx.alloc, value, state.field_name, state.dims)) |vector| {
+            if (!internal_keys.isStoredDocumentRowKey(key)) return .@"continue";
+            const doc_value = try mapper.materializeDocumentValueAlloc(state.ctx.alloc, value);
+            errdefer state.ctx.alloc.free(doc_value);
+            if (try mapper.extractDenseVectorField(state.ctx.alloc, doc_value, state.field_name, state.dims)) |vector| {
                 state.ctx.alloc.free(vector);
             } else {
+                state.ctx.alloc.free(doc_value);
                 return .@"continue";
             }
-            const doc_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.ctx.alloc, key)) orelse return .@"continue";
+            const doc_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.ctx.alloc, key)) orelse {
+                state.ctx.alloc.free(doc_value);
+                return .@"continue";
+            };
             errdefer state.ctx.alloc.free(doc_key);
-            const doc_value = try state.ctx.alloc.dupe(u8, value);
-            errdefer state.ctx.alloc.free(doc_value);
             try state.writes.append(state.ctx.alloc, .{
                 .key = doc_key,
                 .value = doc_value,
@@ -28386,9 +28432,9 @@ test "collectDocumentWrites batches sorted document reads and falls back to inli
     var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
     defer store.close();
 
-    const stored_a = try replayDocumentStoreKeyAlloc(alloc, "a");
+    const stored_a = try replayDocumentStoreKeyAlloc(alloc, "a", false);
     defer alloc.free(stored_a);
-    const stored_c = try replayDocumentStoreKeyAlloc(alloc, "c");
+    const stored_c = try replayDocumentStoreKeyAlloc(alloc, "c", false);
     defer alloc.free(stored_c);
     try store.putBatch(&.{
         .{ .key = stored_a, .value = "{\"title\":\"alpha\"}" },
@@ -28422,7 +28468,7 @@ test "collectDocumentWrites skips missing out-of-range replay docs" {
     var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
     defer store.close();
 
-    const stored_z = try replayDocumentStoreKeyAlloc(alloc, "doc:z");
+    const stored_z = try replayDocumentStoreKeyAlloc(alloc, "doc:z", false);
     defer alloc.free(stored_z);
     try store.putBatch(&.{
         .{ .key = stored_z, .value = "{\"title\":\"zeta\"}" },
@@ -40231,6 +40277,65 @@ test "db updateRange constrains index backfill" {
 
     const text_index = db.core.index_manager.textIndex("ft_range").?;
     try std.testing.expectEqual(@as(u32, 2), text_index.snapshot().global_doc_count);
+}
+
+test "relational table point reads use only the relational base store" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"},"attrs":{"type":"json"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:base",
+            .value =
+            \\{"title":"base row","amount":12.5,"attrs":{"tier":"gold"}}
+            ,
+        }},
+    });
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:base");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:base");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
+
+    const doc = (try db.get(alloc, "row:base")).?;
+    defer alloc.free(doc);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"amount\":12.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"attrs\":{\"tier\":\"gold\"}") != null);
+
+    try db.batch(.{
+        .deletes = &.{"row:base"},
+    });
+    try std.testing.expect((try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:base")) == null);
+    try std.testing.expect((try db.get(alloc, "row:base")) == null);
 }
 
 test "db dense startup catch-up defaults keep more than one cache entry" {

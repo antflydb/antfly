@@ -3604,10 +3604,10 @@ pub fn searchTextQuery(
         }
     }
 
-    // Relational tables persist every column as a typed_doc_values section, so
-    // a full-text hit's document is reconstructed from those columns rather than
-    // the (still-written, for now) segment stored-doc blob. Document-mode tables
-    // are unchanged. Reconstruction needs the segment-local id, which is what
+    // Relational tables persist every indexed column as a typed_doc_values
+    // section, so a full-text hit's document is reconstructed from those
+    // columns rather than the segment stored-doc blob. Document-mode tables are
+    // unchanged. Reconstruction needs the segment-local id, which is what
     // typed_doc_values is keyed by -- resolveDocId maps the global hit id to
     // (segment, local_id), exactly as storedDoc does.
     const relational_columns: ?[]const runtime_schema_mod.RelationalColumn =
@@ -5324,8 +5324,8 @@ pub fn collectMatchAllCandidates(
     }
 
     for (docs) |doc| {
-        if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
-        const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
+        if (!internal_keys.isStoredDocumentRowKey(doc.key)) continue;
+        const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
         errdefer alloc.free(raw_key);
         if (try collector.is_expired_key(collector.ctx, alloc, raw_key)) {
             alloc.free(raw_key);

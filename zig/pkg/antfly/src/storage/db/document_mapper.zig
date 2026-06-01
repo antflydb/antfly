@@ -1527,12 +1527,12 @@ fn buildRelationalTypedFields(
     return try fields.toOwnedSlice(alloc);
 }
 
-/// Project a relational document's JSON into the serialized typed-row value that
-/// is stored as the authoritative KV-store value for relational tables (in place
-/// of a JSON blob). One cell per present column, in declared-column order, using
-/// the same physical encoding + coercion as the segment columns, so the KV value
-/// and the segment columns reconstruct identically. Absent nullable columns are
-/// skipped (NOT NULL is enforced upstream). Caller owns the returned bytes.
+/// Project a relational document's JSON into the serialized typed-row value
+/// stored under the relational base-row key (in place of a JSON blob). One cell
+/// per present column, in declared-column order, using the same physical
+/// encoding + coercion as the segment columns, so the base row and segment
+/// columns reconstruct identically. Absent nullable columns are skipped (NOT
+/// NULL is enforced upstream). Caller owns the returned bytes.
 pub fn buildRelationalRowValueAlloc(
     alloc: Allocator,
     doc_json: []const u8,

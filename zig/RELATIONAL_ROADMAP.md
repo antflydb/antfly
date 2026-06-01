@@ -5,8 +5,8 @@ typed store for the base table and columnar query path, rather than the current
 interim shape:
 
 - document-mode tables: JSON KV value plus derived indexes, unchanged;
-- relational tables today: authoritative typed-row KV value plus derived
-  typed-doc-value sections in search segments;
+- relational tables in this PR: a dedicated relational row key is the base
+  document record, with derived typed-doc-value sections in search segments;
 - relational target: one synchronous typed column store is the relational base
   table, and query/index consumers read from that same committed representation.
 
@@ -46,8 +46,8 @@ participant:
 5. Document-mode tables continue to use the existing JSON KV value and derived
    indexes.
 
-The relational base store should retain the properties that made the current
-typed-row KV safe:
+The relational base store should retain the properties that made the interim
+typed-row encoding safe:
 
 - self-describing enough for generic readers to avoid live-schema dependence at
   recovery/split seams;
@@ -59,8 +59,8 @@ typed-row KV safe:
 
 ## Proposed Storage Shape
 
-Build a `relational_store` layer beside the current document KV path. It should
-start as row-addressable and column-readable:
+Build a `relational_store` layer in the document-scoped keyspace. It should
+start as row-addressable and become column-readable:
 
 - **Row key:** existing document key / document identity namespace.
 - **Row payload:** the current `relational_row_codec` cells, but stored under a
@@ -103,8 +103,7 @@ Acceptance:
 
 ### Phase 2 - Write Path Cutover
 
-Move relational writes from generic document KV values to the relational
-participant:
+Move relational writes fully into the relational participant:
 
 - keep using `schema_capability.projectRelationalRowAlloc` and
   `relational_row_codec` for projection and canonical reconstruction;
@@ -255,15 +254,15 @@ Minimum coverage before merging the one-store implementation:
 
 ## Rollback Points
 
-Keep the current typed-row KV path behind a short-lived internal switch until
-the one-store tests are green:
+Relational mode is new, so this PR should not carry a legacy fallback path. The
+cutover sequence is:
 
-1. New relational participant present but unused.
-2. Writes dual-populate participant and typed-row KV; reads still use KV.
-3. Reads prefer participant with KV fallback.
-4. Remove fallback once recovery/split/query tests pass.
-5. Stop writing generic relational KV values.
-6. Stop writing duplicated relational segment typed columns.
+1. Write relational base rows only through the relational participant keyspace.
+2. Make point reads, stored-data reads, split movement, and rebuild scans
+   recognize relational row keys as document rows.
+3. Keep derived search/index artifacts rebuildable from relational base rows.
+4. Stop writing duplicated relational segment typed columns once query scans can
+   read the relational base store directly.
 
 The final state should remove the switch and make the relational participant the
 only physical base store for relational tables.
