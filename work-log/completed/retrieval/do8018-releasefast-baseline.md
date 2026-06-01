@@ -1815,3 +1815,89 @@ Metrics-on text timing aggregate:
 - Hit materialization timing: 3,499 ms
 
 Interpretation: this repeat is a valid speed comparison. The noisy `20260601-092024` run was environmental; this run returned to the normal ingest band. Compared with the front-coded v23 baseline (`20260601-090240`), metrics-on text timing is effectively flat/slightly better (`34,032 ms` to `33,663 ms`), and term-dictionary timing improved (`8,118 ms` to `7,677 ms`). The prefix matcher does not make front coding dramatically faster, but it removes most evidence of a CPU regression while keeping the compact term block format.
+
+## Post LSM Metadata Probe Cleanup Baseline
+
+Run: `work-log/do8018/releasefast-baseline-20260601-095535`
+Commit: `0996b59da`
+
+Metrics off:
+
+- Load time: 40.412715667s
+- Async catch-up time: 10.228914583s
+- Total elapsed: 50.641691375s
+- Throughput: 1,747.10 records/sec, 5.33 MiB/sec
+- `ps` RSS: 612,843,520 bytes
+- Peak sampled RSS: 946,225,152 bytes
+- Process footprint metric: 123,739,096 bytes
+- Peak sampled process footprint: 435,952,744 bytes
+- Live malloc metric: 78,765,376 bytes
+- Peak sampled live malloc: 192,220,672 bytes
+- vmmap footprint: 123,731,968 bytes
+- vmmap mapped-file resident: 30,723,276 bytes
+- vmmap malloc allocated: 23,907,532 bytes
+- Segment files: 8
+- Segment bytes: 393,788,477
+- Stored fields bytes: 127,771,187
+- Inverted bytes: 261,912,120
+- Postings bytes: 144,659,105
+- Term block bytes: 93,522,082
+- Text merges completed: 150
+- Full-text build peak bytes: 136,429,375
+- Full-text pending peak bytes: 396,245,568
+- Text merge buffer peak bytes: 79,141,812
+- LSM mutable snapshot clone calls: 28
+- LSM mutable snapshot clone bytes total: 12,638,438
+- LSM mutable snapshot clone peak bytes: 968,624
+
+Metrics on:
+
+- Load time: 40.755203291s
+- Async catch-up time: 10.179487292s
+- Total elapsed: 50.934789208s
+- Throughput: 1,732.42 records/sec, 5.29 MiB/sec
+- `ps` RSS: 676,151,296 bytes
+- Peak sampled RSS: 1,128,120,320 bytes
+- Process footprint metric: 133,028,800 bytes
+- Peak sampled process footprint: 291,953,552 bytes
+- Live malloc metric: 86,190,992 bytes
+- Peak sampled live malloc: 161,986,560 bytes
+- vmmap footprint: 133,693,440 bytes
+- vmmap mapped-file resident: 30,303,846 bytes
+- vmmap malloc allocated: 34,917,580 bytes
+- Segment files: 8
+- Segment bytes: 396,983,379
+- Stored fields bytes: 127,723,643
+- Inverted bytes: 265,165,350
+- Postings bytes: 145,184,275
+- Term block bytes: 93,382,309
+- Text merges completed: 159
+- Full-text build peak bytes: 153,407,657
+- Full-text pending peak bytes: 402,189,733
+- Text merge buffer peak bytes: 135,535,305
+- LSM mutable snapshot clone calls: 23
+- LSM mutable snapshot clone bytes total: 6,014,543
+- LSM mutable snapshot clone peak bytes: 807,337
+
+Metrics-on text timing aggregate:
+
+- Timing lines: 178
+- Source/projection docs: 70,605 / 70,605
+- Total text build timing: 30,102 ms
+- Segment build timing: 30,099 ms
+- Segment encode timing: 11,789 ms
+- Inverted build timing: 10,150 ms
+- Inverted term dictionary timing: 6,893 ms
+- Inverted postings serialization timing: 2,093 ms
+- Inverted sort timing: 561 ms
+- Inverted final assembly timing: 194 ms
+- Inverted norms timing: 1 ms
+- Inverted bloom finish timing: 0 ms
+- Section attach timing: 0 ms
+- Segment assembly timing: 1,453 ms
+- Stored compression timing: 472 ms
+- Analyzer timing: 3,367 ms
+- Term accumulation timing: 2,303 ms
+- Hit materialization timing: 2,856 ms
+
+Interpretation: this is a valid post-LSM-cleanup run. Metrics-on mutable snapshot clone calls fell from 32 to 23 versus the valid prefix baseline, and total cloned bytes fell from 15,954,614 to 6,014,543. Metrics-off clone calls rose from 23 to 28, so this does not prove that every remaining LSM clone path is fixed; it does show the metadata point-read probe conversion removed a meaningful part of the instrumented path. Main text timing remained healthy: metrics-on total text build timing improved from 33,663 ms to 30,102 ms, with term dictionary timing down from 7,677 ms to 6,893 ms. Remaining LSM work should identify the residual clone callers by adding call-site labels or per-reader reason counters around `snapshotMutableState`.
