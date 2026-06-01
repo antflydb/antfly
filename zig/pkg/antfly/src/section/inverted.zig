@@ -43,12 +43,13 @@ const bloom = @import("bloom");
 //   v18: v17 + varint postings headers
 //   v19: v18 + sparse block-max records aligned to stored posting chunks
 //   v20: v19 + compact tagged term-block dictionary values
+//   v21: v20 + bit-packed postings chunk metadata columns
 //
-// This project is pre-release; writers emit only the current v20 format.
+// This project is pre-release; writers emit only the current v21 format.
 
-const wire_version_current: u8 = 20;
+const wire_version_current: u8 = 21;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4 + 4; // 33 bytes
-const postings_chunk_meta_size: usize = 12;
+const postings_chunk_meta_header_size: usize = 4;
 const postings_skip_record_size: usize = 8;
 const postings_skip_stride_chunks: usize = 16;
 const postings_skip_min_chunks: usize = postings_skip_stride_chunks * 2;
@@ -474,13 +475,14 @@ pub const InvertedIndexBuilder = struct {
     ///   - General: postings offset within postings_data
     ///   - 1-hit: packed docNum + normBits (for single-doc, freq=1 terms)
     ///
-    /// Postings per term, v19:
+    /// Postings per term, v21:
     ///   [doc_freq: varint u32]
     ///   [stored_chunks: varint u32]
+    ///   [chunk_meta_len: varint u32]
     ///   [positions_section_len: varint u32]
     ///   [skip_section_len: varint u32]
     ///   [stored_chunks × 6-byte block-max records]
-    ///   [stored_chunks × compact chunk metadata]
+    ///   [bit-packed chunk metadata columns]
     ///   [packed per-chunk doc-delta/freqHasLocs/norm payloads]
     ///   [positions: varint count + varint deltas per doc]
     ///
@@ -640,22 +642,32 @@ const PostingSerializeScratch = struct {
     doc_deltas: std.ArrayListUnmanaged(u32) = .empty,
     freq_values: std.ArrayListUnmanaged(u32) = .empty,
     block_max: std.ArrayListUnmanaged(u8) = .empty,
+    chunk_meta: std.ArrayListUnmanaged(u8) = .empty,
     payload: std.ArrayListUnmanaged(u8) = .empty,
     positions: std.ArrayListUnmanaged(u8) = .empty,
     skip: std.ArrayListUnmanaged(u8) = .empty,
     svb_control: std.ArrayListUnmanaged(u8) = .empty,
     svb_data: std.ArrayListUnmanaged(u8) = .empty,
+    chunk_id_deltas: std.ArrayListUnmanaged(u32) = .empty,
+    max_doc_offsets: std.ArrayListUnmanaged(u32) = .empty,
+    chunk_doc_counts: std.ArrayListUnmanaged(u32) = .empty,
+    payload_end_deltas: std.ArrayListUnmanaged(u32) = .empty,
 
     fn reset(self: *PostingSerializeScratch) void {
         self.chunks.clearRetainingCapacity();
         self.doc_deltas.clearRetainingCapacity();
         self.freq_values.clearRetainingCapacity();
         self.block_max.clearRetainingCapacity();
+        self.chunk_meta.clearRetainingCapacity();
         self.payload.clearRetainingCapacity();
         self.positions.clearRetainingCapacity();
         self.skip.clearRetainingCapacity();
         self.svb_control.clearRetainingCapacity();
         self.svb_data.clearRetainingCapacity();
+        self.chunk_id_deltas.clearRetainingCapacity();
+        self.max_doc_offsets.clearRetainingCapacity();
+        self.chunk_doc_counts.clearRetainingCapacity();
+        self.payload_end_deltas.clearRetainingCapacity();
     }
 
     fn deinit(self: *PostingSerializeScratch, alloc: Allocator) void {
@@ -663,11 +675,16 @@ const PostingSerializeScratch = struct {
         self.doc_deltas.deinit(alloc);
         self.freq_values.deinit(alloc);
         self.block_max.deinit(alloc);
+        self.chunk_meta.deinit(alloc);
         self.payload.deinit(alloc);
         self.positions.deinit(alloc);
         self.skip.deinit(alloc);
         self.svb_control.deinit(alloc);
         self.svb_data.deinit(alloc);
+        self.chunk_id_deltas.deinit(alloc);
+        self.max_doc_offsets.deinit(alloc);
+        self.chunk_doc_counts.deinit(alloc);
+        self.payload_end_deltas.deinit(alloc);
     }
 };
 
@@ -681,39 +698,6 @@ fn appendPostingSkipData(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), chu
         try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, boundary.max_doc))));
         try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(chunk_index))))));
     }
-}
-
-fn writeChunkMetaV17(dst: []u8, meta: V7ChunkMeta) void {
-    std.debug.assert(dst.len >= postings_chunk_meta_size);
-    const payload_end = meta.doc_ctrl_off + meta.doc_ctrl_len;
-    dst[0..4].* = @bitCast(std.mem.nativeToLittle(u32, meta.max_doc));
-    dst[4..8].* = @bitCast(std.mem.nativeToLittle(u32, meta.doc_count));
-    dst[8..12].* = @bitCast(std.mem.nativeToLittle(u32, payload_end));
-}
-
-fn readChunkMetaV17(data: []const u8, index: usize, chunk_size: u32) V7ChunkMeta {
-    std.debug.assert(data.len >= (index + 1) * postings_chunk_meta_size);
-    const base = index * postings_chunk_meta_size;
-    const max_doc = std.mem.readInt(u32, data[base..][0..4], .little);
-    const payload_end = std.mem.readInt(u32, data[base + 8 ..][0..4], .little);
-    const prev_payload_end = if (index == 0)
-        0
-    else
-        std.mem.readInt(u32, data[base - postings_chunk_meta_size + 8 ..][0..4], .little);
-    std.debug.assert(payload_end >= prev_payload_end);
-    return .{
-        .chunk_id = if (chunk_size == 0) 0 else max_doc / chunk_size,
-        .max_doc = max_doc,
-        .doc_count = std.mem.readInt(u32, data[base + 4 ..][0..4], .little),
-        .doc_ctrl_off = prev_payload_end,
-        .doc_ctrl_len = payload_end - prev_payload_end,
-        .doc_data_off = 0,
-        .doc_data_len = 0,
-        .freq_ctrl_off = 0,
-        .freq_ctrl_len = 0,
-        .freq_data_off = 0,
-        .freq_data_len = 0,
-    };
 }
 
 fn bitWidthU32(value: u32) u8 {
@@ -832,6 +816,184 @@ fn decodePackedU32IntoStrided(
         }
         out[start + i * stride] = value;
     }
+}
+
+const CompactChunkMetaLayout = struct {
+    chunk_delta_bits: u8,
+    max_doc_offset_bits: u8,
+    doc_count_bits: u8,
+    payload_delta_bits: u8,
+    chunk_delta_off: usize,
+    chunk_delta_len: usize,
+    max_doc_offset_off: usize,
+    max_doc_offset_len: usize,
+    doc_count_off: usize,
+    doc_count_len: usize,
+    payload_delta_off: usize,
+    payload_delta_len: usize,
+    total_len: usize,
+};
+
+fn compactChunkMetaLayout(data: []const u8, count: usize) !CompactChunkMetaLayout {
+    if (count == 0) {
+        return .{
+            .chunk_delta_bits = 0,
+            .max_doc_offset_bits = 0,
+            .doc_count_bits = 0,
+            .payload_delta_bits = 0,
+            .chunk_delta_off = 0,
+            .chunk_delta_len = 0,
+            .max_doc_offset_off = 0,
+            .max_doc_offset_len = 0,
+            .doc_count_off = 0,
+            .doc_count_len = 0,
+            .payload_delta_off = 0,
+            .payload_delta_len = 0,
+            .total_len = 0,
+        };
+    }
+    if (data.len < postings_chunk_meta_header_size) return error.InvalidData;
+    const chunk_delta_bits = data[0];
+    const max_doc_offset_bits = data[1];
+    const doc_count_bits = data[2];
+    const payload_delta_bits = data[3];
+    if (chunk_delta_bits > 32 or max_doc_offset_bits > 32 or doc_count_bits > 32 or payload_delta_bits > 32) return error.InvalidData;
+
+    var cursor: usize = postings_chunk_meta_header_size;
+    const chunk_delta_len = packedU32ByteLen(count, chunk_delta_bits);
+    const chunk_delta_off = cursor;
+    cursor += chunk_delta_len;
+    const max_doc_offset_len = packedU32ByteLen(count, max_doc_offset_bits);
+    const max_doc_offset_off = cursor;
+    cursor += max_doc_offset_len;
+    const doc_count_len = packedU32ByteLen(count, doc_count_bits);
+    const doc_count_off = cursor;
+    cursor += doc_count_len;
+    const payload_delta_len = packedU32ByteLen(count, payload_delta_bits);
+    const payload_delta_off = cursor;
+    cursor += payload_delta_len;
+    if (data.len < cursor) return error.InvalidData;
+
+    return .{
+        .chunk_delta_bits = chunk_delta_bits,
+        .max_doc_offset_bits = max_doc_offset_bits,
+        .doc_count_bits = doc_count_bits,
+        .payload_delta_bits = payload_delta_bits,
+        .chunk_delta_off = chunk_delta_off,
+        .chunk_delta_len = chunk_delta_len,
+        .max_doc_offset_off = max_doc_offset_off,
+        .max_doc_offset_len = max_doc_offset_len,
+        .doc_count_off = doc_count_off,
+        .doc_count_len = doc_count_len,
+        .payload_delta_off = payload_delta_off,
+        .payload_delta_len = payload_delta_len,
+        .total_len = cursor,
+    };
+}
+
+fn readPackedU32At(data: []const u8, index: usize, bits: u8) !u32 {
+    if (bits > 32) return error.InvalidData;
+    if (bits == 0) return 0;
+    var bit_pos: usize = index * @as(usize, bits);
+    const needed = (bit_pos + bits + 7) / 8;
+    if (data.len < needed) return error.InvalidData;
+
+    var value: u32 = 0;
+    var shift: u8 = 0;
+    var remaining = bits;
+    while (remaining > 0) {
+        const byte_index = bit_pos / 8;
+        const bit_in_byte: u3 = @intCast(bit_pos % 8);
+        const avail: u8 = 8 - @as(u8, bit_in_byte);
+        const take: u8 = @min(remaining, avail);
+        const mask: u8 = if (take == 8) 0xff else @as(u8, @truncate((@as(u16, 1) << @intCast(take)) - 1));
+        const part: u32 = (data[byte_index] >> bit_in_byte) & mask;
+        value |= part << @intCast(shift);
+        shift += take;
+        remaining -= take;
+        bit_pos += take;
+    }
+    return value;
+}
+
+fn appendCompactChunkMeta(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    chunks: []const V7ChunkMeta,
+    chunk_size: u32,
+    scratch: *PostingSerializeScratch,
+) !void {
+    if (chunks.len == 0) return;
+
+    try scratch.chunk_id_deltas.ensureTotalCapacity(alloc, chunks.len);
+    try scratch.max_doc_offsets.ensureTotalCapacity(alloc, chunks.len);
+    try scratch.chunk_doc_counts.ensureTotalCapacity(alloc, chunks.len);
+    try scratch.payload_end_deltas.ensureTotalCapacity(alloc, chunks.len);
+
+    var prev_chunk_id: u32 = 0;
+    var prev_payload_end: u32 = 0;
+    for (chunks, 0..) |chunk, i| {
+        const chunk_id_delta = if (i == 0) chunk.chunk_id else chunk.chunk_id - prev_chunk_id;
+        const chunk_base = if (chunk_size == 0) 0 else chunk.chunk_id * chunk_size;
+        const max_doc_offset = chunk.max_doc - chunk_base;
+        const payload_end = chunk.doc_ctrl_off + chunk.doc_ctrl_len;
+        const payload_delta = payload_end - prev_payload_end;
+
+        scratch.chunk_id_deltas.appendAssumeCapacity(chunk_id_delta);
+        scratch.max_doc_offsets.appendAssumeCapacity(max_doc_offset);
+        scratch.chunk_doc_counts.appendAssumeCapacity(chunk.doc_count);
+        scratch.payload_end_deltas.appendAssumeCapacity(payload_delta);
+
+        prev_chunk_id = chunk.chunk_id;
+        prev_payload_end = payload_end;
+    }
+
+    const chunk_delta_bits = maxBitWidth(scratch.chunk_id_deltas.items);
+    const max_doc_offset_bits = maxBitWidth(scratch.max_doc_offsets.items);
+    const doc_count_bits = maxBitWidth(scratch.chunk_doc_counts.items);
+    const payload_delta_bits = maxBitWidth(scratch.payload_end_deltas.items);
+    try out.appendSlice(alloc, &.{ chunk_delta_bits, max_doc_offset_bits, doc_count_bits, payload_delta_bits });
+    _ = try appendPackedU32(alloc, out, scratch.chunk_id_deltas.items, chunk_delta_bits);
+    _ = try appendPackedU32(alloc, out, scratch.max_doc_offsets.items, max_doc_offset_bits);
+    _ = try appendPackedU32(alloc, out, scratch.chunk_doc_counts.items, doc_count_bits);
+    _ = try appendPackedU32(alloc, out, scratch.payload_end_deltas.items, payload_delta_bits);
+}
+
+fn readCompactChunkMetaAt(data: []const u8, count: usize, chunk_size: u32, index: usize) !V7ChunkMeta {
+    if (index >= count) return error.InvalidData;
+    const layout = try compactChunkMetaLayout(data, count);
+    const chunk_delta_data = data[layout.chunk_delta_off..][0..layout.chunk_delta_len];
+    const max_doc_offset_data = data[layout.max_doc_offset_off..][0..layout.max_doc_offset_len];
+    const doc_count_data = data[layout.doc_count_off..][0..layout.doc_count_len];
+    const payload_delta_data = data[layout.payload_delta_off..][0..layout.payload_delta_len];
+
+    var chunk_id: u32 = 0;
+    var payload_end: u32 = 0;
+    var prev_payload_end: u32 = 0;
+    var i: usize = 0;
+    while (i <= index) : (i += 1) {
+        chunk_id +%= try readPackedU32At(chunk_delta_data, i, layout.chunk_delta_bits);
+        const payload_delta = try readPackedU32At(payload_delta_data, i, layout.payload_delta_bits);
+        prev_payload_end = payload_end;
+        payload_end +%= payload_delta;
+    }
+
+    const max_doc_offset = try readPackedU32At(max_doc_offset_data, index, layout.max_doc_offset_bits);
+    const doc_count = try readPackedU32At(doc_count_data, index, layout.doc_count_bits);
+    const max_doc = if (chunk_size == 0) max_doc_offset else chunk_id * chunk_size + max_doc_offset;
+    return .{
+        .chunk_id = chunk_id,
+        .max_doc = max_doc,
+        .doc_count = doc_count,
+        .doc_ctrl_off = prev_payload_end,
+        .doc_ctrl_len = payload_end - prev_payload_end,
+        .doc_data_off = 0,
+        .doc_data_len = 0,
+        .freq_ctrl_off = 0,
+        .freq_ctrl_len = 0,
+        .freq_data_off = 0,
+        .freq_data_len = 0,
+    };
 }
 
 fn encodeNormTable(alloc: Allocator, norms: []const u32) ![]u8 {
@@ -1037,31 +1199,30 @@ const PostingAccumulator = struct {
         }
 
         try appendPostingSkipData(alloc, &scratch.skip, scratch.chunks.items);
+        try appendCompactChunkMeta(alloc, &scratch.chunk_meta, scratch.chunks.items, chunk_size, scratch);
 
         const stored_chunks: u32 = @intCast(scratch.chunks.items.len);
+        const chunk_meta_len: u32 = @intCast(scratch.chunk_meta.items.len);
         const positions_len: u32 = @intCast(scratch.positions.items.len);
         const skip_len: u32 = @intCast(scratch.skip.items.len);
         const header_len =
             varintU32Size(doc_freq) +
             varintU32Size(stored_chunks) +
+            varintU32Size(chunk_meta_len) +
             varintU32Size(positions_len) +
             varintU32Size(skip_len);
-        const total_len = header_len + scratch.block_max.items.len + scratch.chunks.items.len * postings_chunk_meta_size + scratch.payload.items.len + scratch.positions.items.len + scratch.skip.items.len;
+        const total_len = header_len + scratch.block_max.items.len + scratch.chunk_meta.items.len + scratch.payload.items.len + scratch.positions.items.len + scratch.skip.items.len;
         try out.ensureUnusedCapacity(alloc, total_len);
 
         try writeVarintU32(alloc, out, doc_freq);
         try writeVarintU32(alloc, out, stored_chunks);
+        try writeVarintU32(alloc, out, chunk_meta_len);
         try writeVarintU32(alloc, out, positions_len);
         try writeVarintU32(alloc, out, skip_len);
 
         const term_start = out.items.len - header_len;
         try out.appendSlice(alloc, scratch.block_max.items);
-        var chunk_meta_start = out.items.len;
-        try out.appendNTimes(alloc, 0, scratch.chunks.items.len * postings_chunk_meta_size);
-        for (scratch.chunks.items) |chunk| {
-            writeChunkMetaV17(out.items[chunk_meta_start..][0..postings_chunk_meta_size], chunk);
-            chunk_meta_start += postings_chunk_meta_size;
-        }
+        try out.appendSlice(alloc, scratch.chunk_meta.items);
         try out.appendSlice(alloc, scratch.payload.items);
         try out.appendSlice(alloc, scratch.positions.items);
         try out.appendSlice(alloc, scratch.skip.items);
@@ -1365,19 +1526,19 @@ pub const InvertedIndexReader = struct {
         var cursor = base;
         const doc_freq = readVarintU32(self.data, &cursor) catch unreachable;
         const stored_chunks = readVarintU32(self.data, &cursor) catch unreachable;
+        const chunk_meta_len = readVarintU32(self.data, &cursor) catch unreachable;
         const positions_len = readVarintU32(self.data, &cursor) catch unreachable;
         const skip_len = readVarintU32(self.data, &cursor) catch unreachable;
         const header_len = cursor - base;
         const block_max_start = cursor;
         const block_max_len = @as(usize, stored_chunks) * 6;
         const chunk_meta_start = block_max_start + block_max_len;
-        const chunk_meta_len = @as(usize, stored_chunks) * postings_chunk_meta_size;
-        const payload_start = chunk_meta_start + chunk_meta_len;
+        const payload_start = chunk_meta_start + @as(usize, chunk_meta_len);
         const chunk_meta_data = self.data[chunk_meta_start..][0..chunk_meta_len];
         const payload_len: usize = if (stored_chunks == 0)
             0
         else blk: {
-            const last_meta = readChunkMetaV17(chunk_meta_data, @as(usize, stored_chunks) - 1, self.chunk_size);
+            const last_meta = readCompactChunkMetaAt(chunk_meta_data, stored_chunks, self.chunk_size, @as(usize, stored_chunks) - 1) catch unreachable;
             break :blk @as(usize, last_meta.doc_ctrl_off) + last_meta.doc_ctrl_len;
         };
         const positions_start = payload_start + payload_len;
@@ -1394,8 +1555,10 @@ pub const InvertedIndexReader = struct {
                 .meta = self.data[block_max_start..][0..block_max_len],
                 .chunk_size = self.chunk_size,
                 .chunk_meta_data = chunk_meta_data,
+                .chunk_meta_count = stored_chunks,
             },
             .chunk_meta_data = chunk_meta_data,
+            .chunk_meta_count = stored_chunks,
             .payload_data = self.data[payload_start..][0..payload_len],
             .norms_data = self.norms_data,
             .positions_data = if (positions_len > 0) self.data[positions_start..][0..positions_len] else null,
@@ -1544,9 +1707,10 @@ pub const BlockMaxInfo = struct {
     meta: []const u8,
     chunk_size: u32,
     chunk_meta_data: []const u8,
+    chunk_meta_count: u32,
 
     fn chunkCount(self: BlockMaxInfo) usize {
-        return @min(self.meta.len / 6, self.chunk_meta_data.len / postings_chunk_meta_size);
+        return @min(self.meta.len / 6, @as(usize, self.chunk_meta_count));
     }
 
     fn storedChunkOrdinal(self: BlockMaxInfo, chunk_idx: u32) ?usize {
@@ -1554,7 +1718,7 @@ pub const BlockMaxInfo = struct {
         var hi = self.chunkCount();
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            const meta_record = readChunkMetaV17(self.chunk_meta_data, mid, self.chunk_size);
+            const meta_record = readCompactChunkMetaAt(self.chunk_meta_data, self.chunk_meta_count, self.chunk_size, mid) catch return null;
             if (meta_record.chunk_id < chunk_idx) {
                 lo = mid + 1;
             } else {
@@ -1562,7 +1726,7 @@ pub const BlockMaxInfo = struct {
             }
         }
         if (lo >= self.chunkCount()) return null;
-        const meta_record = readChunkMetaV17(self.chunk_meta_data, lo, self.chunk_size);
+        const meta_record = readCompactChunkMetaAt(self.chunk_meta_data, self.chunk_meta_count, self.chunk_size, lo) catch return null;
         if (meta_record.chunk_id == chunk_idx) return lo;
         return null;
     }
@@ -1589,6 +1753,7 @@ pub const TermPostings = struct {
     version: u8,
     block_max: ?BlockMaxInfo = null,
     chunk_meta_data: []const u8,
+    chunk_meta_count: u32,
     payload_data: []const u8,
     norms_data: []const u8,
     positions_data: ?[]const u8 = null,
@@ -1613,6 +1778,7 @@ pub const TermPostings = struct {
             .alloc = alloc,
             .chunk_size = self.chunk_size,
             .chunk_meta_data = self.chunk_meta_data,
+            .chunk_meta_count = self.chunk_meta_count,
             .payload_data = self.payload_data,
             .norms_data = self.norms_data,
             .version = self.version,
@@ -1627,6 +1793,7 @@ pub const PostingsIterator = struct {
     alloc: Allocator,
     chunk_size: u32 = 0,
     chunk_meta_data: []const u8 = &.{},
+    chunk_meta_count: u32 = 0,
     payload_data: []const u8 = &.{},
     norms_data: []const u8 = &.{},
     current_chunk_index: usize = std.math.maxInt(usize),
@@ -1638,6 +1805,9 @@ pub const PostingsIterator = struct {
     positions_cursor: usize = 0,
     doc_values: std.ArrayListUnmanaged(u32) = .empty,
     freq_values: std.ArrayListUnmanaged(u32) = .empty,
+    chunk_metas: std.ArrayListUnmanaged(V7ChunkMeta) = .empty,
+    chunk_meta_values: std.ArrayListUnmanaged(u32) = .empty,
+    chunk_meta_decoded: bool = false,
     /// Reusable buffer for decoded positions.
     positions_buf: std.ArrayListUnmanaged(u32) = .empty,
     /// When false, `next()` skips position decoding entirely — both the
@@ -1671,11 +1841,62 @@ pub const PostingsIterator = struct {
     }
 
     fn chunkCount(self: *const PostingsIterator) usize {
-        return self.chunk_meta_data.len / postings_chunk_meta_size;
+        return self.chunk_meta_count;
     }
 
-    fn chunkMeta(self: *const PostingsIterator, index: usize) V7ChunkMeta {
-        return readChunkMetaV17(self.chunk_meta_data, index, self.chunk_size);
+    fn ensureChunkMetaDecoded(self: *PostingsIterator) !void {
+        if (self.chunk_meta_decoded) return;
+        const count: usize = self.chunk_meta_count;
+        self.chunk_metas.clearRetainingCapacity();
+        self.chunk_meta_values.clearRetainingCapacity();
+        try self.chunk_metas.ensureTotalCapacity(self.alloc, count);
+        self.chunk_metas.items.len = count;
+        if (count == 0) {
+            self.chunk_meta_decoded = true;
+            return;
+        }
+
+        const layout = try compactChunkMetaLayout(self.chunk_meta_data, count);
+        try self.chunk_meta_values.ensureTotalCapacity(self.alloc, count * 4);
+        self.chunk_meta_values.items.len = count * 4;
+        const chunk_deltas = self.chunk_meta_values.items[0..count];
+        const max_doc_offsets = self.chunk_meta_values.items[count..][0..count];
+        const doc_counts = self.chunk_meta_values.items[count * 2 ..][0..count];
+        const payload_deltas = self.chunk_meta_values.items[count * 3 ..][0..count];
+
+        try decodePackedU32Into(self.chunk_meta_data[layout.chunk_delta_off..][0..layout.chunk_delta_len], chunk_deltas, layout.chunk_delta_bits);
+        try decodePackedU32Into(self.chunk_meta_data[layout.max_doc_offset_off..][0..layout.max_doc_offset_len], max_doc_offsets, layout.max_doc_offset_bits);
+        try decodePackedU32Into(self.chunk_meta_data[layout.doc_count_off..][0..layout.doc_count_len], doc_counts, layout.doc_count_bits);
+        try decodePackedU32Into(self.chunk_meta_data[layout.payload_delta_off..][0..layout.payload_delta_len], payload_deltas, layout.payload_delta_bits);
+
+        var chunk_id: u32 = 0;
+        var payload_end: u32 = 0;
+        for (0..count) |i| {
+            chunk_id +%= chunk_deltas[i];
+            const prev_payload_end = payload_end;
+            payload_end +%= payload_deltas[i];
+            const max_doc = if (self.chunk_size == 0) max_doc_offsets[i] else chunk_id * self.chunk_size + max_doc_offsets[i];
+            self.chunk_metas.items[i] = .{
+                .chunk_id = chunk_id,
+                .max_doc = max_doc,
+                .doc_count = doc_counts[i],
+                .doc_ctrl_off = prev_payload_end,
+                .doc_ctrl_len = payload_end - prev_payload_end,
+                .doc_data_off = 0,
+                .doc_data_len = 0,
+                .freq_ctrl_off = 0,
+                .freq_ctrl_len = 0,
+                .freq_data_off = 0,
+                .freq_data_len = 0,
+            };
+        }
+        self.chunk_meta_decoded = true;
+    }
+
+    fn chunkMeta(self: *PostingsIterator, index: usize) !V7ChunkMeta {
+        try self.ensureChunkMetaDecoded();
+        if (index >= self.chunk_metas.items.len) return error.InvalidData;
+        return self.chunk_metas.items[index];
     }
 
     fn skipRecordCount(self: *const PostingsIterator) usize {
@@ -1692,7 +1913,7 @@ pub const PostingsIterator = struct {
         };
     }
 
-    fn skipWindowForTarget(self: *const PostingsIterator, target: u32) struct { lo: usize, hi: usize } {
+    fn skipWindowForTarget(self: *PostingsIterator, target: u32) !struct { lo: usize, hi: usize } {
         const count = self.skipRecordCount();
         if (count == 0) return .{ .lo = self.next_chunk_index, .hi = self.chunkCount() };
 
@@ -1717,21 +1938,21 @@ pub const PostingsIterator = struct {
         };
     }
 
-    fn nextChunkIndexForTarget(self: *const PostingsIterator, target: u32) usize {
-        const window = self.skipWindowForTarget(target);
+    fn nextChunkIndexForTarget(self: *PostingsIterator, target: u32) !usize {
+        const window = try self.skipWindowForTarget(target);
         var lo = window.lo;
         var hi = window.hi;
         if (lo >= hi) return lo;
         if (self.skipRecordCount() > 0) {
             while (lo < hi) : (lo += 1) {
-                const meta = self.chunkMeta(lo);
+                const meta = try self.chunkMeta(lo);
                 if (meta.max_doc >= target) return lo;
             }
             return hi;
         }
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            const meta = self.chunkMeta(mid);
+            const meta = try self.chunkMeta(mid);
             if (meta.max_doc < target) {
                 lo = mid + 1;
             } else {
@@ -1742,7 +1963,7 @@ pub const PostingsIterator = struct {
     }
 
     fn loadChunk(self: *PostingsIterator, index: usize) !void {
-        const meta = self.chunkMeta(index);
+        const meta = try self.chunkMeta(index);
         self.doc_values.clearRetainingCapacity();
         try self.doc_values.ensureTotalCapacity(self.alloc, meta.doc_count);
         self.doc_values.items.len = meta.doc_count;
@@ -1865,7 +2086,7 @@ pub const PostingsIterator = struct {
             }
         }
 
-        const target_chunk_index = self.nextChunkIndexForTarget(target);
+        const target_chunk_index = try self.nextChunkIndexForTarget(target);
         if (target_chunk_index >= self.chunkCount()) return null;
         try self.loadChunk(target_chunk_index);
         if (self.current_chunk_index == std.math.maxInt(usize) or self.current_chunk_index >= self.chunkCount()) return null;
@@ -1889,6 +2110,8 @@ pub const PostingsIterator = struct {
         if (!self.is_one_hit) {
             self.doc_values.deinit(self.alloc);
             self.freq_values.deinit(self.alloc);
+            self.chunk_metas.deinit(self.alloc);
+            self.chunk_meta_values.deinit(self.alloc);
             self.positions_buf.deinit(self.alloc);
         }
     }
@@ -3131,7 +3354,7 @@ test "v19 sparse block-max metadata round-trip" {
     }
 }
 
-test "v19 block-max metadata stores only chunks with postings" {
+test "v21 block-max metadata stores only chunks with postings" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
     defer builder.deinit();
@@ -3161,7 +3384,7 @@ test "v19 block-max metadata stores only chunks with postings" {
     }
 }
 
-test "v19 postings keep norms in per-section table with compact chunk metadata" {
+test "v21 postings keep norms in per-section table with bit-packed chunk metadata" {
     const alloc = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(alloc, .{ .chunk_size = 2 });
     defer builder.deinit();
@@ -3182,7 +3405,7 @@ test "v19 postings keep norms in per-section table with compact chunk metadata" 
     switch (result) {
         .postings => |p| {
             try std.testing.expectEqual(@as(u8, wire_version_current), p.version);
-            try std.testing.expectEqual(@as(usize, 2 * postings_chunk_meta_size), p.chunk_meta_data.len);
+            try std.testing.expect(p.chunk_meta_data.len < 24);
             try std.testing.expectEqual(@as(usize, 8), p.payload_data.len);
             var iter = try p.iterator(alloc);
             defer iter.deinit();
