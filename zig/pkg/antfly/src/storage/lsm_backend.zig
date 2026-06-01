@@ -118,6 +118,10 @@ pub const Options = struct {
     wal_enabled: bool = true,
     wal_sync_on_commit: bool = false,
     wal_segment_bytes: u64 = 64 * 1024 * 1024,
+    wal_soft_limit_segments: u64 = 0,
+    wal_hard_limit_segments: u64 = 0,
+    wal_soft_limit_bytes: u64 = 0,
+    wal_hard_limit_bytes: u64 = 0,
     root_generation: u64 = 0,
     obsolete_retention_ns: u64 = 5 * std.time.ns_per_min,
     read_snapshot_rotate_mutable_bytes: u64 = 256 * 1024,
@@ -240,6 +244,12 @@ pub const Backend = struct {
         active_bulk_ingest_batches: u64 = 0,
         wal_retained_segments: u64 = 0,
         wal_retained_bytes: u64 = 0,
+        wal_checkpoint_oldest_retained_segment: u64 = 0,
+        wal_checkpoint_current_segment: u64 = 0,
+        wal_checkpoint_lag_segments: u64 = 0,
+        wal_replay_retained_segments: u64 = 0,
+        wal_replay_retained_bytes: u64 = 0,
+        wal_replay_current_segment: u64 = 0,
         manifest_dirty: bool = false,
         obsolete_manifest_dirty: bool = false,
         compaction_scheduler_active_jobs: u64 = 0,
@@ -302,6 +312,17 @@ pub const Backend = struct {
         dst.active_bulk_ingest_batches +|= src.active_bulk_ingest_batches;
         dst.wal_retained_segments +|= src.wal_retained_segments;
         dst.wal_retained_bytes +|= src.wal_retained_bytes;
+        dst.wal_checkpoint_oldest_retained_segment = if (dst.wal_checkpoint_oldest_retained_segment == 0)
+            src.wal_checkpoint_oldest_retained_segment
+        else if (src.wal_checkpoint_oldest_retained_segment == 0)
+            dst.wal_checkpoint_oldest_retained_segment
+        else
+            @min(dst.wal_checkpoint_oldest_retained_segment, src.wal_checkpoint_oldest_retained_segment);
+        dst.wal_checkpoint_current_segment = @max(dst.wal_checkpoint_current_segment, src.wal_checkpoint_current_segment);
+        dst.wal_checkpoint_lag_segments +|= src.wal_checkpoint_lag_segments;
+        dst.wal_replay_retained_segments +|= src.wal_replay_retained_segments;
+        dst.wal_replay_retained_bytes +|= src.wal_replay_retained_bytes;
+        dst.wal_replay_current_segment = @max(dst.wal_replay_current_segment, src.wal_replay_current_segment);
         dst.manifest_dirty = dst.manifest_dirty or src.manifest_dirty;
         dst.obsolete_manifest_dirty = dst.obsolete_manifest_dirty or src.obsolete_manifest_dirty;
         dst.compaction_scheduler_active_jobs +|= src.compaction_scheduler_active_jobs;
@@ -771,9 +792,17 @@ pub const Backend = struct {
             const wal_retention = wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?) catch wal_mod.RetentionStats{};
             stats.wal_retained_segments = wal_retention.segments;
             stats.wal_retained_bytes = wal_retention.bytes;
+            stats.wal_checkpoint_oldest_retained_segment = wal_retention.oldest_retained_segment;
+            stats.wal_checkpoint_current_segment = wal_retention.current_segment;
+            if (wal_retention.current_segment > wal_retention.oldest_retained_segment) {
+                stats.wal_checkpoint_lag_segments = wal_retention.current_segment - wal_retention.oldest_retained_segment;
+            }
             const replay_retention = wal_mod.snapshotReplayRetention(self.storage.?, self.allocator, self.root_dir.?) catch wal_mod.RetentionStats{};
             stats.wal_retained_segments += replay_retention.segments;
             stats.wal_retained_bytes += replay_retention.bytes;
+            stats.wal_replay_retained_segments = replay_retention.segments;
+            stats.wal_replay_retained_bytes = replay_retention.bytes;
+            stats.wal_replay_current_segment = replay_retention.current_segment;
         }
         self.syncTrackedInMemoryStateUsageLocked(stats);
         return stats;
@@ -882,6 +911,7 @@ pub const Backend = struct {
 
         score +|= level_overflow_runs * 500;
         score +|= level_overflow_bytes / (64 * 1024);
+        score +|= self.walRetentionPressureScoreLocked();
         if (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()) score +|= 1;
         return score;
     }
@@ -949,7 +979,7 @@ pub const Backend = struct {
         const before_compactions = self.compaction_stats.compactions;
         const before_manifest_writes = self.write_stats.manifest_writes;
 
-        if (self.shouldFlushMutable()) {
+        if (self.shouldFlushMutable() or try self.shouldFlushMutableForWalPressureLocked()) {
             try self.rotateMutableToImmutable();
         }
         if (self.activeImmutableMemtableCount() > 0) {
@@ -2530,6 +2560,54 @@ pub const Backend = struct {
         return self.mutable.entries.items.len >= self.effectiveFlushThreshold();
     }
 
+    fn shouldFlushMutableForWalPressureLocked(self: *Backend) !bool {
+        if (self.mutable.entries.items.len == 0) return false;
+        const retention = try self.snapshotWalRetentionForPressureLocked() orelse return false;
+        return self.walRetentionOverSoftLimit(retention);
+    }
+
+    fn walRetentionPressureEnabled(self: *const Backend) bool {
+        return self.options.wal_soft_limit_segments > 0 or
+            self.options.wal_hard_limit_segments > 0 or
+            self.options.wal_soft_limit_bytes > 0 or
+            self.options.wal_hard_limit_bytes > 0;
+    }
+
+    fn snapshotWalRetentionForPressureLocked(self: *Backend) !?wal_mod.RetentionStats {
+        if (!self.walRetentionPressureEnabled()) return null;
+        if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return null;
+        return try wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?);
+    }
+
+    fn walRetentionOverSoftLimit(self: *const Backend, retention: wal_mod.RetentionStats) bool {
+        if (self.options.wal_soft_limit_segments > 0 and retention.segments > self.options.wal_soft_limit_segments) return true;
+        if (self.options.wal_soft_limit_bytes > 0 and retention.bytes > self.options.wal_soft_limit_bytes) return true;
+        return self.walRetentionOverHardLimit(retention);
+    }
+
+    fn walRetentionOverHardLimit(self: *const Backend, retention: wal_mod.RetentionStats) bool {
+        if (self.options.wal_hard_limit_segments > 0 and retention.segments > self.options.wal_hard_limit_segments) return true;
+        if (self.options.wal_hard_limit_bytes > 0 and retention.bytes > self.options.wal_hard_limit_bytes) return true;
+        return false;
+    }
+
+    fn walRetentionPressureScoreLocked(self: *Backend) u64 {
+        const retention = self.snapshotWalRetentionForPressureLocked() catch return 0;
+        const stats = retention orelse return 0;
+        var score: u64 = 0;
+        if (self.options.wal_hard_limit_segments > 0 and stats.segments > self.options.wal_hard_limit_segments) {
+            score +|= (stats.segments - self.options.wal_hard_limit_segments) * 1_000_000;
+        } else if (self.options.wal_soft_limit_segments > 0 and stats.segments > self.options.wal_soft_limit_segments) {
+            score +|= (stats.segments - self.options.wal_soft_limit_segments) * 10_000;
+        }
+        if (self.options.wal_hard_limit_bytes > 0 and stats.bytes > self.options.wal_hard_limit_bytes) {
+            score +|= (stats.bytes - self.options.wal_hard_limit_bytes) / 1024;
+        } else if (self.options.wal_soft_limit_bytes > 0 and stats.bytes > self.options.wal_soft_limit_bytes) {
+            score +|= (stats.bytes - self.options.wal_soft_limit_bytes) / (16 * 1024);
+        }
+        return score;
+    }
+
     fn effectiveL0SoftLimitRuns(self: *const Backend) usize {
         if (self.options.l0_soft_limit_runs != 0) return self.options.l0_soft_limit_runs;
         return self.options.compact_threshold_runs;
@@ -3676,6 +3754,9 @@ test "lsm backend maintenance stats report retained wal debt across reopen and r
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
     try std.testing.expect(maintenance.wal_retained_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
 
     backend.options.backend.read_only = true;
     backend.close();
@@ -3685,12 +3766,18 @@ test "lsm backend maintenance stats report retained wal debt across reopen and r
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
     try std.testing.expect(maintenance.wal_retained_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
     try std.testing.expect(backend.write_stats.wal_replay_records > 0);
 
     try backend.resetWalAfterManifestCheckpoint();
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
 }
 
 test "lsm backend accounts in-memory recovery state in the resource manager and releases it on close" {
@@ -3797,6 +3884,9 @@ test "lsm backend retires covered wal segments after durable manifest publish" {
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
     try std.testing.expect(maintenance.wal_retained_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 3), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 3), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
 
     backend.options.backend.read_only = true;
     backend.close();
@@ -3805,6 +3895,9 @@ test "lsm backend retires covered wal segments after durable manifest publish" {
     defer backend.close();
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 3), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 3), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
     try std.testing.expect(backend.write_stats.wal_replay_records <= 1);
 
     var read = try backend.beginRead();
@@ -3812,6 +3905,59 @@ test "lsm backend retires covered wal segments after durable manifest publish" {
     try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
     try std.testing.expectEqualStrings("gamma", try read.get(.{ .name = "docs" }, "doc:c"));
+}
+
+test "lsm backend wal pressure maintenance flushes and checkpoints retained segments" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-wal-pressure-maintenance";
+    const options = Options{
+        .flush_threshold = 1024,
+        .storage = storage.storage(),
+        .wal_segment_bytes = 32,
+        .wal_soft_limit_segments = 1,
+        .compact_threshold_runs = 100,
+    };
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+        try txn.commit();
+    }
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:b", "beta");
+        try txn.commit();
+    }
+
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 2), maintenance.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 2), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_lag_segments);
+    try std.testing.expect(backend.maintenanceScore() > 0);
+
+    try std.testing.expect(try backend.runMaintenanceStep());
+
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_entries);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.immutable_memtables);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
 }
 
 test "lsm backend byte flush window coalesces hot overwrites before run publication" {

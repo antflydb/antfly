@@ -500,6 +500,12 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_active_bulk_ingest_batches", "gauge", "Cached write LSM active bulk-ingest session batches", stats.active_bulk_ingest_batches);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_retained_segments", "gauge", "Cached write LSM WAL segments still retained for replay", stats.wal_retained_segments);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_retained_bytes", "gauge", "Cached write LSM WAL bytes still retained for replay", stats.wal_retained_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_oldest_retained_segment", "gauge", "Oldest cached write LSM WAL segment still needed by the durable checkpoint", stats.wal_checkpoint_oldest_retained_segment);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_current_segment", "gauge", "Current cached write LSM WAL segment", stats.wal_checkpoint_current_segment);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_checkpoint_lag_segments", "gauge", "Sealed cached write LSM WAL segments retained before the active segment", stats.wal_checkpoint_lag_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_retained_segments", "gauge", "Cached write LSM dedicated replay WAL segments still retained", stats.wal_replay_retained_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_retained_bytes", "gauge", "Cached write LSM dedicated replay WAL bytes still retained", stats.wal_replay_retained_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_replay_current_segment", "gauge", "Current cached write LSM dedicated replay WAL segment", stats.wal_replay_current_segment);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_active_jobs", "gauge", "Cached write LSM compaction scheduler active jobs", stats.compaction_scheduler_active_jobs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_in_flight_input_bytes", "gauge", "Cached write LSM compaction scheduler in-flight input bytes", stats.compaction_scheduler_in_flight_input_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_compaction_scheduler_grants_total", "counter", "Cached write LSM compaction scheduler grants", stats.compaction_scheduler_grants);
@@ -12557,6 +12563,12 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_provisioned_write_cache_misses_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_retained_segments 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_retained_bytes 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_checkpoint_oldest_retained_segment 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_checkpoint_current_segment 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_checkpoint_lag_segments 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_replay_retained_segments 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_replay_retained_bytes 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_replay_current_segment 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_active 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_retained_segments 4") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_retained_bytes 99") != null);

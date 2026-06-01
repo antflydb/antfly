@@ -875,34 +875,43 @@ startup replay tax if it retains large WAL segments between runs.
 - Dense, sparse, and graph index stores should all inherit the same retention
   guarantees from the LSM layer.
 
-### Planned work
+### Current status
 
 1. Add explicit WAL checkpoint metadata to the backend.
-   - Persist:
+   - Implemented:
      - current segment
      - oldest uncheckpointed segment
-     - last checkpointed mutation sequence or equivalent durable flush marker
      - retained WAL bytes/segments
-   - Surface the metadata through backend maintenance stats and status.
+     - checkpoint lag in sealed segments before the active WAL segment
+   - Surfaced through backend maintenance stats and Prometheus metrics.
+   - Remaining:
+     - last checkpointed mutation sequence or equivalent durable flush marker
 
 2. Add incremental segment retirement after durable publication.
-   - When a flush + manifest publication durably covers WAL through segment `N`,
-     retire segments `<= N` immediately.
+   - Implemented: when a flush + manifest publication durably covers WAL through
+     segment `N`, retire segments `<= N` immediately.
    - Keep the full-reset path for the totally clean case, but do not require a
      full reset to reclaim historical WAL.
 
 3. Split "checkpoint" from "reset".
-   - `checkpoint`: advance durable coverage and retire covered segments while
-     keeping the current WAL live for new writes
-   - `reset`: clean-slate path when mutable + immutable state are both empty
+   - Implemented:
+     - `checkpoint`: advance durable coverage and retire covered segments while
+       keeping the current WAL live for new writes
+     - `reset`: clean-slate path when mutable + immutable state are both empty
 
 4. Add WAL pressure policy.
-   - Soft threshold: schedule maintenance/checkpoint sooner
-   - Hard threshold: throttle or force checkpoint before retained WAL grows
-     without bound
-   - Feed this into backend maintenance score and resource-manager pressure
+   - Implemented:
+     - optional soft/hard WAL segment and byte limits on `Options`
+     - retained WAL pressure feeds backend maintenance score
+     - soft WAL pressure makes maintenance flush/checkpoint a live mutable
+       memtable before the normal flush threshold
+   - Remaining:
+     - hard-threshold write throttling/stalling
+     - resource-manager pressure integration
 
-5. Export startup/open phases for LSM-backed stores.
+### Remaining work
+
+1. Export startup/open phases for LSM-backed stores.
    - Suggested phases:
      - `opening_manifest`
      - `replaying_wal`
@@ -912,13 +921,13 @@ startup replay tax if it retains large WAL segments between runs.
    - Status/metrics should distinguish LSM replay debt from derived replay debt
      and from index rebuild/backfill work.
 
-6. Add aggressive checkpoint triggers for index stores.
+2. Add aggressive checkpoint triggers for index stores.
    - After successful bulk finalize
    - After successful startup repair/rebuild
    - After large catch-up sessions
    - After sustained write bursts that rotated segments
 
-7. Re-benchmark loaded-root restart behavior.
+3. Re-benchmark loaded-root restart behavior.
    - Measure time to:
      - LSM open complete
      - first visible higher-level catch-up progress
