@@ -296,9 +296,14 @@ The promoter turns resolution decisions into durable entity state.
 A deterministic `key_template` computes the canonical key **purely from
 extracted text** -- no global state. Consequence: the materializer can write
 edges pointing at `entities/person/ada_lovelace` even before that entity
-document exists. So in phase 1 the **graph works end-to-end without the
-promoter**; the promoter's job is to make the canonical doc exist for hydration,
-search, and display. This de-risks the first ship.
+document exists, as long as the resolution decision is canonical (`new` or
+`match`). `review` decisions are deliberately not canonical: they remain durable
+in the resolution artifact and review queue, but they do not create entity
+documents or ordinary doc->entity provenance edges until a curator override
+re-resolves them. So in phase 1 the **graph works end-to-end without the
+promoter** for canonical decisions; the promoter's job is to make those
+canonical docs exist for hydration, search, and display. This de-risks the first
+ship without leaking unresolved review state into the canonical graph.
 
 ### Cross-shard placement
 
@@ -625,8 +630,11 @@ Open/index/enrichment validation should reject:
          `OverrideProvider` seam, and it survives re-resolution (replay-stable
          curation; combined with the config-bump backfill it takes effect over
          the corpus). The override record doubles as a training label for
-         `fitScorerWeights`. Verified by lib-resolver-test (the seam) and a
-         db-test (record -> re-resolve honors the curated link).
+         `fitScorerWeights`. Review-band decisions do not feed canonical entity
+         promotion or doc->entity provenance edges; only `new` and `match`
+         decisions cross that boundary. Verified by lib-resolver-test (the
+         seam) and db-tests (record -> re-resolve honors the curated link,
+         review is not promoted/materialized).
    - [x] 2PC atomic promotion: the promoter commits all of a document's
          resolved entities in one multi-participant transaction
          (`EntitySink.upsertBatch` -> `DistributedEntitySink` ->
@@ -690,6 +698,9 @@ Resolver / promoter integration:
 - [x] Live candidate blocking links across shards (e2e `test_resolution.py`).
 - [x] Promoter upsert is idempotent under replay; concurrent promotions union
   aliases (db-test + `DistributedEntitySink` merge transform).
+- [x] Promoter and provenance materializer only consume canonical resolution
+  decisions (`new`/`match`); review-band decisions remain pending review until
+  curation re-resolves them (db-tests).
 - [x] Provenance mention edges appear with source documents and disappear on
   source delete (db-test).
 - [x] Hydration of a not-yet-promoted entity fails closed (db-test).

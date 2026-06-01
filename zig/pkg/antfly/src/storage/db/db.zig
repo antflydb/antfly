@@ -16423,11 +16423,20 @@ fn extractionConfidenceForLocalId(entities: []const resolver_lib.ExtractedEntity
     return null;
 }
 
+fn resolutionDecisionCreatesCanonicalEdge(decision: resolver_lib.Decision) bool {
+    return switch (decision) {
+        .new, .match => true,
+        .review => false,
+    };
+}
+
 /// Build `doc -> entity` mention edges (provenance) from the durable resolution
-/// artifact. The target is the resolved DocRef, so prefix/ANN matches, merge
-/// redirects, and curator overrides are reflected in graph state. The optional
-/// extraction artifact is consulted only for the original mention confidence
-/// used by provenance weight calibration.
+/// artifact for canonical decisions. The target is the resolved DocRef, so
+/// prefix/ANN matches, merge redirects, and curator overrides are reflected in
+/// graph state. Review-band decisions remain visible through the review queue,
+/// not as ordinary resolved provenance. The optional extraction artifact is
+/// consulted only for the original mention confidence used by provenance weight
+/// calibration.
 fn mentionEdgeWritesFromResolutionAlloc(
     alloc: Allocator,
     index_name: []const u8,
@@ -16448,6 +16457,7 @@ fn mentionEdgeWritesFromResolutionAlloc(
     var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
     errdefer freeGraphWrites(alloc, writes.items);
     for (parsed_resolution.entities) |entity| {
+        if (!resolutionDecisionCreatesCanonicalEdge(entity.decision)) continue;
         if (entity.doc_ref.key.len == 0) continue;
         // One mention edge per distinct entity even if mentioned repeatedly.
         var duplicate = false;
@@ -24100,6 +24110,79 @@ test "db materializes doc->entity mention edges as provenance and clears them on
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 0), inbound.len);
     }
+}
+
+test "db does not materialize review-band resolution as canonical mention edges" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "name", "left": "canonical_text", "right": "canonical_name",
+        \\  "levels": [
+        \\    { "when": "exact", "weight": 8.0 },
+        \\    { "when": "jaro_winkler > 0.92", "weight": 5.0 },
+        \\    { "when": "jaro_winkler > 0.85", "weight": 2.0 },
+        \\    { "else": true, "weight": -6.0 }
+        \\  ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9, "review": 0.6 } }
+        ,
+        .config_generation = 1,
+    });
+
+    const existing_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovlace");
+    defer alloc.free(existing_key);
+    try db.core.store.put(existing_key,
+        \\{"canonical_name":"Ada Lovlace","label":"person"}
+    );
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try std.testing.expectEqualStrings("review", ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+
+    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
 }
 
 test "db mention edge weight is fused from extractor trust and mention confidence" {

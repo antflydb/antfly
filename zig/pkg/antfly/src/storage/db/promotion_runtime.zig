@@ -112,10 +112,19 @@ fn buildEntityDocAlloc(alloc: std.mem.Allocator, e: resolver_lib.ResolvedEntity)
     return try std.json.Stringify.valueAlloc(alloc, doc, .{});
 }
 
+fn isPromotableDecision(decision: resolver_lib.Decision) bool {
+    return switch (decision) {
+        .new, .match => true,
+        .review => false,
+    };
+}
+
 /// Read the resolution artifact at `resolution_key` and upsert a canonical
-/// entity document for each resolved mention through `sink`. Returns the number
-/// of entities promoted. Pure of threading/state so it is unit-testable with a
-/// fake store and sink.
+/// entity document for each canonical decision through `sink`. Review-band
+/// decisions stay durable in the resolution artifact/review queue but are not
+/// promoted until a curator override re-resolves them to a canonical decision.
+/// Returns the number of entities promoted. Pure of threading/state so it is
+/// unit-testable with a fake store and sink.
 pub fn processResolutionArtifact(
     gpa: std.mem.Allocator,
     store: resolver_lib.ArtifactStore,
@@ -137,6 +146,7 @@ pub fn processResolutionArtifact(
 
     var entries = std.ArrayListUnmanaged(EntityUpsert).empty;
     for (parsed.entities) |e| {
+        if (!isPromotableDecision(e.decision)) continue;
         // Need at least a canonical name to mint/merge a meaningful entity.
         if (e.canonical_name.len == 0) continue;
         try entries.append(a, .{
@@ -506,6 +516,30 @@ test "processResolutionArtifact upserts a canonical entity per resolved mention"
 
     // A missing artifact promotes nothing.
     try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), "no-such-key", capture.sink()));
+}
+
+test "processResolutionArtifact leaves review-band mentions unpromoted" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:review", "resolution_v1");
+    defer alloc.free(resolution_key);
+    try map.put(resolution_key,
+        \\{"config_generation":3,"entities":[
+        \\  {"local_id":"e0","doc_ref":{"table":"entities","key":"person/ada_review"},"confidence":0.72,"decision":"review","label":"person","canonical_name":"Ada Lovelace","surface_form":"Ada Lovelace"},
+        \\  {"local_id":"e1","doc_ref":{"table":"entities","key":"org/antfly"},"confidence":1.0,"decision":"match","label":"org","canonical_name":"Antfly","surface_form":"Antfly DB"}
+        \\]}
+    );
+
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+
+    const promoted = try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink());
+    try testing.expectEqual(@as(usize, 1), promoted);
+    try testing.expectEqual(@as(usize, 1), capture.batch_calls);
+    try testing.expectEqual(@as(usize, 1), capture.keys.items.len);
+    try testing.expectEqualStrings("org/antfly", capture.keys.items[0]);
 }
 
 test "processResolutionArtifact fails closed on malformed resolution artifacts" {
