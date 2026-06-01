@@ -137,7 +137,8 @@ Current PR progress:
   before document extraction.
 - relational read/backfill seams now treat relational row keys strictly: a
   relational row must decode as a typed row, and stale generic primary document
-  rows are ignored instead of serving as a compatibility fallback.
+  rows are treated only as invariant cleanup state, never as a compatibility
+  fallback.
 - relational writes now enter the base store through a named
   `relational_store.WriteParticipant` with prepare/commit/abort/read/scan
   methods, giving the current row-packed implementation the same participant
@@ -286,24 +287,24 @@ Acceptance:
 - derived indexes can be dropped and rebuilt from relational base rows;
 - range ownership fencing prevents stale relational rows from serving reads.
 
-### Phase 7 - Removal Gate
+### Phase 7 - Invariant Gate
 
 Relational mode has not shipped as a durable public format, so this work should
-not add legacy migration support for older experimental relational encodings.
-Older `AROW`-as-generic-document layouts should fail the invariant checks or be
-ignored at relational seams; they are not a compatibility input. Use the final
-phase as a removal and invariant gate:
+not add migration or compatibility support for older experimental encodings.
+The supported state is only the current relational participant keyspace. Use
+the final phase as an invariant gate:
 
-- remove the remaining generic relational `AROW` write/read fallbacks once all
-  readers use the relational base store;
-- assert or fail fast in tests when relational tables attempt to read a generic
-  document KV value;
-- keep development fixtures and tests on the current base-row format only;
+- remove compatibility-shaped relational `AROW` write/read paths from the
+  generic document keyspace;
+- assert or fail fast in tests when relational readers attempt to use a generic
+  document KV value as row data;
+- keep development fixtures and tests on the current relational participant
+  format only;
 - preserve document-mode KV values exactly.
 
 Acceptance:
 
-- tests and fixtures only exercise the current relational base-row format;
+- tests and fixtures only exercise the current relational participant format;
 - no accidental interpretation of document-mode JSON blobs as relational rows;
 - explicit format/capability marker prevents ambiguous relational table state.
 
