@@ -174,6 +174,7 @@ pub const Backend = struct {
         wal_append_bytes: u64 = 0,
         wal_append_ns: u64 = 0,
         wal_sync_records: u64 = 0,
+        wal_sync_ns: u64 = 0,
         wal_replay_records: u64 = 0,
         wal_replay_entries: u64 = 0,
         wal_replay_bytes: u64 = 0,
@@ -1883,8 +1884,12 @@ pub const Backend = struct {
         self.write_stats.wal_append_records += 1;
         self.write_stats.wal_append_entries += @intCast(state.entries.items.len);
         self.write_stats.wal_append_bytes += bytes;
-        self.write_stats.wal_append_ns += self.writeStatsElapsedNs(start_ns);
-        if (self.options.wal_sync_on_commit) self.write_stats.wal_sync_records += 1;
+        const append_ns = self.writeStatsElapsedNs(start_ns);
+        self.write_stats.wal_append_ns += append_ns;
+        if (self.options.wal_sync_on_commit) {
+            self.write_stats.wal_sync_records += 1;
+            self.write_stats.wal_sync_ns += append_ns;
+        }
     }
 
     pub fn replayWalIntoMutable(self: *Backend) !void {
@@ -4336,6 +4341,48 @@ test "lsm backend wal backed entry threshold defers commit flush to maintenance"
     try std.testing.expectEqual(@as(u64, 1), stats.flushes);
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
     try std.testing.expect(backend.runs.items.len > 0);
+}
+
+test "lsm backend write stats separate wal sync latency from append latency" {
+    {
+        var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer storage.deinit();
+        var backend = try Backend.open(std.testing.allocator, "/lsm-wal-async-stats", .{
+            .storage = storage.storage(),
+            .flush_threshold = 1024,
+            .wal_sync_on_commit = false,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+
+        const stats = backend.snapshotWriteStats();
+        try std.testing.expectEqual(@as(u64, 1), stats.wal_append_records);
+        try std.testing.expectEqual(@as(u64, 0), stats.wal_sync_records);
+        try std.testing.expectEqual(@as(u64, 0), stats.wal_sync_ns);
+    }
+
+    {
+        var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer storage.deinit();
+        var backend = try Backend.open(std.testing.allocator, "/lsm-wal-sync-stats", .{
+            .storage = storage.storage(),
+            .flush_threshold = 1024,
+            .wal_sync_on_commit = true,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+
+        const stats = backend.snapshotWriteStats();
+        try std.testing.expectEqual(@as(u64, 1), stats.wal_append_records);
+        try std.testing.expectEqual(@as(u64, 1), stats.wal_sync_records);
+        try std.testing.expectEqual(stats.wal_append_ns, stats.wal_sync_ns);
+    }
 }
 
 test "lsm backend read snapshot keeps immutable data visible after flush" {

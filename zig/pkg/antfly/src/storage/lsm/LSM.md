@@ -153,6 +153,8 @@ Write path:
 
 - `zig build lsm-write-bench -- --samples 5 --keys 20000 --storage host --mode both > /tmp/lsm-write-before.jsonl`
 - `zig build lsm-write-bench-compare -- --before /tmp/lsm-write-before.jsonl --after /tmp/lsm-write-after.jsonl`
+- Add `--wal-sync-on-commit` when measuring WAL sync latency and retention
+  behavior under durable commit pressure.
 
 Large-ingest guardrails:
 
@@ -257,6 +259,12 @@ Large-ingest guardrails:
    segments incrementally instead of relying on clean full resets.
 2. [ ] Export retained WAL bytes, oldest uncheckpointed segment, WAL truncation
    lag, immutable-memtable bytes, and WAL sync latency through status/metrics.
+   - [x] First slice: backend write stats now expose WAL sync latency alongside
+     sync record counts, while maintenance stats expose retained WAL segments,
+     retained bytes, checkpoint lag, and replay retention.
+   - [x] Bench slice: `lsm-write-bench` and `lsm-write-bench-compare` now emit
+     and compare WAL append/sync/reset deltas plus retained-WAL after-state,
+     with a `--wal-sync-on-commit` workload flag.
 3. [ ] Replace recovery replay allocation churn with a bounded recovery
    allocation model that can release whole chunks after flush.
 4. [ ] Add final-state HBC bulk publication for sustained ingest so large loads

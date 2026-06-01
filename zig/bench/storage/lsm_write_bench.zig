@@ -48,6 +48,7 @@ const Config = struct {
     bloom_bits_per_key: usize = 10,
     bloom_min_bits: usize = 64,
     lsm_io_runtime: antfly.lsm_backend.IoRuntime = .threaded,
+    wal_sync_on_commit: bool = false,
     readers: usize = 0,
     storage_mode: StorageSelection = .host,
     mode: ModeSelection = .both,
@@ -410,6 +411,7 @@ const Scenario = struct {
             .level_target_bytes_multiplier = cfg.level_target_bytes_multiplier,
             .bloom = bloomConfig(cfg),
             .io_runtime = cfg.lsm_io_runtime,
+            .wal_sync_on_commit = cfg.wal_sync_on_commit,
         });
         errdefer {
             var cleanup = backend;
@@ -500,7 +502,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     try out.print(
-        "lsm write bench samples={d} keys={d} hot_keys={d} overwrite_rounds={d} value_size={d} value_pattern={s} batch_size={d} update_stride={d} delete_stride={d} flush_threshold={d} flush_threshold_bytes={d} readers={d} storage={s} mode={s} workload_set={s}\n",
+        "lsm write bench samples={d} keys={d} hot_keys={d} overwrite_rounds={d} value_size={d} value_pattern={s} batch_size={d} update_stride={d} delete_stride={d} flush_threshold={d} flush_threshold_bytes={d} wal_sync_on_commit={} readers={d} storage={s} mode={s} workload_set={s}\n",
         .{
             cfg.samples,
             cfg.keys,
@@ -513,6 +515,7 @@ pub fn main(init: std.process.Init) !void {
             cfg.delete_stride,
             cfg.flush_threshold,
             cfg.flush_threshold_bytes,
+            cfg.wal_sync_on_commit,
             cfg.readers,
             @tagName(cfg.storage_mode),
             @tagName(cfg.mode),
@@ -930,7 +933,7 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"lsm_flushes\":{d},\"lsm_flush_input_entries\":{d},\"lsm_flush_output_runs\":{d},\"lsm_flush_output_bytes\":{d},\"lsm_flush_ns\":{d},\"lsm_table_file_writes\":{d},\"lsm_table_file_bytes\":{d},\"lsm_table_file_logical_entry_bytes\":{d},\"lsm_table_file_physical_entry_bytes\":{d},\"lsm_table_file_raw_blocks\":{d},\"lsm_table_file_compressed_blocks\":{d},\"lsm_table_file_compression_codec_mask\":{d},\"lsm_sorted_ingest_runs\":{d},\"lsm_sorted_ingest_bytes\":{d},\"lsm_sorted_ingest_ns\":{d},\"lsm_manifest_writes\":{d},\"lsm_manifest_bytes\":{d},\"lsm_manifest_ns\":{d}",
+        ",\"lsm_flushes\":{d},\"lsm_flush_input_entries\":{d},\"lsm_flush_output_runs\":{d},\"lsm_flush_output_bytes\":{d},\"lsm_flush_ns\":{d},\"lsm_table_file_writes\":{d},\"lsm_table_file_bytes\":{d},\"lsm_table_file_logical_entry_bytes\":{d},\"lsm_table_file_physical_entry_bytes\":{d},\"lsm_table_file_raw_blocks\":{d},\"lsm_table_file_compressed_blocks\":{d},\"lsm_table_file_compression_codec_mask\":{d},\"lsm_sorted_ingest_runs\":{d},\"lsm_sorted_ingest_bytes\":{d},\"lsm_sorted_ingest_ns\":{d},\"lsm_manifest_writes\":{d},\"lsm_manifest_bytes\":{d},\"lsm_manifest_ns\":{d},\"lsm_wal_append_records\":{d},\"lsm_wal_append_entries\":{d},\"lsm_wal_append_bytes\":{d},\"lsm_wal_append_ns\":{d},\"lsm_wal_sync_records\":{d},\"lsm_wal_sync_ns\":{d},\"lsm_wal_resets\":{d},\"lsm_wal_reset_ns\":{d}",
         .{
             write_delta.flushes,
             write_delta.flush_input_entries,
@@ -950,6 +953,14 @@ fn printResult(
             write_delta.manifest_writes,
             write_delta.manifest_bytes,
             write_delta.manifest_ns,
+            write_delta.wal_append_records,
+            write_delta.wal_append_entries,
+            write_delta.wal_append_bytes,
+            write_delta.wal_append_ns,
+            write_delta.wal_sync_records,
+            write_delta.wal_sync_ns,
+            write_delta.wal_resets,
+            write_delta.wal_reset_ns,
         },
     );
     try writer.print(
@@ -966,7 +977,7 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"compactions\":{d},\"compaction_input_runs\":{d},\"compaction_input_bytes\":{d},\"compaction_output_bytes\":{d},\"compaction_ns\":{d},\"runs_after\":{d},\"l0_runs_after\":{d},\"overlapping_l0_runs_after\":{d},\"max_level_after\":{d},\"run_bytes_after\":{d},\"run_entries_after\":{d},\"obsolete_paths_after\":{d},\"mutable_entries_after\":{d},\"compaction_scheduler_grants_after\":{d},\"compaction_scheduler_denied_capacity_after\":{d},\"compaction_scheduler_denied_resource_pressure_after\":{d},\"compaction_scheduler_remembered_pending_after\":{d},\"compaction_scheduler_remembered_candidates_after\":{d},\"compaction_scheduler_remembered_retries_after\":{d},\"compaction_scheduler_remembered_hits_after\":{d},\"compaction_scheduler_remembered_stale_after\":{d},\"compaction_scheduler_conflict_denials_after\":{d}}}\n",
+        ",\"compactions\":{d},\"compaction_input_runs\":{d},\"compaction_input_bytes\":{d},\"compaction_output_bytes\":{d},\"compaction_ns\":{d},\"runs_after\":{d},\"l0_runs_after\":{d},\"overlapping_l0_runs_after\":{d},\"max_level_after\":{d},\"run_bytes_after\":{d},\"run_entries_after\":{d},\"obsolete_paths_after\":{d},\"mutable_entries_after\":{d},\"wal_retained_segments_after\":{d},\"wal_retained_bytes_after\":{d},\"wal_checkpoint_lag_segments_after\":{d},\"wal_replay_retained_segments_after\":{d},\"wal_replay_retained_bytes_after\":{d},\"compaction_scheduler_grants_after\":{d},\"compaction_scheduler_denied_capacity_after\":{d},\"compaction_scheduler_denied_resource_pressure_after\":{d},\"compaction_scheduler_remembered_pending_after\":{d},\"compaction_scheduler_remembered_candidates_after\":{d},\"compaction_scheduler_remembered_retries_after\":{d},\"compaction_scheduler_remembered_hits_after\":{d},\"compaction_scheduler_remembered_stale_after\":{d},\"compaction_scheduler_conflict_denials_after\":{d}}}\n",
         .{
             compaction_delta.compactions,
             compaction_delta.input_runs,
@@ -981,6 +992,11 @@ fn printResult(
             after.runs.entries,
             after.obsolete_paths,
             after.mutable_entries,
+            after.maintenance.wal_retained_segments,
+            after.maintenance.wal_retained_bytes,
+            after.maintenance.wal_checkpoint_lag_segments,
+            after.maintenance.wal_replay_retained_segments,
+            after.maintenance.wal_replay_retained_bytes,
             after.maintenance.compaction_scheduler_grants,
             after.maintenance.compaction_scheduler_denied_capacity,
             after.maintenance.compaction_scheduler_denied_resource_pressure,
@@ -1051,6 +1067,14 @@ fn diffWriteStats(after: WriteStats, before: WriteStats) WriteStats {
         .manifest_writes = after.manifest_writes - before.manifest_writes,
         .manifest_bytes = after.manifest_bytes - before.manifest_bytes,
         .manifest_ns = after.manifest_ns - before.manifest_ns,
+        .wal_append_records = after.wal_append_records - before.wal_append_records,
+        .wal_append_entries = after.wal_append_entries - before.wal_append_entries,
+        .wal_append_bytes = after.wal_append_bytes - before.wal_append_bytes,
+        .wal_append_ns = after.wal_append_ns - before.wal_append_ns,
+        .wal_sync_records = after.wal_sync_records - before.wal_sync_records,
+        .wal_sync_ns = after.wal_sync_ns - before.wal_sync_ns,
+        .wal_resets = after.wal_resets - before.wal_resets,
+        .wal_reset_ns = after.wal_reset_ns - before.wal_reset_ns,
     };
 }
 
@@ -1127,6 +1151,8 @@ fn parseArgs(alloc: Allocator, proc_args: std.process.Args) !Config {
         } else if (std.mem.eql(u8, arg, "--lsm-io")) {
             const value = args.next() orelse return error.InvalidArgument;
             cfg.lsm_io_runtime = std.meta.stringToEnum(antfly.lsm_backend.IoRuntime, value) orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--wal-sync-on-commit")) {
+            cfg.wal_sync_on_commit = true;
         } else if (std.mem.eql(u8, arg, "--readers")) {
             cfg.readers = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--workload-set")) {

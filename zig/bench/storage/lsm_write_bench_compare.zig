@@ -52,6 +52,14 @@ const Record = struct {
     lsm_manifest_writes: u64 = 0,
     lsm_manifest_bytes: u64 = 0,
     lsm_manifest_ns: u64 = 0,
+    lsm_wal_append_records: u64 = 0,
+    lsm_wal_append_entries: u64 = 0,
+    lsm_wal_append_bytes: u64 = 0,
+    lsm_wal_append_ns: u64 = 0,
+    lsm_wal_sync_records: u64 = 0,
+    lsm_wal_sync_ns: u64 = 0,
+    lsm_wal_resets: u64 = 0,
+    lsm_wal_reset_ns: u64 = 0,
     compactions: u64 = 0,
     compaction_input_runs: u64 = 0,
     compaction_input_bytes: u64 = 0,
@@ -64,6 +72,11 @@ const Record = struct {
     run_entries_after: u64 = 0,
     obsolete_paths_after: u64 = 0,
     mutable_entries_after: u64 = 0,
+    wal_retained_segments_after: u64 = 0,
+    wal_retained_bytes_after: u64 = 0,
+    wal_checkpoint_lag_segments_after: u64 = 0,
+    wal_replay_retained_segments_after: u64 = 0,
+    wal_replay_retained_bytes_after: u64 = 0,
 };
 
 const Config = struct {
@@ -117,6 +130,14 @@ const GroupAgg = struct {
     lsm_sorted_ingest_ns: MetricSeries = .{},
     lsm_manifest_writes: MetricSeries = .{},
     lsm_manifest_bytes: MetricSeries = .{},
+    lsm_wal_append_records: MetricSeries = .{},
+    lsm_wal_append_entries: MetricSeries = .{},
+    lsm_wal_append_bytes: MetricSeries = .{},
+    lsm_wal_append_ns: MetricSeries = .{},
+    lsm_wal_sync_records: MetricSeries = .{},
+    lsm_wal_sync_ns: MetricSeries = .{},
+    lsm_wal_resets: MetricSeries = .{},
+    lsm_wal_reset_ns: MetricSeries = .{},
     compactions: MetricSeries = .{},
     compaction_input_bytes: MetricSeries = .{},
     compaction_output_bytes: MetricSeries = .{},
@@ -124,6 +145,11 @@ const GroupAgg = struct {
     l0_runs_after: MetricSeries = .{},
     run_bytes_after: MetricSeries = .{},
     obsolete_paths_after: MetricSeries = .{},
+    wal_retained_segments_after: MetricSeries = .{},
+    wal_retained_bytes_after: MetricSeries = .{},
+    wal_checkpoint_lag_segments_after: MetricSeries = .{},
+    wal_replay_retained_segments_after: MetricSeries = .{},
+    wal_replay_retained_bytes_after: MetricSeries = .{},
 
     fn init(allocator: Allocator, scenario: []const u8, workload: []const u8) !GroupAgg {
         return .{
@@ -153,6 +179,14 @@ const GroupAgg = struct {
         self.lsm_sorted_ingest_ns.deinit(allocator);
         self.lsm_manifest_writes.deinit(allocator);
         self.lsm_manifest_bytes.deinit(allocator);
+        self.lsm_wal_append_records.deinit(allocator);
+        self.lsm_wal_append_entries.deinit(allocator);
+        self.lsm_wal_append_bytes.deinit(allocator);
+        self.lsm_wal_append_ns.deinit(allocator);
+        self.lsm_wal_sync_records.deinit(allocator);
+        self.lsm_wal_sync_ns.deinit(allocator);
+        self.lsm_wal_resets.deinit(allocator);
+        self.lsm_wal_reset_ns.deinit(allocator);
         self.compactions.deinit(allocator);
         self.compaction_input_bytes.deinit(allocator);
         self.compaction_output_bytes.deinit(allocator);
@@ -160,6 +194,11 @@ const GroupAgg = struct {
         self.l0_runs_after.deinit(allocator);
         self.run_bytes_after.deinit(allocator);
         self.obsolete_paths_after.deinit(allocator);
+        self.wal_retained_segments_after.deinit(allocator);
+        self.wal_retained_bytes_after.deinit(allocator);
+        self.wal_checkpoint_lag_segments_after.deinit(allocator);
+        self.wal_replay_retained_segments_after.deinit(allocator);
+        self.wal_replay_retained_bytes_after.deinit(allocator);
         self.* = undefined;
     }
 
@@ -183,6 +222,14 @@ const GroupAgg = struct {
         try self.lsm_sorted_ingest_ns.append(allocator, @floatFromInt(record.lsm_sorted_ingest_ns));
         try self.lsm_manifest_writes.append(allocator, @floatFromInt(record.lsm_manifest_writes));
         try self.lsm_manifest_bytes.append(allocator, @floatFromInt(record.lsm_manifest_bytes));
+        try self.lsm_wal_append_records.append(allocator, @floatFromInt(record.lsm_wal_append_records));
+        try self.lsm_wal_append_entries.append(allocator, @floatFromInt(record.lsm_wal_append_entries));
+        try self.lsm_wal_append_bytes.append(allocator, @floatFromInt(record.lsm_wal_append_bytes));
+        try self.lsm_wal_append_ns.append(allocator, @floatFromInt(record.lsm_wal_append_ns));
+        try self.lsm_wal_sync_records.append(allocator, @floatFromInt(record.lsm_wal_sync_records));
+        try self.lsm_wal_sync_ns.append(allocator, @floatFromInt(record.lsm_wal_sync_ns));
+        try self.lsm_wal_resets.append(allocator, @floatFromInt(record.lsm_wal_resets));
+        try self.lsm_wal_reset_ns.append(allocator, @floatFromInt(record.lsm_wal_reset_ns));
         try self.compactions.append(allocator, @floatFromInt(record.compactions));
         try self.compaction_input_bytes.append(allocator, @floatFromInt(record.compaction_input_bytes));
         try self.compaction_output_bytes.append(allocator, @floatFromInt(record.compaction_output_bytes));
@@ -190,6 +237,11 @@ const GroupAgg = struct {
         try self.l0_runs_after.append(allocator, @floatFromInt(record.l0_runs_after));
         try self.run_bytes_after.append(allocator, @floatFromInt(record.run_bytes_after));
         try self.obsolete_paths_after.append(allocator, @floatFromInt(record.obsolete_paths_after));
+        try self.wal_retained_segments_after.append(allocator, @floatFromInt(record.wal_retained_segments_after));
+        try self.wal_retained_bytes_after.append(allocator, @floatFromInt(record.wal_retained_bytes_after));
+        try self.wal_checkpoint_lag_segments_after.append(allocator, @floatFromInt(record.wal_checkpoint_lag_segments_after));
+        try self.wal_replay_retained_segments_after.append(allocator, @floatFromInt(record.wal_replay_retained_segments_after));
+        try self.wal_replay_retained_bytes_after.append(allocator, @floatFromInt(record.wal_replay_retained_bytes_after));
     }
 };
 
@@ -342,6 +394,14 @@ fn printComparison(
     try printMetric(writer, allocator, "  lsm_sorted_ingest_ns", before.lsm_sorted_ingest_ns, after.lsm_sorted_ingest_ns);
     try printMetric(writer, allocator, "  lsm_manifest_writes", before.lsm_manifest_writes, after.lsm_manifest_writes);
     try printMetric(writer, allocator, "  lsm_manifest_bytes", before.lsm_manifest_bytes, after.lsm_manifest_bytes);
+    try printMetric(writer, allocator, "  lsm_wal_append_records", before.lsm_wal_append_records, after.lsm_wal_append_records);
+    try printMetric(writer, allocator, "  lsm_wal_append_entries", before.lsm_wal_append_entries, after.lsm_wal_append_entries);
+    try printMetric(writer, allocator, "  lsm_wal_append_bytes", before.lsm_wal_append_bytes, after.lsm_wal_append_bytes);
+    try printMetric(writer, allocator, "  lsm_wal_append_ns", before.lsm_wal_append_ns, after.lsm_wal_append_ns);
+    try printMetric(writer, allocator, "  lsm_wal_sync_records", before.lsm_wal_sync_records, after.lsm_wal_sync_records);
+    try printMetric(writer, allocator, "  lsm_wal_sync_ns", before.lsm_wal_sync_ns, after.lsm_wal_sync_ns);
+    try printMetric(writer, allocator, "  lsm_wal_resets", before.lsm_wal_resets, after.lsm_wal_resets);
+    try printMetric(writer, allocator, "  lsm_wal_reset_ns", before.lsm_wal_reset_ns, after.lsm_wal_reset_ns);
     try printMetric(writer, allocator, "  compactions", before.compactions, after.compactions);
     try printMetric(writer, allocator, "  compaction_input_bytes", before.compaction_input_bytes, after.compaction_input_bytes);
     try printMetric(writer, allocator, "  compaction_output_bytes", before.compaction_output_bytes, after.compaction_output_bytes);
@@ -349,6 +409,11 @@ fn printComparison(
     try printMetric(writer, allocator, "  l0_runs_after", before.l0_runs_after, after.l0_runs_after);
     try printMetric(writer, allocator, "  run_bytes_after", before.run_bytes_after, after.run_bytes_after);
     try printMetric(writer, allocator, "  obsolete_paths_after", before.obsolete_paths_after, after.obsolete_paths_after);
+    try printMetric(writer, allocator, "  wal_retained_segments_after", before.wal_retained_segments_after, after.wal_retained_segments_after);
+    try printMetric(writer, allocator, "  wal_retained_bytes_after", before.wal_retained_bytes_after, after.wal_retained_bytes_after);
+    try printMetric(writer, allocator, "  wal_checkpoint_lag_segments_after", before.wal_checkpoint_lag_segments_after, after.wal_checkpoint_lag_segments_after);
+    try printMetric(writer, allocator, "  wal_replay_retained_segments_after", before.wal_replay_retained_segments_after, after.wal_replay_retained_segments_after);
+    try printMetric(writer, allocator, "  wal_replay_retained_bytes_after", before.wal_replay_retained_bytes_after, after.wal_replay_retained_bytes_after);
 }
 
 fn printMetric(writer: anytype, allocator: Allocator, label: []const u8, before: MetricSeries, after: MetricSeries) !void {
