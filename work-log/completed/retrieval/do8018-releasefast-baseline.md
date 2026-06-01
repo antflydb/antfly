@@ -1255,3 +1255,82 @@ Timing read:
 - Post active-mmap-advice metrics-on load/catch-up was 41.98s/14.22s with 144 merges.
 
 RSS moved as expected for warmer active mappings, but the first-class memory targets stayed low: final footprint was ~131-155 MiB, final live malloc was ~94-100 MiB, and mapped-file resident was ~30 MiB. Final segment bytes remained ~401-409 MiB.
+
+## Post LSM Snapshot-Clone Diagnostics Repeat
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260601-071337/`.
+
+This repeat was run from commit `8ff42be91b9b` after adding LSM mutable snapshot clone counters to the DO8018 bench summary and resource logs. The run confirms that the maintenance clone path is now visible and is not the large RSS driver for this workload: clone totals were ~10.6-12.2 MiB across the full run, with ~1.0 MiB peak clone size.
+
+Metrics off:
+
+- Load time: 42.010433875s
+- Async catch-up time: 13.233531292s
+- Catch-up complete: true, `scope=full-text`
+- Throughput: 1,680.65 records/sec, 5.13 MiB/sec
+- `ps` RSS: 725,762,048 bytes
+- Peak sampled RSS: 1,004,224,512 bytes
+- Process footprint metric: 136,747,776 bytes
+- Peak sampled process footprint: 278,894,976 bytes
+- Live malloc metric: 84,162,736 bytes
+- Peak sampled live malloc: 163,950,368 bytes
+- vmmap footprint: 137,468,313 bytes
+- vmmap peak footprint: 835,190,784 bytes
+- vmmap mapped-file resident: 30,513,561 bytes
+- vmmap malloc allocated: 23,802,675 bytes
+- Segment files: 8
+- Segment bytes: 406,527,856
+- Stored fields bytes: 127,729,820
+- Inverted bytes: 274,682,003
+- Postings bytes: 146,862,612
+- Term block bytes: 104,141,522
+- Text merges completed: 148
+- Full-text build peak bytes: 168,016,832
+- Full-text pending peak bytes: 412,875,355
+- Text merge buffer peak bytes: 183,352,759
+- LSM compaction peak bytes: 67,649,376
+- LSM state peak bytes: 19,187,537
+- LSM mutable snapshot clone calls: 26
+- LSM mutable snapshot clone bytes total: 10,592,753
+- LSM mutable snapshot clone peak bytes: 1,035,811
+
+Metrics on:
+
+- Load time: 41.067259875s
+- Async catch-up time: 14.407353792s
+- Catch-up complete: true, `scope=full-text`
+- Throughput: 1,719.25 records/sec, 5.25 MiB/sec
+- `ps` RSS: 709,459,968 bytes
+- Peak sampled RSS: 889,356,288 bytes
+- Process footprint metric: 129,833,560 bytes
+- Peak sampled process footprint: 268,048,288 bytes
+- Live malloc metric: 84,615,744 bytes
+- Peak sampled live malloc: 189,305,776 bytes
+- vmmap footprint: 129,708,851 bytes
+- vmmap peak footprint: 800,797,491 bytes
+- vmmap mapped-file resident: 30,828,134 bytes
+- vmmap malloc allocated: 24,956,108 bytes
+- Segment files: 8
+- Segment bytes: 393,482,410
+- Stored fields bytes: 127,567,965
+- Inverted bytes: 261,837,073
+- Postings bytes: 140,140,869
+- Term block bytes: 97,528,401
+- Text merges completed: 140
+- Full-text build peak bytes: 147,964,273
+- Full-text pending peak bytes: 404,839,005
+- Text merge buffer peak bytes: 106,396,247
+- LSM compaction peak bytes: 67,852,152
+- LSM state peak bytes: 28,477,592
+- LSM mutable snapshot clone calls: 23
+- LSM mutable snapshot clone bytes total: 12,215,835
+- LSM mutable snapshot clone peak bytes: 1,016,963
+
+Timing read:
+
+- Post active-mmap-advice metrics-off load/catch-up was 44.27s/16.76s with 159 merges.
+- Post snapshot-clone-diagnostics metrics-off load/catch-up was 42.01s/13.23s with 148 merges.
+- Post active-mmap-advice metrics-on load/catch-up was 41.98s/14.22s with 144 merges.
+- Post snapshot-clone-diagnostics metrics-on load/catch-up was 41.07s/14.41s with 140 merges.
+
+The latest repeat does not show a slowdown from the diagnostics wiring. The broader slowdown versus the earlier ~35s best runs remains real enough to investigate, but this repeat points at merge/codec/write-path composition rather than metrics overhead. RSS is still mostly not live heap: final footprint is ~130-137 MiB, final live malloc is ~84-85 MiB, vmmap mapped-file resident is ~30-31 MiB, and final segment bytes are ~393-407 MiB.
