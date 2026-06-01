@@ -1901,3 +1901,97 @@ Metrics-on text timing aggregate:
 - Hit materialization timing: 2,856 ms
 
 Interpretation: this is a valid post-LSM-cleanup run. Metrics-on mutable snapshot clone calls fell from 32 to 23 versus the valid prefix baseline, and total cloned bytes fell from 15,954,614 to 6,014,543. Metrics-off clone calls rose from 23 to 28, so this does not prove that every remaining LSM clone path is fixed; it does show the metadata point-read probe conversion removed a meaningful part of the instrumented path. Main text timing remained healthy: metrics-on total text build timing improved from 33,663 ms to 30,102 ms, with term dictionary timing down from 7,677 ms to 6,893 ms. Remaining LSM work should identify the residual clone callers by adding call-site labels or per-reader reason counters around `snapshotMutableState`.
+
+## LSM Mutable Snapshot Reason Baseline
+
+Run: `work-log/do8018/releasefast-baseline-20260601-101628`
+Commit: `c903c3cb5`
+
+This run adds per-reader-class attribution for LSM mutable snapshot clones. The workload still uses the same 70,605-doc DO8018 source and ReleaseFast binary. The release compile for this run was unusually long and memory-heavy, but the ingest run itself completed cleanly.
+
+Metrics off:
+
+- Load time: 42.535871583s
+- Async catch-up time: 12.771573667s
+- Total elapsed: 55.307514125s
+- Throughput: 1,659.89 records/sec, 5.06 MiB/sec
+- `ps` RSS: 652,787,712 bytes
+- Peak sampled RSS: 1,007,124,480 bytes
+- Process footprint metric: 146,758,736 bytes
+- Peak sampled process footprint: 297,179,880 bytes
+- Live malloc metric: 88,528,464 bytes
+- Peak sampled live malloc: 242,369,552 bytes
+- vmmap footprint: 147,429,785 bytes
+- vmmap mapped-file resident: 29,989,273 bytes
+- vmmap malloc allocated: 35,861,299 bytes
+- Segment files: 8
+- Segment bytes: 396,697,921
+- Stored fields bytes: 127,749,372
+- Inverted bytes: 264,861,558
+- Postings bytes: 146,101,036
+- Term block bytes: 94,160,137
+- Text merges completed: 177
+- Full-text build peak bytes: 156,881,030
+- Full-text pending peak bytes: 400,438,702
+- Text merge buffer peak bytes: 86,872,362
+- LSM mutable snapshot clone calls: 32
+- LSM mutable snapshot clone bytes total: 14,744,320
+- LSM mutable snapshot clone peak bytes: 1,006,495
+- LSM mutable snapshot clone `bound_read_txn` calls/bytes: 32 / 14,744,320
+- LSM mutable snapshot clone `namespace_read_txn` calls/bytes: 0 / 0
+- LSM mutable snapshot clone `other` calls/bytes: 0 / 0
+
+Metrics on:
+
+- Load time: 45.325735292s
+- Async catch-up time: 15.763844667s
+- Total elapsed: 1m1.089657875s
+- Throughput: 1,557.72 records/sec, 4.75 MiB/sec
+- `ps` RSS: 707,018,752 bytes
+- Peak sampled RSS: 1,030,193,152 bytes
+- Process footprint metric: 160,521,104 bytes
+- Peak sampled process footprint: 412,490,040 bytes
+- Live malloc metric: 80,162,128 bytes
+- Peak sampled live malloc: 403,528,608 bytes
+- vmmap footprint: 160,536,985 bytes
+- vmmap mapped-file resident: 32,086,425 bytes
+- vmmap malloc allocated: 23,802,675 bytes
+- Segment files: 8
+- Segment bytes: 394,683,562
+- Stored fields bytes: 127,590,177
+- Inverted bytes: 263,008,453
+- Postings bytes: 144,637,114
+- Term block bytes: 93,192,382
+- Text merges completed: 154
+- Full-text build peak bytes: 176,386,799
+- Full-text pending peak bytes: 401,253,470
+- Text merge buffer peak bytes: 114,895,516
+- LSM mutable snapshot clone calls: 29
+- LSM mutable snapshot clone bytes total: 10,503,558
+- LSM mutable snapshot clone peak bytes: 1,006,705
+- LSM mutable snapshot clone `bound_read_txn` calls/bytes: 29 / 10,503,558
+- LSM mutable snapshot clone `namespace_read_txn` calls/bytes: 0 / 0
+- LSM mutable snapshot clone `other` calls/bytes: 0 / 0
+
+Metrics-on text timing aggregate:
+
+- Timing lines: 168
+- Source/projection docs: 70,605 / 70,605
+- Total text build timing: 33,766 ms
+- Segment build timing: 33,747 ms
+- Segment encode timing: 13,356 ms
+- Inverted build timing: 11,621 ms
+- Inverted term dictionary timing: 7,905 ms
+- Inverted postings serialization timing: 2,404 ms
+- Inverted sort timing: 634 ms
+- Inverted final assembly timing: 267 ms
+- Inverted norms timing: 1 ms
+- Inverted bloom finish timing: 0 ms
+- Section attach timing: 0 ms
+- Segment assembly timing: 1,566 ms
+- Stored compression timing: 513 ms
+- Analyzer timing: 3,475 ms
+- Term accumulation timing: 2,414 ms
+- Hit materialization timing: 3,066 ms
+
+Interpretation: the reason counters prove the remaining mutable snapshot clone bytes in this workload are not coming from namespace reads, TTL/schema maintenance, or legacy direct callers. All clones in both runs are `bound_read_txn`, which means the next LSM memory-pressure work should target ordinary bound read transaction opens: either avoid cloning mutable state there with a current/point-read path where snapshot isolation is not required, or make the mutable read snapshot an immutable/RCU-style view that can be shared without copying the active memtable. This is a smaller contributor than the full-text segment working set: clone totals are 10.5-14.7 MiB across the full run with ~1.0 MiB peak clone size, while full-text pending peaks remain ~400 MiB and build peaks are ~157-176 MiB.
