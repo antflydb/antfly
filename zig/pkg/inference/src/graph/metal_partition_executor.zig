@@ -4641,6 +4641,7 @@ fn tryExecuteMetalCommand(
         .abs => try executeRuntimeUnary(cb, values, inputs, .abs),
         .slice => |attrs| try executeRuntimeSlice(graph, cb, values, inputs, attrs),
         .concat_prim => |attrs| try executeRuntimeConcatPrim(graph, cb, values, inputs, attrs),
+        .scatter_add => |attrs| try executeRuntimeScatterAdd(graph, cb, values, inputs, attrs),
         .fused_gelu => try executeRuntimeActivation(cb, values, inputs, .gelu, n.output_shape),
         .fused_relu => try executeRuntimeActivation(cb, values, inputs, .relu, n.output_shape),
         .fused_silu => try executeRuntimeActivation(cb, values, inputs, .silu, n.output_shape),
@@ -4888,6 +4889,65 @@ fn executeRuntimeConcatPrim(
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
+}
+
+fn executeRuntimeScatterAdd(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    inputs: []const NodeId,
+    attrs: anytype,
+) !?CT {
+    if (attrs.axis != 0 or inputs.len != 3) return null;
+    const dest = valueFor(values, inputs[0]) orelse return null;
+    const update_values = valueFor(values, inputs[1]) orelse return null;
+    const indices = valueFor(values, inputs[2]) orelse return null;
+
+    var dest_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+    var values_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+    var indices_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+    const dest_shape = try fillShapeDims(graph.node(inputs[0]).output_shape, &dest_shape_buf);
+    const values_shape = try fillShapeDims(graph.node(inputs[1]).output_shape, &values_shape_buf);
+    const indices_shape = try fillShapeDims(graph.node(inputs[2]).output_shape, &indices_shape_buf);
+
+    if (dest_shape.len != 2 or values_shape.len != 2 or indices_shape.len != 1) return null;
+    if (dest_shape[0] <= 0 or dest_shape[1] <= 0 or values_shape[0] < 0 or values_shape[1] != dest_shape[1]) return null;
+
+    const out_rows: usize = @intCast(dest_shape[0]);
+    const value_rows: usize = @intCast(values_shape[0]);
+    const dim: usize = @intCast(dest_shape[1]);
+
+    const allocator = std.heap.page_allocator;
+    const dest_data = try cb.toFloat32(dest, allocator);
+    defer allocator.free(dest_data);
+    const values_data = try cb.toFloat32(update_values, allocator);
+    defer allocator.free(values_data);
+    const index_data = try cb.toFloat32(indices, allocator);
+    defer allocator.free(index_data);
+
+    if (dest_data.len != out_rows * dim or values_data.len != value_rows * dim or index_data.len < value_rows) return error.ShapeMismatch;
+
+    const output = try allocator.dupe(f32, dest_data);
+    defer allocator.free(output);
+    for (0..value_rows) |row_idx| {
+        const out_row_f = @round(index_data[row_idx]);
+        if (out_row_f < 0) return error.IndexOutOfBounds;
+        const out_row: usize = @intFromFloat(out_row_f);
+        if (out_row >= out_rows) return error.IndexOutOfBounds;
+        const src = values_data[row_idx * dim ..][0..dim];
+        const dst = output[out_row * dim ..][0..dim];
+        for (src, dst) |v, *d| d.* += v;
+    }
+
+    const out_shape = [_]i32{ @intCast(out_rows), @intCast(dim) };
+    const host_result = try cb.fromFloat32Shape(output, &out_shape);
+    errdefer cb.free(host_result);
+    if (isMetalDeviceResident(cb, host_result)) return host_result;
+    if (try makeMetalDeviceResident(cb, host_result)) |device_result| {
+        if (device_result != host_result) cb.free(host_result);
+        return device_result;
+    }
+    return host_result;
 }
 
 fn executeRuntimeEmbeddingLookup(

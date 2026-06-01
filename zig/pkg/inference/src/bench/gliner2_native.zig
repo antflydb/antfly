@@ -30,6 +30,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const platform = @import("antfly_platform");
 
 const inference_internal = @import("inference_internal");
 const deberta_arch = inference_internal.architectures.deberta;
@@ -98,6 +99,14 @@ const BenchConfig = struct {
     matrix: bool = false,
     format: OutputFormat = .text,
 };
+
+fn glinerSuppressPlannedComputeBarriers() bool {
+    return !platform.env.getenvBool("TERMITE_METAL_GLINER_KEEP_PLANNED_COMPUTE_BARRIERS");
+}
+
+fn glinerTraceMetalStages() bool {
+    return platform.env.getenvBool("TERMITE_METAL_TRACE_GLINER_STAGES");
+}
 
 fn parseArgs(init: std.process.Init) !BenchConfig {
     var cfg = BenchConfig{};
@@ -652,7 +661,6 @@ const MetalAudit = struct {
     host_download_bytes: u64 = 0,
     mps_standalone: u64 = 0,
     mps_active: u64 = 0,
-    mpsgraph: u64 = 0,
     planned_layers: u64 = 0,
     layer_count: u64 = 0,
     fused_ffn: u64 = 0,
@@ -660,6 +668,7 @@ const MetalAudit = struct {
     packed_qkv_fallbacks: u64 = 0,
     relative_qk_pair: u64 = 0,
     relative_qk_pair_fallbacks: u64 = 0,
+    attention_flash: u64 = 0,
     attention_legacy: u64 = 0,
     attention_gemm: u64 = 0,
     attention_gemm_fallbacks: u64 = 0,
@@ -697,6 +706,7 @@ fn buildMetalAudit(cfg: BenchConfig, before: ops.BackendDebugTimingSnapshot, aft
     const ffn_fused_total = deltaU64(a.metal_runtime_deberta_ffn_fused_calls, b.metal_runtime_deberta_ffn_fused_calls);
     const packed_qkv_total = deltaU64(a.metal_runtime_dense_qkv_packed_calls, b.metal_runtime_dense_qkv_packed_calls);
     const relative_qk_pair_total = deltaU64(a.metal_runtime_deberta_relative_qk_pair_calls, b.metal_runtime_deberta_relative_qk_pair_calls);
+    const attention_flash_total = deltaU64(a.metal_runtime_deberta_attention_flash_calls, b.metal_runtime_deberta_attention_flash_calls);
     const attention_legacy_total = deltaU64(a.metal_runtime_deberta_attention_legacy_calls, b.metal_runtime_deberta_attention_legacy_calls);
     const attention_gemm_total = deltaU64(a.metal_runtime_deberta_attention_gemm_calls, b.metal_runtime_deberta_attention_gemm_calls);
     const layer_count: u64 = @intCast(cfg.num_layers);
@@ -710,7 +720,6 @@ fn buildMetalAudit(cfg: BenchConfig, before: ops.BackendDebugTimingSnapshot, aft
         .host_download_bytes = deltaU64(a.metal_tensor_host_mirror_download_bytes, b.metal_tensor_host_mirror_download_bytes),
         .mps_standalone = deltaU64(a.metal_runtime_mps_dense_linear_standalone_calls, b.metal_runtime_mps_dense_linear_standalone_calls),
         .mps_active = deltaU64(a.metal_runtime_mps_dense_linear_active_frame_calls, b.metal_runtime_mps_dense_linear_active_frame_calls),
-        .mpsgraph = deltaU64(a.metal_runtime_mpsgraph_ffn_calls, b.metal_runtime_mpsgraph_ffn_calls),
         .planned_layers = perIter(layer_successes_total, cfg.measure_iters),
         .layer_count = layer_count,
         .fused_ffn = perIter(ffn_fused_total, cfg.measure_iters),
@@ -718,6 +727,7 @@ fn buildMetalAudit(cfg: BenchConfig, before: ops.BackendDebugTimingSnapshot, aft
         .packed_qkv_fallbacks = deltaU64(a.metal_runtime_dense_qkv_packed_fallbacks, b.metal_runtime_dense_qkv_packed_fallbacks),
         .relative_qk_pair = perIter(relative_qk_pair_total, cfg.measure_iters),
         .relative_qk_pair_fallbacks = deltaU64(a.metal_runtime_deberta_relative_qk_pair_fallbacks, b.metal_runtime_deberta_relative_qk_pair_fallbacks),
+        .attention_flash = perIter(attention_flash_total, cfg.measure_iters),
         .attention_legacy = perIter(attention_legacy_total, cfg.measure_iters),
         .attention_gemm = perIter(attention_gemm_total, cfg.measure_iters),
         .attention_gemm_fallbacks = deltaU64(a.metal_runtime_deberta_attention_gemm_fallbacks, b.metal_runtime_deberta_attention_gemm_fallbacks),
@@ -825,13 +835,18 @@ fn runForwardTimed(
     const total_start = nowNs();
 
     var session_frame_active = false;
+    var session_barriers_suppressed = false;
     if (cb.kind() == .metal) {
         _ = try deberta_arch.preplanMetalDebertaEncoderFrame(cb, allocator, deberta_cfg, cfg.batch, cfg.seq_len);
         _ = reserveBenchmarkGlinerSessionScratch(cb, cfg, inputs.span_idx);
         if (!cb.decoderRuntimeHasActiveFrame()) {
             session_frame_active = try cb.decoderRuntimeBeginFrame();
+            if (session_frame_active and glinerSuppressPlannedComputeBarriers()) {
+                session_barriers_suppressed = try cb.decoderRuntimePushPlannedComputeBarrierSuppression();
+            }
         }
     }
+    errdefer if (session_barriers_suppressed) cb.decoderRuntimePopPlannedComputeBarrierSuppression() catch {};
     errdefer if (session_frame_active) cb.decoderRuntimeCancelFrame() catch {};
 
     var timing = ForwardTiming{};
@@ -879,6 +894,13 @@ fn runForwardTimed(
     timing.head_profile = head_profile;
 
     if (session_frame_active) {
+        if (session_barriers_suppressed) {
+            cb.decoderRuntimePopPlannedComputeBarrierSuppression() catch |err| {
+                if (glinerTraceMetalStages()) std.debug.print("bench gliner2: session frame pop barrier suppression failed: {s}; ignoring\n", .{@errorName(err)});
+                if (err != error.PlannedBarrierSuppressionNotActive) return err;
+            };
+            session_barriers_suppressed = false;
+        }
         try cb.decoderRuntimeSubmitAndWaitFrame();
         session_frame_active = false;
     }
@@ -1011,7 +1033,7 @@ fn runBenchmark(
 
     if (cfg.format == .csv) {
         std.debug.print(
-            "{s},{s},{},{},{},{},{},{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{s},{},{},{},{},{},{},{},{}",
+            "{s},{s},{},{},{},{},{},{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{s},{},{},{},{},{},{},{}",
             .{
                 @tagName(cfg.backend),
                 @tagName(cfg.quant),
@@ -1033,7 +1055,6 @@ fn runBenchmark(
                 metal_audit.host_downloads,
                 metal_audit.mps_standalone,
                 metal_audit.mps_active,
-                metal_audit.mpsgraph,
                 metal_audit.planned_layers,
                 metal_audit.layer_count,
                 metal_audit.fused_ffn,
@@ -1060,8 +1081,9 @@ fn runBenchmark(
             },
         );
         std.debug.print(
-            ",{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3}\n",
+            ",{},{},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3}\n",
             .{
+                metal_audit.attention_flash,
                 metal_audit.attention_gemm,
                 metal_audit.attention_gemm_fallbacks,
                 metal_audit.attention_legacy,
@@ -1140,14 +1162,13 @@ fn runBenchmark(
     );
     if (cfg.backend == .metal) {
         std.debug.print(
-            "gliner2_metal_audit resident_frame={s} interpreter_fallbacks={} host_downloads={} mps_standalone={} mps_active={} mpsgraph={} planned_layers={} layer_count={} fused_ffn={} packed_qkv={} packed_qkv_fallbacks={} relative_qk_pair={} relative_qk_pair_fallbacks={} command_plan_reused={s} graph_plan_reuses={} frame_begins={} frame_submits={} frame_gpu_ms={d:.3} frame_wait_ms={d:.3}\n",
+            "gliner2_metal_audit resident_frame={s} interpreter_fallbacks={} host_downloads={} mps_standalone={} mps_active={} planned_layers={} layer_count={} fused_ffn={} packed_qkv={} packed_qkv_fallbacks={} relative_qk_pair={} relative_qk_pair_fallbacks={} command_plan_reused={s} graph_plan_reuses={} frame_begins={} frame_submits={} frame_gpu_ms={d:.3} frame_wait_ms={d:.3}\n",
             .{
                 yesNo(metal_audit.resident_frame),
                 metal_audit.interpreter_fallbacks,
                 metal_audit.host_downloads,
                 metal_audit.mps_standalone,
                 metal_audit.mps_active,
-                metal_audit.mpsgraph,
                 metal_audit.planned_layers,
                 metal_audit.layer_count,
                 metal_audit.fused_ffn,
@@ -1261,7 +1282,7 @@ fn runScenario(allocator: std.mem.Allocator, cfg: BenchConfig) !void {
 
 fn printCsvHeader() void {
     std.debug.print(
-        "backend,quant,batch,seq_len,num_labels,layers,hidden,intermediate,warmup_iters,measure_iters,avg_ms,min_ms,encoder_ms,head_ms,logits_to_f32_ms,resident_frame,interpreter_fallbacks,host_downloads,mps_standalone,mps_active,mpsgraph,planned_layers,layer_count,fused_ffn,packed_qkv,packed_qkv_fallbacks,relative_qk_pair,relative_qk_pair_fallbacks,command_plan_reused,frame_gpu_ms,frame_wait_ms,graph_plan_reuses,frame_begins,frame_submits,host_downloads_total,layer_fallbacks,ffn_fallbacks,plan_successes,plan_failures,deberta_attention_gemm,deberta_attention_gemm_fallbacks,deberta_attention_legacy,encoder_embeddings_ms,encoder_relative_pos_ms,encoder_qkv_ms,encoder_relative_qk_ms,encoder_attention_ms,encoder_attn_output_ms,encoder_ffn_intermediate_ms,encoder_ffn_output_ms,head_start_end_mlp_ms,head_gather_concat_relu_ms,head_out_project_ms,head_label_projection_ms,head_logits_ms\n",
+        "backend,quant,batch,seq_len,num_labels,layers,hidden,intermediate,warmup_iters,measure_iters,avg_ms,min_ms,encoder_ms,head_ms,logits_to_f32_ms,resident_frame,interpreter_fallbacks,host_downloads,mps_standalone,mps_active,planned_layers,layer_count,fused_ffn,packed_qkv,packed_qkv_fallbacks,relative_qk_pair,relative_qk_pair_fallbacks,command_plan_reused,frame_gpu_ms,frame_wait_ms,graph_plan_reuses,frame_begins,frame_submits,host_downloads_total,layer_fallbacks,ffn_fallbacks,plan_successes,plan_failures,deberta_attention_flash,deberta_attention_gemm,deberta_attention_gemm_fallbacks,deberta_attention_legacy,encoder_embeddings_ms,encoder_relative_pos_ms,encoder_qkv_ms,encoder_relative_qk_ms,encoder_attention_ms,encoder_attn_output_ms,encoder_ffn_intermediate_ms,encoder_ffn_output_ms,head_start_end_mlp_ms,head_gather_concat_relu_ms,head_out_project_ms,head_label_projection_ms,head_logits_ms\n",
         .{},
     );
 }
