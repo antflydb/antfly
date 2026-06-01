@@ -12,6 +12,7 @@ Updated on 2026-05-31 from worktree commit `a2dfe4cec46a` after the v18 varint p
 Updated on 2026-05-31 from worktree commit `eb338f2fdbca` after the v19 sparse block-max codec change.
 Updated on 2026-05-31 from worktree commit `629ad9cdecd2` after the v20 compact tagged term-block value codec change.
 Updated on 2026-05-31 from worktree commit `7f83fe7b7904` after the v21 bit-packed postings chunk metadata codec change.
+Updated on 2026-05-31 from worktree commit `312fc58f215c` after fixing idle derived-backlog release and making the DO8018 wait gate full-text scoped. Metrics-on no longer hits the 300s catch-up ceiling.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -52,6 +53,10 @@ Latest v20 artifacts:
 Latest v21 artifacts:
 
 `work-log/do8018/releasefast-baseline-20260531-210218/`
+
+Latest corrected v21 artifacts:
+
+`work-log/do8018/releasefast-baseline-20260531-213429/`
 
 ## Latest Segment-v3 Metrics Off
 
@@ -994,3 +999,100 @@ Artifacts: `work-log/do8018/releasefast-baseline-20260531-210218/`.
 The v21 codec replaces fixed 12-byte postings chunk metadata records with bit-packed per-term metadata columns: chunk-id deltas, max-doc offsets, doc counts, and payload-end deltas. This is a clean codec break and keeps the query-facing chunk metadata semantics unchanged by decoding the compact columns into iterator-owned scratch.
 
 The DO8018 baseline shows the intended byte reduction. Compared with v20, final segment bytes moved from ~422-430 MiB to ~405-411 MiB, and postings moved from ~164-167 MiB to ~145-146 MiB. RSS remains a noisy process-level number, while footprint is still ~132-137 MiB, live malloc is ~85-105 MiB, and mapped-file resident remains ~31 MiB. The remaining large full-text byte targets are now stored fields (~127.5 MiB), term blocks (~105-108 MiB), and the remaining postings payload (~145-146 MiB).
+
+## Corrected v21 Metrics Off
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260531-213429/`.
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Payload bytes: 246,859,144
+- Load time: 47.359518583s
+- Async catch-up time: 18.287606458s
+- Catch-up complete: true, `scope=full-text`
+- Throughput: 1,490.83 records/sec, 4.55 MiB/sec
+- `ps` RSS: 681,263,104 bytes
+- Process resident metric: 681,263,104 bytes
+- Process footprint metric: 120,232,632 bytes
+- Live malloc metric: 96,003,056 bytes
+- Malloc zone metric: 139,870,208 bytes
+- vmmap footprint: 120,271,667 bytes
+- vmmap peak footprint: 801,846,067 bytes
+- vmmap mapped-file resident: 29,360,128 bytes
+- vmmap malloc allocated: 35,861,299 bytes
+- Final full-text segment files: 7
+- Final full-text segment bytes: 396,343,271
+- Final mapped segment bytes: 396,343,271
+- Max segment bytes: 102,593,154
+- Stored fields bytes: 127,798,681
+- Inverted bytes: 264,468,040
+- Inverted header bytes: 112,596
+- Inverted norms bytes: 11,439,429
+- Inverted postings bytes: 141,906,786
+- Inverted term dictionary bytes: 104,954,377
+- Term block bytes: 99,571,314
+- Term index bytes: 2,711,912
+- Term FST bytes: 2,602,911
+- Bloom bytes: 6,054,852
+- Typed doc values bytes: 3,446,299
+- Doc ordinal bytes: 282,455
+- Section index bytes: 347,516
+- Text merges completed: 158
+- Full-text build peak bytes: 163,933,004
+- Full-text pending peak bytes: 397,010,478
+- Text merge buffer peak bytes: 102,574,135
+- LSM compaction peak bytes: 67,715,568
+- LSM in-memory state peak bytes: 28,652,737
+
+## Corrected v21 Metrics On
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260531-213429/`.
+
+- Records: 70,605
+- Input bytes: 225,883,530
+- Payload bytes: 246,859,144
+- Load time: 45.210656833s
+- Async catch-up time: 10.671201s
+- Catch-up complete: true, `scope=full-text`
+- Final full-text pending bytes: 0
+- Final derived backlog bytes: 0
+- Final text merge buffer bytes: 0
+- Throughput: 1,561.69 records/sec, 4.76 MiB/sec
+- `ps` RSS: 681,836,544 bytes
+- Process resident metric: 681,836,544 bytes
+- Process footprint metric: 146,594,680 bytes
+- Live malloc metric: 89,025,024 bytes
+- Malloc zone metric: 138,362,880 bytes
+- vmmap footprint: 146,590,924 bytes
+- vmmap peak footprint: 821,978,726 bytes
+- vmmap mapped-file resident: 29,989,273 bytes
+- vmmap malloc allocated: 23,802,675 bytes
+- Final full-text segment files: 8
+- Final full-text segment bytes: 403,812,594
+- Final mapped segment bytes: 403,812,594
+- Max segment bytes: 85,934,862
+- Stored fields bytes: 127,756,276
+- Inverted bytes: 271,986,979
+- Inverted header bytes: 110,154
+- Inverted norms bytes: 10,947,875
+- Inverted postings bytes: 146,531,243
+- Inverted term dictionary bytes: 108,435,779
+- Term block bytes: 102,954,927
+- Term index bytes: 2,768,655
+- Term FST bytes: 2,645,437
+- Bloom bytes: 5,961,928
+- Typed doc values bytes: 3,446,141
+- Doc ordinal bytes: 282,460
+- Section index bytes: 340,418
+- Text merges completed: 148
+- Full-text build peak bytes: 162,029,947
+- Full-text pending peak bytes: 412,213,600
+- Text merge buffer peak bytes: 85,716,342
+- LSM compaction peak bytes: 67,446,096
+- LSM in-memory state peak bytes: 20,724,659
+
+## Corrected v21 Read
+
+The corrected baseline confirms the earlier 300s metrics-on catch-up ceiling was not full-text merge/index work. With the benchmark wait gate scoped to full-text readiness and idle derived watermark persistence retrying, metrics-on catch-up completed in 10.67s with final `derived_backlog_bytes=0`.
+
+The first-class memory targets remain stable: final RSS was ~681 MiB, but footprint was ~120-147 MiB, live malloc was ~89-96 MiB, and mapped-file resident was ~29-30 MiB. Final full-text segment bytes are now ~396-404 MiB. The remaining byte targets are still stored fields (~127.8 MiB), term blocks (~99.6-103.0 MiB), and postings (~141.9-146.5 MiB).

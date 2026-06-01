@@ -71,18 +71,25 @@ type diagSnapshot struct {
 	RecordsPerSec                        float64        `json:"records_per_sec,omitempty"`
 	MiBPerSec                            float64        `json:"mib_per_sec,omitempty"`
 	RSSBytes                             int64          `json:"rss_bytes,omitempty"`
+	PeakRSSBytes                         int64          `json:"peak_rss_bytes,omitempty"`
 	HealthMetricsAvailable               bool           `json:"health_metrics_available"`
 	ProcessResidentBytes                 int64          `json:"process_resident_bytes,omitempty"`
+	PeakProcessResidentBytes             int64          `json:"peak_process_resident_bytes,omitempty"`
 	ProcessFootprintBytes                int64          `json:"process_footprint_bytes,omitempty"`
+	PeakProcessFootprintBytes            int64          `json:"peak_process_footprint_bytes,omitempty"`
 	MallocAllocatedBytes                 int64          `json:"malloc_allocated_bytes,omitempty"`
+	PeakMallocAllocatedBytes             int64          `json:"peak_malloc_allocated_bytes,omitempty"`
 	MallocZoneBytes                      int64          `json:"malloc_zone_bytes,omitempty"`
+	PeakMallocZoneBytes                  int64          `json:"peak_malloc_zone_bytes,omitempty"`
 	FullTextPendingBytes                 int64          `json:"full_text_pending_bytes,omitempty"`
 	DerivedBacklogBytes                  int64          `json:"derived_backlog_bytes,omitempty"`
 	TextMergeBufferBytes                 int64          `json:"text_merge_buffer_bytes,omitempty"`
 	FullTextIndexes                      int64          `json:"full_text_indexes,omitempty"`
 	FullTextSegments                     int64          `json:"full_text_segments,omitempty"`
 	FullTextSegmentBytes                 int64          `json:"full_text_segment_bytes,omitempty"`
+	PeakFullTextSegmentBytes             int64          `json:"peak_full_text_segment_bytes,omitempty"`
 	FullTextMmapSegmentBytes             int64          `json:"full_text_mmap_segment_bytes,omitempty"`
+	PeakFullTextMmapSegmentBytes         int64          `json:"peak_full_text_mmap_segment_bytes,omitempty"`
 	FullTextHeapSegmentBytes             int64          `json:"full_text_heap_segment_bytes,omitempty"`
 	FullTextMaxSegmentBytes              int64          `json:"full_text_max_segment_bytes,omitempty"`
 	FullTextStoredFieldsBytes            int64          `json:"full_text_stored_fields_bytes,omitempty"`
@@ -131,6 +138,7 @@ type diagSnapshot struct {
 	LSMStatePeakBytes                    int64          `json:"lsm_state_peak_bytes,omitempty"`
 	SegmentFiles                         int64          `json:"segment_files,omitempty"`
 	SegmentBytes                         int64          `json:"segment_bytes,omitempty"`
+	PeakSegmentBytes                     int64          `json:"peak_segment_bytes,omitempty"`
 	VMMapPhysicalFootprintBytes          int64          `json:"vmmap_physical_footprint_bytes,omitempty"`
 	VMMapPhysicalPeakBytes               int64          `json:"vmmap_physical_peak_bytes,omitempty"`
 	VMMapMappedFileResidentBytes         int64          `json:"vmmap_mapped_file_resident_bytes,omitempty"`
@@ -449,7 +457,9 @@ func main() {
 	}
 	if *summaryOut != "" {
 		if mon != nil {
-			finalDiag.Extra = map[string]any{"samples": mon.snapshots()}
+			snapshots := mon.snapshots()
+			applySamplePeaks(&finalDiag, snapshots)
+			finalDiag.Extra = map[string]any{"samples": snapshots}
 		}
 		if err := writeSummary(*summaryOut, finalDiag); err != nil {
 			fmt.Printf("summary_write_error err=%v\n", err)
@@ -510,6 +520,34 @@ func (m *monitor) snapshots() []diagSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]diagSnapshot(nil), m.samples...)
+}
+
+func applySamplePeaks(out *diagSnapshot, samples []diagSnapshot) {
+	for _, sample := range samples {
+		out.PeakRSSBytes = maxInt64(out.PeakRSSBytes, sample.RSSBytes)
+		out.PeakProcessResidentBytes = maxInt64(out.PeakProcessResidentBytes, sample.ProcessResidentBytes)
+		out.PeakProcessFootprintBytes = maxInt64(out.PeakProcessFootprintBytes, sample.ProcessFootprintBytes)
+		out.PeakMallocAllocatedBytes = maxInt64(out.PeakMallocAllocatedBytes, sample.MallocAllocatedBytes)
+		out.PeakMallocZoneBytes = maxInt64(out.PeakMallocZoneBytes, sample.MallocZoneBytes)
+		out.PeakFullTextSegmentBytes = maxInt64(out.PeakFullTextSegmentBytes, sample.FullTextSegmentBytes)
+		out.PeakFullTextMmapSegmentBytes = maxInt64(out.PeakFullTextMmapSegmentBytes, sample.FullTextMmapSegmentBytes)
+		out.PeakSegmentBytes = maxInt64(out.PeakSegmentBytes, sample.SegmentBytes)
+	}
+	out.PeakRSSBytes = maxInt64(out.PeakRSSBytes, out.RSSBytes)
+	out.PeakProcessResidentBytes = maxInt64(out.PeakProcessResidentBytes, out.ProcessResidentBytes)
+	out.PeakProcessFootprintBytes = maxInt64(out.PeakProcessFootprintBytes, out.ProcessFootprintBytes)
+	out.PeakMallocAllocatedBytes = maxInt64(out.PeakMallocAllocatedBytes, out.MallocAllocatedBytes)
+	out.PeakMallocZoneBytes = maxInt64(out.PeakMallocZoneBytes, out.MallocZoneBytes)
+	out.PeakFullTextSegmentBytes = maxInt64(out.PeakFullTextSegmentBytes, out.FullTextSegmentBytes)
+	out.PeakFullTextMmapSegmentBytes = maxInt64(out.PeakFullTextMmapSegmentBytes, out.FullTextMmapSegmentBytes)
+	out.PeakSegmentBytes = maxInt64(out.PeakSegmentBytes, out.SegmentBytes)
+}
+
+func maxInt64(a, b int64) int64 {
+	if b > a {
+		return b
+	}
+	return a
 }
 
 func collectDiagnostics(pid int, healthURL, dataDir string, elapsed time.Duration) diagSnapshot {
