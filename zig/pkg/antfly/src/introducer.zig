@@ -205,7 +205,7 @@ fn buildSegmentWithExtraSections(
     var fit = field_builders.iterator();
     while (fit.next()) |entry| {
         const field_name = entry.key_ptr.*;
-        const inv_data = try entry.value_ptr.buildAlloc(alloc);
+        const inv_data = try entry.value_ptr.buildAlloc(alloc, null);
         errdefer alloc.free(inv_data);
 
         if (inv_data.len == 0) {

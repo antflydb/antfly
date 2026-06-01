@@ -224,6 +224,9 @@ Large-ingest guardrails:
      from retained block handles or immutable snapshots instead of copying every
      result into `held_values`. Current/live locked helpers still copy because
      they do not own a transaction-level block lifetime.
+   - [x] Cursor scratch now uses one aligned backing allocation for all
+     per-source arrays instead of allocating positions, heap state, block
+     handles, and entry slots separately for every cursor open.
 4. [ ] Make sorted `getManySorted` keep per-run cursor state across keys so
    batch reads resume inside the current block where possible.
 5. [x] Tune bloom defaults once the benchmark can show false-positive block

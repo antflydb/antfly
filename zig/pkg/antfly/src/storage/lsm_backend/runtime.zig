@@ -324,6 +324,18 @@ pub fn BoundCursor(comptime StateType: type) type {
 
 pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type {
     return struct {
+        const Self = @This();
+        const SourceEntry = struct {
+            namespace_name: ?[]const u8,
+            key: []const u8,
+            value: []const u8,
+            tombstone: bool,
+        };
+        const cursor_storage_alignment = @max(
+            @max(@alignOf(?usize), @alignOf(?SourceEntry)),
+            @max(@max(@alignOf(?[]const u8), @alignOf(?cache_mod.Handle)), @alignOf(usize)),
+        );
+
         allocator: Allocator,
         backend: *BackendType,
         mutable: *const MutableType,
@@ -341,24 +353,119 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         source_heap: []usize,
         source_heap_positions: []?usize,
         source_heap_len: usize = 0,
+        cursor_storage: []align(cursor_storage_alignment) u8 = &.{},
         visible_entry_bytes: ?[]u8 = null,
         mutable_source_entry_bytes: ?[]u8 = null,
         current_key: ?[]const u8 = null,
         upper_bound: ?[]const u8 = null,
         backend_locked: bool = false,
 
+        fn cursorStorageSize(source_count: usize) usize {
+            var offset: usize = 0;
+            cursorStorageAdvance(?usize, &offset, source_count);
+            cursorStorageAdvance(?SourceEntry, &offset, source_count);
+            cursorStorageAdvance(?[]const u8, &offset, source_count);
+            cursorStorageAdvance(?cache_mod.Handle, &offset, source_count);
+            cursorStorageAdvance(?usize, &offset, source_count);
+            cursorStorageAdvance(usize, &offset, source_count);
+            cursorStorageAdvance(usize, &offset, source_count);
+            cursorStorageAdvance(?usize, &offset, source_count);
+            return offset;
+        }
+
+        fn cursorStorageAdvance(comptime T: type, offset: *usize, count: usize) void {
+            offset.* = std.mem.alignForward(usize, offset.*, @alignOf(T));
+            offset.* += @sizeOf(T) * count;
+        }
+
+        fn allocCursorStorage(allocator: Allocator, source_count: usize) ![]align(cursor_storage_alignment) u8 {
+            const size = cursorStorageSize(source_count);
+            if (size == 0) return &.{};
+            return try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(cursor_storage_alignment), size);
+        }
+
+        fn cursorStorageSlice(
+            comptime T: type,
+            storage: []align(cursor_storage_alignment) u8,
+            offset: *usize,
+            count: usize,
+        ) []T {
+            offset.* = std.mem.alignForward(usize, offset.*, @alignOf(T));
+            const len = @sizeOf(T) * count;
+            const bytes: []align(@alignOf(T)) u8 = @alignCast(storage[offset.*..][0..len]);
+            offset.* += len;
+            return std.mem.bytesAsSlice(T, bytes);
+        }
+
+        pub fn init(
+            allocator: Allocator,
+            backend: *BackendType,
+            mutable: *const MutableType,
+            immutable_memtables: []const *const State,
+            runs: []Run,
+            l0_groups: []const RunGroup,
+            levels: []const RunLevel,
+            namespace: backend_types.Namespace,
+            backend_locked: bool,
+        ) !Self {
+            const source_count = 1 + immutable_memtables.len + runs.len;
+            const storage = try allocCursorStorage(allocator, source_count);
+            errdefer allocator.free(storage);
+
+            var offset: usize = 0;
+            const positions = cursorStorageSlice(?usize, storage, &offset, source_count);
+            @memset(positions, null);
+            const source_entries = cursorStorageSlice(?SourceEntry, storage, &offset, source_count);
+            @memset(source_entries, null);
+            const source_block_bytes = cursorStorageSlice(?[]const u8, storage, &offset, source_count);
+            @memset(source_block_bytes, null);
+            const source_block_handles = cursorStorageSlice(?cache_mod.Handle, storage, &offset, source_count);
+            @memset(source_block_handles, null);
+            const source_block_indices = cursorStorageSlice(?usize, storage, &offset, source_count);
+            @memset(source_block_indices, null);
+            const advance_sources = cursorStorageSlice(usize, storage, &offset, source_count);
+            const source_heap = cursorStorageSlice(usize, storage, &offset, source_count);
+            const source_heap_positions = cursorStorageSlice(?usize, storage, &offset, source_count);
+            @memset(source_heap_positions, null);
+
+            return .{
+                .allocator = allocator,
+                .backend = backend,
+                .mutable = mutable,
+                .immutable_memtables = immutable_memtables,
+                .runs = runs,
+                .l0_groups = l0_groups,
+                .levels = levels,
+                .namespace = namespace,
+                .positions = positions,
+                .source_entries = source_entries,
+                .source_block_bytes = source_block_bytes,
+                .source_block_handles = source_block_handles,
+                .source_block_indices = source_block_indices,
+                .advance_sources = advance_sources,
+                .source_heap = source_heap,
+                .source_heap_positions = source_heap_positions,
+                .cursor_storage = storage,
+                .backend_locked = backend_locked,
+            };
+        }
+
         pub fn close(self: *@This()) void {
             for (0..self.source_block_bytes.len) |source_index| self.clearSourceBlock(source_index);
             self.clearVisibleEntryBytes();
             self.clearMutableSourceEntryBytes();
-            self.allocator.free(self.source_block_indices);
-            self.allocator.free(self.source_block_handles);
-            self.allocator.free(self.source_block_bytes);
-            self.allocator.free(self.source_entries);
-            self.allocator.free(self.positions);
-            self.allocator.free(self.advance_sources);
-            self.allocator.free(self.source_heap);
-            self.allocator.free(self.source_heap_positions);
+            if (self.cursor_storage.len > 0) {
+                self.allocator.free(self.cursor_storage);
+            } else {
+                self.allocator.free(self.source_block_indices);
+                self.allocator.free(self.source_block_handles);
+                self.allocator.free(self.source_block_bytes);
+                self.allocator.free(self.source_entries);
+                self.allocator.free(self.positions);
+                self.allocator.free(self.advance_sources);
+                self.allocator.free(self.source_heap);
+                self.allocator.free(self.source_heap_positions);
+            }
         }
 
         pub fn first(self: *@This()) !?backend_adapter.Entry {
@@ -595,13 +702,6 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             }
             return match_count;
         }
-
-        const SourceEntry = struct {
-            namespace_name: ?[]const u8,
-            key: []const u8,
-            value: []const u8,
-            tombstone: bool,
-        };
 
         fn runSourceOffset(self: *const @This()) usize {
             return 1 + self.immutable_memtables.len;
@@ -1909,49 +2009,7 @@ fn readManySortedCurrentLocked(
         ),
     }
 
-    const source_count = 1 + immutable_memtables.len + runs.len;
-    const positions = try metadata_allocator.alloc(?usize, source_count);
-    errdefer metadata_allocator.free(positions);
-    @memset(positions, null);
-    const source_entries = try metadata_allocator.alloc(?LocalCursor.SourceEntry, source_count);
-    errdefer metadata_allocator.free(source_entries);
-    @memset(source_entries, null);
-    const source_block_bytes = try metadata_allocator.alloc(?[]const u8, source_count);
-    errdefer metadata_allocator.free(source_block_bytes);
-    @memset(source_block_bytes, null);
-    const source_block_handles = try metadata_allocator.alloc(?cache_mod.Handle, source_count);
-    errdefer metadata_allocator.free(source_block_handles);
-    @memset(source_block_handles, null);
-    const source_block_indices = try metadata_allocator.alloc(?usize, source_count);
-    errdefer metadata_allocator.free(source_block_indices);
-    @memset(source_block_indices, null);
-    const advance_sources = try metadata_allocator.alloc(usize, source_count);
-    errdefer metadata_allocator.free(advance_sources);
-    const source_heap = try metadata_allocator.alloc(usize, source_count);
-    errdefer metadata_allocator.free(source_heap);
-    const source_heap_positions = try metadata_allocator.alloc(?usize, source_count);
-    errdefer metadata_allocator.free(source_heap_positions);
-    @memset(source_heap_positions, null);
-
-    var cursor = LocalCursor{
-        .allocator = metadata_allocator,
-        .backend = backend,
-        .mutable = &backend.mutable,
-        .immutable_memtables = immutable_memtables,
-        .runs = runs,
-        .l0_groups = l0_groups,
-        .levels = levels,
-        .namespace = namespace,
-        .positions = positions,
-        .source_entries = source_entries,
-        .source_block_bytes = source_block_bytes,
-        .source_block_handles = source_block_handles,
-        .source_block_indices = source_block_indices,
-        .advance_sources = advance_sources,
-        .source_heap = source_heap,
-        .source_heap_positions = source_heap_positions,
-        .backend_locked = true,
-    };
+    var cursor = try LocalCursor.init(metadata_allocator, backend, &backend.mutable, immutable_memtables, runs, l0_groups, levels, namespace, true);
     defer cursor.close();
 
     return try readManySortedFromCursor(backend, allocator, held_values, &cursor, keys, values);
@@ -2056,48 +2114,8 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
         }
 
         pub fn openCursor(self: *@This()) !LocalCursor {
-            const source_count = 1 + self.immutable_memtables.len + self.runs.len;
             const cursor_alloc = runtimeScratchAllocator(self.allocator);
-            const positions = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(positions);
-            @memset(positions, null);
-            const source_entries = try cursor_alloc.alloc(?LocalCursor.SourceEntry, source_count);
-            errdefer cursor_alloc.free(source_entries);
-            @memset(source_entries, null);
-            const source_block_bytes = try cursor_alloc.alloc(?[]const u8, source_count);
-            errdefer cursor_alloc.free(source_block_bytes);
-            @memset(source_block_bytes, null);
-            const source_block_handles = try cursor_alloc.alloc(?cache_mod.Handle, source_count);
-            errdefer cursor_alloc.free(source_block_handles);
-            @memset(source_block_handles, null);
-            const source_block_indices = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(source_block_indices);
-            @memset(source_block_indices, null);
-            const advance_sources = try cursor_alloc.alloc(usize, source_count);
-            errdefer cursor_alloc.free(advance_sources);
-            const source_heap = try cursor_alloc.alloc(usize, source_count);
-            errdefer cursor_alloc.free(source_heap);
-            const source_heap_positions = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(source_heap_positions);
-            @memset(source_heap_positions, null);
-            return .{
-                .allocator = cursor_alloc,
-                .backend = self.backend,
-                .mutable = self.mutable_snapshot,
-                .immutable_memtables = self.immutable_memtables,
-                .runs = self.runs,
-                .l0_groups = self.l0_groups,
-                .levels = self.levels,
-                .namespace = self.namespace,
-                .positions = positions,
-                .source_entries = source_entries,
-                .source_block_bytes = source_block_bytes,
-                .source_block_handles = source_block_handles,
-                .source_block_indices = source_block_indices,
-                .advance_sources = advance_sources,
-                .source_heap = source_heap,
-                .source_heap_positions = source_heap_positions,
-            };
+            return try LocalCursor.init(cursor_alloc, self.backend, self.mutable_snapshot, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.namespace, false);
         }
     };
 }
@@ -2344,48 +2362,8 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
         }
 
         pub fn openCursor(self: *@This()) !LocalCursor {
-            const source_count = 1 + self.immutable_memtables.len + self.runs.len;
             const cursor_alloc = runtimeScratchAllocator(self.allocator);
-            const positions = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(positions);
-            @memset(positions, null);
-            const source_entries = try cursor_alloc.alloc(?LocalCursor.SourceEntry, source_count);
-            errdefer cursor_alloc.free(source_entries);
-            @memset(source_entries, null);
-            const source_block_bytes = try cursor_alloc.alloc(?[]const u8, source_count);
-            errdefer cursor_alloc.free(source_block_bytes);
-            @memset(source_block_bytes, null);
-            const source_block_handles = try cursor_alloc.alloc(?cache_mod.Handle, source_count);
-            errdefer cursor_alloc.free(source_block_handles);
-            @memset(source_block_handles, null);
-            const source_block_indices = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(source_block_indices);
-            @memset(source_block_indices, null);
-            const advance_sources = try cursor_alloc.alloc(usize, source_count);
-            errdefer cursor_alloc.free(advance_sources);
-            const source_heap = try cursor_alloc.alloc(usize, source_count);
-            errdefer cursor_alloc.free(source_heap);
-            const source_heap_positions = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(source_heap_positions);
-            @memset(source_heap_positions, null);
-            return .{
-                .allocator = cursor_alloc,
-                .backend = self.backend,
-                .mutable = &self.backend.mutable,
-                .immutable_memtables = self.immutable_memtables,
-                .runs = self.runs,
-                .l0_groups = self.l0_groups,
-                .levels = self.levels,
-                .namespace = self.namespace,
-                .positions = positions,
-                .source_entries = source_entries,
-                .source_block_bytes = source_block_bytes,
-                .source_block_handles = source_block_handles,
-                .source_block_indices = source_block_indices,
-                .advance_sources = advance_sources,
-                .source_heap = source_heap,
-                .source_heap_positions = source_heap_positions,
-            };
+            return try LocalCursor.init(cursor_alloc, self.backend, &self.backend.mutable, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.namespace, false);
         }
     };
 }
@@ -2454,54 +2432,9 @@ pub fn BoundProbeCursor(comptime BackendType: type) type {
                 &.{};
             defer if (immutable_memtables.len > 0) self.allocator.free(immutable_memtables);
 
-            const positions = try metadata_allocator.alloc(?usize, 1 + immutable_memtables.len + runs.len);
-            defer metadata_allocator.free(positions);
-            @memset(positions, null);
-            const source_entries = try metadata_allocator.alloc(?MergeCursor(BackendType, ActiveMemTable).SourceEntry, positions.len);
-            defer metadata_allocator.free(source_entries);
-            @memset(source_entries, null);
-            const source_block_bytes = try metadata_allocator.alloc(?[]const u8, positions.len);
-            defer {
-                metadata_allocator.free(source_block_bytes);
-            }
-            @memset(source_block_bytes, null);
-            const source_block_handles = try metadata_allocator.alloc(?cache_mod.Handle, positions.len);
-            defer metadata_allocator.free(source_block_handles);
-            @memset(source_block_handles, null);
-            const source_block_indices = try metadata_allocator.alloc(?usize, positions.len);
-            defer metadata_allocator.free(source_block_indices);
-            @memset(source_block_indices, null);
-            const advance_sources = try metadata_allocator.alloc(usize, positions.len);
-            defer metadata_allocator.free(advance_sources);
-            const source_heap = try metadata_allocator.alloc(usize, positions.len);
-            defer metadata_allocator.free(source_heap);
-            const source_heap_positions = try metadata_allocator.alloc(?usize, positions.len);
-            defer metadata_allocator.free(source_heap_positions);
-            @memset(source_heap_positions, null);
-
-            var cursor = MergeCursor(BackendType, ActiveMemTable){
-                .allocator = metadata_allocator,
-                .backend = self.backend,
-                .mutable = &self.backend.mutable,
-                .immutable_memtables = immutable_memtables,
-                .runs = runs,
-                .l0_groups = l0_groups,
-                .levels = levels,
-                .namespace = self.namespace,
-                .positions = positions,
-                .source_entries = source_entries,
-                .source_block_bytes = source_block_bytes,
-                .source_block_handles = source_block_handles,
-                .source_block_indices = source_block_indices,
-                .advance_sources = advance_sources,
-                .source_heap = source_heap,
-                .source_heap_positions = source_heap_positions,
-                .upper_bound = self.upper_bound,
-                .backend_locked = true,
-            };
-            defer {
-                for (0..source_block_bytes.len) |source_index| cursor.clearSourceBlock(source_index);
-            }
+            var cursor = try MergeCursor(BackendType, ActiveMemTable).init(metadata_allocator, self.backend, &self.backend.mutable, immutable_memtables, runs, l0_groups, levels, self.namespace, true);
+            defer cursor.close();
+            cursor.upper_bound = self.upper_bound;
             const entry = if (inclusive)
                 try cursor.seekAtOrAfter(stable_key)
             else blk: {
@@ -2905,48 +2838,8 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
 
         pub fn openCursor(self: *@This()) !LocalCursor {
             try self.ensureCursorSnapshot();
-            const source_count = 1 + self.cursor_immutable_memtables.len + self.cursor_runs.len;
             const cursor_alloc = runtimeScratchAllocator(self.allocator);
-            const positions = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(positions);
-            @memset(positions, null);
-            const source_entries = try cursor_alloc.alloc(?LocalCursor.SourceEntry, source_count);
-            errdefer cursor_alloc.free(source_entries);
-            @memset(source_entries, null);
-            const source_block_bytes = try cursor_alloc.alloc(?[]const u8, source_count);
-            errdefer cursor_alloc.free(source_block_bytes);
-            @memset(source_block_bytes, null);
-            const source_block_handles = try cursor_alloc.alloc(?cache_mod.Handle, source_count);
-            errdefer cursor_alloc.free(source_block_handles);
-            @memset(source_block_handles, null);
-            const source_block_indices = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(source_block_indices);
-            @memset(source_block_indices, null);
-            const advance_sources = try cursor_alloc.alloc(usize, source_count);
-            errdefer cursor_alloc.free(advance_sources);
-            const source_heap = try cursor_alloc.alloc(usize, source_count);
-            errdefer cursor_alloc.free(source_heap);
-            const source_heap_positions = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(source_heap_positions);
-            @memset(source_heap_positions, null);
-            return .{
-                .allocator = cursor_alloc,
-                .backend = self.backend,
-                .mutable = &self.cursor_overlay.?,
-                .immutable_memtables = self.cursor_immutable_memtables,
-                .runs = self.cursor_runs,
-                .l0_groups = self.cursor_l0_groups,
-                .levels = self.cursor_levels,
-                .namespace = self.namespace,
-                .positions = positions,
-                .source_entries = source_entries,
-                .source_block_bytes = source_block_bytes,
-                .source_block_handles = source_block_handles,
-                .source_block_indices = source_block_indices,
-                .advance_sources = advance_sources,
-                .source_heap = source_heap,
-                .source_heap_positions = source_heap_positions,
-            };
+            return try LocalCursor.init(cursor_alloc, self.backend, &self.cursor_overlay.?, self.cursor_immutable_memtables, self.cursor_runs, self.cursor_l0_groups, self.cursor_levels, self.namespace, false);
         }
 
         fn ensureCursorSnapshot(self: *@This()) !void {
@@ -3117,48 +3010,8 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
         }
 
         pub fn openCursor(self: *@This(), namespace: backend_types.Namespace) !LocalCursor {
-            const source_count = 1 + self.immutable_memtables.len + self.runs.len;
             const cursor_alloc = runtimeScratchAllocator(self.allocator);
-            const positions = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(positions);
-            @memset(positions, null);
-            const source_entries = try cursor_alloc.alloc(?LocalCursor.SourceEntry, source_count);
-            errdefer cursor_alloc.free(source_entries);
-            @memset(source_entries, null);
-            const source_block_bytes = try cursor_alloc.alloc(?[]const u8, source_count);
-            errdefer cursor_alloc.free(source_block_bytes);
-            @memset(source_block_bytes, null);
-            const source_block_handles = try cursor_alloc.alloc(?cache_mod.Handle, source_count);
-            errdefer cursor_alloc.free(source_block_handles);
-            @memset(source_block_handles, null);
-            const source_block_indices = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(source_block_indices);
-            @memset(source_block_indices, null);
-            const advance_sources = try cursor_alloc.alloc(usize, source_count);
-            errdefer cursor_alloc.free(advance_sources);
-            const source_heap = try cursor_alloc.alloc(usize, source_count);
-            errdefer cursor_alloc.free(source_heap);
-            const source_heap_positions = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(source_heap_positions);
-            @memset(source_heap_positions, null);
-            return .{
-                .allocator = cursor_alloc,
-                .backend = self.backend,
-                .mutable = self.mutable_snapshot,
-                .immutable_memtables = self.immutable_memtables,
-                .runs = self.runs,
-                .l0_groups = self.l0_groups,
-                .levels = self.levels,
-                .namespace = namespace,
-                .positions = positions,
-                .source_entries = source_entries,
-                .source_block_bytes = source_block_bytes,
-                .source_block_handles = source_block_handles,
-                .source_block_indices = source_block_indices,
-                .advance_sources = advance_sources,
-                .source_heap = source_heap,
-                .source_heap_positions = source_heap_positions,
-            };
+            return try LocalCursor.init(cursor_alloc, self.backend, self.mutable_snapshot, self.immutable_memtables, self.runs, self.l0_groups, self.levels, namespace, false);
         }
     };
 }
@@ -4990,48 +4843,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
         pub fn openCursor(self: *@This(), namespace: backend_types.Namespace) !LocalCursor {
             try self.ensureCursorSnapshot();
-            const source_count = 1 + self.cursor_immutable_memtables.len + self.cursor_runs.len;
             const cursor_alloc = runtimeScratchAllocator(self.allocator);
-            const positions = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(positions);
-            @memset(positions, null);
-            const source_entries = try cursor_alloc.alloc(?LocalCursor.SourceEntry, source_count);
-            errdefer cursor_alloc.free(source_entries);
-            @memset(source_entries, null);
-            const source_block_bytes = try cursor_alloc.alloc(?[]const u8, source_count);
-            errdefer cursor_alloc.free(source_block_bytes);
-            @memset(source_block_bytes, null);
-            const source_block_handles = try cursor_alloc.alloc(?cache_mod.Handle, source_count);
-            errdefer cursor_alloc.free(source_block_handles);
-            @memset(source_block_handles, null);
-            const source_block_indices = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(source_block_indices);
-            @memset(source_block_indices, null);
-            const advance_sources = try cursor_alloc.alloc(usize, source_count);
-            errdefer cursor_alloc.free(advance_sources);
-            const source_heap = try cursor_alloc.alloc(usize, source_count);
-            errdefer cursor_alloc.free(source_heap);
-            const source_heap_positions = try cursor_alloc.alloc(?usize, source_count);
-            errdefer cursor_alloc.free(source_heap_positions);
-            @memset(source_heap_positions, null);
-            return .{
-                .allocator = cursor_alloc,
-                .backend = self.backend,
-                .mutable = &self.cursor_overlay.?,
-                .immutable_memtables = self.cursor_immutable_memtables,
-                .runs = self.cursor_runs,
-                .l0_groups = self.cursor_l0_groups,
-                .levels = self.cursor_levels,
-                .namespace = namespace,
-                .positions = positions,
-                .source_entries = source_entries,
-                .source_block_bytes = source_block_bytes,
-                .source_block_handles = source_block_handles,
-                .source_block_indices = source_block_indices,
-                .advance_sources = advance_sources,
-                .source_heap = source_heap,
-                .source_heap_positions = source_heap_positions,
-            };
+            return try LocalCursor.init(cursor_alloc, self.backend, &self.cursor_overlay.?, self.cursor_immutable_memtables, self.cursor_runs, self.cursor_l0_groups, self.cursor_levels, namespace, false);
         }
 
         fn ensureCursorSnapshot(self: *@This()) !void {
