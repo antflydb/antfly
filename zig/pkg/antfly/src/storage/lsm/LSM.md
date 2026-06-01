@@ -267,6 +267,9 @@ Large-ingest guardrails:
      with a `--wal-sync-on-commit` workload flag.
 3. [ ] Replace recovery replay allocation churn with a bounded recovery
    allocation model that can release whole chunks after flush.
+   - [x] First slice: state WAL recovery now reads segment chunks directly
+     into the reusable pending replay buffer instead of allocating one chunk
+     per read and retaining those chunks until segment replay exits.
 4. [ ] Add final-state HBC bulk publication for sustained ingest so large loads
    avoid persisting every intermediate online mutation.
 5. [ ] Raise compaction concurrency only after the scheduler can prove selected

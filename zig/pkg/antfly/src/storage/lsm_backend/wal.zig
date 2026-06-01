@@ -970,7 +970,6 @@ fn replayFileStreaming(
     hooks: ?ReplayHooks,
     options: ReplayFileOptions,
 ) !void {
-    const chunk_allocator = allocator;
     const file_size = storage.fileSize(wal_path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
@@ -981,13 +980,16 @@ fn replayFileStreaming(
 
     var pending = std.ArrayListUnmanaged(u8).empty;
     defer pending.deinit(allocator);
+    try pending.ensureTotalCapacityPrecise(allocator, replay_chunk_bytes + @max(record_header_len, replay_record_header_len));
 
     var offset: u64 = 0;
     while (offset < file_size) {
         const len: usize = @intCast(@min(@as(u64, replay_chunk_bytes), file_size - offset));
-        const chunk = try storage.readFileRangeAlloc(chunk_allocator, wal_path, offset, len);
-        defer chunk_allocator.free(chunk);
-        try pending.appendSlice(allocator, chunk);
+        const start = pending.items.len;
+        try pending.ensureUnusedCapacity(allocator, len);
+        pending.items.len += len;
+        errdefer pending.items.len = start;
+        try storage.readFileRangeInto(allocator, wal_path, offset, pending.items[start..][0..len]);
         const final_chunk = offset + len >= file_size;
         offset += len;
         consumeCompleteRecords(allocator, &pending, segment, mutable, stats, hooks) catch |err| switch (err) {
@@ -1628,6 +1630,120 @@ test "lsm wal encodes and replays state" {
     try std.testing.expectEqual(@as(u64, 2), stats.entries);
     try std.testing.expectEqualStrings("A", try replayed.get(.{ .name = "docs" }, "a"));
     try std.testing.expectError(error.NotFound, replayed.get(.{}, "b"));
+}
+
+test "lsm wal replay reads chunks into bounded pending buffer" {
+    const CountingStorage = struct {
+        backing: *storage_io.MemoryStorage,
+        range_alloc_reads: usize = 0,
+        range_alloc_log_reads: usize = 0,
+        range_into_reads: usize = 0,
+        range_into_log_reads: usize = 0,
+
+        fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().createDirPath(path);
+        }
+
+        fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().readFileAlloc(allocator, path, max_bytes);
+        }
+
+        fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.range_alloc_reads += 1;
+            if (std.mem.endsWith(u8, path, ".log")) self.range_alloc_log_reads += 1;
+            return self.backing.storage().readFileRangeAlloc(allocator, path, offset, len);
+        }
+
+        fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.range_into_reads += 1;
+            if (std.mem.endsWith(u8, path, ".log")) self.range_into_log_reads += 1;
+            return self.backing.storage().readFileRangeInto(std.testing.allocator, path, offset, out);
+        }
+
+        fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().fileSize(path);
+        }
+
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
+        }
+
+        fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().writeFileAbsolute(path, contents);
+        }
+
+        fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().appendFileAbsolute(std.testing.allocator, path, contents, sync);
+        }
+
+        fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().renameAbsolute(old_path, new_path);
+        }
+
+        fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().deleteFileAbsolute(path);
+        }
+
+        fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().deleteTree(path);
+        }
+
+        fn nowNs(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().nowNs();
+        }
+    };
+
+    const vtable: storage_io.Storage.VTable = .{
+        .create_dir_path = CountingStorage.createDirPath,
+        .read_file_alloc = CountingStorage.readFileAlloc,
+        .read_file_range_alloc = CountingStorage.readFileRangeAlloc,
+        .read_file_range_into = CountingStorage.readFileRangeInto,
+        .file_size = CountingStorage.fileSize,
+        .read_file_trailer_alloc = CountingStorage.readFileTrailerAlloc,
+        .write_file_absolute = CountingStorage.writeFileAbsolute,
+        .append_file_absolute = CountingStorage.appendFileAbsolute,
+        .rename_absolute = CountingStorage.renameAbsolute,
+        .delete_file_absolute = CountingStorage.deleteFileAbsolute,
+        .delete_tree = CountingStorage.deleteTree,
+        .now_ns = CountingStorage.nowNs,
+    };
+
+    var backing = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer backing.deinit();
+    var counting = CountingStorage{ .backing = &backing };
+    const storage = storage_io.HostStorage.init(&counting, &vtable).storage();
+    const root_dir = "/wal-replay-bounded-buffer-test";
+    try storage.createDirPath(root_dir);
+
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    for (0..64) |i| {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>3}", .{i});
+        try state.upsert(std.testing.allocator, .{ .name = "docs" }, key, "value", false);
+    }
+    _ = try appendStateWithOptions(storage, std.testing.allocator, root_dir, &state, false, .{ .segment_bytes = 256 });
+
+    var replayed: State = .{};
+    defer replayed.deinit(std.testing.allocator);
+    const stats = try replayIntoMutable(storage, std.testing.allocator, root_dir, &replayed);
+    try std.testing.expectEqual(@as(u64, 1), stats.records);
+    try std.testing.expectEqual(@as(u64, 64), stats.entries);
+    try std.testing.expect(counting.range_into_reads > 0);
+    try std.testing.expect(counting.range_into_log_reads > 0);
+    try std.testing.expectEqual(@as(usize, 0), counting.range_alloc_log_reads);
 }
 
 test "lsm wal rotates small segments and replays all records" {
