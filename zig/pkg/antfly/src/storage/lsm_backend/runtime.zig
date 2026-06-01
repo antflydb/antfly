@@ -1993,7 +1993,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             else
                 &.{};
             errdefer if (immutable_memtables.len > 0) backend.allocator.free(immutable_memtables);
-            const mutable_snapshot = try snapshotReadMutable(BackendType, backend);
+            const mutable_snapshot = try snapshotReadMutable(BackendType, backend, .bound_read_txn);
             errdefer if (mutable_snapshot.owned) {
                 var owned = @constCast(mutable_snapshot.state);
                 owned.deinit(backend.allocator);
@@ -2115,7 +2115,10 @@ fn releaseReadReader(comptime BackendType: type, backend: *BackendType) void {
     }
 }
 
-fn snapshotReadMutable(comptime BackendType: type, backend: *BackendType) !MutableReadSnapshot {
+fn snapshotReadMutable(comptime BackendType: type, backend: *BackendType, reason: anytype) !MutableReadSnapshot {
+    if (@hasDecl(BackendType, "snapshotMutableStateWithReason")) {
+        return .{ .state = try backend.snapshotMutableStateWithReason(reason), .owned = false };
+    }
     if (@hasDecl(BackendType, "snapshotMutableState")) {
         return .{ .state = try backend.snapshotMutableState(), .owned = false };
     }
@@ -3051,7 +3054,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             else
                 &.{};
             errdefer if (immutable_memtables.len > 0) backend.allocator.free(immutable_memtables);
-            const mutable_snapshot = try snapshotReadMutable(BackendType, backend);
+            const mutable_snapshot = try snapshotReadMutable(BackendType, backend, .namespace_read_txn);
             errdefer if (mutable_snapshot.owned) {
                 var owned = @constCast(mutable_snapshot.state);
                 owned.deinit(backend.allocator);

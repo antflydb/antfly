@@ -465,6 +465,24 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_calls_total", "counter", "LSM mutable snapshot clone calls issued by snapshot reads", stats.mutable_snapshot_clone_calls);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_bytes_total", "counter", "Total bytes cloned into LSM mutable snapshot reads", stats.mutable_snapshot_clone_bytes_total);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_peak_bytes", "gauge", "Peak bytes cloned for a single LSM mutable snapshot read", stats.mutable_snapshot_clone_peak_bytes);
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_calls_total", "counter", "LSM mutable snapshot clone calls by reader class");
+    for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
+        const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+        const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) }};
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_mutable_snapshot_clone_reason_calls_total", &labels, reason_stats.calls);
+    }
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_bytes_total", "counter", "Total bytes cloned into LSM mutable snapshot reads by reader class");
+    for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
+        const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+        const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) }};
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_mutable_snapshot_clone_reason_bytes_total", &labels, reason_stats.bytes_total);
+    }
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_peak_bytes", "gauge", "Peak bytes cloned for a single LSM mutable snapshot read by reader class");
+    for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
+        const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+        const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) }};
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_mutable_snapshot_clone_reason_peak_bytes", &labels, reason_stats.peak_bytes);
+    }
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_run_logical_entry_bytes", "gauge", "Cached write LSM logical table entry bytes", stats.total_run_logical_entry_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_run_physical_entry_bytes", "gauge", "Cached write LSM physical table entry bytes after block compression", stats.total_run_physical_entry_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_total_run_compressed_blocks", "gauge", "Cached write LSM compressed table blocks", stats.total_run_compressed_blocks);

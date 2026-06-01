@@ -1846,7 +1846,7 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_mutable_snapshot_clone_calls={d} lsm_mutable_snapshot_clone_bytes_total={d} lsm_mutable_snapshot_clone_peak_bytes={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d}",
+            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_mutable_snapshot_clone_calls={d} lsm_mutable_snapshot_clone_bytes_total={d} lsm_mutable_snapshot_clone_peak_bytes={d} lsm_mutable_snapshot_clone_bound_read_txn_calls={d} lsm_mutable_snapshot_clone_bound_read_txn_bytes_total={d} lsm_mutable_snapshot_clone_namespace_read_txn_calls={d} lsm_mutable_snapshot_clone_namespace_read_txn_bytes_total={d} lsm_mutable_snapshot_clone_other_calls={d} lsm_mutable_snapshot_clone_other_bytes_total={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d}",
             .{
                 label,
                 ft_pending_used,
@@ -1869,6 +1869,12 @@ pub const IndexManager = struct {
                 lsm_stats.mutable_snapshot_clone_calls,
                 lsm_stats.mutable_snapshot_clone_bytes_total,
                 lsm_stats.mutable_snapshot_clone_peak_bytes,
+                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.bound_read_txn)].calls,
+                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.bound_read_txn)].bytes_total,
+                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.namespace_read_txn)].calls,
+                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.namespace_read_txn)].bytes_total,
+                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.other)].calls,
+                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.other)].bytes_total,
                 lsm_cache_stats.entry_count,
                 lsm_cache_stats.run_state.used_bytes,
                 lsm_cache_stats.run_table_raw.used_bytes,

@@ -36,6 +36,8 @@ pub const NativeStorageStats = impl.NativeStorageStats;
 pub const Cache = impl.Cache;
 pub const DefaultCacheSizeBytes = impl.DefaultCacheSizeBytes;
 pub const TableEntry = impl.TableEntry;
+pub const MutableSnapshotReason = impl.MutableSnapshotReason;
+pub const mutableSnapshotReasonName = impl.mutableSnapshotReasonName;
 
 test {
     _ = impl;

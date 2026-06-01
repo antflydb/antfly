@@ -48,6 +48,32 @@ const compareNamespace = state_mod.compareNamespace;
 const compareEntryTo = state_mod.compareEntryTo;
 const CounterU64 = platform.atomic.Value(u64);
 
+pub const MutableSnapshotReason = enum(u8) {
+    bound_read_txn,
+    namespace_read_txn,
+    other,
+};
+
+pub const mutable_snapshot_reason_count = @typeInfo(MutableSnapshotReason).@"enum".fields.len;
+
+pub const MutableSnapshotCloneReasonStats = struct {
+    calls: u64 = 0,
+    bytes_total: u64 = 0,
+    peak_bytes: u64 = 0,
+};
+
+pub fn mutableSnapshotReasonName(reason: MutableSnapshotReason) []const u8 {
+    return switch (reason) {
+        .bound_read_txn => "bound_read_txn",
+        .namespace_read_txn => "namespace_read_txn",
+        .other => "other",
+    };
+}
+
+fn mutableSnapshotReasonIndex(reason: MutableSnapshotReason) usize {
+    return @intFromEnum(reason);
+}
+
 fn atomicMaxCounter(counter: *CounterU64, candidate: u64) void {
     var current = counter.load(.monotonic);
     while (candidate > current) {
@@ -182,6 +208,7 @@ pub const Backend = struct {
         mutable_snapshot_clone_calls: u64 = 0,
         mutable_snapshot_clone_bytes_total: u64 = 0,
         mutable_snapshot_clone_peak_bytes: u64 = 0,
+        mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
         immutable_memtables: u64 = 0,
         immutable_entries: u64 = 0,
         immutable_bytes: u64 = 0,
@@ -236,6 +263,11 @@ pub const Backend = struct {
         dst.mutable_snapshot_clone_calls +|= src.mutable_snapshot_clone_calls;
         dst.mutable_snapshot_clone_bytes_total +|= src.mutable_snapshot_clone_bytes_total;
         dst.mutable_snapshot_clone_peak_bytes = @max(dst.mutable_snapshot_clone_peak_bytes, src.mutable_snapshot_clone_peak_bytes);
+        for (&dst.mutable_snapshot_clone_by_reason, src.mutable_snapshot_clone_by_reason) |*dst_reason, src_reason| {
+            dst_reason.calls +|= src_reason.calls;
+            dst_reason.bytes_total +|= src_reason.bytes_total;
+            dst_reason.peak_bytes = @max(dst_reason.peak_bytes, src_reason.peak_bytes);
+        }
         dst.immutable_memtables +|= src.immutable_memtables;
         dst.immutable_entries +|= src.immutable_entries;
         dst.immutable_bytes +|= src.immutable_bytes;
@@ -547,6 +579,7 @@ pub const Backend = struct {
     mutable_snapshot_clone_calls: u64 = 0,
     mutable_snapshot_clone_bytes_total: u64 = 0,
     mutable_snapshot_clone_peak_bytes: u64 = 0,
+    mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
     active_bulk_ingest_batches: usize = 0,
     mutable: ActiveMemTable = .{},
     mutable_wal_range: WalSegmentRange = .{},
@@ -648,6 +681,7 @@ pub const Backend = struct {
             .mutable_snapshot_clone_calls = self.mutable_snapshot_clone_calls,
             .mutable_snapshot_clone_bytes_total = self.mutable_snapshot_clone_bytes_total,
             .mutable_snapshot_clone_peak_bytes = self.mutable_snapshot_clone_peak_bytes,
+            .mutable_snapshot_clone_by_reason = self.mutable_snapshot_clone_by_reason,
             .immutable_memtables = @intCast(self.activeImmutableMemtableCount()),
             .total_runs = @intCast(self.runs.items.len),
             .obsolete_paths = @intCast(self.obsolete_paths.items.len),
@@ -961,6 +995,10 @@ pub const Backend = struct {
     }
 
     pub fn snapshotMutableState(self: *Backend) !*const State {
+        return try self.snapshotMutableStateWithReason(.other);
+    }
+
+    pub fn snapshotMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !*const State {
         if (self.mutable_read_snapshot) |snapshot| return snapshot;
         if (self.mutable.entries.items.len == 0) return &self.empty_mutable_snapshot;
         const snapshot = try self.allocator.create(State);
@@ -971,6 +1009,10 @@ pub const Backend = struct {
         self.mutable_snapshot_clone_calls +|= 1;
         self.mutable_snapshot_clone_bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_peak_bytes = @max(self.mutable_snapshot_clone_peak_bytes, snapshot_bytes);
+        const reason_index = mutableSnapshotReasonIndex(reason);
+        self.mutable_snapshot_clone_by_reason[reason_index].calls +|= 1;
+        self.mutable_snapshot_clone_by_reason[reason_index].bytes_total +|= snapshot_bytes;
+        self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes = @max(self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes, snapshot_bytes);
         try self.retired_mutable_snapshots.ensureUnusedCapacity(self.allocator, 1);
         self.mutable_read_snapshot = snapshot;
         return snapshot;
@@ -7231,6 +7273,50 @@ test "lsm backend rotates large mutable state for read snapshots instead of clon
     try std.testing.expectEqual(@as(?*State, null), backend.mutable_read_snapshot);
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
     try std.testing.expectEqual(@as(u64, 0), backend.mutable_snapshot_clone_calls);
+}
+
+test "lsm backend attributes mutable snapshot clones by reader class" {
+    var backend = Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    {
+        var read = try runtime.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("A", try read.get("doc:a"));
+    }
+
+    var maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 1), maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.bound_read_txn)].calls);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.namespace_read_txn)].calls);
+    try std.testing.expect(maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.bound_read_txn)].bytes_total > 0);
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:b", "B");
+        try txn.commit();
+    }
+
+    {
+        var read = try backend.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("B", try read.get(.{ .name = "docs" }, "doc:b"));
+    }
+
+    maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 2), maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.bound_read_txn)].calls);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.namespace_read_txn)].calls);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.other)].calls);
 }
 
 test "lsm backend write txns retain reader guards until completion" {
