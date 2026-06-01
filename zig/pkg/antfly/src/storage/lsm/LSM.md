@@ -208,6 +208,10 @@ Large-ingest guardrails:
    - [x] Live mutable merge cursors now reuse cursor-owned entry scratch across
      source movement, avoiding one allocation/free cycle per visible mutable row
      while preserving the valid-until-next cursor contract.
+   - [x] Live mutable cursor scratch now has a retained-cap policy: rows within
+     the cap reuse a bounded geometric buffer, while oversized rows are released
+     on the next smaller row instead of pinning cursor memory for the rest of
+     the scan.
 6. [ ] Cache per-cursor source layout (`runs`, L0 groups, lower levels, and
    immutable pointer slice) across repeated seeks while the cursor snapshot is
    valid.

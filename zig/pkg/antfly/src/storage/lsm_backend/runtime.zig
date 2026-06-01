@@ -363,6 +363,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             @max(@alignOf(?usize), @alignOf(?SourceEntry)),
             @max(@max(@alignOf(?[]const u8), @alignOf(?cache_mod.Handle)), @max(@alignOf(?*const lsm_table_file.TableIndex), @alignOf(usize))),
         );
+        const max_retained_mutable_source_entry_scratch: usize = 1 * 1024 * 1024;
+        const min_retained_mutable_source_entry_scratch: usize = 4096;
 
         allocator: Allocator,
         backend: *BackendType,
@@ -1081,16 +1083,31 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn mutableSourceEntryScratch(self: *@This(), needed: usize) ![]u8 {
+            var current_capacity: usize = 0;
             if (self.mutable_source_entry_bytes) |bytes| {
                 if (bytes.len >= needed) {
-                    return bytes[0..needed];
+                    if (bytes.len <= max_retained_mutable_source_entry_scratch or needed > max_retained_mutable_source_entry_scratch) {
+                        return bytes[0..needed];
+                    }
                 }
+                current_capacity = if (bytes.len <= max_retained_mutable_source_entry_scratch) bytes.len else 0;
                 self.allocator.free(bytes);
                 self.mutable_source_entry_bytes = null;
             }
-            const bytes = try self.allocator.alloc(u8, needed);
+            const bytes = try self.allocator.alloc(u8, mutableSourceEntryScratchCapacity(current_capacity, needed));
             self.mutable_source_entry_bytes = bytes;
             return bytes[0..needed];
+        }
+
+        fn mutableSourceEntryScratchCapacity(current_capacity: usize, needed: usize) usize {
+            if (needed > max_retained_mutable_source_entry_scratch) return needed;
+            var capacity = @max(current_capacity, min_retained_mutable_source_entry_scratch);
+            while (capacity < needed) {
+                const next_capacity = capacity * 2;
+                if (next_capacity >= max_retained_mutable_source_entry_scratch) return max_retained_mutable_source_entry_scratch;
+                capacity = next_capacity;
+            }
+            return capacity;
         }
 
         fn mutableSourceLock(self: *@This()) bool {
@@ -5440,4 +5457,39 @@ test "lsm merge cursor frees loaded blocks with backend allocator" {
     try std.testing.expectEqual(@as(?[]const u8, null), cursor.source_block_bytes[0]);
     try std.testing.expectEqual(@as(?cache_mod.Handle, null), cursor.source_block_handles[0]);
     try std.testing.expectEqual(@as(?usize, null), cursor.source_block_indices[0]);
+}
+
+test "lsm merge cursor caps retained mutable source scratch" {
+    const TestBackend = struct {
+        allocator: Allocator,
+        mutable: ActiveMemTable = .{},
+    };
+
+    const Cursor = MergeCursor(TestBackend, ActiveMemTable);
+
+    var backend = TestBackend{ .allocator = std.testing.allocator };
+    defer backend.mutable.deinit(std.testing.allocator);
+
+    var cursor = try Cursor.init(
+        std.testing.allocator,
+        &backend,
+        &backend.mutable,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        .{ .name = "docs" },
+        true,
+    );
+    defer cursor.close();
+
+    const oversized_needed = Cursor.max_retained_mutable_source_entry_scratch + 128;
+    _ = try cursor.mutableSourceEntryScratch(oversized_needed);
+    try std.testing.expectEqual(oversized_needed, cursor.mutable_source_entry_bytes.?.len);
+
+    _ = try cursor.mutableSourceEntryScratch(32);
+    try std.testing.expectEqual(Cursor.min_retained_mutable_source_entry_scratch, cursor.mutable_source_entry_bytes.?.len);
+
+    _ = try cursor.mutableSourceEntryScratch(Cursor.min_retained_mutable_source_entry_scratch + 1);
+    try std.testing.expectEqual(Cursor.min_retained_mutable_source_entry_scratch * 2, cursor.mutable_source_entry_bytes.?.len);
 }
