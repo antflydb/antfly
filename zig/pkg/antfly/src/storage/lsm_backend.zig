@@ -172,6 +172,8 @@ pub const Backend = struct {
         manifest_ns: u64 = 0,
         write_pressure_compactions: u64 = 0,
         write_pressure_ns: u64 = 0,
+        wal_pressure_flushes: u64 = 0,
+        wal_pressure_ns: u64 = 0,
         wal_append_records: u64 = 0,
         wal_append_entries: u64 = 0,
         wal_append_bytes: u64 = 0,
@@ -627,6 +629,7 @@ pub const Backend = struct {
     background_io_reserved_bytes: u64 = 0,
     background_io_denied_jobs: u64 = 0,
     background_io_oversized_jobs: u64 = 0,
+    write_pressure_enforcing: bool = false,
     remembered_compaction: ?compaction_mod.RememberedCompaction = null,
     write_stats: WriteStats = .{},
     read_stats: AtomicReadStats = .{},
@@ -1312,14 +1315,16 @@ pub const Backend = struct {
     }
 
     pub fn maybeFlushMutable(self: *Backend) !void {
-        if (!self.shouldFlushMutable()) return;
-        if (self.shouldDeferCommitFlush()) {
-            try self.rotateMutableToImmutable();
-            self.scheduleImmutableFlushJob();
-            try self.enforceDeferredImmutableBackpressure();
-        } else {
-            try self.flushMutable();
+        if (self.shouldFlushMutable()) {
+            if (self.shouldDeferCommitFlush()) {
+                try self.rotateMutableToImmutable();
+                self.scheduleImmutableFlushJob();
+                try self.enforceDeferredImmutableBackpressure();
+            } else {
+                try self.flushMutable();
+            }
         }
+        try self.enforceWalRetentionHardPressureGuarded();
     }
 
     fn shouldDeferCommitFlush(self: *const Backend) bool {
@@ -2721,8 +2726,14 @@ pub const Backend = struct {
         return std.math.mul(usize, @max(@as(usize, 1), soft), 4) catch std.math.maxInt(usize);
     }
 
-    fn enforceWritePressure(self: *Backend) !void {
+    fn enforceWritePressure(self: *Backend) anyerror!void {
         if (self.bulkIngestActive()) return;
+        if (self.write_pressure_enforcing) return;
+        self.write_pressure_enforcing = true;
+        defer self.write_pressure_enforcing = false;
+
+        try self.enforceWalRetentionHardPressure();
+
         const hard_runs = self.effectiveL0HardLimitRuns();
         const hard_bytes = self.options.l0_hard_limit_bytes;
         if (hard_runs == 0 and hard_bytes == 0) return;
@@ -2743,6 +2754,45 @@ pub const Backend = struct {
         if (self.compaction_stats.compactions != before_compactions) {
             self.write_stats.write_pressure_compactions += 1;
             self.write_stats.write_pressure_ns += self.writeStatsElapsedNs(start_ns);
+        }
+    }
+
+    fn enforceWalRetentionHardPressureGuarded(self: *Backend) anyerror!void {
+        if (self.bulkIngestActive()) return;
+        if (self.write_pressure_enforcing) return;
+        self.write_pressure_enforcing = true;
+        defer self.write_pressure_enforcing = false;
+        try self.enforceWalRetentionHardPressure();
+    }
+
+    fn enforceWalRetentionHardPressure(self: *Backend) anyerror!void {
+        var retention = try self.snapshotWalRetentionForPressureLocked() orelse return;
+        if (!self.walRetentionOverHardLimit(retention)) return;
+
+        const start_ns = self.writeStatsNowNs();
+        var flushes: u64 = 0;
+        if (self.mutable.entries.items.len > 0) {
+            try self.rotateMutableToImmutable();
+        }
+
+        const saved_budget = self.maintenance_io_budget_remaining;
+        self.maintenance_io_budget_remaining = null;
+        defer self.maintenance_io_budget_remaining = saved_budget;
+
+        while (self.activeImmutableMemtableCount() > 0 and self.walRetentionOverHardLimit(retention)) {
+            if (!try self.flushOldestImmutableMemtable()) break;
+            flushes += 1;
+            retention = try self.snapshotWalRetentionForPressureLocked() orelse break;
+        }
+
+        if (self.activeImmutableMemtableCount() == 0 and self.mutable.entries.items.len == 0 and self.walRetentionOverHardLimit(retention)) {
+            try self.resetWalAfterManifestCheckpoint();
+            retention = try self.snapshotWalRetentionForPressureLocked() orelse retention;
+        }
+
+        if (flushes > 0 or !self.walRetentionOverHardLimit(retention)) {
+            self.write_stats.wal_pressure_flushes += flushes;
+            self.write_stats.wal_pressure_ns += self.writeStatsElapsedNs(start_ns);
         }
     }
 
@@ -4048,6 +4098,54 @@ test "lsm backend wal pressure maintenance flushes and checkpoints retained segm
     try std.testing.expect(try backend.runMaintenanceStep());
 
     maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_entries);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.immutable_memtables);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_oldest_retained_segment);
+    try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
+}
+
+test "lsm backend hard wal pressure forces foreground checkpoint on commit" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-hard-wal-pressure-commit";
+    const options = Options{
+        .flush_threshold = 1024,
+        .storage = storage.storage(),
+        .wal_segment_bytes = 32,
+        .wal_hard_limit_segments = 1,
+        .compact_threshold_runs = 100,
+    };
+
+    var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+        try txn.commit();
+    }
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:b", "beta");
+        try txn.commit();
+    }
+
+    const write_stats = backend.snapshotWriteStats();
+    try std.testing.expect(write_stats.wal_pressure_flushes > 0);
+    try std.testing.expect(write_stats.wal_pressure_ns > 0);
+
+    const maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_entries);
     try std.testing.expectEqual(@as(u64, 0), maintenance.immutable_memtables);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);

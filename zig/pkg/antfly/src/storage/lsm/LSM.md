@@ -966,8 +966,10 @@ startup replay tax if it retains large WAL segments between runs.
      - retained WAL pressure feeds backend maintenance score
      - soft WAL pressure makes maintenance flush/checkpoint a live mutable
        memtable before the normal flush threshold
+     - hard WAL pressure forces foreground rotate/flush/checkpoint work on the
+       commit path so retained WAL segments are retired without waiting for a
+       later maintenance pass.
    - Remaining:
-     - hard-threshold write throttling/stalling
      - resource-manager pressure integration
 
 ### Remaining work
