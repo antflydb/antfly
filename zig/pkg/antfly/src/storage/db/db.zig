@@ -90,6 +90,7 @@ const graph_pattern_mod = @import("../../graph/pattern.zig");
 const search_mod = @import("../../search/search.zig");
 const search_geo_mod = @import("../../search/geo.zig");
 const mapper = @import("document_mapper.zig");
+const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const relational_store_mod = @import("relational_store.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
@@ -2673,6 +2674,7 @@ pub const DB = struct {
             .identity_namespace = self.core.identity_namespace,
             .alloc = self.runtime_alloc,
             .relational_base_rows = self.relationalColumnsForStore() != null,
+            .relational_columns = self.relationalColumnsForStore() orelse &.{},
         };
         var effective_cfg = cfg;
         effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
@@ -3289,13 +3291,14 @@ pub const DB = struct {
             for (owned_delete_keys.items) |key| self.alloc.free(key);
             owned_delete_keys.deinit(self.alloc);
         }
-        var relational_participant = relational_store_mod.WriteParticipant.init(
+        var relational_participant = relational_store_mod.WriteParticipant.initWithColumnIndexPolicy(
             self.alloc,
             self.core.store,
             &store_writes,
             &delete_keys,
             &owned_store_keys,
             &owned_store_values,
+            self.relationalColumnIndexPolicyForStore(),
         );
         var relational_participant_prepared = false;
         var relational_participant_closed = false;
@@ -4290,7 +4293,7 @@ pub const DB = struct {
     }
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
-        if (self.relationalColumnsForStore() != null and !isMetadataKey(key) and !internal_keys.isInternalUserKey(key)) {
+        if (self.relationalColumnsForStore() != null and !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) {
             return try relational_store_mod.getMaterializedAlloc(alloc, self.core.store, key);
         }
         const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
@@ -4348,7 +4351,7 @@ pub const DB = struct {
     }
 
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
-        if (!internal_keys.isInternalUserKey(key) and (try isExpiredDocumentKey(self, alloc, key))) return null;
+        if (!internal_keys.isInternalPhysicalTableDataKey(key) and (try isExpiredDocumentKey(self, alloc, key))) return null;
         const raw = try self.get(alloc, key) orelse return null;
         defer alloc.free(raw);
         const stored = try projectLookupStoredBytes(self, alloc, key, raw, opts);
@@ -4356,7 +4359,7 @@ pub const DB = struct {
     }
 
     pub fn getTimestamp(self: *DB, alloc: Allocator, key: []const u8) !u64 {
-        if (internal_keys.isInternalUserKey(key)) return 0;
+        if (internal_keys.isInternalPhysicalTableDataKey(key)) return 0;
         return try self.core.readTimestamp(alloc, key);
     }
 
@@ -4896,7 +4899,10 @@ pub const DB = struct {
         self.async_context.relational_base_rows = relational_base_rows;
         if (self.ttl_cleanup_context) |ctx| ctx.batch.relational_base_rows = relational_base_rows;
         if (self.enrichment_runtime) |runtime| runtime.setRelationalBaseRows(relational_base_rows);
-        if (self.transaction_recovery_identity_context) |ctx| ctx.relational_base_rows = relational_base_rows;
+        if (self.transaction_recovery_identity_context) |ctx| {
+            ctx.relational_base_rows = relational_base_rows;
+            ctx.relational_columns = self.relationalColumnsForStore() orelse &.{};
+        }
     }
 
     /// Returns the relational column catalog when the table is in relational
@@ -4906,6 +4912,11 @@ pub const DB = struct {
         const schema = self.core.schema orelse return null;
         if (schema.storage_mode != .relational) return null;
         return schema.relational_columns;
+    }
+
+    fn relationalColumnIndexPolicyForStore(self: *DB) relational_store_mod.ColumnIndexPolicy {
+        const columns = self.relationalColumnsForStore() orelse return relational_store_mod.ColumnIndexPolicy.all();
+        return relational_store_mod.ColumnIndexPolicy.fromColumns(columns);
     }
 
     /// Refresh schema-derived algebraic index configs (notably dynamic-template
@@ -4952,7 +4963,7 @@ pub const DB = struct {
             const relational_columns = self.relationalColumnsForStore() orelse break :blk intents;
             for (intents) |intent| {
                 const value = if (intent.value) |raw|
-                    if (isMetadataKey(intent.key) or internal_keys.isInternalUserKey(intent.key))
+                    if (isMetadataKey(intent.key) or internal_keys.isInternalPhysicalTableDataKey(intent.key))
                         raw
                     else
                         try relationalStoreRowValueAlloc(self.alloc, raw, relational_columns, &owned_relational_values)
@@ -4969,7 +4980,7 @@ pub const DB = struct {
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(self.alloc);
         for (effective_intents) |intent| {
-            if (intent.value == null or isMetadataKey(intent.key)) continue;
+            if (intent.value == null or isMetadataKey(intent.key) or internal_keys.isInternalPhysicalTableDataKey(intent.key)) continue;
             try identity_upsert_keys.append(self.alloc, intent.key);
         }
 
@@ -5065,10 +5076,10 @@ pub const DB = struct {
         if (status == .committed) {
             try self.core.collectTransactionIntentDocumentKeys(self.alloc, txn_id, &raw_identity_upserts, &raw_identity_deletes);
             for (raw_identity_upserts.items) |key| {
-                if (!isMetadataKey(key)) try identity_upserts.append(self.alloc, key);
+                if (!isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) try identity_upserts.append(self.alloc, key);
             }
             for (raw_identity_deletes.items) |key| {
-                if (!isMetadataKey(key)) try identity_deletes.append(self.alloc, key);
+                if (!isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) try identity_deletes.append(self.alloc, key);
             }
             try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
                 self.alloc,
@@ -5086,7 +5097,7 @@ pub const DB = struct {
                     if (mutations.len > 0) self.alloc.free(mutations);
                 }
                 for (mutations) |mutation| {
-                    if (isMetadataKey(mutation.key) or internal_keys.isInternalUserKey(mutation.key)) continue;
+                    if (isMetadataKey(mutation.key) or internal_keys.isInternalPhysicalTableDataKey(mutation.key)) continue;
                     const skip_key = try self.alloc.dupe(u8, mutation.key);
                     var skip_key_owned = true;
                     errdefer if (skip_key_owned) self.alloc.free(skip_key);
@@ -5103,13 +5114,14 @@ pub const DB = struct {
                         const row_value = try self.alloc.dupe(u8, value);
                         var row_value_owned = true;
                         errdefer if (row_value_owned) self.alloc.free(row_value);
-                        try relational_store_mod.appendUpsertOwnedBatch(
+                        try relational_store_mod.appendUpsertOwnedBatchWithColumnIndexPolicy(
                             self.alloc,
                             self.core.store,
                             &relational_extra_writes,
                             &relational_extra_deletes,
                             mutation.key,
                             row_value,
+                            self.relationalColumnIndexPolicyForStore(),
                         );
                         row_value_owned = false;
                         if (shouldWriteTimestamp(mutation.key)) {
@@ -7763,6 +7775,7 @@ pub const DB = struct {
         if (self.transaction_recovery_identity_context) |ctx| {
             ctx.identity_namespace = namespace;
             ctx.relational_base_rows = self.relationalColumnsForStore() != null;
+            ctx.relational_columns = self.relationalColumnsForStore() orelse &.{};
         }
     }
 
@@ -9302,7 +9315,7 @@ pub const DB = struct {
     ) !?doc_set.ResolvedDocSet {
         const column = relationalColumnForField(runtime_schema, term.field) orelse return null;
         if (column.field_type != .keyword) return null;
-        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
             wanted: []const u8,
 
             fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
@@ -9320,7 +9333,7 @@ pub const DB = struct {
     ) !?doc_set.ResolvedDocSet {
         const column = relationalColumnForField(runtime_schema, range.field) orelse return null;
         if (column.field_type != .keyword) return null;
-        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
             min: ?[]const u8,
             max: ?[]const u8,
             inclusive_min: bool,
@@ -9356,7 +9369,7 @@ pub const DB = struct {
     ) !?doc_set.ResolvedDocSet {
         const column = relationalColumnForField(runtime_schema, range.field) orelse return null;
         if (column.field_type != .numeric) return null;
-        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
             min: ?f64,
             max: ?f64,
             inclusive_min: bool,
@@ -9386,7 +9399,7 @@ pub const DB = struct {
     ) !?doc_set.ResolvedDocSet {
         const column = relationalColumnForField(runtime_schema, range.field) orelse return null;
         if (column.field_type != .datetime) return null;
-        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
             start_ns: ?u64,
             end_ns: ?u64,
             inclusive_start: bool,
@@ -9416,7 +9429,7 @@ pub const DB = struct {
     ) !?doc_set.ResolvedDocSet {
         const column = relationalColumnForField(runtime_schema, bool_query.field) orelse return null;
         if (column.field_type != .boolean) return null;
-        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
             wanted: bool,
 
             fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
@@ -9434,7 +9447,7 @@ pub const DB = struct {
     ) !?doc_set.ResolvedDocSet {
         const column = relationalColumnForField(runtime_schema, geo_query.field) orelse return null;
         if (column.field_type != .geopoint) return null;
-        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
             center: search_mod.GeoPoint,
             radius_meters: f64,
 
@@ -9461,7 +9474,7 @@ pub const DB = struct {
     ) !?doc_set.ResolvedDocSet {
         const column = relationalColumnForField(runtime_schema, geo_query.field) orelse return null;
         if (column.field_type != .geopoint) return null;
-        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
             min_lat: f64,
             min_lon: f64,
             max_lat: f64,
@@ -9565,11 +9578,13 @@ pub const DB = struct {
     fn scanRelationalColumnFilterDocSetAlloc(
         self: *DB,
         alloc: Allocator,
-        column_name: []const u8,
+        column: schema_mod.RelationalColumn,
         generation: ?u64,
         matcher: anytype,
     ) !doc_set.ResolvedDocSet {
-        const values = try relational_store_mod.scanColumnAlloc(alloc, self.core.store, column_name, "", "");
+        if (!column.indexed) return try self.scanRelationalBaseRowsFilterDocSetAlloc(alloc, column, generation, matcher);
+
+        const values = try relational_store_mod.scanColumnAlloc(alloc, self.core.store, column.path, "", "");
         defer relational_store_mod.freeColumnValues(alloc, values);
 
         var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
@@ -9577,6 +9592,32 @@ pub const DB = struct {
         for (values) |value| {
             if (!matcher.matches(value)) continue;
             try doc_ids.append(alloc, value.doc_key);
+        }
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids.items, generation);
+    }
+
+    fn scanRelationalBaseRowsFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        column: schema_mod.RelationalColumn,
+        generation: ?u64,
+        matcher: anytype,
+    ) !doc_set.ResolvedDocSet {
+        const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+        defer relational_store_mod.freeRows(alloc, rows);
+
+        var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+        defer doc_ids.deinit(alloc);
+        for (rows) |row| {
+            const cell = (try relational_row_codec.findCellByPath(row.row_value, column.path)) orelse continue;
+            const value = relational_store_mod.OwnedColumnValue{
+                .doc_key = row.doc_key,
+                .value_type = cell.value_type,
+                .is_json = cell.is_json,
+                .value = cell.value,
+            };
+            if (!matcher.matches(value)) continue;
+            try doc_ids.append(alloc, row.doc_key);
         }
         return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids.items, generation);
     }
@@ -10919,14 +10960,14 @@ pub const DB = struct {
     }
 
     fn encodeBaseDocumentLookupKeyAlloc(self: *DB, alloc: Allocator, key: []const u8) ![]u8 {
-        if (self.relationalColumnsForStore() != null and !isMetadataKey(key) and !internal_keys.isInternalUserKey(key)) {
+        if (self.relationalColumnsForStore() != null and !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) {
             return try relational_store_mod.rowKeyAlloc(alloc, key);
         }
         return try encodeStoreLookupKeyAlloc(alloc, key);
     }
 
     fn loadStoredSearchDocumentProbe(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
-        const relational_row = self.relationalColumnsForStore() != null and !isMetadataKey(key) and !internal_keys.isInternalUserKey(key);
+        const relational_row = self.relationalColumnsForStore() != null and !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key);
         const store_key = try self.encodeBaseDocumentLookupKeyAlloc(alloc, key);
         defer alloc.free(store_key);
         var txn = try self.core.store.beginProbeTxn();
@@ -11462,7 +11503,7 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
         try pending.append(alloc, .{
             .original_index = i,
             .store_key = try self.encodeBaseDocumentLookupKeyAlloc(alloc, key),
-            .relational_row = relational_base_rows and !isMetadataKey(key) and !internal_keys.isInternalUserKey(key),
+            .relational_row = relational_base_rows and !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key),
         });
     }
     if (bench_profile) key_ns = platform_time.monotonicNs() - key_start_ns;
@@ -11626,7 +11667,8 @@ test "resolved doc set from search hits uses complete hit ordinals" {
 fn isMetadataKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "\x00\x00__metadata__:") or
         isSplitMetadataKey(key) or
-        internal_keys.isTtlKey(key);
+        internal_keys.isTtlKey(key) or
+        internal_keys.isInternalMetadataKey(key);
 }
 
 fn isBaseDocumentStoreKeyForMode(relational_base_rows: bool, key: []const u8) bool {
@@ -11645,7 +11687,7 @@ fn skipNonRelationalMedianKey(key: []const u8) bool {
 }
 
 fn encodeStoreLookupKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
-    if (internal_keys.isInternalUserKey(key) or std.mem.startsWith(u8, key, "\x00\x00__metadata__:") or isSplitMetadataKey(key)) {
+    if (internal_keys.isInternalPhysicalTableDataKey(key) or isMetadataKey(key)) {
         return try alloc.dupe(u8, key);
     }
     return try internal_keys.documentKeyAlloc(alloc, key);
@@ -13454,7 +13496,7 @@ fn makeTxnId(self: *DB) transactions_mod.TxnId {
 }
 
 fn shouldWriteTimestamp(key: []const u8) bool {
-    return !isMetadataKey(key) and !internal_keys.isInternalUserKey(key);
+    return !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key);
 }
 
 fn makeTimestampKey(alloc: Allocator, key: []const u8) ![]u8 {
@@ -13539,7 +13581,7 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
     }
 
     for (keys, 0..) |key, i| {
-        if (internal_keys.isInternalUserKey(key)) continue;
+        if (internal_keys.isInternalPhysicalTableDataKey(key)) continue;
         try pending.append(alloc, .{
             .original_index = i,
             .store_key = try internal_keys.ttlKeyAlloc(alloc, key),
@@ -17642,6 +17684,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
                 split_handoffs.dense,
                 split_handoffs.text,
                 split_handoffs.sparse,
+                self.relationalColumnIndexPolicyForStore(),
             );
         }
     } else {
@@ -17655,6 +17698,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
             split_handoffs.dense,
             split_handoffs.text,
             split_handoffs.sparse,
+            self.relationalColumnIndexPolicyForStore(),
         );
     }
     try applySplitGraphArtifactsInRange(
@@ -17664,6 +17708,9 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
         dest_store,
         &dest_indexes,
     );
+    if (self.relationalColumnsForStore() != null) {
+        try relational_store_mod.rebuildColumnIndexesForRowRangeWithColumnIndexPolicy(self.alloc, dest_store, byte_range.start, byte_range.end, self.relationalColumnIndexPolicyForStore());
+    }
 
     try dest_indexes.syncAll(true);
     try dest_store.sync(true);
@@ -17725,6 +17772,7 @@ fn streamRangeIntoSplitDestinationDirect(
     dense_handoffs: []const index_manager_mod.DenseSplitHandoff,
     text_handoffs: []const index_manager_mod.TextSplitHandoff,
     sparse_handoffs: []const index_manager_mod.SparseSplitHandoff,
+    column_index_policy: relational_store_mod.ColumnIndexPolicy,
 ) !void {
     const batch_size = 8192;
 
@@ -17745,12 +17793,12 @@ fn streamRangeIntoSplitDestinationDirect(
             .value = entry.value,
         });
         if (writes.items.len == batch_size) {
-            try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs);
+            try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs, column_index_policy);
             writes.clearRetainingCapacity();
         }
     }
 
-    if (writes.items.len > 0) try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs);
+    if (writes.items.len > 0) try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs, column_index_policy);
 }
 
 fn copyGraphEdgeRangeIntoSplitDestination(
@@ -17789,11 +17837,41 @@ fn putIndexedSplitBatchDirect(
     dense_handoffs: []const index_manager_mod.DenseSplitHandoff,
     text_handoffs: []const index_manager_mod.TextSplitHandoff,
     sparse_handoffs: []const index_manager_mod.SparseSplitHandoff,
+    column_index_policy: relational_store_mod.ColumnIndexPolicy,
 ) !void {
     if (writes.len == 0) return;
 
-    const raw_writes: []const docstore_mod.KVPair = @ptrCast(writes);
-    try dest_store.putBatch(raw_writes, &.{});
+    var raw_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer raw_writes.deinit(dest_indexes.alloc);
+    try raw_writes.ensureUnusedCapacity(dest_indexes.alloc, writes.len);
+    for (writes) |write| raw_writes.appendAssumeCapacity(.{ .key = write.key, .value = write.value });
+
+    var owned_column_index_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_column_index_keys.items) |key| dest_indexes.alloc.free(key);
+        owned_column_index_keys.deinit(dest_indexes.alloc);
+    }
+    var owned_column_index_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_column_index_values.items) |value| dest_indexes.alloc.free(value);
+        owned_column_index_values.deinit(dest_indexes.alloc);
+    }
+    if (dest_indexes.relational_base_rows) {
+        for (writes) |write| {
+            const doc_key = (try internal_keys.decodeRelationalRowKeyAlloc(dest_indexes.alloc, write.key)) orelse continue;
+            defer dest_indexes.alloc.free(doc_key);
+            try relational_store_mod.appendColumnIndexWritesForRowWithColumnIndexPolicy(
+                dest_indexes.alloc,
+                &raw_writes,
+                &owned_column_index_keys,
+                &owned_column_index_values,
+                doc_key,
+                write.value,
+                column_index_policy,
+            );
+        }
+    }
+    try dest_store.putBatch(raw_writes.items, &.{});
 
     try applySplitEmbeddingArtifactsFromBatch(dest_store, dest_indexes, writes, dense_handoffs, sparse_handoffs);
 
@@ -18083,6 +18161,7 @@ fn indexExistingSplitDestinationDirect(
     dense_handoffs: []const index_manager_mod.DenseSplitHandoff,
     text_handoffs: []const index_manager_mod.TextSplitHandoff,
     sparse_handoffs: []const index_manager_mod.SparseSplitHandoff,
+    column_index_policy: relational_store_mod.ColumnIndexPolicy,
 ) !void {
     const batch_size = 8192;
 
@@ -18103,12 +18182,12 @@ fn indexExistingSplitDestinationDirect(
             .value = entry.value,
         });
         if (writes.items.len == batch_size) {
-            try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs);
+            try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs, column_index_policy);
             writes.clearRetainingCapacity();
         }
     }
 
-    if (writes.items.len > 0) try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs);
+    if (writes.items.len > 0) try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs, column_index_policy);
 }
 
 fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
@@ -18119,6 +18198,14 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
     try finalizePrimarySplitPreservingIdentity(self, split_lower);
+    if (self.relationalColumnsForStore() != null) {
+        try relational_store_mod.deleteColumnIndexesByDocRange(
+            self.alloc,
+            self.core.store,
+            split_state.split_key,
+            split_state.original_range_end,
+        );
+    }
     try ensureReplayFloor(self.core.store, replay_floor);
     try self.core.pruneSplitRangeFromPrimaryIndexes(split_state.split_key, split_state.original_range_end);
     try self.rebaseManagedIndexAppliedSequencesIfNeeded();
@@ -41950,6 +42037,54 @@ test "relational column filter pushdown declines stale identity generations" {
     }
     try std.testing.expectEqual(@as(usize, 1), ids.len);
     try std.testing.expectEqualStrings("row:a", ids[0]);
+}
+
+test "relational unindexed column filters fall back to base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric","x-antfly-index":false}},"required":["title","amount"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"title\":\"alpha\",\"amount\":42.5}" },
+            .{ .key = "row:b", .value = "{\"title\":\"alpha\",\"amount\":7.0}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const amount_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:a");
+    defer alloc.free(amount_index_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, amount_index_key));
+
+    var filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .filter_query_json = "{\"numeric_range\":{\"field\":\"amount\",\"min\":40.0}}",
+        .limit = 10,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", filtered.hits[0].id);
 }
 
 test "relational embedded json search intersects with top-level relational filters" {

@@ -795,6 +795,8 @@ pub fn applySchemaUpdateRecord(
     table: *const metadata_table_manager.TableRecord,
     schema_json: []const u8,
 ) !metadata_table_manager.TableRecord {
+    try validateRelationalStorageModeUpdateAlloc(alloc, table.schema_json, schema_json);
+
     var updated = try metadata_table_manager.cloneTable(alloc, table.*);
     errdefer metadata_table_manager.freeTable(alloc, updated);
 
@@ -832,15 +834,56 @@ pub fn applySchemaUpdateRecord(
     // Relational tables get an auto-created schema-derived algebraic index for
     // aggregation pushdown. Done last, on the (possibly full-text-migrated)
     // index set, and independently of doc-schema version changes so a table
-    // switched to relational mode still gets one; idempotent if an algebraic
-    // index already exists. The injected marker is expanded against the schema
-    // so the stored indexes_json carries the concrete derived config,
+    // that already uses relational storage gets one; idempotent if an algebraic
+    // index already exists. Storage-mode switches are rejected until an explicit
+    // row migration path exists. The injected marker is expanded against the
+    // schema so the stored indexes_json carries the concrete derived config,
     // provisioned like any explicit algebraic index.
     const prepared_indexes_json = try prepareTableIndexesForSchemaAlloc(alloc, table.name, updated.indexes_json, updated.schema_json);
     alloc.free(updated.indexes_json);
     updated.indexes_json = prepared_indexes_json;
 
     return updated;
+}
+
+fn validateRelationalStorageModeUpdateAlloc(
+    alloc: std.mem.Allocator,
+    current_schema_json: []const u8,
+    next_schema_json: []const u8,
+) !void {
+    var current_parsed = try schema_mod.parseValidatedTableSchema(alloc, effectiveSchemaJson(if (current_schema_json.len > 0) current_schema_json else null));
+    defer current_parsed.deinit(alloc);
+    var next_parsed = try schema_mod.parseValidatedTableSchema(alloc, next_schema_json);
+    defer next_parsed.deinit(alloc);
+
+    if (current_parsed.storage_mode != next_parsed.storage_mode) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    if (next_parsed.storage_mode != .relational) return;
+
+    const current_runtime = try schema_mod.deriveRuntimeTableSchema(alloc, current_parsed);
+    defer runtime_schema_mod.freeSchema(alloc, current_runtime);
+    const next_runtime = try schema_mod.deriveRuntimeTableSchema(alloc, next_parsed);
+    defer runtime_schema_mod.freeSchema(alloc, next_runtime);
+
+    if (!relationalColumnCatalogsEqual(current_runtime.relational_columns, next_runtime.relational_columns)) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn relationalColumnCatalogsEqual(
+    current: []const runtime_schema_mod.RelationalColumn,
+    next: []const runtime_schema_mod.RelationalColumn,
+) bool {
+    if (current.len != next.len) return false;
+    for (current, next) |a, b| {
+        if (!std.mem.eql(u8, a.name, b.name)) return false;
+        if (!std.mem.eql(u8, a.path, b.path)) return false;
+        if (a.field_type != b.field_type) return false;
+        if (a.nullable != b.nullable) return false;
+        if (a.indexed != b.indexed) return false;
+    }
+    return true;
 }
 
 pub fn routeQueryRequestToActiveReadIndex(
@@ -2493,14 +2536,14 @@ test "metadata.schema update auto-creates an algebraic index for relational tabl
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 9,
         .name = "sales",
-        .schema_json = "{\"version\":0,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}}}",
+        .schema_json = "{\"version\":0,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"numeric\"}},\"required\":[\"tenant\",\"amount\"],\"additionalProperties\":false}}}}",
         .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
         .replication_sources_json = "[]",
         .placement_role = "data",
     };
 
-    // Switching the table to relational mode injects a schema-derived algebraic
-    // aggregation index alongside the migrated full-text index.
+    // A relational table that predates the automatic aggregation sidecar gets a
+    // schema-derived algebraic index without changing the relational base columns.
     const updated = try applySchemaUpdateRecord(
         std.testing.allocator,
         &table,
@@ -2510,12 +2553,57 @@ test "metadata.schema update auto-creates an algebraic index for relational tabl
 
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"algebraic_index_v0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"type\":\"algebraic\"") != null);
-    // The full-text migration still happens; the algebraic add does not clobber it.
-    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v1\"") != null);
     // The derive_from_schema marker is expanded to a concrete config at write time.
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"derive_from_schema\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"group_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"capability_fingerprint\"") != null);
+}
+
+test "metadata.schema update rejects relational storage mode and base column changes" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 9,
+        .name = "sales",
+        .schema_json = "{\"version\":0,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}}}",
+        .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        applySchemaUpdateRecord(
+            std.testing.allocator,
+            &table,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}}}",
+        ),
+    );
+
+    const relational_table: metadata_table_manager.TableRecord = .{
+        .table_id = 10,
+        .name = "sales",
+        .schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"numeric\"}},\"required\":[\"tenant\"],\"additionalProperties\":false}}}}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        applySchemaUpdateRecord(
+            std.testing.allocator,
+            &relational_table,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"numeric\"},\"region\":{\"type\":\"keyword\"}},\"required\":[\"tenant\"],\"additionalProperties\":false}}}}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        applySchemaUpdateRecord(
+            std.testing.allocator,
+            &relational_table,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"keyword\"}},\"required\":[\"tenant\"],\"additionalProperties\":false}}}}",
+        ),
+    );
 }
 
 test "create table preparation auto-creates an algebraic index for relational schemas" {
@@ -2571,7 +2659,7 @@ test "metadata.schema update does not duplicate an existing algebraic index" {
     const updated = try applySchemaUpdateRecord(
         std.testing.allocator,
         &table,
-        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"numeric\"},\"region\":{\"type\":\"keyword\"}},\"required\":[\"tenant\",\"amount\"],\"additionalProperties\":false}}}}",
+        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"numeric\"}},\"required\":[\"tenant\",\"amount\"],\"additionalProperties\":false}}}}",
     );
     defer metadata_table_manager.freeTable(std.testing.allocator, updated);
 

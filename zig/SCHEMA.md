@@ -242,6 +242,20 @@ fields remain eligible for the sidecar. Rebuild/backfill reprojects the JSON
 cell from the committed relational row; the schema update does not rewrite
 unchanged row values.
 
+Relational base-column changes are different: they change authoritative storage
+or secondary scan layout, not just derived interpretation. Schema updates
+therefore reject storage-mode switches and relational column-catalog changes
+(add/remove/rename/type/nullability/indexed) until an explicit row rewrite or
+secondary-index rebuild path is available. Derived-only changes below an
+existing `json` column remain valid because the base row still stores the same
+JSON cell.
+
+Backup/restore follows that same boundary. Native backups preserve relational
+physical rows and secondary scan entries as a snapshot. Portable logical backups
+are not currently schema-aware for relational tables; they must either reject
+relational physical rows or, in a future implementation, materialize packed rows
+through the schema and restore through the relational write path.
+
 ## Related Docs
 
 - [TODO.md](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/TODO.md)

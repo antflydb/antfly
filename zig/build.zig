@@ -3513,6 +3513,7 @@ pub fn build(b: *std.Build) void {
             "public table batch handler maps doc identity unavailable errors",
             "public table query handler maps doc identity unavailable errors",
             "public table query view handler maps doc identity unavailable errors",
+            "public table backup handler rejects portable format",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

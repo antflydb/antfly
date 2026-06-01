@@ -1458,7 +1458,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (schema.storage_mode != .relational) return;
     if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;
     if (schema.dynamic_templates.len > 0) return error.InvalidSchemaUpdateRequest;
-    if (schema.document_schemas.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (schema.document_schemas.len != 1) return error.InvalidSchemaUpdateRequest;
 
     var relational_columns: usize = 0;
     for (schema.document_schemas) |document_schema| {

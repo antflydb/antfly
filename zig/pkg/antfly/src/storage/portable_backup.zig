@@ -39,6 +39,10 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     const pairs = try store.scanRange(alloc, "", "");
     defer DocStore.freeResults(alloc, pairs);
 
+    for (pairs) |kv| {
+        if (isRelationalPhysicalKey(kv.key)) return error.UnsupportedPortableRelationalTable;
+    }
+
     // Write file header
     const backup_id = [_]u8{0} ** 16; // zero UUID for now
     try backup_codec.writeHeader(out, alloc, .{
@@ -208,6 +212,13 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
         .total_bytes = out.items.len,
     });
     try backup_codec.writeBlock(out, alloc, .file_footer, &file_footer);
+}
+
+fn isRelationalPhysicalKey(key: []const u8) bool {
+    return internal_keys.isRelationalRowKey(key) or
+        internal_keys.isRelationalColumnKey(key) or
+        internal_keys.isRelationalColumnIndexKey(key) or
+        internal_keys.isRelationalColumnIndexByDocKey(key);
 }
 
 const Counts = struct {
@@ -785,6 +796,24 @@ test "export and import documents round trip" {
         defer alloc.free(val);
         try std.testing.expectEqualStrings(expected, val);
     }
+}
+
+test "exportPortable rejects relational physical rows" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const row_key = try internal_keys.relationalRowKeyAlloc(alloc, "row:a");
+    defer alloc.free(row_key);
+    try src.putBatch(&.{.{ .key = row_key, .value = "packed-row" }}, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedPortableRelationalTable, exportPortable(alloc, &src, &out));
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "export and import preserves doc identity metadata" {

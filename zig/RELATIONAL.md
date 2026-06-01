@@ -55,9 +55,9 @@ over things that are already built, plus one genuinely new query operator
 Relational mode uses the relational base-store keyspace as the source of truth.
 Incoming JSON is validated against the closed schema, projected into typed
 cells, and written through the relational participant. The store maintains both
-the packed row entry used for point reads/reconstruction and document-scoped
-column entries used for scalar scans. There is no legacy JSON primary-row mode
-for relational tables in this feature set.
+the packed row entry used for point reads/reconstruction and secondary column
+entries used for movement, cleanup, and scalar scans. There is no legacy JSON
+primary-row mode for relational tables in this feature set.
 
 Full-text, dense, sparse, graph, and algebraic indexes remain derived artifacts.
 They can be rebuilt from the relational base store, but they are not the
@@ -74,6 +74,8 @@ authoritative column store.
 In `relational` mode the following are implied/enforced:
 
 - `enforce_types = true` (documents must match a declared type).
+- Exactly one document schema is allowed in v1; the physical relational row
+  does not carry a document-type discriminator.
 - Each document type is treated as closed (`additionalProperties: false`)
   unless a field is explicitly typed `json`.
 - `required_fields` declares `NOT NULL` columns.
@@ -81,9 +83,10 @@ In `relational` mode the following are implied/enforced:
 
 Schema create/update validation normalizes omitted `enforce_types` to `true`
 for relational schemas, rejects explicit `enforce_types: false`, rejects open
-top-level document types, and rejects relational schemas that would produce no
-storable relational columns. This keeps relational mode a single-store contract
-rather than a document-mode table with optional relational projections.
+top-level document types, rejects multi-document-type schemas, and rejects
+relational schemas that would produce no storable relational columns. This
+keeps relational mode a single-store contract rather than a document-mode table
+with optional relational projections.
 
 `json` is added to `AntflyType`. A `json` column is stored as a `bytes` column
 and indexed like a document subtree (path facts + dynamic templates). It is the
@@ -131,9 +134,10 @@ schema. Top-level dynamic templates in relational schemas stay invalid; flexible
 fields belong behind an explicit `json` column.
 
 Constraints in scope for v1: primary key is the existing document key;
-`NOT NULL` via `required_fields`. **Out of scope for v1:** cross-document unique
-constraints, multi-document transactions, foreign-key enforcement (use the
-`graph` index / join planner for relationships).
+`NOT NULL` via `required_fields`. Existing Antfly transaction/2PC semantics still
+apply to relational writes. **Out of scope for v1:** SQL-style cross-document
+unique constraints, foreign-key enforcement, and constraint-driven cascading
+actions (use the `graph` index / join planner for relationships).
 
 ## Runtime model
 
@@ -218,10 +222,10 @@ continue through the normal analyzer/inverted-index path.
 The *compiled* runtime schema carries the relational contract:
 `runtime_schema.TableSchema` (`storage/schema.zig`) has `storage_mode` and a
 `relational_columns` catalog (`RelationalColumn{name, path, field_type,
-nullable}`), populated by `deriveRuntimeTableSchema` and round-tripped through
-the versioned binary format. `NOT NULL` is enforced upstream by JSON-schema
-`required` validation, and `projectRelationalRowAlloc` enforces strict physical
-types before the row is serialized.
+nullable, indexed}`), populated by `deriveRuntimeTableSchema` and round-tripped
+through the versioned binary format. `NOT NULL` is enforced upstream by
+JSON-schema `required` validation, and `projectRelationalRowAlloc` enforces
+strict physical types before the row is serialized.
 
 ### Query path
 
@@ -259,18 +263,28 @@ tables:
   self-describing cell per committed column. Each cell carries path, physical
   `typed_doc_values` type, and `is_json`, so reconstruction does not require a
   live schema lookup.
-- **Column access:** document-scoped column entries maintained alongside the row
-  entry. Scalar predicates and scan-based aggregations read these entries rather
-  than derived segment doc-values.
+- **Column access:** document-scoped column entries are maintained alongside the
+  row entry for range movement and delete cleanup, and column-major scan entries
+  (`column_path -> doc_key`) are maintained from the same packed row for scalar
+  predicate scans when the column catalog marks the path `indexed`. Both are
+  secondary to the packed row and can be regenerated from it. `indexed: false`
+  suppresses only the column-major scan entry; the packed row and
+  document-scoped cell remain authoritative, and filters over that column fall
+  back to base-row evaluation.
 - **Commit boundary:** prepare/commit/abort/read/scan methods participate in the
   existing two-phase commit and recovery path, so committed rows, column
   entries, and deletes resolve at the same visibility point.
 
 The row entry keeps point lookups and read-modify-write transforms as one atomic
-document operation. Column entries make scalar scans independent from derived
-search segments and move with the document range during split/merge. A future
-physical optimization can pack entries into larger column blocks without
-changing the participant boundary.
+document operation. Column-major entries make scalar scans independent from
+derived search segments without scanning every document-local column key.
+Document-scoped entries keep split/merge movement and overwrite/delete cleanup
+tied to the row's document range. A reverse scan-entry namespace keyed by
+`doc_key -> column_path` is maintained with column-major entries so split
+finalization can delete outgoing secondary scan entries by document range
+without scanning every column index in the shard. A future physical optimization
+can pack column-major entries into larger column blocks without changing the
+participant boundary.
 
 ### Write and read seams
 
@@ -329,6 +343,14 @@ planning withholds fields below that JSON column until the sidecar is rebuilt
 from committed rows. Full-text JSON projection follows the existing
 schema-versioned index handoff.
 
+By contrast, changing the relational base-column catalog is a storage migration.
+Schema updates that switch storage mode or add, remove, rename, retag, or change
+nullability/indexed status for a relational base column are rejected until an
+explicit row rewrite or secondary-index rebuild path exists. This keeps the
+committed packed rows, column entries, and runtime schema in one physical shape.
+Derived-only changes below a stable `json` column remain allowed and flow
+through the rebuild lifecycle above.
+
 The production invariants are:
 
 - embedded JSON indexes are disposable and never accept writes that bypass the
@@ -347,20 +369,23 @@ from the relational row keyspace. Algebraic fact projection and materialization
 therefore rebuild from committed typed rows, not from stale generic document KV
 values or derived text segment columns.
 
-Relational table creation and schema updates both run the same schema-aware
-index preparation: if no algebraic index exists, `algebraic_index_v0` is added
-with `derive_from_schema: true` and stored as a concrete derived config. That
-keeps aggregation pushdown available whether the table starts relational or is
-switched to relational mode later.
+Relational table creation and same-catalog relational schema updates both run
+the same schema-aware index preparation: if no algebraic index exists,
+`algebraic_index_v0` is added with `derive_from_schema: true` and stored as a
+concrete derived config. Storage-mode switches are not schema updates; they need
+an explicit row migration path.
 
 ### Query and movement invariants
 
 Structured relational filters for supported keyword/range/bool/geo clauses
-resolve against relational column entries. Top-level supported relational
-structured queries become base-row doc constraints over the text match-all path,
-so scalar query results follow the committed relational row rather than stale
-segment doc-values. Unsupported text-oriented shapes may still use the inverted
-text index, but not segment doc-values as a relational column source.
+resolve against relational column-major scan entries when the column is indexed.
+For `indexed: false` columns, the same filters evaluate against committed packed
+base rows, which is slower but preserves correctness. Top-level supported
+relational structured queries become base-row doc constraints over the text
+match-all path, so scalar query results follow the committed relational row
+rather than stale segment doc-values. Unsupported text-oriented shapes may still
+use the inverted text index, but not segment doc-values as a relational column
+source.
 
 Relational column pushdown is only valid at the current identity generation,
 because relational rows and column entries are the committed current row image,
@@ -379,16 +404,37 @@ For example:
 tenant_id:acme AND attrs.plan:pro AND attrs.score:[10 TO *]
 ```
 
-`tenant_id` uses relational column entries. `attrs.plan` and `attrs.score` use
+`tenant_id` uses relational column-major scan entries. `attrs.plan` and `attrs.score` use
 the embedded JSON artifacts scoped to the `attrs` column. The final hit list is
 materialized from relational rows, not from derived artifacts.
 
 Split, merge, replay, TTL cleanup, and generated-enrichment replay treat the
 relational base store as table data. Split prepare/finalize moves relational row
-entries and document-scoped column entries into the destination range and removes
-them from the finalized parent range. Merge bootstrap/catch-up reprojects donor
-logical writes into receiver relational rows and column entries; donor deletes
-remove receiver column entries during catch-up.
+entries and document-scoped column entries into the destination range, rebuilds
+destination column-major scan entries from the destination's packed rows using
+the schema's `indexed` policy, and prunes parent scan entries through the
+reverse `doc_key -> column_path` scan-entry namespace only after the
+authoritative parent range has been rewritten. Stale parent scan entries are
+safe across crash/retry because scan reads verify that the base relational row
+still exists before returning a value. Merge bootstrap/catch-up reprojects donor logical writes into
+receiver relational rows and column entries; donor deletes remove receiver column
+entries during catch-up.
+
+Physical data movement uses the internal table-data classifier rather than
+assuming every table datum lives under the document-range `0x01` namespace.
+Document-scoped rows, document-scoped column entries, artifacts, and the
+column-major scan namespace are all physical table data; replay and identity
+metadata are separate internal metadata. Code that moves, deletes, or exports
+physical table state must either handle every table-data namespace or explicitly
+regenerate the secondary namespace from packed rows.
+
+Native backups are physical snapshots and preserve relational rows plus their
+secondary scan entries. The portable logical AFB path is not relational-aware in
+this feature set and is rejected for relational physical rows rather than
+silently exporting an empty document set. A future portable path should be
+schema-aware: materialize packed relational rows into logical documents during
+export and restore them through the DB write path so row, column, and derived
+state are regenerated consistently.
 
 ### No legacy relational storage
 
@@ -415,8 +461,8 @@ and column keys:
 
 - **Landed shape:** one packed typed-row value per document, detected by the `AROW`
   magic prefix and stored under the relational row keyspace rather than the
-  generic primary document key, plus document-scoped column entries maintained
-  by the same participant. This keeps `DB.get`, transforms, lookup, vector
+  generic primary document key, plus secondary column entries maintained by the
+  same participant. This keeps `DB.get`, transforms, lookup, vector
   `include_stored`, backfill, and enrichment readers synchronous while removing
   the relational JSON blob and avoiding a second base-row copy. The row carries
   enough path/type metadata that generic store-value readers can reconstruct JSON
@@ -454,7 +500,7 @@ The coverage expected for this feature set is:
 Current tests cover mapper projection, runtime-schema round-trip, row-codec
 round-trip, document-mode passthrough, relational point reads, full-text
 `include_stored` hydration from base rows, scan-based aggregations over
-base-row `stored_data`, scalar filters over column entries, transaction
+base-row `stored_data`, scalar filters over column scan entries, transaction
 commit/abort/transform behavior, stale generic-primary cleanup, split movement,
 and merge bootstrap/catch-up for row and column entries.
 

@@ -752,6 +752,7 @@ pub const DBCore = struct {
             .identity_namespace = self.identity_namespace,
             .alloc = alloc,
             .relational_base_rows = schemaUsesRelationalBaseRows(self.schema),
+            .relational_columns = relationalColumnsForSchema(self.schema),
         };
         var effective_config = config;
         effective_config.resolution_extra_hooks = transactionRecoveryIdentityHooks(&identity_ctx);
@@ -1124,6 +1125,7 @@ pub const DBCore = struct {
             .identity_namespace = self.identity_namespace,
             .alloc = self.alloc,
             .relational_base_rows = schemaUsesRelationalBaseRows(self.schema),
+            .relational_columns = relationalColumnsForSchema(self.schema),
         };
         return try manager.recoverTransactionsWithExtraBatchHooks(
             cutoff_timestamp,
@@ -1138,6 +1140,7 @@ pub const TransactionRecoveryIdentityContext = struct {
     identity_namespace: doc_identity.Namespace,
     alloc: Allocator,
     relational_base_rows: bool = false,
+    relational_columns: []const schema_mod.RelationalColumn = &.{},
 };
 
 pub fn transactionRecoveryIdentityHooks(ctx: *TransactionRecoveryIdentityContext) transactions_mod.TxnManager.RecoveryExtraBatchHooks {
@@ -1240,13 +1243,14 @@ fn buildTransactionRecoveryIdentityExtraBatch(
                 const row_value = try alloc.dupe(u8, value);
                 var row_value_owned = true;
                 errdefer if (row_value_owned) alloc.free(row_value);
-                try relational_store_mod.appendUpsertOwnedBatch(
+                try relational_store_mod.appendUpsertOwnedBatchWithColumnIndexPolicy(
                     alloc,
                     identity_ctx.store,
                     &extra_writes,
                     &extra_deletes,
                     mutation.key,
                     row_value,
+                    relational_store_mod.ColumnIndexPolicy.fromColumns(identity_ctx.relational_columns),
                 );
                 row_value_owned = false;
 
@@ -1515,6 +1519,12 @@ pub fn openCoreResourcesFromPrimaryStore(
 fn schemaUsesRelationalBaseRows(schema: ?schema_mod.TableSchema) bool {
     const active = schema orelse return false;
     return active.storage_mode == .relational and active.relational_columns.len > 0;
+}
+
+fn relationalColumnsForSchema(schema: ?schema_mod.TableSchema) []const schema_mod.RelationalColumn {
+    const active = schema orelse return &.{};
+    if (active.storage_mode != .relational) return &.{};
+    return active.relational_columns;
 }
 
 fn loadArtifactCleanupMaybe(alloc: Allocator, store: *docstore_mod.DocStore) !bool {

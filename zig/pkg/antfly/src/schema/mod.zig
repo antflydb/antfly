@@ -199,6 +199,7 @@ fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableS
                 .path = path,
                 .field_type = field_type,
                 .nullable = nullable,
+                .indexed = if (property.antfly_index) |indexed| indexed else true,
             });
         }
     }
@@ -853,7 +854,7 @@ fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?stor
 test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}}}
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}}}
     );
     defer parsed.deinit(alloc);
 
@@ -867,8 +868,10 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expectEqual(storage_schema.AntflyType.keyword, id.field_type);
     try std.testing.expectEqualStrings("id", id.path);
     try std.testing.expect(!id.nullable); // required
+    try std.testing.expect(id.indexed);
     try std.testing.expectEqual(storage_schema.AntflyType.numeric, findRuntimeColumn(runtime, "amount").?.field_type);
     try std.testing.expect(findRuntimeColumn(runtime, "amount").?.nullable);
+    try std.testing.expect(!findRuntimeColumn(runtime, "amount").?.indexed);
     try std.testing.expectEqual(storage_schema.AntflyType.datetime, findRuntimeColumn(runtime, "created_at").?.field_type);
     // nested object and json field both become json columns
     try std.testing.expectEqual(storage_schema.AntflyType.json, findRuntimeColumn(runtime, "attrs").?.field_type);
@@ -916,6 +919,16 @@ test "relational embedded document schema is scoped to explicit json columns" {
         error.InvalidSchemaUpdateRequest,
         parseValidatedTableSchema(alloc,
             \\{"version":4,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"object","dynamic_templates":{"metric":{"path_match":"metrics.*","mapping":{"type":"numeric"}}}}},"required":["id"],"additionalProperties":false}}}}
+        ),
+    );
+}
+
+test "relational schema is physically single document schema" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseValidatedTableSchema(alloc,
+            \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}},"other":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
         ),
     );
 }

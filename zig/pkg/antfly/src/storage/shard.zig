@@ -580,7 +580,7 @@ pub const ShardManager = struct {
 
             for (to_delete) |kv| {
                 if (isSplitMetadataKey(kv.key)) continue;
-                if (internal_user_keys and !internal_keys.isInternalUserKey(kv.key)) continue;
+                if (internal_user_keys and !internal_keys.isInternalPhysicalTableDataKey(kv.key)) continue;
                 try del_keys.append(self.alloc, kv.key);
             }
 

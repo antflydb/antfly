@@ -131,6 +131,7 @@ pub const RelationalColumn = struct {
     path: []const u8,
     field_type: AntflyType = .text,
     nullable: bool = true,
+    indexed: bool = true,
 };
 
 pub const TableSchema = struct {
@@ -163,7 +164,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 9); // format version
+    try appendU32(&buf, alloc, 10); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -223,6 +224,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try appendStr(&buf, alloc, column.path);
         try buf.append(alloc, @intFromEnum(column.field_type));
         try buf.append(alloc, if (column.nullable) 1 else 0);
+        try buf.append(alloc, if (column.indexed) 1 else 0);
     }
 
     const result = try alloc.dupe(u8, buf.items);
@@ -238,7 +240,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version != 1 and fmt_version != 2 and fmt_version != 3 and fmt_version != 4 and fmt_version != 5 and fmt_version != 6 and fmt_version != 7 and fmt_version != 8 and fmt_version != 9) return error.UnsupportedVersion;
+    if (fmt_version != 1 and fmt_version != 2 and fmt_version != 3 and fmt_version != 4 and fmt_version != 5 and fmt_version != 6 and fmt_version != 7 and fmt_version != 8 and fmt_version != 9 and fmt_version != 10) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -511,7 +513,12 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             pos += 1;
             const nullable = data[pos] == 1;
             pos += 1;
-            column.* = .{ .name = name, .path = path, .field_type = field_type, .nullable = nullable };
+            const indexed = if (fmt_version >= 10) indexed_blk: {
+                const value = data[pos] == 1;
+                pos += 1;
+                break :indexed_blk value;
+            } else true;
+            column.* = .{ .name = name, .path = path, .field_type = field_type, .nullable = nullable, .indexed = indexed };
             columns_initialized += 1;
         }
         break :blk columns;
@@ -1065,7 +1072,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
             .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
             .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
             .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true },
-            .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true },
+            .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true, .indexed = false },
         },
     };
 
@@ -1085,6 +1092,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(AntflyType.datetime, loaded.relational_columns[2].field_type);
     try std.testing.expect(loaded.relational_columns[2].nullable);
     try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[3].field_type);
+    try std.testing.expect(!loaded.relational_columns[3].indexed);
 }
 
 test "schema save/load via DocStore" {
