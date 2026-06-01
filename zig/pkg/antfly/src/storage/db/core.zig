@@ -803,6 +803,7 @@ pub const DBCore = struct {
         try schema_mod.saveSchema(self.store, self.alloc, table_schema);
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
         self.schema = try schema_mod.loadSchema(self.store, self.alloc);
+        self.index_manager.setRelationalBaseRows(schemaUsesRelationalBaseRows(self.schema));
     }
 
     pub fn saveSchemaCloneTo(self: *DBCore, dest_store: *docstore_mod.DocStore) !void {
@@ -1381,6 +1382,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     index_manager.updateRange(shard_manager.getByteRange());
 
     const schema = try schema_mod.loadSchema(store, alloc);
+    index_manager.setRelationalBaseRows(schemaUsesRelationalBaseRows(schema));
 
     owned_path = null;
     owned_applied_sequence_checkpoint_path = null;
@@ -1406,6 +1408,11 @@ pub fn openCoreResourcesFromPrimaryStore(
         .identity_namespace = identity_namespace,
         .artifact_cleanup_maybe = artifact_cleanup_maybe,
     };
+}
+
+fn schemaUsesRelationalBaseRows(schema: ?schema_mod.TableSchema) bool {
+    const active = schema orelse return false;
+    return active.storage_mode == .relational and active.relational_columns.len > 0;
 }
 
 fn loadArtifactCleanupMaybe(alloc: Allocator, store: *docstore_mod.DocStore) !bool {

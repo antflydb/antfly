@@ -104,6 +104,9 @@ Current PR progress:
   so chunking, asset producers, dense embeddings, sparse embeddings, and
   generated-request planning read the committed relational row keyspace rather
   than probing a generic document KV value;
+- dense HBC external-vector hydration carries relational-base-row state, so
+  field-backed dense vectors can be reloaded from the committed relational row
+  when the HBC layer does not hold an inline vector copy;
 - TTL-driven async deletes and graph artifact-source materialization also carry
   the relational-base-row state, so background cleanup removes committed
   relational rows and graph extraction hydrates source documents from those rows;

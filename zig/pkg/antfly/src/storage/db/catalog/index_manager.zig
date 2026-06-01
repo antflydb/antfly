@@ -42,6 +42,7 @@ const schema_mod = @import("../../schema.zig");
 const ttl_mod = @import("../../ttl.zig");
 const lmdb = @import("../../lmdb.zig");
 const mapper = @import("../document_mapper.zig");
+const relational_store_mod = @import("../relational_store.zig");
 const merger_mod = @import("../../../merger.zig");
 const index_mod = @import("../../../index.zig");
 const text_index_maintenance = @import("text_index_maintenance.zig");
@@ -558,6 +559,7 @@ pub const IndexManager = struct {
     hll_maintenance_lane: ?background_runtime_mod.DurableJobLane = null,
     hll_maintenance_owner_id: u64 = 0,
     primary_store: ?*docstore_mod.DocStore,
+    relational_base_rows: bool = false,
     applied_sequence_checkpoint_path: ?[]const u8,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     load_parallelism: ?usize = null,
@@ -1053,6 +1055,7 @@ pub const IndexManager = struct {
             .lsm_root_generation = opts.lsm_root_generation,
             .resource_manager = opts.resource_manager,
             .primary_store = null,
+            .relational_base_rows = false,
             .applied_sequence_checkpoint_path = null,
             .load_parallelism = null,
             .full_text_pending_bytes_accounted = 0,
@@ -1195,6 +1198,10 @@ pub const IndexManager = struct {
         if (comptime Store == *docstore_mod.DocStore) {
             self.primary_store = store;
         }
+    }
+
+    pub fn setRelationalBaseRows(self: *IndexManager, enabled: bool) void {
+        self.relational_base_rows = enabled;
     }
 
     fn freeTextIndexEntry(self: *IndexManager, entry: *TextIndex) void {
@@ -8538,14 +8545,16 @@ pub const IndexManager = struct {
                 break :blk try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session);
             }
 
-            const doc_store_key = try internal_keys.documentKeyAlloc(alloc, metadata);
+            const doc_store_key = try manager.denseSourceDocumentStoreKeyAlloc(alloc, metadata);
             defer alloc.free(doc_store_key);
             const raw = manager.loadPrimaryDocumentRawForHbc(store, doc_store_key, load_session, alloc) catch |err| switch (err) {
                 error.NotFound => break :blk try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session),
                 else => return err,
             };
             defer if (load_session == null) alloc.free(raw);
-            break :blk (try mapper.extractDenseVectorField(alloc, raw, entry.field_name, entry.dims)) orelse
+            const doc_value = try manager.materializeDenseSourceDocumentValueAlloc(alloc, metadata, raw);
+            defer if (doc_value.ptr != raw.ptr) alloc.free(doc_value);
+            break :blk (try mapper.extractDenseVectorField(alloc, doc_value, entry.field_name, entry.dims)) orelse
                 try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session);
         };
         errdefer alloc.free(vector);
@@ -8985,6 +8994,18 @@ pub const IndexManager = struct {
         _ = self;
         if (load_session) |session| return try session.get(store, doc_store_key);
         return try store.get(alloc, doc_store_key);
+    }
+
+    fn denseSourceDocumentStoreKeyAlloc(self: *const IndexManager, alloc: Allocator, doc_key: []const u8) ![]u8 {
+        return if (self.relational_base_rows and !internal_keys.isInternalUserKey(doc_key))
+            try relational_store_mod.rowKeyAlloc(alloc, doc_key)
+        else
+            try internal_keys.documentKeyAlloc(alloc, doc_key);
+    }
+
+    fn materializeDenseSourceDocumentValueAlloc(self: *const IndexManager, alloc: Allocator, doc_key: []const u8, raw: []const u8) ![]const u8 {
+        if (!self.relational_base_rows or internal_keys.isInternalUserKey(doc_key)) return raw;
+        return try mapper.materializeDocumentValueAlloc(alloc, raw);
     }
 
     fn loadDenseEmbeddingArtifactVectorWithSession(

@@ -24957,6 +24957,68 @@ test "db relational enrichment sources read committed base rows" {
     try std.testing.expectEqualStrings("row:a", result.hits[0].id);
 }
 
+test "db relational dense HBC loader reads committed base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"embedding":{"type":"array"}},"required":["title","embedding"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:a",
+            .value = "{\"title\":\"alpha\",\"embedding\":[1,0,0]}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "row:a", "dv_v1");
+    defer alloc.free(artifact_key);
+    try db.core.store.delete(artifact_key);
+    db.clearDenseHbcCaches();
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:a");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = &[_]f32{ 1, 0, 0 },
+            .k = 1,
+        },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("row:a", result.hits[0].id);
+}
+
 test "db leased enrichment worker generates dense embeddings with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
