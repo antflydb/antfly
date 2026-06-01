@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
 
 func TestCatchupDrainedScopes(t *testing.T) {
 	diag := diagSnapshot{
@@ -69,5 +74,34 @@ func TestApplySamplePeaks(t *testing.T) {
 	}
 	if diag.PeakSegmentBytes != 70 {
 		t.Fatalf("PeakSegmentBytes=%d", diag.PeakSegmentBytes)
+	}
+}
+
+func TestCollectDiagnosticsIncludesLSMMutableSnapshotCloneStats(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`
+# TYPE antfly_lsm_mutable_snapshot_clone_calls_total counter
+antfly_lsm_mutable_snapshot_clone_calls_total 7
+# TYPE antfly_lsm_mutable_snapshot_clone_bytes_total counter
+antfly_lsm_mutable_snapshot_clone_bytes_total 8192
+# TYPE antfly_lsm_mutable_snapshot_clone_peak_bytes gauge
+antfly_lsm_mutable_snapshot_clone_peak_bytes 4096
+`))
+	}))
+	defer server.Close()
+
+	diag := collectDiagnostics(0, server.URL, "", time.Second)
+	if !diag.HealthMetricsAvailable {
+		t.Fatalf("expected health metrics to be available")
+	}
+	if diag.LSMMutableSnapshotCloneCalls != 7 {
+		t.Fatalf("LSMMutableSnapshotCloneCalls=%d", diag.LSMMutableSnapshotCloneCalls)
+	}
+	if diag.LSMMutableSnapshotCloneBytesTotal != 8192 {
+		t.Fatalf("LSMMutableSnapshotCloneBytesTotal=%d", diag.LSMMutableSnapshotCloneBytesTotal)
+	}
+	if diag.LSMMutableSnapshotClonePeakBytes != 4096 {
+		t.Fatalf("LSMMutableSnapshotClonePeakBytes=%d", diag.LSMMutableSnapshotClonePeakBytes)
 	}
 }

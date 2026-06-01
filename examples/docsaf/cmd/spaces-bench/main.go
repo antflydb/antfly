@@ -136,6 +136,9 @@ type diagSnapshot struct {
 	LSMCompactionPeakBytes               int64          `json:"lsm_compaction_peak_bytes,omitempty"`
 	LSMStateUsedBytes                    int64          `json:"lsm_state_used_bytes,omitempty"`
 	LSMStatePeakBytes                    int64          `json:"lsm_state_peak_bytes,omitempty"`
+	LSMMutableSnapshotCloneCalls         int64          `json:"lsm_mutable_snapshot_clone_calls,omitempty"`
+	LSMMutableSnapshotCloneBytesTotal    int64          `json:"lsm_mutable_snapshot_clone_bytes_total,omitempty"`
+	LSMMutableSnapshotClonePeakBytes     int64          `json:"lsm_mutable_snapshot_clone_peak_bytes,omitempty"`
 	SegmentFiles                         int64          `json:"segment_files,omitempty"`
 	SegmentBytes                         int64          `json:"segment_bytes,omitempty"`
 	PeakSegmentBytes                     int64          `json:"peak_segment_bytes,omitempty"`
@@ -432,7 +435,7 @@ func main() {
 		finalDiag.FullTextDocOrdinalsBytes,
 		finalDiag.FullTextSectionIndexBytes,
 	)
-	fmt.Printf("merge_and_resource_diagnostics text_merge_pending_segments=%d text_merge_pending_bytes=%d text_merge_completed_total=%d text_merge_failed_total=%d full_text_build_peak_bytes=%d full_text_pending_peak_bytes=%d text_merge_buffer_peak_bytes=%d lsm_cache_peak_bytes=%d lsm_compaction_peak_bytes=%d lsm_state_peak_bytes=%d\n",
+	fmt.Printf("merge_and_resource_diagnostics text_merge_pending_segments=%d text_merge_pending_bytes=%d text_merge_completed_total=%d text_merge_failed_total=%d full_text_build_peak_bytes=%d full_text_pending_peak_bytes=%d text_merge_buffer_peak_bytes=%d lsm_cache_peak_bytes=%d lsm_compaction_peak_bytes=%d lsm_state_peak_bytes=%d lsm_mutable_snapshot_clone_calls=%d lsm_mutable_snapshot_clone_bytes_total=%d lsm_mutable_snapshot_clone_peak_bytes=%d\n",
 		finalDiag.TextMergePendingSegments,
 		finalDiag.TextMergePendingBytes,
 		finalDiag.TextMergeCompletedTotal,
@@ -443,6 +446,9 @@ func main() {
 		finalDiag.LSMCachePeakBytes,
 		finalDiag.LSMCompactionPeakBytes,
 		finalDiag.LSMStatePeakBytes,
+		finalDiag.LSMMutableSnapshotCloneCalls,
+		finalDiag.LSMMutableSnapshotCloneBytesTotal,
+		finalDiag.LSMMutableSnapshotClonePeakBytes,
 	)
 	if *vmmapOut != "" && *samplePID > 0 {
 		if vmmapStats, err := writeVMMapSummary(*samplePID, *vmmapOut); err != nil {
@@ -615,6 +621,9 @@ func collectDiagnostics(pid int, healthURL, dataDir string, elapsed time.Duratio
 			out.LSMCompactionPeakBytes = int64(promValue(metrics, "antfly_resource_peak_bytes", map[string]string{"slice": "lsm.compaction_work"}))
 			out.LSMStateUsedBytes = int64(promValue(metrics, "antfly_resource_used_bytes", map[string]string{"slice": "lsm.in_memory_state"}))
 			out.LSMStatePeakBytes = int64(promValue(metrics, "antfly_resource_peak_bytes", map[string]string{"slice": "lsm.in_memory_state"}))
+			out.LSMMutableSnapshotCloneCalls = int64(promValue(metrics, "antfly_lsm_mutable_snapshot_clone_calls_total", nil))
+			out.LSMMutableSnapshotCloneBytesTotal = int64(promValue(metrics, "antfly_lsm_mutable_snapshot_clone_bytes_total", nil))
+			out.LSMMutableSnapshotClonePeakBytes = int64(promValue(metrics, "antfly_lsm_mutable_snapshot_clone_peak_bytes", nil))
 		}
 	}
 	if dataDir != "" {

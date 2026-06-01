@@ -1846,7 +1846,7 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d}",
+            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_mutable_snapshot_clone_calls={d} lsm_mutable_snapshot_clone_bytes_total={d} lsm_mutable_snapshot_clone_peak_bytes={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d}",
             .{
                 label,
                 ft_pending_used,
@@ -1866,6 +1866,9 @@ pub const IndexManager = struct {
                 lsm_stats.immutable_memtables,
                 lsm_stats.total_run_bytes,
                 lsm_stats.total_runs,
+                lsm_stats.mutable_snapshot_clone_calls,
+                lsm_stats.mutable_snapshot_clone_bytes_total,
+                lsm_stats.mutable_snapshot_clone_peak_bytes,
                 lsm_cache_stats.entry_count,
                 lsm_cache_stats.run_state.used_bytes,
                 lsm_cache_stats.run_table_raw.used_bytes,
@@ -9048,12 +9051,15 @@ pub const IndexManager = struct {
         }
         if (after_lsm_maintenance) |maintenance| {
             std.log.info(
-                "antfly_bench_hbc_lsm_maintenance phase={s} index={s} mutable_entries={d} mutable_bytes={d} total_runs={d} total_run_bytes={d} total_run_logical_entry_bytes={d} total_run_physical_entry_bytes={d} total_run_compressed_blocks={d} total_run_raw_blocks={d} total_run_compression_codec_mask={d} l0_runs={d} l0_bytes={d} overlapping_l0_runs={d} lower_level_runs={d} lower_level_bytes={d} max_level={d} compactable_l0_runs={d} soft_limit_l0_runs={d} hard_limit_l0_runs={d} soft_limit_l0_bytes={d} hard_limit_l0_bytes={d} level_overflow_runs={d} level_overflow_bytes={d} obsolete_paths={d} active_readers={d} active_bulk_ingest_batches={d} manifest_dirty={any} obsolete_manifest_dirty={any}",
+                "antfly_bench_hbc_lsm_maintenance phase={s} index={s} mutable_entries={d} mutable_bytes={d} mutable_snapshot_clone_calls={d} mutable_snapshot_clone_bytes_total={d} mutable_snapshot_clone_peak_bytes={d} total_runs={d} total_run_bytes={d} total_run_logical_entry_bytes={d} total_run_physical_entry_bytes={d} total_run_compressed_blocks={d} total_run_raw_blocks={d} total_run_compression_codec_mask={d} l0_runs={d} l0_bytes={d} overlapping_l0_runs={d} lower_level_runs={d} lower_level_bytes={d} max_level={d} compactable_l0_runs={d} soft_limit_l0_runs={d} hard_limit_l0_runs={d} soft_limit_l0_bytes={d} hard_limit_l0_bytes={d} level_overflow_runs={d} level_overflow_bytes={d} obsolete_paths={d} active_readers={d} active_bulk_ingest_batches={d} manifest_dirty={any} obsolete_manifest_dirty={any}",
                 .{
                     phase,
                     entry.config.name,
                     maintenance.mutable_entries,
                     maintenance.mutable_bytes,
+                    maintenance.mutable_snapshot_clone_calls,
+                    maintenance.mutable_snapshot_clone_bytes_total,
+                    maintenance.mutable_snapshot_clone_peak_bytes,
                     maintenance.total_runs,
                     maintenance.total_run_bytes,
                     maintenance.total_run_logical_entry_bytes,
