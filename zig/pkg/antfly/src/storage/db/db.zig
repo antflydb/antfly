@@ -14736,6 +14736,7 @@ fn applyDerivedBatchToIndexReplayContext(
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
+        .relational_base_rows = ctx.relational_base_rows,
     };
     if (benchMetricsEnabled()) {
         var profile = BatchProfile{};
@@ -14814,6 +14815,7 @@ fn applyDerivedBatchTargetsContextProfiled(ctx: *const BatchExecutionContext, ba
                 .index_manager = ctx.index_manager,
                 .apply_mutex = ctx.apply_mutex,
                 .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
+                .relational_base_rows = ctx.relational_base_rows,
             };
             try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, profile);
             const index_sync_start_ns = monotonicTimeNs();
@@ -15101,6 +15103,7 @@ fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_
         .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
+        .relational_base_rows = self.relationalColumnsForStore() != null,
     };
     try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
 }
@@ -17074,6 +17077,7 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
+        .relational_base_rows = self.relationalColumnsForStore() != null,
     };
     try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
     return true;
@@ -17201,6 +17205,7 @@ fn applyDerivedBatchToShadowIfNeeded(self: *DB, batch: derived_types.DerivedBatc
         .index_manager = shadow.manager,
         .apply_mutex = async_resources.apply_mutex,
         .allow_graph_materialization = false,
+        .relational_base_rows = self.relationalColumnsForStore() != null,
     };
 
     for (managed_indexes) |index_ref| {
@@ -40843,4 +40848,81 @@ test "relational table full-text search loads stored_data from base rows" {
     defer bool_filtered.deinit();
     try std.testing.expectEqual(@as(u32, 1), bool_filtered.total_hits);
     try std.testing.expectEqualStrings("row:a", bool_filtered.hits[0].id);
+}
+
+test "relational derived replay reads base row keyspace" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_replay_relational",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    const doc_json = "{\"title\":\"async replay row\",\"amount\":9.5}";
+    const row_value = try mapper.buildRelationalRowValueAlloc(alloc, doc_json, runtime_schema.relational_columns);
+    defer alloc.free(row_value);
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:async");
+    defer alloc.free(relational_key);
+    try db.core.store.put(relational_key, row_value);
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:async");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
+
+    const targets = [_]derived_types.DerivedTargetRef{.{
+        .kind = .full_text,
+        .index_name = "ft_replay_relational",
+    }};
+    const docs = [_]derived_types.DerivedDocument{.{
+        .key = "row:async",
+        .targets = &targets,
+    }};
+    const batch = derived_types.DerivedBatch{
+        .sequence = 1,
+        .documents = &docs,
+    };
+    var replay_ctx = ReplayApplyContext{ .db = &db };
+    try std.testing.expect(try applyDerivedBatchToIndexReplay(&replay_ctx, batch, .{
+        .name = "ft_replay_relational",
+        .kind = .full_text,
+    }));
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_replay_relational",
+        .query = .{ .match = .{ .field = "title", .text = "async" } },
+        .include_stored = true,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("row:async", result.hits[0].id);
+    try std.testing.expect(result.hits[0].stored_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.hits[0].stored_data.?, "\"amount\":9.5") != null);
 }

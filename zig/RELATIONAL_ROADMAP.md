@@ -6,7 +6,8 @@ interim shape:
 
 - document-mode tables: JSON KV value plus derived indexes, unchanged;
 - relational tables in this PR: a dedicated relational row key is the base
-  document record, with derived typed-doc-value sections in search segments;
+  document record, and derived search segments no longer carry full relational
+  column copies;
 - relational target: one synchronous typed column store is the relational base
   table, and query/index consumers read from that same committed representation.
 
@@ -95,7 +96,10 @@ Current PR progress:
   base-row doc constraints over the text match-all path, so scalar query results
   follow the committed relational row rather than stale segment doc-values;
 - normal relational text projection no longer emits full-column
-  `typed_doc_values` or relational manifests into derived text segments.
+  `typed_doc_values` or relational manifests into derived text segments;
+- foreground, replay, catch-up, and split-shadow derived apply contexts carry
+  the relational-base-row flag, so replays probe the relational row keyspace
+  instead of the old primary document key.
 
 ## Implementation Phases
 
