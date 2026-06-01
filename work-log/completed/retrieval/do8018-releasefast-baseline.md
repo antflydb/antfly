@@ -1589,3 +1589,71 @@ Metrics-on text timing aggregate:
 - Hit materialization timing: 2,881 ms
 
 Interpretation: v22 reduced metrics-on term block bytes from the prior 101,577,520 bytes to 96,722,169 bytes, a ~4.8 MiB reduction in this run. It also moved term-dictionary build timing from 7,525 ms to 7,277 ms, though timing remains noisy. The next dictionary-size work should target repeated term text itself and per-entry varint framing inside term blocks; the value stream is no longer the only obvious waste.
+
+## Post Front-Coded Term Block Baseline
+
+Run: `work-log/do8018/releasefast-baseline-20260601-090240`
+Commit: `36eadde9db55`
+
+Metrics off:
+
+- Load time: 45.612584833s
+- Async catch-up time: 10.189278791s
+- Total elapsed: 55.801927542s
+- Throughput: 1,547.93 records/sec, 4.72 MiB/sec
+- `ps` RSS: 634,961,920 bytes
+- Peak sampled RSS: 1,090,387,968 bytes
+- Process footprint metric: 120,200,152 bytes
+- Peak sampled process footprint: 695,884,688 bytes
+- Live malloc metric: 78,468,576 bytes
+- Peak sampled live malloc: 245,306,240 bytes
+- Segment files: 8
+- Segment bytes: 392,182,126
+- Stored fields bytes: 127,622,654
+- Inverted bytes: 260,489,030
+- Postings bytes: 144,981,053
+- Term block bytes: 93,353,740
+- Text merges completed: 161
+- Full-text build peak bytes: 164,634,188
+- Full-text pending peak bytes: 403,316,076
+- Text merge buffer peak bytes: 87,765,162
+
+Metrics on:
+
+- Load time: 47.294567458s
+- Async catch-up time: 13.724819708s
+- Total elapsed: 1m1.019452417s
+- Throughput: 1,492.88 records/sec, 4.55 MiB/sec
+- `ps` RSS: 611,368,960 bytes
+- Peak sampled RSS: 930,430,976 bytes
+- Process footprint metric: 114,318,200 bytes
+- Peak sampled process footprint: 591,010,920 bytes
+- Live malloc metric: 88,928,048 bytes
+- Peak sampled live malloc: 251,188,704 bytes
+- Segment files: 8
+- Segment bytes: 395,727,382
+- Peak full-text segment bytes: 394,771,859
+- Text merges completed: 168
+- Full-text build peak bytes: 169,324,343
+- Full-text pending peak bytes: 397,264,046
+- Text merge buffer peak bytes: 78,884,848
+
+Metrics-on text timing aggregate:
+
+- Timing lines: 181
+- Source/projection docs: 70,605 / 70,605
+- Total text build timing: 34,032 ms
+- Segment build timing: 34,018 ms
+- Segment encode timing: 13,622 ms
+- Inverted build timing: 11,832 ms
+- Inverted term dictionary timing: 8,118 ms
+- Inverted postings serialization timing: 2,416 ms
+- Inverted sort timing: 602 ms
+- Inverted final assembly timing: 260 ms
+- Segment assembly timing: 1,618 ms
+- Stored compression timing: 491 ms
+- Analyzer timing: 3,617 ms
+- Term accumulation timing: 2,662 ms
+- Hit materialization timing: 3,141 ms
+
+Interpretation: front-coded term blocks reduced metrics-off term block bytes from 102,639,384 to 93,353,740 bytes and segment bytes from 411,602,061 to 392,182,126 bytes. Metrics-off total elapsed was effectively flat at ~56 seconds, but metrics-on got slower versus the v22 baseline: total elapsed moved from 56.180276333s to 1m1.019452417s and metrics-on text build timing moved from 30,449 ms to 34,032 ms. The slowdown is larger than ordinary noise in the instrumented path and is concentrated in the term dictionary/inverted encoding work. Next work should keep the compact format but remove extra encoder overhead, likely by avoiding per-entry suffix comparison churn and reusing block scratch when writing/looking up front-coded terms.
