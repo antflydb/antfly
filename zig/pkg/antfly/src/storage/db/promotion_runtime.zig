@@ -57,6 +57,14 @@ pub const EntityUpsert = struct {
     doc_json: []const u8,
 };
 
+pub const MissingSinkPolicy = enum {
+    /// Hold the applied sequence until a sink is injected; production routing or
+    /// metadata gaps must not permanently drop promotion work.
+    wait,
+    /// Explicitly disable promotion and advance applied sequence without writes.
+    disabled,
+};
+
 pub const EntitySink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -195,17 +203,17 @@ pub fn catchUpWindow(
 /// Managed worker that catches the promoter up on changed resolution artifacts.
 /// Mirrors `ResolutionRuntime`: it wraps the shard store and replay source,
 /// drains `applied_sequence` toward `target_sequence`, and persists the applied
-/// sequence only after the entity upserts are durable. With no `EntitySink`
-/// injected the worker advances without writing, so the replay journal can still
-/// prune.
+/// sequence only after the entity upserts are durable, or when promotion is
+/// explicitly disabled by policy.
 pub const PromotionRuntime = struct {
     alloc: Allocator,
     store_handle: resolution_runtime.RuntimeStoreHandle,
     replay_source: replay_source_mod.Source,
     /// Cross-shard entity write sink injected by the api/serving layer; null
-    /// means no promotion (the stage advances without writing). Must outlive the
-    /// runtime.
+    /// means promotion waits or is explicitly disabled, depending on
+    /// `missing_sink_policy`. Must outlive the runtime.
     sink: ?EntitySink,
+    missing_sink_policy: MissingSinkPolicy,
     applied_sequence: std.atomic.Value(u64),
     target_sequence: std.atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
@@ -219,6 +227,7 @@ pub const PromotionRuntime = struct {
         replay_source: replay_source_mod.Source,
         backend_runtime: *background_runtime_mod.BackendRuntime,
         sink: ?EntitySink,
+        missing_sink_policy: MissingSinkPolicy,
     ) !PromotionRuntime {
         var store_handle = try resolution_runtime.initRuntimeStore(alloc, store);
         errdefer store_handle.deinit();
@@ -228,6 +237,7 @@ pub const PromotionRuntime = struct {
             .store_handle = store_handle,
             .replay_source = replay_source,
             .sink = sink,
+            .missing_sink_policy = missing_sink_policy,
             .applied_sequence = .init(applied),
             .target_sequence = .init(applied),
             .shutdown_flag = .init(false),
@@ -286,9 +296,10 @@ pub const PromotionRuntime = struct {
             const applied = self.applied_sequence.load(.acquire);
             if (applied >= target) return;
 
-            // No sink: nothing to promote, but advance so the hint does not
-            // rescan and the prune watermark can move.
+            // No sink is either an explicit disabled mode or a temporary wiring /
+            // routing gap. Only the disabled mode is allowed to mark work applied.
             const sink = self.sink orelse {
+                if (self.missing_sink_policy == .wait) return;
                 try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
                 self.applied_sequence.store(target, .release);
                 return;
@@ -322,7 +333,11 @@ pub const PromotionRuntime = struct {
                 self.catchUp() catch |err| {
                     std.log.warn("promotion catch-up failed: {s}", .{@errorName(err)});
                     io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
+                    continue;
                 };
+                if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
+                    io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
+                }
             } else {
                 io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
             }

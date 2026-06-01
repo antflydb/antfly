@@ -100,10 +100,7 @@ pub const DistributedEntitySink = struct {
             try reqs.append(a, .{ .table_name = t, .transforms = table_ops.items[i].items });
         }
 
-        const outcome = self.writes.commitTransaction(allocator, reqs.items, self.sync_level) catch |err| switch (err) {
-            error.UnexpectedHttpStatus, error.TableNotFound => return,
-            else => return err,
-        };
+        const outcome = try self.writes.commitTransaction(allocator, reqs.items, self.sync_level);
         if (outcome) |result| {
             switch (result) {
                 .committed => return,
@@ -136,10 +133,7 @@ pub const DistributedEntitySink = struct {
             // Commit the merge through the 2PC path. A null outcome means the
             // write source does not implement the transaction vtable, so fall
             // back to a plain batch.
-            const outcome = self.writes.commitTransaction(allocator, &.{.{ .table_name = table, .transforms = &.{transform} }}, self.sync_level) catch |err| switch (err) {
-                error.UnexpectedHttpStatus, error.TableNotFound => return,
-                else => return err,
-            };
+            const outcome = try self.writes.commitTransaction(allocator, &.{.{ .table_name = table, .transforms = &.{transform} }}, self.sync_level);
             if (outcome) |result| {
                 switch (result) {
                     .committed => return,
@@ -160,12 +154,9 @@ pub const DistributedEntitySink = struct {
             .sync_level = self.sync_level,
         };
         // null means the table is unknown to this node's routing (e.g. not yet
-        // created); drop the promotion rather than failing the stage. Replay
-        // re-promotes once the entity table exists.
-        _ = self.writes.batch(allocator, table, req) catch |err| switch (err) {
-            error.UnexpectedHttpStatus, error.TableNotFound => return,
-            else => return err,
-        } orelse return;
+        // created). Keep the promotion sequence unapplied so replay retries once
+        // metadata/routing catches up.
+        _ = (try self.writes.batch(allocator, table, req)) orelse return error.EntityPromotionUnavailable;
     }
 };
 

@@ -96,15 +96,21 @@ pub const DistributedCandidateSource = struct {
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
         table: []const u8,
-        embedding: []const f32,
-        k: usize,
+        query: CandidateSource.NearestQuery,
         ctx: *anyopaque,
         consume: CandidateSource.Consume,
     ) anyerror!void {
         const self: *DistributedCandidateSource = @ptrCast(@alignCast(ptr));
-        const limit: u32 = @intCast(@min(k, std.math.maxInt(u32)));
+        const limit: u32 = @intCast(@min(query.k, std.math.maxInt(u32)));
+        const dense_query = db_mod.types.DenseKnnQuery{ .vector = query.embedding, .k = limit };
+        const named_queries = [_]db_mod.types.NamedDenseQuery{.{
+            .name = "resolver_candidates",
+            .index_name = query.index_name,
+            .query = dense_query,
+        }};
         const req = db_mod.types.SearchRequest{
-            .dense = .{ .vector = embedding, .k = limit },
+            .dense = if (query.index_name.len == 0) dense_query else null,
+            .dense_queries = if (query.index_name.len == 0) &.{} else named_queries[0..],
             .limit = limit,
             .include_stored = true,
             .include_all_fields = true,
@@ -201,6 +207,7 @@ const FakeTableReadSource = struct {
     /// Canned query envelope returned by `query` (the vector path).
     query_body: []const u8 = "",
     last_query_k: u32 = 0,
+    last_query_index: []const u8 = "",
 
     fn source(self: *FakeTableReadSource) table_reads.TableReadSource {
         return .{ .ptr = self, .vtable = &vtable };
@@ -274,7 +281,13 @@ const FakeTableReadSource = struct {
         _ = consistency;
         const self: *FakeTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table)) return null;
-        self.last_query_k = if (req.dense) |d| d.k else 0;
+        if (req.dense_queries.len > 0) {
+            self.last_query_k = req.dense_queries[0].query.k;
+            self.last_query_index = req.dense_queries[0].index_name;
+        } else {
+            self.last_query_k = if (req.dense) |d| d.k else 0;
+            self.last_query_index = "";
+        }
         return .{ .json = try alloc.dupe(u8, self.query_body) };
     }
 };
@@ -375,9 +388,14 @@ test "DistributedCandidateSource nearest parses query hits into candidates" {
     var ctx = CollectCtx{ .alloc = alloc };
     defer ctx.deinit();
     const embedding = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
-    try src.nearest(alloc, "entities", &embedding, 25, &ctx, CollectCtx.consume);
+    try src.nearest(alloc, "entities", .{
+        .index_name = "name_embedding",
+        .embedding = &embedding,
+        .k = 25,
+    }, &ctx, CollectCtx.consume);
 
     try testing.expectEqual(@as(u32, 25), fake.last_query_k);
+    try testing.expectEqualStrings("name_embedding", fake.last_query_index);
     try testing.expectEqual(@as(usize, 1), ctx.keys.items.len);
     try testing.expectEqualStrings("person/ada_lovelace", ctx.keys.items[0]);
     try testing.expect(std.mem.indexOf(u8, ctx.values.items[0], "Ada Lovelace") != null);

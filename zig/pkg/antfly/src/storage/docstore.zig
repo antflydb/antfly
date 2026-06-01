@@ -62,6 +62,8 @@ const replay_hints = [_]change_journal_mod.TargetHint{
     .sparse_vector,
     .graph,
     .algebraic,
+    .resolution,
+    .promotion,
 };
 
 fn replayHintOrdinal(hint: change_journal_mod.TargetHint) u8 {

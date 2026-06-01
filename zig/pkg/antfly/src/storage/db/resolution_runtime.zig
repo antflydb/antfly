@@ -62,14 +62,19 @@ pub const CandidateSource = struct {
     vtable: *const VTable,
 
     pub const Consume = *const fn (ctx: *anyopaque, entity_key: []const u8, value: []const u8) anyerror!void;
+    pub const NearestQuery = struct {
+        index_name: []const u8,
+        embedding: []const f32,
+        k: usize,
+    };
 
     pub const VTable = struct {
         /// Fetch the entity doc for `key` in `table` (owned bytes or null).
         get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8,
         /// Scan `table` for entities whose key starts with `prefix`.
         scan_prefix: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, prefix: []const u8, ctx: *anyopaque, consume: Consume) anyerror!void = null,
-        /// The `k` nearest entities in `table` to `embedding`.
-        nearest: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, embedding: []const f32, k: usize, ctx: *anyopaque, consume: Consume) anyerror!void = null,
+        /// The nearest entities in `table` for a named dense index.
+        nearest: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, query: NearestQuery, ctx: *anyopaque, consume: Consume) anyerror!void = null,
     };
 
     pub fn get(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8 {
@@ -79,9 +84,9 @@ pub const CandidateSource = struct {
         const f = self.vtable.scan_prefix orelse return error.ScanUnsupported;
         return f(self.ptr, allocator, table, prefix, ctx, consume);
     }
-    pub fn nearest(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, embedding: []const f32, k: usize, ctx: *anyopaque, consume: Consume) anyerror!void {
+    pub fn nearest(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, query: NearestQuery, ctx: *anyopaque, consume: Consume) anyerror!void {
         const f = self.vtable.nearest orelse return error.NearestUnsupported;
-        return f(self.ptr, allocator, table, embedding, k, ctx, consume);
+        return f(self.ptr, allocator, table, query, ctx, consume);
     }
 };
 
@@ -187,7 +192,14 @@ pub fn processChangedExtraction(
         // in-store providers when the resolver declares a candidate search mode.
         if (candidate_source) |src| {
             if (candidateModeFromConfig(cfg.candidate_search)) |mode| {
-                source_provider = .{ .source = src, .resolver = &resolver, .table = cfg.table, .mode = mode };
+                source_provider = .{
+                    .source = src,
+                    .resolver = &resolver,
+                    .table = cfg.table,
+                    .mode = mode,
+                    .ann_index_name = annIndexName(cfg),
+                    .candidate_limit = candidateLimit(cfg),
+                };
                 break :blk source_provider.provider();
             }
             break :blk null;
@@ -411,6 +423,7 @@ fn appendEntityCandidate(
 }
 
 pub const CandidateMode = enum { exact_key, prefix, ann };
+const default_candidate_limit: usize = 25;
 
 fn candidateModeFromConfig(s: []const u8) ?CandidateMode {
     if (std.mem.eql(u8, s, "exact_key")) return .exact_key;
@@ -427,6 +440,8 @@ const SourceCandidateProvider = struct {
     resolver: *const resolver_lib.Resolver,
     table: []const u8,
     mode: CandidateMode,
+    ann_index_name: []const u8,
+    candidate_limit: usize,
 
     fn provider(self: *SourceCandidateProvider) resolver_lib.CandidateProvider {
         return .{ .ptr = self, .vtable = &vtable };
@@ -472,7 +487,11 @@ const SourceCandidateProvider = struct {
             .ann => {
                 const emb = entity.embedding orelse return;
                 var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .out = out };
-                self.source.nearest(allocator, self.table, emb, 25, &ctx, ScanCtx.consume) catch |e| switch (e) {
+                self.source.nearest(allocator, self.table, .{
+                    .index_name = self.ann_index_name,
+                    .embedding = emb,
+                    .k = self.candidate_limit,
+                }, &ctx, ScanCtx.consume) catch |e| switch (e) {
                     error.NearestUnsupported => return,
                     else => return e,
                 };
@@ -480,6 +499,15 @@ const SourceCandidateProvider = struct {
         }
     }
 };
+
+fn annIndexName(cfg: *const ResolverConfig) []const u8 {
+    if (cfg.candidate_ann_index.len > 0) return cfg.candidate_ann_index;
+    return cfg.name_embedding;
+}
+
+fn candidateLimit(cfg: *const ResolverConfig) usize {
+    return if (cfg.candidate_limit > 0) cfg.candidate_limit else default_candidate_limit;
+}
 
 /// "exact_key" blocking: look up the rendered canonical key as an existing
 /// entity (by document key through the store seam). Reads whatever the worker's
@@ -805,10 +833,7 @@ pub fn catchUpWindow(
     var seen_sequences = std.AutoHashMapUnmanaged(u64, void).empty;
     defer seen_sequences.deinit(gpa);
     ctx.seen_sequences = &seen_sequences;
-    const hints = [_]change_journal_mod.TargetHint{ .resolution, .graph };
-    for (hints) |hint| {
-        _ = try replay_source.forEachMatchingRecord(gpa, from_sequence, hint, max_records, &ctx, Ctx.consume);
-    }
+    _ = try replay_source.forEachMatchingRecord(gpa, from_sequence, .resolution, max_records, &ctx, Ctx.consume);
     return ctx.max_seen;
 }
 
@@ -1961,6 +1986,8 @@ const FakeCandidateSource = struct {
     map: std.StringHashMapUnmanaged([]u8) = .empty,
     /// Records the (table) each mode was queried with, for assertions.
     last_table: []const u8 = "",
+    last_ann_index: []const u8 = "",
+    last_ann_k: usize = 0,
 
     fn deinit(self: *FakeCandidateSource) void {
         var it = self.map.iterator();
@@ -2022,19 +2049,20 @@ const FakeCandidateSource = struct {
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
         table: []const u8,
-        embedding: []const f32,
-        k: usize,
+        query: CandidateSource.NearestQuery,
         ctx: *anyopaque,
         consume: CandidateSource.Consume,
     ) anyerror!void {
         _ = allocator;
-        _ = embedding;
+        _ = query.embedding;
         const self: *FakeCandidateSource = @ptrCast(@alignCast(ptr));
         self.last_table = table;
+        self.last_ann_index = query.index_name;
+        self.last_ann_k = query.k;
         var emitted: usize = 0;
         var it = self.map.iterator();
         while (it.next()) |e| {
-            if (emitted >= k) break;
+            if (emitted >= query.k) break;
             try consume(ctx, e.key_ptr.*, e.value_ptr.*);
             emitted += 1;
         }
@@ -2152,6 +2180,8 @@ test "SourceCandidateProvider ann blocking links via cross-shard nearest neighbo
         .resolution_artifact = "resolution_v1",
         .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
         .candidate_search = "ann",
+        .candidate_ann_index = "entity_name_embedding",
+        .candidate_limit = 7,
         .scorer_json =
         \\{ "comparisons": [ { "name": "emb", "left": "name_embedding", "right": "name_embedding",
         \\  "levels": [ { "when": "cosine > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
@@ -2179,6 +2209,8 @@ test "SourceCandidateProvider ann blocking links via cross-shard nearest neighbo
     const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, remote.candidateSource(), null)).?;
     defer alloc.free(outcome.resolution_key);
     try testing.expectEqualStrings("entities", remote.last_table);
+    try testing.expectEqualStrings("entity_name_embedding", remote.last_ann_index);
+    try testing.expectEqual(@as(usize, 7), remote.last_ann_k);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
     defer alloc.free(resolution_key);

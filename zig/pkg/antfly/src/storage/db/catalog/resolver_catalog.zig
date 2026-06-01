@@ -58,6 +58,11 @@ pub const ResolverConfig = struct {
     /// scorer can link to an existing entity). ANN/prefix blocking over the
     /// entity table is a phase-2 extension.
     candidate_search: []const u8 = "",
+    /// Dense index to use for `candidate_search = "ann"`. Empty defaults to
+    /// `name_embedding` for compatibility with early resolver configs.
+    candidate_ann_index: []const u8 = "",
+    /// Maximum ANN candidates to request. Zero uses the runtime default.
+    candidate_limit: u32 = 0,
     /// Embedding model name used to backfill a mention's name embedding (for
     /// `cosine` scoring / `ann` blocking) when the extraction artifact carries
     /// none. Empty disables backfill. Must match the embedding the entity table
@@ -93,6 +98,8 @@ pub const ResolverConfig = struct {
             .type_must_match = cfg.type_must_match,
             .scorer_json = if (cfg.scorer_json.len > 0) try alloc.dupe(u8, cfg.scorer_json) else "",
             .candidate_search = if (cfg.candidate_search.len > 0) try alloc.dupe(u8, cfg.candidate_search) else "",
+            .candidate_ann_index = if (cfg.candidate_ann_index.len > 0) try alloc.dupe(u8, cfg.candidate_ann_index) else "",
+            .candidate_limit = cfg.candidate_limit,
             .name_embedding = if (cfg.name_embedding.len > 0) try alloc.dupe(u8, cfg.name_embedding) else "",
             .name_embedding_dims = cfg.name_embedding_dims,
             .fusion_combine = if (cfg.fusion_combine.len > 0) try alloc.dupe(u8, cfg.fusion_combine) else "",
@@ -111,6 +118,7 @@ pub const ResolverConfig = struct {
         alloc.free(@constCast(self.key_template));
         if (self.scorer_json.len > 0) alloc.free(@constCast(self.scorer_json));
         if (self.candidate_search.len > 0) alloc.free(@constCast(self.candidate_search));
+        if (self.candidate_ann_index.len > 0) alloc.free(@constCast(self.candidate_ann_index));
         if (self.name_embedding.len > 0) alloc.free(@constCast(self.name_embedding));
         if (self.fusion_combine.len > 0) alloc.free(@constCast(self.fusion_combine));
         self.* = undefined;
@@ -122,6 +130,9 @@ pub const ResolverConfig = struct {
     /// prior outside [0, 1]) collapses every edge weight toward 0, which a
     /// weighted traversal with a positive `min_weight` would silently drop.
     pub fn validate(self: ResolverConfig) !void {
+        if (std.mem.eql(u8, self.candidate_search, "ann")) {
+            if (self.candidate_ann_index.len == 0 and self.name_embedding.len == 0) return error.InvalidResolverConfig;
+        }
         if (self.fusion_combine.len == 0) return;
         if (fusionStrategy(self.fusion_combine) == null) return error.InvalidResolverConfig;
         if (!(self.fusion_trust > 0.0 and self.fusion_trust <= 1.0)) return error.InvalidResolverConfig;

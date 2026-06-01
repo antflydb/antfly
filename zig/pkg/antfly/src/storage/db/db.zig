@@ -172,9 +172,11 @@ pub const OpenOptions = struct {
     /// outlive the DB.
     resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
     /// Optional cross-shard entity sink for the promoter, injected by the serving
-    /// layer (see `api/distributed_entity_sink.zig`). Null means no promotion
-    /// (the stage advances without writing entities). Must outlive the DB.
+    /// layer (see `api/distributed_entity_sink.zig`). Must outlive the DB.
     entity_sink: ?promotion_runtime_mod.EntitySink = null,
+    /// What the promoter does when no sink is currently available. The safe
+    /// default holds replay so a later sink injection or routing repair can retry.
+    entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
     /// Optional name embedder for resolution: backfills a mention's name
     /// embedding (for cosine/ann blocking) when a resolver declares a
     /// `name_embedding` model and the extraction artifact carries no vector.
@@ -2263,6 +2265,7 @@ pub const DB = struct {
     resolution_embedder: ?embedder_mod.DenseEmbedder = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     entity_sink: ?promotion_runtime_mod.EntitySink = null,
+    entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
@@ -2448,6 +2451,7 @@ pub const DB = struct {
                 .resolution_candidate_source = opts.resolution_candidate_source,
                 .resolution_embedder = opts.resolution_embedder,
                 .entity_sink = opts.entity_sink,
+                .entity_sink_missing_policy = opts.entity_sink_missing_policy,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
                 .transaction_recovery_identity_context = null,
@@ -2701,8 +2705,10 @@ pub const DB = struct {
             self.core.replaySource(),
             self.backend_runtime,
             // Cross-shard entity sink when the serving layer injected one (via
-            // OpenOptions); null means the stage advances without promoting.
+            // OpenOptions or setEntitySink); the missing-sink policy decides
+            // whether null means wait or explicit no-op.
             self.entity_sink,
+            self.entity_sink_missing_policy,
         );
         errdefer runtime.deinit();
         self.promotion_runtime = runtime;
@@ -14479,11 +14485,6 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     // wake the promoter so it upserts the canonical entity documents.
     if (ctx.promotion_runtime) |runtime| runtime.notifySequence(sequence);
     if (ctx.executor.hasWorkers()) {
-        if (derivedBatchHasResolutionArtifact(batch)) {
-            var applied_batch = batch;
-            applied_batch.sequence = sequence;
-            try applyDerivedBatchContext(&batch_ctx, applied_batch);
-        }
         ctx.executor.forceSequence(sequence);
         return sequence;
     }
@@ -14492,13 +14493,6 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     applied_batch.sequence = sequence;
     try applyDerivedBatchContext(&batch_ctx, applied_batch);
     return sequence;
-}
-
-fn derivedBatchHasResolutionArtifact(batch: derived_types.DerivedBatch) bool {
-    for (batch.changed_artifact_keys) |key| {
-        if (internal_keys.isResolutionArtifactKey(key)) return true;
-    }
-    return false;
 }
 
 fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
