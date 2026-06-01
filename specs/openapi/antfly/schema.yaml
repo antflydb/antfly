@@ -24,6 +24,7 @@ components:
         - blob
         - link
         - search_as_you_type
+        - json
 
     DocumentSchema:
       type: object
@@ -47,6 +48,18 @@ components:
           type: integer
           format: uint32
           description: Version of the schema. Used for migrations.
+        storage_mode:
+          type: string
+          enum: [document, relational]
+          description: |
+            Storage profile for the table.
+            - "document" (default): schemaless JSON documents with optional,
+              soft schema validation. All indexes are derived from the document.
+            - "relational": required closed schema with typed columns. Documents
+              must match a declared type; declared scalar properties are stored
+              as typed columns for columnar predicate pushdown and aggregation.
+              A field typed "json" stores a subtree that is still indexed like a
+              document. Implies enforce_types and closed document types.
         default_type:
           type: string
           description: Default type to use from the document_types.

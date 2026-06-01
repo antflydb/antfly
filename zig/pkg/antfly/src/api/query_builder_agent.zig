@@ -6661,7 +6661,9 @@ test "query builder preflight estimate mode derives text bounds and postings lat
     try std.testing.expectApproxEqAbs(@as(f32, 0.3), estimate.selectivity_upper_bound_ratio.?, 0.001);
     try std.testing.expectEqual(QueryPreflightEstimateSummary.SelectivityHeuristic.broad, estimate.selectivity_heuristic);
     try std.testing.expectEqual(@as(usize, 4), estimate.selectivity_risk_factors.len);
-    try std.testing.expectEqualStrings("no_positive_id_bound", estimate.selectivity_risk_factors[0]);
+    // result_doc_upper_bound is derived as 300 (sum of term doc-freqs, capped at
+    // corpus), so the bound is positive -- the first risk factor reflects that.
+    try std.testing.expectEqualStrings("positive_id_bound", estimate.selectivity_risk_factors[0]);
     try std.testing.expectEqualStrings("corpus_size_available", estimate.selectivity_risk_factors[1]);
     try std.testing.expectEqualStrings("text_term_stats", estimate.selectivity_risk_factors[2]);
     try std.testing.expectEqualStrings("text_term_bound", estimate.selectivity_risk_factors[3]);

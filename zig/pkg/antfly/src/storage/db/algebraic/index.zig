@@ -26,6 +26,7 @@ const law_mod = @import("law.zig");
 const hll = @import("hll.zig");
 const lexical_mod = @import("lexical.zig");
 const pathfact_mod = @import("pathfact.zig");
+const relational_row_codec = @import("relational_row_codec.zig");
 const tensor_mod = @import("tensor.zig");
 const token = @import("token.zig");
 const value_mod = @import("value.zig");
@@ -2987,13 +2988,23 @@ pub const Index = struct {
         }
         for (batch.documents) |doc| {
             if (doc.action != .upsert) continue;
+            // When the batch carries no cleaned value, the document body is read
+            // straight from the store. For relational tables that stored value is
+            // a typed row, not JSON, so route it through the relational row codec
+            // (a JSON blob passes through unchanged) before indexing -- otherwise
+            // every relational row fails to parse and nothing is materialized.
+            var materialized_value: ?[]u8 = null;
+            defer if (materialized_value) |buf| self.alloc.free(buf);
             const value = doc.cleaned_value orelse blk: {
                 const store_key = try documentStoreKeyAlloc(self.alloc, doc.key);
                 defer self.alloc.free(store_key);
-                break :blk txn.get(store_key) catch |err| switch (err) {
+                const raw = txn.get(store_key) catch |err| switch (err) {
                     error.NotFound => continue,
                     else => return err,
                 };
+                const owned = try relational_row_codec.materializeDocumentValueAlloc(self.alloc, raw);
+                materialized_value = owned;
+                break :blk owned;
             };
             try self.addDoc(txn, doc.key, value, if (maintenance_context) |*ctx| ctx else null);
         }

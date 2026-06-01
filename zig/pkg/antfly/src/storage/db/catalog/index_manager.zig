@@ -2760,6 +2760,7 @@ pub const IndexManager = struct {
                     split_key,
                     .right,
                     dest_entry.config.config_json,
+                    dest_entry.runtime_schema,
                     collect_skip_doc_keys,
                 );
                 defer if (rebuilt.segment_bytes) |segment_bytes| self.alloc.free(segment_bytes);
@@ -3291,6 +3292,7 @@ pub const IndexManager = struct {
                             split_key,
                             .left,
                             entry.config.config_json,
+                            entry.runtime_schema,
                             false,
                         );
                         defer if (rebuilt.segment_bytes) |segment_bytes| self.alloc.free(segment_bytes);
@@ -3800,6 +3802,19 @@ pub const IndexManager = struct {
             return null;
         }
         if (self.algebraic_indexes.items.len == 1) return &self.algebraic_indexes.items[0];
+        return null;
+    }
+
+    /// Resolve the algebraic index that should serve an aggregation. `preferred`
+    /// is the query's index_name, which usually names the *text* index, not an
+    /// algebraic one: use it only when it actually names an algebraic index,
+    /// otherwise fall back to the table's default algebraic index (the first
+    /// one). Returns null when the table has no algebraic index.
+    pub fn aggregationAlgebraicIndex(self: *IndexManager, preferred: ?[]const u8) ?*AlgebraicIndex {
+        if (preferred) |name| {
+            if (self.algebraicIndex(name)) |entry| return entry;
+        }
+        if (self.algebraic_indexes.items.len > 0) return &self.algebraic_indexes.items[0];
         return null;
     }
 
@@ -4540,6 +4555,21 @@ pub const IndexManager = struct {
         try self.applySparseEmbeddingWritesEntry(store, entry, writes, batch_options);
     }
 
+    /// Reconstruct any relational typed-row values in a freshly scanned set of
+    /// document rows into canonical JSON, in place. Backfill scans read the raw
+    /// stored value (a typed row for relational tables); rewriting each row's
+    /// value to JSON here means every downstream consumer (text segment build,
+    /// dense/sparse vector field extraction) sees a document exactly as in
+    /// document mode, with no further per-consumer changes. Non-document and
+    /// JSON-blob rows are left untouched. The pair's `value` is owned, so the old
+    /// buffer is freed and replaced with the reconstructed bytes.
+    fn materializeScannedDocumentRows(self: *IndexManager, rows: []backend_scan.OwnedKVPair) !void {
+        for (rows) |*row| {
+            if (!mapper.isRelationalRowValue(row.value)) continue;
+            row.value = try mapper.materializeOwnedDocumentValueAlloc(self.alloc, row.value);
+        }
+    }
+
     fn backfillTextIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, resume_from: ?[]const u8) !void {
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
         var runtime_store = try initRuntimeStore(self.alloc, store);
@@ -4552,6 +4582,7 @@ pub const IndexManager = struct {
 
         const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
         defer backend_scan.freeResults(self.alloc, docs);
+        try self.materializeScannedDocumentRows(docs);
         var identity_txn = try runtime_store.store.beginRead();
         defer identity_txn.abort();
 
@@ -5812,6 +5843,7 @@ pub const IndexManager = struct {
 
         const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
         defer backend_scan.freeResults(self.alloc, docs);
+        try self.materializeScannedDocumentRows(docs);
 
         var items = std.ArrayListUnmanaged(hbc_mod.BatchInsertItem).empty;
         defer {
@@ -5863,6 +5895,7 @@ pub const IndexManager = struct {
 
         const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
         defer backend_scan.freeResults(self.alloc, docs);
+        try self.materializeScannedDocumentRows(docs);
 
         var writes = std.ArrayListUnmanaged(sparse_mod.SparseWrite).empty;
         defer {
@@ -9631,6 +9664,7 @@ fn buildSplitSegment(
     split_key: []const u8,
     side: SplitSide,
     config_json: ?[]const u8,
+    runtime_schema: ?schema_mod.TableSchema,
     collect_doc_keys: bool,
 ) !SplitRebuiltSegment {
     var reader = try segment_mod.SegmentReader.init(alloc, segment_bytes);
@@ -9698,7 +9732,10 @@ fn buildSplitSegment(
 
     const split_text_analysis = try introducer_mod.parseTextAnalysisConfig(alloc, config_json);
     defer introducer_mod.freeTextAnalysisConfig(alloc, split_text_analysis);
-    const rebuilt = try mapper.buildTextSegmentFromDocuments(alloc, docs.items, split_text_analysis, null);
+    // Pass the runtime schema so a relational table's split segment re-derives
+    // its typed columns + manifest from the reconstructed documents (rather than
+    // degrading to a document-mode segment that has lost columnar pushdown).
+    const rebuilt = try mapper.buildTextSegmentFromDocuments(alloc, docs.items, split_text_analysis, runtime_schema);
     return .{
         .segment_bytes = rebuilt,
         .doc_keys = try doc_keys.toOwnedSlice(alloc),

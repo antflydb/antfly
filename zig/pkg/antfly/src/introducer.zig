@@ -24,6 +24,7 @@ const index_mod = @import("index.zig");
 const segment_mod = @import("segment.zig");
 const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
+const relational_manifest = @import("section/relational_manifest.zig");
 const analysis_mod = @import("search/analysis.zig");
 const geo_mod = @import("search/geo.zig");
 const platform_time = @import("platform/time.zig");
@@ -184,6 +185,11 @@ pub const BuildTextOptions = struct {
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
     profile: ?*BuildTextProfile = null,
+    /// When set, the segment is relational: a manifest section describing these
+    /// columns is written, and document bodies are stored empty (reconstructed
+    /// from the typed columns on read). When null the segment stores bodies as
+    /// before (document mode, unchanged).
+    relational_manifest_columns: ?[]const relational_manifest.ManifestColumn = null,
 };
 
 pub const BuildTextProfile = struct {
@@ -286,7 +292,10 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
         const doc_alloc = doc_arena_state.allocator();
 
         const stored_attach_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
-        try seg_writer.addStoredDocBorrowed(text_doc.id, text_doc.stored_data);
+        // Relational segments store an empty body: the document is reconstructed
+        // from its typed columns via the manifest on read. The id is still kept.
+        const stored_body: []const u8 = if (options.relational_manifest_columns != null) "" else text_doc.stored_data;
+        try seg_writer.addStoredDocBorrowed(text_doc.id, stored_body);
         if (profile) |p| p.stored_doc_attach_ns +|= platform_time.monotonicNs() - stored_attach_start_ns;
 
         const doc_ordinal = text_doc.doc_ordinal orelse 0;
@@ -420,6 +429,9 @@ pub fn buildSegmentFromTextWithAnalysisOptions(
 
     const segment_encode_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
     if (has_doc_ordinal) try seg_writer.addDocOrdinals(doc_ordinals.items);
+    if (options.relational_manifest_columns) |manifest_columns| {
+        try seg_writer.addRelationalManifest(manifest_columns);
+    }
 
     const section_attach_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
     var fit = field_builders.iterator();
@@ -1765,7 +1777,11 @@ fn jsonValueToGeoPoint(value: std.json.Value) ?geo_mod.GeoPoint {
     return .{ .lat = lat, .lon = lon };
 }
 
-fn parseRfc3339ToNs(text: []const u8) !?u64 {
+/// Parse an RFC3339/ISO-8601 UTC timestamp ("YYYY-MM-DDTHH:MM:SS[.fffffffff]Z")
+/// to epoch nanoseconds. Returns null if the text is not a well-formed UTC
+/// RFC3339 instant. Shared with the relational datetime column coercion so query
+/// ingest and write ingest agree on the epoch-ns encoding.
+pub fn parseRfc3339ToNs(text: []const u8) !?u64 {
     if (text.len < 20) return null;
     if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
 
@@ -2013,6 +2029,54 @@ test "buildSegmentFromText emits typed doc values from stored JSON" {
     var bool_reader = try typed_dv.TypedDocValuesReader.init(alloc, bool_section);
     try std.testing.expectEqual(typed_dv.ValueType.bool_val, bool_reader.value_type);
     try std.testing.expectEqual(@as(?bool, true), try bool_reader.getBool(0));
+}
+
+test "buildSegmentFromText indexes caller-supplied relational typed columns and excludes others" {
+    const alloc = std.testing.allocator;
+
+    // Shape produced by schema_capability.relationalTypedColumnsAlloc for a
+    // relational document: authoritative typed columns supplied directly, so
+    // detection is bypassed. The json column ("meta") and any undeclared field
+    // ("score") are intentionally absent and must not become typed columns.
+    const relational_columns = [_]TypedFieldValue{
+        .{ .field_name = "price", .value_type = .f64_val, .value = .{ .f64_val = 10.5 } },
+        .{ .field_name = "active", .value_type = .bool_val, .value = .{ .bool_val = true } },
+        .{ .field_name = "ts", .value_type = .u64_val, .value = .{ .u64_val = 1000 } },
+    };
+
+    const seg_bytes = try buildSegmentFromText(alloc, &.{
+        .{
+            .id = "doc1",
+            .stored_data = "{\"price\":10.5,\"active\":true,\"ts\":1000,\"meta\":{\"k\":\"v\"},\"score\":99}",
+            .text_fields = &.{},
+            .typed_fields = &relational_columns,
+        },
+    }, &analysis_mod.default_analyzer, null);
+    defer alloc.free(seg_bytes);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
+    defer reader.deinit();
+
+    const price_section = reader.getSection("price", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var price_reader = try typed_dv.TypedDocValuesReader.init(alloc, price_section);
+    try std.testing.expectEqual(typed_dv.ValueType.f64_val, price_reader.value_type);
+    try std.testing.expectEqual(@as(?f64, 10.5), try price_reader.getF64(0));
+
+    const active_section = reader.getSection("active", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var active_reader = try typed_dv.TypedDocValuesReader.init(alloc, active_section);
+    try std.testing.expectEqual(typed_dv.ValueType.bool_val, active_reader.value_type);
+    try std.testing.expectEqual(@as(?bool, true), try active_reader.getBool(0));
+
+    const ts_section = reader.getSection("ts", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var ts_reader = try typed_dv.TypedDocValuesReader.init(alloc, ts_section);
+    try std.testing.expectEqual(typed_dv.ValueType.u64_val, ts_reader.value_type);
+    try std.testing.expectEqual(@as(?u64, 1000), try ts_reader.getU64(0));
+
+    // Authoritative + json-excluded: detection is bypassed, so fields that are
+    // not supplied as typed columns get no typed doc values even though they
+    // would otherwise be detected (object -> geo attempt, number -> f64).
+    try std.testing.expect(reader.getSection("meta", .typed_doc_values) == null);
+    try std.testing.expect(reader.getSection("score", .typed_doc_values) == null);
 }
 
 test "buildSegmentFromText uses configured custom datetime parsers for typed doc values" {

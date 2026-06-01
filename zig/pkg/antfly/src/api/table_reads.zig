@@ -5552,10 +5552,10 @@ fn algebraicIndexFreshEnoughForName(
     index_name_opt: ?[]const u8,
     db: *db_mod.DB,
 ) !bool {
-    const entry = if (index_name_opt) |index_name|
-        db.core.index_manager.algebraicIndex(index_name) orelse return false
-    else
-        db.core.index_manager.algebraicIndex(null) orelse return false;
+    // The request's index_name selects the text index; the algebraic index used
+    // for aggregation pushdown is resolved independently (an explicit algebraic
+    // index name, else the table's default algebraic index).
+    const entry = db.core.index_manager.aggregationAlgebraicIndex(index_name_opt) orelse return false;
     if (entry.index.hasErrors()) return false;
     const target_sequence = db.core.nextDerivedSequence();
     var applied_sequence = try db.core.loadAppliedSequence(alloc, entry.config.name);
@@ -8490,6 +8490,46 @@ fn identityGenerationForAggregationFullResultRerun(
     return req.identity_read_generation orelse result.identity_read_generation orelse error.UnsupportedQueryRequest;
 }
 
+/// True when the first-pass search already materialized every matching document,
+/// so its hits can be aggregated directly without a full-scan re-fetch. This
+/// only holds when the request did not bound the result below the match count:
+/// the page is complete (hits == total_hits) AND the caller asked for at least
+/// as many hits as matched (the limit did not truncate). A `limit` of 0
+/// (aggregation-only) never qualifies -- total_hits is then a truncated 0.
+fn aggregationFirstPassIsComplete(
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+) bool {
+    if (req.limit == 0) return false;
+    if (result.hits.len != result.total_hits) return false;
+    // hits == total_hits but the page was filled to the limit: there may be more
+    // matches the limit hid, so a full scan is still required.
+    return result.hits.len < req.limit;
+}
+
+/// Limit to use when re-fetching all matching documents for scan-based
+/// aggregation. total_hits is unreliable (truncated to the page), so bound the
+/// re-fetch by the shard's primary document count, which is an exact upper bound
+/// on the number of matches. Falls back to the observed total_hits if the count
+/// is unavailable.
+fn aggregationFullScanLimit(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    result: db_mod.types.SearchResult,
+) !u32 {
+    const doc_count = db.primaryDocCount(alloc) catch return @max(result.total_hits, 1);
+    const capped = std.math.cast(u32, doc_count) orelse std.math.maxInt(u32);
+    return @max(capped, result.total_hits);
+}
+
+/// Re-fetch limit for scan-based aggregation across multiple groups, where a
+/// single primary doc count is not available. An unbounded limit makes every
+/// shard return all of its matching documents so the merge aggregates over the
+/// full match set.
+fn aggregationDistributedFullScanLimit(result: db_mod.types.SearchResult) u32 {
+    return @max(result.total_hits, std.math.maxInt(u32));
+}
+
 fn applyBoundQueryAggregations(
     self: *BoundTableReadSource,
     alloc: std.mem.Allocator,
@@ -8500,10 +8540,9 @@ fn applyBoundQueryAggregations(
 ) !void {
     if (req.aggregations_json.len == 0) return;
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
-    if (!req.count_only and result.hits.len == result.total_hits) {
-        return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, self.db), meta);
-    }
-    if (result.total_hits == 0) {
+    // Aggregate over every matching document, not the (limit-truncated) page;
+    // see aggregationFirstPassIsComplete / aggregationFullScanLimit.
+    if (!req.count_only and aggregationFirstPassIsComplete(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, self.db), meta);
     }
 
@@ -8511,7 +8550,7 @@ fn applyBoundQueryAggregations(
     var full_req = req;
     full_req.identity_read_generation = identity_read_generation;
     full_req.offset = 0;
-    full_req.limit = result.total_hits;
+    full_req.limit = try aggregationFullScanLimit(alloc, self.db, result.*);
     full_req.include_stored = true;
     full_req.count_only = false;
     var full_result = try self.reads.searchWithConsistency(alloc, self.db, full_req, consistency);
@@ -8537,10 +8576,13 @@ fn applyProvisionedQueryAggregations(
         var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], 0, self.backend_runtime);
         defer db.close();
 
-        if (!req.count_only and result.hits.len == result.total_hits) {
-            return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
-        }
-        if (result.total_hits == 0) {
+        // Scan-based aggregations must run over every matching document, not the
+        // returned page. total_hits is recomputed from the (limit-truncated,
+        // MVCC-visible) page during postprocessing, so it cannot be trusted as
+        // the true match count: re-fetch with an unbounded limit (capped by the
+        // shard's primary doc count) whenever the first pass could have been
+        // truncated.
+        if (!req.count_only and aggregationFirstPassIsComplete(req, result.*)) {
             return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
         }
 
@@ -8549,7 +8591,7 @@ fn applyProvisionedQueryAggregations(
         var full_req = req;
         full_req.identity_read_generation = identity_read_generation;
         full_req.offset = 0;
-        full_req.limit = result.total_hits;
+        full_req.limit = try aggregationFullScanLimit(alloc, &db, result.*);
         full_req.include_stored = true;
         full_req.count_only = false;
         var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
@@ -8563,13 +8605,10 @@ fn applyProvisionedQueryAggregations(
     defer distributed_stats_mod.deinitTextFieldStats(alloc, current_agg_stats);
     const current_bg_stats = try collectProvisionedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, current_bg_stats);
-    if (!req.count_only and result.hits.len == result.total_hits) {
-        return try applyAggregationResults(alloc, aggregation_req, result.*, .{
-            .distributed_text_stats = current_agg_stats,
-            .distributed_background_text_stats = current_bg_stats,
-        }, meta);
-    }
-    if (result.total_hits == 0) {
+    // Aggregate over every matching document, not the (limit-truncated) page;
+    // see aggregationFirstPassIsComplete. Across groups the per-shard doc count
+    // is not readily available, so the re-fetch uses an unbounded limit.
+    if (!req.count_only and aggregationFirstPassIsComplete(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, .{
             .distributed_text_stats = current_agg_stats,
             .distributed_background_text_stats = current_bg_stats,
@@ -8580,7 +8619,7 @@ fn applyProvisionedQueryAggregations(
     var full_req = req;
     full_req.identity_read_generation = identity_read_generation;
     full_req.offset = 0;
-    full_req.limit = result.total_hits;
+    full_req.limit = aggregationDistributedFullScanLimit(result.*);
     full_req.include_stored = true;
     full_req.count_only = false;
     var full_result = try queryProvisionedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
@@ -8746,10 +8785,10 @@ fn applyHostedProvisionedQueryAggregations(
                 var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], 0, self.backend_runtime);
                 defer db.close();
 
-                if (!req.count_only and result.hits.len == result.total_hits) {
-                    return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
-                }
-                if (result.total_hits == 0) {
+                // Aggregate over every matching document, not the
+                // (limit-truncated) page; see aggregationFirstPassIsComplete /
+                // aggregationFullScanLimit.
+                if (!req.count_only and aggregationFirstPassIsComplete(req, result.*)) {
                     return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
                 }
 
@@ -8758,7 +8797,7 @@ fn applyHostedProvisionedQueryAggregations(
                 var full_req = req;
                 full_req.identity_read_generation = identity_read_generation;
                 full_req.offset = 0;
-                full_req.limit = result.total_hits;
+                full_req.limit = try aggregationFullScanLimit(alloc, &db, result.*);
                 full_req.include_stored = true;
                 full_req.count_only = false;
                 var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
@@ -8775,13 +8814,9 @@ fn applyHostedProvisionedQueryAggregations(
     defer distributed_stats_mod.deinitTextFieldStats(alloc, current_agg_stats);
     const current_bg_stats = try collectHostedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, consistency);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, current_bg_stats);
-    if (!req.count_only and result.hits.len == result.total_hits) {
-        return try applyAggregationResults(alloc, aggregation_req, result.*, .{
-            .distributed_text_stats = current_agg_stats,
-            .distributed_background_text_stats = current_bg_stats,
-        }, meta);
-    }
-    if (result.total_hits == 0) {
+    // Aggregate over every matching document, not the (limit-truncated) page;
+    // see aggregationFirstPassIsComplete.
+    if (!req.count_only and aggregationFirstPassIsComplete(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, .{
             .distributed_text_stats = current_agg_stats,
             .distributed_background_text_stats = current_bg_stats,
@@ -8792,7 +8827,7 @@ fn applyHostedProvisionedQueryAggregations(
     var full_req = req;
     full_req.identity_read_generation = identity_read_generation;
     full_req.offset = 0;
-    full_req.limit = result.total_hits;
+    full_req.limit = aggregationDistributedFullScanLimit(result.*);
     full_req.include_stored = true;
     full_req.count_only = false;
     var full_result = try queryHostedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);

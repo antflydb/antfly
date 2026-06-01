@@ -35,6 +35,7 @@ const Allocator = std.mem.Allocator;
 const platform_time = @import("platform/time.zig");
 const inverted = @import("section/inverted.zig");
 const typed_dv = @import("section/typed_doc_values.zig");
+const relational_manifest = @import("section/relational_manifest.zig");
 const snappy = @import("encoding/snappy.zig");
 const roaring = @import("encoding/roaring.zig");
 
@@ -64,9 +65,11 @@ pub const SectionType = enum(u16) {
     columnar_stored = 3,
     typed_doc_values = 4,
     doc_ordinals = 5,
+    relational_manifest = 6,
 };
 
 pub const doc_ordinals_field = "\x00__antfly_doc_ordinals";
+pub const relational_manifest_field = relational_manifest.manifest_field;
 
 // ============================================================================
 // Segment writer
@@ -155,6 +158,16 @@ pub const SegmentWriter = struct {
             .owns_data = false,
         });
         self.doc_count += 1;
+    }
+
+    /// Attach the relational column manifest, marking this a relational segment
+    /// whose document bodies are reconstructed from typed columns on read.
+    pub fn addRelationalManifest(self: *SegmentWriter, columns: []const relational_manifest.ManifestColumn) !void {
+        if (columns.len == 0) return;
+        const data = try relational_manifest.serialize(self.alloc, columns);
+        errdefer self.alloc.free(data);
+        const field_idx = try self.addField(relational_manifest_field);
+        try self.addSectionOwned(field_idx, .relational_manifest, data);
     }
 
     /// Store a document with Snappy-compressed data already prepared.
@@ -523,9 +536,32 @@ pub const SegmentReader = struct {
         return .{ .id = id, .data = compressed_data };
     }
 
+    /// Parsed relational column manifest, if this is a relational segment.
+    /// Caller owns the result (free via `Manifest.deinit`); the column strings
+    /// borrow the segment bytes.
+    pub fn relationalManifest(self: *const SegmentReader) !?relational_manifest.Manifest {
+        const section = self.getSection(relational_manifest_field, .relational_manifest) orelse return null;
+        return try relational_manifest.parse(self.alloc, section);
+    }
+
     /// Read and decompress stored document data. Caller owns returned data.
+    ///
+    /// For relational segments the document body is not stored as a blob — it
+    /// is reconstructed from the typed columns described by the segment's
+    /// relational manifest (keyed by the segment-local `doc_idx`). The id is
+    /// still taken from the stored-doc table. This is the single chokepoint
+    /// through which every body read (query, merge, shard split) is served, so
+    /// none of those call sites need schema access.
     pub fn storedDocDecompressed(self: *const SegmentReader, doc_idx: u32) !?struct { id: []const u8, data: []u8 } {
         const raw = self.storedDoc(doc_idx) orelse return null;
+
+        if (try self.relationalManifest()) |manifest_const| {
+            var manifest = manifest_const;
+            defer manifest.deinit(self.alloc);
+            const data = try relational_manifest.reconstructDocumentAlloc(self.alloc, self, manifest.columns, doc_idx);
+            return .{ .id = raw.id, .data = data };
+        }
+
         const ver = self.data[@intCast(self.stored_offset)];
         if (ver == stored_fields_version_compressed_per_doc) {
             const decompressed = try snappy.decode(self.alloc, raw.data);
@@ -734,6 +770,9 @@ pub fn writeMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []
     for (inputs) |input| {
         for (input.reader.fields) |*f| {
             if (std.mem.eql(u8, f.name, doc_ordinals_field)) continue;
+            // The relational manifest is carried forward verbatim below, not
+            // merged per-field like inverted/typed-doc-value sections.
+            if (std.mem.eql(u8, f.name, relational_manifest_field)) continue;
             try field_set.put(alloc, f.name, {});
         }
     }
@@ -802,6 +841,19 @@ pub fn writeMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []
         errdefer built_field.deinit(alloc);
         try appendBuiltSection(alloc, sink, &built_field, .doc_ordinals, merged_doc_ordinals);
         try built_fields.append(alloc, built_field);
+    }
+
+    // Carry the relational manifest forward verbatim. The column catalog is
+    // identical across a table's segments, so the first input that has one is
+    // authoritative; reconstruction post-merge reads it from the merged segment.
+    for (inputs) |input| {
+        if (input.reader.getSection(relational_manifest_field, .relational_manifest)) |manifest_section| {
+            var built_field = BuiltField{ .name = relational_manifest_field };
+            errdefer built_field.deinit(alloc);
+            try appendBuiltSection(alloc, sink, &built_field, .relational_manifest, manifest_section);
+            try built_fields.append(alloc, built_field);
+            break;
+        }
     }
 
     const sections_index_offset: u64 = @intCast(sink.len());
@@ -939,7 +991,12 @@ fn mergeTypedDocValuesSections(
                     .bool_val => if (try dv.getBool(doc_id)) |value| {
                         try writer.?.add(merged_doc_id, .{ .bool_val = value });
                     },
-                    .bytes_val => return error.UnsupportedTypedDocValues,
+                    .bytes_val => if (try dv.getBytes(doc_id)) |value| {
+                        // getBytes returns an owned dupe; writer.add dupes again,
+                        // so free the temporary after adding.
+                        defer alloc.free(value);
+                        try writer.?.add(merged_doc_id, .{ .bytes_val = value });
+                    },
                 }
             }
             merged_doc_id += 1;

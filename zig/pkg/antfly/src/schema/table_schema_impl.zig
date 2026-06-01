@@ -15,8 +15,20 @@
 const std = @import("std");
 const schema_regex = @import("antfly_regex");
 
+pub const StorageMode = enum {
+    document,
+    relational,
+
+    pub fn fromString(text: []const u8) ?StorageMode {
+        if (std.mem.eql(u8, text, "document")) return .document;
+        if (std.mem.eql(u8, text, "relational")) return .relational;
+        return null;
+    }
+};
+
 pub const TableSchema = struct {
     version: u32 = 0,
+    storage_mode: StorageMode = .document,
     default_type: []const u8 = "",
     ttl_duration_ns: u64 = 0,
     ttl_field: []const u8 = "_timestamp",
@@ -603,6 +615,12 @@ fn validateSchemaValue(value: std.json.Value) !void {
     };
 
     if (root.get("version")) |version| if (version != .null) try validateNonNegativeInteger(version);
+    if (root.get("storage_mode")) |storage_mode| if (storage_mode != .null) switch (storage_mode) {
+        .string => |text| {
+            if (StorageMode.fromString(text) == null) return error.InvalidSchemaUpdateRequest;
+        },
+        else => return error.InvalidSchemaUpdateRequest,
+    };
     if (root.get("default_type")) |default_type| if (default_type != .null and default_type != .string) return error.InvalidSchemaUpdateRequest;
     if (root.get("ttl_duration_ns")) |ttl_duration_ns| if (ttl_duration_ns != .null) try validateNonNegativeInteger(ttl_duration_ns);
     if (root.get("ttl_field")) |ttl_field| if (ttl_field != .null) switch (ttl_field) {
@@ -1182,6 +1200,7 @@ fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]
         std.mem.eql(u8, schema_type_name, "numeric") or
         std.mem.eql(u8, schema_type_name, "boolean") or
         std.mem.eql(u8, schema_type_name, "datetime") or
+        std.mem.eql(u8, schema_type_name, "json") or
         std.mem.eql(u8, schema_type_name, "object") or
         std.mem.eql(u8, schema_type_name, "array"))
     {
@@ -1360,6 +1379,12 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
 
     if (root.get("version")) |version| {
         if (version != .null) parsed.version = std.math.cast(u32, version.integer) orelse return error.InvalidSchemaUpdateRequest;
+    }
+    if (root.get("storage_mode")) |storage_mode| {
+        if (storage_mode != .null) {
+            if (storage_mode != .string) return error.InvalidSchemaUpdateRequest;
+            parsed.storage_mode = StorageMode.fromString(storage_mode.string) orelse return error.InvalidSchemaUpdateRequest;
+        }
     }
     if (root.get("default_type")) |default_type| {
         if (default_type != .null) {

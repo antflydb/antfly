@@ -3375,12 +3375,20 @@ pub const DB = struct {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_artifacts_ns, graph_artifacts_start_ns);
             if (extracted[i].cleaned_value) |cleaned| {
                 const strip_store_value_start_ns = monotonicTimeNs();
-                const store_value = try strippedStoredDocumentValueAlloc(
-                    self.alloc,
-                    cleaned,
-                    vector_store_field_names,
-                    &owned_store_values,
-                );
+                // Relational tables make the typed columns the authoritative KV
+                // value: store the serialized typed row instead of the JSON
+                // blob. Every reader (sync DB.get and the async index/derived/
+                // enrichment readers) routes through the materialization seam to
+                // reconstruct canonical JSON. Document-mode tables keep the blob.
+                const store_value = if (self.relationalColumnsForStore()) |relational_columns|
+                    try relationalStoreRowValueAlloc(self.alloc, cleaned, relational_columns, &owned_store_values)
+                else
+                    try strippedStoredDocumentValueAlloc(
+                        self.alloc,
+                        cleaned,
+                        vector_store_field_names,
+                        &owned_store_values,
+                    );
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
                 const store_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
                 try owned_store_keys.append(self.alloc, store_key);
@@ -4232,7 +4240,14 @@ pub const DB = struct {
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
         const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
         defer alloc.free(store_key);
-        return try self.core.getStoreValue(alloc, store_key);
+        const value = try self.core.getStoreValue(alloc, store_key) orelse return null;
+        // Relational tables store the authoritative typed row; reconstruct the
+        // document's canonical JSON here so every consumer (point lookup,
+        // read-modify-write transform, vector include_stored) sees a document.
+        // The row is self-describing and magic-tagged, so detection needs no
+        // schema and never collides with a real JSON document. A document-mode
+        // blob is returned unchanged (in place).
+        return try mapper.materializeOwnedDocumentValueAlloc(alloc, value);
     }
 
     pub fn getGroupCreatedAtMillis(self: *DB, alloc: Allocator, group_id: u64) !?u64 {
@@ -4823,6 +4838,16 @@ pub const DB = struct {
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
         try self.core.setSchema(table_schema);
+    }
+
+    /// Returns the relational column catalog when the table is in relational
+    /// storage mode (so document writes store the typed row as the authoritative
+    /// KV value), or null for document-mode tables (which keep the JSON blob).
+    fn relationalColumnsForStore(self: *DB) ?[]const schema_mod.RelationalColumn {
+        const schema = self.core.schema orelse return null;
+        if (schema.storage_mode != .relational) return null;
+        if (schema.relational_columns.len == 0) return null;
+        return schema.relational_columns;
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
@@ -11238,6 +11263,21 @@ fn appendUniqueOwnedKey(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), k
     try list.append(alloc, try alloc.dupe(u8, key));
 }
 
+/// Project a relational document into its serialized typed-row KV value and
+/// track the buffer for cleanup. The row is always freshly allocated (the codec
+/// owns no input bytes), so it is appended to `owned_values` unconditionally.
+fn relationalStoreRowValueAlloc(
+    alloc: Allocator,
+    cleaned: []const u8,
+    relational_columns: []const schema_mod.RelationalColumn,
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) ![]const u8 {
+    const row_value = try mapper.buildRelationalRowValueAlloc(alloc, cleaned, relational_columns);
+    errdefer alloc.free(row_value);
+    try owned_values.append(alloc, row_value);
+    return row_value;
+}
+
 fn strippedStoredDocumentValueAlloc(
     alloc: Allocator,
     cleaned: []const u8,
@@ -15253,7 +15293,11 @@ fn collectSparseFieldWritesProfiled(
             continue;
         };
         const extract_start_ns = if (profile != null) monotonicTimeNs() else 0;
-        if (try mapper.extractSparseVectorField(alloc, value, field_name)) |raw_sparse_vec| {
+        // Materialize a relational typed row to JSON before field extraction;
+        // a document-mode blob is duped. Freed after extraction either way.
+        const doc_json = try mapper.materializeDocumentValueAlloc(alloc, value);
+        defer alloc.free(doc_json);
+        if (try mapper.extractSparseVectorField(alloc, doc_json, field_name)) |raw_sparse_vec| {
             var sparse_vec = raw_sparse_vec;
             writes.append(alloc, .{
                 .doc_id = item.doc_key,
@@ -15397,7 +15441,11 @@ fn collectDocumentWritesProfiled(
             missing_required += 1;
             continue;
         };
-        const owned_value = try alloc.dupe(u8, value);
+        // Materialize the stored value to JSON: a relational typed row is
+        // reconstructed to canonical JSON, a document-mode blob is duped. So the
+        // derived consumers (text/dense/sparse indexers) downstream of this
+        // collected write always receive a document, never a raw typed row.
+        const owned_value = try mapper.materializeDocumentValueAlloc(alloc, value);
         try writes.append(alloc, .{
             .key = item.doc_key,
             .value = owned_value,
@@ -15496,6 +15544,15 @@ fn applyTextDocumentsForIndex(
     var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
     defer writes.deinit(alloc);
 
+    // Owned JSON buffers for store-read documents that were materialized from a
+    // relational typed row. Inline/cleaned values are borrowed and not tracked
+    // here; only freshly reconstructed bytes need freeing.
+    var materialized_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (materialized_values.items) |buf| alloc.free(buf);
+        materialized_values.deinit(alloc);
+    }
+
     const trust_inline = if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
         store.nextReplaySequence(sequence + 1) == sequence + 1
     else
@@ -15547,10 +15604,18 @@ fn applyTextDocumentsForIndex(
     try txn.getManySorted(read_keys, read_values);
 
     for (pending.items, 0..) |item, i| {
-        const value = read_values[i] orelse item.inline_value orelse {
+        const raw = read_values[i] orelse item.inline_value orelse {
             missing_required += 1;
             continue;
         };
+        // A store-read relational document is a typed row; reconstruct it to
+        // JSON (tracked for cleanup) so the text indexer sees a document. An
+        // inline/cleaned value or a document-mode blob is used as-is (borrowed).
+        const value = if (read_values[i] != null and mapper.isRelationalRowValue(raw)) blk: {
+            const json = try mapper.materializeDocumentValueAlloc(alloc, raw);
+            try materialized_values.append(alloc, json);
+            break :blk json;
+        } else raw;
         try writes.append(alloc, .{
             .key = item.doc_key,
             .value = value,
@@ -40191,4 +40256,66 @@ fn loadStoredSearchDocumentManyCallback(
 ) anyerror![]?[]u8 {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return try loadStoredSearchDocumentsMany(self, alloc, keys);
+}
+
+test "relational table full-text search reconstructs stored_data from columns" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // Relational schema: typed columns persisted as typed_doc_values so the
+    // document is reconstructed from columns rather than the segment blob.
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"},"active":{"type":"boolean"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:a",
+            .value =
+            \\{"title":"hello world","amount":42.5,"active":true}
+            ,
+        }},
+        .sync_level = .full_index,
+    });
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .include_stored = true,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expect(result.hits[0].stored_data != null);
+
+    // stored_data was reconstructed from the persisted typed columns.
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.hits[0].stored_data.?, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("hello world", obj.get("title").?.string);
+    const amount = obj.get("amount").?;
+    const amount_num: f64 = switch (amount) {
+        .float => |f| f,
+        .integer => |n| @floatFromInt(n),
+        else => unreachable,
+    };
+    try std.testing.expectEqual(@as(f64, 42.5), amount_num);
+    try std.testing.expect(obj.get("active").?.bool);
 }
