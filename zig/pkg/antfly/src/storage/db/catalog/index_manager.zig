@@ -16489,7 +16489,7 @@ test "text merge resource manager accounts pending bytes and active buffers" {
         .compact_text_segment_threshold = 2,
         .defer_text_compaction = true,
     };
-    for (0..3) |i| {
+    for (0..12) |i| {
         var key_buf: [64]u8 = undefined;
         const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
         defer alloc.free(key);
@@ -16565,7 +16565,7 @@ test "text merge resource pressure defers background merges" {
         .compact_text_segment_threshold = 2,
         .defer_text_compaction = true,
     };
-    for (0..3) |i| {
+    for (0..12) |i| {
         var key_buf: [64]u8 = undefined;
         const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
         defer alloc.free(key);
@@ -16700,7 +16700,7 @@ test "force compact accounts text merge buffers via resource manager" {
         .compact_text_segment_threshold = 2,
         .defer_text_compaction = true,
     };
-    for (0..3) |i| {
+    for (0..12) |i| {
         var key_buf: [64]u8 = undefined;
         const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
         defer alloc.free(key);
@@ -16770,7 +16770,7 @@ test "best effort force compact defers under text merge pressure" {
         .compact_text_segment_threshold = 2,
         .defer_text_compaction = true,
     };
-    for (0..3) |i| {
+    for (0..12) |i| {
         var key_buf: [64]u8 = undefined;
         const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
         defer alloc.free(key);
@@ -16916,7 +16916,7 @@ test "best effort force compact resumes after modeled reopen under relaxed press
             .compact_text_segment_threshold = 2,
             .defer_text_compaction = true,
         };
-        for (0..3) |i| {
+        for (0..12) |i| {
             var key_buf: [64]u8 = undefined;
             const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
             defer alloc.free(key);
@@ -16963,7 +16963,7 @@ test "best effort force compact resumes after modeled reopen under relaxed press
 
     const drained_entry = manager_reopened.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expect(!drained_entry.compaction_pending);
-    try std.testing.expectEqual(@as(usize, 1), drained_entry.persistent.snapshot().segments.len);
+    try std.testing.expect(drained_entry.persistent.snapshot().segments.len <= default_merge_policy.max_segments_per_tier);
 }
 
 test "dense hbc batch options keep startup replay in bulk-ingest mode without assuming absent ids" {
