@@ -229,6 +229,9 @@ Large-ingest guardrails:
      handles, and entry slots separately for every cursor open.
 4. [ ] Make sorted `getManySorted` keep per-run cursor state across keys so
    batch reads resume inside the current block where possible.
+   - [x] First slice: cached sorted-by-run reads now keep a per-run forward
+     entry hint and bounded-scan from the previous hit before falling back to
+     exact block lookup.
 5. [x] Tune bloom defaults once the benchmark can show false-positive block
    loads.
    - Run-level and per-block LSM filters now default to 14 bits/key. The option

@@ -1545,6 +1545,7 @@ const RunBatchIndexState = struct {
     block_index: ?usize = null,
     block_handle: ?cache_mod.Handle = null,
     block_has_values: bool = false,
+    last_entry_index: ?usize = null,
 
     fn deinit(self: *@This()) void {
         self.handle.release();
@@ -1567,6 +1568,12 @@ const RunBatchIndexState = struct {
         }
         self.block_has_values = false;
     }
+};
+
+const BatchForwardScanResult = union(enum) {
+    found: LocatedTableEntry,
+    not_found,
+    fallback,
 };
 
 const RunBatchIndexHandles = struct {
@@ -3655,7 +3662,21 @@ fn getFromRunWithBlockCacheBatchState(
     }
 
     var located: ?LocatedTableEntry = null;
-    if (index.blockCount() == 0 and read_hint.* != null) {
+    if (state.last_entry_index) |last_entry_index| {
+        backend.recordReadHintAttempt();
+        switch (try scanForExactEntryInBatchBlocksBounded(backend, run, index, state, held_blocks, last_entry_index + 1, namespace, key, 64)) {
+            .found => |entry| {
+                backend.recordReadHintHit();
+                located = entry;
+            },
+            .not_found => {
+                backend.recordReadHintHit();
+                return null;
+            },
+            .fallback => backend.recordReadHintMiss(),
+        }
+    }
+    if (located == null and index.blockCount() == 0 and read_hint.* != null) {
         const hint = (read_hint.*).?;
         if (hint.run_index == run_index and
             compareNamespace(namespace, .{ .name = hint.namespace_name }) == .eq and
@@ -3674,6 +3695,7 @@ fn getFromRunWithBlockCacheBatchState(
         located = try findExactEntryInBatchBlocks(backend, run, index, state, held_blocks, namespace, key);
     }
     if (located) |entry| {
+        state.last_entry_index = entry.entry_index;
         if (!entry.entry.tombstone) state.block_has_values = true;
     }
     return located;
@@ -3945,6 +3967,33 @@ fn scanForExactEntryInBatchBlocks(
         return loaded;
     }
     return null;
+}
+
+fn scanForExactEntryInBatchBlocksBounded(
+    backend: anytype,
+    run: *Run,
+    index: *const lsm_table_file.TableIndex,
+    state: *RunBatchIndexState,
+    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    start_index: usize,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    max_steps: usize,
+) !BatchForwardScanResult {
+    var idx = start_index;
+    var steps: usize = 0;
+    while (idx < index.entryCount() and steps < max_steps) : ({
+        idx += 1;
+        steps += 1;
+    }) {
+        const loaded = try loadEntryFromBatchBlock(backend, run, index, state, held_blocks, idx);
+        const order = compareTableEntryTo(loaded.entry, namespace, key);
+        if (order == .lt) continue;
+        if (compareNamespace(.{ .name = loaded.entry.namespace_name }, namespace) != .eq or order != .eq) return .not_found;
+        return .{ .found = loaded };
+    }
+    if (idx >= index.entryCount()) return .not_found;
+    return .fallback;
 }
 
 fn visibleEntryFromRunIndices(
