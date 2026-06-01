@@ -3242,6 +3242,50 @@ pub fn build(b: *std.Build) void {
     const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
 
+    const lib_api_logic_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            // api/tables.zig: status/detail/debug encoders, parsers, schema
+            // update, and query-routing logic.
+            "metadata.table status encoder",
+            "metadata.table detail encoder",
+            "metadata.table debug encoder",
+            "create table parser",
+            "schema-derived algebraic indexes",
+            "single schema-derived algebraic index",
+            "public algebraic index definitions",
+            "schema update parser",
+            "validated table schema parses",
+            "table schema write validation",
+            "metadata.schema update",
+            "metadata.query routing",
+            "derive initial ranges",
+            // api/indexes.zig: index status/config encoders and aggregation.
+            "index encoders expose",
+            "index encoders aggregate",
+            "index encoders report missing",
+            "index config map encoder",
+            "single index config encoder",
+            "single index helpers use default",
+            "index metadata helpers",
+            "index status aggregation",
+            "index status keeps",
+            "single embeddings index encoder",
+            "external embeddings index readiness",
+            "embeddings index status",
+            "embeddings index replay completion",
+            "managed embeddings",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_logic_tests = b.addRunArtifact(lib_api_logic_tests);
+    run_lib_api_logic_tests.step.dependOn(&openapi_root_check.step);
+    const lib_api_logic_test_step = b.step("lib-api-logic-test", "Run focused API table/index encoder, parser, and schema-update logic tests");
+    lib_api_logic_test_step.dependOn(&run_lib_api_logic_tests.step);
+
     const lib_api_docid_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -3926,6 +3970,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_metadata_service_tests.step);
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
+    unit_test_step.dependOn(&run_lib_api_logic_tests.step);
     unit_test_step.dependOn(&run_public_api_parity_tests.step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
     unit_test_step.dependOn(&run_lib_toon_tests.step);

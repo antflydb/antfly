@@ -137,6 +137,70 @@ paths instead of falling back to field-name-only schema heuristics.
 The first debug surface for this compiled plan now hangs off the existing admin
 table and index detail routes via `?debug=runtime_schema`.
 
+## Dynamic Templates and the Algebraic Index
+
+Dynamic templates feed the algebraic sidecar as well as the full-text index, so
+a template-matched field is promoted into typed group/measure/time docfacts at
+ingest time — Elasticsearch-style runtime-adaptive mapping — without a schema
+version bump or a reindex.
+
+- `schema/mod.zig` compilation lowers each bounded template
+  (`keyword`/`link`/`numeric`/`boolean`/`datetime`) into a capability
+  `dynamic_field_rule`. A rule requires a name/path selector (`match` /
+  `path_match`). Unbounded templates (`text`/`html`/`search_as_you_type`),
+  selector-less templates, and `match_mapping_type`-only templates are
+  intentionally NOT promoted — they stay on the schemaless path-fact path. This
+  is the cardinality guard that keeps a broad `match: "*"` template from
+  exploding group-by cardinality, and it keeps ingest and query symmetric: a
+  `match_mapping_type`-only rule could be evaluated at ingest (a value is
+  present) but never at query time (no value), so it is excluded from both.
+  `index.zig:validateConfig` enforces the same selector requirement so a
+  hand-authored config cannot reintroduce the asymmetry.
+- At ingest, `storage/db/algebraic/index.zig` evaluates the rules against every
+  observed field not already covered by a static spec. Both ingest and query use
+  a single shared selector evaluator (`dynamicRuleSelectorMatches`, parameterized
+  by an optional value) reusing the same `globMatch` / `match_mapping_type`
+  semantics as the full-text resolver in `storage/schema.zig`, so the two can
+  never drift. Explicit schema fields always win over templates. The FIRST
+  selector-matching rule wins (Elasticsearch dynamic-template order): a value that
+  does not coerce under that rule's type simply yields no fact (exactly like a
+  static typed field given a non-coercible value) — ingest does not fall through
+  to a later overlapping rule of a different type.
+- The dynamic fact identity is the full dotted path (top-level templates have
+  path == field name). Numeric templates project group+measure, datetime
+  project group+time, keyword/boolean project group.
+- At query time the planner resolves a queried field against the same
+  `dynamic_field_rules` (`Index.fieldConfig`/`resolveField`), so group-by, sum,
+  and term aggregations over template-promoted fields route to the sidecar's
+  docfact fold scan. Resolution requires that all name/path-matching rules AGREE
+  on the scalar type: with one matching rule (or several that agree) query reads
+  the exact type ingest stored; if overlapping rules disagree, the field is
+  ambiguous and query declines (the aggregation falls back to a complete scan)
+  rather than reading a type that ingest may have stored differently per
+  document.
+
+Template-only updates propagate without a recreate on two levels:
+
+- the durable table `indexes_json` is regenerated on every schema update
+  (`api/tables.zig: regenerateAlgebraicIndexesFromSchemaAlloc`), which carries
+  forward user-tunable runtime knobs (adaptive policy, planner/result limits) so
+  a schema change does not reset tuning; fresh opens, new replicas, and restarts
+  pick up the new rules; and
+- live indexes are refreshed in place
+  (`DB.reloadAlgebraicSchemaConfigs` → `Index.reloadConfigJson`) so running
+  writers apply the new rules immediately.
+
+Because the change applies without re-projecting existing documents, a capability
+change (detected by a differing capability fingerprint) sets
+`dynamic_rules_backfill_pending` on the config — both durably and in the live
+index. While pending, query-time resolution of dynamic-template fields is
+withheld, so aggregations over those fields fall back to a complete scan and
+return correct results rather than aggregates computed over only the
+post-change subset. Static fields are unaffected and keep accelerating. The flag
+is cleared when the sidecar is rebuilt, which re-projects existing documents.
+Tables created with a template (rather than updated) take the fingerprint-equality
+fast path and are never flagged.
+
 ## Related Docs
 
 - [TODO.md](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/TODO.md)
