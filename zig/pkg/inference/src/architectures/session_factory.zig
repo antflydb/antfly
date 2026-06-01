@@ -333,7 +333,6 @@ fn printGlinerMetalArchitectureAudit(
     const mps_standalone = deltaU64(a.metal_runtime_mps_dense_linear_standalone_calls, b.metal_runtime_mps_dense_linear_standalone_calls);
     const mps_active = deltaU64(a.metal_runtime_mps_dense_linear_active_frame_calls, b.metal_runtime_mps_dense_linear_active_frame_calls);
     const mps_ffn = deltaU64(a.metal_runtime_deberta_ffn_fused_mps_matmuls, b.metal_runtime_deberta_ffn_fused_mps_matmuls);
-    const mpsgraph_ffn = deltaU64(a.metal_runtime_mpsgraph_ffn_calls, b.metal_runtime_mpsgraph_ffn_calls);
     const plan_successes = deltaU64(a.metal_runtime_deberta_encoder_frame_plan_successes, b.metal_runtime_deberta_encoder_frame_plan_successes);
     const plan_failures = deltaU64(a.metal_runtime_deberta_encoder_frame_plan_failures, b.metal_runtime_deberta_encoder_frame_plan_failures);
     const embedding_successes = deltaU64(a.metal_runtime_deberta_embeddings_successes, b.metal_runtime_deberta_embeddings_successes);
@@ -358,7 +357,7 @@ fn printGlinerMetalArchitectureAudit(
     const host_download_bytes = deltaU64(a.metal_tensor_host_mirror_download_bytes, b.metal_tensor_host_mirror_download_bytes);
 
     const resident_frame = frame_begins == 1 and frame_submits == 1;
-    const no_mps = mps_standalone == 0 and mps_active == 0 and a.metal_runtime_last_frame_mps_dense_linear_count == 0 and mps_ffn == 0 and mpsgraph_ffn == 0;
+    const no_mps = mps_standalone == 0 and mps_active == 0 and a.metal_runtime_last_frame_mps_dense_linear_count == 0 and mps_ffn == 0;
     const planned_encoder = plan_successes >= 1 and plan_failures == 0;
     const fused_embeddings = embedding_successes >= 1 and embedding_fallbacks == 0;
     const planned_layers = layer_successes == layer_count and layer_fallbacks == 0;
@@ -370,7 +369,7 @@ fn printGlinerMetalArchitectureAudit(
     const pass = resident_frame and no_mps and planned_encoder and fused_embeddings and planned_layers and fused_ffn and packed_qkv_ok and relative_qk_pair_ok and one_final_download and warm_plan_reuse;
 
     std.debug.print(
-        "gliner_arch_audit: status={s} resident_frame={s} no_mps={s} planned_encoder={s} fused_embeddings={s} planned_layers={s} fused_ffn={s} packed_qkv={s} relative_qk_pair={s} attention_flash={} attention_gemm={} attention_legacy={} final_download_only={s} warm_plan_reuse={s} frame_begins={} frame_submits={} compute_encoders={} last_frame_compute_encoders={} mps_standalone={} mps_active={} last_frame_mps={} mps_ffn={} mpsgraph_ffn={}\n",
+        "gliner_arch_audit: status={s} resident_frame={s} no_mps={s} planned_encoder={s} fused_embeddings={s} planned_layers={s} fused_ffn={s} packed_qkv={s} relative_qk_pair={s} attention_flash={} attention_gemm={} attention_legacy={} final_download_only={s} warm_plan_reuse={s} frame_begins={} frame_submits={} compute_encoders={} last_frame_compute_encoders={} mps_standalone={} mps_active={} last_frame_mps={} mps_ffn={}\n",
         .{
             if (pass) "pass" else "fail",
             yesNo(resident_frame),
@@ -394,7 +393,6 @@ fn printGlinerMetalArchitectureAudit(
             mps_active,
             a.metal_runtime_last_frame_mps_dense_linear_count,
             mps_ffn,
-            mpsgraph_ffn,
         },
     );
     std.debug.print(
@@ -470,15 +468,6 @@ fn printMetalRuntimeProfile(before: ops.BackendDebugTimingSnapshot, after: ops.B
             deltaU64(a.metal_runtime_deberta_attention_gemm_calls, b.metal_runtime_deberta_attention_gemm_calls),
             deltaU64(a.metal_runtime_deberta_attention_gemm_fallbacks, b.metal_runtime_deberta_attention_gemm_fallbacks),
             deltaU64(a.metal_runtime_deberta_attention_legacy_calls, b.metal_runtime_deberta_attention_legacy_calls),
-        },
-    );
-    std.debug.print(
-        "gliner_metal_profile_mpsgraph: ffn={} ffn_fallbacks={} ffn_compiles={} ffn_cache_hits={}\n",
-        .{
-            deltaU64(a.metal_runtime_mpsgraph_ffn_calls, b.metal_runtime_mpsgraph_ffn_calls),
-            deltaU64(a.metal_runtime_mpsgraph_ffn_fallbacks, b.metal_runtime_mpsgraph_ffn_fallbacks),
-            deltaU64(a.metal_runtime_mpsgraph_ffn_compiles, b.metal_runtime_mpsgraph_ffn_compiles),
-            deltaU64(a.metal_runtime_mpsgraph_ffn_cache_hits, b.metal_runtime_mpsgraph_ffn_cache_hits),
         },
     );
 }

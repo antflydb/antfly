@@ -16,7 +16,6 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
-#import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -259,23 +258,6 @@ typedef struct termite_metal_embedding_table_cache_entry {
     uintptr_t source_id;
     size_t source_offset;
 } termite_metal_embedding_table_cache_entry;
-
-typedef struct termite_metal_mpsgraph_ffn_cache {
-    MPSGraph *graph;
-    MPSGraphTensor *input_tensor;
-    MPSGraphTensor *residual_tensor;
-    MPSGraphTensor *w1_tensor;
-    MPSGraphTensor *b1_tensor;
-    MPSGraphTensor *w2_tensor;
-    MPSGraphTensor *b2_tensor;
-    MPSGraphTensor *ln_w_tensor;
-    MPSGraphTensor *ln_b_tensor;
-    MPSGraphTensor *output_tensor;
-    size_t rows;
-    size_t hidden_size;
-    size_t intermediate_size;
-    uint32_t activation_kind;
-} termite_metal_mpsgraph_ffn_cache;
 
 typedef struct termite_metal_provider {
     id<MTLDevice> device;
@@ -764,11 +746,6 @@ typedef struct termite_metal_decode_runtime {
     uint64_t deberta_attention_legacy_calls;
     uint64_t deberta_attention_gemm_calls;
     uint64_t deberta_attention_gemm_fallbacks;
-    termite_metal_mpsgraph_ffn_cache mpsgraph_ffn_cache;
-    uint64_t mpsgraph_ffn_calls;
-    uint64_t mpsgraph_ffn_fallbacks;
-    uint64_t mpsgraph_ffn_compiles;
-    uint64_t mpsgraph_ffn_cache_hits;
     uint64_t q8_0_linear_dispatch_scalar;
     uint64_t q8_0_linear_dispatch_mmv;
     uint64_t q8_0_linear_dispatch_small_batch;
@@ -929,10 +906,6 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t deberta_attention_legacy_calls;
     uint64_t deberta_attention_gemm_calls;
     uint64_t deberta_attention_gemm_fallbacks;
-    uint64_t mpsgraph_ffn_calls;
-    uint64_t mpsgraph_ffn_fallbacks;
-    uint64_t mpsgraph_ffn_compiles;
-    uint64_t mpsgraph_ffn_cache_hits;
     uint64_t compute_encoder_count;
     uint64_t blit_encoder_count;
     uint64_t last_frame_compute_encoder_count;
@@ -5689,210 +5662,6 @@ static bool termite_metal_direct_packed_dense_enabled(void) {
 static bool termite_metal_direct_deberta_ffn_enabled(void) {
     const char *disabled = getenv("TERMITE_METAL_DISABLE_GLINER_DEBERTA_DIRECT_FFN");
     return disabled == NULL || disabled[0] == '\0' || strcmp(disabled, "0") == 0;
-}
-
-static void termite_metal_mpsgraph_ffn_cache_clear(termite_metal_mpsgraph_ffn_cache *cache) {
-    if (cache == NULL) return;
-    cache->graph = nil;
-    cache->input_tensor = nil;
-    cache->residual_tensor = nil;
-    cache->w1_tensor = nil;
-    cache->b1_tensor = nil;
-    cache->w2_tensor = nil;
-    cache->b2_tensor = nil;
-    cache->ln_w_tensor = nil;
-    cache->ln_b_tensor = nil;
-    cache->output_tensor = nil;
-    cache->rows = 0;
-    cache->hidden_size = 0;
-    cache->intermediate_size = 0;
-    cache->activation_kind = UINT32_MAX;
-}
-
-static MPSGraphTensor *termite_metal_mpsgraph_gelu_tanh(MPSGraph *graph, MPSGraphTensor *x) {
-    MPSGraphTensor *half = [graph constantWithScalar:0.5 dataType:MPSDataTypeFloat32];
-    MPSGraphTensor *one = [graph constantWithScalar:1.0 dataType:MPSDataTypeFloat32];
-    MPSGraphTensor *coef = [graph constantWithScalar:0.7978845608028654 dataType:MPSDataTypeFloat32];
-    MPSGraphTensor *cubic_coef = [graph constantWithScalar:0.044715 dataType:MPSDataTypeFloat32];
-    MPSGraphTensor *x2 = [graph multiplicationWithPrimaryTensor:x secondaryTensor:x name:@"gelu_x2"];
-    MPSGraphTensor *x3 = [graph multiplicationWithPrimaryTensor:x2 secondaryTensor:x name:@"gelu_x3"];
-    MPSGraphTensor *x3_scaled = [graph multiplicationWithPrimaryTensor:x3 secondaryTensor:cubic_coef name:@"gelu_x3_scaled"];
-    MPSGraphTensor *inner_sum = [graph additionWithPrimaryTensor:x secondaryTensor:x3_scaled name:@"gelu_inner_sum"];
-    MPSGraphTensor *inner = [graph multiplicationWithPrimaryTensor:inner_sum secondaryTensor:coef name:@"gelu_inner"];
-    MPSGraphTensor *tanh_inner = [graph tanhWithTensor:inner name:@"gelu_tanh"];
-    MPSGraphTensor *cdf = [graph additionWithPrimaryTensor:one secondaryTensor:tanh_inner name:@"gelu_cdf"];
-    MPSGraphTensor *xh = [graph multiplicationWithPrimaryTensor:x secondaryTensor:half name:@"gelu_xh"];
-    return [graph multiplicationWithPrimaryTensor:xh secondaryTensor:cdf name:@"gelu_out"];
-}
-
-static int termite_metal_mpsgraph_ffn_cache_prepare(
-    termite_metal_decode_runtime *runtime,
-    size_t rows,
-    size_t hidden_size,
-    size_t intermediate_size,
-    uint32_t activation_kind,
-    float eps
-) {
-    if (runtime == NULL) return -1;
-    if (activation_kind != 0u && activation_kind != 1u) return -2;
-    termite_metal_mpsgraph_ffn_cache *cache = &runtime->mpsgraph_ffn_cache;
-    if (cache->graph != nil &&
-        cache->rows == rows &&
-        cache->hidden_size == hidden_size &&
-        cache->intermediate_size == intermediate_size &&
-        cache->activation_kind == activation_kind) {
-        runtime->mpsgraph_ffn_cache_hits += 1;
-        return 0;
-    }
-
-    termite_metal_mpsgraph_ffn_cache_clear(cache);
-    @autoreleasepool {
-        MPSGraph *graph = [MPSGraph new];
-        if (graph == nil) return -3;
-        MPSShape *hidden_shape = @[ @(rows), @(hidden_size) ];
-        MPSShape *intermediate_shape = @[ @(rows), @(intermediate_size) ];
-        MPSShape *w1_shape = @[ @(intermediate_size), @(hidden_size) ];
-        MPSShape *b1_shape = @[ @(intermediate_size) ];
-        MPSShape *w2_shape = @[ @(hidden_size), @(intermediate_size) ];
-        MPSShape *b2_shape = @[ @(hidden_size) ];
-        MPSGraphTensor *input = [graph placeholderWithShape:hidden_shape dataType:MPSDataTypeFloat32 name:@"input"];
-        MPSGraphTensor *residual = [graph placeholderWithShape:hidden_shape dataType:MPSDataTypeFloat32 name:@"residual"];
-        MPSGraphTensor *w1 = [graph placeholderWithShape:w1_shape dataType:MPSDataTypeFloat32 name:@"w1"];
-        MPSGraphTensor *b1 = [graph placeholderWithShape:b1_shape dataType:MPSDataTypeFloat32 name:@"b1"];
-        MPSGraphTensor *w2 = [graph placeholderWithShape:w2_shape dataType:MPSDataTypeFloat32 name:@"w2"];
-        MPSGraphTensor *b2 = [graph placeholderWithShape:b2_shape dataType:MPSDataTypeFloat32 name:@"b2"];
-        MPSGraphTensor *ln_w = [graph placeholderWithShape:b2_shape dataType:MPSDataTypeFloat32 name:@"ln_w"];
-        MPSGraphTensor *ln_b = [graph placeholderWithShape:b2_shape dataType:MPSDataTypeFloat32 name:@"ln_b"];
-        if (input == nil || residual == nil || w1 == nil || b1 == nil || w2 == nil || b2 == nil || ln_w == nil || ln_b == nil) return -4;
-
-        MPSGraphTensor *w1_t = [graph transposeTensor:w1 dimension:0 withDimension:1 name:@"w1_t"];
-        MPSGraphTensor *h1 = [graph matrixMultiplicationWithPrimaryTensor:input secondaryTensor:w1_t name:@"ffn_up"];
-        MPSGraphTensor *h1_bias = [graph additionWithPrimaryTensor:h1 secondaryTensor:b1 name:@"ffn_up_bias"];
-        MPSGraphTensor *h1_act = termite_metal_mpsgraph_gelu_tanh(graph, h1_bias);
-        MPSGraphTensor *w2_t = [graph transposeTensor:w2 dimension:0 withDimension:1 name:@"w2_t"];
-        MPSGraphTensor *h2 = [graph matrixMultiplicationWithPrimaryTensor:h1_act secondaryTensor:w2_t name:@"ffn_down"];
-        MPSGraphTensor *h2_bias = [graph additionWithPrimaryTensor:h2 secondaryTensor:b2 name:@"ffn_down_bias"];
-        MPSGraphTensor *residual_sum = [graph additionWithPrimaryTensor:h2_bias secondaryTensor:residual name:@"ffn_residual"];
-        NSArray<NSNumber *> *axes = @[ @1 ];
-        MPSGraphTensor *mean = [graph meanOfTensor:residual_sum axes:axes name:@"ln_mean"];
-        MPSGraphTensor *variance = [graph varianceOfTensor:residual_sum meanTensor:mean axes:axes name:@"ln_variance"];
-        MPSGraphTensor *output = [graph normalizationWithTensor:residual_sum
-                                                     meanTensor:mean
-                                                 varianceTensor:variance
-                                                    gammaTensor:ln_w
-                                                     betaTensor:ln_b
-                                                        epsilon:eps
-                                                           name:@"ln_out"];
-        if (output == nil) return -5;
-
-        cache->graph = graph;
-        cache->input_tensor = input;
-        cache->residual_tensor = residual;
-        cache->w1_tensor = w1;
-        cache->b1_tensor = b1;
-        cache->w2_tensor = w2;
-        cache->b2_tensor = b2;
-        cache->ln_w_tensor = ln_w;
-        cache->ln_b_tensor = ln_b;
-        cache->output_tensor = output;
-        cache->rows = rows;
-        cache->hidden_size = hidden_size;
-        cache->intermediate_size = intermediate_size;
-        cache->activation_kind = activation_kind;
-        runtime->mpsgraph_ffn_compiles += 1;
-        return 0;
-    }
-}
-
-static int termite_metal_decode_runtime_apply_mpsgraph_ffn_layer_norm_device(
-    termite_metal_decode_runtime *runtime,
-    size_t first_linear_slot,
-    size_t second_linear_slot,
-    size_t layer_norm_slot,
-    id<MTLBuffer> input_buffer,
-    id<MTLBuffer> residual_buffer,
-    id<MTLBuffer> output_buffer,
-    size_t rows,
-    size_t hidden_size,
-    size_t intermediate_size,
-    uint32_t activation_kind,
-    float eps
-) {
-    if (runtime == NULL || input_buffer == nil || residual_buffer == nil || output_buffer == nil) return -1;
-    int cache_rc = termite_metal_mpsgraph_ffn_cache_prepare(runtime, rows, hidden_size, intermediate_size, activation_kind, eps);
-    if (cache_rc != 0) return -2;
-    termite_metal_mpsgraph_ffn_cache *cache = &runtime->mpsgraph_ffn_cache;
-    if (cache->graph == nil || cache->output_tensor == nil) return -3;
-
-    const bool frame_owned = (runtime->active_frame_cb == nil);
-    if (!frame_owned && runtime->active_planned_compute_encoder != nil) {
-        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
-    }
-    id<MTLCommandBuffer> command_buffer = frame_owned
-        ? termite_metal_new_command_buffer(runtime->queue, __func__)
-        : runtime->active_frame_cb;
-    if (command_buffer == nil) return -4;
-    MPSCommandBuffer *mps_command_buffer = [MPSCommandBuffer commandBufferWithCommandBuffer:command_buffer];
-    if (mps_command_buffer == nil) return -5;
-
-    MPSShape *hidden_shape = @[ @(rows), @(hidden_size) ];
-    MPSShape *intermediate_shape = @[ @(rows), @(intermediate_size) ];
-    MPSShape *w1_shape = @[ @(intermediate_size), @(hidden_size) ];
-    MPSShape *b1_shape = @[ @(intermediate_size) ];
-    MPSShape *w2_shape = @[ @(hidden_size), @(intermediate_size) ];
-    MPSShape *b2_shape = @[ @(hidden_size) ];
-    MPSGraphTensorData *input_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:input_buffer shape:hidden_shape dataType:MPSDataTypeFloat32];
-    MPSGraphTensorData *residual_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:residual_buffer shape:hidden_shape dataType:MPSDataTypeFloat32];
-    MPSGraphTensorData *w1_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:runtime->linear_weight_buffers[first_linear_slot] shape:w1_shape dataType:MPSDataTypeFloat32];
-    MPSGraphTensorData *b1_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:runtime->linear_bias_buffers[first_linear_slot] shape:b1_shape dataType:MPSDataTypeFloat32];
-    MPSGraphTensorData *w2_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:runtime->linear_weight_buffers[second_linear_slot] shape:w2_shape dataType:MPSDataTypeFloat32];
-    MPSGraphTensorData *b2_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:runtime->linear_bias_buffers[second_linear_slot] shape:b2_shape dataType:MPSDataTypeFloat32];
-    MPSGraphTensorData *ln_w_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:runtime->layer_norm_weight_buffers[layer_norm_slot] shape:b2_shape dataType:MPSDataTypeFloat32];
-    MPSGraphTensorData *ln_b_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:runtime->layer_norm_bias_buffers[layer_norm_slot] shape:b2_shape dataType:MPSDataTypeFloat32];
-    MPSGraphTensorData *output_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:output_buffer shape:hidden_shape dataType:MPSDataTypeFloat32];
-    if (input_data == nil || residual_data == nil || w1_data == nil || b1_data == nil || w2_data == nil || b2_data == nil || ln_w_data == nil || ln_b_data == nil || output_data == nil) return -6;
-
-    MPSGraphTensorDataDictionary *feeds = @{
-        cache->input_tensor: input_data,
-        cache->residual_tensor: residual_data,
-        cache->w1_tensor: w1_data,
-        cache->b1_tensor: b1_data,
-        cache->w2_tensor: w2_data,
-        cache->b2_tensor: b2_data,
-        cache->ln_w_tensor: ln_w_data,
-        cache->ln_b_tensor: ln_b_data,
-    };
-    MPSGraphTensorDataDictionary *results = @{
-        cache->output_tensor: output_data,
-    };
-    if (feeds == nil || results == nil) return -7;
-    [cache->graph encodeToCommandBuffer:mps_command_buffer
-                                  feeds:feeds
-                       targetOperations:nil
-                      resultsDictionary:results
-                    executionDescriptor:nil];
-    if (!frame_owned) {
-        runtime->active_frame_cb = mps_command_buffer.rootCommandBuffer;
-        if (termite_metal_decode_runtime_retain_frame_resource(runtime, mps_command_buffer) != 0 ||
-            termite_metal_decode_runtime_retain_frame_resource(runtime, feeds) != 0 ||
-            termite_metal_decode_runtime_retain_frame_resource(runtime, results) != 0) {
-            return -8;
-        }
-        runtime->mpsgraph_ffn_calls += 1;
-        return 0;
-    }
-    const uint64_t wait_start = termite_metal_clock_monotonic_nanos();
-    [mps_command_buffer commit];
-    [mps_command_buffer waitUntilCompleted];
-    const uint64_t wait_end = termite_metal_clock_monotonic_nanos();
-    if (wait_end > wait_start) runtime->mps_dense_linear_standalone_wait_nanos += wait_end - wait_start;
-    if (mps_command_buffer.status == MTLCommandBufferStatusCompleted) {
-        runtime->mps_dense_linear_standalone_gpu_nanos += termite_metal_command_buffer_gpu_elapsed_nanos(mps_command_buffer);
-        runtime->mpsgraph_ffn_calls += 1;
-        return 0;
-    }
-    termite_metal_log_command_buffer_failure(mps_command_buffer, __func__);
-    return -9;
 }
 
 static int termite_metal_decode_runtime_finish_command_buffer(id<MTLCommandBuffer> command_buffer, bool frame_owned, int failure_code) {
@@ -11719,11 +11488,6 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->graph_plan_count = 0;
     runtime->graph_plan_allocations = 0;
     runtime->graph_plan_reuses = 0;
-    termite_metal_mpsgraph_ffn_cache_clear(&runtime->mpsgraph_ffn_cache);
-    runtime->mpsgraph_ffn_calls = 0;
-    runtime->mpsgraph_ffn_fallbacks = 0;
-    runtime->mpsgraph_ffn_compiles = 0;
-    runtime->mpsgraph_ffn_cache_hits = 0;
     runtime->mps_dense_linear_standalone_calls = 0;
     runtime->mps_dense_linear_active_frame_calls = 0;
     runtime->mps_dense_linear_standalone_wait_nanos = 0;
@@ -33490,10 +33254,6 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->deberta_attention_legacy_calls = runtime->deberta_attention_legacy_calls;
     snapshot->deberta_attention_gemm_calls = runtime->deberta_attention_gemm_calls;
     snapshot->deberta_attention_gemm_fallbacks = runtime->deberta_attention_gemm_fallbacks;
-    snapshot->mpsgraph_ffn_calls = runtime->mpsgraph_ffn_calls;
-    snapshot->mpsgraph_ffn_fallbacks = runtime->mpsgraph_ffn_fallbacks;
-    snapshot->mpsgraph_ffn_compiles = runtime->mpsgraph_ffn_compiles;
-    snapshot->mpsgraph_ffn_cache_hits = runtime->mpsgraph_ffn_cache_hits;
     snapshot->compute_encoder_count = runtime->compute_encoder_count;
     snapshot->blit_encoder_count = runtime->blit_encoder_count;
     snapshot->last_frame_compute_encoder_count = runtime->last_frame_compute_encoder_count;

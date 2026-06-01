@@ -7928,9 +7928,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const bias_data = try hostSliceForBuf(bias_buf);
         if (bias_data.len != out_dim) return error.InvalidTensorShape;
         const result_buf = toBuf(result);
+        const result_data = try hostSliceForBuf(result_buf);
+        if (result_data.len != rows * out_dim) return error.InvalidTensorShape;
         for (0..rows) |row| {
             for (0..out_dim) |col| {
-                result_buf.data[row * out_dim + col] += bias_data[col];
+                result_data[row * out_dim + col] += bias_data[col];
             }
         }
         return result;
@@ -18349,10 +18351,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_deberta_attention_legacy_calls = runtime_stats.deberta_attention_legacy_calls;
         stats.metal_runtime_deberta_attention_gemm_calls = runtime_stats.deberta_attention_gemm_calls;
         stats.metal_runtime_deberta_attention_gemm_fallbacks = runtime_stats.deberta_attention_gemm_fallbacks;
-        stats.metal_runtime_mpsgraph_ffn_calls = runtime_stats.mpsgraph_ffn_calls;
-        stats.metal_runtime_mpsgraph_ffn_fallbacks = runtime_stats.mpsgraph_ffn_fallbacks;
-        stats.metal_runtime_mpsgraph_ffn_compiles = runtime_stats.mpsgraph_ffn_compiles;
-        stats.metal_runtime_mpsgraph_ffn_cache_hits = runtime_stats.mpsgraph_ffn_cache_hits;
         stats.metal_runtime_compute_encoder_count = runtime_stats.compute_encoder_count;
         stats.metal_runtime_blit_encoder_count = runtime_stats.blit_encoder_count;
         stats.metal_runtime_last_frame_compute_encoder_count = runtime_stats.last_frame_compute_encoder_count;

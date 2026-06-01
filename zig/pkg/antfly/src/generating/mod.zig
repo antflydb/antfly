@@ -547,3 +547,64 @@ test "generating backend passes multimodal messages to local provider callback" 
     try std.testing.expectEqualStrings("local multimodal ok", result.content);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
+
+test "generating antfly backend treats missing default api key env as optional" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var ts = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/generate", .respond = .{
+            .body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"no auth ok\"}}]}",
+        } },
+    });
+    defer ts.deinit();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const chain = [_]ChainLink{.{
+        .generator = .{
+            .provider = .antfly,
+            .model = "local",
+            .url = ts.baseUrl(),
+        },
+    }};
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+
+    var group = std.Io.Group.init;
+    var content: ?[]u8 = null;
+    defer if (content) |value| alloc.free(value);
+    var run_err: ?anyerror = null;
+
+    const Fiber = struct {
+        fn run(
+            a: std.mem.Allocator,
+            test_io: std.Io,
+            test_client: *httpx.Client,
+            links: []const ChainLink,
+            test_messages: []const ChatMessage,
+            out: *?[]u8,
+            err_out: *?anyerror,
+        ) std.Io.Cancelable!void {
+            _ = test_io;
+            var result = executeChain(a, test_client, links, test_messages) catch |err| {
+                err_out.* = err;
+                return;
+            };
+            defer result.deinit();
+            out.* = a.dupe(u8, result.content) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    group.concurrent(io, Fiber.run, .{ alloc, io, &client, &chain, &messages, &content, &run_err }) catch return;
+    try ts.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+
+    try std.testing.expectEqualStrings("no auth ok", content orelse return error.TestUnexpectedResult);
+}

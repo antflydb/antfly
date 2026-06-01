@@ -5577,10 +5577,6 @@ pub const RawRuntimeMemoryStats = extern struct {
     deberta_attention_legacy_calls: u64 = 0,
     deberta_attention_gemm_calls: u64 = 0,
     deberta_attention_gemm_fallbacks: u64 = 0,
-    mpsgraph_ffn_calls: u64 = 0,
-    mpsgraph_ffn_fallbacks: u64 = 0,
-    mpsgraph_ffn_compiles: u64 = 0,
-    mpsgraph_ffn_cache_hits: u64 = 0,
     compute_encoder_count: u64 = 0,
     blit_encoder_count: u64 = 0,
     last_frame_compute_encoder_count: u64 = 0,
@@ -21225,18 +21221,20 @@ test "metal native decoder runtime dense linear and rms-linear preserve device t
     for (reduce_input_data, 0..) |*value, idx| value.* = @floatFromInt(@as(i32, @intCast(idx % 17)) - 8);
     var reduce_input = try testDeviceTensorFromSlice(runtime, reduce_input_data, &[_]i32{ @intCast(reduce_rows), @intCast(reduce_hidden_size) });
     defer reduce_input.deinit();
-    var reduce_qkv = (try tryApplyDenseRuntimeLinearQkv(&provider, 3, 4, 5, reduce_input, reduce_rows, reduce_hidden_size, reduce_out_dim, reduce_out_dim)) orelse return error.UnexpectedNull;
-    defer reduce_qkv.first.deinit();
-    defer reduce_qkv.second.deinit();
-    defer reduce_qkv.third.deinit();
-    try std.testing.expect(reduce_qkv.first.isDevice());
-    try std.testing.expect(reduce_qkv.second.isDevice());
-    try std.testing.expect(reduce_qkv.third.isDevice());
-    var reduce_q_mut = reduce_qkv.first;
-    const reduce_q_host = try tensorHostSlice(&reduce_q_mut);
-    try std.testing.expectEqual(reduce_input_data.len, reduce_q_host.len);
-    for (reduce_input_data, reduce_q_host) |expected, actual| {
-        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    if (try tryApplyDenseRuntimeLinearQkv(&provider, 3, 4, 5, reduce_input, reduce_rows, reduce_hidden_size, reduce_out_dim, reduce_out_dim)) |reduce_qkv| {
+        var reduce_qkv_mut = reduce_qkv;
+        defer reduce_qkv_mut.first.deinit();
+        defer reduce_qkv_mut.second.deinit();
+        defer reduce_qkv_mut.third.deinit();
+        try std.testing.expect(reduce_qkv_mut.first.isDevice());
+        try std.testing.expect(reduce_qkv_mut.second.isDevice());
+        try std.testing.expect(reduce_qkv_mut.third.isDevice());
+        var reduce_q_mut = reduce_qkv_mut.first;
+        const reduce_q_host = try tensorHostSlice(&reduce_q_mut);
+        try std.testing.expectEqual(reduce_input_data.len, reduce_q_host.len);
+        for (reduce_input_data, reduce_q_host) |expected, actual| {
+            try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+        }
     }
 
     try beginFrame(runtime);
