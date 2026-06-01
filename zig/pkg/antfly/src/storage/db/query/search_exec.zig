@@ -2351,6 +2351,9 @@ fn collectStructuredFilterTextDocNumsAlloc(
     filter_query_json: []const u8,
 ) !?TextDocNumSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+    if (text_entry.runtime_schema) |rs| {
+        if (rs.storage_mode == .relational and rs.relational_columns.len > 0) return null;
+    }
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();

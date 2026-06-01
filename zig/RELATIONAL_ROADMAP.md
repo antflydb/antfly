@@ -95,8 +95,9 @@ Current PR progress:
   relational base-row store, while the inverted index remains responsible only
   for term matching and scoring;
 - structured relational filters for supported keyword/range/bool/geo clauses
-  resolve against relational base-row column scans before falling back to
-  segment doc-values for unsupported text-oriented filter shapes;
+  resolve against relational base-row column scans; unsupported text-oriented
+  filter shapes may still use the inverted text index, but not segment
+  doc-values as a relational column source;
 - top-level supported relational structured queries are now converted into
   base-row doc constraints over the text match-all path, so scalar query results
   follow the committed relational row rather than stale segment doc-values;
