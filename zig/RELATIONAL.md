@@ -195,83 +195,99 @@ type-changed column → rebuild). Relational mode adds: making an existing
 nullable column `NOT NULL` is a breaking change; widening (e.g. integer →
 number) is additive where the physical type is compatible.
 
-## Phased plan
+## Implementation state
 
-- **Phase 1 — contract + catalog (this change).**
-  `storage_mode` on `TableSchema` (spec + Go + Zig), `json` `AntflyType`, and
-  `relationalColumnPlanAlloc` producing the typed-column catalog with tests.
-  No behaviour change for document-mode tables.
-- **Phase 2 — write path (projection done, encoding aligned).**
-  `projectRelationalRowAlloc` produces typed cells per column, enforces
-  `NOT NULL`, and captures `json` subtrees, verified end-to-end against the real
-  row codec and typed-value readers. The physical value kinds remain aligned
-  with the engine's typed doc values so predicate code can share comparison and
-  decoding behavior without making search segments authoritative.
-- **Phase 3 — write path wired end-to-end (done).** The compiled runtime schema
-  carries `storage_mode` + the `relational_columns` catalog (derived in
-  `schema/mod.zig`, v9 binary format); relational writes serialize the declared
-  columns into the dedicated base-row keyspace. Text projection intentionally
-  supplies an empty typed-field list so the introducer does not infer a second
-  full-column copy in derived text segments. Covered by runtime-schema,
-  `document_mapper`, and DB tests.
-- **Phase 4 — read path with schema-aware predicate routing (done).** Relational
-  predicates are resolved from relational base-row column scans for supported
-  keyword/range/bool/geo clauses. Predicate auto-routing is wired through
-  `searchQueryToFilterArenaRelational`, including `bool_query` recursion.
-  Document-mode queries are unchanged.
-- **Phase 5 — derived text simplification (done).** Relational text projection
-  no longer writes full-column `typed_doc_values` sections, no longer writes a
-  segment manifest, and no longer reconstructs rows from segment-local columns.
-  Full-text segments remain derived text artifacts: they carry term/scoring
-  data, doc identity, and projection payloads only. Query materialization and
-  `include_stored` hydrate from the committed relational base row.
+Relational mode now uses one authoritative base representation. A relational
+document is not stored as a generic JSON primary value plus derived column
+copies; it is projected once into typed cells and committed through the
+relational participant.
 
-- **Phase 6 — authoritative relational base row (done).** The remaining
-  document copy is no longer a generic primary document value for relational
-  tables. Relational rows are stored under the dedicated relational row keyspace
-  as serialized typed columns, so reconstruction-on-read stays fully synchronous
-  without relying on async segment reconstruction.
+### Relational participant
 
-  - **Storage format.** A relational document is stored as a packed
-    `relational_row_codec` value (magic `AROW`) under the relational row
-    keyspace, with one document-scoped column entry per committed cell. The row
-    entry keeps point lookups / read-modify-write transforms a single atomic
-    document operation; the column entries make scalar scans independent from
-    derived segment doc-values and move with the document range during
-    split/merge. The row is self-describing (each cell carries path + physical
-    `typed_doc_values` type + `is_json`), so reconstruction needs no schema
-    lookup. Round-trip is *canonical*, not byte-exact (schema field order,
-    numbers/datetime normalized) — acceptable because relational tables are
-    closed-schema, so every referenceable field is a declared column.
+The relational base-store participant owns row and column state for relational
+tables:
 
-  - **One formatter, one row source.** `relational_row_codec.appendCellValue` is
-    the single canonical-JSON per-value formatter for relational base-row
-    materialization. Point reads, transforms, vector `include_stored`, backfill,
-    enrichment, and full-text result materialization all hydrate from the same
-    committed row representation.
+- **Row key:** the dedicated relational row keyspace for the document key.
+- **Row payload:** a packed `relational_row_codec` value (magic `AROW`) with one
+  self-describing cell per committed column. Each cell carries path, physical
+  `typed_doc_values` type, and `is_json`, so reconstruction does not require a
+  live schema lookup.
+- **Column access:** document-scoped column entries maintained alongside the row
+  entry. Scalar predicates and scan-based aggregations read these entries rather
+  than derived segment doc-values.
+- **Commit boundary:** prepare/commit/abort/read/scan methods participate in the
+  existing two-phase commit and recovery path, so committed rows, column
+  entries, and deletes resolve at the same visibility point.
 
-  - **Seam A — materialize to JSON.** `materializeDocumentValueAlloc` is the one
-    decode point every document-value reader routes through. The synchronous
-    `DB.get` chokepoint, and every async reader that re-reads a stored document —
-    index backfill (text/dense/sparse), derived replay collectors, and the
-    enrichment runtime — reconstruct JSON from the typed row (or pass a
-    document-mode blob through). The initial-write indexers are unaffected: they
-    carry the original JSON (`cleaned_value`/`write.value`) and never re-read the
-    store. Routed reader-first, write-flipped last, so each step stayed green.
+The row entry keeps point lookups and read-modify-write transforms as one atomic
+document operation. Column entries make scalar scans independent from derived
+search segments and move with the document range during split/merge. A future
+physical optimization can pack entries into larger column blocks without
+changing the participant boundary.
 
-  - **Seam B — typed-column scan path.** Predicate filters and scan-based
-    aggregations read document-scoped relational column entries. Where a
-    consumer genuinely wants one source field (the enrichment `source_field`
-    case), `relational_row_codec.findCellByPath` can read that cell straight
-    from the row, skipping full reconstruction + re-parse. Consumers that need
-    the whole document (templates, algebraic fact-projection, `db.get`) keep
-    Seam A.
+### Write and read seams
 
-  Document-mode tables are unchanged throughout: their KV value stays a JSON
-  blob, and the seam is a pure passthrough (the row magic never matches a JSON
-  document). Covered by the relational write → store typed row → async
-  index/catch-up → full-text query reconstruction tests, alongside the KV
-  row-codec and document-mode passthrough coverage.
+Writes validate incoming JSON against the closed runtime schema, project it via
+`schema_capability.projectRelationalRowAlloc`, and commit the resulting typed
+cells through `relational_store.WriteParticipant`. The original JSON is only
+transient write input for foreground derived-index projection.
+
+`materializeDocumentValueAlloc` is the document-value seam. Document-mode values
+pass through unchanged; relational values reconstruct canonical JSON from the
+typed row. Point reads, transforms, lookup, vector `include_stored`, enrichment
+source reads, full-text result materialization, derived replay, and backfill all
+hydrate from the same committed relational row representation. Consumers that
+need one declared source field, such as enrichment `source_field`, can read the
+cell directly with `relational_row_codec.findCellByPath`.
+
+Relational rows reconstruct canonical JSON rather than the original byte
+sequence. That is acceptable because relational tables are closed-schema and
+every referenceable field is a declared column. Vector-field stripping follows
+the same stored-document seam as document mode: the typed row represents the
+stored document value, not transient vector payloads stripped from storage.
+
+### Derived index contract
+
+Full-text, dense, sparse, graph, and algebraic indexes are derived artifacts.
+They may carry their own index-local state for ranking, traversal, pruning, or
+fold execution, but they are not authoritative row or column storage.
+
+Full-text projection for relational tables sets `TextDocument.typed_fields` to
+an explicit empty slice, so derived text segments do not infer and store a
+second full-column `typed_doc_values` copy. Text segments keep term/scoring data,
+doc identity, and projection payloads only. Query materialization and
+`include_stored` hydrate from the relational base row.
+
+Algebraic, graph, vector, enrichment, split-shadow, catch-up, and backfill
+readers that need a document body carry the relational-base-row context and read
+from the relational row keyspace. Algebraic fact projection and materialization
+therefore rebuild from committed typed rows, not from stale generic document KV
+values or derived text segment columns.
+
+### Query and movement invariants
+
+Structured relational filters for supported keyword/range/bool/geo clauses
+resolve against relational column entries. Top-level supported relational
+structured queries become base-row doc constraints over the text match-all path,
+so scalar query results follow the committed relational row rather than stale
+segment doc-values. Unsupported text-oriented shapes may still use the inverted
+text index, but not segment doc-values as a relational column source.
+
+Split, merge, replay, TTL cleanup, and generated-enrichment replay treat the
+relational base store as table data. Split prepare/finalize moves relational row
+entries and document-scoped column entries into the destination range and removes
+them from the finalized parent range. Merge bootstrap/catch-up reprojects donor
+logical writes into receiver relational rows and column entries; donor deletes
+remove receiver column entries during catch-up.
+
+### No legacy relational storage
+
+Relational mode is new in this feature set, so there is no migration or
+compatibility path for older experimental relational encodings. The supported
+state is the relational participant keyspace. Generic primary document rows for
+relational ids are treated only as invariant cleanup state; relational readers
+must not use a generic document KV value as row data. Document-mode KV values
+remain JSON blobs and are preserved exactly.
 
 ### Relational base-row rationale
 
@@ -287,7 +303,7 @@ The landed design keeps the DocStore transaction boundary as the synchronous
 source of truth while moving relational documents to dedicated relational row
 and column keys:
 
-- **Chosen:** one packed typed-row value per document, detected by the `AROW`
+- **Landed shape:** one packed typed-row value per document, detected by the `AROW`
   magic prefix and stored under the relational row keyspace rather than the
   generic primary document key, plus document-scoped column entries maintained
   by the same participant. This keeps `DB.get`, transforms, lookup, vector
@@ -295,10 +311,9 @@ and column keys:
   the relational JSON blob and avoiding a second base-row copy. The row carries
   enough path/type metadata that generic store-value readers can reconstruct JSON
   without looking up live schema.
-- **Target:** make relational typed storage the single physical base store,
-  with point reads, transforms, predicate scans, recovery, split/merge, and
-  derived-index backfill reading the same committed representation. The concrete
-  work is tracked in [RELATIONAL_ROADMAP.md](RELATIONAL_ROADMAP.md).
+- **Invariant:** relational typed storage is the single physical base store for
+  point reads, transforms, predicate scans, recovery, split/merge, and
+  derived-index backfill.
 
 The value-level magic check is intentional because `DB.get` is generic and also
 serves non-document internal keys. Document-mode JSON blobs and internal store
@@ -309,44 +324,32 @@ column. Vector-field stripping follows the same document-value seam as document
 mode: the typed row represents the stored document value, not transient vector
 payloads stripped from storage.
 
+## Validation coverage
+
+The coverage expected for this feature set is:
+
+- write -> `DB.get` -> query stored data for all scalar types plus `json`;
+- transform read-modify-write on scalar and nullable columns;
+- delete and overwrite remove old column values from scans;
+- read-after-commit through the existing transaction/2PC path;
+- abort and recovery of prepared relational writes;
+- replay/backfill derived text/algebraic/graph/vector/sparse indexes from typed
+  base rows;
+- split and merge preserve relational base rows and column scans;
+- document-mode tables continue to store/retrieve JSON blobs unchanged;
+- mixed text search plus relational predicate filters;
+- generated-enrichment, TTL cleanup, and graph artifact-source readers hydrate
+  from committed relational rows when they need stored document data.
+
+Current tests cover mapper projection, runtime-schema round-trip, row-codec
+round-trip, document-mode passthrough, relational point reads, full-text
+`include_stored` hydration from base rows, scan-based aggregations over
+base-row `stored_data`, scalar filters over column entries, transaction
+commit/abort/transform behavior, stale generic-primary cleanup, split movement,
+and merge bootstrap/catch-up for row and column entries.
+
 ## Related docs
 
 - [SCHEMA.md](SCHEMA.md) — schema contract and compiled runtime schema
 - [ALGEBRAIC.md](ALGEBRAIC.md) — fact projection, materializations, folds
 - [JOINS.md](JOINS.md) — relational join planner and distributed execution
-
----
-
-## One-store text projection: DONE
-
-Relational tables store one packed typed-row value under the relational base-row
-keyspace. Derived full-text segments no longer carry a second copy of the full
-relational column set as `typed_doc_values`, no longer emit a relational manifest
-section, and no longer reconstruct JSON from segment-local columns. Segment
-stored bodies are projection payloads used by the text index, while authoritative
-relational reads hydrate from the committed base row.
-
-This keeps the physical model simple:
-
-- **Write path**: relational writes project the declared columns once into the
-  base-row value. Full-text projection emits analyzed text and any text-specific
-  payload needed by the derived index, but it does not duplicate scalar
-  relational columns into the segment.
-- **Point and mutation reads**: `DB.get`, transforms, update/delete validation,
-  vector `include_stored`, and lookup/enrichment paths read the packed base row.
-- **Query reads**: structured relational predicates resolve document ids from
-  base-store column entries, then full-text ranking/materialization hydrates
-  from the base row before returning public stored data.
-- **Merge / compaction / split**: segment data movement remains schema-less
-  because it only moves derived text-index state. It does not need a relational
-  column catalog, and it cannot become a second source of truth for row values.
-
-The earlier segment-manifest approach was removed rather than retained as a
-compatibility path because relational mode is new. There is no supported
-on-disk relational segment format to migrate.
-
-### Validation
-
-Covered by mapper tests proving relational text projection omits segment
-typed-column copies, DB tests proving full-text results hydrate from the base
-row, point-read tests over the relational base store, and the root test suite.

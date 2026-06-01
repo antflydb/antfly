@@ -1792,6 +1792,13 @@ Full-text remains responsible for analyzer-specific ranking behavior such as
 BM25, phrase/proximity, highlighting, and analyzer state. Algebraic consumes exact
 candidate tensors for filters, joins, vector pruning, and aggregate folds.
 
+For relational tables, algebraic remains a derived index over the relational base
+store. Fact projection, materialization maintenance, replay, and backfill hydrate
+documents from committed relational base rows when they need a document body;
+they do not read stale generic document KV values or derived text segment
+columns as authoritative relational data. See [RELATIONAL.md](RELATIONAL.md) for
+the one-store relational storage contract.
+
 ### Vector And Graph Integration
 
 Supported algebraic `docfact` and `pathfact` filters can be resolved into native
