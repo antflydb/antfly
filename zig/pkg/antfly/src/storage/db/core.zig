@@ -1235,15 +1235,18 @@ fn buildTransactionRecoveryIdentityExtraBatch(
             try extra_deletes.append(alloc, primary_key);
             primary_key_owned = false;
 
-            const row_key = try relational_store_mod.rowKeyAlloc(alloc, mutation.key);
-            var row_key_owned = true;
-            errdefer if (row_key_owned) alloc.free(row_key);
             if (mutation.value) |value| {
                 const row_value = try alloc.dupe(u8, value);
                 var row_value_owned = true;
                 errdefer if (row_value_owned) alloc.free(row_value);
-                try extra_writes.append(alloc, .{ .key = row_key, .value = row_value });
-                row_key_owned = false;
+                try relational_store_mod.appendUpsertOwnedBatch(
+                    alloc,
+                    identity_ctx.store,
+                    &extra_writes,
+                    &extra_deletes,
+                    mutation.key,
+                    row_value,
+                );
                 row_value_owned = false;
 
                 const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, mutation.key);
@@ -1257,8 +1260,12 @@ fn buildTransactionRecoveryIdentityExtraBatch(
                 timestamp_key_owned = false;
                 timestamp_value_owned = false;
             } else {
-                try extra_deletes.append(alloc, row_key);
-                row_key_owned = false;
+                try relational_store_mod.appendDeleteOwnedBatch(
+                    alloc,
+                    identity_ctx.store,
+                    &extra_deletes,
+                    mutation.key,
+                );
 
                 const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, mutation.key);
                 var timestamp_key_owned = true;

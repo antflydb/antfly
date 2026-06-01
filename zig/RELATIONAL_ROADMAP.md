@@ -66,15 +66,20 @@ start as row-addressable and become column-readable:
 - **Row key:** existing document key / document identity namespace.
 - **Row payload:** the current `relational_row_codec` cells, but stored under a
   relational participant API rather than as the generic document KV value.
-- **Column access:** maintain column-organized blocks or memtables as part of
-  the same participant so scans do not need derived segment doc-values.
+- **Column access:** maintain document-scoped column entries as part of the
+  same participant so scans do not need derived segment doc-values. The current
+  PR writes one entry per committed cell under the owning document range; a
+  later physical optimization can pack those entries into column blocks without
+  changing the participant boundary.
 - **Commit metadata:** row version / generation, delete marker, and enough
   range ownership metadata to participate in split/merge/replay.
 
-The first implementation can keep a row-packed on-disk encoding internally while
-exposing a column scan API. That lets the PR remove the second logical storage
-copy first, then optimize physical column layout later. The important boundary
-is that derived search segments stop being the authoritative column source for
+The first implementation keeps row and per-column cell entries in the same
+document-scoped relational keyspace. That removes the second logical storage
+copy first, while preserving split/merge safety because all relational state for
+a document moves with the document range. A later optimization can reorganize
+the physical layout into larger column blocks. The important boundary is that
+derived search segments stop being the authoritative column source for
 relational reads.
 
 Current PR progress:
@@ -83,9 +88,9 @@ Current PR progress:
   the generic primary document key;
 - point reads, derived replay, backfill, split movement, and match-all scans
   recognize relational row keys as document rows;
-- `relational_store.scanRowsAlloc` and `scanColumnAlloc` expose row and column
-  scans over the packed base-row encoding, so query consumers can start moving
-  off segment doc-values before the physical column layout changes;
+- `relational_store.scanRowsAlloc` reads committed relational row entries, while
+  `scanColumnAlloc` reads document-scoped relational column entries instead of
+  decoding packed rows or derived segment doc-values;
 - relational full-text `include_stored` now reconstructs returned rows from the
   relational base-row store, while the inverted index remains responsible only
   for term matching and scoring;
@@ -127,6 +132,10 @@ Current PR progress:
   `relational_store.WriteParticipant` with prepare/commit/abort/read/scan
   methods, giving the current row-packed implementation the same participant
   boundary the typed-column store will occupy.
+- relational upserts now maintain document-scoped per-column entries alongside
+  the row entry, relational overwrites/delete remove stale column entries, and
+  transaction commit resolution/recovery use the same helper so scalar scans
+  observe the committed relational base store consistently.
 - relational transaction intent writes are projected before prepare, and commit
   resolution/recovery skip the generic document KV apply path; committed
   relational intents now materialize only as relational base rows plus their

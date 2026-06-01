@@ -62,9 +62,11 @@ pub const WriteParticipant = struct {
     writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
     deletes: *std.ArrayListUnmanaged([]const u8),
     owned_keys: *std.ArrayListUnmanaged([]u8),
+    owned_values: *std.ArrayListUnmanaged([]u8),
     writes_start: usize,
     deletes_start: usize,
     owned_keys_start: usize,
+    owned_values_start: usize,
     prepared: bool = false,
     closed: bool = false,
 
@@ -74,6 +76,7 @@ pub const WriteParticipant = struct {
         writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
         deletes: *std.ArrayListUnmanaged([]const u8),
         owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
     ) WriteParticipant {
         return .{
             .alloc = alloc,
@@ -81,9 +84,11 @@ pub const WriteParticipant = struct {
             .writes = writes,
             .deletes = deletes,
             .owned_keys = owned_keys,
+            .owned_values = owned_values,
             .writes_start = writes.items.len,
             .deletes_start = deletes.items.len,
             .owned_keys_start = owned_keys.items.len,
+            .owned_values_start = owned_values.items.len,
         };
     }
 
@@ -97,7 +102,7 @@ pub const WriteParticipant = struct {
         _ = table;
         _ = txn_id;
         if (self.closed) return error.ParticipantClosed;
-        try appendUpsert(self.alloc, self.writes, self.owned_keys, doc_key, typed_row);
+        try appendUpsert(self.alloc, self.store, self.writes, self.deletes, self.owned_keys, self.owned_values, doc_key, typed_row);
         self.prepared = true;
     }
 
@@ -110,7 +115,7 @@ pub const WriteParticipant = struct {
         _ = table;
         _ = txn_id;
         if (self.closed) return error.ParticipantClosed;
-        try appendDelete(self.alloc, self.deletes, self.owned_keys, doc_key);
+        try appendDelete(self.alloc, self.store, self.deletes, self.owned_keys, doc_key);
         self.prepared = true;
     }
 
@@ -125,7 +130,9 @@ pub const WriteParticipant = struct {
         _ = txn_id;
         if (!self.closed) {
             for (self.owned_keys.items[self.owned_keys_start..]) |key| self.alloc.free(key);
+            for (self.owned_values.items[self.owned_values_start..]) |value| self.alloc.free(value);
             self.owned_keys.shrinkRetainingCapacity(self.owned_keys_start);
+            self.owned_values.shrinkRetainingCapacity(self.owned_values_start);
             self.writes.shrinkRetainingCapacity(self.writes_start);
             self.deletes.shrinkRetainingCapacity(self.deletes_start);
         }
@@ -150,30 +157,45 @@ pub const WriteParticipant = struct {
 
 pub fn appendUpsert(
     alloc: Allocator,
+    store: *docstore_mod.DocStore,
     writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: *std.ArrayListUnmanaged([]const u8),
     owned_keys: *std.ArrayListUnmanaged([]u8),
+    owned_values: *std.ArrayListUnmanaged([]u8),
     doc_key: []const u8,
     row_value: []const u8,
 ) !void {
-    const key = try rowKeyAlloc(alloc, doc_key);
-    errdefer alloc.free(key);
-    try owned_keys.append(alloc, key);
-    try writes.append(alloc, .{
-        .key = key,
-        .value = row_value,
-    });
+    try appendUpsertInternal(alloc, store, writes, deletes, owned_keys, owned_values, doc_key, row_value);
 }
 
 pub fn appendDelete(
     alloc: Allocator,
+    store: *docstore_mod.DocStore,
     deletes: *std.ArrayListUnmanaged([]const u8),
     owned_keys: *std.ArrayListUnmanaged([]u8),
     doc_key: []const u8,
 ) !void {
-    const key = try rowKeyAlloc(alloc, doc_key);
-    errdefer alloc.free(key);
-    try owned_keys.append(alloc, key);
-    try deletes.append(alloc, key);
+    try appendDeleteInternal(alloc, store, deletes, owned_keys, doc_key);
+}
+
+pub fn appendUpsertOwnedBatch(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    doc_key: []const u8,
+    row_value: []const u8,
+) !void {
+    try appendUpsertInternal(alloc, store, writes, deletes, null, null, doc_key, row_value);
+}
+
+pub fn appendDeleteOwnedBatch(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    doc_key: []const u8,
+) !void {
+    try appendDeleteInternal(alloc, store, deletes, null, doc_key);
 }
 
 pub fn getRawAlloc(alloc: Allocator, store: *docstore_mod.DocStore, doc_key: []const u8) !?[]u8 {
@@ -243,8 +265,13 @@ pub fn scanColumnAlloc(
     lower_doc_key: []const u8,
     upper_doc_key: []const u8,
 ) ![]OwnedColumnValue {
-    const rows = try scanRowsAlloc(alloc, store, lower_doc_key, upper_doc_key);
-    defer freeRows(alloc, rows);
+    const lower = try internal_keys.documentRangeLowerAlloc(alloc, lower_doc_key);
+    defer alloc.free(lower);
+    const upper = try internal_keys.documentRangeUpperAlloc(alloc, upper_doc_key);
+    defer if (upper) |buf| alloc.free(buf);
+
+    const scanned = try store.scanRange(alloc, lower, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
 
     var out = std.ArrayListUnmanaged(OwnedColumnValue).empty;
     errdefer {
@@ -252,21 +279,125 @@ pub fn scanColumnAlloc(
         out.deinit(alloc);
     }
 
-    for (rows) |row| {
-        const cell = (try relational_row_codec.findCellByPath(row.row_value, column_path)) orelse continue;
-        const doc_key = try alloc.dupe(u8, row.doc_key);
-        errdefer alloc.free(doc_key);
+    for (scanned) |entry| {
+        var decoded = (try internal_keys.decodeRelationalColumnKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!std.mem.eql(u8, decoded.column_path, column_path)) continue;
+        const cell = (try relational_row_codec.findCellByPath(entry.value, column_path)) orelse continue;
+        const doc_key = try alloc.dupe(u8, decoded.doc_key);
+        var doc_key_owned = true;
+        errdefer if (doc_key_owned) alloc.free(doc_key);
         const value = try cloneTypedValue(alloc, cell.value_type, cell.value);
-        errdefer if (cell.value_type == .bytes_val) alloc.free(value.bytes_val);
+        var value_owned = cell.value_type == .bytes_val;
+        errdefer if (value_owned) alloc.free(value.bytes_val);
         try out.append(alloc, .{
             .doc_key = doc_key,
             .value_type = cell.value_type,
             .is_json = cell.is_json,
             .value = value,
         });
+        doc_key_owned = false;
+        value_owned = false;
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendUpsertInternal(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    owned_values: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    row_value: []const u8,
+) !void {
+    try appendExistingColumnDeletes(alloc, store, deletes, owned_keys, doc_key);
+
+    const row_key = try rowKeyAlloc(alloc, doc_key);
+    var row_key_owned = true;
+    errdefer if (row_key_owned) alloc.free(row_key);
+    if (owned_keys) |keys| {
+        try keys.append(alloc, row_key);
+        row_key_owned = false;
+    }
+    try writes.append(alloc, .{
+        .key = row_key,
+        .value = row_value,
+    });
+    row_key_owned = false;
+
+    var row = try relational_row_codec.deserialize(alloc, row_value);
+    defer row.deinit(alloc);
+    for (row.cells) |cell| {
+        const key = try internal_keys.relationalColumnKeyAlloc(alloc, doc_key, cell.path);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        if (owned_keys) |keys| {
+            try keys.append(alloc, key);
+            key_owned = false;
+        }
+
+        const value = try relational_row_codec.serialize(alloc, &.{cell});
+        var value_owned = true;
+        errdefer if (value_owned) alloc.free(value);
+        if (owned_values) |values| {
+            try values.append(alloc, value);
+            value_owned = false;
+        }
+
+        try writes.append(alloc, .{
+            .key = key,
+            .value = value,
+        });
+        key_owned = false;
+        value_owned = false;
+    }
+}
+
+fn appendDeleteInternal(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+) !void {
+    try appendExistingColumnDeletes(alloc, store, deletes, owned_keys, doc_key);
+
+    const key = try rowKeyAlloc(alloc, doc_key);
+    var key_owned = true;
+    errdefer if (key_owned) alloc.free(key);
+    if (owned_keys) |keys| {
+        try keys.append(alloc, key);
+        key_owned = false;
+    }
+    try deletes.append(alloc, key);
+    key_owned = false;
+}
+
+fn appendExistingColumnDeletes(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+) !void {
+    const old_row = try getRawAlloc(alloc, store, doc_key) orelse return;
+    defer alloc.free(old_row);
+    var row = try relational_row_codec.deserialize(alloc, old_row);
+    defer row.deinit(alloc);
+    for (row.cells) |cell| {
+        const key = try internal_keys.relationalColumnKeyAlloc(alloc, doc_key, cell.path);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        if (owned_keys) |keys| {
+            try keys.append(alloc, key);
+            key_owned = false;
+        }
+        try deletes.append(alloc, key);
+        key_owned = false;
+    }
 }
 
 fn cloneTypedValue(alloc: Allocator, value_type: typed_dv.ValueType, value: typed_dv.TypedValue) !typed_dv.TypedValue {
@@ -306,8 +437,13 @@ test "relational base store writes materialize and delete by document key" {
         for (owned_keys.items) |key| alloc.free(key);
         owned_keys.deinit(alloc);
     }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
 
-    try appendUpsert(alloc, &writes, &owned_keys, "doc:a", row);
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row);
     try store.putBatch(writes.items, deletes.items);
 
     const materialized = (try getMaterializedAlloc(alloc, &store, "doc:a")).?;
@@ -315,7 +451,8 @@ test "relational base store writes materialize and delete by document key" {
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", materialized);
 
     writes.clearRetainingCapacity();
-    try appendDelete(alloc, &deletes, &owned_keys, "doc:a");
+    deletes.clearRetainingCapacity();
+    try appendDelete(alloc, &store, &deletes, &owned_keys, "doc:a");
     try store.putBatch(writes.items, deletes.items);
     try std.testing.expect((try getRawAlloc(alloc, &store, "doc:a")) == null);
 }
@@ -346,13 +483,18 @@ test "relational write participant prepares commit and abort boundaries" {
         for (owned_keys.items) |key| alloc.free(key);
         owned_keys.deinit(alloc);
     }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
 
-    var participant = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys);
+    var participant = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys, &owned_values);
     try participant.prepareUpsert("events", "doc:a", row, null);
     participant.abort(null);
     try std.testing.expect((try getRawAlloc(alloc, &store, "doc:a")) == null);
 
-    var committed = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys);
+    var committed = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys, &owned_values);
     try committed.prepareUpsert("events", "doc:a", row, null);
     try store.putBatch(writes.items, deletes.items);
     try committed.commit(null, 1);
@@ -363,7 +505,7 @@ test "relational write participant prepares commit and abort boundaries" {
 
     writes.clearRetainingCapacity();
     deletes.clearRetainingCapacity();
-    var delete_participant = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys);
+    var delete_participant = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys, &owned_values);
     try delete_participant.prepareDelete("events", "doc:a", null);
     try store.putBatch(writes.items, deletes.items);
     try delete_participant.commit(null, 2);
@@ -424,10 +566,15 @@ test "relational base store scans rows and columns by document range" {
         for (owned_keys.items) |key| alloc.free(key);
         owned_keys.deinit(alloc);
     }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
 
-    try appendUpsert(alloc, &writes, &owned_keys, "doc:a", row_a);
-    try appendUpsert(alloc, &writes, &owned_keys, "doc:b", row_b);
-    try appendUpsert(alloc, &writes, &owned_keys, "doc:c", row_c);
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a);
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b);
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:c", row_c);
     try writes.append(alloc, .{ .key = primary_key, .value = "{\"ignored\":true}" });
     try store.putBatch(writes.items, deletes.items);
 
@@ -444,4 +591,36 @@ test "relational base store scans rows and columns by document range" {
     try std.testing.expectEqual(@as(f64, 10.5), amounts[0].value.f64_val);
     try std.testing.expectEqualStrings("doc:b", amounts[1].doc_key);
     try std.testing.expectEqual(@as(f64, 20.25), amounts[1].value.f64_val);
+
+    const doc_b_amount_key = try internal_keys.relationalColumnKeyAlloc(alloc, "doc:b", "amount");
+    defer alloc.free(doc_b_amount_key);
+    const doc_b_amount = try store.get(alloc, doc_b_amount_key);
+    defer alloc.free(doc_b_amount);
+
+    const row_b_without_amount = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "title",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "beta-updated" },
+        },
+    });
+    defer alloc.free(row_b_without_amount);
+    writes.clearRetainingCapacity();
+    deletes.clearRetainingCapacity();
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b_without_amount);
+    try store.putBatch(writes.items, deletes.items);
+    try std.testing.expectError(error.NotFound, store.get(alloc, doc_b_amount_key));
+
+    const amounts_after_update = try scanColumnAlloc(alloc, &store, "amount", "doc:a", "doc:c");
+    defer freeColumnValues(alloc, amounts_after_update);
+    try std.testing.expectEqual(@as(usize, 1), amounts_after_update.len);
+    try std.testing.expectEqualStrings("doc:a", amounts_after_update[0].doc_key);
+
+    const doc_a_amount_key = try internal_keys.relationalColumnKeyAlloc(alloc, "doc:a", "amount");
+    defer alloc.free(doc_a_amount_key);
+    writes.clearRetainingCapacity();
+    deletes.clearRetainingCapacity();
+    try appendDelete(alloc, &store, &deletes, &owned_keys, "doc:a");
+    try store.putBatch(writes.items, deletes.items);
+    try std.testing.expectError(error.NotFound, store.get(alloc, doc_a_amount_key));
 }

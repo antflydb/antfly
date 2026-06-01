@@ -3295,6 +3295,7 @@ pub const DB = struct {
             &store_writes,
             &delete_keys,
             &owned_store_keys,
+            &owned_store_values,
         );
         var relational_participant_prepared = false;
         var relational_participant_closed = false;
@@ -3413,6 +3414,7 @@ pub const DB = struct {
                     );
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
                 const store_key = if (relational_columns != null) blk: {
+                    const row_write_index = store_writes.items.len;
                     try relational_participant.prepareUpsert("", write.key, store_value, null);
                     relational_participant_prepared = true;
                     const primary_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
@@ -3421,7 +3423,7 @@ pub const DB = struct {
                     try owned_delete_keys.append(self.alloc, primary_key);
                     primary_key_owned = false;
                     try delete_keys.append(self.alloc, primary_key);
-                    break :blk store_writes.items[store_writes.items.len - 1].key;
+                    break :blk store_writes.items[row_write_index].key;
                 } else blk: {
                     const key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
                     try owned_store_keys.append(self.alloc, key);
@@ -5097,15 +5099,18 @@ pub const DB = struct {
                     try relational_extra_deletes.append(self.alloc, primary_key);
                     primary_key_owned = false;
 
-                    const row_key = try relational_store_mod.rowKeyAlloc(self.alloc, mutation.key);
-                    var row_key_owned = true;
-                    errdefer if (row_key_owned) self.alloc.free(row_key);
                     if (mutation.value) |value| {
                         const row_value = try self.alloc.dupe(u8, value);
                         var row_value_owned = true;
                         errdefer if (row_value_owned) self.alloc.free(row_value);
-                        try relational_extra_writes.append(self.alloc, .{ .key = row_key, .value = row_value });
-                        row_key_owned = false;
+                        try relational_store_mod.appendUpsertOwnedBatch(
+                            self.alloc,
+                            self.core.store,
+                            &relational_extra_writes,
+                            &relational_extra_deletes,
+                            mutation.key,
+                            row_value,
+                        );
                         row_value_owned = false;
                         if (shouldWriteTimestamp(mutation.key)) {
                             const timestamp_key = try makeTimestampKey(self.alloc, mutation.key);
@@ -5119,8 +5124,12 @@ pub const DB = struct {
                             timestamp_value_owned = false;
                         }
                     } else {
-                        try relational_extra_deletes.append(self.alloc, row_key);
-                        row_key_owned = false;
+                        try relational_store_mod.appendDeleteOwnedBatch(
+                            self.alloc,
+                            self.core.store,
+                            &relational_extra_deletes,
+                            mutation.key,
+                        );
                         if (shouldWriteTimestamp(mutation.key)) {
                             const timestamp_key = try makeTimestampKey(self.alloc, mutation.key);
                             var timestamp_key_owned = true;
@@ -14168,7 +14177,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
 
     for (keys) |key| {
         if (ctx.relational_base_rows) {
-            try relational_store_mod.appendDelete(ctx.alloc, &delete_keys, &owned_delete_keys, key);
+            try relational_store_mod.appendDelete(ctx.alloc, ctx.store, &delete_keys, &owned_delete_keys, key);
             const primary_key = try internal_keys.documentKeyAlloc(ctx.alloc, key);
             var primary_key_owned = true;
             errdefer if (primary_key_owned) ctx.alloc.free(primary_key);
@@ -41548,9 +41557,32 @@ test "relational table full-text search loads stored_data from base rows" {
     ;
     const replacement_row = try mapper.buildRelationalRowValueAlloc(alloc, replacement_json, runtime_schema.relational_columns);
     defer alloc.free(replacement_row);
-    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:a");
-    defer alloc.free(relational_key);
-    try db.core.store.put(relational_key, replacement_row);
+    var replacement_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (replacement_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        replacement_writes.deinit(alloc);
+    }
+    var replacement_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (replacement_deletes.items) |key| alloc.free(@constCast(key));
+        replacement_deletes.deinit(alloc);
+    }
+    const replacement_row_copy = try alloc.dupe(u8, replacement_row);
+    var replacement_row_copy_owned = true;
+    errdefer if (replacement_row_copy_owned) alloc.free(replacement_row_copy);
+    try relational_store_mod.appendUpsertOwnedBatch(
+        alloc,
+        db.core.store,
+        &replacement_writes,
+        &replacement_deletes,
+        "row:a",
+        replacement_row_copy,
+    );
+    replacement_row_copy_owned = false;
+    try db.core.store.putBatch(replacement_writes.items, replacement_deletes.items);
 
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
