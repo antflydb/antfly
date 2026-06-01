@@ -125,7 +125,7 @@ pub fn processResolutionArtifact(
     const raw = (try store.get(gpa, resolution_key)) orelse return 0;
     defer gpa.free(raw);
 
-    var parsed = resolver_lib.parseResolution(gpa, raw) catch return 0;
+    var parsed = try resolver_lib.parseResolution(gpa, raw);
     defer parsed.deinit();
 
     // Collect every resolvable entity, then commit them in one batch so a
@@ -215,9 +215,11 @@ pub const PromotionRuntime = struct {
     /// means promotion waits or is explicitly disabled, depending on
     /// `missing_sink_policy`. Must outlive the runtime.
     sink: ?EntitySink,
+    sink_available: std.atomic.Value(bool),
     missing_sink_policy: MissingSinkPolicy,
     applied_sequence: std.atomic.Value(u64),
     target_sequence: std.atomic.Value(u64),
+    error_count: std.atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
     io_impl: ?*background_runtime_mod.IoImpl,
@@ -239,9 +241,11 @@ pub const PromotionRuntime = struct {
             .store_handle = store_handle,
             .replay_source = replay_source,
             .sink = sink,
+            .sink_available = .init(sink != null),
             .missing_sink_policy = missing_sink_policy,
             .applied_sequence = .init(applied),
             .target_sequence = .init(applied),
+            .error_count = .init(0),
             .shutdown_flag = .init(false),
             .io_impl = backend_runtime.io_impl,
             .future = null,
@@ -265,9 +269,7 @@ pub const PromotionRuntime = struct {
     pub fn stats(self: *PromotionRuntime) types.ReplayStageStats {
         const target = self.target_sequence.load(.acquire);
         const applied = self.applied_sequence.load(.acquire);
-        lockMutex(&self.catch_up_mutex);
-        defer self.catch_up_mutex.unlock();
-        const blocked = applied < target and self.sink == null and self.missing_sink_policy == .wait;
+        const blocked = applied < target and !self.sink_available.load(.acquire) and self.missing_sink_policy == .wait;
         return .{
             .enabled = target > 0 or applied < target,
             .target_sequence = target,
@@ -275,6 +277,7 @@ pub const PromotionRuntime = struct {
             .catch_up_required = applied < target,
             .blocked = blocked,
             .blocked_reason = if (blocked) "missing_entity_sink" else "",
+            .error_count = self.error_count.load(.monotonic),
         };
     }
 
@@ -284,6 +287,7 @@ pub const PromotionRuntime = struct {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         self.sink = sink;
+        self.sink_available.store(sink != null, .release);
     }
 
     pub fn start(self: *PromotionRuntime) !void {
@@ -308,6 +312,7 @@ pub const PromotionRuntime = struct {
     pub fn catchUp(self: *PromotionRuntime) !void {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        errdefer _ = self.error_count.fetchAdd(1, .monotonic);
 
         while (true) {
             const target = self.target_sequence.load(.acquire);
@@ -503,6 +508,22 @@ test "processResolutionArtifact upserts a canonical entity per resolved mention"
     try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), "no-such-key", capture.sink()));
 }
 
+test "processResolutionArtifact fails closed on malformed resolution artifacts" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:bad", "resolution_v1");
+    defer alloc.free(resolution_key);
+    try map.put(resolution_key, "{}");
+
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+
+    try testing.expectError(error.InvalidResolution, processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 0), capture.keys.items.len);
+}
+
 /// Minimal replay Source for tests: replays a fixed list of encoded records.
 const FakeSource = struct {
     const Rec = struct { sequence: u64, payload: []const u8 };
@@ -581,6 +602,54 @@ test "catchUpWindow promotes resolution artifacts referenced by a replay record"
     const max_seen = try catchUpWindow(alloc, fake_source.source(), map.store(), capture.sink(), 1, 0);
     try testing.expectEqual(@as(u64, 9), max_seen);
     try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
+}
+
+test "catchUpWindow leaves replay unapplied when a resolution artifact is malformed" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:bad", "resolution_v1");
+    defer alloc.free(resolution_key);
+    try map.put(resolution_key, "{}");
+
+    const payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 9,
+        .changed_artifact_keys = &.{resolution_key},
+        .target_hints = &.{.promotion},
+    });
+    defer alloc.free(payload);
+
+    var fake_source = FakeSource{ .records = &.{.{ .sequence = 9, .payload = payload }} };
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+
+    try testing.expectError(error.InvalidResolution, catchUpWindow(alloc, fake_source.source(), map.store(), capture.sink(), 1, 0));
+    try testing.expectEqual(@as(usize, 0), capture.keys.items.len);
+}
+
+test "PromotionRuntime stats are nonblocking while catch-up owns the mutex" {
+    var runtime = PromotionRuntime{
+        .alloc = testing.allocator,
+        .store_handle = undefined,
+        .replay_source = undefined,
+        .sink = null,
+        .sink_available = .init(false),
+        .missing_sink_policy = .wait,
+        .applied_sequence = .init(1),
+        .target_sequence = .init(2),
+        .error_count = .init(3),
+        .shutdown_flag = .init(false),
+        .io_impl = null,
+        .future = null,
+    };
+    lockMutex(&runtime.catch_up_mutex);
+    defer runtime.catch_up_mutex.unlock();
+
+    const stats_snapshot = runtime.stats();
+    try testing.expect(stats_snapshot.catch_up_required);
+    try testing.expect(stats_snapshot.blocked);
+    try testing.expectEqual(@as(u64, 3), stats_snapshot.error_count);
 }
 
 test "catchUpWindow with no matching records returns from_sequence" {

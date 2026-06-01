@@ -1207,6 +1207,7 @@ pub const ReplayStageStats = struct {
     catch_up_required: bool = false,
     blocked: bool = false,
     blocked_reason: []const u8 = "",
+    error_count: u64 = 0,
 };
 
 pub const TransactionRecoveryStats = struct {

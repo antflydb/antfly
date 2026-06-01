@@ -374,6 +374,18 @@ fn appendEntityCandidate(
     value: []const u8,
     out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
 ) !void {
+    try appendEntityCandidateWithResolved(allocator, table, entity_key, value, null, null, out);
+}
+
+fn appendEntityCandidateWithResolved(
+    allocator: std.mem.Allocator,
+    table: []const u8,
+    entity_key: []const u8,
+    value: []const u8,
+    resolved_key: ?[]const u8,
+    resolved_value: ?[]const u8,
+    out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
+) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, value, .{}) catch return;
     defer parsed.deinit();
     if (parsed.value != .object) return;
@@ -416,11 +428,66 @@ fn appendEntityCandidate(
         }
     }
 
+    var resolved_record: ?matcher.Record = null;
+    if (resolved_value) |rv| {
+        var resolved_parsed = std.json.parseFromSlice(std.json.Value, allocator, rv, .{}) catch return;
+        defer resolved_parsed.deinit();
+        if (resolved_parsed.value == .object) {
+            var resolved_fields = std.ArrayListUnmanaged(matcher.Field).empty;
+            var rit = resolved_parsed.value.object.iterator();
+            while (rit.next()) |e| {
+                switch (e.value_ptr.*) {
+                    .string => |s| {
+                        try resolved_fields.append(allocator, .{
+                            .name = try allocator.dupe(u8, e.key_ptr.*),
+                            .value = .{ .text = try allocator.dupe(u8, s) },
+                        });
+                    },
+                    .array => |arr| {
+                        if (arr.items.len == 0) continue;
+                        const vec = try allocator.alloc(f32, arr.items.len);
+                        var ok = true;
+                        for (arr.items, 0..) |item, i| {
+                            vec[i] = switch (item) {
+                                .float => |f| @floatCast(f),
+                                .integer => |n| @floatFromInt(n),
+                                .number_string => |ns| std.fmt.parseFloat(f32, ns) catch {
+                                    ok = false;
+                                    break;
+                                },
+                                else => {
+                                    ok = false;
+                                    break;
+                                },
+                            };
+                        }
+                        if (ok) {
+                            try resolved_fields.append(allocator, .{ .name = try allocator.dupe(u8, e.key_ptr.*), .value = .{ .vector = vec } });
+                        } else allocator.free(vec);
+                    },
+                    else => {},
+                }
+            }
+            resolved_record = .{ .fields = try resolved_fields.toOwnedSlice(allocator) };
+        }
+    }
+
     try out.append(allocator, .{
         .doc_ref = .{ .table = try allocator.dupe(u8, table), .key = try allocator.dupe(u8, entity_key) },
         .label = label,
         .record = .{ .fields = try fields.toOwnedSlice(allocator) },
+        .resolved_doc_ref = if (resolved_key) |rk| .{ .table = try allocator.dupe(u8, table), .key = try allocator.dupe(u8, rk) } else null,
+        .resolved_record = resolved_record,
     });
+}
+
+fn jsonStringFieldAlloc(allocator: std.mem.Allocator, value: []const u8, field_name: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, value, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const field = parsed.value.object.get(field_name) orelse return null;
+    if (field != .string or field.string.len == 0) return null;
+    return try allocator.dupe(u8, field.string);
 }
 
 pub const CandidateMode = enum { exact_key, prefix, ann };
@@ -452,10 +519,15 @@ const SourceCandidateProvider = struct {
     const ScanCtx = struct {
         allocator: std.mem.Allocator,
         table: []const u8,
+        source: CandidateSource,
         out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
         fn consume(ptr: *anyopaque, entity_key: []const u8, value: []const u8) anyerror!void {
             const self: *ScanCtx = @ptrCast(@alignCast(ptr));
-            try appendEntityCandidate(self.allocator, self.table, entity_key, value, self.out);
+            const resolved_key = try jsonStringFieldAlloc(self.allocator, value, "merged_into");
+            defer if (resolved_key) |rk| self.allocator.free(rk);
+            const resolved_raw = if (resolved_key) |rk| try self.source.get(self.allocator, self.table, rk) else null;
+            defer if (resolved_raw) |raw| self.allocator.free(raw);
+            try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, value, resolved_key, resolved_raw, self.out);
         }
     };
 
@@ -472,14 +544,18 @@ const SourceCandidateProvider = struct {
                 defer allocator.free(@constCast(key));
                 const raw = (try self.source.get(allocator, self.table, key)) orelse return;
                 defer allocator.free(raw);
-                try appendEntityCandidate(allocator, self.table, key, raw, out);
+                const resolved_key = try jsonStringFieldAlloc(allocator, raw, "merged_into");
+                defer if (resolved_key) |rk| allocator.free(rk);
+                const resolved_raw = if (resolved_key) |rk| try self.source.get(allocator, self.table, rk) else null;
+                defer if (resolved_raw) |rv| allocator.free(rv);
+                try appendEntityCandidateWithResolved(allocator, self.table, key, raw, resolved_key, resolved_raw, out);
             },
             .prefix => {
                 const key = try self.resolver.renderKeyAlloc(allocator, entity);
                 defer allocator.free(@constCast(key));
                 const slash = std.mem.indexOfScalar(u8, key, '/');
                 const prefix = if (slash) |i| key[0 .. i + 1] else key;
-                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .out = out };
+                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .source = self.source, .out = out };
                 self.source.scanPrefix(allocator, self.table, prefix, &ctx, ScanCtx.consume) catch |e| switch (e) {
                     error.ScanUnsupported => return,
                     else => return e,
@@ -487,7 +563,7 @@ const SourceCandidateProvider = struct {
             },
             .ann => {
                 const emb = entity.embedding orelse return;
-                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .out = out };
+                var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .source = self.source, .out = out };
                 self.source.nearest(allocator, self.table, .{
                     .index_name = self.ann_index_name,
                     .embedding = emb,
@@ -531,11 +607,13 @@ const ExactKeyCandidateProvider = struct {
         const self: *ExactKeyCandidateProvider = @ptrCast(@alignCast(ptr));
         const key = try self.resolver.renderKeyAlloc(allocator, entity);
         defer allocator.free(@constCast(key));
-        const doc_store_key = try internal_keys.documentKeyAlloc(allocator, key);
-        defer allocator.free(doc_store_key);
-        const raw = (try self.store.get(allocator, doc_store_key)) orelse return;
+        const raw = (try entityRawFromStore(allocator, self.store, key)) orelse return;
         defer allocator.free(raw);
-        try appendEntityCandidate(allocator, self.table, key, raw, out);
+        const resolved_key = try jsonStringFieldAlloc(allocator, raw, "merged_into");
+        defer if (resolved_key) |rk| allocator.free(rk);
+        const resolved_raw = if (resolved_key) |rk| try entityRawFromStore(allocator, self.store, rk) else null;
+        defer if (resolved_raw) |rv| allocator.free(rv);
+        try appendEntityCandidateWithResolved(allocator, self.table, key, raw, resolved_key, resolved_raw, out);
     }
 };
 
@@ -556,13 +634,18 @@ const PrefixCandidateProvider = struct {
     const ScanCtx = struct {
         allocator: std.mem.Allocator,
         table: []const u8,
+        store: resolver_lib.ArtifactStore,
         out: *std.ArrayListUnmanaged(resolver_lib.Candidate),
 
         fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
             const self: *ScanCtx = @ptrCast(@alignCast(ptr));
             const entity_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.allocator, key)) orelse return;
             defer self.allocator.free(entity_key);
-            try appendEntityCandidate(self.allocator, self.table, entity_key, value, self.out);
+            const resolved_key = try jsonStringFieldAlloc(self.allocator, value, "merged_into");
+            defer if (resolved_key) |rk| self.allocator.free(rk);
+            const resolved_raw = if (resolved_key) |rk| try entityRawFromStore(self.allocator, self.store, rk) else null;
+            defer if (resolved_raw) |rv| self.allocator.free(rv);
+            try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, value, resolved_key, resolved_raw, self.out);
         }
     };
 
@@ -583,13 +666,19 @@ const PrefixCandidateProvider = struct {
         const upper = (try internal_keys.documentRangeUpperAlloc(allocator, prefix)) orelse return;
         defer allocator.free(upper);
 
-        var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .out = out };
+        var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .store = self.store, .out = out };
         self.store.scanPrefix(lower, upper, &ctx, ScanCtx.consume) catch |e| switch (e) {
             error.ScanUnsupported => return,
             else => return e,
         };
     }
 };
+
+fn entityRawFromStore(allocator: std.mem.Allocator, store: resolver_lib.ArtifactStore, entity_key: []const u8) !?[]u8 {
+    const doc_store_key = try internal_keys.documentKeyAlloc(allocator, entity_key);
+    defer allocator.free(doc_store_key);
+    return try store.get(allocator, doc_store_key);
+}
 
 /// Process every changed artifact key in a replay record: resolve each
 /// extraction artifact and journal the resolution keys that actually changed
@@ -1925,6 +2014,11 @@ test "prefix blocking follows a merged_into redirect to the survivor entity" {
     try store.put(dup_key,
         \\{ "canonical_name": "Ada Lovelace", "label": "person", "merged_into": "person/ada_canonical" }
     );
+    const survivor_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_canonical");
+    defer alloc.free(survivor_key);
+    try store.put(survivor_key,
+        \\{ "canonical_name": "Augusta Ada King", "label": "person" }
+    );
 
     const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, null, null)).?;
     defer alloc.free(outcome.resolution_key);
@@ -1939,6 +2033,8 @@ test "prefix blocking follows a merged_into redirect to the survivor entity" {
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     // Resolved to the survivor named by merged_into, not the matched duplicate.
     try testing.expectEqualStrings("person/ada_canonical", ent.get("doc_ref").?.object.get("key").?.string);
+    try testing.expectEqualStrings("Augusta Ada King", ent.get("canonical_name").?.string);
+    try testing.expectEqualStrings("Ada Lovelace", ent.get("surface_form").?.string);
 }
 
 test "embedding (cosine) scoring links via prefix blocking" {

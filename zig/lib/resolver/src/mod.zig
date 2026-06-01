@@ -55,11 +55,15 @@ pub const ExtractedEntity = struct {
 };
 
 /// A resolution candidate fetched by blocking. `record` is scored against the
-/// mention; `label` gates `type_must_match`.
+/// mention; `label` gates `type_must_match`. When blocking finds a merged-away
+/// duplicate, `resolved_doc_ref` / `resolved_record` carry the canonical survivor
+/// to link/promote after scoring against the duplicate.
 pub const Candidate = struct {
     doc_ref: DocRef,
     label: []const u8,
     record: matcher.Record,
+    resolved_doc_ref: ?DocRef = null,
+    resolved_record: ?matcher.Record = null,
 };
 
 pub const Decision = enum {
@@ -290,16 +294,29 @@ pub const Resolver = struct {
 
                 if (best) |bi| {
                     if (best_outcome == .match) {
-                        // Follow a `merged_into` redirect so a mention linking to
-                        // a merged-away entity resolves to its canonical survivor
-                        // (lazy merge; the merged doc points at the survivor).
-                        const matched_key = recordTextField(candidates[bi].record, "merged_into") orelse candidates[bi].doc_ref.key;
-                        const matched_name = recordTextField(candidates[bi].record, "canonical_name") orelse entity.text;
+                        const matched = candidates[bi];
+                        const target_ref = matched.resolved_doc_ref orelse blk: {
+                            if (recordTextField(matched.record, "merged_into") != null) {
+                                // A redirect without a resolved survivor record is
+                                // not safe to promote: graph edges may still point
+                                // at the survivor, but promotion must not clobber
+                                // the survivor's canonical scalar fields with the
+                                // merged-away duplicate's record.
+                                break :blk DocRef{ .table = matched.doc_ref.table, .key = recordTextField(matched.record, "merged_into").? };
+                            }
+                            break :blk matched.doc_ref;
+                        };
+                        const canonical_record = matched.resolved_record orelse if (matched.resolved_doc_ref != null) matched.record else matcher.Record{ .fields = &.{} };
+                        const matched_name = recordTextField(canonical_record, "canonical_name") orelse
+                            if (matched.resolved_doc_ref == null and recordTextField(matched.record, "merged_into") == null)
+                                (recordTextField(matched.record, "canonical_name") orelse entity.text)
+                            else
+                                "";
                         return .{
                             .local_id = local_id,
                             .doc_ref = .{
-                                .table = try a.dupe(u8, candidates[bi].doc_ref.table),
-                                .key = try a.dupe(u8, matched_key),
+                                .table = try a.dupe(u8, target_ref.table),
+                                .key = try a.dupe(u8, target_ref.key),
                             },
                             .confidence = best_prob,
                             .decision = .match,
@@ -1233,6 +1250,7 @@ const MergedCandidate = struct {
     label: []const u8,
     name: []const u8,
     merged_into: []const u8,
+    survivor_name: []const u8,
 
     fn provider(self: *MergedCandidate) CandidateProvider {
         return .{ .ptr = self, .vtable = &vtable };
@@ -1249,7 +1267,15 @@ const MergedCandidate = struct {
         const fields = try allocator.alloc(matcher.Field, 2);
         fields[0] = .{ .name = "canonical_name", .value = .{ .text = try allocator.dupe(u8, self.name) } };
         fields[1] = .{ .name = "merged_into", .value = .{ .text = try allocator.dupe(u8, self.merged_into) } };
-        try out.append(allocator, .{ .doc_ref = self.doc_ref, .label = self.label, .record = .{ .fields = fields } });
+        const survivor_fields = try allocator.alloc(matcher.Field, 1);
+        survivor_fields[0] = .{ .name = "canonical_name", .value = .{ .text = try allocator.dupe(u8, self.survivor_name) } };
+        try out.append(allocator, .{
+            .doc_ref = self.doc_ref,
+            .label = self.label,
+            .record = .{ .fields = fields },
+            .resolved_doc_ref = .{ .table = self.doc_ref.table, .key = self.merged_into },
+            .resolved_record = .{ .fields = survivor_fields },
+        });
     }
 };
 
@@ -1278,6 +1304,7 @@ test "resolution follows a candidate's merged_into redirect to the survivor" {
         .label = "person",
         .name = "Ada Lovelace",
         .merged_into = "person/ada_lovelace",
+        .survivor_name = "Augusta Ada King",
     };
     const stage = ResolutionStage{ .resolver = &resolver, .config_generation = 1 };
     try testing.expectEqual(RunResult.written, try stage.run(testing.allocator, map.store(), candidate.provider(), "ext:doc1", "res:doc1"));
@@ -1290,6 +1317,8 @@ test "resolution follows a candidate's merged_into redirect to the survivor" {
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     // Resolved to the survivor, not the merged-away duplicate.
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+    try testing.expectEqualStrings("Augusta Ada King", ent.get("canonical_name").?.string);
+    try testing.expectEqualStrings("Ada Lovelace", ent.get("surface_form").?.string);
 }
 
 const FixedVectorCandidate = struct {
