@@ -192,6 +192,9 @@ Large-ingest guardrails:
    - [x] First slice: merge cursors now reuse cursor-owned scratch for source
      advancement, removing the per-row stable-key allocation while preserving
      block-release safety.
+   - [x] Snapshot cursor-plan `getManySorted` now returns values borrowed from
+     retained cache block handles or stable snapshot states instead of copying
+     every hit into transaction-owned value buffers.
 6. [ ] Cache per-cursor source layout (`runs`, L0 groups, lower levels, and
    immutable pointer slice) across repeated seeks while the cursor snapshot is
    valid.

@@ -448,6 +448,17 @@ pub const Cache = struct {
         return null;
     }
 
+    fn retainEntry(self: *Cache, entry: *Entry) void {
+        const shard = self.shardForKey(entry.key());
+        const locked = lockAtomic(&shard.mutex);
+        defer if (locked) shard.mutex.unlock();
+
+        std.debug.assert(entry.ref_count > 0);
+        entry.ref_count += 1;
+        entry.last_access = self.nextAccess();
+        self.touchEntryLocked(shard, entry);
+    }
+
     fn put(self: *Cache, path: []const u8, run_id: u64, generation: u64, value: Value, byte_cost: usize) !Handle {
         return try self.putWithBlock(path, run_id, generation, value, byte_cost, 0, 0);
     }
@@ -758,6 +769,15 @@ pub const Handle = struct {
     cache: *Cache,
     entry: *Cache.Entry,
     kind: Kind,
+
+    pub fn retain(self: *const Handle) Handle {
+        self.cache.retainEntry(self.entry);
+        return .{
+            .cache = self.cache,
+            .entry = self.entry,
+            .kind = self.kind,
+        };
+    }
 
     pub fn release(self: *Handle) void {
         self.cache.release(self.entry);

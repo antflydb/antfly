@@ -378,6 +378,8 @@ pub const Backend = struct {
         local_block_cache_misses: u64 = 0,
         cursor_block_reuses: u64 = 0,
         cursor_block_loads: u64 = 0,
+        cursor_value_borrows: u64 = 0,
+        cursor_value_copies: u64 = 0,
         run_group_builds: u64 = 0,
         run_group_build_ns: u64 = 0,
         run_group_total_runs: u64 = 0,
@@ -419,6 +421,8 @@ pub const Backend = struct {
         local_block_cache_misses: CounterU64 = .init(0),
         cursor_block_reuses: CounterU64 = .init(0),
         cursor_block_loads: CounterU64 = .init(0),
+        cursor_value_borrows: CounterU64 = .init(0),
+        cursor_value_copies: CounterU64 = .init(0),
         run_group_builds: CounterU64 = .init(0),
         run_group_build_ns: CounterU64 = .init(0),
         run_group_total_runs: CounterU64 = .init(0),
@@ -460,6 +464,8 @@ pub const Backend = struct {
                 .local_block_cache_misses = self.local_block_cache_misses.load(.monotonic),
                 .cursor_block_reuses = self.cursor_block_reuses.load(.monotonic),
                 .cursor_block_loads = self.cursor_block_loads.load(.monotonic),
+                .cursor_value_borrows = self.cursor_value_borrows.load(.monotonic),
+                .cursor_value_copies = self.cursor_value_copies.load(.monotonic),
                 .run_group_builds = self.run_group_builds.load(.monotonic),
                 .run_group_build_ns = self.run_group_build_ns.load(.monotonic),
                 .run_group_total_runs = self.run_group_total_runs.load(.monotonic),
@@ -2225,6 +2231,14 @@ pub const Backend = struct {
 
     pub fn recordCursorBlockLoad(self: *Backend) void {
         _ = self.read_stats.cursor_block_loads.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordCursorValueBorrow(self: *Backend) void {
+        _ = self.read_stats.cursor_value_borrows.fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordCursorValueCopy(self: *Backend) void {
+        _ = self.read_stats.cursor_value_copies.fetchAdd(1, .monotonic);
     }
 
     pub fn recordRunGroupBuild(self: *Backend, total_runs: usize, l0_runs: usize, elapsed_ns: u64) void {
@@ -6661,6 +6675,8 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         try std.testing.expect(read_stats.table_block_bytes > 0);
         try std.testing.expect(read_stats.cursor_block_loads > 0);
         try std.testing.expect(read_stats.cursor_block_reuses > 0);
+        try std.testing.expectEqual(@as(u64, keys.len), read_stats.cursor_value_borrows);
+        try std.testing.expectEqual(@as(u64, 0), read_stats.cursor_value_copies);
     }
 
     {

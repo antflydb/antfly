@@ -42,6 +42,14 @@ fn releaseHeldValues(held_values: *std.ArrayListUnmanaged([]u8), allocator: Allo
     held_values.deinit(allocator);
 }
 
+fn recordCursorValueBorrow(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "recordCursorValueBorrow")) backend.recordCursorValueBorrow();
+}
+
+fn recordCursorValueCopy(backend: anytype) void {
+    if (@hasDecl(@TypeOf(backend.*), "recordCursorValueCopy")) backend.recordCursorValueCopy();
+}
+
 fn compareTableEntryTo(entry: lsm_table_file.Entry, namespace: backend_types.Namespace, key: []const u8) std.math.Order {
     const namespace_order = compareNamespace(.{ .name = entry.namespace_name }, namespace);
     if (namespace_order != .eq) return namespace_order;
@@ -357,6 +365,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         visible_entry_bytes: ?[]u8 = null,
         mutable_source_entry_bytes: ?[]u8 = null,
         current_key: ?[]const u8 = null,
+        current_visible_source: ?usize = null,
         upper_bound: ?[]const u8 = null,
         backend_locked: bool = false,
 
@@ -537,13 +546,43 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         fn selectVisibleForward(self: *@This()) !?backend_adapter.Entry {
             while (true) {
-                const winner_source = self.bestVisibleForwardSource() orelse return null;
+                const winner_source = self.bestVisibleForwardSource() orelse {
+                    self.current_visible_source = null;
+                    return null;
+                };
                 const candidate = self.source_entries[winner_source].?.key;
                 const entry = self.source_entries[winner_source].?;
-                if (!self.keyBeforeUpper(entry.key)) return null;
-                if (!entry.tombstone) return .{ .key = entry.key, .value = entry.value };
+                if (!self.keyBeforeUpper(entry.key)) {
+                    self.current_visible_source = null;
+                    return null;
+                }
+                if (!entry.tombstone) {
+                    self.current_visible_source = winner_source;
+                    return .{ .key = entry.key, .value = entry.value };
+                }
+                self.current_visible_source = null;
                 try self.advanceForwardSourcesAtKey(candidate);
             }
+        }
+
+        pub fn retainCurrentValueForTxn(self: *@This(), held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle)) !bool {
+            const source_index = self.current_visible_source orelse return false;
+            if (self.source_block_handles[source_index]) |*handle| {
+                var retained = handle.retain();
+                errdefer retained.release();
+                try held_blocks.append(self.backend.allocator, retained);
+                return true;
+            }
+
+            if (source_index == 0) {
+                if (comptime MutableType == ActiveMemTable) return false;
+                return true;
+            }
+            if (self.immutableForSource(source_index) != null) return true;
+
+            const run = try self.runForSource(source_index);
+            if (run.state != null) return true;
+            return run.path == null;
         }
 
         fn bestVisibleForwardSource(self: *@This()) ?usize {
@@ -1448,6 +1487,7 @@ fn advanceSortedBatchCursorToKey(cursor: anytype, current: ?backend_adapter.Entr
 fn readManySortedFromCursor(
     backend: anytype,
     allocator: Allocator,
+    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
     held_values: *std.ArrayListUnmanaged([]u8),
     cursor: anytype,
     keys: []const []const u8,
@@ -1469,10 +1509,19 @@ fn readManySortedFromCursor(
             result.misses += 1;
             continue;
         }
+        if (held_blocks) |blocks| {
+            if (try cursor.retainCurrentValueForTxn(blocks)) {
+                values[i] = entry.value;
+                recordCursorValueBorrow(backend);
+                result.hits += 1;
+                continue;
+            }
+        }
         const owned = try allocator.dupe(u8, entry.value);
         errdefer allocator.free(owned);
         try held_values.append(allocator, owned);
         values[i] = owned;
+        recordCursorValueCopy(backend);
         result.hits += 1;
     }
     return result;
@@ -2019,7 +2068,7 @@ fn readManySortedCurrentLocked(
     var cursor = try LocalCursor.init(metadata_allocator, backend, &backend.mutable, immutable_memtables, runs, l0_groups, levels, namespace, true);
     defer cursor.close();
 
-    return try readManySortedFromCursor(backend, allocator, held_values, &cursor, keys, values);
+    return try readManySortedFromCursor(backend, allocator, null, held_values, &cursor, keys, values);
 }
 
 pub fn BoundReadTxn(comptime BackendType: type) type {
@@ -2112,7 +2161,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 .cursor => blk: {
                     var cursor = try self.openCursor();
                     defer cursor.close();
-                    break :blk try readManySortedFromCursor(self.backend, self.allocator, &self.held_values, &cursor, keys, values);
+                    break :blk try readManySortedFromCursor(self.backend, self.allocator, &self.held_blocks, &self.held_values, &cursor, keys, values);
                 },
                 .sorted_by_run => try readManySortedByRunFromSnapshot(self.backend, self.mutable_snapshot, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys, values, false),
                 .point => try readManySortedPointFromSnapshot(self.backend, self.mutable_snapshot, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys, values, false),
@@ -3008,7 +3057,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
                 .cursor => blk: {
                     var cursor = try self.openCursor(namespace);
                     defer cursor.close();
-                    break :blk try readManySortedFromCursor(self.backend, self.allocator, &self.held_values, &cursor, keys, values);
+                    break :blk try readManySortedFromCursor(self.backend, self.allocator, &self.held_blocks, &self.held_values, &cursor, keys, values);
                 },
                 .sorted_by_run => try readManySortedByRunFromSnapshot(self.backend, self.mutable_snapshot, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.allocator, &self.held_blocks, &self.held_values, namespace, keys, values, false),
                 .point => try readManySortedPointFromSnapshot(self.backend, self.mutable_snapshot, self.immutable_memtables, self.runs, self.l0_groups, self.levels, self.allocator, &self.held_blocks, &self.held_values, namespace, keys, values, false),
