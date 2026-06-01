@@ -13,6 +13,7 @@ Updated on 2026-05-31 from worktree commit `eb338f2fdbca` after the v19 sparse b
 Updated on 2026-05-31 from worktree commit `629ad9cdecd2` after the v20 compact tagged term-block value codec change.
 Updated on 2026-05-31 from worktree commit `7f83fe7b7904` after the v21 bit-packed postings chunk metadata codec change.
 Updated on 2026-05-31 from worktree commit `312fc58f215c` after fixing idle derived-backlog release and making the DO8018 wait gate full-text scoped. Metrics-on no longer hits the 300s catch-up ceiling.
+Repeated on 2026-05-31 from worktree commit `12e7e4cb4` to check whether the corrected baseline represented a real slowdown or run noise.
 
 Generated artifacts are intentionally local and untracked under:
 
@@ -57,6 +58,10 @@ Latest v21 artifacts:
 Latest corrected v21 artifacts:
 
 `work-log/do8018/releasefast-baseline-20260531-213429/`
+
+Corrected v21 repeat artifacts:
+
+`work-log/do8018/releasefast-baseline-20260531-215403/`
 
 ## Latest Segment-v3 Metrics Off
 
@@ -1096,3 +1101,74 @@ Artifacts: `work-log/do8018/releasefast-baseline-20260531-213429/`.
 The corrected baseline confirms the earlier 300s metrics-on catch-up ceiling was not full-text merge/index work. With the benchmark wait gate scoped to full-text readiness and idle derived watermark persistence retrying, metrics-on catch-up completed in 10.67s with final `derived_backlog_bytes=0`.
 
 The first-class memory targets remain stable: final RSS was ~681 MiB, but footprint was ~120-147 MiB, live malloc was ~89-96 MiB, and mapped-file resident was ~29-30 MiB. Final full-text segment bytes are now ~396-404 MiB. The remaining byte targets are still stored fields (~127.8 MiB), term blocks (~99.6-103.0 MiB), and postings (~141.9-146.5 MiB).
+
+## Corrected v21 Repeat
+
+Artifacts: `work-log/do8018/releasefast-baseline-20260531-215403/`.
+
+This repeat was run to check the apparent timing slowdown after the derived-backlog fix. It does not prove a clean regression. Metrics-off landed between the prior v21 and first corrected run, while metrics-on was slower and also did substantially more merge work.
+
+Metrics off:
+
+- Load time: 44.424158833s
+- Async catch-up time: 16.770946458s
+- Catch-up complete: true, `scope=full-text`
+- Throughput: 1,589.34 records/sec, 4.85 MiB/sec
+- `ps` RSS: 676,069,376 bytes
+- Peak sampled RSS: 1,120,239,616 bytes
+- Process footprint metric: 133,602,288 bytes
+- Peak sampled process footprint: 323,443,144 bytes
+- Live malloc metric: 106,699,728 bytes
+- Peak sampled live malloc: 280,740,192 bytes
+- vmmap footprint: 133,588,582 bytes
+- vmmap peak footprint: 711,039,385 bytes
+- vmmap mapped-file resident: 30,723,276 bytes
+- vmmap malloc allocated: 34,917,580 bytes
+- Segment files: 8
+- Segment bytes: 403,657,736
+- Peak sampled mapped segment bytes: 405,155,421
+- Stored fields bytes: 127,611,966
+- Inverted bytes: 271,951,779
+- Postings bytes: 145,145,088
+- Term block bytes: 103,880,808
+- Text merges completed: 160
+- Full-text pending peak bytes: 411,377,884
+- Text merge buffer peak bytes: 108,878,579
+
+Metrics on:
+
+- Load time: 47.850299666s
+- Async catch-up time: 13.265462875s
+- Catch-up complete: true, `scope=full-text`
+- Final derived backlog bytes: 0
+- Throughput: 1,475.54 records/sec, 4.50 MiB/sec
+- `ps` RSS: 708,673,536 bytes
+- Peak sampled RSS: 1,070,137,344 bytes
+- Process footprint metric: 138,566,664 bytes
+- Peak sampled process footprint: 295,164,432 bytes
+- Live malloc metric: 105,499,744 bytes
+- Peak sampled live malloc: 245,986,016 bytes
+- vmmap footprint: 139,250,892 bytes
+- vmmap peak footprint: 834,666,496 bytes
+- vmmap mapped-file resident: 30,303,846 bytes
+- vmmap malloc allocated: 36,595,302 bytes
+- Segment files: 8
+- Segment bytes: 409,536,277
+- Peak sampled mapped segment bytes: 409,863,131
+- Stored fields bytes: 127,639,967
+- Inverted bytes: 277,817,286
+- Postings bytes: 146,597,444
+- Term block bytes: 108,210,054
+- Text merges completed: 178
+- Full-text pending peak bytes: 409,994,017
+- Text merge buffer peak bytes: 90,641,284
+
+Timing read:
+
+- Prior v21 metrics-off load/catch-up was 40.69s/15.25s with 141 merges.
+- First corrected metrics-off load/catch-up was 47.36s/18.29s with 158 merges.
+- Repeat corrected metrics-off load/catch-up was 44.42s/16.77s with 160 merges.
+- First corrected metrics-on load/catch-up was 45.21s/10.67s with 148 merges.
+- Repeat corrected metrics-on load/catch-up was 47.85s/13.27s with 178 merges.
+
+The derived-backlog fix itself is an idle-watermark retry path, so it is not expected to affect hot foreground writes materially. The observed timing spread tracks merge composition closely enough that the current evidence should be treated as run noise plus merge-scheduler variability, not a confirmed regression.
