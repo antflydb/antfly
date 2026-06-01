@@ -117,20 +117,22 @@ it cannot be the open scoring grammar (you cannot run Jaro-Winkler against every
 entity).
 
 ```json
-"candidate_search": {
-  "any_of": [
-    { "ann":    { "field": "name_embedding", "k": 25 } },
-    { "exact":  { "field": "external_ids.isbn" } },
-    { "prefix": { "field": "canonical_name", "len": 4 } }
-  ]
-}
+"candidate_search": "ann",
+"candidate_ann_index": "name_embedding",
+"candidate_limit": 25
 ```
 
-`ann` maps to the existing vector index; `exact`/`prefix` map to key lookups.
+The implemented v1 config uses a single `candidate_search` mode:
+`"exact_key"`, `"prefix"`, or `"ann"`. `exact_key` renders the resolver's key
+template and fetches that entity doc, `prefix` scans the rendered entity-key
+namespace, and `ann` probes the named dense vector index in
+`candidate_ann_index`, capped by `candidate_limit`.
+
 A vector comparator in scoring (`cosine` on `name_embedding`) implicitly
-declares an **enrichment dependency** on a name-embedding artifact, plugging
-into the same managed-enrichment-dependency mechanism `GRAPH.md` defines for
-graph indexes.
+declares an **enrichment dependency** on a name-embedding artifact, plugging into
+the same managed-enrichment-dependency mechanism `GRAPH.md` defines for graph
+indexes. A richer boolean candidate-search DSL can be layered on top later, but
+the v1 runtime intentionally exposes one blocking strategy per resolver.
 
 ### 2. Scoring (comparison levels -- "Fellegi-Sunter")
 

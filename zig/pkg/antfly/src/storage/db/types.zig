@@ -1200,6 +1200,15 @@ pub const EnrichmentStats = struct {
     artifact_bytes_written: u64 = 0,
 };
 
+pub const ReplayStageStats = struct {
+    enabled: bool = false,
+    target_sequence: u64 = 0,
+    applied_sequence: u64 = 0,
+    catch_up_required: bool = false,
+    blocked: bool = false,
+    blocked_reason: []const u8 = "",
+};
+
 pub const TransactionRecoveryStats = struct {
     enabled: bool = false,
     lease_owned: bool = false,
@@ -1289,6 +1298,8 @@ pub const DBStats = struct {
     doc_identity: DocIdentityStats = .{},
     doc_set_planning: DocSetPlanningStats = .{},
     enrichment: EnrichmentStats = .{},
+    resolution: ReplayStageStats = .{},
+    promotion: ReplayStageStats = .{},
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},
     text_merge: TextMergeStats = .{},

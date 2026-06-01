@@ -37,6 +37,7 @@ const embedder_mod = @import("enrichment/embedder.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const backend_erased = @import("../backend_erased.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
+const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -937,6 +938,17 @@ pub const ResolutionRuntime = struct {
         while (sequence > cur) {
             cur = self.target_sequence.cmpxchgWeak(cur, sequence, .monotonic, .monotonic) orelse break;
         }
+    }
+
+    pub fn stats(self: *ResolutionRuntime) types.ReplayStageStats {
+        const target = self.target_sequence.load(.acquire);
+        const applied = self.applied_sequence.load(.acquire);
+        return .{
+            .enabled = target > 0 or applied < target,
+            .target_sequence = target,
+            .applied_sequence = applied,
+            .catch_up_required = applied < target,
+        };
     }
 
     /// Inject (or clear) the cross-shard candidate source after construction.

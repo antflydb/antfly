@@ -80,9 +80,13 @@ pub const ResolvedEntity = struct {
     /// Entity label / type carried from the mention so the promoter can build
     /// the canonical entity document without re-reading the extraction artifact.
     label: []const u8 = "",
-    /// Mention surface form; the promoter uses it as the canonical name (on a
-    /// freshly minted entity) and as an alias to union into an existing one.
+    /// Canonical entity name to persist on the entity document. For matches this
+    /// comes from the matched candidate; for new/review decisions it is the
+    /// mention text that minted the entity.
     canonical_name: []const u8 = "",
+    /// Original mention text. The promoter unions this as an alias so mention
+    /// variants do not clobber an existing entity's canonical name.
+    surface_form: []const u8 = "",
 };
 
 /// The resolution artifact: the durable record of identity decisions for one
@@ -125,6 +129,10 @@ pub const Resolution = struct {
             if (e.canonical_name.len > 0) {
                 try out.appendSlice(allocator, ",\"canonical_name\":");
                 try writeJsonString(allocator, &out, e.canonical_name);
+            }
+            if (e.surface_form.len > 0) {
+                try out.appendSlice(allocator, ",\"surface_form\":");
+                try writeJsonString(allocator, &out, e.surface_form);
             }
             try out.append(allocator, '}');
         }
@@ -265,7 +273,7 @@ pub const Resolver = struct {
                     .{ .name = "canonical_text", .value = .{ .text = entity.text } },
                     .{ .name = "name_embedding", .value = if (entity.embedding) |emb| .{ .vector = emb } else .none },
                 };
-                const mention = matcher.Record{ .fields = mention_fields[0 .. if (entity.embedding != null) @as(usize, 4) else 3] };
+                const mention = matcher.Record{ .fields = mention_fields[0..if (entity.embedding != null) @as(usize, 4) else 3] };
 
                 var best_prob: f64 = -1;
                 var best: ?usize = null;
@@ -286,6 +294,7 @@ pub const Resolver = struct {
                         // a merged-away entity resolves to its canonical survivor
                         // (lazy merge; the merged doc points at the survivor).
                         const matched_key = recordTextField(candidates[bi].record, "merged_into") orelse candidates[bi].doc_ref.key;
+                        const matched_name = recordTextField(candidates[bi].record, "canonical_name") orelse entity.text;
                         return .{
                             .local_id = local_id,
                             .doc_ref = .{
@@ -295,7 +304,8 @@ pub const Resolver = struct {
                             .confidence = best_prob,
                             .decision = .match,
                             .label = try a.dupe(u8, entity.label),
-                            .canonical_name = try a.dupe(u8, entity.text),
+                            .canonical_name = try a.dupe(u8, matched_name),
+                            .surface_form = try a.dupe(u8, entity.text),
                         };
                     }
                     return .{
@@ -305,6 +315,7 @@ pub const Resolver = struct {
                         .decision = if (best_outcome == .review) .review else .new,
                         .label = try a.dupe(u8, entity.label),
                         .canonical_name = try a.dupe(u8, entity.text),
+                        .surface_form = try a.dupe(u8, entity.text),
                     };
                 }
             }
@@ -317,6 +328,7 @@ pub const Resolver = struct {
             .decision = .new,
             .label = try a.dupe(u8, entity.label),
             .canonical_name = try a.dupe(u8, entity.text),
+            .surface_form = try a.dupe(u8, entity.text),
         };
     }
 
@@ -485,7 +497,7 @@ fn writeJsonString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8
 
 /// Parsed entities from an extraction artifact, owning their backing memory.
 /// Reads a text field's value from a matcher record, or null. Used to follow a
-/// candidate entity's `merged_into` redirect to its canonical survivor.
+/// candidate entity's `merged_into` redirect and canonical fields.
 fn recordTextField(record: matcher.Record, name: []const u8) ?[]const u8 {
     for (record.fields) |field| {
         if (!std.mem.eql(u8, field.name, name)) continue;
@@ -566,7 +578,8 @@ fn decisionFromTag(tag: []const u8) ?Decision {
 
 /// Parse a resolution artifact (the shape produced by `Resolution.toJson`) back
 /// into resolved entities. The promoter reads this to upsert canonical entity
-/// documents; carrying `label`/`canonical_name` keeps it self-contained.
+/// documents; carrying `label`/`canonical_name`/`surface_form` keeps it
+/// self-contained.
 pub fn parseResolution(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedResolution {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json_bytes, .{});
     defer parsed.deinit();
@@ -592,6 +605,13 @@ pub fn parseResolution(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedRe
         const ref = o.get("doc_ref") orelse return error.InvalidResolution;
         if (ref != .object) return error.InvalidResolution;
         const decision_tag = jsonString(o.get("decision") orelse return error.InvalidResolution) orelse return error.InvalidResolution;
+        const canonical_name = if (o.get("canonical_name")) |v| try a.dupe(u8, jsonString(v) orelse "") else "";
+        const surface_form = if (o.get("surface_form")) |v|
+            try a.dupe(u8, jsonString(v) orelse "")
+        else if (canonical_name.len > 0)
+            try a.dupe(u8, canonical_name)
+        else
+            "";
         out[i] = .{
             .local_id = try a.dupe(u8, jsonString(o.get("local_id") orelse return error.InvalidResolution) orelse return error.InvalidResolution),
             .doc_ref = .{
@@ -605,7 +625,8 @@ pub fn parseResolution(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedRe
             },
             .decision = decisionFromTag(decision_tag) orelse return error.InvalidResolution,
             .label = if (o.get("label")) |v| try a.dupe(u8, jsonString(v) orelse "") else "",
-            .canonical_name = if (o.get("canonical_name")) |v| try a.dupe(u8, jsonString(v) orelse "") else "",
+            .canonical_name = canonical_name,
+            .surface_form = surface_form,
         };
     }
     return .{ .arena = arena, .config_generation = config_generation, .entities = out };
@@ -848,11 +869,7 @@ test "initFromParts builds a deterministic resolver and one with a scorer" {
     try testing.expectEqualStrings("entities", deterministic.table);
     try testing.expect(deterministic.scorer == null);
 
-    var scored = try Resolver.initFromParts(
-        testing.allocator,
-        "entities",
-        "{{ slug _entity.text }}",
-        false,
+    var scored = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", false,
         \\{ "comparisons": [ { "name": "n", "left": "canonical_text", "right": "canonical_name",
         \\  "levels": [ { "when": "exact", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
         \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
@@ -969,6 +986,8 @@ test "resolution artifact serializes to the documented schema" {
     try testing.expectEqualStrings("e0", ents[0].object.get("local_id").?.string);
     try testing.expectEqualStrings("new", ents[0].object.get("decision").?.string);
     try testing.expectEqualStrings("ada_lovelace", ents[0].object.get("doc_ref").?.object.get("key").?.string);
+    try testing.expectEqualStrings("Ada Lovelace", ents[0].object.get("canonical_name").?.string);
+    try testing.expectEqualStrings("Ada Lovelace", ents[0].object.get("surface_form").?.string);
 }
 
 test "invalid resolver configs are rejected" {
@@ -1164,6 +1183,8 @@ test "resolution stage links to a candidate supplied by the provider" {
     const ent = parsed.value.object.get("entities").?.array.items[0].object;
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+    try testing.expectEqualStrings("Ada Lovelace", ent.get("canonical_name").?.string);
+    try testing.expectEqualStrings("Ada Lovelace", ent.get("surface_form").?.string);
 }
 
 const FixedOverride = struct {

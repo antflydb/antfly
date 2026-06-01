@@ -37,6 +37,7 @@ const enrichment_state = @import("enrichment/enrichment_state.zig");
 const backend_erased = @import("../backend_erased.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
 const resolution_runtime = @import("resolution_runtime.zig");
+const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -101,7 +102,8 @@ const EntityDoc = struct {
 };
 
 fn buildEntityDocAlloc(alloc: std.mem.Allocator, e: resolver_lib.ResolvedEntity) ![]u8 {
-    const aliases = [_][]const u8{e.canonical_name};
+    const alias = if (e.surface_form.len > 0) e.surface_form else e.canonical_name;
+    const aliases = [_][]const u8{alias};
     const doc = EntityDoc{
         .entity_type = e.label,
         .canonical_name = e.canonical_name,
@@ -258,6 +260,22 @@ pub const PromotionRuntime = struct {
         while (sequence > cur) {
             cur = self.target_sequence.cmpxchgWeak(cur, sequence, .monotonic, .monotonic) orelse break;
         }
+    }
+
+    pub fn stats(self: *PromotionRuntime) types.ReplayStageStats {
+        const target = self.target_sequence.load(.acquire);
+        const applied = self.applied_sequence.load(.acquire);
+        lockMutex(&self.catch_up_mutex);
+        defer self.catch_up_mutex.unlock();
+        const blocked = applied < target and self.sink == null and self.missing_sink_policy == .wait;
+        return .{
+            .enabled = target > 0 or applied < target,
+            .target_sequence = target,
+            .applied_sequence = applied,
+            .catch_up_required = applied < target,
+            .blocked = blocked,
+            .blocked_reason = if (blocked) "missing_entity_sink" else "",
+        };
     }
 
     /// Inject (or clear) the entity sink after construction, taken under
@@ -449,8 +467,8 @@ const CaptureSink = struct {
 
 const sample_resolution =
     \\{"config_generation":3,"entities":[
-    \\  {"local_id":"e0","doc_ref":{"table":"entities","key":"person/ada_lovelace"},"confidence":0.98,"decision":"new","label":"person","canonical_name":"Ada Lovelace"},
-    \\  {"local_id":"e1","doc_ref":{"table":"entities","key":"org/antfly"},"confidence":1.0,"decision":"match","label":"org","canonical_name":"Antfly"}
+    \\  {"local_id":"e0","doc_ref":{"table":"entities","key":"person/ada_lovelace"},"confidence":0.98,"decision":"new","label":"person","canonical_name":"Ada Lovelace","surface_form":"Ada Lovelace"},
+    \\  {"local_id":"e1","doc_ref":{"table":"entities","key":"org/antfly"},"confidence":1.0,"decision":"match","label":"org","canonical_name":"Antfly","surface_form":"Antfly DB"}
     \\]}
 ;
 
@@ -475,8 +493,11 @@ test "processResolutionArtifact upserts a canonical entity per resolved mention"
     try testing.expectEqualStrings("entities", capture.tables.items[0]);
     try testing.expectEqualStrings("person/ada_lovelace", capture.keys.items[0]);
     try testing.expect(std.mem.indexOf(u8, capture.docs.items[0], "\"canonical_name\":\"Ada Lovelace\"") != null);
+    try testing.expect(std.mem.indexOf(u8, capture.docs.items[0], "\"aliases\":[\"Ada Lovelace\"]") != null);
     try testing.expect(std.mem.indexOf(u8, capture.docs.items[0], "\"entity_type\":\"person\"") != null);
     try testing.expectEqualStrings("org/antfly", capture.keys.items[1]);
+    try testing.expect(std.mem.indexOf(u8, capture.docs.items[1], "\"canonical_name\":\"Antfly\"") != null);
+    try testing.expect(std.mem.indexOf(u8, capture.docs.items[1], "\"aliases\":[\"Antfly DB\"]") != null);
 
     // A missing artifact promotes nothing.
     try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), "no-such-key", capture.sink()));

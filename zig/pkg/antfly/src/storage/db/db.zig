@@ -6196,8 +6196,32 @@ pub const DB = struct {
             .derived_target_sequence = self.core.nextDerivedSequence(),
             .has_async_indexes = self.executor.hasWorkers(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
         };
+    }
+
+    fn persistedReplayStageStats(self: *DB, scope_name: []const u8, force_enabled: bool) !types.ReplayStageStats {
+        const resources = self.core.batchExecutionResources();
+        const applied = try enrichment_state.loadAppliedSequence(self.alloc, resources.store, scope_name);
+        const target = @max(applied, self.core.nextDerivedSequence());
+        return .{
+            .enabled = force_enabled or target > 0 or applied < target,
+            .target_sequence = target,
+            .applied_sequence = applied,
+            .catch_up_required = applied < target,
+        };
+    }
+
+    fn resolutionStageStats(self: *DB) types.ReplayStageStats {
+        if (self.resolution_runtime) |runtime| return runtime.stats();
+        return self.persistedReplayStageStats(resolution_runtime_mod.scope_name, false) catch .{};
+    }
+
+    fn promotionStageStats(self: *DB) types.ReplayStageStats {
+        if (self.promotion_runtime) |runtime| return runtime.stats();
+        return self.persistedReplayStageStats(promotion_runtime_mod.scope_name, false) catch .{};
     }
 
     fn persistedEnrichmentStats(self: *DB) !types.EnrichmentStats {
@@ -7580,6 +7604,8 @@ pub const DB = struct {
             runtime.stats()
         else
             self.persistedEnrichmentStats() catch runtime_stats.enrichment;
+        runtime_stats.resolution = self.resolutionStageStats();
+        runtime_stats.promotion = self.promotionStageStats();
         runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
         runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
 
@@ -7771,6 +7797,8 @@ pub const DB = struct {
                 .async_indexing = self.snapshotAsyncIndexingStats(),
                 .doc_set_planning = self.snapshotDocSetPlanningStats(),
                 .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+                .resolution = self.resolutionStageStats(),
+                .promotion = self.promotionStageStats(),
                 .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
                 .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             };
@@ -7983,6 +8011,8 @@ pub const DB = struct {
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot(),
@@ -8149,6 +8179,8 @@ pub const DB = struct {
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try self.persistedEnrichmentStats(),
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
@@ -8232,6 +8264,8 @@ pub const DB = struct {
             .indexes = index_stats[0..index_count],
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
             .async_indexing = self.async_context.stats.snapshot(),
         };
     }
@@ -23922,6 +23956,14 @@ test "db promotes resolved entities into entity-document upserts end-to-end" {
         .sync_level = .enrichments,
     });
     try db.runUntilIdle();
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.resolution.enabled);
+    try std.testing.expect(stats.promotion.enabled);
+    try std.testing.expectEqual(stats.resolution.target_sequence, stats.resolution.applied_sequence);
+    try std.testing.expectEqual(stats.promotion.target_sequence, stats.promotion.applied_sequence);
+    try std.testing.expect(!stats.promotion.blocked);
 
     // The promoter upserted a canonical entity document per resolved mention,
     // keyed by the rendered canonical key, into the entity table.

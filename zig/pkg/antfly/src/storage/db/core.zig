@@ -52,6 +52,8 @@ pub const PendingWorkStats = struct {
     derived_target_sequence: u64,
     has_async_indexes: bool,
     enrichment: types.EnrichmentStats,
+    resolution: types.ReplayStageStats = .{},
+    promotion: types.ReplayStageStats = .{},
     text_merge: types.TextMergeStats = .{},
 };
 
