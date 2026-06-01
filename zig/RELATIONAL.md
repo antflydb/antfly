@@ -373,6 +373,39 @@ number) is additive where the physical type is compatible.
   index/catch-up → full-text query reconstruction tests, alongside the KV
   row-codec and document-mode passthrough coverage.
 
+### KV typed-row rationale
+
+The important design decision is that relational KV reads are still served from
+the synchronous KV store, not from search segments. Search segments are
+columnar, but they are built asynchronously; a transform or point lookup
+immediately after a write must see the just-written document without waiting for
+segment materialization. That rules out treating segments as the only document
+store without a larger consistency-model redesign.
+
+The landed design keeps the KV store as the synchronous source of truth while
+changing the relational document value from JSON text to a self-describing typed
+row:
+
+- **Chosen:** one packed typed-row KV value per document, detected by the `AROW`
+  magic prefix. This keeps `DB.get`, transforms, lookup, vector
+  `include_stored`, backfill, and enrichment readers on their existing
+  synchronous path while removing the relational JSON blob. The row carries
+  enough path/type metadata that generic store-value readers can reconstruct
+  JSON without looking up live schema.
+- **Rejected for now:** making search segments the single physical document
+  store. That would remove the remaining physical duplication between the KV row
+  and segment doc-values, but it would require a synchronous columnar memtable
+  and a broader rewrite of the write/index consistency model.
+
+The value-level magic check is intentional because `DB.get` is generic and also
+serves non-document internal keys. Document-mode JSON blobs and internal store
+values pass through untouched. Relational rows reconstruct a canonical JSON
+document rather than the original byte sequence; this is acceptable because
+relational tables are closed-schema and every referenceable field is a declared
+column. Vector-field stripping follows the same document-value seam as document
+mode: the typed row represents the stored document value, not transient vector
+payloads stripped from storage.
+
 ## Related docs
 
 - [SCHEMA.md](SCHEMA.md) — schema contract and compiled runtime schema
