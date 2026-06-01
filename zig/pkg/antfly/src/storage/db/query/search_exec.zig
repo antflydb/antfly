@@ -100,6 +100,13 @@ pub const SearchTextQueryExecutor = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    resolve_relational_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        runtime_schema: runtime_schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -311,6 +318,13 @@ pub const DenseSearchExecutor = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    resolve_relational_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        runtime_schema: runtime_schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -444,6 +458,13 @@ pub const SparseSearchExecutor = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    resolve_relational_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        runtime_schema: runtime_schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -532,6 +553,13 @@ pub const MatchAllExecutor = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    resolve_relational_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        runtime_schema: runtime_schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1278,6 +1306,13 @@ pub const StructuredFilterResolverExecutor = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    resolve_relational_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        runtime_schema: runtime_schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -2195,6 +2230,16 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     if (patternFilterValueHasRole(parsed.value)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
+    if (executor.resolve_relational_filter_doc_set) |resolve_relational| {
+        if (text_entry.runtime_schema) |rs| {
+            if (rs.storage_mode == .relational and rs.relational_columns.len > 0) {
+                if (try resolve_relational(executor.ctx, alloc, rs, search_query, executor.identity_read_generation)) |resolved| {
+                    return resolved;
+                }
+            }
+        }
+    }
+
     return try collectSearchQueryResolvedDocSetAlloc(alloc, arena_alloc, executor, text_entry, search_query);
 }
 
@@ -3081,6 +3126,7 @@ fn deriveNativeDenseConstraintsAlloc(
         .text_index_entry = executor.text_index_entry,
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        .resolve_relational_filter_doc_set = executor.resolve_relational_filter_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .project_ordinals_to_doc_ids = false,
         .apply_live_all_docs = apply_broad_live_docs,
@@ -3538,6 +3584,7 @@ pub fn searchTextQuery(
         .text_index_entry = executor.text_index_entry,
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        .resolve_relational_filter_doc_set = executor.resolve_relational_filter_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .project_ordinals_to_doc_ids = false,
         .text_snapshot_for_doc_num_projection = snapshot,
@@ -3556,6 +3603,7 @@ pub fn searchTextQuery(
             .text_index_entry = executor.text_index_entry,
             .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
             .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+            .resolve_relational_filter_doc_set = executor.resolve_relational_filter_doc_set,
             .live_filter_doc_set = executor.live_filter_doc_set,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = effective_req.identity_read_generation,
@@ -4968,6 +5016,7 @@ pub fn searchSparse(
         .text_index_entry = executor.text_index_entry,
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        .resolve_relational_filter_doc_set = executor.resolve_relational_filter_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .lookup_doc_nums_for_ordinals = executor.lookup_doc_nums_for_ordinals,
         .doc_num_index_name = req.index_name orelse entry.config.name,
@@ -5206,6 +5255,7 @@ pub fn searchMatchAll(
         .text_index_entry = executor.text_index_entry,
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        .resolve_relational_filter_doc_set = executor.resolve_relational_filter_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .project_ordinals_to_doc_ids = false,
         .apply_live_all_docs = true,

@@ -87,7 +87,10 @@ Current PR progress:
   off segment doc-values before the physical column layout changes;
 - relational full-text `include_stored` now reconstructs returned rows from the
   relational base-row store, while the inverted index remains responsible only
-  for term matching and scoring.
+  for term matching and scoring;
+- structured relational filters for supported keyword/range/bool/geo clauses
+  resolve against relational base-row column scans before falling back to
+  segment doc-values for unsupported text-oriented filter shapes.
 
 ## Implementation Phases
 

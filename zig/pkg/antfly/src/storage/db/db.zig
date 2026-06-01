@@ -87,6 +87,8 @@ const traversal_mod = @import("../../graph/traversal.zig");
 const paths_mod = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
+const search_mod = @import("../../search/search.zig");
+const search_geo_mod = @import("../../search/geo.zig");
 const mapper = @import("document_mapper.zig");
 const relational_store_mod = @import("relational_store.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
@@ -8652,6 +8654,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = req.identity_read_generation,
@@ -8669,6 +8672,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .all_docs_visible = allDocsVisibleCallback,
             .project_ordinals_to_doc_ids = false,
@@ -8703,6 +8707,7 @@ pub const DB = struct {
             .load_projected_document = loadProjectedSearchDocumentCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .postprocess = postprocessTextSearchResultCallback,
         });
@@ -9050,6 +9055,358 @@ pub const DB = struct {
         return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, generation);
     }
 
+    fn resolveRelationalFilterDocSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (runtime_schema.storage_mode != .relational or runtime_schema.relational_columns.len == 0) return null;
+        return try self.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, query, generation);
+    }
+
+    fn resolveRelationalFilterQueryDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        return switch (query) {
+            .match_none => .none,
+            .match_all => try self.relationalAllRowsDocSetAlloc(alloc, generation),
+            .doc_id => |doc_id| try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_id.ids, generation),
+            .term => |term| try self.resolveRelationalTermFilterDocSetAlloc(alloc, runtime_schema, term, generation),
+            .term_range => |range| try self.resolveRelationalTermRangeFilterDocSetAlloc(alloc, runtime_schema, range, generation),
+            .numeric_range => |range| try self.resolveRelationalNumericFilterDocSetAlloc(alloc, runtime_schema, range, generation),
+            .date_range => |range| try self.resolveRelationalDateFilterDocSetAlloc(alloc, runtime_schema, range, generation),
+            .bool_field => |bool_query| try self.resolveRelationalBoolFieldFilterDocSetAlloc(alloc, runtime_schema, bool_query, generation),
+            .geo_distance => |geo_query| try self.resolveRelationalGeoDistanceFilterDocSetAlloc(alloc, runtime_schema, geo_query, generation),
+            .geo_bbox => |geo_query| try self.resolveRelationalGeoBBoxFilterDocSetAlloc(alloc, runtime_schema, geo_query, generation),
+            .bool_query => |bool_query| try self.resolveRelationalBoolQueryDocSetAlloc(alloc, runtime_schema, bool_query, generation),
+            else => null,
+        };
+    }
+
+    fn relationalAllRowsDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocSet {
+        const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+        defer relational_store_mod.freeRows(alloc, rows);
+
+        var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+        defer doc_ids.deinit(alloc);
+        try doc_ids.ensureUnusedCapacity(alloc, rows.len);
+        for (rows) |row| doc_ids.appendAssumeCapacity(row.doc_key);
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids.items, generation);
+    }
+
+    fn resolveRelationalTermFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        term: search_mod.TermQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, term.field) orelse return null;
+        if (column.field_type != .keyword) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+            wanted: []const u8,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                return value.value_type == .bytes_val and !value.is_json and std.mem.eql(u8, value.value.bytes_val, ctx.wanted);
+            }
+        }{ .wanted = term.term });
+    }
+
+    fn resolveRelationalTermRangeFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        range: search_mod.TermRangeQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, range.field) orelse return null;
+        if (column.field_type != .keyword) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+            min: ?[]const u8,
+            max: ?[]const u8,
+            inclusive_min: bool,
+            inclusive_max: bool,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                if (value.value_type != .bytes_val or value.is_json) return false;
+                const bytes = value.value.bytes_val;
+                const above_min = if (ctx.min) |min| blk: {
+                    const order = std.mem.order(u8, bytes, min);
+                    break :blk order == .gt or (ctx.inclusive_min and order == .eq);
+                } else true;
+                const below_max = if (ctx.max) |max| blk: {
+                    const order = std.mem.order(u8, bytes, max);
+                    break :blk order == .lt or (ctx.inclusive_max and order == .eq);
+                } else true;
+                return above_min and below_max;
+            }
+        }{
+            .min = range.min,
+            .max = range.max,
+            .inclusive_min = range.inclusive_min,
+            .inclusive_max = range.inclusive_max,
+        });
+    }
+
+    fn resolveRelationalNumericFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        range: search_mod.NumericRangeQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, range.field) orelse return null;
+        if (column.field_type != .numeric) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+            min: ?f64,
+            max: ?f64,
+            inclusive_min: bool,
+            inclusive_max: bool,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                if (value.value_type != .f64_val) return false;
+                const number = value.value.f64_val;
+                const above_min = if (ctx.min) |min| if (ctx.inclusive_min) number >= min else number > min else true;
+                const below_max = if (ctx.max) |max| if (ctx.inclusive_max) number <= max else number < max else true;
+                return above_min and below_max;
+            }
+        }{
+            .min = range.min,
+            .max = range.max,
+            .inclusive_min = range.inclusive_min,
+            .inclusive_max = range.inclusive_max,
+        });
+    }
+
+    fn resolveRelationalDateFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        range: search_mod.DateRangeQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, range.field) orelse return null;
+        if (column.field_type != .datetime) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+            start_ns: ?u64,
+            end_ns: ?u64,
+            inclusive_start: bool,
+            inclusive_end: bool,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                if (value.value_type != .u64_val) return false;
+                const timestamp = value.value.u64_val;
+                const after_start = if (ctx.start_ns) |start| if (ctx.inclusive_start) timestamp >= start else timestamp > start else true;
+                const before_end = if (ctx.end_ns) |end| if (ctx.inclusive_end) timestamp <= end else timestamp < end else true;
+                return after_start and before_end;
+            }
+        }{
+            .start_ns = range.start_ns,
+            .end_ns = range.end_ns,
+            .inclusive_start = range.inclusive_start,
+            .inclusive_end = range.inclusive_end,
+        });
+    }
+
+    fn resolveRelationalBoolFieldFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        bool_query: search_mod.BoolFieldQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, bool_query.field) orelse return null;
+        if (column.field_type != .boolean) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+            wanted: bool,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                return value.value_type == .bool_val and value.value.bool_val == ctx.wanted;
+            }
+        }{ .wanted = bool_query.value });
+    }
+
+    fn resolveRelationalGeoDistanceFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        geo_query: search_mod.GeoDistanceQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, geo_query.field) orelse return null;
+        if (column.field_type != .geopoint) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+            center: search_mod.GeoPoint,
+            radius_meters: f64,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                if (value.value_type != .geo_point) return false;
+                const point = search_mod.GeoPoint{
+                    .lat = value.value.geo_point.lat,
+                    .lon = value.value.geo_point.lon,
+                };
+                return search_geo_mod.haversineDistance(ctx.center, point) <= ctx.radius_meters;
+            }
+        }{
+            .center = geo_query.center,
+            .radius_meters = geo_query.radius_meters,
+        });
+    }
+
+    fn resolveRelationalGeoBBoxFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        geo_query: search_mod.GeoBBoxQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, geo_query.field) orelse return null;
+        if (column.field_type != .geopoint) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column.name, generation, struct {
+            min_lat: f64,
+            min_lon: f64,
+            max_lat: f64,
+            max_lon: f64,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                if (value.value_type != .geo_point) return false;
+                const point = value.value.geo_point;
+                return point.lat >= ctx.min_lat and point.lat <= ctx.max_lat and
+                    point.lon >= ctx.min_lon and point.lon <= ctx.max_lon;
+            }
+        }{
+            .min_lat = geo_query.min_lat,
+            .min_lon = geo_query.min_lon,
+            .max_lat = geo_query.max_lat,
+            .max_lon = geo_query.max_lon,
+        });
+    }
+
+    fn resolveRelationalBoolQueryDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        bool_query: search_mod.BoolQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        if (bool_query.min_should > 1) return null;
+
+        var current: ?doc_set.ResolvedDocSet = null;
+        errdefer if (current) |*set| set.deinit(alloc);
+
+        for (bool_query.must) |child_query| {
+            var child = (try self.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, child_query, generation)) orelse {
+                if (current) |*set| set.deinit(alloc);
+                return null;
+            };
+            defer child.deinit(alloc);
+            try combineRelationalFilterSet(alloc, &current, &child, .intersect);
+        }
+
+        if (bool_query.should.len > 0 and (bool_query.min_should > 0 or current == null)) {
+            var should_set: ?doc_set.ResolvedDocSet = null;
+            errdefer if (should_set) |*set| set.deinit(alloc);
+            for (bool_query.should) |child_query| {
+                var child = (try self.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, child_query, generation)) orelse {
+                    if (current) |*set| set.deinit(alloc);
+                    if (should_set) |*set| set.deinit(alloc);
+                    return null;
+                };
+                defer child.deinit(alloc);
+                try combineRelationalFilterSet(alloc, &should_set, &child, .union_set);
+            }
+            if (should_set) |*set| {
+                try combineRelationalFilterSet(alloc, &current, set, .intersect);
+                set.* = .none;
+            }
+        }
+
+        if (current == null and bool_query.must_not.len > 0) {
+            current = try self.relationalAllRowsDocSetAlloc(alloc, generation);
+        }
+
+        for (bool_query.must_not) |child_query| {
+            var child = (try self.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, child_query, generation)) orelse {
+                if (current) |*set| set.deinit(alloc);
+                return null;
+            };
+            defer child.deinit(alloc);
+            try combineRelationalFilterSet(alloc, &current, &child, .difference);
+        }
+
+        return current orelse null;
+    }
+
+    const RelationalFilterCombineMode = enum {
+        intersect,
+        union_set,
+        difference,
+    };
+
+    fn combineRelationalFilterSet(
+        alloc: Allocator,
+        current: *?doc_set.ResolvedDocSet,
+        child: *const doc_set.ResolvedDocSet,
+        mode: RelationalFilterCombineMode,
+    ) !void {
+        if (current.* == null) {
+            current.* = try doc_set.cloneAlloc(alloc, child);
+            return;
+        }
+        var next = switch (mode) {
+            .intersect => (try doc_set.intersectAlloc(alloc, &current.*.?, child)) orelse return error.UnsupportedQueryRequest,
+            .union_set => (try doc_set.unionAlloc(alloc, &current.*.?, child)) orelse return error.UnsupportedQueryRequest,
+            .difference => (try doc_set.differenceAlloc(alloc, &current.*.?, child)) orelse return error.UnsupportedQueryRequest,
+        };
+        errdefer next.deinit(alloc);
+        current.*.?.deinit(alloc);
+        current.* = next;
+    }
+
+    fn scanRelationalColumnFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        column_name: []const u8,
+        generation: ?u64,
+        matcher: anytype,
+    ) !doc_set.ResolvedDocSet {
+        const values = try relational_store_mod.scanColumnAlloc(alloc, self.core.store, column_name, "", "");
+        defer relational_store_mod.freeColumnValues(alloc, values);
+
+        var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+        defer doc_ids.deinit(alloc);
+        for (values) |value| {
+            if (!matcher.matches(value)) continue;
+            try doc_ids.append(alloc, value.doc_key);
+        }
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids.items, generation);
+    }
+
+    fn relationalColumnForField(runtime_schema: schema_mod.TableSchema, field: []const u8) ?schema_mod.RelationalColumn {
+        const normalized = if (std.mem.startsWith(u8, field, "/")) field[1..] else field;
+        for (runtime_schema.relational_columns) |column| {
+            if (std.mem.eql(u8, field, column.name) or
+                std.mem.eql(u8, field, column.path) or
+                std.mem.eql(u8, normalized, column.name) or
+                std.mem.eql(u8, normalized, column.path))
+            {
+                return column;
+            }
+        }
+        return null;
+    }
+
     fn liveFilterDocSetCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -9205,6 +9562,7 @@ pub const DB = struct {
             .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
@@ -9250,6 +9608,7 @@ pub const DB = struct {
             .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
@@ -9305,6 +9664,7 @@ pub const DB = struct {
             .sparse_index = sparseIndexCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
@@ -9516,6 +9876,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = req.identity_read_generation,
@@ -9990,6 +10351,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
         });
@@ -40382,8 +40744,8 @@ test "relational table full-text search loads stored_data from base rows" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    // Relational schema: typed columns persisted as typed_doc_values so the
-    // document is reconstructed from columns rather than the segment blob.
+    // Relational schema: returned documents and structured filters should read
+    // the relational base row, not duplicated segment typed_doc_values.
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"},"active":{"type":"boolean"}},"required":["title"],"additionalProperties":false}}}}
     ;
@@ -40442,4 +40804,25 @@ test "relational table full-text search loads stored_data from base rows" {
     };
     try std.testing.expectEqual(@as(f64, 77.25), amount_num);
     try std.testing.expect(!obj.get("active").?.bool);
+
+    var filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"numeric_range\":{\"field\":\"amount\",\"min\":70.0}}",
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", filtered.hits[0].id);
+
+    var bool_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"bool_field\":{\"field\":\"active\",\"value\":false}}",
+        .limit = 10,
+    });
+    defer bool_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), bool_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", bool_filtered.hits[0].id);
 }
