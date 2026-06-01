@@ -207,8 +207,8 @@ the catalog via `buildRelationalTypedFields` (numeric/datetime/boolean/geopoint
 → typed; keyword/text continue through the full-text path; json columns are
 subtrees), bypassing value detection. `NOT NULL` is enforced upstream by
 JSON-schema `required` validation. The introducer materializes those typed
-columns into segment doc-values and, for relational tables, the KV value is a
-self-describing typed row rather than the original JSON blob.
+columns into segment doc-values and, for relational tables, the relational base
+row is a self-describing typed row rather than the original JSON blob.
 
 ### Query path
 
@@ -372,11 +372,11 @@ number) is additive where the physical type is compatible.
   index/catch-up → full-text query reconstruction tests, alongside the KV
   row-codec and document-mode passthrough coverage.
 
-### KV typed-row rationale
+### Relational base-row rationale
 
-The important design decision is that relational KV reads are still served from
-the synchronous KV store, not from search segments. Search segments are
-columnar, but they are built asynchronously; a transform or point lookup
+The important design decision is that relational point reads are still served
+from the synchronous base-row store, not from search segments. Search segments
+are columnar, but they are built asynchronously; a transform or point lookup
 immediately after a write must see the just-written document without waiting for
 segment materialization. The existing two-phase commit machinery gives us the
 right commit boundary, but the columnar storage still needs to become a

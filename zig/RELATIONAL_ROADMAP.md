@@ -76,6 +76,16 @@ copy first, then optimize physical column layout later. The important boundary
 is that derived search segments stop being the authoritative column source for
 relational reads.
 
+Current PR progress:
+
+- relational rows are written under the dedicated relational row keyspace, not
+  the generic primary document key;
+- point reads, derived replay, backfill, split movement, and match-all scans
+  recognize relational row keys as document rows;
+- `relational_store.scanRowsAlloc` and `scanColumnAlloc` expose row and column
+  scans over the packed base-row encoding, so query consumers can start moving
+  off segment doc-values before the physical column layout changes.
+
 ## Implementation Phases
 
 ### Phase 1 - Transaction Participant Contract

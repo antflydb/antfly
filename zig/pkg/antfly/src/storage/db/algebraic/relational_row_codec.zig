@@ -12,28 +12,31 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! On-disk codec for a relational document's typed columns — the authoritative
-//! value stored in the synchronous key-value store for a relational table.
+//! On-disk codec for a relational document's typed columns — the row payload
+//! stored under the synchronous relational base-row key for a relational table.
 //!
-//! In relational mode the KV source of truth is *not* a JSON blob: it is the
-//! document's projected typed columns, serialized by this codec. `db.get`
-//! decodes the row and reconstructs canonical JSON on read.
+//! In relational mode the base row is *not* a JSON blob: it is the document's
+//! projected typed columns, serialized by this codec. `db.get` decodes the row
+//! and reconstructs canonical JSON on read.
 //!
-//! A document is one KV pair (one packed row), not a key-range of per-column
-//! pairs: every synchronous reader (point lookup, read-modify-write transform,
-//! vector `include_stored`) consumes the whole document, so a packed value is a
-//! single atomic lookup/write and keeps shard splits boundary-agnostic. The
-//! columnar predicate-pushdown tier lives in the search segments, not here.
+//! A document is one relational base-row pair (one packed row), not a key-range
+//! of per-column pairs: every synchronous reader (point lookup,
+//! read-modify-write transform, vector `include_stored`) consumes the whole
+//! document, so a packed value is a single atomic lookup/write and keeps shard
+//! splits boundary-agnostic. The relational base-store facade exposes row and
+//! column scans over this packed representation while the physical column layout
+//! evolves.
 //!
 //! **Self-describing on purpose.** Each cell stores the column's JSON `path`,
 //! physical `value_type`, the `is_json` flag, and the typed value — everything
-//! reconstruction needs. So the KV read chokepoint decodes and reconstructs
-//! without a schema lookup, and reconstruction works even while the table schema
-//! is mid-change. The value representation is `typed_doc_values` (the same types
+//! reconstruction needs. So base-row readers decode and reconstruct without a
+//! schema lookup, and reconstruction works even while the table schema is
+//! mid-change. The value representation is `typed_doc_values` (the same types
 //! the search segments persist), and the per-value formatter (`appendCellValue`)
 //! is shared with the segment read path so a document reconstructs *byte for
-//! byte identically* whether served from columns in a segment or from the KV
-//! store. That single-formatter guarantee is the whole point of this layer.
+//! byte identically* whether served from columns in a segment or from the
+//! relational row store. That single-formatter guarantee is the whole point of
+//! this layer.
 //!
 //! Format (little-endian):
 //!   magic   [4] = "AROW"
@@ -257,8 +260,9 @@ pub fn reconstructDocumentAlloc(alloc: Allocator, cells: []const Cell) ![]u8 {
 }
 
 /// Append one `"path": value` pair to `out`. This is the single canonical
-/// per-value formatter shared by the KV read path and the segment read path, so
-/// a column reconstructs identically regardless of where its value came from.
+/// per-value formatter shared by the relational base-row read path and the
+/// segment read path, so a column reconstructs identically regardless of where
+/// its value came from.
 pub fn appendCellValue(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
