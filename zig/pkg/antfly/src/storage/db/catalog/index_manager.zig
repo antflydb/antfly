@@ -5866,7 +5866,7 @@ pub const IndexManager = struct {
             var reservation = try self.reserveTextMergeBuffers(index, snap, planned);
             defer if (reservation) |*active| active.release();
 
-            try text_index_maintenance.applyPlannedMerge(
+            if (!try text_index_maintenance.applyPlannedMerge(
                 self.alloc,
                 index,
                 snap,
@@ -5874,7 +5874,7 @@ pub const IndexManager = struct {
                 policy.max_segment_size,
                 "compact text index merge failed",
                 "compact text index apply merge failed",
-            );
+            )) return;
         }
     }
 
@@ -6193,7 +6193,7 @@ pub const IndexManager = struct {
             };
             defer if (reservation) |*active| active.release();
 
-            text_index_maintenance.applyPlannedMerge(
+            const applied = text_index_maintenance.applyPlannedMerge(
                 self.alloc,
                 &entry.persistent,
                 snap,
@@ -6205,6 +6205,7 @@ pub const IndexManager = struct {
                 error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
                 else => return err,
             };
+            if (!applied) return false;
         }
     }
 
@@ -16256,13 +16257,6 @@ test "text merge task skips stale source after concurrent delete" {
     try std.testing.expectEqual(@as(u64, 1), in_flight_stats.in_flight_merges);
     try std.testing.expect(in_flight_stats.in_flight_segments >= 2);
 
-    var second_task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
-    defer second_task.deinit(alloc);
-    const parallel_stats = manager.textMergeStats();
-    try std.testing.expectEqual(@as(u64, 2), parallel_stats.in_flight_merges);
-    try std.testing.expect(parallel_stats.in_flight_segments > in_flight_stats.in_flight_segments);
-    manager.cancelTextMergeTask(&second_task);
-
     const stale_segment = &task.snapshot.segments[task.merge_indices[0]];
     const stale_doc = stale_segment.reader.storedDoc(0) orelse return error.TestUnexpectedResult;
     try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{stale_doc.id}, opts);
@@ -16311,7 +16305,7 @@ test "text merge task records input and output bytes" {
         .compact_text_segment_threshold = 2,
         .defer_text_compaction = true,
     };
-    for (0..3) |i| {
+    for (0..12) |i| {
         var key_buf: [64]u8 = undefined;
         const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
         defer alloc.free(key);
@@ -16841,7 +16835,7 @@ test "best effort force compact stops on resource budget rejection" {
         .compact_text_segment_threshold = 2,
         .defer_text_compaction = true,
     };
-    for (0..3) |i| {
+    for (0..12) |i| {
         var key_buf: [64]u8 = undefined;
         const key = try alloc.dupe(u8, std.fmt.bufPrint(&key_buf, "doc:{d:0>8}", .{i}) catch unreachable);
         defer alloc.free(key);

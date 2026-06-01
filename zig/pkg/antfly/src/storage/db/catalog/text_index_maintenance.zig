@@ -78,7 +78,7 @@ pub fn applyPlannedMerge(
     target_segment_bytes: u64,
     merge_error_prefix: []const u8,
     apply_error_prefix: []const u8,
-) !void {
+) !bool {
     const old_ids = try alloc.alloc(u64, planned.len);
     defer alloc.free(old_ids);
     for (planned, 0..) |seg_idx, i| {
@@ -86,14 +86,13 @@ pub fn applyPlannedMerge(
     }
 
     if (index.prepareMergedSegmentToFile(snap, planned)) |prepared| {
-        _ = index.replaceSegmentsIfActiveManyPrepared(old_ids, prepared) catch |err| switch (err) {
+        return index.replaceSegmentsIfActiveManyPrepared(old_ids, prepared) catch |err| switch (err) {
             error.EmptySegment => try index.removeSegmentsIfActive(old_ids),
             else => {
                 logErr(apply_error_prefix, err);
                 return err;
             },
         };
-        return;
     } else |err| switch (err) {
         error.Unsupported => {},
         else => {
@@ -108,18 +107,18 @@ pub fn applyPlannedMerge(
         logErr(merge_error_prefix, err);
         return err;
     };
-    defer merger_mod.freeMergedSegments(alloc, merged);
+    errdefer merger_mod.freeMergedSegments(alloc, merged);
 
-    merger_mod.applyPersistentMergeManyOwned(index, planned, merged) catch |err| {
+    const applied = index.replaceSegmentsIfActiveManyOwned(old_ids, merged) catch |err| {
         merged = &.{};
         if (err == error.EmptySegment) {
-            try index.removeSegments(old_ids);
-            return;
+            return try index.removeSegmentsIfActive(old_ids);
         }
         logErr(apply_error_prefix, err);
         return err;
     };
     merged = &.{};
+    return applied;
 }
 
 fn buildSegmentInfosAlloc(
