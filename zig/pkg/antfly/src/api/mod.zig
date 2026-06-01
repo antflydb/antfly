@@ -196,6 +196,10 @@ test "api distributed graph hydrate carries identity generation and clears cross
     try distributed_graph.testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(std.testing.allocator);
 }
 
+test "api distributed graph cross-table hydrate clears query scoped filter" {
+    try distributed_graph.testCrossTableHydrateClearsQueryScopedFilterAndOrdinals(std.testing.allocator);
+}
+
 test "public graph result_ref fail-closed guards are covered" {
     try public_graph_query.testResolveGraphSelectorFailClosedGuard(std.testing.allocator);
 }

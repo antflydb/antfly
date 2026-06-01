@@ -98,7 +98,9 @@ fn appendReplayArtifactsForHint(
     for (artifact_keys) |key| {
         const keep = switch (hint) {
             .dense_vector, .sparse_vector => isEmbeddingReplayArtifactKey(key),
-            .graph => internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key),
+            .graph => internal_keys.isGraphEdgeArtifactKey(key) or
+                internal_keys.isAssetArtifactKey(key) or
+                internal_keys.isResolutionArtifactKey(key),
             .resolution => internal_keys.isAssetArtifactKey(key),
             .promotion => internal_keys.isResolutionArtifactKey(key),
             .enrichment, .full_text, .algebraic => false,

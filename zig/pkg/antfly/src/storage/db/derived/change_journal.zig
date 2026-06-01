@@ -212,8 +212,11 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
             try appendUniqueHintAlloc(alloc, &target_hints, .resolution);
         } else if (internal_keys.isResolutionArtifactKey(key)) {
-            // The resolution stage journals its output; wake the promoter so it
-            // upserts the canonical entity documents for the resolved mentions.
+            // The resolution stage journals its output; wake the graph
+            // materializer for doc->entity provenance edges and the promoter so
+            // it upserts the canonical entity documents for the resolved
+            // mentions.
+            try appendUniqueHintAlloc(alloc, &target_hints, .graph);
             try appendUniqueHintAlloc(alloc, &target_hints, .promotion);
         } else if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);

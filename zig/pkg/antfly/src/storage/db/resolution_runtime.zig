@@ -765,10 +765,13 @@ pub fn catchUpWindow(
         write_fn: DerivedRecordWriter,
         candidate_source: ?CandidateSource,
         embedder: ?embedder_mod.DenseEmbedder,
+        seen_sequences: *std.AutoHashMapUnmanaged(u64, void),
         max_seen: u64,
 
         fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const seen = try self.seen_sequences.getOrPut(self.gpa, sequence);
+            if (seen.found_existing) return;
             var decoded = try change_journal_mod.decodeRecord(self.gpa, payload);
             defer decoded.deinit();
             try processRecordKeys(
@@ -795,10 +798,17 @@ pub fn catchUpWindow(
         .write_fn = write_fn,
         .candidate_source = candidate_source,
         .embedder = embedder,
+        .seen_sequences = undefined,
         // from_sequence is exclusive; with no records, return it unchanged.
         .max_seen = from_sequence,
     };
-    _ = try replay_source.forEachMatchingRecord(gpa, from_sequence, .resolution, max_records, &ctx, Ctx.consume);
+    var seen_sequences = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer seen_sequences.deinit(gpa);
+    ctx.seen_sequences = &seen_sequences;
+    const hints = [_]change_journal_mod.TargetHint{ .resolution, .graph };
+    for (hints) |hint| {
+        _ = try replay_source.forEachMatchingRecord(gpa, from_sequence, hint, max_records, &ctx, Ctx.consume);
+    }
     return ctx.max_seen;
 }
 
