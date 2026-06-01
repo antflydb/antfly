@@ -221,8 +221,8 @@ Move every relational document-value reader to the relational participant:
 - serverless/materialized publication readers if they touch relational rows.
 
 The existing `materializeDocumentValueAlloc` helper can remain as a document-mode
-pass-through and typed-row materializer, but relational readers should not use it
-as a compatibility fallback to a generic document KV value.
+pass-through and typed-row materializer, but relational readers should only use
+the relational participant keyspace for row data.
 
 Acceptance:
 
