@@ -25,6 +25,7 @@ const platform_time = @import("../platform/time.zig");
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
 const http_common = antfly.common.http.http_common;
 const public_api_max_requests_per_connection: u32 = 64;
+const public_api_max_body_size: usize = antfly.common.http.default_max_request_bytes;
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
 const default_public_port: u16 = 8080;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
@@ -1106,6 +1107,7 @@ fn serveUnifiedInner(
         .host = bind_host,
         .port = bind_port,
         .request_timeout_ms = 300_000,
+        .max_body_size = public_api_max_body_size,
         .max_requests_per_connection = public_api_max_requests_per_connection,
     });
     defer server.deinit();
@@ -2034,6 +2036,10 @@ test "antfly config uses cli override before common config" {
 test "swarm public api caps keep alive request reuse" {
     try std.testing.expect(public_api_max_requests_per_connection > 0);
     try std.testing.expect(public_api_max_requests_per_connection < 1000);
+}
+
+test "swarm public api body limit matches common http listener" {
+    try std.testing.expectEqual(antfly.common.http.default_max_request_bytes, public_api_max_body_size);
 }
 
 test "parse cli accepts inference budget overrides" {

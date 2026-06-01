@@ -58,9 +58,16 @@ pub const OwnedBatchRequest = struct {
 };
 
 pub fn parseBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatchRequest {
+    return try parseBatchRequestWithOptions(alloc, body, .{ .allocate = .alloc_always });
+}
+
+fn parseBatchRequestWithOptions(alloc: std.mem.Allocator, body: []const u8, options: std.json.ParseOptions) !OwnedBatchRequest {
     if (body.len == 0) return .{};
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .allocate = .alloc_always }) catch return error.InvalidBatchRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, options) catch |err| switch (err) {
+        error.ValueTooLong => return error.ValueTooLong,
+        else => return error.InvalidBatchRequest,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidBatchRequest;
     const root = parsed.value.object;
@@ -358,6 +365,13 @@ test "batch parser accepts inserts and deletes" {
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), owned.writes.len);
     try std.testing.expectEqual(@as(usize, 1), owned.deletes.len);
+}
+
+test "batch parser preserves oversized value errors" {
+    const body =
+        \\{"inserts":{"doc:a":{"raw_payload":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
+    ;
+    try std.testing.expectError(error.ValueTooLong, parseBatchRequestWithOptions(std.testing.allocator, body, .{ .allocate = .alloc_always, .max_value_len = 64 }));
 }
 
 test "batch parser accepts go sync levels" {
