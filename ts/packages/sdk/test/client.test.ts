@@ -247,6 +247,113 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("should perform bounded batch writes with fetch", async () => {
+      const mockFetch = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(new Response(JSON.stringify({ inserted: 1 }), { status: 201 }));
+
+      const result = await client.tables.batchWithOptions(
+        "products",
+        {
+          inserts: {
+            "prod:1": { title: "Notebook" },
+          },
+        },
+        {
+          maxRequestBytes: 1024,
+          maxResponseBytes: 1024,
+        }
+      );
+
+      expect(result).toEqual({ inserted: 1 });
+      expect(mockFetch).toHaveBeenCalledWith(
+        "http://localhost:8080/db/v1/tables/products/batch",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({
+            inserts: {
+              "prod:1": { title: "Notebook" },
+            },
+          }),
+        })
+      );
+
+      mockFetch.mockRestore();
+    });
+
+    it("should reject oversized encoded batch requests", async () => {
+      const mockFetch = vi.spyOn(globalThis, "fetch");
+
+      await expect(
+        client.tables.batchWithOptions(
+          "products",
+          {
+            inserts: {
+              "prod:1": { title: "Notebook" },
+            },
+          },
+          { maxRequestBytes: 8 }
+        )
+      ).rejects.toThrow("encoded request exceeded 8 bytes");
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      mockFetch.mockRestore();
+    });
+
+    it("should reject oversized batch success responses", async () => {
+      const mockFetch = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(new Response("x".repeat(17), { status: 201 }));
+
+      await expect(
+        client.tables.batchWithOptions(
+          "products",
+          { inserts: { "prod:1": { title: "Notebook" } } },
+          { maxRequestBytes: 1024, maxResponseBytes: 16 }
+        )
+      ).rejects.toThrow("Batch operation failed response exceeded 16 bytes");
+
+      mockFetch.mockRestore();
+    });
+
+    it("should perform bounded linear merge requests", async () => {
+      const mockResponse = {
+        status: "success",
+        upserted: 1,
+        skipped: 0,
+        deleted: 0,
+        next_cursor: "prod:1",
+      };
+      const mockFetch = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(new Response(JSON.stringify(mockResponse), { status: 200 }));
+
+      const result = await client.linearMergeWithOptions(
+        "products",
+        {
+          records: {
+            "prod:1": { title: "Notebook" },
+          },
+        },
+        { maxRequestBytes: 1024, maxResponseBytes: 1024 }
+      );
+
+      expect(result).toEqual(mockResponse);
+      expect(mockFetch).toHaveBeenCalledWith(
+        "http://localhost:8080/db/v1/tables/products/merge",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({
+            records: {
+              "prod:1": { title: "Notebook" },
+            },
+          }),
+        })
+      );
+
+      mockFetch.mockRestore();
+    });
+
     it("should lookup a key without field projection", async () => {
       const mockDocument = {
         _key: "user:123",

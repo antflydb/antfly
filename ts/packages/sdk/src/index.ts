@@ -34,7 +34,49 @@
  */
 
 // Main client export
-export { AntflyClient } from "./client.js";
+export {
+  AntflyClient,
+  DEFAULT_WRITE_MAX_REQUEST_BYTES,
+  DEFAULT_WRITE_MAX_RESPONSE_BYTES,
+} from "./client.js";
+export { InferenceClient } from "./inference-client.js";
+export { deserializeEmbeddings, serializeEmbeddings } from "./inference-codec.js";
+export type {
+  Chunk,
+  ChunkConfig,
+  ChunkRequest,
+  ChunkResponse,
+  ClassificationResult,
+  Config as InferenceRuntimeConfig,
+  ContentPart,
+  ContentSecurityConfig,
+  Credentials,
+  EmbedInput,
+  EmbedRequest,
+  EmbedResponse,
+  EntityExtractionResult,
+  ExtractClassification,
+  ExtractEntity,
+  ExtractRelation,
+  ExtractRequest,
+  ExtractResponse,
+  ImageURL,
+  ImageURLContentPart,
+  InferenceConfig,
+  InferenceError,
+  Level,
+  ModelsResponse,
+  RequestOptions,
+  RerankRequest,
+  RerankResponse,
+  RewriteRequest,
+  RewriteResponse,
+  Style,
+  TextContentPart,
+  TranscribeRequest,
+  TranscribeResponse,
+} from "./inference-types.js";
+export { logLevels, logStyles } from "./inference-types.js";
 // Re-export the generated types for advanced users
 export type { components, operations, paths } from "./public-api.js";
 export type { components as query_components } from "./query.js";
@@ -58,42 +100,6 @@ export {
   term,
 } from "./query-helpers.js";
 export { Client, type SDKConfig } from "./sdk.js";
-export { InferenceClient } from "./inference-client.js";
-export { deserializeEmbeddings, serializeEmbeddings } from "./inference-codec.js";
-export type {
-  Chunk,
-  ChunkConfig,
-  ChunkRequest,
-  ChunkResponse,
-  Config as InferenceRuntimeConfig,
-  ContentPart,
-  ContentSecurityConfig,
-  Credentials,
-  EmbedInput,
-  EmbedRequest,
-  EmbedResponse,
-  ExtractClassification,
-  ExtractEntity,
-  ExtractRelation,
-  ExtractRequest,
-  ExtractResponse,
-  ImageURL,
-  ImageURLContentPart,
-  Level,
-  ModelsResponse,
-  RequestOptions,
-  RerankRequest,
-  RerankResponse,
-  RewriteRequest,
-  RewriteResponse,
-  Style,
-  InferenceConfig,
-  InferenceError,
-  TextContentPart,
-  TranscribeRequest,
-  TranscribeResponse,
-} from "./inference-types.js";
-export { logLevels, logStyles } from "./inference-types.js";
 // Type exports
 export type {
   // Chat Agent types
@@ -121,6 +127,7 @@ export type {
   // Backup/Restore types
   BackupRequest,
   BatchRequest, // Now using our custom type
+  BatchResult,
   CalendarInterval,
   ChatAgentConfig,
   ChatAgentTurnResult,
@@ -181,7 +188,11 @@ export type {
   JoinProfile,
   JoinStrategy,
   JoinType,
+  LinearMergeRequest,
+  LinearMergeResult,
   MergeProfile,
+  MultiBatchRequest,
+  MultiBatchResult,
   Permission,
   PermissionType,
   // Query Builder Agent types
@@ -227,6 +238,7 @@ export type {
   // Web search types
   WebSearchConfig,
   WebSearchResultItem,
+  WriteOptions,
 } from "./types.js";
 export { embedderProviders, generatorProviders } from "./types.js";
 

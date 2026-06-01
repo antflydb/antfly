@@ -10,6 +10,7 @@ import type {
   AntflyConfig,
   BackupRequest,
   BatchRequest,
+  BatchResult,
   ChatAgentConfig,
   ChatAgentTurnResult,
   ChatMessage,
@@ -17,6 +18,10 @@ import type {
   CreateTableRequest,
   CreateUserRequest,
   IndexConfig,
+  LinearMergeRequest,
+  LinearMergeResult,
+  MultiBatchRequest,
+  MultiBatchResult,
   Permission,
   QueryBuilderRequest,
   QueryBuilderResult,
@@ -31,7 +36,12 @@ import type {
   ScanKeysRequest,
   TableSchema,
   User,
+  WriteOptions,
 } from "./types.js";
+
+export const DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20;
+export const DEFAULT_WRITE_MAX_RESPONSE_BYTES = 1 << 20;
+const MAX_ERROR_RESPONSE_BYTES = 1 << 20;
 
 type UserOperations = {
   getCurrentUser: () => Promise<CurrentUser | undefined>;
@@ -63,7 +73,8 @@ type SuccessMessage = {
   message?: string;
 };
 
-type ClusterTopology = paths["/db/v1/cluster"]["get"]["responses"][200]["content"]["application/json"];
+type ClusterTopology =
+  paths["/db/v1/cluster"]["get"]["responses"][200]["content"]["application/json"];
 
 function apiErrorMessage(error: unknown, fallback = "unknown error"): string {
   if (!error) return fallback;
@@ -89,6 +100,77 @@ function apiErrorMessage(error: unknown, fallback = "unknown error"): string {
 
 function errorMessage(error: unknown): string {
   return apiErrorMessage(error);
+}
+
+function normalizedWriteOptions(
+  options?: WriteOptions
+): Required<Pick<WriteOptions, "maxRequestBytes" | "maxResponseBytes">> &
+  Pick<WriteOptions, "signal"> {
+  return {
+    maxRequestBytes:
+      options?.maxRequestBytes && options.maxRequestBytes > 0
+        ? options.maxRequestBytes
+        : DEFAULT_WRITE_MAX_REQUEST_BYTES,
+    maxResponseBytes:
+      options?.maxResponseBytes && options.maxResponseBytes > 0
+        ? options.maxResponseBytes
+        : DEFAULT_WRITE_MAX_RESPONSE_BYTES,
+    signal: options?.signal,
+  };
+}
+
+function encodeBoundedJSON(value: unknown, maxBytes: number): string {
+  const encoded = JSON.stringify(value);
+  if (new TextEncoder().encode(encoded).byteLength > maxBytes) {
+    throw new Error(`encoded request exceeded ${maxBytes} bytes`);
+  }
+  return encoded;
+}
+
+async function readLimitedResponseText(
+  response: Response,
+  maxBytes: number
+): Promise<{ text: string; truncated: boolean }> {
+  if (!response.body) {
+    return { text: await response.text(), truncated: false };
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const remaining = maxBytes - total;
+    if (remaining <= 0) {
+      truncated = true;
+      await reader.cancel();
+      break;
+    }
+    if (value.byteLength > remaining) {
+      chunks.push(value.slice(0, remaining));
+      total += remaining;
+      truncated = true;
+      await reader.cancel();
+      break;
+    }
+    chunks.push(value);
+    total += value.byteLength;
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { text: new TextDecoder().decode(bytes), truncated };
+}
+
+function parseJSON<T>(text: string): T {
+  return JSON.parse(text) as T;
 }
 
 export class AntflyClient {
@@ -150,6 +232,63 @@ export class AntflyClient {
         return JSON.stringify(body);
       },
     });
+  }
+
+  private requestHeaders(extra?: Record<string, string>): Record<string, string> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...this.config.headers,
+      ...extra,
+    };
+
+    const authHeader = this.getAuthHeader();
+    if (authHeader) {
+      headers.Authorization = authHeader;
+    }
+
+    return headers;
+  }
+
+  private url(path: string): string {
+    return `${normalizeBaseUrl(this.config.baseUrl)}${path}`;
+  }
+
+  private async postBoundedJSON<T>(
+    path: string,
+    body: unknown,
+    options: WriteOptions | undefined,
+    errorPrefix: string
+  ): Promise<{ data?: T; text: string }> {
+    const opts = normalizedWriteOptions(options);
+    const response = await fetch(this.url(path), {
+      method: "POST",
+      headers: this.requestHeaders(),
+      body: encodeBoundedJSON(body, opts.maxRequestBytes),
+      signal: opts.signal,
+    });
+
+    if (!response.ok) {
+      const { text, truncated } = await readLimitedResponseText(response, MAX_ERROR_RESPONSE_BYTES);
+      let message = apiErrorMessage(text);
+      try {
+        message = apiErrorMessage(parseJSON<unknown>(text), message);
+      } catch {
+        // Non-JSON error bodies are reported as-is below.
+      }
+      if (truncated) {
+        message = `${message} (response body exceeded ${MAX_ERROR_RESPONSE_BYTES} bytes)`;
+      }
+      throw new Error(`${errorPrefix}: ${response.status} ${message}`);
+    }
+
+    const { text, truncated } = await readLimitedResponseText(response, opts.maxResponseBytes);
+    if (truncated) {
+      throw new Error(`${errorPrefix} response exceeded ${opts.maxResponseBytes} bytes`);
+    }
+    if (!text.trim()) {
+      return { text };
+    }
+    return { data: parseJSON<T>(text), text };
   }
 
   /**
@@ -559,6 +698,54 @@ export class AntflyClient {
   }
 
   /**
+   * Perform a cross-table batch operation atomically.
+   */
+  async multiBatch(request: MultiBatchRequest): Promise<MultiBatchResult> {
+    return this.multiBatchWithOptions(request);
+  }
+
+  /**
+   * Perform a cross-table batch operation with request and response size bounds.
+   */
+  async multiBatchWithOptions(
+    request: MultiBatchRequest,
+    options?: WriteOptions
+  ): Promise<MultiBatchResult> {
+    const { data } = await this.postBoundedJSON<MultiBatchResult>(
+      "/db/v1/batch",
+      request,
+      options,
+      "Multi-batch operation failed"
+    );
+    return data ?? {};
+  }
+
+  /**
+   * Perform a stateless linear merge against a table.
+   */
+  async linearMerge(tableName: string, request: LinearMergeRequest): Promise<LinearMergeResult> {
+    return this.linearMergeWithOptions(tableName, request);
+  }
+
+  /**
+   * Perform a stateless linear merge with request and response size bounds.
+   */
+  async linearMergeWithOptions(
+    tableName: string,
+    request: LinearMergeRequest,
+    options?: WriteOptions
+  ): Promise<LinearMergeResult> {
+    const { data } = await this.postBoundedJSON<LinearMergeResult>(
+      `/db/v1/tables/${encodeURIComponent(tableName)}/merge`,
+      request,
+      options,
+      "Linear merge operation failed"
+    );
+    if (!data) throw new Error("Linear merge operation failed: unexpected empty response");
+    return data;
+  }
+
+  /**
    * Table operations
    */
   tables = {
@@ -638,14 +825,31 @@ export class AntflyClient {
     /**
      * Perform batch operations on a table
      */
-    batch: async (tableName: string, request: BatchRequest) => {
-      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/batch", {
-        params: { path: { tableName } },
-        // @ts-expect-error Our BatchRequest type allows any object shape for inserts
-        body: request,
-      });
-      if (error) throw new Error(`Batch operation failed: ${error.error}`);
-      return data;
+    batch: async (tableName: string, request: BatchRequest): Promise<BatchResult> => {
+      return this.tables.batchWithOptions(tableName, request);
+    },
+
+    /**
+     * Perform batch operations on a table with request and response size bounds.
+     */
+    batchWithOptions: async (
+      tableName: string,
+      request: BatchRequest,
+      options?: WriteOptions
+    ): Promise<BatchResult> => {
+      const { data } = await this.postBoundedJSON<BatchResult>(
+        `/db/v1/tables/${encodeURIComponent(tableName)}/batch`,
+        request,
+        options,
+        "Batch operation failed"
+      );
+      return (
+        data ?? {
+          inserted: Object.keys(request.inserts ?? {}).length,
+          deleted: request.deletes?.length ?? 0,
+          transformed: request.transforms?.length ?? 0,
+        }
+      );
     },
 
     /**
