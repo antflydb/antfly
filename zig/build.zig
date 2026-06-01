@@ -6034,6 +6034,14 @@ pub fn build(b: *std.Build) void {
         .name = "antfly",
         .root_module = antfly_main_mod,
     });
+    const antfly_main_tests = b.addTest(.{
+        .root_module = antfly_main_mod,
+    });
+    const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);
+    const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");
+    antfly_main_test_step.dependOn(&run_antfly_main_tests.step);
+    unit_test_step.dependOn(&run_antfly_main_tests.step);
+
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
     const install_antfarm_assets = b.addInstallDirectory(.{
         .source_dir = b.path("../go/pkg/antfly/src/metadata/antfarm"),
