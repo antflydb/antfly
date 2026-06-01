@@ -33,6 +33,77 @@ import (
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
+const (
+	// DefaultBatchMaxRequestBytes bounds encoded SDK batch request bodies.
+	// Call BatchWithOptions or MultiBatchWithOptions with a larger value for
+	// intentionally large imports.
+	DefaultBatchMaxRequestBytes int64 = 64 << 20
+	// DefaultBatchMaxResponseBytes bounds batch write response bodies. Batch
+	// writes should return small count/error payloads, so large responses are
+	// treated as protocol errors.
+	DefaultBatchMaxResponseBytes int64 = 1 << 20
+)
+
+// BatchOptions controls request and response bounds for batch write APIs.
+// Non-positive values use SDK defaults.
+type BatchOptions struct {
+	MaxRequestBytes  int64
+	MaxResponseBytes int64
+}
+
+func normalizeBatchOptions(opts BatchOptions) BatchOptions {
+	if opts.MaxRequestBytes <= 0 {
+		opts.MaxRequestBytes = DefaultBatchMaxRequestBytes
+	}
+	if opts.MaxResponseBytes <= 0 {
+		opts.MaxResponseBytes = DefaultBatchMaxResponseBytes
+	}
+	return opts
+}
+
+type limitedWriter struct {
+	w       io.Writer
+	max     int64
+	written int64
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	if w.max <= 0 {
+		return w.w.Write(p)
+	}
+	remaining := w.max - w.written
+	if remaining <= 0 {
+		return 0, fmt.Errorf("encoded request exceeded %d bytes", w.max)
+	}
+	if int64(len(p)) > remaining {
+		n, err := w.w.Write(p[:remaining])
+		w.written += int64(n)
+		if err != nil {
+			return n, err
+		}
+		return n, fmt.Errorf("encoded request exceeded %d bytes", w.max)
+	}
+	n, err := w.w.Write(p)
+	w.written += int64(n)
+	return n, err
+}
+
+func jsonBodyReader(v any, maxBytes int64) (*io.PipeReader, func()) {
+	pr, pw := io.Pipe()
+	go func() {
+		w := io.Writer(pw)
+		if maxBytes > 0 {
+			w = &limitedWriter{w: pw, max: maxBytes}
+		}
+		if err := json.NewEncoder(w).Encode(v); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_ = pw.Close()
+	}()
+	return pr, func() { _ = pr.Close() }
+}
+
 // readSSEEvents reads SSE events from a reader and yields (eventType, data) pairs.
 // Events are parsed from "event: <type>" and "data: <content>" lines.
 func readSSEEvents(r io.Reader) iter.Seq2[string, string] {
@@ -108,12 +179,17 @@ func (c *AntflyClient) Query(ctx context.Context, opts ...QueryRequest) (*QueryR
 
 // Batch performs a batch operation on a table
 func (c *AntflyClient) Batch(ctx context.Context, tableName string, request BatchRequest) (*BatchResult, error) {
-	batchBody, err := json.Marshal(request)
-	if err != nil {
-		return nil, fmt.Errorf("marshalling batch request: %w", err)
-	}
+	return c.BatchWithOptions(ctx, tableName, request, BatchOptions{})
+}
 
-	resp, err := c.client.BatchWriteWithBody(ctx, tableName, "application/json", bytes.NewBuffer(batchBody))
+// BatchWithOptions performs a batch operation on a table with request and
+// response size bounds.
+func (c *AntflyClient) BatchWithOptions(ctx context.Context, tableName string, request BatchRequest, opts BatchOptions) (*BatchResult, error) {
+	opts = normalizeBatchOptions(opts)
+	batchBody, closeBody := jsonBodyReader(request, opts.MaxRequestBytes)
+	defer closeBody()
+
+	resp, err := c.client.BatchWriteWithBody(ctx, tableName, "application/json", batchBody)
 	if err != nil {
 		return nil, fmt.Errorf("batch operation failed: %w", err)
 	}
@@ -123,9 +199,12 @@ func (c *AntflyClient) Batch(ctx context.Context, tableName string, request Batc
 		return nil, fmt.Errorf("batch failed: %w", readErrorResponse(resp))
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, truncated, err := readLimitedBody(resp.Body, opts.MaxResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("batch response exceeded %d bytes", opts.MaxResponseBytes)
 	}
 
 	var result BatchResult
@@ -593,12 +672,17 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 
 // MultiBatch performs a cross-table batch operation atomically.
 func (c *AntflyClient) MultiBatch(ctx context.Context, request MultiBatchRequest) (*MultiBatchResult, error) {
-	batchBody, err := json.Marshal(request)
-	if err != nil {
-		return nil, fmt.Errorf("marshalling multi-batch request: %w", err)
-	}
+	return c.MultiBatchWithOptions(ctx, request, BatchOptions{})
+}
 
-	resp, err := c.client.MultiBatchWriteWithBody(ctx, "application/json", bytes.NewBuffer(batchBody))
+// MultiBatchWithOptions performs a cross-table batch operation atomically with
+// request and response size bounds.
+func (c *AntflyClient) MultiBatchWithOptions(ctx context.Context, request MultiBatchRequest, opts BatchOptions) (*MultiBatchResult, error) {
+	opts = normalizeBatchOptions(opts)
+	batchBody, closeBody := jsonBodyReader(request, opts.MaxRequestBytes)
+	defer closeBody()
+
+	resp, err := c.client.MultiBatchWriteWithBody(ctx, "application/json", batchBody)
 	if err != nil {
 		return nil, fmt.Errorf("multi-batch operation failed: %w", err)
 	}
@@ -608,9 +692,12 @@ func (c *AntflyClient) MultiBatch(ctx context.Context, request MultiBatchRequest
 		return nil, fmt.Errorf("multi-batch failed: %w", readErrorResponse(resp))
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, truncated, err := readLimitedBody(resp.Body, opts.MaxResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("multi-batch response exceeded %d bytes", opts.MaxResponseBytes)
 	}
 
 	var result MultiBatchResult

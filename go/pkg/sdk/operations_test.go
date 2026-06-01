@@ -17,10 +17,16 @@ limitations under the License.
 package sdk
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
 func TestReadSSEEvents(t *testing.T) {
@@ -160,5 +166,103 @@ func TestReadSSEEventsEarlyTermination(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("early termination: got %d events, want 1", count)
+	}
+}
+
+func TestBatchStreamsRequestAndParsesResponse(t *testing.T) {
+	var gotPath string
+	var gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll request body: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"inserted":1}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	result, err := client.BatchWithOptions(context.Background(), "files", BatchRequest{
+		Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}},
+	}, BatchOptions{
+		MaxRequestBytes:  1024,
+		MaxResponseBytes: 1024,
+	})
+	if err != nil {
+		t.Fatalf("BatchWithOptions: %v", err)
+	}
+	if result.Inserted != 1 {
+		t.Fatalf("Inserted = %d, want 1", result.Inserted)
+	}
+	if gotPath != "/db/v1/tables/files/batch" {
+		t.Fatalf("path = %q, want /db/v1/tables/files/batch", gotPath)
+	}
+	if !strings.Contains(gotBody, `"doc-1"`) || !strings.Contains(gotBody, `"title":"hello"`) {
+		t.Fatalf("request body = %q, want encoded insert", gotBody)
+	}
+}
+
+func TestBatchRejectsOversizedSuccessResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = w.Write([]byte(strings.Repeat("x", 17)))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.BatchWithOptions(context.Background(), "files", BatchRequest{
+		Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}},
+	}, BatchOptions{
+		MaxRequestBytes:  1024,
+		MaxResponseBytes: 16,
+	})
+	if err == nil || !strings.Contains(err.Error(), "batch response exceeded 16 bytes") {
+		t.Fatalf("BatchWithOptions error = %v, want response limit error", err)
+	}
+}
+
+func TestReadErrorResponseCapsBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		http.Error(w, strings.Repeat("x", int(maxErrorResponseBytes)+1), http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.BatchWithOptions(context.Background(), "files", BatchRequest{
+		Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}},
+	}, BatchOptions{
+		MaxRequestBytes:  1024,
+		MaxResponseBytes: 1024,
+	})
+	if err == nil {
+		t.Fatal("BatchWithOptions error = nil, want API error")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %T %[1]v, want APIError", err)
+	}
+	if !strings.Contains(apiErr.Message, "response body exceeded") {
+		t.Fatalf("APIError.Message missing truncation marker: %q", apiErr.Message)
+	}
+	if len(apiErr.Message) > int(maxErrorResponseBytes)+128 {
+		t.Fatalf("APIError.Message length = %d, want capped message", len(apiErr.Message))
 	}
 }
