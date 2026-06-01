@@ -4643,8 +4643,6 @@ pub const IndexManager = struct {
             if (self.relational_base_rows) {
                 if (!internal_keys.isRelationalRowKey(row.key)) continue;
                 row.value = try mapper.materializeOwnedRelationalRowValueAlloc(self.alloc, row.value);
-            } else if (mapper.isRelationalRowValue(row.value)) {
-                row.value = try mapper.materializeOwnedDocumentValueAlloc(self.alloc, row.value);
             }
         }
     }

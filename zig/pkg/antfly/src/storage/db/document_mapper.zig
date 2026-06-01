@@ -1535,22 +1535,16 @@ pub fn isRelationalRowValue(value: []const u8) bool {
     return relational_row_codec.looksLikeRow(value);
 }
 
-/// Materialize a stored document value as JSON. This is the single seam every
-/// document-value reader — synchronous (`DB.get`) and asynchronous (index
-/// backfill, derived catch-up/replay, enrichment, algebraic re-read) — routes a
-/// raw store value through, so none of them need to know whether the document is
-/// stored as a JSON blob (document mode) or a serialized typed row (relational
-/// mode). A typed row is reconstructed to canonical JSON; anything else (a JSON
-/// blob) is returned as an owned copy. Detection is schema-free via the row
-/// magic and never collides with a real JSON document (which starts with '{').
+/// Materialize a document-mode stored value as JSON. Relational row values use
+/// `materializeRelationalRowValueAlloc` at strict relational row-key read seams;
+/// this generic path intentionally does not reconstruct `AROW` values as a
+/// compatibility fallback.
 /// Caller owns the returned bytes.
 pub fn materializeDocumentValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
     return try relational_row_codec.materializeDocumentValueAlloc(alloc, value);
 }
 
-/// As `materializeDocumentValueAlloc`, but takes ownership of `value`: a typed
-/// row is reconstructed and `value` is freed; a JSON blob is returned as-is
-/// without an extra copy. Convenient at read sites that already own the bytes.
+/// As `materializeDocumentValueAlloc`, but takes ownership of `value`.
 pub fn materializeOwnedDocumentValueAlloc(alloc: Allocator, value: []u8) ![]u8 {
     return try relational_row_codec.materializeOwnedDocumentValueAlloc(alloc, value);
 }
@@ -3660,7 +3654,7 @@ test "relational KV row value round-trips a document through project + reconstru
     try std.testing.expectEqual(@as(f64, 12.5), amount_num);
 }
 
-test "materializeDocumentValueAlloc reconstructs typed rows and passes blobs through" {
+test "document materializer passes through blobs and leaves rows to relational seams" {
     const alloc = std.testing.allocator;
 
     const columns = [_]runtime_schema.RelationalColumn{
@@ -3669,12 +3663,17 @@ test "materializeDocumentValueAlloc reconstructs typed rows and passes blobs thr
     };
     const doc_json = "{\"id\":\"abc\",\"amount\":12.5}";
 
-    // Typed row -> reconstructed canonical JSON.
+    // Typed rows are not a generic document-mode compatibility format. They
+    // reconstruct only through strict relational row-key seams.
     const row_value = try buildRelationalRowValueAlloc(alloc, doc_json, &columns);
     defer alloc.free(row_value);
     const materialized = try materializeDocumentValueAlloc(alloc, row_value);
     defer alloc.free(materialized);
-    try std.testing.expectEqualStrings("{\"id\":\"abc\",\"amount\":12.5}", materialized);
+    try std.testing.expectEqualSlices(u8, row_value, materialized);
+
+    const relational = try materializeRelationalRowValueAlloc(alloc, row_value);
+    defer alloc.free(relational);
+    try std.testing.expectEqualStrings("{\"id\":\"abc\",\"amount\":12.5}", relational);
 
     // Plain JSON blob (document mode) -> owned passthrough copy.
     const blob = "{\"hello\":\"world\"}";
@@ -3683,11 +3682,11 @@ test "materializeDocumentValueAlloc reconstructs typed rows and passes blobs thr
     try std.testing.expectEqualStrings(blob, passed);
     try std.testing.expect(passed.ptr != blob.ptr);
 
-    // Owned variant: typed row freed + reconstructed; blob returned as-is.
+    // Owned variant returns the original document-mode allocation unchanged.
     const row_owned = try buildRelationalRowValueAlloc(alloc, doc_json, &columns);
-    const mat_owned = try materializeOwnedDocumentValueAlloc(alloc, row_owned);
-    defer alloc.free(mat_owned);
-    try std.testing.expectEqualStrings("{\"id\":\"abc\",\"amount\":12.5}", mat_owned);
+    const row_back = try materializeOwnedDocumentValueAlloc(alloc, row_owned);
+    defer alloc.free(row_back);
+    try std.testing.expect(row_back.ptr == row_owned.ptr);
 
     const blob_owned = try alloc.dupe(u8, blob);
     const blob_back = try materializeOwnedDocumentValueAlloc(alloc, blob_owned);

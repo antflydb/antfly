@@ -16250,10 +16250,6 @@ fn applyTextDocumentsForIndex(
             const json = try mapper.materializeRelationalRowValueAlloc(alloc, raw);
             try materialized_values.append(alloc, json);
             break :blk json;
-        } else if (read_values[i] != null and mapper.isRelationalRowValue(raw)) blk: {
-            const json = try mapper.materializeDocumentValueAlloc(alloc, raw);
-            try materialized_values.append(alloc, json);
-            break :blk json;
         } else raw;
         try writes.append(alloc, .{
             .key = item.doc_key,
@@ -17808,10 +17804,6 @@ fn putIndexedSplitBatchDirect(
                 const materialized = try mapper.materializeRelationalRowValueAlloc(dest_indexes.alloc, write.value);
                 try owned_values.append(dest_indexes.alloc, materialized);
                 break :blk materialized;
-            } else if (mapper.isRelationalRowValue(write.value)) blk: {
-                const materialized = try mapper.materializeDocumentValueAlloc(dest_indexes.alloc, write.value);
-                try owned_values.append(dest_indexes.alloc, materialized);
-                break :blk materialized;
             } else write.value;
             try logical_writes.append(dest_indexes.alloc, .{
                 .key = raw,
@@ -18428,8 +18420,6 @@ fn densePrimaryVectorTargetCountForIndexContext(ctx: *AsyncContext, index_name: 
             if (!isBaseDocumentStoreKeyForMode(state.relational_base_rows, key)) return .@"continue";
             const doc_value = if (state.relational_base_rows)
                 try mapper.materializeRelationalRowValueAlloc(state.alloc, value)
-            else if (mapper.isRelationalRowValue(value))
-                try mapper.materializeDocumentValueAlloc(state.alloc, value)
             else
                 value;
             defer if (doc_value.ptr != value.ptr) state.alloc.free(doc_value);

@@ -223,25 +223,18 @@ pub fn reconstructValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
     return try reconstructDocumentAlloc(alloc, row.cells);
 }
 
-/// Materialize a stored document value as JSON: a typed row is reconstructed to
-/// canonical JSON; anything else (a JSON blob) is returned as an owned copy.
-/// This is the single seam every document-value reader routes a raw store value
-/// through, so none of them need to know the storage format. Detection is
-/// schema-free via the row magic and never collides with a real JSON document
-/// (which starts with '{'). Caller owns the returned bytes.
+/// Materialize a document-mode stored value as JSON by returning an owned copy.
+/// Relational rows must go through `reconstructValueAlloc` at a relational row
+/// keyspace read seam; this generic document path intentionally has no AROW
+/// fallback because relational mode is a new format with no legacy primary-row
+/// compatibility contract.
 pub fn materializeDocumentValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
-    if (looksLikeRow(value)) return try reconstructValueAlloc(alloc, value);
     return try alloc.dupe(u8, value);
 }
 
-/// As `materializeDocumentValueAlloc`, but takes ownership of `value`: a typed
-/// row is reconstructed and `value` is freed; a JSON blob is returned as-is
-/// without an extra copy. Convenient at read sites that already own the bytes.
+/// As `materializeDocumentValueAlloc`, but takes ownership of `value`.
 pub fn materializeOwnedDocumentValueAlloc(alloc: Allocator, value: []u8) ![]u8 {
-    if (looksLikeRow(value)) {
-        defer alloc.free(value);
-        return try reconstructValueAlloc(alloc, value);
-    }
+    _ = alloc;
     return value;
 }
 

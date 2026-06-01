@@ -139,6 +139,9 @@ Current PR progress:
   transaction writes, including delete precedence and abort behavior, so
   transforms are pinned to the committed relational base row instead of any
   stale generic primary value.
+- generic document materialization no longer treats `AROW` bytes as a supported
+  compatibility format; relational rows reconstruct only through strict
+  relational row-key seams.
 
 ## Implementation Phases
 
