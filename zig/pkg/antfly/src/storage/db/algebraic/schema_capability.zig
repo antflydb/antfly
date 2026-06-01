@@ -1083,6 +1083,23 @@ test "schema capability config derives from a relational schema for auto-created
     try index_mod.validateConfig(parsed_config.value);
 }
 
+test "schema capability config accepts version zero relational schemas" {
+    // Public table schemas use version 0 as the default/initial schema version.
+    // The schema-derived algebraic sidecar still has a durable capability
+    // fingerprint, so version 0 must remain valid for relational auto-indexes.
+    const alloc = std.testing.allocator;
+    const config_json = try configJsonFromSchemaJsonAlloc(alloc, "rows",
+        \\{"version":0,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created":{"type":"datetime"},"active":{"type":"boolean"},"meta":{"type":"json"}},"required":["title","status","amount"],"additionalProperties":false}}}}
+    );
+    defer alloc.free(config_json);
+
+    var parsed_config = try std.json.parseFromSlice(index_mod.Config, alloc, config_json, .{ .allocate = .alloc_always });
+    defer parsed_config.deinit();
+    try std.testing.expectEqual(@as(u32, 0), parsed_config.value.schema_version);
+    try std.testing.expect(parsed_config.value.capability_fingerprint.len > 0);
+    try index_mod.validateConfig(parsed_config.value);
+}
+
 test "schema capability change classification separates additive from rebuild changes" {
     const alloc = std.testing.allocator;
     var old_schema = try schema_mod.parseValidatedTableSchema(alloc,

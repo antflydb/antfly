@@ -17,8 +17,8 @@
 These drive the real server to verify, end to end:
   - the provisioned-table server provisions the `algebraic` index kind on a
     relational table (this previously failed with UnsupportedCreateTableRequest);
-  - switching a table to relational mode auto-creates a schema-derived algebraic
-    index (algebraic_index_v0) with no user configuration;
+  - creating a relational table auto-creates a schema-derived algebraic index
+    (algebraic_index_v0) with no user configuration;
   - aggregations (terms / stats) over a relational table return correct results,
     computed over ALL matching documents -- including when the result page is
     bounded below the match count (low or zero `limit`), and respecting a
@@ -120,8 +120,7 @@ def _stats(stateful_api, table_name, field, *, limit, query=None):
 
 def _setup_relational(stateful_api, *, create_index):
     table_name = f"rel_alg_{time.time_ns()}"
-    stateful_api.create_table(table_name, num_shards=1)
-    stateful_api.update_schema(table_name, RELATIONAL_SCHEMA)
+    stateful_api.create_table(table_name, num_shards=1, schema=RELATIONAL_SCHEMA)
     if create_index:
         stateful_api.create_index(table_name, "agg_idx", {"type": "algebraic", "derive_from_schema": True})
     # Wait for an algebraic index (explicit or auto-created) to be visible.
@@ -146,7 +145,7 @@ def test_relational_explicit_algebraic_index_serves_aggregations(stateful_api):
 
 
 def test_relational_table_autocreates_algebraic_index_and_serves_aggregations(stateful_api):
-    """Switching a table to relational mode auto-creates a schema-derived
+    """Creating a relational table auto-creates a schema-derived
     algebraic index (no user config) that serves correct aggregations."""
     table_name = _setup_relational(stateful_api, create_index=False)
 

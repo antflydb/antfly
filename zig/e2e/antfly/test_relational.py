@@ -73,11 +73,9 @@ def _query_hit_ids(stateful_api, table_name: str, payload: dict) -> list[str] | 
 
 def test_relational_table_columns_reconstruct_and_route(stateful_api):
     table_name = f"relational_{time.time_ns()}"
-    created = stateful_api.create_table(table_name, num_shards=1)
+    created = stateful_api.create_table(table_name, num_shards=1, schema=RELATIONAL_SCHEMA)
     assert created["name"] == table_name
-
-    updated = stateful_api.update_schema(table_name, RELATIONAL_SCHEMA)
-    assert updated["schema"]["storage_mode"] == "relational"
+    assert created["schema"]["storage_mode"] == "relational"
 
     batch = stateful_api.batch_write(
         table_name,
@@ -162,8 +160,7 @@ def test_relational_table_columns_reconstruct_and_route(stateful_api):
 
 def test_relational_table_enforces_closed_schema(stateful_api):
     table_name = f"relational_closed_{time.time_ns()}"
-    stateful_api.create_table(table_name, num_shards=1)
-    stateful_api.update_schema(table_name, RELATIONAL_SCHEMA)
+    stateful_api.create_table(table_name, num_shards=1, schema=RELATIONAL_SCHEMA)
 
     # A document missing a required column (amount) must be rejected.
     rejected = False

@@ -238,7 +238,6 @@ pub fn validateConfig(cfg: Config) !void {
     if (cfg.version != 1 and cfg.version != 2) return error.InvalidAlgebraicConfig;
     if (cfg.version == 2) {
         if (cfg.table.len == 0) return error.InvalidAlgebraicConfig;
-        if (cfg.schema_version == 0) return error.InvalidAlgebraicConfig;
         if (cfg.capability_fingerprint.len == 0) return error.InvalidAlgebraicConfig;
     }
 
