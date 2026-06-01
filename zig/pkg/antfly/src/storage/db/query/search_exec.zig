@@ -3573,7 +3573,7 @@ pub fn searchTextQuery(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
-    const base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
+    var base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
     const snapshot = text_index.snapshot();
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var constraint_req = effective_req;
@@ -3608,6 +3608,30 @@ pub fn searchTextQuery(
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = effective_req.identity_read_generation,
         });
+    }
+    if (executor.resolve_relational_filter_doc_set) |resolve_relational| {
+        if (text_entry.runtime_schema) |rs| {
+            if (rs.storage_mode == .relational and rs.relational_columns.len > 0) {
+                if (try resolve_relational(executor.ctx, alloc, rs, base_search_query, effective_req.identity_read_generation)) |resolved| {
+                    var owned_resolved = resolved;
+                    defer owned_resolved.deinit(alloc);
+                    const filter = doc_set.ResolvedDocFilter{
+                        .include = owned_resolved,
+                        .exclude = .none,
+                    };
+                    try applyResolvedDocFilterToTextDocNumsAlloc(alloc, snapshot, &native_constraints, &filter, .{
+                        .ctx = executor.ctx,
+                        .text_index_entry = executor.text_index_entry,
+                        .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
+                        .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+                        .live_filter_doc_set = executor.live_filter_doc_set,
+                        .project_ordinals_to_doc_ids = false,
+                        .identity_read_generation = effective_req.identity_read_generation,
+                    });
+                    base_search_query = .{ .match_all = {} };
+                }
+            }
+        }
     }
     const resolved_filter_ns = if (bench_query_profile) platform_time.monotonicNs() - resolved_filter_start_ns else 0;
     const convert_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;

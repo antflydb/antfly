@@ -40816,6 +40816,16 @@ test "relational table full-text search loads stored_data from base rows" {
     try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
     try std.testing.expectEqualStrings("row:a", filtered.hits[0].id);
 
+    var top_level_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .numeric_range = .{ .field = "amount", .min = 70.0 } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer top_level_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), top_level_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", top_level_filtered.hits[0].id);
+
     var bool_filtered = try db.search(alloc, .{
         .index_name = "ft_v1",
         .query = .{ .match = .{ .field = "title", .text = "hello" } },
