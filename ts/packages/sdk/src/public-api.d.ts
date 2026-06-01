@@ -8293,7 +8293,7 @@ export interface components {
             checkpoint_path: string;
             prefix: string;
             num_tokens: number;
-            /** @description Each result is an array of ClassifyResult sorted by score descending. */
+            /** @description Token classification predictions sorted by score descending. */
             predictions: components["schemas"]["InferenceDocumentTokenClassificationPrediction"][];
         };
         /**
