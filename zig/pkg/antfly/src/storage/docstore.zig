@@ -305,8 +305,10 @@ pub const OwnedKVPair = struct {
 pub const ReplayIterationStats = struct {
     scanned_entries: usize = 0,
     matched_entries: usize = 0,
+    last_sequence: u64 = 0,
     hint_filter_skips: usize = 0,
     scan_batches: usize = 0,
+    fallback_used: bool = false,
 };
 
 // ============================================================================
@@ -1239,6 +1241,32 @@ pub const DocStore = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !void {
         if (!(try self.hasReplayEntries())) return error.ReplayIndexUnavailable;
+        _ = try self.forEachReplayLaneFrom(kind_ordinal, from_sequence, 0, ctx, callback);
+    }
+
+    pub fn forEachReplayLaneFrom(
+        self: *DocStore,
+        kind_ordinal: u8,
+        from_sequence: u64,
+        max_entries: usize,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
+    ) !ReplayIterationStats {
+        if (!(try self.hasReplayEntries())) return error.ReplayIndexUnavailable;
+
+        switch (self.kind) {
+            .runtime => {
+                const lane_stats = try self.runtime_store.forEachReplayLaneFrom(kind_ordinal, from_sequence, max_entries, ctx, callback);
+                return .{
+                    .scanned_entries = lane_stats.scanned_entries,
+                    .matched_entries = lane_stats.matched_entries,
+                    .last_sequence = lane_stats.last_sequence,
+                    .scan_batches = lane_stats.scan_batches,
+                    .fallback_used = lane_stats.fallback_used,
+                };
+            },
+            .lmdb => {},
+        }
 
         var txn = try self.beginCurrentScanTxn();
         defer txn.abort();
@@ -1250,12 +1278,18 @@ pub const DocStore = struct {
         const upper = internal_keys.replayRangeUpper(kind_ordinal);
         cur.setUpperBound(upper[0..]);
 
+        var stats = ReplayIterationStats{ .scan_batches = 1 };
         var entry = try cur.seekAtOrAfter(lower[0..]);
         while (entry) |kv| : (entry = try cur.next()) {
             if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
             const sequence = internal_keys.parseReplayEntrySequence(kv.key, kind_ordinal) orelse break;
             try callback(ctx, sequence, kv.value);
+            stats.scanned_entries += 1;
+            stats.matched_entries += 1;
+            stats.last_sequence = sequence;
+            if (max_entries != 0 and stats.matched_entries >= max_entries) break;
         }
+        return stats;
     }
 
     pub fn iterateReplayEntriesFromHint(
@@ -1306,42 +1340,29 @@ pub const DocStore = struct {
         stats: *ReplayIterationStats,
     ) !void {
         const Context = struct {
-            required_hint_mask: u8 = 0,
-            stats: *ReplayIterationStats,
             callback_ctx: *anyopaque,
             callback: backend_erased.Store.ReplayCallback,
 
             fn pass(self_ctx: *@This(), sequence: u64, payload: []const u8) !void {
-                self_ctx.stats.scanned_entries += 1;
-                self_ctx.stats.matched_entries += 1;
-                try self_ctx.callback(self_ctx.callback_ctx, sequence, payload);
-            }
-
-            fn filter(self_ctx: *@This(), sequence: u64, payload: []const u8) !void {
-                self_ctx.stats.scanned_entries += 1;
-                if (self_ctx.required_hint_mask != 0 and !(try change_journal_mod.encodedRecordMatchesHintMask(payload, self_ctx.required_hint_mask))) {
-                    self_ctx.stats.hint_filter_skips += 1;
-                    return;
-                }
-                self_ctx.stats.matched_entries += 1;
                 try self_ctx.callback(self_ctx.callback_ctx, sequence, payload);
             }
         };
 
         var ctx = Context{
-            .required_hint_mask = required_hint_mask,
-            .stats = stats,
             .callback_ctx = callback_ctx,
             .callback = callback,
         };
-        if (replayHintFromSingleMask(required_hint_mask)) |hint| {
-            stats.scan_batches += 1;
-            const matched_before = stats.matched_entries;
-            try self.forEachReplayEntryFromOrdinal(from_sequence, replayHintOrdinal(hint), &ctx, Context.pass);
-            if (stats.matched_entries > matched_before) return;
-        }
-        stats.scan_batches += 1;
-        return try self.forEachReplayEntryFromOrdinal(from_sequence, internal_keys.replay_all_kind, &ctx, Context.filter);
+        const lane_stats = if (required_hint_mask == 0)
+            try self.forEachReplayLaneFrom(internal_keys.replay_all_kind, from_sequence, 0, &ctx, Context.pass)
+        else if (replayHintFromSingleMask(required_hint_mask)) |hint|
+            try self.forEachReplayLaneFrom(replayHintOrdinal(hint), from_sequence, 0, &ctx, Context.pass)
+        else
+            return error.Unsupported;
+        stats.scanned_entries += lane_stats.scanned_entries;
+        stats.matched_entries += lane_stats.matched_entries;
+        stats.last_sequence = lane_stats.last_sequence;
+        stats.scan_batches += lane_stats.scan_batches;
+        stats.fallback_used = lane_stats.fallback_used;
     }
 
     pub fn forEachReplayFromMatchingHint(

@@ -185,6 +185,14 @@ pub const ReplayEntry = struct {
     }
 };
 
+pub const ReplayLaneIterationStats = struct {
+    scanned_entries: usize = 0,
+    matched_entries: usize = 0,
+    last_sequence: u64 = 0,
+    scan_batches: usize = 0,
+    fallback_used: bool = false,
+};
+
 test "default backend capabilities assume ordered single-writer snapshots" {
     const caps: Capabilities = .{};
     try std.testing.expect(caps.ordered_ranges);

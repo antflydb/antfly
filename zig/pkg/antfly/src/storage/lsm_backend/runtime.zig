@@ -19,6 +19,7 @@ const Allocator = std.mem.Allocator;
 const backend_adapter = @import("../backend_adapter.zig");
 const backend_erased = @import("../backend_erased.zig");
 const backend_types = @import("../backend_types.zig");
+const internal_keys = @import("../internal_keys.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
 const cache_mod = @import("cache.zig");
 const repository_mod = @import("repository.zig");
@@ -258,6 +259,39 @@ pub fn BoundStore(comptime BackendType: type) type {
 
         pub fn beginCurrentScan(self: *@This()) !LocalCurrentScanTxn {
             return try LocalCurrentScanTxn.open(self.backend, self.namespace);
+        }
+
+        pub fn forEachReplayLaneFrom(
+            self: *@This(),
+            lane_ordinal: u8,
+            from_sequence: u64,
+            max_entries: usize,
+            ctx: *anyopaque,
+            callback: backend_erased.Store.ReplayCallback,
+        ) !backend_types.ReplayLaneIterationStats {
+            var scan = try LocalCurrentScanTxn.open(self.backend, self.namespace);
+            defer scan.abort();
+
+            var cursor = try scan.openCursor();
+            defer cursor.close();
+
+            const lower = internal_keys.replayRangeLower(lane_ordinal, from_sequence);
+            const upper = internal_keys.replayRangeUpper(lane_ordinal);
+            cursor.setUpperBound(upper[0..]);
+
+            var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
+            var entry = try cursor.seekAtOrAfter(lower[0..]);
+            while (entry) |kv| {
+                if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
+                const sequence = internal_keys.parseReplayEntrySequence(kv.key, lane_ordinal) orelse break;
+                try callback(ctx, sequence, kv.value);
+                stats.scanned_entries += 1;
+                stats.matched_entries += 1;
+                stats.last_sequence = sequence;
+                if (max_entries != 0 and stats.matched_entries >= max_entries) break;
+                entry = try cursor.next();
+            }
+            return stats;
         }
 
         pub fn beginWrite(self: *@This()) !LocalWriteTxn {

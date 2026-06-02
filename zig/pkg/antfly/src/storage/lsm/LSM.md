@@ -1074,13 +1074,20 @@ Near-term task list:
    onto a probe path.
 5. [x] Keep `ProbeTxn` point-read only by splitting replay scans onto a
    dedicated current-scan contract.
-6. [ ] Add native LSM/runtime replay-lane iteration so replay workers no longer
+6. [x] Add native LSM/runtime replay-lane iteration so replay workers no longer
    scan the replay-all lane and decode hint masks in userland.
    - [x] First slice: `DocStore` and the erased store API now expose streaming
      replay iteration by hint mask. Single-hint scans use the per-hint replay
-     lane directly, with an all-lane fallback only for older stores missing
-     hint-lane rows, and derived replay source uses this streaming API for
+     lane directly, and derived replay source uses this streaming API for
      chunk collection.
+   - [x] Native runtime slice: erased stores now expose
+     `forEachReplayLaneFrom`, LSM and memory runtime stores implement it as a
+     lane-bounded replay scan, and `DocStore` delegates runtime replay
+     iteration through that API instead of opening a generic current-scan
+     cursor.
+   - [x] Compatibility cleanup: hinted replay no longer falls back to the
+     replay-all lane. Missing hint-lane rows produce no hinted work; the
+     replay-all lane remains for unhinted/all-lane consumers.
 7. [ ] Export replay-live scan metrics so we can compare:
    - replay sequences scanned
    - replay scan batches

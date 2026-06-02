@@ -19,6 +19,7 @@ const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_types = @import("backend_types.zig");
 const change_journal_mod = @import("db/derived/change_journal.zig");
+const internal_keys = @import("internal_keys.zig");
 
 pub const types = backend_types;
 
@@ -42,6 +43,14 @@ fn allocBox(allocator: Allocator, value: anytype) !*Box(@TypeOf(value)) {
 fn wrapperBoxAllocator(fallback: Allocator) Allocator {
     const effective_fallback = if (!builtin.single_threaded) std.heap.smp_allocator else fallback;
     return platform.allocator.processAllocator(effective_fallback);
+}
+
+fn replayHintOrdinalFromSingleMask(mask: u8) ?u8 {
+    if (mask == 0 or (mask & (mask - 1)) != 0) return null;
+    inline for (std.meta.fields(change_journal_mod.TargetHint)) |field| {
+        if (mask == (@as(u8, 1) << @intCast(field.value))) return @intCast(field.value);
+    }
+    return null;
 }
 
 pub const Cursor = struct {
@@ -478,6 +487,7 @@ pub const Store = struct {
         append_replay_opaque: ?*const fn (Allocator, *anyopaque, u64, []const u8) anyerror!void = null,
         iterate_replay_from: ?*const fn (Allocator, *anyopaque, u64) anyerror![]ReplayEntry = null,
         for_each_replay_from: ?*const fn (*anyopaque, u64, *anyopaque, ReplayCallback) anyerror!void = null,
+        for_each_replay_lane_from: ?*const fn (*anyopaque, u8, u64, usize, *anyopaque, ReplayCallback) anyerror!backend_types.ReplayLaneIterationStats = null,
         for_each_replay_from_matching_hint_mask: ?*const fn (*anyopaque, u64, u8, *anyopaque, ReplayCallback) anyerror!void = null,
         truncate_replay_up_to: ?*const fn (Allocator, *anyopaque, u64) anyerror!void = null,
     };
@@ -622,16 +632,48 @@ pub const Store = struct {
             };
             return try f(self.ptr, from_sequence, required_hint_mask, ctx, Adapter.call);
         }
+        if (self.vtable.for_each_replay_lane_from) |f| {
+            const Adapter = struct {
+                fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
+                    const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
+                    return try callback(typed_ctx, sequence, payload);
+                }
+            };
+            const lane_ordinal = if (required_hint_mask == 0)
+                internal_keys.replay_all_kind
+            else if (replayHintOrdinalFromSingleMask(required_hint_mask)) |ordinal|
+                ordinal
+            else
+                return error.Unsupported;
+            _ = try f(self.ptr, lane_ordinal, from_sequence, 0, ctx, Adapter.call);
+            return;
+        }
 
+        if (required_hint_mask != 0) return error.Unsupported;
         const entries = try self.iterateReplayFrom(self.allocator, from_sequence);
         defer {
             for (entries) |*entry| entry.deinit(self.allocator);
             self.allocator.free(entries);
         }
-        for (entries) |entry| {
-            if (required_hint_mask != 0 and !(try change_journal_mod.encodedRecordMatchesHintMask(entry.payload, required_hint_mask))) continue;
-            try callback(ctx, entry.sequence, entry.payload);
-        }
+        for (entries) |entry| try callback(ctx, entry.sequence, entry.payload);
+    }
+
+    pub fn forEachReplayLaneFrom(
+        self: *Store,
+        lane_ordinal: u8,
+        from_sequence: u64,
+        max_entries: usize,
+        ctx: anytype,
+        comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
+    ) !backend_types.ReplayLaneIterationStats {
+        const f = self.vtable.for_each_replay_lane_from orelse return error.Unsupported;
+        const Adapter = struct {
+            fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
+                const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
+                return try callback(typed_ctx, sequence, payload);
+            }
+        };
+        return try f(self.ptr, lane_ordinal, from_sequence, max_entries, ctx, Adapter.call);
     }
 
     pub fn truncateReplayUpTo(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {
@@ -1402,8 +1444,46 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
                 if (state.handle.vtable.for_each_replay_from_matching_hint_mask) |f| {
                     return try f(state.handle.ptr, from_sequence, required_hint_mask, callback_ctx, callback);
                 }
+                if (state.handle.vtable.for_each_replay_lane_from) |f| {
+                    const lane_ordinal = if (required_hint_mask == 0)
+                        internal_keys.replay_all_kind
+                    else if (replayHintOrdinalFromSingleMask(required_hint_mask)) |ordinal|
+                        ordinal
+                    else
+                        return error.Unsupported;
+                    _ = try f(state.handle.ptr, lane_ordinal, from_sequence, 0, callback_ctx, callback);
+                    return;
+                }
             } else if (@hasDecl(Handle, "forEachReplayFromMatchingHintMask")) {
                 return try unbox(ptr).handle.forEachReplayFromMatchingHintMask(from_sequence, required_hint_mask, callback_ctx, callback);
+            } else if (@hasDecl(Handle, "forEachReplayLaneFrom")) {
+                const lane_ordinal = if (required_hint_mask == 0)
+                    internal_keys.replay_all_kind
+                else if (replayHintOrdinalFromSingleMask(required_hint_mask)) |ordinal|
+                    ordinal
+                else
+                    return error.Unsupported;
+                _ = try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, 0, callback_ctx, callback);
+                return;
+            }
+            return error.Unsupported;
+        }
+
+        fn forEachReplayLaneFrom(
+            ptr: *anyopaque,
+            lane_ordinal: u8,
+            from_sequence: u64,
+            max_entries: usize,
+            callback_ctx: *anyopaque,
+            callback: Store.ReplayCallback,
+        ) anyerror!backend_types.ReplayLaneIterationStats {
+            if (Handle == Store) {
+                const state = unbox(ptr);
+                if (state.handle.vtable.for_each_replay_lane_from) |f| {
+                    return try f(state.handle.ptr, lane_ordinal, from_sequence, max_entries, callback_ctx, callback);
+                }
+            } else if (@hasDecl(Handle, "forEachReplayLaneFrom")) {
+                return try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, max_entries, callback_ctx, callback);
             }
             return error.Unsupported;
         }
@@ -1439,6 +1519,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             .append_replay_opaque = vt.appendReplayOpaque,
             .iterate_replay_from = vt.iterateReplayFrom,
             .for_each_replay_from = vt.forEachReplayFrom,
+            .for_each_replay_lane_from = vt.forEachReplayLaneFrom,
             .for_each_replay_from_matching_hint_mask = vt.forEachReplayFromMatchingHintMask,
             .truncate_replay_up_to = vt.truncateReplayUpTo,
         },
