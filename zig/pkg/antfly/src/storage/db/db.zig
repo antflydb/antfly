@@ -68,6 +68,7 @@ const mem_backend_mod = @import("../mem_backend.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const schema_mod = @import("../schema.zig");
+const schema_api_mod = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
 const transactions_mod = @import("../transactions.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
@@ -87,7 +88,11 @@ const traversal_mod = @import("../../graph/traversal.zig");
 const paths_mod = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
+const search_mod = @import("../../search/search.zig");
+const search_geo_mod = @import("../../search/geo.zig");
 const mapper = @import("document_mapper.zig");
+const relational_row_codec = @import("algebraic/relational_row_codec.zig");
+const relational_store_mod = @import("relational_store.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
 const planning_stats_mod = @import("planning_stats.zig");
@@ -166,6 +171,7 @@ pub const OpenOptions = struct {
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
+pub const local_schema_json_key = "\x00\x00__metadata__:schema_json";
 pub const ReplayProgress = struct {
     sequence: u64 = 0,
     target_sequence: u64 = 0,
@@ -238,6 +244,7 @@ const AsyncContext = struct {
     dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
+    relational_base_rows: bool = false,
     applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
     stats: AsyncContentionStats = .{},
 
@@ -655,6 +662,7 @@ const BatchExecutionContext = struct {
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
     async_context: ?*AsyncContext = null,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
+    relational_base_rows: bool = false,
 };
 
 const ReplayApplyContext = struct {
@@ -2277,7 +2285,16 @@ pub const DB = struct {
             .io = self.backend_runtime.io(),
             .enrichment_runtime = self.enrichment_runtime,
             .async_context = self.async_context,
+            .relational_base_rows = self.relationalColumnsForStore() != null,
         };
+    }
+
+    // Hand the durable-jobs lane to the index manager so algebraic indexes can
+    // run HLL cardinality maintenance off the foreground write path, and so that
+    // adaptively promoted sketches are reloaded and backfilled on a live server.
+    fn attachAlgebraicHllMaintenanceLane(self: *DB) void {
+        const runtime = self.backend_runtime;
+        self.core.index_manager.attachHllMaintenance(runtime.durable_jobs, runtime.allocOwnerId());
     }
 
     fn hydrateAlgebraicObservationStatusBestEffort(self: *DB) void {
@@ -2438,6 +2455,7 @@ pub const DB = struct {
                 profile.init_optional_runtimes_ns = elapsedSince(init_optional_started_ns);
             }
 
+            db.attachAlgebraicHllMaintenanceLane();
             if (opts.open_mode == .status_only) {
                 try db.core.loadIndexCatalogOnly();
             } else if (opts.open_mode == .query_readonly) {
@@ -2537,6 +2555,7 @@ pub const DB = struct {
             .io = self.backend_runtime.io(),
             .query_visibility_hook = null,
             .text_merge_runtime = null,
+            .relational_base_rows = self.relationalColumnsForStore() != null,
         };
         self.executor.* = try derived_executor_mod.init(
             self.runtime_alloc,
@@ -2571,6 +2590,8 @@ pub const DB = struct {
 
     fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
         if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return;
+        var runtime_enrichment_cfg = enrichment_cfg;
+        runtime_enrichment_cfg.relational_base_rows = self.relationalColumnsForStore() != null;
 
         const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
         errdefer self.runtime_alloc.destroy(append_ctx);
@@ -2602,7 +2623,7 @@ pub const DB = struct {
             self.executor,
             notifyDerivedExecutorSequence,
             self.backend_runtime,
-            enrichment_cfg,
+            runtime_enrichment_cfg,
         );
         errdefer runtime.deinit();
         self.enrichment_append_context = append_ctx;
@@ -2627,6 +2648,7 @@ pub const DB = struct {
                 .identity_namespace = batch_resources.identity_namespace,
                 .executor = self.executor,
                 .enrichment_runtime = self.enrichment_runtime,
+                .relational_base_rows = self.relationalColumnsForStore() != null,
             },
             .grace_period_ns = cfg.grace_period_ns,
         };
@@ -2653,6 +2675,8 @@ pub const DB = struct {
             .store = self.core.store,
             .identity_namespace = self.core.identity_namespace,
             .alloc = self.runtime_alloc,
+            .relational_base_rows = self.relationalColumnsForStore() != null,
+            .relational_columns = self.relationalColumnsForStore() orelse &.{},
         };
         var effective_cfg = cfg;
         effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
@@ -3269,6 +3293,19 @@ pub const DB = struct {
             for (owned_delete_keys.items) |key| self.alloc.free(key);
             owned_delete_keys.deinit(self.alloc);
         }
+        var relational_participant = relational_store_mod.WriteParticipant.initWithColumnIndexPolicy(
+            self.alloc,
+            self.core.store,
+            &store_writes,
+            &delete_keys,
+            &owned_store_keys,
+            &owned_store_values,
+            self.relationalColumnIndexPolicyForStore(),
+        );
+        var relational_participant_prepared = false;
+        var relational_participant_closed = false;
+        defer if (relational_participant_prepared and !relational_participant_closed)
+            relational_participant.abort(null);
         var graph_artifact_clears = std.ArrayListUnmanaged(GraphArtifactClear).empty;
         defer {
             for (graph_artifact_clears.items) |*item| item.deinit(self.alloc);
@@ -3366,22 +3403,44 @@ pub const DB = struct {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_artifacts_ns, graph_artifacts_start_ns);
             if (extracted[i].cleaned_value) |cleaned| {
                 const strip_store_value_start_ns = monotonicTimeNs();
-                const store_value = try strippedStoredDocumentValueAlloc(
-                    self.alloc,
-                    cleaned,
-                    vector_store_field_names,
-                    &owned_store_values,
-                );
+                // Relational tables project the document once into a typed row
+                // and store that row as the table's only base document record.
+                // Document-mode tables keep the JSON blob under the primary
+                // document key.
+                const relational_columns = self.relationalColumnsForStore();
+                const store_value = if (relational_columns) |columns|
+                    try relationalStoreRowValueAlloc(self.alloc, cleaned, columns, &owned_store_values)
+                else
+                    try strippedStoredDocumentValueAlloc(
+                        self.alloc,
+                        cleaned,
+                        vector_store_field_names,
+                        &owned_store_values,
+                    );
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
-                const store_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
-                try owned_store_keys.append(self.alloc, store_key);
+                const store_key = if (relational_columns != null) blk: {
+                    const row_write_index = store_writes.items.len;
+                    try relational_participant.prepareUpsert("", write.key, store_value, null);
+                    relational_participant_prepared = true;
+                    const primary_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
+                    var primary_key_owned = true;
+                    errdefer if (primary_key_owned) self.alloc.free(primary_key);
+                    try owned_delete_keys.append(self.alloc, primary_key);
+                    primary_key_owned = false;
+                    try delete_keys.append(self.alloc, primary_key);
+                    break :blk store_writes.items[row_write_index].key;
+                } else blk: {
+                    const key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
+                    try owned_store_keys.append(self.alloc, key);
+                    try store_writes.append(self.alloc, .{
+                        .key = key,
+                        .value = store_value,
+                    });
+                    break :blk key;
+                };
                 try overwrite_probe_entries.append(self.alloc, .{
                     .key = store_key,
                     .write_index = i,
-                });
-                try store_writes.append(self.alloc, .{
-                    .key = store_key,
-                    .value = store_value,
                 });
                 try identity_upsert_keys.append(self.alloc, write.key);
                 try identity_upsert_write_indexes.append(self.alloc, i);
@@ -3480,9 +3539,20 @@ pub const DB = struct {
             try appendUniqueOwnedKey(self.alloc, &changed_graph_artifact_keys, artifact_key);
         }
         for (effective_req.deletes) |key| {
-            const store_key = try internal_keys.documentKeyAlloc(self.alloc, key);
-            try owned_delete_keys.append(self.alloc, store_key);
-            try delete_keys.append(self.alloc, store_key);
+            if (self.relationalColumnsForStore() != null) {
+                try relational_participant.prepareDelete("", key, null);
+                relational_participant_prepared = true;
+                const primary_key = try internal_keys.documentKeyAlloc(self.alloc, key);
+                var primary_key_owned = true;
+                errdefer if (primary_key_owned) self.alloc.free(primary_key);
+                try owned_delete_keys.append(self.alloc, primary_key);
+                primary_key_owned = false;
+                try delete_keys.append(self.alloc, primary_key);
+            } else {
+                const store_key = try internal_keys.documentKeyAlloc(self.alloc, key);
+                try owned_delete_keys.append(self.alloc, store_key);
+                try delete_keys.append(self.alloc, store_key);
+            }
             if (shouldWriteTimestamp(key)) {
                 const timestamp_key = try makeTimestampKey(self.alloc, key);
                 try timestamp_delete_keys.append(self.alloc, timestamp_key);
@@ -3654,6 +3724,10 @@ pub const DB = struct {
             },
             store_batch_options,
         );
+        if (relational_participant_prepared) {
+            try relational_participant.commit(null, sequence);
+            relational_participant_closed = true;
+        }
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
         }
@@ -4221,9 +4295,13 @@ pub const DB = struct {
     }
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
+        if (self.relationalColumnsForStore() != null and !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) {
+            return try relational_store_mod.getMaterializedAlloc(alloc, self.core.store, key);
+        }
         const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
         defer alloc.free(store_key);
-        return try self.core.getStoreValue(alloc, store_key);
+        const value = try self.core.getStoreValue(alloc, store_key) orelse return null;
+        return try mapper.materializeOwnedDocumentValueAlloc(alloc, value);
     }
 
     pub fn getGroupCreatedAtMillis(self: *DB, alloc: Allocator, group_id: u64) !?u64 {
@@ -4275,7 +4353,7 @@ pub const DB = struct {
     }
 
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
-        if (!internal_keys.isInternalUserKey(key) and (try isExpiredDocumentKey(self, alloc, key))) return null;
+        if (!internal_keys.isInternalPhysicalTableDataKey(key) and (try isExpiredDocumentKey(self, alloc, key))) return null;
         const raw = try self.get(alloc, key) orelse return null;
         defer alloc.free(raw);
         const stored = try projectLookupStoredBytes(self, alloc, key, raw, opts);
@@ -4283,7 +4361,7 @@ pub const DB = struct {
     }
 
     pub fn getTimestamp(self: *DB, alloc: Allocator, key: []const u8) !u64 {
-        if (internal_keys.isInternalUserKey(key)) return 0;
+        if (internal_keys.isInternalPhysicalTableDataKey(key)) return 0;
         return try self.core.readTimestamp(alloc, key);
     }
 
@@ -4304,15 +4382,19 @@ pub const DB = struct {
         const upper = if (byte_range.end.len > 0) try self.core.documentRangeUpperAlloc(byte_range.end) else null;
         defer if (upper) |buf| self.core.alloc.free(buf);
 
+        const skip_fn = if (self.relationalColumnsForStore() != null)
+            &skipNonRelationalMedianKey
+        else
+            &skipNonPrimaryMedianKey;
         const internal_key = self.core.findMedianStoreKey(alloc, lower, if (upper) |buf| buf else "", .{
-            .skip_fn = &skipNonPrimaryMedianKey,
+            .skip_fn = skip_fn,
         }) catch |err| switch (err) {
             error.NotFound => return try doc_identity.findMedianDocIdAlloc(alloc, self.core.store, byte_range.start, byte_range.end),
             else => return err,
         };
         defer alloc.free(internal_key);
 
-        return (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, internal_key)) orelse error.NotFound;
+        return (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, internal_key)) orelse error.NotFound;
     }
 
     pub fn getSplitState(self: *DB, alloc: Allocator) !?types.SplitState {
@@ -4437,6 +4519,7 @@ pub const DB = struct {
             self.index_backends,
         );
         errdefer shadow_manager.deinit();
+        shadow_manager.setRelationalBaseRows(self.relationalColumnsForStore() != null);
 
         const shadow_start = try self.alloc.dupe(u8, split_key);
         errdefer self.alloc.free(shadow_start);
@@ -4812,8 +4895,167 @@ pub const DB = struct {
         self.core.index_manager.clearDenseHbcCaches();
     }
 
-    pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
+    fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
         try self.core.setSchema(table_schema);
+        self.refreshSchemaRuntimeSideEffects();
+    }
+
+    fn refreshSchemaRuntimeSideEffects(self: *DB) void {
+        const relational_base_rows = self.relationalColumnsForStore() != null;
+        self.async_context.relational_base_rows = relational_base_rows;
+        if (self.ttl_cleanup_context) |ctx| ctx.batch.relational_base_rows = relational_base_rows;
+        if (self.enrichment_runtime) |runtime| runtime.setRelationalBaseRows(relational_base_rows);
+        if (self.transaction_recovery_identity_context) |ctx| {
+            ctx.relational_base_rows = relational_base_rows;
+            ctx.relational_columns = self.relationalColumnsForStore() orelse &.{};
+        }
+    }
+
+    pub const ApplyTableSchemaOptions = struct {
+        persist_local_schema_json: bool = true,
+        reload_algebraic_schema_configs: bool = true,
+    };
+
+    /// Apply table metadata schema JSON to the DB runtime and all schema-derived
+    /// local artifacts. This is the single production entry point for table
+    /// schema application so write-cache reconciliation, metadata provisioning,
+    /// and crash recovery keep algebraic sidecars in the same lifecycle state.
+    pub fn applyTableSchemaJson(
+        self: *DB,
+        alloc: Allocator,
+        schema_json: []const u8,
+        options: ApplyTableSchemaOptions,
+    ) !void {
+        if (schema_json.len == 0) return;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+
+        var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+
+        const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        try self.validateTableSchemaCompatibilityLocked(alloc, runtime_schema);
+        if (options.reload_algebraic_schema_configs) {
+            try self.stageAlgebraicSchemaConfigsPending(schema_json);
+        }
+        if (options.persist_local_schema_json) {
+            try self.setSchemaWithLocalSchemaJson(runtime_schema, schema_json);
+        } else {
+            try self.setSchema(runtime_schema);
+        }
+        if (options.reload_algebraic_schema_configs) {
+            try self.completePendingAlgebraicSchemaRebuilds();
+        }
+    }
+
+    fn validateTableSchemaCompatibilityLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
+        if (self.core.schema) |current_schema| {
+            return validateRuntimeTableSchemaTransition(current_schema, next_schema);
+        }
+
+        const durable_schema = try schema_mod.loadSchema(self.core.store, alloc);
+        defer if (durable_schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+        if (durable_schema) |current_schema| {
+            return validateRuntimeTableSchemaTransition(current_schema, next_schema);
+        }
+
+        try self.validateFirstTableSchemaApplyAgainstExistingRows(alloc, next_schema);
+    }
+
+    fn validateRuntimeTableSchemaTransition(current_schema: schema_mod.TableSchema, next_schema: schema_mod.TableSchema) !void {
+        if (current_schema.storage_mode != next_schema.storage_mode) return error.InvalidSchemaUpdateRequest;
+        if (next_schema.storage_mode != .relational) return;
+        if (!schema_mod.relationalColumnCatalogsEqual(current_schema.relational_columns, next_schema.relational_columns)) {
+            return error.InvalidSchemaUpdateRequest;
+        }
+    }
+
+    const ExistingPhysicalStorageMode = enum {
+        empty,
+        document,
+        relational,
+        mixed,
+    };
+
+    fn validateFirstTableSchemaApplyAgainstExistingRows(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
+        const existing_mode = try self.detectExistingPhysicalStorageMode(alloc);
+        switch (existing_mode) {
+            .empty => return,
+            .document => if (next_schema.storage_mode != .document) return error.InvalidSchemaUpdateRequest,
+            .relational => if (next_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest,
+            .mixed => return error.InvalidSchemaUpdateRequest,
+        }
+    }
+
+    fn detectExistingPhysicalStorageMode(self: *DB, alloc: Allocator) !ExistingPhysicalStorageMode {
+        const lower = [_]u8{internal_keys.user_namespace};
+        const upper = [_]u8{internal_keys.user_namespace + 1};
+        const rows = try self.core.store.scanRange(alloc, lower[0..], upper[0..]);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+
+        var saw_document = false;
+        var saw_relational = false;
+        for (rows) |entry| {
+            if (internal_keys.isPrimaryDocumentKey(entry.key)) {
+                saw_document = true;
+            } else if (internal_keys.isRelationalRowKey(entry.key)) {
+                saw_relational = true;
+            }
+            if (saw_document and saw_relational) return .mixed;
+        }
+
+        if (saw_document) return .document;
+        if (saw_relational) return .relational;
+        return .empty;
+    }
+
+    /// Returns the relational column catalog when the table is in relational
+    /// storage mode (so document writes store a dedicated relational base row),
+    /// or null for document-mode tables (which keep the JSON blob).
+    fn relationalColumnsForStore(self: *DB) ?[]const schema_mod.RelationalColumn {
+        const schema = self.core.schema orelse return null;
+        if (schema.storage_mode != .relational) return null;
+        return schema.relational_columns;
+    }
+
+    fn relationalColumnIndexPolicyForStore(self: *DB) relational_store_mod.ColumnIndexPolicy {
+        const columns = self.relationalColumnsForStore() orelse return relational_store_mod.ColumnIndexPolicy.all();
+        return relational_store_mod.ColumnIndexPolicy.fromColumns(columns);
+    }
+
+    /// Refresh schema-derived algebraic index configs for callers that have
+    /// already applied the runtime schema. This remains a structural mutation:
+    /// config swaps, sidecar clears, and rebuild replay are serialized with
+    /// normal apply work just like `applyTableSchemaJson`.
+    pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
+        if (schema_json.len == 0) return;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        try self.core.index_manager.reloadAlgebraicSchemaConfigs(self.core.store, schema_json);
+    }
+
+    fn stageAlgebraicSchemaConfigsPending(self: *DB, schema_json: []const u8) !void {
+        try self.core.index_manager.stageAlgebraicSchemaConfigsPending(self.core.store, schema_json);
+    }
+
+    fn completePendingAlgebraicSchemaRebuilds(self: *DB) !void {
+        try self.core.index_manager.completePendingAlgebraicSchemaRebuilds(self.core.store);
+    }
+
+    fn setSchemaWithLocalSchemaJson(self: *DB, table_schema: schema_mod.TableSchema, schema_json: []const u8) !void {
+        const metadata_puts = [_]schema_mod.SchemaMetadataPut{.{
+            .key = local_schema_json_key,
+            .value = schema_json,
+        }};
+        try self.core.setSchemaWithMetadata(table_schema, metadata_puts[0..]);
+        self.refreshSchemaRuntimeSideEffects();
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
@@ -4842,17 +5084,42 @@ pub const DB = struct {
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
+        var relational_intents = std.ArrayListUnmanaged(transactions_mod.WriteIntent).empty;
+        defer relational_intents.deinit(self.alloc);
+        var owned_relational_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_relational_values.items) |value| self.alloc.free(value);
+            owned_relational_values.deinit(self.alloc);
+        }
+        const effective_intents = blk: {
+            const relational_columns = self.relationalColumnsForStore() orelse break :blk intents;
+            for (intents) |intent| {
+                const value = if (intent.value) |raw|
+                    if (isMetadataKey(intent.key) or internal_keys.isInternalPhysicalTableDataKey(intent.key))
+                        raw
+                    else
+                        try relationalStoreRowValueAlloc(self.alloc, raw, relational_columns, &owned_relational_values)
+                else
+                    null;
+                try relational_intents.append(self.alloc, .{
+                    .key = intent.key,
+                    .value = value,
+                });
+            }
+            break :blk relational_intents.items;
+        };
+
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(self.alloc);
-        for (intents) |intent| {
-            if (intent.value == null or isMetadataKey(intent.key)) continue;
+        for (effective_intents) |intent| {
+            if (intent.value == null or isMetadataKey(intent.key) or internal_keys.isInternalPhysicalTableDataKey(intent.key)) continue;
             try identity_upsert_keys.append(self.alloc, intent.key);
         }
 
         lockApply(self);
         defer self.core.unlockApply();
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
-        try self.core.writeIntents(txn_id, intents, predicates);
+        try self.core.writeIntents(txn_id, effective_intents, predicates);
     }
 
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
@@ -4919,14 +5186,32 @@ pub const DB = struct {
             }
             identity_writes.deinit(self.alloc);
         }
+        var relational_extra_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer {
+            for (relational_extra_writes.items) |item| {
+                self.alloc.free(@constCast(item.key));
+                self.alloc.free(@constCast(item.value));
+            }
+            relational_extra_writes.deinit(self.alloc);
+        }
+        var relational_extra_deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (relational_extra_deletes.items) |key| self.alloc.free(@constCast(key));
+            relational_extra_deletes.deinit(self.alloc);
+        }
+        var relational_skip_intent_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (relational_skip_intent_keys.items) |key| self.alloc.free(@constCast(key));
+            relational_skip_intent_keys.deinit(self.alloc);
+        }
 
         if (status == .committed) {
             try self.core.collectTransactionIntentDocumentKeys(self.alloc, txn_id, &raw_identity_upserts, &raw_identity_deletes);
             for (raw_identity_upserts.items) |key| {
-                if (!isMetadataKey(key)) try identity_upserts.append(self.alloc, key);
+                if (!isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) try identity_upserts.append(self.alloc, key);
             }
             for (raw_identity_deletes.items) |key| {
-                if (!isMetadataKey(key)) try identity_deletes.append(self.alloc, key);
+                if (!isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) try identity_deletes.append(self.alloc, key);
             }
             try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
                 self.alloc,
@@ -4937,11 +5222,77 @@ pub const DB = struct {
                 identity_upserts.items,
                 identity_deletes.items,
             );
+            if (self.relationalColumnsForStore() != null) {
+                const mutations = try self.core.collectTransactionIntentMutations(self.alloc, txn_id);
+                defer {
+                    for (mutations) |*mutation| mutation.deinit(self.alloc);
+                    if (mutations.len > 0) self.alloc.free(mutations);
+                }
+                for (mutations) |mutation| {
+                    if (isMetadataKey(mutation.key) or internal_keys.isInternalPhysicalTableDataKey(mutation.key)) continue;
+                    const skip_key = try self.alloc.dupe(u8, mutation.key);
+                    var skip_key_owned = true;
+                    errdefer if (skip_key_owned) self.alloc.free(skip_key);
+                    try relational_skip_intent_keys.append(self.alloc, skip_key);
+                    skip_key_owned = false;
+
+                    const primary_key = try internal_keys.documentKeyAlloc(self.alloc, mutation.key);
+                    var primary_key_owned = true;
+                    errdefer if (primary_key_owned) self.alloc.free(primary_key);
+                    try relational_extra_deletes.append(self.alloc, primary_key);
+                    primary_key_owned = false;
+
+                    if (mutation.value) |value| {
+                        const row_value = try self.alloc.dupe(u8, value);
+                        var row_value_owned = true;
+                        errdefer if (row_value_owned) self.alloc.free(row_value);
+                        try relational_store_mod.appendUpsertOwnedBatchWithColumnIndexPolicy(
+                            self.alloc,
+                            self.core.store,
+                            &relational_extra_writes,
+                            &relational_extra_deletes,
+                            mutation.key,
+                            row_value,
+                            self.relationalColumnIndexPolicyForStore(),
+                        );
+                        row_value_owned = false;
+                        if (shouldWriteTimestamp(mutation.key)) {
+                            const timestamp_key = try makeTimestampKey(self.alloc, mutation.key);
+                            var timestamp_key_owned = true;
+                            errdefer if (timestamp_key_owned) self.alloc.free(timestamp_key);
+                            const timestamp_value = try encodeTimestampValue(self.alloc, commit_version);
+                            var timestamp_value_owned = true;
+                            errdefer if (timestamp_value_owned) self.alloc.free(timestamp_value);
+                            try relational_extra_writes.append(self.alloc, .{ .key = timestamp_key, .value = timestamp_value });
+                            timestamp_key_owned = false;
+                            timestamp_value_owned = false;
+                        }
+                    } else {
+                        try relational_store_mod.appendDeleteOwnedBatch(
+                            self.alloc,
+                            self.core.store,
+                            &relational_extra_deletes,
+                            mutation.key,
+                        );
+                        if (shouldWriteTimestamp(mutation.key)) {
+                            const timestamp_key = try makeTimestampKey(self.alloc, mutation.key);
+                            var timestamp_key_owned = true;
+                            errdefer if (timestamp_key_owned) self.alloc.free(timestamp_key);
+                            try relational_extra_deletes.append(self.alloc, timestamp_key);
+                            timestamp_key_owned = false;
+                        }
+                    }
+                }
+            }
         }
 
         const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
+        try identity_writes.appendSlice(self.alloc, relational_extra_writes.items);
+        relational_extra_writes.clearRetainingCapacity();
         try self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
             .writes = identity_writes.items,
+            .deletes = relational_extra_deletes.items,
+            .skip_intent_keys = relational_skip_intent_keys.items,
         });
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
@@ -5414,6 +5765,9 @@ pub const DB = struct {
         var changed: u64 = 0;
         for (self.core.index_manager.algebraic_indexes.items) |*entry| {
             changed += try entry.index.evaluateAdaptiveCandidates(self.core.store, target_sequence);
+            // Promote + backfill recurring cardinality observations into HLL
+            // sketches here (leader-gated), not on the read path.
+            changed += try entry.index.evaluateHllCardinalityCandidates(self.core.store);
         }
         return changed;
     }
@@ -6840,14 +7194,20 @@ pub const DB = struct {
         defer self.core.alloc.free(lower);
         const docs = try self.core.scanStoreRange(alloc, lower, "");
         defer docstore_mod.DocStore.freeResults(alloc, docs);
+        var materialized_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (materialized_values.items) |value| alloc.free(value);
+            materialized_values.deinit(alloc);
+        }
         const chunk_size: usize = 128;
         var index: usize = 0;
         var generated_ref_count: usize = 0;
+        const relational_base_rows = self.relationalColumnsForStore() != null;
         while (index < docs.len) {
             var write_count: usize = 0;
             var probe = index;
             while (probe < docs.len and write_count < chunk_size) : (probe += 1) {
-                if (isPrimaryDocumentStoreKey(docs[probe].key)) write_count += 1;
+                if (isBaseDocumentStoreKeyForMode(relational_base_rows, docs[probe].key)) write_count += 1;
             }
             if (write_count == 0) break;
 
@@ -6867,14 +7227,20 @@ pub const DB = struct {
             var filled: usize = 0;
             while (index < docs.len and filled < write_count) : (index += 1) {
                 const doc = docs[index];
-                if (!isPrimaryDocumentStoreKey(doc.key)) continue;
-                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
+                if (!isBaseDocumentStoreKeyForMode(relational_base_rows, doc.key)) continue;
+                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
                 errdefer alloc.free(raw_key);
+                const doc_json = if (relational_base_rows)
+                    try mapper.materializeRelationalRowValueAlloc(alloc, doc.value)
+                else
+                    try mapper.materializeDocumentValueAlloc(alloc, doc.value);
+                errdefer alloc.free(doc_json);
+                try materialized_values.append(alloc, doc_json);
                 writes[filled] = .{
                     .key = raw_key,
-                    .value = doc.value,
+                    .value = doc_json,
                 };
-                extracted[filled] = try mapper.extractWrite(alloc, raw_key, doc.value);
+                extracted[filled] = try mapper.extractWrite(alloc, raw_key, doc_json);
                 extracted_initialized += 1;
                 filled += 1;
             }
@@ -7538,7 +7904,11 @@ pub const DB = struct {
         defer self.core.unlockApply();
         try doc_identity.reassignNamespaceAlloc(self.alloc, self.core.store, namespace);
         self.core.identity_namespace = namespace;
-        if (self.transaction_recovery_identity_context) |ctx| ctx.identity_namespace = namespace;
+        if (self.transaction_recovery_identity_context) |ctx| {
+            ctx.identity_namespace = namespace;
+            ctx.relational_base_rows = self.relationalColumnsForStore() != null;
+            ctx.relational_columns = self.relationalColumnsForStore() orelse &.{};
+        }
     }
 
     fn dbDocIdentityStats(raw: doc_identity.Stats, namespace: doc_identity.Namespace) types.DocIdentityStats {
@@ -8254,17 +8624,21 @@ pub const DB = struct {
 
         var doc_count: u64 = 0;
         const CountState = struct {
+            relational_base_rows: bool,
             doc_count: *u64,
 
             fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                 _ = value;
                 const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-                if (isPrimaryDocumentStoreKey(key)) state.doc_count.* += 1;
+                if (isBaseDocumentStoreKeyForMode(state.relational_base_rows, key)) state.doc_count.* += 1;
                 return .@"continue";
             }
         };
 
-        var state = CountState{ .doc_count = &doc_count };
+        var state = CountState{
+            .relational_base_rows = self.relationalColumnsForStore() != null,
+            .doc_count = &doc_count,
+        };
         try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, CountState.scanEntry);
         return doc_count;
     }
@@ -8284,14 +8658,15 @@ pub const DB = struct {
         var coverage = DocIdentityCoverage{};
         const ScanState = struct {
             alloc: Allocator,
+            relational_base_rows: bool,
             doc_ids: *std.ArrayListUnmanaged([]u8),
             coverage: *DocIdentityCoverage,
 
             fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                 _ = value;
                 const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-                if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
-                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.alloc, key)) orelse return .@"continue";
+                if (!isBaseDocumentStoreKeyForMode(state.relational_base_rows, key)) return .@"continue";
+                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.alloc, key)) orelse return .@"continue";
                 errdefer state.alloc.free(raw_key);
                 try state.doc_ids.append(state.alloc, raw_key);
                 state.coverage.scanned_primary_docs += 1;
@@ -8301,6 +8676,7 @@ pub const DB = struct {
 
         var scan_state = ScanState{
             .alloc = self.core.alloc,
+            .relational_base_rows = self.relationalColumnsForStore() != null,
             .doc_ids = &doc_ids,
             .coverage = &coverage,
         };
@@ -8360,9 +8736,10 @@ pub const DB = struct {
         }
 
         var count: u32 = 0;
+        const relational_base_rows = self.relationalColumnsForStore() != null;
         for (docs) |doc| {
-            if (!isPrimaryDocumentStoreKey(doc.key)) continue;
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
+            if (!isBaseDocumentStoreKeyForMode(relational_base_rows, doc.key)) continue;
+            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
             defer alloc.free(raw_key);
 
             if (!byte_range.contains(raw_key)) continue;
@@ -8377,7 +8754,13 @@ pub const DB = struct {
             }
             if (try isExpiredDocumentKey(self, alloc, raw_key)) continue;
 
-            const hash = std.hash.Wyhash.hash(0, doc.value);
+            const doc_json = if (relational_base_rows)
+                try mapper.materializeRelationalRowValueAlloc(alloc, doc.value)
+            else
+                try mapper.materializeDocumentValueAlloc(alloc, doc.value);
+            defer alloc.free(doc_json);
+
+            const hash = std.hash.Wyhash.hash(0, doc_json);
             try hashes.append(alloc, .{
                 .id = try alloc.dupe(u8, raw_key),
                 .hash = hash,
@@ -8386,7 +8769,7 @@ pub const DB = struct {
             if (opts.include_documents) {
                 try documents.append(alloc, .{
                     .id = try alloc.dupe(u8, raw_key),
-                    .json = try projectLookupStoredBytes(self, alloc, raw_key, doc.value, .{
+                    .json = try projectLookupStoredBytes(self, alloc, raw_key, doc_json, .{
                         .fields = opts.fields,
                         .include_all_fields = opts.include_all_fields,
                     }),
@@ -8598,6 +8981,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = req.identity_read_generation,
@@ -8615,6 +8999,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .all_docs_visible = allDocsVisibleCallback,
             .project_ordinals_to_doc_ids = false,
@@ -8646,8 +9031,10 @@ pub const DB = struct {
             .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
+            .load_projected_document = loadProjectedSearchDocumentCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .postprocess = postprocessTextSearchResultCallback,
         });
@@ -8995,6 +9382,392 @@ pub const DB = struct {
         return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, generation);
     }
 
+    fn resolveRelationalFilterDocSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (runtime_schema.storage_mode != .relational or runtime_schema.relational_columns.len == 0) return null;
+        return try self.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, query, generation);
+    }
+
+    fn resolveRelationalFilterQueryDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        if (!self.relationalFilterGenerationCanUseCurrentRows(generation)) return null;
+        return switch (query) {
+            .match_none => .none,
+            .match_all => try self.relationalAllRowsDocSetAlloc(alloc, generation),
+            .doc_id => |doc_id| try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_id.ids, generation),
+            .term => |term| try self.resolveRelationalTermFilterDocSetAlloc(alloc, runtime_schema, term, generation),
+            .term_range => |range| try self.resolveRelationalTermRangeFilterDocSetAlloc(alloc, runtime_schema, range, generation),
+            .numeric_range => |range| try self.resolveRelationalNumericFilterDocSetAlloc(alloc, runtime_schema, range, generation),
+            .date_range => |range| try self.resolveRelationalDateFilterDocSetAlloc(alloc, runtime_schema, range, generation),
+            .bool_field => |bool_query| try self.resolveRelationalBoolFieldFilterDocSetAlloc(alloc, runtime_schema, bool_query, generation),
+            .geo_distance => |geo_query| try self.resolveRelationalGeoDistanceFilterDocSetAlloc(alloc, runtime_schema, geo_query, generation),
+            .geo_bbox => |geo_query| try self.resolveRelationalGeoBBoxFilterDocSetAlloc(alloc, runtime_schema, geo_query, generation),
+            .bool_query => |bool_query| try self.resolveRelationalBoolQueryDocSetAlloc(alloc, runtime_schema, bool_query, generation),
+            else => null,
+        };
+    }
+
+    fn relationalFilterGenerationCanUseCurrentRows(self: *DB, generation: ?u64) bool {
+        const requested = generation orelse return true;
+        return requested == self.core.nextDerivedSequence();
+    }
+
+    fn relationalAllRowsDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocSet {
+        const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+        defer relational_store_mod.freeRows(alloc, rows);
+
+        var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+        defer doc_ids.deinit(alloc);
+        try doc_ids.ensureUnusedCapacity(alloc, rows.len);
+        for (rows) |row| doc_ids.appendAssumeCapacity(row.doc_key);
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids.items, generation);
+    }
+
+    fn resolveRelationalTermFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        term: search_mod.TermQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, term.field) orelse return null;
+        if (column.field_type != .keyword) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
+            wanted: []const u8,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                return value.value_type == .bytes_val and !value.is_json and std.mem.eql(u8, value.value.bytes_val, ctx.wanted);
+            }
+        }{ .wanted = term.term });
+    }
+
+    fn resolveRelationalTermRangeFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        range: search_mod.TermRangeQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, range.field) orelse return null;
+        if (column.field_type != .keyword) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
+            min: ?[]const u8,
+            max: ?[]const u8,
+            inclusive_min: bool,
+            inclusive_max: bool,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                if (value.value_type != .bytes_val or value.is_json) return false;
+                const bytes = value.value.bytes_val;
+                const above_min = if (ctx.min) |min| blk: {
+                    const order = std.mem.order(u8, bytes, min);
+                    break :blk order == .gt or (ctx.inclusive_min and order == .eq);
+                } else true;
+                const below_max = if (ctx.max) |max| blk: {
+                    const order = std.mem.order(u8, bytes, max);
+                    break :blk order == .lt or (ctx.inclusive_max and order == .eq);
+                } else true;
+                return above_min and below_max;
+            }
+        }{
+            .min = range.min,
+            .max = range.max,
+            .inclusive_min = range.inclusive_min,
+            .inclusive_max = range.inclusive_max,
+        });
+    }
+
+    fn resolveRelationalNumericFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        range: search_mod.NumericRangeQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, range.field) orelse return null;
+        if (column.field_type != .numeric) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
+            min: ?f64,
+            max: ?f64,
+            inclusive_min: bool,
+            inclusive_max: bool,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                if (value.value_type != .f64_val) return false;
+                const number = value.value.f64_val;
+                const above_min = if (ctx.min) |min| if (ctx.inclusive_min) number >= min else number > min else true;
+                const below_max = if (ctx.max) |max| if (ctx.inclusive_max) number <= max else number < max else true;
+                return above_min and below_max;
+            }
+        }{
+            .min = range.min,
+            .max = range.max,
+            .inclusive_min = range.inclusive_min,
+            .inclusive_max = range.inclusive_max,
+        });
+    }
+
+    fn resolveRelationalDateFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        range: search_mod.DateRangeQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, range.field) orelse return null;
+        if (column.field_type != .datetime) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
+            start_ns: ?u64,
+            end_ns: ?u64,
+            inclusive_start: bool,
+            inclusive_end: bool,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                if (value.value_type != .u64_val) return false;
+                const timestamp = value.value.u64_val;
+                const after_start = if (ctx.start_ns) |start| if (ctx.inclusive_start) timestamp >= start else timestamp > start else true;
+                const before_end = if (ctx.end_ns) |end| if (ctx.inclusive_end) timestamp <= end else timestamp < end else true;
+                return after_start and before_end;
+            }
+        }{
+            .start_ns = range.start_ns,
+            .end_ns = range.end_ns,
+            .inclusive_start = range.inclusive_start,
+            .inclusive_end = range.inclusive_end,
+        });
+    }
+
+    fn resolveRelationalBoolFieldFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        bool_query: search_mod.BoolFieldQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, bool_query.field) orelse return null;
+        if (column.field_type != .boolean) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
+            wanted: bool,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                return value.value_type == .bool_val and value.value.bool_val == ctx.wanted;
+            }
+        }{ .wanted = bool_query.value });
+    }
+
+    fn resolveRelationalGeoDistanceFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        geo_query: search_mod.GeoDistanceQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, geo_query.field) orelse return null;
+        if (column.field_type != .geopoint) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
+            center: search_mod.GeoPoint,
+            radius_meters: f64,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                if (value.value_type != .geo_point) return false;
+                const point = search_mod.GeoPoint{
+                    .lat = value.value.geo_point.lat,
+                    .lon = value.value.geo_point.lon,
+                };
+                return search_geo_mod.haversineDistance(ctx.center, point) <= ctx.radius_meters;
+            }
+        }{
+            .center = geo_query.center,
+            .radius_meters = geo_query.radius_meters,
+        });
+    }
+
+    fn resolveRelationalGeoBBoxFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        geo_query: search_mod.GeoBBoxQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        const column = relationalColumnForField(runtime_schema, geo_query.field) orelse return null;
+        if (column.field_type != .geopoint) return null;
+        return try self.scanRelationalColumnFilterDocSetAlloc(alloc, column, generation, struct {
+            min_lat: f64,
+            min_lon: f64,
+            max_lat: f64,
+            max_lon: f64,
+
+            fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                if (value.value_type != .geo_point) return false;
+                const point = value.value.geo_point;
+                return point.lat >= ctx.min_lat and point.lat <= ctx.max_lat and
+                    point.lon >= ctx.min_lon and point.lon <= ctx.max_lon;
+            }
+        }{
+            .min_lat = geo_query.min_lat,
+            .min_lon = geo_query.min_lon,
+            .max_lat = geo_query.max_lat,
+            .max_lon = geo_query.max_lon,
+        });
+    }
+
+    fn resolveRelationalBoolQueryDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        bool_query: search_mod.BoolQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet {
+        if (bool_query.min_should > 1) return null;
+
+        var current: ?doc_set.ResolvedDocSet = null;
+        errdefer if (current) |*set| set.deinit(alloc);
+
+        for (bool_query.must) |child_query| {
+            var child = (try self.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, child_query, generation)) orelse {
+                if (current) |*set| set.deinit(alloc);
+                return null;
+            };
+            defer child.deinit(alloc);
+            try combineRelationalFilterSet(alloc, &current, &child, .intersect);
+        }
+
+        if (bool_query.should.len > 0 and (bool_query.min_should > 0 or current == null)) {
+            var should_set: ?doc_set.ResolvedDocSet = null;
+            errdefer if (should_set) |*set| set.deinit(alloc);
+            for (bool_query.should) |child_query| {
+                var child = (try self.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, child_query, generation)) orelse {
+                    if (current) |*set| set.deinit(alloc);
+                    if (should_set) |*set| set.deinit(alloc);
+                    return null;
+                };
+                defer child.deinit(alloc);
+                try combineRelationalFilterSet(alloc, &should_set, &child, .union_set);
+            }
+            if (should_set) |*set| {
+                try combineRelationalFilterSet(alloc, &current, set, .intersect);
+                set.* = .none;
+            }
+        }
+
+        if (current == null and bool_query.must_not.len > 0) {
+            current = try self.relationalAllRowsDocSetAlloc(alloc, generation);
+        }
+
+        for (bool_query.must_not) |child_query| {
+            var child = (try self.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, child_query, generation)) orelse {
+                if (current) |*set| set.deinit(alloc);
+                return null;
+            };
+            defer child.deinit(alloc);
+            try combineRelationalFilterSet(alloc, &current, &child, .difference);
+        }
+
+        return current orelse null;
+    }
+
+    const RelationalFilterCombineMode = enum {
+        intersect,
+        union_set,
+        difference,
+    };
+
+    fn combineRelationalFilterSet(
+        alloc: Allocator,
+        current: *?doc_set.ResolvedDocSet,
+        child: *const doc_set.ResolvedDocSet,
+        mode: RelationalFilterCombineMode,
+    ) !void {
+        if (current.* == null) {
+            current.* = try doc_set.cloneAlloc(alloc, child);
+            return;
+        }
+        var next = switch (mode) {
+            .intersect => (try doc_set.intersectAlloc(alloc, &current.*.?, child)) orelse return error.UnsupportedQueryRequest,
+            .union_set => (try doc_set.unionAlloc(alloc, &current.*.?, child)) orelse return error.UnsupportedQueryRequest,
+            .difference => (try doc_set.differenceAlloc(alloc, &current.*.?, child)) orelse return error.UnsupportedQueryRequest,
+        };
+        errdefer next.deinit(alloc);
+        current.*.?.deinit(alloc);
+        current.* = next;
+    }
+
+    fn scanRelationalColumnFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        column: schema_mod.RelationalColumn,
+        generation: ?u64,
+        matcher: anytype,
+    ) !doc_set.ResolvedDocSet {
+        if (!column.indexed) return try self.scanRelationalBaseRowsFilterDocSetAlloc(alloc, column, generation, matcher);
+
+        const values = try relational_store_mod.scanColumnAlloc(alloc, self.core.store, column.path, "", "");
+        defer relational_store_mod.freeColumnValues(alloc, values);
+
+        var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+        defer doc_ids.deinit(alloc);
+        for (values) |value| {
+            if (!matcher.matches(value)) continue;
+            try doc_ids.append(alloc, value.doc_key);
+        }
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids.items, generation);
+    }
+
+    fn scanRelationalBaseRowsFilterDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        column: schema_mod.RelationalColumn,
+        generation: ?u64,
+        matcher: anytype,
+    ) !doc_set.ResolvedDocSet {
+        const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+        defer relational_store_mod.freeRows(alloc, rows);
+
+        var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+        defer doc_ids.deinit(alloc);
+        for (rows) |row| {
+            const cell = (try relational_row_codec.findCellByPath(row.row_value, column.path)) orelse continue;
+            const value = relational_store_mod.OwnedColumnValue{
+                .doc_key = row.doc_key,
+                .value_type = cell.value_type,
+                .is_json = cell.is_json,
+                .value = cell.value,
+            };
+            if (!matcher.matches(value)) continue;
+            try doc_ids.append(alloc, row.doc_key);
+        }
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids.items, generation);
+    }
+
+    fn relationalColumnForField(runtime_schema: schema_mod.TableSchema, field: []const u8) ?schema_mod.RelationalColumn {
+        const normalized = if (std.mem.startsWith(u8, field, "/")) field[1..] else field;
+        for (runtime_schema.relational_columns) |column| {
+            if (std.mem.eql(u8, field, column.name) or
+                std.mem.eql(u8, field, column.path) or
+                std.mem.eql(u8, normalized, column.name) or
+                std.mem.eql(u8, normalized, column.path))
+            {
+                return column;
+            }
+        }
+        return null;
+    }
+
     fn liveFilterDocSetCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -9150,6 +9923,7 @@ pub const DB = struct {
             .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
@@ -9195,6 +9969,7 @@ pub const DB = struct {
             .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
@@ -9250,6 +10025,7 @@ pub const DB = struct {
             .sparse_index = sparseIndexCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
@@ -9461,6 +10237,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = req.identity_read_generation,
@@ -9935,6 +10712,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
         });
@@ -9948,6 +10726,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try db_query_search.collectMatchAllCandidates(alloc, req, .{
             .ctx = self,
+            .relational_base_rows = self.relationalColumnsForStore() != null,
             .scan_store_range = scanStoreRangeCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalCallback,
@@ -10312,8 +11091,16 @@ pub const DB = struct {
         return try self.loadProjectedSearchDocumentMany(alloc, req, keys);
     }
 
+    fn encodeBaseDocumentLookupKeyAlloc(self: *DB, alloc: Allocator, key: []const u8) ![]u8 {
+        if (self.relationalColumnsForStore() != null and !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) {
+            return try relational_store_mod.rowKeyAlloc(alloc, key);
+        }
+        return try encodeStoreLookupKeyAlloc(alloc, key);
+    }
+
     fn loadStoredSearchDocumentProbe(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
-        const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
+        const relational_row = self.relationalColumnsForStore() != null and !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key);
+        const store_key = try self.encodeBaseDocumentLookupKeyAlloc(alloc, key);
         defer alloc.free(store_key);
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
@@ -10321,7 +11108,11 @@ pub const DB = struct {
             error.NotFound => return null,
             else => return err,
         };
-        return try alloc.dupe(u8, raw);
+        const owned = try alloc.dupe(u8, raw);
+        return if (relational_row)
+            try mapper.materializeOwnedRelationalRowValueAlloc(alloc, owned)
+        else
+            try mapper.materializeOwnedDocumentValueAlloc(alloc, owned);
     }
 
     fn loadProjectedSearchDocumentMany(
@@ -10822,6 +11613,7 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
     const PendingStoredSearchLoad = struct {
         original_index: usize,
         store_key: []u8,
+        relational_row: bool,
     };
 
     const loaded = try alloc.alloc(?[]u8, keys.len);
@@ -10838,10 +11630,12 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
     errdefer freeOptionalOwnedBytes(alloc, loaded);
 
     const key_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+    const relational_base_rows = self.relationalColumnsForStore() != null;
     for (keys, 0..) |key, i| {
         try pending.append(alloc, .{
             .original_index = i,
-            .store_key = try encodeStoreLookupKeyAlloc(alloc, key),
+            .store_key = try self.encodeBaseDocumentLookupKeyAlloc(alloc, key),
+            .relational_row = relational_base_rows and !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key),
         });
     }
     if (bench_profile) key_ns = platform_time.monotonicNs() - key_start_ns;
@@ -10873,7 +11667,11 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
     const dupe_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
-        loaded[item.original_index] = try alloc.dupe(u8, value);
+        const owned = try alloc.dupe(u8, value);
+        loaded[item.original_index] = if (item.relational_row)
+            try mapper.materializeOwnedRelationalRowValueAlloc(alloc, owned)
+        else
+            try mapper.materializeOwnedDocumentValueAlloc(alloc, owned);
     }
     if (bench_profile) dupe_ns = platform_time.monotonicNs() - dupe_start_ns;
     if (bench_profile) {
@@ -11001,19 +11799,27 @@ test "resolved doc set from search hits uses complete hit ordinals" {
 fn isMetadataKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "\x00\x00__metadata__:") or
         isSplitMetadataKey(key) or
-        internal_keys.isTtlKey(key);
+        internal_keys.isTtlKey(key) or
+        internal_keys.isInternalMetadataKey(key);
 }
 
-fn isPrimaryDocumentStoreKey(key: []const u8) bool {
-    return internal_keys.isPrimaryDocumentKey(key);
+fn isBaseDocumentStoreKeyForMode(relational_base_rows: bool, key: []const u8) bool {
+    return if (relational_base_rows)
+        internal_keys.isRelationalRowKey(key)
+    else
+        internal_keys.isPrimaryDocumentKey(key);
 }
 
 fn skipNonPrimaryMedianKey(key: []const u8) bool {
-    return !isPrimaryDocumentStoreKey(key);
+    return !internal_keys.isPrimaryDocumentKey(key);
+}
+
+fn skipNonRelationalMedianKey(key: []const u8) bool {
+    return !internal_keys.isRelationalRowKey(key);
 }
 
 fn encodeStoreLookupKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
-    if (internal_keys.isInternalUserKey(key) or std.mem.startsWith(u8, key, "\x00\x00__metadata__:") or isSplitMetadataKey(key)) {
+    if (internal_keys.isInternalPhysicalTableDataKey(key) or isMetadataKey(key)) {
         return try alloc.dupe(u8, key);
     }
     return try internal_keys.documentKeyAlloc(alloc, key);
@@ -11224,6 +12030,21 @@ fn appendUniqueOwnedKey(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), k
         if (std.mem.eql(u8, existing, key)) return;
     }
     try list.append(alloc, try alloc.dupe(u8, key));
+}
+
+/// Project a relational document into its serialized typed-row KV value and
+/// track the buffer for cleanup. The row is always freshly allocated (the codec
+/// owns no input bytes), so it is appended to `owned_values` unconditionally.
+fn relationalStoreRowValueAlloc(
+    alloc: Allocator,
+    cleaned: []const u8,
+    relational_columns: []const schema_mod.RelationalColumn,
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) ![]const u8 {
+    const row_value = try mapper.buildRelationalRowValueAlloc(alloc, cleaned, relational_columns);
+    errdefer alloc.free(row_value);
+    try owned_values.append(alloc, row_value);
+    return row_value;
 }
 
 fn strippedStoredDocumentValueAlloc(
@@ -12559,7 +13380,13 @@ fn appendPrecomputedGraphSourceArtifactKey(
         defer graph_store_writes.deinit(self.alloc);
 
         if (artifact_value) |value| {
-            const raw_doc = try batchDocumentValueForGraphSource(self.alloc, self.core.store, store_writes.items, artifact_ref.document_id);
+            const raw_doc = try batchDocumentValueForGraphSource(
+                self.alloc,
+                self.core.store,
+                store_writes.items,
+                artifact_ref.document_id,
+                self.relationalColumnsForStore() != null,
+            );
             defer if (raw_doc) |doc_value| self.alloc.free(doc_value);
             const graph_writes = try graphWritesFromArtifactValueAlloc(self.alloc, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
             defer freeGraphWrites(self.alloc, graph_writes);
@@ -12622,26 +13449,47 @@ fn batchDocumentValueForGraphSource(
     store: *docstore_mod.DocStore,
     store_writes: []const docstore_mod.KVPair,
     doc_key: []const u8,
+    relational_base_rows: bool,
 ) !?[]u8 {
-    const internal_doc_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    const internal_doc_key = try graphSourceDocumentStoreKeyAlloc(alloc, doc_key, relational_base_rows);
     defer alloc.free(internal_doc_key);
     for (store_writes) |write| {
-        if (std.mem.eql(u8, write.key, internal_doc_key)) return try alloc.dupe(u8, write.value);
+        if (std.mem.eql(u8, write.key, internal_doc_key)) {
+            return if (relational_base_rows)
+                try mapper.materializeRelationalRowValueAlloc(alloc, write.value)
+            else
+                try mapper.materializeDocumentValueAlloc(alloc, write.value);
+        }
     }
-    return try storeDocumentValueForGraphSource(alloc, store, doc_key);
+    return try storeDocumentValueForGraphSource(alloc, store, doc_key, relational_base_rows);
 }
 
 fn storeDocumentValueForGraphSource(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     doc_key: []const u8,
+    relational_base_rows: bool,
 ) !?[]u8 {
-    const internal_doc_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    const internal_doc_key = try graphSourceDocumentStoreKeyAlloc(alloc, doc_key, relational_base_rows);
     defer alloc.free(internal_doc_key);
-    return store.get(alloc, internal_doc_key) catch |err| switch (err) {
+    const raw = store.get(alloc, internal_doc_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
+    return if (raw) |value|
+        if (relational_base_rows)
+            try mapper.materializeOwnedRelationalRowValueAlloc(alloc, value)
+        else
+            try mapper.materializeOwnedDocumentValueAlloc(alloc, value)
+    else
+        null;
+}
+
+fn graphSourceDocumentStoreKeyAlloc(alloc: Allocator, doc_key: []const u8, relational_base_rows: bool) ![]u8 {
+    return if (relational_base_rows)
+        try relational_store_mod.rowKeyAlloc(alloc, doc_key)
+    else
+        try internal_keys.documentKeyAlloc(alloc, doc_key);
 }
 
 fn graphArtifactContentType(index_manager: *const index_manager_mod.IndexManager, artifact_name: []const u8) []const u8 {
@@ -12780,7 +13628,7 @@ fn makeTxnId(self: *DB) transactions_mod.TxnId {
 }
 
 fn shouldWriteTimestamp(key: []const u8) bool {
-    return !isMetadataKey(key) and !internal_keys.isInternalUserKey(key);
+    return !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key);
 }
 
 fn makeTimestampKey(alloc: Allocator, key: []const u8) ![]u8 {
@@ -12865,7 +13713,7 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
     }
 
     for (keys, 0..) |key, i| {
-        if (internal_keys.isInternalUserKey(key)) continue;
+        if (internal_keys.isInternalPhysicalTableDataKey(key)) continue;
         try pending.append(alloc, .{
             .original_index = i,
             .store_key = try internal_keys.ttlKeyAlloc(alloc, key),
@@ -13508,9 +14356,19 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     }
 
     for (keys) |key| {
-        const store_key = try internal_keys.documentKeyAlloc(ctx.alloc, key);
-        try owned_delete_keys.append(ctx.alloc, store_key);
-        try delete_keys.append(ctx.alloc, store_key);
+        if (ctx.relational_base_rows) {
+            try relational_store_mod.appendDelete(ctx.alloc, ctx.store, &delete_keys, &owned_delete_keys, key);
+            const primary_key = try internal_keys.documentKeyAlloc(ctx.alloc, key);
+            var primary_key_owned = true;
+            errdefer if (primary_key_owned) ctx.alloc.free(primary_key);
+            try owned_delete_keys.append(ctx.alloc, primary_key);
+            primary_key_owned = false;
+            try delete_keys.append(ctx.alloc, primary_key);
+        } else {
+            const store_key = try internal_keys.documentKeyAlloc(ctx.alloc, key);
+            try owned_delete_keys.append(ctx.alloc, store_key);
+            try delete_keys.append(ctx.alloc, store_key);
+        }
         if (!shouldWriteTimestamp(key)) continue;
         const timestamp_key = try makeTimestampKey(ctx.alloc, key);
         try timestamp_delete_keys.append(ctx.alloc, timestamp_key);
@@ -14295,6 +15153,7 @@ fn applyDerivedBatchToIndexReplayContext(
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
+        .relational_base_rows = ctx.relational_base_rows,
     };
     if (benchMetricsEnabled()) {
         var profile = BatchProfile{};
@@ -14373,6 +15232,7 @@ fn applyDerivedBatchTargetsContextProfiled(ctx: *const BatchExecutionContext, ba
                 .index_manager = ctx.index_manager,
                 .apply_mutex = ctx.apply_mutex,
                 .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
+                .relational_base_rows = ctx.relational_base_rows,
             };
             try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, profile);
             const index_sync_start_ns = monotonicTimeNs();
@@ -14660,6 +15520,7 @@ fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_
         .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
+        .relational_base_rows = self.relationalColumnsForStore() != null,
     };
     try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
 }
@@ -14706,7 +15567,10 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 index_ref.name,
                 ctx.index_manager.byte_range,
                 delete_keys,
-                .{ .prefer_inline_when_store_tip_matches_sequence = batch.sequence },
+                .{
+                    .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
+                    .relational_base_rows = ctx.relational_base_rows,
+                },
                 text_replay_options,
             );
             if (missing_required != 0) return error.ReplayDocumentNotVisible;
@@ -14746,7 +15610,10 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 ctx.store,
                 batch.documents,
                 ctx.index_manager.byte_range,
-                .{ .skip_doc_keys = &dense_embedding_doc_keys },
+                .{
+                    .skip_doc_keys = &dense_embedding_doc_keys,
+                    .relational_base_rows = ctx.relational_base_rows,
+                },
                 null,
             );
             defer index_writes.deinit();
@@ -14813,6 +15680,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                     .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
                     .prefer_available_inline_values = true,
                     .skip_doc_keys = &sparse_embedding_doc_keys,
+                    .relational_base_rows = ctx.relational_base_rows,
                 },
                 if (emit_sparse_write_profile) &collect_doc_profile else null,
             );
@@ -14866,7 +15734,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try applyGraphDocClearsForIndex(ctx, batch.graph_doc_clears, index_ref.name);
 
             const materialized_artifact_keys = if (ctx.allow_graph_materialization)
-                try materializeGraphSourceArtifactsForIndex(ctx.alloc, ctx.store, ctx.index_manager, batch.changed_artifact_keys, index_ref.name)
+                try materializeGraphSourceArtifactsForIndex(ctx.alloc, ctx.store, ctx.index_manager, batch.changed_artifact_keys, index_ref.name, ctx.relational_base_rows)
             else
                 try ctx.alloc.alloc([]u8, 0);
             defer freeOwnedKeySlice(ctx.alloc, materialized_artifact_keys);
@@ -15087,19 +15955,30 @@ const OwnedSparseEmbeddingWrites = struct {
 
 const CollectTextDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
+    relational_base_rows: bool = false,
 };
 
 const CollectDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
     prefer_available_inline_values: bool = false,
     skip_doc_keys: ?*const std.StringHashMapUnmanaged(void) = null,
+    relational_base_rows: bool = false,
 };
 
-fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8, relational_base_rows: bool) ![]u8 {
     return if (internal_keys.isInternalUserKey(key))
         try alloc.dupe(u8, key)
+    else if (relational_base_rows)
+        try relational_store_mod.rowKeyAlloc(alloc, key)
     else
         try internal_keys.documentKeyAlloc(alloc, key);
+}
+
+fn materializeReplayDocumentValueAlloc(alloc: Allocator, value: []const u8, relational_base_rows: bool) ![]u8 {
+    return if (relational_base_rows)
+        try mapper.materializeRelationalRowValueAlloc(alloc, value)
+    else
+        try mapper.materializeDocumentValueAlloc(alloc, value);
 }
 
 const OwnedSparseFieldWrites = struct {
@@ -15190,7 +16069,7 @@ fn collectSparseFieldWritesProfiled(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
+            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -15241,7 +16120,11 @@ fn collectSparseFieldWritesProfiled(
             continue;
         };
         const extract_start_ns = if (profile != null) monotonicTimeNs() else 0;
-        if (try mapper.extractSparseVectorField(alloc, value, field_name)) |raw_sparse_vec| {
+        // Store-read relational values must be typed rows; document-mode blobs
+        // stay on the generic materialization path.
+        const doc_json = try materializeReplayDocumentValueAlloc(alloc, value, opts.relational_base_rows);
+        defer alloc.free(doc_json);
+        if (try mapper.extractSparseVectorField(alloc, doc_json, field_name)) |raw_sparse_vec| {
             var sparse_vec = raw_sparse_vec;
             writes.append(alloc, .{
                 .doc_id = item.doc_key,
@@ -15334,7 +16217,7 @@ fn collectDocumentWritesProfiled(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
+            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -15385,7 +16268,9 @@ fn collectDocumentWritesProfiled(
             missing_required += 1;
             continue;
         };
-        const owned_value = try alloc.dupe(u8, value);
+        // Relational replay reads the relational row keyspace and requires a
+        // typed row there; document mode keeps accepting JSON blobs.
+        const owned_value = try materializeReplayDocumentValueAlloc(alloc, value, opts.relational_base_rows);
         try writes.append(alloc, .{
             .key = item.doc_key,
             .value = owned_value,
@@ -15484,6 +16369,15 @@ fn applyTextDocumentsForIndex(
     var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
     defer writes.deinit(alloc);
 
+    // Owned JSON buffers for store-read documents that were materialized from a
+    // relational typed row. Inline/cleaned values are borrowed and not tracked
+    // here; only freshly reconstructed bytes need freeing.
+    var materialized_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (materialized_values.items) |buf| alloc.free(buf);
+        materialized_values.deinit(alloc);
+    }
+
     const trust_inline = if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
         store.nextReplaySequence(sequence + 1) == sequence + 1
     else
@@ -15502,7 +16396,7 @@ fn applyTextDocumentsForIndex(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key),
+            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -15535,10 +16429,17 @@ fn applyTextDocumentsForIndex(
     try txn.getManySorted(read_keys, read_values);
 
     for (pending.items, 0..) |item, i| {
-        const value = read_values[i] orelse item.inline_value orelse {
+        const raw = read_values[i] orelse item.inline_value orelse {
             missing_required += 1;
             continue;
         };
+        // A store-read relational document must be a typed row. Inline values
+        // are already cleaned JSON and document-mode store values are borrowed.
+        const value = if (read_values[i] != null and opts.relational_base_rows) blk: {
+            const json = try mapper.materializeRelationalRowValueAlloc(alloc, raw);
+            try materialized_values.append(alloc, json);
+            break :blk json;
+        } else raw;
         try writes.append(alloc, .{
             .key = item.doc_key,
             .value = value,
@@ -15876,6 +16777,7 @@ fn materializeGraphSourceArtifactsForIndex(
     index_manager: *index_manager_mod.IndexManager,
     changed_artifact_keys: []const []const u8,
     index_name: []const u8,
+    relational_base_rows: bool,
 ) ![][]u8 {
     const source = index_manager.graphArtifactSource(index_name) orelse return try alloc.alloc([]u8, 0);
 
@@ -15910,7 +16812,7 @@ fn materializeGraphSourceArtifactsForIndex(
         }
 
         if (raw) |value| {
-            const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id);
+            const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id, relational_base_rows);
             defer if (raw_doc) |doc_value| alloc.free(doc_value);
             const graph_writes = try graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc);
             defer freeGraphWrites(alloc, graph_writes);
@@ -16597,6 +17499,7 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
+        .relational_base_rows = self.relationalColumnsForStore() != null,
     };
     try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
     return true;
@@ -16724,6 +17627,7 @@ fn applyDerivedBatchToShadowIfNeeded(self: *DB, batch: derived_types.DerivedBatc
         .index_manager = shadow.manager,
         .apply_mutex = async_resources.apply_mutex,
         .allow_graph_materialization = false,
+        .relational_base_rows = self.relationalColumnsForStore() != null,
     };
 
     for (managed_indexes) |index_ref| {
@@ -16850,6 +17754,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
         self.index_backends,
     );
     defer dest_indexes.deinit();
+    dest_indexes.setRelationalBaseRows(self.relationalColumnsForStore() != null);
     dest_indexes.setRelaxedSplitDurability(true);
     const dest_applied_sequence_checkpoint_path = try apply_state.checkpointPathAlloc(self.alloc, dest_dir);
     defer self.alloc.free(dest_applied_sequence_checkpoint_path);
@@ -16862,7 +17767,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     try ensureReplayFloor(dest_store, replay_floor);
 
     const split_doc_frontier = if (page_split_built)
-        try collectSplitFrontierDocKeys(self.alloc, dest_store, byte_range.start, byte_range.end)
+        try collectSplitFrontierDocKeys(self.alloc, dest_store, byte_range.start, byte_range.end, self.relationalColumnsForStore() != null)
     else
         &.{};
     defer {
@@ -16911,6 +17816,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
                 split_handoffs.dense,
                 split_handoffs.text,
                 split_handoffs.sparse,
+                self.relationalColumnIndexPolicyForStore(),
             );
         }
     } else {
@@ -16924,6 +17830,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
             split_handoffs.dense,
             split_handoffs.text,
             split_handoffs.sparse,
+            self.relationalColumnIndexPolicyForStore(),
         );
     }
     try applySplitGraphArtifactsInRange(
@@ -16933,12 +17840,15 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
         dest_store,
         &dest_indexes,
     );
+    if (self.relationalColumnsForStore() != null) {
+        try relational_store_mod.rebuildAllColumnIndexesFromRowsInRangeWithColumnIndexPolicy(self.alloc, dest_store, byte_range.start, byte_range.end, self.relationalColumnIndexPolicyForStore());
+    }
 
     try dest_indexes.syncAll(true);
     try dest_store.sync(true);
 }
 
-fn collectSplitFrontierDocKeys(alloc: Allocator, store: *docstore_mod.DocStore, lower: []const u8, upper: []const u8) ![][]u8 {
+fn collectSplitFrontierDocKeys(alloc: Allocator, store: *docstore_mod.DocStore, lower: []const u8, upper: []const u8, relational_base_rows: bool) ![][]u8 {
     const store_lower = try documentRangeLowerAlloc(alloc, lower);
     defer alloc.free(store_lower);
     const store_upper = if (upper.len > 0) try documentRangeUpperAlloc(alloc, upper) else null;
@@ -16954,8 +17864,8 @@ fn collectSplitFrontierDocKeys(alloc: Allocator, store: *docstore_mod.DocStore, 
     }
 
     for (scanned) |entry| {
-        if (!isPrimaryDocumentStoreKey(entry.key)) continue;
-        const raw = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
+        if (!isBaseDocumentStoreKeyForMode(relational_base_rows, entry.key)) continue;
+        const raw = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, entry.key)) orelse continue;
         try keys.append(alloc, raw);
     }
 
@@ -16994,6 +17904,7 @@ fn streamRangeIntoSplitDestinationDirect(
     dense_handoffs: []const index_manager_mod.DenseSplitHandoff,
     text_handoffs: []const index_manager_mod.TextSplitHandoff,
     sparse_handoffs: []const index_manager_mod.SparseSplitHandoff,
+    column_index_policy: relational_store_mod.ColumnIndexPolicy,
 ) !void {
     const batch_size = 8192;
 
@@ -17014,12 +17925,12 @@ fn streamRangeIntoSplitDestinationDirect(
             .value = entry.value,
         });
         if (writes.items.len == batch_size) {
-            try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs);
+            try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs, column_index_policy);
             writes.clearRetainingCapacity();
         }
     }
 
-    if (writes.items.len > 0) try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs);
+    if (writes.items.len > 0) try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs, column_index_policy);
 }
 
 fn copyGraphEdgeRangeIntoSplitDestination(
@@ -17058,36 +17969,78 @@ fn putIndexedSplitBatchDirect(
     dense_handoffs: []const index_manager_mod.DenseSplitHandoff,
     text_handoffs: []const index_manager_mod.TextSplitHandoff,
     sparse_handoffs: []const index_manager_mod.SparseSplitHandoff,
+    column_index_policy: relational_store_mod.ColumnIndexPolicy,
 ) !void {
     if (writes.len == 0) return;
 
-    const raw_writes: []const docstore_mod.KVPair = @ptrCast(writes);
-    try dest_store.putBatch(raw_writes, &.{});
+    var raw_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer raw_writes.deinit(dest_indexes.alloc);
+    try raw_writes.ensureUnusedCapacity(dest_indexes.alloc, writes.len);
+    for (writes) |write| raw_writes.appendAssumeCapacity(.{ .key = write.key, .value = write.value });
+
+    var owned_column_index_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_column_index_keys.items) |key| dest_indexes.alloc.free(key);
+        owned_column_index_keys.deinit(dest_indexes.alloc);
+    }
+    var owned_column_index_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_column_index_values.items) |value| dest_indexes.alloc.free(value);
+        owned_column_index_values.deinit(dest_indexes.alloc);
+    }
+    if (dest_indexes.relational_base_rows) {
+        for (writes) |write| {
+            const doc_key = (try internal_keys.decodeRelationalRowKeyAlloc(dest_indexes.alloc, write.key)) orelse continue;
+            defer dest_indexes.alloc.free(doc_key);
+            try relational_store_mod.appendColumnIndexWritesForRowWithColumnIndexPolicy(
+                dest_indexes.alloc,
+                &raw_writes,
+                &owned_column_index_keys,
+                &owned_column_index_values,
+                doc_key,
+                write.value,
+                column_index_policy,
+            );
+        }
+    }
+    try dest_store.putBatch(raw_writes.items, &.{});
 
     try applySplitEmbeddingArtifactsFromBatch(dest_store, dest_indexes, writes, dense_handoffs, sparse_handoffs);
 
-    var logical_writes = try dest_indexes.alloc.alloc(types.BatchWrite, writes.len);
-    defer dest_indexes.alloc.free(logical_writes);
+    var logical_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer logical_writes.deinit(dest_indexes.alloc);
     var owned_keys = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (owned_keys.items) |key| dest_indexes.alloc.free(key);
         owned_keys.deinit(dest_indexes.alloc);
     }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| dest_indexes.alloc.free(value);
+        owned_values.deinit(dest_indexes.alloc);
+    }
 
-    for (writes, 0..) |write, i| {
-        if (internal_keys.isPrimaryDocumentKey(write.key)) {
-            const raw = (try internal_keys.decodePrimaryDocumentKeyAlloc(dest_indexes.alloc, write.key)) orelse return error.InvalidInternalUserKey;
+    for (writes) |write| {
+        if (internal_keys.isRelationalColumnKey(write.key)) continue;
+        if (internal_keys.isStoredDocumentRowKey(write.key)) {
+            if (!isBaseDocumentStoreKeyForMode(dest_indexes.relational_base_rows, write.key)) continue;
+            const raw = (try internal_keys.decodeStoredDocumentRowKeyAlloc(dest_indexes.alloc, write.key)) orelse return error.InvalidInternalUserKey;
             try owned_keys.append(dest_indexes.alloc, raw);
-            logical_writes[i] = .{
+            const value = if (dest_indexes.relational_base_rows) blk: {
+                const materialized = try mapper.materializeRelationalRowValueAlloc(dest_indexes.alloc, write.value);
+                try owned_values.append(dest_indexes.alloc, materialized);
+                break :blk materialized;
+            } else write.value;
+            try logical_writes.append(dest_indexes.alloc, .{
                 .key = raw,
-                .value = write.value,
-            };
+                .value = value,
+            });
         } else {
-            logical_writes[i] = write;
+            try logical_writes.append(dest_indexes.alloc, write);
         }
     }
 
-    try dest_indexes.indexSplitBatch(dest_store, logical_writes, dense_handoffs, text_handoffs, sparse_handoffs);
+    try dest_indexes.indexSplitBatch(dest_store, logical_writes.items, dense_handoffs, text_handoffs, sparse_handoffs);
 }
 
 fn findDenseSplitHandoffLocal(handoffs: []const index_manager_mod.DenseSplitHandoff, index_name: []const u8) ?*const index_manager_mod.DenseSplitHandoff {
@@ -17340,6 +18293,7 @@ fn indexExistingSplitDestinationDirect(
     dense_handoffs: []const index_manager_mod.DenseSplitHandoff,
     text_handoffs: []const index_manager_mod.TextSplitHandoff,
     sparse_handoffs: []const index_manager_mod.SparseSplitHandoff,
+    column_index_policy: relational_store_mod.ColumnIndexPolicy,
 ) !void {
     const batch_size = 8192;
 
@@ -17360,12 +18314,12 @@ fn indexExistingSplitDestinationDirect(
             .value = entry.value,
         });
         if (writes.items.len == batch_size) {
-            try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs);
+            try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs, column_index_policy);
             writes.clearRetainingCapacity();
         }
     }
 
-    if (writes.items.len > 0) try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs);
+    if (writes.items.len > 0) try putIndexedSplitBatchDirect(dest_store, dest_indexes, writes.items, dense_handoffs, text_handoffs, sparse_handoffs, column_index_policy);
 }
 
 fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
@@ -17376,6 +18330,15 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
     try finalizePrimarySplitPreservingIdentity(self, split_lower);
+    if (self.relationalColumnsForStore() != null) {
+        try relational_store_mod.rebuildAllColumnIndexesFromRowsInRangeWithColumnIndexPolicy(
+            self.alloc,
+            self.core.store,
+            new_range.start,
+            new_range.end,
+            self.relationalColumnIndexPolicyForStore(),
+        );
+    }
     try ensureReplayFloor(self.core.store, replay_floor);
     try self.core.pruneSplitRangeFromPrimaryIndexes(split_state.split_key, split_state.original_range_end);
     try self.rebaseManagedIndexAppliedSequencesIfNeeded();
@@ -17683,14 +18646,20 @@ fn densePrimaryVectorTargetCountForIndexContext(ctx: *AsyncContext, index_name: 
 
     const ScanState = struct {
         alloc: Allocator,
+        relational_base_rows: bool,
         field_name: []const u8,
         dims: u32,
         count: u64 = 0,
 
         fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
-            if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
-            if (try mapper.extractDenseVectorField(state.alloc, value, state.field_name, state.dims)) |vector| {
+            if (!isBaseDocumentStoreKeyForMode(state.relational_base_rows, key)) return .@"continue";
+            const doc_value = if (state.relational_base_rows)
+                try mapper.materializeRelationalRowValueAlloc(state.alloc, value)
+            else
+                value;
+            defer if (doc_value.ptr != value.ptr) state.alloc.free(doc_value);
+            if (try mapper.extractDenseVectorField(state.alloc, doc_value, state.field_name, state.dims)) |vector| {
                 state.alloc.free(vector);
                 state.count += 1;
             }
@@ -17700,6 +18669,7 @@ fn densePrimaryVectorTargetCountForIndexContext(ctx: *AsyncContext, index_name: 
 
     var state = ScanState{
         .alloc = ctx.alloc,
+        .relational_base_rows = ctx.relational_base_rows,
         .field_name = field_name,
         .dims = dims,
     };
@@ -17766,16 +18736,23 @@ fn rebuildDenseIndexFromPrimaryVectorsContext(
 
         fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
-            if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
-            if (try mapper.extractDenseVectorField(state.ctx.alloc, value, state.field_name, state.dims)) |vector| {
+            if (!isBaseDocumentStoreKeyForMode(state.ctx.relational_base_rows, key)) return .@"continue";
+            const doc_value = if (state.ctx.relational_base_rows)
+                try mapper.materializeRelationalRowValueAlloc(state.ctx.alloc, value)
+            else
+                try mapper.materializeDocumentValueAlloc(state.ctx.alloc, value);
+            errdefer state.ctx.alloc.free(doc_value);
+            if (try mapper.extractDenseVectorField(state.ctx.alloc, doc_value, state.field_name, state.dims)) |vector| {
                 state.ctx.alloc.free(vector);
             } else {
+                state.ctx.alloc.free(doc_value);
                 return .@"continue";
             }
-            const doc_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.ctx.alloc, key)) orelse return .@"continue";
+            const doc_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.ctx.alloc, key)) orelse {
+                state.ctx.alloc.free(doc_value);
+                return .@"continue";
+            };
             errdefer state.ctx.alloc.free(doc_key);
-            const doc_value = try state.ctx.alloc.dupe(u8, value);
-            errdefer state.ctx.alloc.free(doc_value);
             try state.writes.append(state.ctx.alloc, .{
                 .key = doc_key,
                 .value = doc_value,
@@ -18144,6 +19121,16 @@ fn cleanupTempDir(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+fn testStoreHasAlgebraicDocFactScalarKeyContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !bool {
+    const rows = try store.scanRange(alloc, "", "");
+    defer docstore_mod.DocStore.freeResults(alloc, rows);
+    for (rows) |row| {
+        if (std.mem.indexOf(u8, row.key, "docfact_scalar") != null and
+            std.mem.indexOf(u8, row.key, needle) != null) return true;
+    }
+    return false;
 }
 
 const default_test_wait_attempts: usize = 100;
@@ -19624,7 +20611,10 @@ test "db open borrows shared backend runtime" {
     try std.testing.expect(first.backend_owner_id != 0);
     try std.testing.expect(second.backend_owner_id != 0);
     try std.testing.expect(first.backend_owner_id != second.backend_owner_id);
-    try std.testing.expectEqual(@as(u64, 3), runtime.ptr().allocOwnerId());
+    // Each open allocates two owner ids from the shared runtime: one for the
+    // backend (backend_owner_id) and one dedicated to algebraic HLL cardinality
+    // maintenance. Two opens therefore consume ids 1..4, leaving 5 next.
+    try std.testing.expectEqual(@as(u64, 5), runtime.ptr().allocOwnerId());
 }
 
 test "db open downgrades borrowed manual backend runtime to manual executor" {
@@ -19644,6 +20634,331 @@ test "db open downgrades borrowed manual backend runtime to manual executor" {
 
     try std.testing.expectEqual(runtime.ptr(), db.backend_runtime);
     try std.testing.expect(db.owned_backend_runtime == null);
+}
+
+test "db open wires algebraic HLL maintenance lane and adaptively backfills sketches" {
+    const alloc = std.testing.allocator;
+
+    // A manual backend runtime drives durable jobs inline (synchronously on
+    // submit), so a lane-scheduled HLL backfill completes within the call that
+    // promotes the sketch — the path a read-mostly cardinality workload takes.
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "schema_version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"product","path":"product","type":"string"}],
+        \\  "materializations": [],
+        \\  "adaptive": {"observe": true, "lazy_materialization": true, "min_observations": 2}
+        \\}
+    ;
+
+    var adaptive_name_buf: [64]u8 = undefined;
+    var adaptive_name_len: usize = 0;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .backend_runtime = runtime.ptr(),
+        });
+        defer db.close();
+
+        try db.addIndex(.{ .name = "alg", .kind = .algebraic, .config_json = cfg });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "d1", .value = "{\"product\":\"pen\"}" },
+                .{ .key = "d2", .value = "{\"product\":\"book\"}" },
+                .{ .key = "d3", .value = "{\"product\":\"pen\"}" },
+                .{ .key = "d4", .value = "{\"product\":\"notebook\"}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        const entry = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        const index = &entry.index;
+
+        // DB.open must thread the durable-jobs lane into the algebraic index so
+        // background HLL maintenance has somewhere to run on a live server.
+        try std.testing.expect(index.hll_maintenance_lane != null);
+
+        const adaptive_name = try index.hllAdaptiveNameAlloc(null, "product");
+        defer alloc.free(adaptive_name);
+        @memcpy(adaptive_name_buf[0..adaptive_name.len], adaptive_name);
+        adaptive_name_len = adaptive_name.len;
+
+        // Reads only record observations — they never promote — so no sketch and
+        // no approximate total exist after two recurring cardinality queries.
+        index.observeCardinalityForAdaptive(db.core.store, null, "product");
+        index.observeCardinalityForAdaptive(db.core.store, null, "product");
+        try std.testing.expect(!index.hllRegistryContains(adaptive_name));
+        try std.testing.expect((try index.approxCardinalityTotalForFieldAlloc(db.core.store, "product", &.{}, null)) == null);
+
+        // The leader-gated adaptive maintenance pass promotes the over-threshold
+        // observation and backfills it, so the next read resolves an approximate
+        // distinct-product count (4 docs, 3 distinct products).
+        _ = try db.evaluateAlgebraicAdaptiveCandidates();
+        try std.testing.expect(index.hllRegistryContains(adaptive_name));
+        const estimate = (try index.approxCardinalityTotalForFieldAlloc(db.core.store, "product", &.{}, null)) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(@max(estimate, 3) - @min(estimate, 3) <= 1);
+    }
+
+    // The promotion is durable: a freshly reopened DB reloads the adaptive marker
+    // through the open-site wiring (attachHllMaintenance + loadAdaptiveHllCardinalities)
+    // and keeps serving the approximate count without re-observing.
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .backend_runtime = runtime.ptr(),
+        });
+        defer db.close();
+
+        const entry = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        const index = &entry.index;
+        const adaptive_name = adaptive_name_buf[0..adaptive_name_len];
+        try std.testing.expect(index.hllRegistryContains(adaptive_name));
+        const reopened = (try index.approxCardinalityTotalForFieldAlloc(db.core.store, "product", &.{}, null)) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(@max(reopened, 3) - @min(reopened, 3) <= 1);
+    }
+}
+
+test "db table schema apply stages algebraic pending before durable schema swap" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const schema_v1 =
+        \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+
+        var parsed_v1 = try schema_api_mod.parseValidatedTableSchema(alloc, schema_v1);
+        defer parsed_v1.deinit(alloc);
+        const runtime_v1 = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_v1);
+        defer schema_mod.freeSchema(alloc, runtime_v1);
+        try db.setSchema(runtime_v1);
+
+        const config_v1 = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_v1);
+        defer alloc.free(config_v1);
+        try db.addIndex(.{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = config_v1,
+        });
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:1", .value = "{\"old_field\":\"legacy\",\"new_field\":\"fresh\"}" }},
+            .sync_level = .full_index,
+        });
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, db.core.store, "old_field"));
+
+        // Simulate a crash after the algebraic catalog has been marked pending
+        // for schema v2, but before the runtime schema is durably swapped from
+        // v1 to v2.
+        try db.stageAlgebraicSchemaConfigsPending(schema_v2);
+        const staged = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 2), staged.index.config().schema_version);
+        try std.testing.expectEqualStrings("rebuild_required", staged.index.config().capability_lifecycle_status);
+
+        const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+        defer schema_mod.freeSchema(alloc, durable_schema);
+        try std.testing.expectEqual(@as(u32, 1), durable_schema.version);
+    }
+
+    {
+        var readonly = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+        });
+        defer readonly.close();
+
+        const entry = readonly.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 2), entry.index.config().schema_version);
+        try std.testing.expectEqualStrings("rebuild_required", entry.index.config().capability_lifecycle_status);
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, readonly.core.store, "old_field"));
+    }
+
+    {
+        var writer = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer writer.close();
+
+        // The writable open sees durable schema v1 and pending algebraic config
+        // v2, so it must leave the rebuild pending until the schema write lands.
+        const pending = writer.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("rebuild_required", pending.index.config().capability_lifecycle_status);
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
+
+        try writer.applyTableSchemaJson(alloc, schema_v2, .{});
+        const current = writer.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 2), current.index.config().schema_version);
+        try std.testing.expectEqualStrings("current", current.index.config().capability_lifecycle_status);
+        try std.testing.expect(!try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "new_field"));
+
+        const durable_schema = (try schema_mod.loadSchema(writer.core.store, alloc)) orelse return error.TestUnexpectedResult;
+        defer schema_mod.freeSchema(alloc, durable_schema);
+        try std.testing.expectEqual(@as(u32, 2), durable_schema.version);
+
+        const local_schema_json = try writer.core.store.get(alloc, local_schema_json_key);
+        defer alloc.free(local_schema_json);
+        try std.testing.expectEqualStrings(schema_v2, local_schema_json);
+    }
+}
+
+test "db staged algebraic pending waits for first durable schema" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const schema_v1 =
+        \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+
+        const config_v1 = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_v1);
+        defer alloc.free(config_v1);
+        try db.addIndex(.{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = config_v1,
+        });
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:1", .value = "{\"old_field\":\"legacy\",\"new_field\":\"fresh\"}" }},
+            .sync_level = .full_index,
+        });
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, db.core.store, "old_field"));
+
+        try db.stageAlgebraicSchemaConfigsPending(schema_v2);
+        const staged = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 2), staged.index.config().schema_version);
+        try std.testing.expectEqualStrings("rebuild_required", staged.index.config().capability_lifecycle_status);
+        const missing_schema = try schema_mod.loadSchema(db.core.store, alloc);
+        defer if (missing_schema) |schema| schema_mod.freeSchema(alloc, schema);
+        try std.testing.expect(missing_schema == null);
+    }
+
+    {
+        var writer = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer writer.close();
+
+        const pending = writer.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 2), pending.index.config().schema_version);
+        try std.testing.expectEqualStrings("rebuild_required", pending.index.config().capability_lifecycle_status);
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
+
+        try writer.applyTableSchemaJson(alloc, schema_v2, .{});
+        const current = writer.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u32, 2), current.index.config().schema_version);
+        try std.testing.expectEqualStrings("current", current.index.config().capability_lifecycle_status);
+        try std.testing.expect(!try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
+        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "new_field"));
+
+        const durable_schema = (try schema_mod.loadSchema(writer.core.store, alloc)) orelse return error.TestUnexpectedResult;
+        defer schema_mod.freeSchema(alloc, durable_schema);
+        try std.testing.expectEqual(@as(u32, 2), durable_schema.version);
+
+        const local_schema_json = try writer.core.store.get(alloc, local_schema_json_key);
+        defer alloc.free(local_schema_json);
+        try std.testing.expectEqualStrings(schema_v2, local_schema_json);
+    }
+}
+
+test "db direct schema apply rejects storage mode switches" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const document_schema =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}}}
+    ;
+    const relational_schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, document_schema, .{});
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, relational_schema, .{}));
+
+    const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+    defer schema_mod.freeSchema(alloc, durable_schema);
+    try std.testing.expectEqual(schema_mod.StorageMode.document, durable_schema.storage_mode);
+}
+
+test "db direct schema apply rejects relational base column changes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const relational_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    const changed_columns_schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"keyword"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, relational_schema, .{});
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, changed_columns_schema, .{}));
+
+    const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+    defer schema_mod.freeSchema(alloc, durable_schema);
+    try std.testing.expectEqual(schema_mod.StorageMode.relational, durable_schema.storage_mode);
+    try std.testing.expectEqual(schema_mod.AntflyType.numeric, durable_schema.relational_columns[1].field_type);
+}
+
+test "db first relational schema apply rejects existing document rows" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:existing", .value = "{\"title\":\"already document mode\"}" }},
+    });
+
+    const relational_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, relational_schema, .{}));
+    const schema = try schema_mod.loadSchema(db.core.store, alloc);
+    defer if (schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+    try std.testing.expect(schema == null);
 }
 
 test "db text merge enabled requires backend runtime io" {
@@ -20303,6 +21618,41 @@ test "db identity namespace reassignment refreshes transaction recovery hook con
     const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
     const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
     try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:a"), state.canonical_doc_id);
+}
+
+test "db setSchema refreshes transaction recovery relational mode context" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 60_000,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    const identity_ctx = db.transaction_recovery_identity_context orelse return error.TestExpectedEqual;
+    try std.testing.expect(!identity_ctx.relational_base_rows);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try std.testing.expect(identity_ctx.relational_base_rows);
 }
 
 test "db identity namespace reassignment is unavailable on status-only handles" {
@@ -24247,6 +25597,142 @@ test "db leased enrichment worker generates dense embeddings" {
     try std.testing.expectEqual(@as(usize, 1), artifacts.len);
     try std.testing.expectEqualStrings(artifact_key, artifacts[0].key);
     try expectDenseEmbeddingArtifactValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("generated vector text"), 3);
+}
+
+test "db relational enrichment sources read committed base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"body":{"type":"text"}},"required":["title","body"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:a",
+            .value = "{\"title\":\"alpha\",\"body\":\"generated relational vector text\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.executor.waitForAll(2);
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:a");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:a");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "generated relational vector text", 3);
+    defer alloc.free(query_vec);
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = query_vec,
+            .k = 1,
+        },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("row:a", result.hits[0].id);
+}
+
+test "db relational dense HBC loader reads committed base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"embedding":{"type":"array"}},"required":["title","embedding"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:a",
+            .value = "{\"title\":\"alpha\",\"embedding\":[1,0,0]}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "row:a", "dv_v1");
+    defer alloc.free(artifact_key);
+    try db.core.store.delete(artifact_key);
+    db.clearDenseHbcCaches();
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:a");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = &[_]f32{ 1, 0, 0 },
+            .k = 1,
+        },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("row:a", result.hits[0].id);
 }
 
 test "db leased enrichment worker generates dense embeddings with durable lsm primary backend" {
@@ -28207,9 +29693,9 @@ test "collectDocumentWrites batches sorted document reads and falls back to inli
     var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
     defer store.close();
 
-    const stored_a = try replayDocumentStoreKeyAlloc(alloc, "a");
+    const stored_a = try replayDocumentStoreKeyAlloc(alloc, "a", false);
     defer alloc.free(stored_a);
-    const stored_c = try replayDocumentStoreKeyAlloc(alloc, "c");
+    const stored_c = try replayDocumentStoreKeyAlloc(alloc, "c", false);
     defer alloc.free(stored_c);
     try store.putBatch(&.{
         .{ .key = stored_a, .value = "{\"title\":\"alpha\"}" },
@@ -28243,7 +29729,7 @@ test "collectDocumentWrites skips missing out-of-range replay docs" {
     var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
     defer store.close();
 
-    const stored_z = try replayDocumentStoreKeyAlloc(alloc, "doc:z");
+    const stored_z = try replayDocumentStoreKeyAlloc(alloc, "doc:z", false);
     defer alloc.free(stored_z);
     try store.putBatch(&.{
         .{ .key = stored_z, .value = "{\"title\":\"zeta\"}" },
@@ -35392,6 +36878,55 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
     try std.testing.expectEqual(@as(u32, 0), text.total_hits);
 }
 
+test "db ttl cleanup deletes relational base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .batch_size = 8,
+            .grace_period_ns = 0,
+        },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"body":{"type":"text"}},"required":["title","body"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    var runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    runtime_schema.ttl_duration_ns = 1_000_000_000;
+    try db.setSchema(runtime_schema);
+
+    const now_ns = currentTimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:expired", .value = "{\"title\":\"gone\",\"body\":\"common token\"}" }},
+        .timestamp_ns = now_ns - 2_000_000_000,
+    });
+
+    try waitForRawDelete(alloc, &db, "row:expired", 200);
+    try std.testing.expect((try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:expired")) == null);
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:expired");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
+}
+
 test "db stats expose ttl cleanup activity" {
     const alloc = std.testing.allocator;
 
@@ -35667,6 +37202,61 @@ test "db exposes local transaction lifecycle" {
     }
 }
 
+test "db relational transaction commits through relational base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const begin_ts: u64 = 1_700_000_000_000_100_000;
+    const commit_ts: u64 = begin_ts + 1;
+    const txn_id = try db.beginTransaction(begin_ts);
+    try db.writeIntents(txn_id, &.{
+        .{ .key = "row:txn", .value = "{\"title\":\"txn row\",\"amount\":12.5}" },
+    }, &.{});
+    try db.commitTransaction(txn_id, commit_ts);
+
+    const raw = (try db.get(alloc, "row:txn")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"txn row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"amount\":12.5") != null);
+    try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "row:txn"));
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:txn");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:txn");
+    defer alloc.free(primary_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+
+    const delete_txn = try db.beginTransaction(commit_ts + 1);
+    try db.writeIntents(delete_txn, &.{
+        .{ .key = "row:txn", .value = null },
+    }, &.{});
+    try db.commitTransaction(delete_txn, commit_ts + 2);
+    try std.testing.expect((try db.get(alloc, "row:txn")) == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, relational_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "row:txn"));
+}
+
 test "db transaction intent writes reject new documents at ordinal exhaustion" {
     const alloc = std.testing.allocator;
 
@@ -35792,6 +37382,58 @@ test "db batch resolves transforms against pending same-batch writes" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("tags").?.array.items.len);
 }
 
+test "db relational batch transforms read and rewrite base rows only" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"count":{"type":"numeric"},"active":{"type":"boolean"},"attrs":{"type":"json"}},"required":["title","count"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:transform",
+            .value = "{\"title\":\"base row\",\"count\":1,\"active\":true,\"attrs\":{\"tier\":\"gold\"}}",
+        }},
+    });
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:transform");
+    defer alloc.free(primary_key);
+    try db.core.store.put(primary_key, "{\"title\":\"stale primary\",\"count\":999,\"active\":false}");
+
+    try db.batch(.{
+        .transforms = &.{.{
+            .key = "row:transform",
+            .operations = &.{
+                .{ .op = .inc, .path = "count", .value_json = "4" },
+                .{ .op = .set, .path = "active", .value_json = "false" },
+                .{ .op = .set, .path = "attrs", .value_json = "{\"tier\":\"platinum\"}" },
+            },
+        }},
+    });
+
+    const raw = (try db.get(alloc, "row:transform")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"count\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"attrs\":{\"tier\":\"platinum\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "stale primary") == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+}
+
 test "db batch keeps delete when same-batch transform targets deleted key" {
     const alloc = std.testing.allocator;
 
@@ -35821,6 +37463,42 @@ test "db batch keeps delete when same-batch transform targets deleted key" {
     });
 
     try std.testing.expect((try db.get(alloc, "doc:delete_transform")) == null);
+}
+
+test "db relational batch keeps delete when same-batch transform targets deleted key" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"text"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:delete_transform", .value = "{\"title\":\"delete me\",\"status\":\"old\"}" }},
+    });
+
+    try db.batch(.{
+        .deletes = &.{"row:delete_transform"},
+        .transforms = &.{.{
+            .key = "row:delete_transform",
+            .operations = &.{.{ .op = .set, .path = "status", .value_json = "\"new\"" }},
+        }},
+    });
+
+    try std.testing.expect((try db.get(alloc, "row:delete_transform")) == null);
+    try std.testing.expect((try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:delete_transform")) == null);
 }
 
 test "db transaction abort leaves no visible document" {
@@ -35880,6 +37558,64 @@ test "db transaction resolves transforms against pending same-transaction writes
         .float => |value| try std.testing.expectEqual(@as(f64, 5), value),
         else => return error.TestExpectedEqual,
     }
+}
+
+test "db relational transaction transforms read base rows and honor abort" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"count":{"type":"numeric"}},"required":["title","count"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:txn_transform", .value = "{\"title\":\"base row\",\"count\":1}" }},
+    });
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:txn_transform");
+    defer alloc.free(primary_key);
+    try db.core.store.put(primary_key, "{\"title\":\"stale primary\",\"count\":999}");
+
+    const txn_id = try db.beginTransaction(11_000);
+    try db.writeTransaction(txn_id, .{
+        .transforms = &.{.{
+            .key = "row:txn_transform",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "4" }},
+        }},
+    });
+    try db.commitTransaction(txn_id, 11_001);
+
+    const raw = (try db.get(alloc, "row:txn_transform")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"count\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "stale primary") == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+
+    const abort_txn = try db.beginTransaction(12_000);
+    try db.writeTransaction(abort_txn, .{
+        .transforms = &.{.{
+            .key = "row:txn_transform",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "100" }},
+        }},
+    });
+    try db.abortTransaction(abort_txn, 12_001);
+
+    const after_abort = (try db.get(alloc, "row:txn_transform")) orelse return error.TestExpectedEqual;
+    defer alloc.free(after_abort);
+    try std.testing.expect(std.mem.indexOf(u8, after_abort, "\"count\":5") != null);
 }
 
 test "db bulk ingest write commits document writes before finish" {
@@ -36880,6 +38616,168 @@ test "db transaction recovery runtime appends identity rows for committed orphan
     try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
 }
 
+test "db relational transaction recovery resolves orphaned intents into base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const commit_ts: u64 = 2_000;
+    const txn_id = blk: {
+        var setup_db = try DB.open(alloc, std.mem.span(path), .{});
+        defer setup_db.close();
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+        ;
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try setup_db.setSchema(runtime_schema);
+
+        const txn_id = try setup_db.beginTransaction(1_000);
+        try setup_db.writeTransaction(txn_id, .{
+            .writes = &.{.{ .key = "row:recovered_orphan", .value = "{\"title\":\"recovered row\",\"amount\":14.5}" }},
+        });
+
+        const record_key = blk_key: {
+            const prefix = "\x00\x00__txn_records__:";
+            var key: [prefix.len + @sizeOf(transactions_mod.TxnId)]u8 = undefined;
+            @memcpy(key[0..prefix.len], prefix);
+            @memcpy(key[prefix.len..], &txn_id);
+            break :blk_key key;
+        };
+        var record_value: [33]u8 = undefined;
+        record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+        std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
+        std.mem.writeInt(u64, record_value[9..17], commit_ts, .little);
+        std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
+        std.mem.writeInt(u64, record_value[25..33], commit_ts, .little);
+        try setup_db.core.store.put(record_key[0..], record_value[0..]);
+        break :blk txn_id;
+    };
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .cutoff_ns = 1,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    var cleaned = false;
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const status = db.getTransactionStatus(txn_id);
+        if (status) |_| {} else |err| {
+            if (err == transactions_mod.TxnError.TxnNotFound) {
+                cleaned = true;
+                break;
+            }
+            return err;
+        }
+        sleepPollInterval();
+    }
+    if (!cleaned) return error.TransactionRecoveryCleanupTimeout;
+
+    const raw = (try db.get(alloc, "row:recovered_orphan")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"recovered row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"amount\":14.5") != null);
+    try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "row:recovered_orphan"));
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:recovered_orphan");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:recovered_orphan");
+    defer alloc.free(primary_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+}
+
+test "db one-shot relational transaction recovery resolves orphaned intents into base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const commit_ts: u64 = 2_000;
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "row:one_shot_recovered", .value = "{\"title\":\"one shot\",\"amount\":21.5}" }},
+    });
+
+    const record_key = blk_key: {
+        const prefix = "\x00\x00__txn_records__:";
+        var key: [prefix.len + @sizeOf(transactions_mod.TxnId)]u8 = undefined;
+        @memcpy(key[0..prefix.len], prefix);
+        @memcpy(key[prefix.len..], &txn_id);
+        break :blk_key key;
+    };
+    var record_value: [33]u8 = undefined;
+    record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+    std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
+    std.mem.writeInt(u64, record_value[9..17], commit_ts, .little);
+    std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
+    std.mem.writeInt(u64, record_value[25..33], commit_ts, .little);
+    try db.core.store.put(record_key[0..], record_value[0..]);
+
+    var recorder = TxnResolverRecorder{};
+    const stats = try db.runTransactionRecoveryOnce(.{
+        .enabled = true,
+        .cutoff_ns = 1,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = TxnResolverRecorder.resolve,
+    });
+    try std.testing.expect(stats.resolved_finalized >= 1);
+
+    const raw = (try db.get(alloc, "row:one_shot_recovered")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"one shot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"amount\":21.5") != null);
+    try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "row:one_shot_recovered"));
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:one_shot_recovered");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:one_shot_recovered");
+    defer alloc.free(primary_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+}
+
 test "db batch enforces optimistic version predicates" {
     const alloc = std.testing.allocator;
 
@@ -37239,6 +39137,97 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     const parent_incoming = try db.getEdges(alloc, "graph_v1", "doc:y", "cites", .in);
     defer graph_mod.GraphIndex.freeEdges(alloc, parent_incoming);
     try std.testing.expectEqual(@as(usize, 0), parent_incoming.len);
+}
+
+test "db split moves relational rows and column entries" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var dest_buf: [256]u8 = undefined;
+    const dest = tempPath(&dest_buf);
+    defer cleanupTempDir(dest);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"title\":\"alpha\",\"status\":\"open\",\"amount\":10}" },
+            .{ .key = "row:z", .value = "{\"title\":\"zeta\",\"status\":\"closed\",\"amount\":90}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    try db.split(db.getRange(), "row:m", "", std.mem.span(dest), true);
+
+    var split_db = try DB.open(alloc, std.mem.span(dest), .{});
+    defer split_db.close();
+    try std.testing.expectEqualStrings("row:m", split_db.getRange().start);
+
+    const split_doc = (try split_db.get(alloc, "row:z")) orelse return error.TestExpectedEqual;
+    defer alloc.free(split_doc);
+    try std.testing.expect(std.mem.indexOf(u8, split_doc, "\"title\":\"zeta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, split_doc, "\"status\":\"closed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, split_doc, "\"amount\":90") != null);
+
+    const split_amounts = try relational_store_mod.scanColumnAlloc(alloc, split_db.core.store, "amount", "row:z", "row:z");
+    defer relational_store_mod.freeColumnValues(alloc, split_amounts);
+    try std.testing.expectEqual(@as(usize, 1), split_amounts.len);
+    try std.testing.expectEqualStrings("row:z", split_amounts[0].doc_key);
+    try std.testing.expectEqual(.f64_val, split_amounts[0].value_type);
+    try std.testing.expectEqual(@as(f64, 90), split_amounts[0].value.f64_val);
+
+    var split_filtered = try split_db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "zeta" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"closed\"}}",
+        .limit = 10,
+    });
+    defer split_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), split_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:z", split_filtered.hits[0].id);
+
+    try db.finalizeSplit(.{ .start = "", .end = "row:m" });
+    try std.testing.expect((try db.get(alloc, "row:z")) == null);
+
+    const parent_left_amounts = try relational_store_mod.scanColumnAlloc(alloc, db.core.store, "amount", "row:a", "row:a");
+    defer relational_store_mod.freeColumnValues(alloc, parent_left_amounts);
+    try std.testing.expectEqual(@as(usize, 1), parent_left_amounts.len);
+    try std.testing.expectEqualStrings("row:a", parent_left_amounts[0].doc_key);
+    try std.testing.expectEqual(.f64_val, parent_left_amounts[0].value_type);
+    try std.testing.expectEqual(@as(f64, 10), parent_left_amounts[0].value.f64_val);
+
+    var parent_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"open\"}}",
+        .limit = 10,
+    });
+    defer parent_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parent_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", parent_filtered.hits[0].id);
+
+    const parent_amounts = try relational_store_mod.scanColumnAlloc(alloc, db.core.store, "amount", "row:z", "row:z");
+    defer relational_store_mod.freeColumnValues(alloc, parent_amounts);
+    try std.testing.expectEqual(@as(usize, 0), parent_amounts.len);
 }
 
 test "db split prepare and finalize work with durable lsm primary backend" {
@@ -40054,6 +42043,101 @@ test "db updateRange constrains index backfill" {
     try std.testing.expectEqual(@as(u32, 2), text_index.snapshot().global_doc_count);
 }
 
+test "relational table point reads use only the relational base store" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"},"attrs":{"type":"json"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:base",
+            .value =
+            \\{"title":"base row","amount":12.5,"attrs":{"tier":"gold"}}
+            ,
+        }},
+    });
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:base");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:base");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
+    try db.core.store.put(primary_key, "{\"title\":\"stale primary\",\"amount\":999}");
+
+    const doc = (try db.get(alloc, "row:base")).?;
+    defer alloc.free(doc);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "stale primary") == null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"amount\":12.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"attrs\":{\"tier\":\"gold\"}") != null);
+
+    const median = try db.findMedianKey(alloc);
+    defer alloc.free(median);
+    try std.testing.expectEqualStrings("row:base", median);
+
+    var scan_result = try db.scan(alloc, "row:", "row:\xff", .{
+        .include_documents = true,
+        .fields = &.{"title"},
+        .include_all_fields = false,
+    });
+    defer scan_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), scan_result.hashes.len);
+    try std.testing.expectEqualStrings("row:base", scan_result.hashes[0].id);
+    try std.testing.expectEqual(@as(usize, 1), scan_result.documents.len);
+    try std.testing.expectEqualStrings("row:base", scan_result.documents[0].id);
+    try std.testing.expect(std.mem.indexOf(u8, scan_result.documents[0].json, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scan_result.documents[0].json, "stale primary") == null);
+    try std.testing.expect(std.mem.indexOf(u8, scan_result.documents[0].json, "\"amount\"") == null);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:base",
+            .value =
+            \\{"title":"updated row","amount":99.25,"attrs":{"tier":"platinum"}}
+            ,
+        }},
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+
+    const updated_doc = (try db.get(alloc, "row:base")).?;
+    defer alloc.free(updated_doc);
+    try std.testing.expect(std.mem.indexOf(u8, updated_doc, "\"title\":\"updated row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated_doc, "stale primary") == null);
+
+    try db.batch(.{
+        .deletes = &.{"row:base"},
+    });
+    try std.testing.expect((try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:base")) == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+    try std.testing.expect((try db.get(alloc, "row:base")) == null);
+}
+
 test "db dense startup catch-up defaults keep more than one cache entry" {
     try std.testing.expect(denseCatchUpStartupCacheNodes() > 1);
     try std.testing.expect(denseCatchUpStartupCacheVectors() > 1);
@@ -40084,4 +42168,521 @@ fn loadStoredSearchDocumentManyCallback(
 ) anyerror![]?[]u8 {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return try loadStoredSearchDocumentsMany(self, alloc, keys);
+}
+
+test "relational table full-text search loads stored_data from base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // Relational schema: returned documents and structured filters should read
+    // the relational base row, not duplicated segment typed_doc_values.
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"},"active":{"type":"boolean"},"location":{"type":"geopoint"},"attrs":{"type":"json"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:a",
+            .value =
+            \\{"title":"hello world","status":"open","amount":42.5,"created_at":100,"active":true,"location":{"lat":0,"lon":0},"attrs":{"version":"old"}}
+            ,
+        }},
+        .sync_level = .full_index,
+    });
+
+    const text_entry = db.core.textIndexEntry("ft_v1") orelse return error.TestExpectedEqual;
+    const snapshot = text_entry.persistent.snapshot();
+    try std.testing.expect(snapshot.segments.len > 0);
+    for (snapshot.segments) |*segment| {
+        try std.testing.expect(segment.reader.getSection("status", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("amount", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("created_at", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("active", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("location", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("attrs", .typed_doc_values) == null);
+    }
+
+    const replacement_json =
+        \\{"title":"base row wins","status":"closed","amount":77.25,"created_at":200,"active":false,"location":{"lat":37.78,"lon":-122.42},"attrs":{"version":"new","nested":{"ok":true}}}
+    ;
+    const replacement_row = try mapper.buildRelationalRowValueAlloc(alloc, replacement_json, runtime_schema.relational_columns);
+    defer alloc.free(replacement_row);
+    var replacement_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (replacement_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        replacement_writes.deinit(alloc);
+    }
+    var replacement_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (replacement_deletes.items) |key| alloc.free(@constCast(key));
+        replacement_deletes.deinit(alloc);
+    }
+    const replacement_row_copy = try alloc.dupe(u8, replacement_row);
+    var replacement_row_copy_owned = true;
+    errdefer if (replacement_row_copy_owned) alloc.free(replacement_row_copy);
+    try relational_store_mod.appendUpsertOwnedBatch(
+        alloc,
+        db.core.store,
+        &replacement_writes,
+        &replacement_deletes,
+        "row:a",
+        replacement_row_copy,
+    );
+    replacement_row_copy_owned = false;
+    try db.core.store.putBatch(replacement_writes.items, replacement_deletes.items);
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .include_stored = true,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expect(result.hits[0].stored_data != null);
+
+    // Search still matches the full-text segment, but stored_data comes from the
+    // relational base row. If this path reads segment typed_doc_values, these
+    // assertions see the original 42.5/true row instead.
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.hits[0].stored_data.?, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("base row wins", obj.get("title").?.string);
+    const amount = obj.get("amount").?;
+    const amount_num: f64 = switch (amount) {
+        .float => |f| f,
+        .integer => |n| @floatFromInt(n),
+        else => unreachable,
+    };
+    try std.testing.expectEqual(@as(f64, 77.25), amount_num);
+    try std.testing.expectEqualStrings("closed", obj.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 200), obj.get("created_at").?.integer);
+    try std.testing.expect(!obj.get("active").?.bool);
+    try std.testing.expectEqualStrings("new", obj.get("attrs").?.object.get("version").?.string);
+    try std.testing.expect(obj.get("attrs").?.object.get("nested").?.object.get("ok").?.bool);
+
+    const aggregation_requests = [_]aggregations_mod.SearchAggregationRequest{
+        .{ .name = "amount_sum", .type = "sum", .field = "amount" },
+        .{ .name = "by_status", .type = "terms", .field = "status", .size = 5 },
+    };
+    const aggregation_results = try aggregations_mod.computeSearchAggregations(alloc, aggregation_requests[0..], result, .{});
+    defer aggregations_mod.deinitResults(alloc, aggregation_results);
+    try std.testing.expectEqual(@as(usize, 2), aggregation_results.len);
+    try std.testing.expectEqualStrings("77.25", aggregation_results[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), aggregation_results[1].buckets.len);
+    try std.testing.expectEqualStrings("\"closed\"", aggregation_results[1].buckets[0].key_json);
+    try std.testing.expectEqual(@as(i64, 1), aggregation_results[1].buckets[0].count);
+
+    var filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"numeric_range\":{\"field\":\"amount\",\"min\":70.0}}",
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", filtered.hits[0].id);
+
+    var top_level_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .numeric_range = .{ .field = "amount", .min = 70.0 } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer top_level_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), top_level_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", top_level_filtered.hits[0].id);
+
+    var bool_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"bool_field\":{\"field\":\"active\",\"value\":false}}",
+        .limit = 10,
+    });
+    defer bool_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), bool_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", bool_filtered.hits[0].id);
+
+    var keyword_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"closed\"}}",
+        .limit = 10,
+    });
+    defer keyword_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), keyword_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", keyword_filtered.hits[0].id);
+
+    var stale_keyword_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"open\"}}",
+        .limit = 10,
+    });
+    defer stale_keyword_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale_keyword_filtered.total_hits);
+
+    var term_range_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"term_range\":{\"field\":\"status\",\"min\":\"cl\",\"max\":\"cm\"}}",
+        .limit = 10,
+    });
+    defer term_range_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), term_range_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", term_range_filtered.hits[0].id);
+
+    var date_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .date_range = .{ .field = "created_at", .start_ns = 150 } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer date_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), date_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", date_filtered.hits[0].id);
+
+    var geo_distance_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"geo_distance\":{\"field\":\"location\",\"lat\":37.78,\"lon\":-122.42,\"radius_meters\":1000}}",
+        .limit = 10,
+    });
+    defer geo_distance_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), geo_distance_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", geo_distance_filtered.hits[0].id);
+
+    var geo_bbox_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"geo_bbox\":{\"field\":\"location\",\"min_lat\":37.0,\"min_lon\":-123.0,\"max_lat\":38.0,\"max_lon\":-122.0}}",
+        .limit = 10,
+    });
+    defer geo_bbox_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), geo_bbox_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", geo_bbox_filtered.hits[0].id);
+}
+
+test "relational column filter pushdown declines stale identity generations" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:a", .value = "{\"title\":\"alpha\",\"status\":\"active\"}" }},
+    });
+    const active_generation = db.core.nextDerivedSequence();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:a", .value = "{\"title\":\"alpha\",\"status\":\"archived\"}" }},
+    });
+    const current_generation = db.core.nextDerivedSequence();
+
+    const stale = try db.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+        .term = .{ .field = "status", .term = "active" },
+    }, active_generation);
+    try std.testing.expect(stale == null);
+
+    var current = (try db.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+        .term = .{ .field = "status", .term = "archived" },
+    }, current_generation)) orelse return error.TestExpectedEqual;
+    defer current.deinit(alloc);
+    const ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &current, current_generation)) orelse return error.TestExpectedEqual;
+    defer {
+        for (ids) |id| alloc.free(@constCast(id));
+        alloc.free(ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expectEqualStrings("row:a", ids[0]);
+}
+
+test "relational unindexed column filters fall back to base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric","x-antfly-index":false}},"required":["title","amount"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"title\":\"alpha\",\"amount\":42.5}" },
+            .{ .key = "row:b", .value = "{\"title\":\"alpha\",\"amount\":7.0}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const amount_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:a");
+    defer alloc.free(amount_index_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, amount_index_key));
+
+    var filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .filter_query_json = "{\"numeric_range\":{\"field\":\"amount\",\"min\":40.0}}",
+        .limit = 10,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", filtered.hits[0].id);
+}
+
+test "relational embedded json search intersects with top-level relational filters" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"}},"additionalProperties":true}}},"required":["status"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_json",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "row:active",
+                .value = "{\"status\":\"active\",\"attrs\":{\"title\":\"nebula plan\",\"plan\":\"pro\",\"notes\":\"alpha note\"}}",
+            },
+            .{
+                .key = "row:archived",
+                .value = "{\"status\":\"archived\",\"attrs\":{\"title\":\"nebula archive\",\"plan\":\"free\",\"notes\":\"beta note\"}}",
+            },
+        },
+        .sync_level = .full_index,
+    });
+
+    var active = try db.search(alloc, .{
+        .index_name = "ft_json",
+        .query = .{ .match = .{ .field = "attrs.title", .text = "nebula" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"active\"}}",
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer active.deinit();
+    try std.testing.expectEqual(@as(u32, 1), active.total_hits);
+    try std.testing.expectEqualStrings("row:active", active.hits[0].id);
+    try std.testing.expect(active.hits[0].stored_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, active.hits[0].stored_data.?, "\"attrs\":{\"title\":\"nebula plan\"") != null);
+
+    var archived = try db.search(alloc, .{
+        .index_name = "ft_json",
+        .query = .{ .term = .{ .field = "attrs.plan", .term = "free" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"archived\"}}",
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer archived.deinit();
+    try std.testing.expectEqual(@as(u32, 1), archived.total_hits);
+    try std.testing.expectEqualStrings("row:archived", archived.hits[0].id);
+
+    var mismatched = try db.search(alloc, .{
+        .index_name = "ft_json",
+        .query = .{ .term = .{ .field = "attrs.plan", .term = "free" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"active\"}}",
+        .limit = 10,
+    });
+    defer mismatched.deinit();
+    try std.testing.expectEqual(@as(u32, 0), mismatched.total_hits);
+}
+
+test "relational text backfill ignores generic primary rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:a",
+            .value = "{\"title\":\"base row\",\"amount\":10}",
+        }},
+    });
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:a");
+    defer alloc.free(primary_key);
+    try db.core.store.put(primary_key, "{\"title\":\"stale primary\",\"amount\":999}");
+
+    try db.addIndex(.{
+        .name = "ft_backfill",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    var stale = try db.search(alloc, .{
+        .index_name = "ft_backfill",
+        .query = .{ .match = .{ .field = "title", .text = "stale" } },
+        .include_stored = true,
+    });
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale.total_hits);
+
+    var base = try db.search(alloc, .{
+        .index_name = "ft_backfill",
+        .query = .{ .match = .{ .field = "title", .text = "base" } },
+        .include_stored = true,
+    });
+    defer base.deinit();
+    try std.testing.expectEqual(@as(u32, 1), base.total_hits);
+    try std.testing.expect(base.hits[0].stored_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, base.hits[0].stored_data.?, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base.hits[0].stored_data.?, "stale primary") == null);
+}
+
+test "relational derived replay reads base row keyspace" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_replay_relational",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    const doc_json = "{\"title\":\"async replay row\",\"amount\":9.5}";
+    const row_value = try mapper.buildRelationalRowValueAlloc(alloc, doc_json, runtime_schema.relational_columns);
+    defer alloc.free(row_value);
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:async");
+    defer alloc.free(relational_key);
+    try db.core.store.put(relational_key, row_value);
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:async");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
+
+    const targets = [_]derived_types.DerivedTargetRef{.{
+        .kind = .full_text,
+        .index_name = "ft_replay_relational",
+    }};
+    const docs = [_]derived_types.DerivedDocument{.{
+        .key = "row:async",
+        .targets = &targets,
+    }};
+    const batch = derived_types.DerivedBatch{
+        .sequence = 1,
+        .documents = &docs,
+    };
+    var replay_ctx = ReplayApplyContext{ .db = &db };
+    try std.testing.expect(try applyDerivedBatchToIndexReplay(&replay_ctx, batch, .{
+        .name = "ft_replay_relational",
+        .kind = .full_text,
+    }));
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_replay_relational",
+        .query = .{ .match = .{ .field = "title", .text = "async" } },
+        .include_stored = true,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("row:async", result.hits[0].id);
+    try std.testing.expect(result.hits[0].stored_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.hits[0].stored_data.?, "\"amount\":9.5") != null);
 }

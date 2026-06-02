@@ -563,7 +563,7 @@ fn createTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
     var expanded_indexes_json: ?[]u8 = null;
     defer if (expanded_indexes_json) |value| alloc.free(value);
     const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-    expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
+    expanded_indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
     normalized_req.indexes_json = expanded_indexes_json;
     const table = tables_api.deriveTableRecord(table_name, normalized_req);
     const ranges = try tables_api.deriveInitialRanges(alloc, table);
@@ -12749,7 +12749,9 @@ test "api http server create index expands schema-derived algebraic config" {
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"derive_from_schema\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"group_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"measure_fields\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"materializations\":[]") != null);
+    // The schema-derived config carries default materializations.
+    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"materializations\":[]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"op\":\"count\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"sum_by_customer\"") == null);
 }
 

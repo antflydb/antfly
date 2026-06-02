@@ -1437,6 +1437,9 @@ algebraic bulk-ingest sessions defer promoted path dictionary FST rebuilds acros
 durable planner default policy remains opt-in and conservative until LSM guardrail evidence covers latency, bytes, write cost, churn, cold reads, fanout, and constrained queries
 schema capability fingerprints, skipped-unbounded-field metadata, and debug lifecycle classification
 schema-derived v2 configs with declared laws and adaptive defaults
+runtime-adaptive dynamic templates: bounded table-level dynamic templates (keyword/numeric/boolean/datetime) compile into capability `dynamic_field_rules` and project template-matched fields into typed docfacts at ingest, so template changes take effect for new writes without a schema version bump or reindex; unbounded text templates stay on the schemaless path-fact path (cardinality guard), and template-only updates refresh both the durable config and live indexes in place (`Index.reloadConfigJson`)
+relational `json` columns compile into scoped JSON-subdocument domains: embedded schemas and column-local dynamic templates emit prefixed capability fields (`attrs.plan`, `attrs.score`) plus a per-column capability fingerprint, algebraic docfact projection serves aggregations over those paths from the relational row-derived document body, and JSON-domain fingerprint changes mark that domain `rebuild_required` so field resolution withholds stale subdocument facts until rebuild
+relational column `indexed: false` suppresses only relational column-major predicate scan entries; embedded JSON algebraic/full-text projection still follows the JSON column's declared embedded schema and dynamic templates
 public algebraic index requests constrained to schema-derived capability sidecars with internal materialization fields stripped/rejected
 canonical-token shard merge keys for distributed symbol semantics
 distributed partial merge helpers that combine shard results by canonical axis and law
@@ -1791,6 +1794,13 @@ Full-text remains responsible for analyzer-specific ranking behavior such as
 BM25, phrase/proximity, highlighting, and analyzer state. Algebraic consumes exact
 candidate tensors for filters, joins, vector pruning, and aggregate folds.
 
+For relational tables, algebraic remains a derived index over the relational base
+store. Fact projection, materialization maintenance, replay, and backfill hydrate
+documents from committed relational base rows when they need a document body;
+they do not read stale generic document KV values or derived text segment
+columns as authoritative relational data. See [RELATIONAL.md](RELATIONAL.md) for
+the one-store relational storage contract.
+
 ### Vector And Graph Integration
 
 Supported algebraic `docfact` and `pathfact` filters can be resolved into native
@@ -1979,10 +1989,38 @@ fields. Schemaless `pathfact`, `path_lookup`, and `path_profile` rows are the
 discovery substrate for late-typed promotion. Mixed-kind paths require
 kind-qualified plans, explicit coercion policy, or fallback.
 
-Schema lifecycle drift marks affected algebraic capability stale or
-rebuild-required. Added compatible fields can start from the change point plus
-optional backfill; type, analyzer, coercion, or expression changes require
-readiness gating before the planner can select algebraic execution.
+Schema lifecycle drift marks the algebraic capability stale or rebuild-required
+while migration is in progress. Durable regeneration records
+`capability_lifecycle_status: "rebuild_required"` for crash safety. The local
+table-schema apply path persists that pending algebraic state before durably
+exposing the new runtime schema. The runtime schema and the local schema JSON
+mirror used by public write validation commit in the same transaction, and the
+sidecar rebuild runs after that schema save. Schema application is a DB-level
+structural mutation: it is serialized with normal apply work before staging the
+pending algebraic config, saving the runtime schema, and completing the sidecar
+rebuild. Reopen completion is schema-version gated: if a process dies after the
+pending catalog write but before the runtime schema save, writable reopen leaves
+the algebraic capability pending instead of publishing sidecar facts for a
+schema version the table has not durably adopted.
+Schema-versioned pending capabilities also stay pending when no durable runtime
+schema exists yet. Once the durable schema version matches, the index manager
+replays committed base rows through the refreshed config using bounded cursor
+batches and a durable `rebuild.state` cursor. A crash or injected failure resumes
+from the last applied base-row key instead of materializing the whole table range
+in memory or restarting from zero. Only after replay, bulk-ingest finish, and
+catalog persistence succeed does it clear the rebuild state and persist
+`capability_lifecycle_status: "current"`. While pending, the planner declines
+schema-derived algebraic execution, favoring correct scan fallback over reading
+facts that only cover the post-change subset.
+
+Relational embedded JSON domains apply that lifecycle per column path. Durable
+schema regeneration and local schema reload preserve user-owned knobs, compare
+each `json_subdocument_domains` fingerprint, and mark changed domains
+`lifecycle_status: "rebuild_required"` until local replay has reprojected the
+committed relational rows. `Index.fieldConfig` declines both static and dynamic
+fields under that JSON path while the domain is pending, so queries either fall
+back or report pending capability instead of reading stale facts. Fields outside
+the pending JSON column remain eligible for algebraic execution.
 
 ### Adaptive Lifecycle
 
@@ -2341,3 +2379,70 @@ manual user-facing materialization lifecycle or explicit materialization definit
 best-effort approximate MIN/MAX
 using the algebraic sidecar when status indicates incomplete derived state
 ```
+
+## Approximate cardinality (HyperLogLog)
+
+An index can materialize approximate distinct-counts so a `cardinality`
+aggregation is answered from a per-group sketch instead of scanning and
+deduplicating every value. Configure it with `hll_cardinalities`:
+
+```json
+{
+  "hll_cardinalities": [
+    {"name": "customers_by_region", "group_by": ["region"],
+     "value_field": "customer", "precision": 14}
+  ]
+}
+```
+
+`group_by` are the bucket axes, `value_field` is the field whose distinct values
+are counted, and `precision` (4–18, default 14) sizes each sketch at
+`2^precision` bytes and sets its accuracy.
+
+### Result contract
+
+Every `cardinality` result is self-describing, so a client can always tell an
+estimate from an exact count and reason about the error budget:
+
+```json
+{"value": 4044, "approximate": true, "relative_error": 0.0081}   // from a sketch
+{"value": 4096, "approximate": false}                            // exact distinct scan
+```
+
+`relative_error` is the HyperLogLog standard error of the sketch that produced
+the value, `1.04 / sqrt(2^precision)` — about 1.6% at p=12 and 0.8% at p=14. It
+is present only when `approximate` is true.
+
+Queries choose the exact/approximate contract with `mode` on a `cardinality`
+aggregation:
+
+- `auto` (default): use a matching current sketch when one applies; otherwise
+  fall back to an exact distinct scan.
+- `exact`: always run the exact distinct scan and return `approximate: false`.
+- `approximate`: require a matching current sketch. If no sketch applies, the
+  query fails instead of silently scanning.
+
+### Selection and maintenance
+
+The planner answers a `cardinality` from a matching sketch automatically when
+the query has no constraints and no MVCC read generation (sketches are
+maintained unconstrained and without per-generation visibility), a sketch's
+`group_by`/`value_field` match the query, and that materialization is not
+mid-rebuild; otherwise it falls back to the exact distinct scan (which reports
+`approximate: false`). Deletes and overwrites mark the affected groups dirty and
+rebuild only those groups' sketches in the background.
+
+`hll_cardinalities` is user-owned algebraic index configuration. Schema-derived
+regeneration and live schema reload preserve it alongside the other runtime
+knobs, so dynamic-template or schema updates do not drop configured sketches.
+
+Cardinality sketches can also be promoted adaptively. Repeated cardinality
+queries are observed in the same adaptive-materialization stream; once a
+leader-gated candidate crosses the promotion threshold, the index records an HLL
+configuration for that shape, backfills the sketch, and then maintains it with
+the same dirty-group rebuild path used by static `hll_cardinalities`. Adaptive
+HLL promotions are derived runtime state, not user configuration. A destructive
+schema sidecar rebuild clears persisted adaptive HLL markers together with the
+old algebraic keyspace and resets the in-memory HLL registry back to static
+`hll_cardinalities`; recurring queries can promote the adaptive sketches again
+under the refreshed schema.

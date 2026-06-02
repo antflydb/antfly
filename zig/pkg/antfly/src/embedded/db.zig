@@ -159,8 +159,8 @@ pub const DB = struct {
         try self.inner.addEnrichment(cfg);
     }
 
-    pub fn setSchema(self: *DB, table_schema: support.schema.TableSchema) !void {
-        try self.inner.setSchema(table_schema);
+    pub fn applyTableSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        try self.inner.applyTableSchemaJson(alloc, schema_json, .{});
     }
 };
 

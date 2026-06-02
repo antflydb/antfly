@@ -315,7 +315,12 @@ pub const AdminSource = struct {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
-        const table = tables_api.deriveTableRecord(table_name, req);
+        var normalized_req = req;
+        const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
+        const prepared_indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
+        defer alloc.free(prepared_indexes_json);
+        normalized_req.indexes_json = prepared_indexes_json;
+        const table = tables_api.deriveTableRecord(table_name, normalized_req);
         const ranges = try tables_api.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
@@ -519,7 +524,12 @@ pub const AdminSource = struct {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
-        const table = tables_api.deriveTableRecord(table_name, req);
+        var normalized_req = req;
+        const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
+        const prepared_indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
+        defer alloc.free(prepared_indexes_json);
+        normalized_req.indexes_json = prepared_indexes_json;
+        const table = tables_api.deriveTableRecord(table_name, normalized_req);
         const ranges = try tables_api.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| metadata_table_manager.freeRange(alloc, record);

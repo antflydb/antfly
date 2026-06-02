@@ -658,7 +658,7 @@ pub fn visiblePrimaryDocSetIfCompleteFromStoreAlloc(
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             _ = value;
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            const doc_id = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.alloc, key)) orelse return .@"continue";
+            const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.alloc, key)) orelse return .@"continue";
             errdefer state.alloc.free(doc_id);
             try state.doc_ids.append(state.alloc, doc_id);
             return .@"continue";

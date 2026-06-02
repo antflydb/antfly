@@ -416,16 +416,23 @@ pub fn backupLocationErrorMessage(err: anyerror) ?[]const u8 {
 }
 
 pub fn parseBackupRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(BackupRequest) {
-    return metadata_openapi.server.parseBackupTableBody(alloc, body);
+    var parsed = try metadata_openapi.server.parseBackupTableBody(alloc, body);
+    errdefer parsed.deinit();
+    try validateNativeBackupFormat(parsed.value.format);
+    return parsed;
 }
 
 pub fn parseRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(RestoreRequest) {
-    return metadata_openapi.server.parseRestoreTableBody(alloc, body);
+    var parsed = try metadata_openapi.server.parseRestoreTableBody(alloc, body);
+    errdefer parsed.deinit();
+    try validateNativeBackupFormat(parsed.value.format);
+    return parsed;
 }
 
 pub fn parseClusterBackupRequest(alloc: std.mem.Allocator, body: []const u8) !ClusterBackupRequest {
     var parsed = try metadata_openapi.server.parseBackupBody(alloc, body);
     defer parsed.deinit();
+    try validateNativeBackupFormat(parsed.value.format);
     return .{
         .backup_id = try alloc.dupe(u8, parsed.value.backup_id),
         .location = try alloc.dupe(u8, parsed.value.location),
@@ -442,6 +449,12 @@ pub fn parseClusterRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !C
         .table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names),
         .restore_mode = if (parsed.value.restore_mode) |value| try alloc.dupe(u8, value) else null,
     };
+}
+
+fn validateNativeBackupFormat(format: ?[]const u8) !void {
+    const value = format orelse return;
+    if (std.mem.eql(u8, value, "native")) return;
+    return error.UnsupportedBackupFormat;
 }
 
 pub fn parseFileLocation(location: []const u8) ![]const u8 {
@@ -828,7 +841,12 @@ pub fn deriveRestoreTableRecord(
     _ = location_uri;
     var req = try createTableRequestFromManifest(alloc, manifest);
     defer req.deinit(alloc);
-    var table = try metadata_table_manager.cloneTable(alloc, tables_api.deriveTableRecord(table_name, req));
+    var normalized_req = req;
+    const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
+    const prepared_indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
+    defer alloc.free(prepared_indexes_json);
+    normalized_req.indexes_json = prepared_indexes_json;
+    var table = try metadata_table_manager.cloneTable(alloc, tables_api.deriveTableRecord(table_name, normalized_req));
     table.min_ranges = @intCast(@max(manifest.shards.len, 1));
     return table;
 }
@@ -1170,6 +1188,22 @@ fn clusterRestoreOverallStatus(statuses: []const ClusterTableRestoreStatus) []co
 
 fn currentTimestampRfc3339(alloc: std.mem.Allocator) ![]u8 {
     return try alloc.dupe(u8, "1970-01-01T00:00:00Z");
+}
+
+test "backup request parser accepts native format and rejects portable format" {
+    var native = try parseBackupRequest(
+        std.testing.allocator,
+        "{\"backup_id\":\"snap-native\",\"location\":\"file:///tmp/antfly-backups\",\"format\":\"native\"}",
+    );
+    native.deinit();
+
+    try std.testing.expectError(
+        error.UnsupportedBackupFormat,
+        parseBackupRequest(
+            std.testing.allocator,
+            "{\"backup_id\":\"snap-portable\",\"location\":\"file:///tmp/antfly-backups\",\"format\":\"portable\"}",
+        ),
+    );
 }
 
 test "backup manifest round trips through metadata path" {

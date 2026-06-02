@@ -58,7 +58,16 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         req.indexes_json = try alloc.dupe(u8, tables_api.default_indexes_json);
     }
 
-    if (parsed.value.schema) |schema| {
+    if (raw_root.get("schema")) |schema_value| {
+        if (schema_value != .null) {
+            const raw_schema = try stringifyJsonAlloc(alloc, schema_value);
+            defer alloc.free(raw_schema);
+            req.schema_json = tables_api.parseSchemaUpdateRequest(alloc, raw_schema) catch |err| switch (err) {
+                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
+                else => return err,
+            };
+        }
+    } else if (parsed.value.schema) |schema| {
         const raw_schema = try stringifyJsonAlloc(alloc, schema);
         defer alloc.free(raw_schema);
         req.schema_json = tables_api.parseSchemaUpdateRequest(alloc, raw_schema) catch |err| switch (err) {

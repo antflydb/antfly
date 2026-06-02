@@ -47,6 +47,21 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
+/// Physical kind of a declared relational typed column, used to auto-route
+/// query-string predicates on that column to the matching typed-doc-values
+/// filter (instead of an inverted-index term/term_range filter that would not
+/// match a typed column). See zig/RELATIONAL.md.
+pub const TypedColumnKind = enum {
+    numeric,
+    datetime,
+    boolean,
+};
+
+pub const TypedColumn = struct {
+    name: []const u8,
+    kind: TypedColumnKind,
+};
+
 pub const QueryStringParser = struct {
     pub const DefaultOperator = enum {
         and_,
@@ -55,6 +70,10 @@ pub const QueryStringParser = struct {
 
     default_field: []const u8 = "_all",
     default_operator: DefaultOperator = .and_,
+    /// Declared relational typed columns. When a field predicate targets one of
+    /// these, it is routed to the typed-doc-values filter. Empty for document
+    /// (schemaless) tables, leaving behaviour unchanged.
+    typed_columns: []const TypedColumn = &.{},
 
     /// Parse a query string into a Filter. Caller must manage the allocator
     /// for any allocated filter data (phrase terms, bool sub-filters).
@@ -65,6 +84,7 @@ pub const QueryStringParser = struct {
             .pos = 0,
             .default_field = self.default_field,
             .default_operator = self.default_operator,
+            .typed_columns = self.typed_columns,
         };
         const result = try parser.parseQuery();
 
@@ -79,6 +99,90 @@ const Parser = struct {
     pos: usize,
     default_field: []const u8,
     default_operator: QueryStringParser.DefaultOperator,
+    typed_columns: []const TypedColumn = &.{},
+
+    /// Return the declared typed-column kind for `field`, if any.
+    fn typedColumnKind(self: *const Parser, field: []const u8) ?TypedColumnKind {
+        for (self.typed_columns) |column| {
+            if (std.mem.eql(u8, column.name, field)) return column.kind;
+        }
+        return null;
+    }
+
+    /// Build a typed-doc-values equality filter for a declared typed column.
+    /// Returns null if the value does not parse as the column's type, so the
+    /// caller can fall back to a normal term filter.
+    fn typedEqualityFilter(kind: TypedColumnKind, field: []const u8, value: []const u8) ?Filter {
+        switch (kind) {
+            .numeric => {
+                const number = std.fmt.parseFloat(f64, value) catch return null;
+                return .{ .range = .{
+                    .field = field,
+                    .min_val = number,
+                    .max_val = number,
+                    .inclusive_min = true,
+                    .inclusive_max = true,
+                } };
+            },
+            .datetime => {
+                const ns = std.fmt.parseInt(u64, value, 10) catch return null;
+                return .{ .date_range = .{
+                    .field = field,
+                    .start_ns = ns,
+                    .end_ns = ns,
+                    .inclusive_start = true,
+                    .inclusive_end = true,
+                } };
+            },
+            .boolean => {
+                const flag = if (std.mem.eql(u8, value, "true"))
+                    true
+                else if (std.mem.eql(u8, value, "false"))
+                    false
+                else
+                    return null;
+                return .{ .bool_field = .{ .field = field, .value = flag } };
+            },
+        }
+    }
+
+    /// Build a typed-doc-values range filter for a declared numeric/datetime
+    /// column from string bounds. Returns null on parse failure or for boolean
+    /// columns (ranges are meaningless), so the caller can fall back.
+    fn typedRangeFilter(
+        kind: TypedColumnKind,
+        field: []const u8,
+        min_word: ?[]const u8,
+        max_word: ?[]const u8,
+        inclusive_min: bool,
+        inclusive_max: bool,
+    ) ?Filter {
+        switch (kind) {
+            .numeric => {
+                const min_val: ?f64 = if (min_word) |w| (std.fmt.parseFloat(f64, w) catch return null) else null;
+                const max_val: ?f64 = if (max_word) |w| (std.fmt.parseFloat(f64, w) catch return null) else null;
+                return .{ .range = .{
+                    .field = field,
+                    .min_val = min_val,
+                    .max_val = max_val,
+                    .inclusive_min = inclusive_min,
+                    .inclusive_max = inclusive_max,
+                } };
+            },
+            .datetime => {
+                const start_ns: ?u64 = if (min_word) |w| (std.fmt.parseInt(u64, w, 10) catch return null) else null;
+                const end_ns: ?u64 = if (max_word) |w| (std.fmt.parseInt(u64, w, 10) catch return null) else null;
+                return .{ .date_range = .{
+                    .field = field,
+                    .start_ns = start_ns,
+                    .end_ns = end_ns,
+                    .inclusive_start = inclusive_min,
+                    .inclusive_end = inclusive_max,
+                } };
+            },
+            .boolean => return null,
+        }
+    }
 
     fn parseQuery(self: *Parser) ParseError!?Filter {
         self.skipWhitespace();
@@ -252,6 +356,13 @@ const Parser = struct {
                 return try self.applyOptionalBoost(.{ .prefix = .{ .field = word, .prefix = val } });
             }
 
+            // Route equality on a declared typed column to its typed filter.
+            if (self.typedColumnKind(word)) |kind| {
+                if (typedEqualityFilter(kind, word, val)) |typed_filter| {
+                    return try self.applyOptionalBoost(typed_filter);
+                }
+            }
+
             return try self.applyOptionalBoost(.{ .term = .{ .field = word, .term = val } });
         }
 
@@ -335,18 +446,22 @@ const Parser = struct {
     }
 
     fn parseRange(self: *Parser, field: []const u8) ParseError!Filter {
+        // Lucene range delimiters are independent: '[' / ']' are inclusive,
+        // '{' / '}' are exclusive, and the closing bracket need not match the
+        // opening one (e.g. "[10 TO 20}" is min-inclusive, max-exclusive).
         const start_delim = self.input[self.pos];
         const inclusive_min = start_delim == '[';
-        const end_delim: u8 = if (inclusive_min) ']' else '}';
         self.pos += 1;
         self.skipWhitespace();
-        const min_raw = self.readRangeBound(end_delim);
+        const min_raw = self.readRangeBound();
         self.skipWhitespace();
         if (!self.matchKeyword("TO")) return ParseError.InvalidSyntax;
         self.skipWhitespace();
-        const max_raw = self.readRangeBound(end_delim);
+        const max_raw = self.readRangeBound();
         self.skipWhitespace();
-        if (self.pos >= self.input.len or self.input[self.pos] != end_delim) return ParseError.InvalidSyntax;
+        if (self.pos >= self.input.len) return ParseError.InvalidSyntax;
+        const end_delim = self.input[self.pos];
+        if (end_delim != ']' and end_delim != '}') return ParseError.InvalidSyntax;
         self.pos += 1;
         const inclusive_max = end_delim == ']';
 
@@ -354,6 +469,13 @@ const Parser = struct {
         const max = if (max_raw.len == 0 or std.mem.eql(u8, max_raw, "*")) null else max_raw;
 
         if (min == null and max == null) return ParseError.InvalidSyntax;
+
+        // Route ranges on a declared numeric/datetime column to the typed filter.
+        if (self.typedColumnKind(field)) |kind| {
+            if (typedRangeFilter(kind, field, min, max, inclusive_min, inclusive_max)) |typed_filter| {
+                return typed_filter;
+            }
+        }
 
         if ((min == null or parseF64(min.?) != null) and (max == null or parseF64(max.?) != null)) {
             return .{ .range = .{
@@ -382,10 +504,14 @@ const Parser = struct {
         } };
     }
 
-    fn readRangeBound(self: *Parser, end_delim: u8) []const u8 {
+    fn readRangeBound(self: *Parser) []const u8 {
         const start = self.pos;
         while (self.pos < self.input.len) {
-            if (self.input[self.pos] == end_delim) break;
+            // Stop at either closing delimiter (']' or '}') so mixed-delimiter
+            // ranges parse; the upper bound's inclusivity is decided by which
+            // bracket actually closes the range.
+            const c = self.input[self.pos];
+            if (c == ']' or c == '}') break;
             if (std.mem.startsWith(u8, self.input[self.pos..], " TO")) break;
             self.pos += 1;
         }
@@ -794,4 +920,91 @@ test "query string: term range" {
     try testing.expectEqualStrings("title", filter.term_range.field);
     try testing.expectEqualStrings("alpha", filter.term_range.min.?);
     try testing.expectEqualStrings("omega", filter.term_range.max.?);
+}
+
+test "typed column routes equality to typed filters" {
+    // range / bool_field / date_range filters allocate nothing, so no cleanup.
+    const parser = QueryStringParser{ .typed_columns = &.{
+        .{ .name = "amount", .kind = .numeric },
+        .{ .name = "active", .kind = .boolean },
+        .{ .name = "ts", .kind = .datetime },
+    } };
+
+    const numeric = try parser.parse(testing.allocator, "amount:25");
+    try testing.expect(numeric == .range);
+    try testing.expectEqualStrings("amount", numeric.range.field);
+    try testing.expectEqual(@as(?f64, 25.0), numeric.range.min_val);
+    try testing.expectEqual(@as(?f64, 25.0), numeric.range.max_val);
+
+    const boolean = try parser.parse(testing.allocator, "active:true");
+    try testing.expect(boolean == .bool_field);
+    try testing.expectEqualStrings("active", boolean.bool_field.field);
+    try testing.expect(boolean.bool_field.value);
+
+    const datetime = try parser.parse(testing.allocator, "ts:1000");
+    try testing.expect(datetime == .date_range);
+    try testing.expectEqual(@as(?u64, 1000), datetime.date_range.start_ns);
+    try testing.expectEqual(@as(?u64, 1000), datetime.date_range.end_ns);
+}
+
+test "typed numeric column routes range to typed range filter" {
+    const parser = QueryStringParser{ .typed_columns = &.{
+        .{ .name = "amount", .kind = .numeric },
+    } };
+
+    // Inclusive range (matched delimiters). Note: mixed delimiters like
+    // "[10 TO 40}" are rejected by the underlying parseRange before routing is
+    // reached -- that is a pre-existing parser limitation, not specific to
+    // typed columns.
+    const filter = try parser.parse(testing.allocator, "amount:[10 TO 40]");
+    try testing.expect(filter == .range);
+    try testing.expectEqualStrings("amount", filter.range.field);
+    try testing.expectEqual(@as(?f64, 10.0), filter.range.min_val);
+    try testing.expectEqual(@as(?f64, 40.0), filter.range.max_val);
+    try testing.expect(filter.range.inclusive_min);
+    try testing.expect(filter.range.inclusive_max);
+}
+
+test "undeclared and non-typed columns keep term behaviour" {
+    const parser = QueryStringParser{ .typed_columns = &.{
+        .{ .name = "amount", .kind = .numeric },
+    } };
+
+    // Undeclared field stays a term filter.
+    const term = try parser.parse(testing.allocator, "title:hello");
+    try testing.expect(term == .term);
+
+    // Declared numeric column with a non-numeric value falls back to a term.
+    const fallback = try parser.parse(testing.allocator, "amount:abc");
+    try testing.expect(fallback == .term);
+
+    // No catalog at all: alphabetic range stays a term_range (unchanged).
+    const plain = QueryStringParser{};
+    const plain_range = try plain.parse(testing.allocator, "title:[alpha TO omega]");
+    try testing.expect(plain_range == .term_range);
+}
+
+test "query string: range delimiters are independent (Lucene)" {
+    const parser = QueryStringParser{};
+
+    // [ / ] inclusive, { / } exclusive; bounds independent, mixing allowed.
+    const incl_incl = try parser.parse(testing.allocator, "age:[10 TO 20]");
+    try testing.expect(incl_incl == .range);
+    try testing.expect(incl_incl.range.inclusive_min);
+    try testing.expect(incl_incl.range.inclusive_max);
+
+    const incl_excl = try parser.parse(testing.allocator, "age:[10 TO 20}");
+    try testing.expect(incl_excl == .range);
+    try testing.expect(incl_excl.range.inclusive_min);
+    try testing.expect(!incl_excl.range.inclusive_max);
+
+    const excl_incl = try parser.parse(testing.allocator, "age:{10 TO 20]");
+    try testing.expect(excl_incl == .range);
+    try testing.expect(!excl_incl.range.inclusive_min);
+    try testing.expect(excl_incl.range.inclusive_max);
+
+    const excl_excl = try parser.parse(testing.allocator, "age:{10 TO 20}");
+    try testing.expect(excl_excl == .range);
+    try testing.expect(!excl_excl.range.inclusive_min);
+    try testing.expect(!excl_excl.range.inclusive_max);
 }

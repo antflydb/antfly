@@ -62,6 +62,17 @@ pub const WriteIntent = struct {
     value: ?[]const u8, // null for deletes
 };
 
+pub const OwnedIntentMutation = struct {
+    key: []u8,
+    value: ?[]u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.key);
+        if (self.value) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
 pub const VersionPredicate = struct {
     key: []const u8,
     expected_version: u64, // 0 = key must not exist
@@ -96,6 +107,7 @@ pub const TxnSummary = struct {
 pub const ResolutionExtraBatch = struct {
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
+    skip_intent_keys: []const []const u8 = &.{},
 };
 
 const TxnRecord = struct {
@@ -307,6 +319,7 @@ pub const TxnManager = struct {
                 // Extract user key from intent key:
                 // intents_prefix(20) + txn_id(16) + ':'(1) + user_key
                 const user_key = entry.key[intents_prefix.len + 17 ..];
+                if (containsKey(extra_batch.skip_intent_keys, user_key)) continue;
 
                 if (entry.value.len > 0 and entry.value[0] == 1) {
                     // Delete — also remove the timestamp entry
@@ -383,6 +396,46 @@ pub const TxnManager = struct {
                 try upserts.append(alloc, owned_key);
             }
         }
+    }
+
+    pub fn collectIntentMutations(self: *TxnManager, alloc: Allocator, txn_id: TxnId) ![]OwnedIntentMutation {
+        var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
+        @memcpy(intent_prefix_buf[0..intents_prefix.len], intents_prefix);
+        @memcpy(intent_prefix_buf[intents_prefix.len..][0..16], &txn_id);
+        intent_prefix_buf[intents_prefix.len + 16] = ':';
+        const scan_prefix = intent_prefix_buf[0 .. intents_prefix.len + 17];
+
+        const intent_entries = try self.scanPrefix(alloc, scan_prefix);
+        defer backend_scan.freeResults(alloc, intent_entries);
+
+        var out = std.ArrayListUnmanaged(OwnedIntentMutation).empty;
+        errdefer {
+            for (out.items) |*item| item.deinit(alloc);
+            out.deinit(alloc);
+        }
+
+        for (intent_entries) |entry| {
+            const user_key = entry.key[intents_prefix.len + 17 ..];
+            const owned_key = try alloc.dupe(u8, user_key);
+            var owned_key_pending = true;
+            errdefer if (owned_key_pending) alloc.free(owned_key);
+            const owned_value = if (entry.value.len > 0 and entry.value[0] == 1)
+                null
+            else
+                try alloc.dupe(u8, if (entry.value.len > 1) entry.value[1..] else "");
+            var owned_value_pending = owned_value != null;
+            errdefer if (owned_value_pending) {
+                if (owned_value) |value| alloc.free(value);
+            };
+            try out.append(alloc, .{
+                .key = owned_key,
+                .value = owned_value,
+            });
+            owned_key_pending = false;
+            owned_value_pending = false;
+        }
+
+        return try out.toOwnedSlice(alloc);
     }
 
     /// Get the status of a transaction.
@@ -1054,6 +1107,13 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
     });
     defer alloc.free(path);
     return try alloc.dupeZ(u8, path);
+}
+
+fn containsKey(keys: []const []const u8, needle: []const u8) bool {
+    for (keys) |key| {
+        if (std.mem.eql(u8, key, needle)) return true;
+    }
+    return false;
 }
 
 // ============================================================================

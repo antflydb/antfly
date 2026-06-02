@@ -22,6 +22,7 @@ const common_secrets = @import("../../../common/secrets.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
 const replay_source_mod = @import("../derived/replay_source.zig");
 const derived_types = @import("../derived/derived_types.zig");
@@ -68,6 +69,7 @@ pub const Config = struct {
     sparse_embedder: ?embedder_mod.SparseEmbedder = null,
     asset_producer: ?asset_producer_mod.Producer = null,
     enable_without_producers: bool = false,
+    relational_base_rows: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
@@ -677,9 +679,9 @@ fn getOrCreateRequestChunks(
         }
     }
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => null,
     };
@@ -735,6 +737,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     fatal_error_count: u64 = 0,
     retrying: bool = false,
     worker_failed: bool = false,
+    relational_base_rows: bool = false,
     skip_by_hash_count: u64 = 0,
     codec_decode_failures: u64 = 0,
     embed_batches_started: u64 = 0,
@@ -780,12 +783,15 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .write_fn = write_fn,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
+            .relational_base_rows = config.relational_base_rows,
             .config = .{
+                .owner_id = config.owner_id,
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
                 .asset_producer = config.asset_producer,
                 .enable_without_producers = config.enable_without_producers,
+                .relational_base_rows = config.relational_base_rows,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
                 .clock = config.clock,
@@ -812,6 +818,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn setStatusHook(self: *@This(), hook: ?StatusHook) void {
         _ = self;
         _ = hook;
+    }
+
+    pub fn setRelationalBaseRows(self: *@This(), enabled: bool) void {
+        self.relational_base_rows = enabled;
     }
 
     pub fn notifySequence(self: *@This(), sequence: u64) void {
@@ -944,6 +954,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     fatal_error_count: u64 = 0,
     retrying: bool = false,
     worker_failed: bool = false,
+    relational_base_rows: std.atomic.Value(bool) = .init(false),
     skip_by_hash_count: u64 = 0,
     codec_decode_failures: u64 = 0,
     embed_batches_started: u64 = 0,
@@ -996,12 +1007,15 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .write_fn = write_fn,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
+            .relational_base_rows = .init(config.relational_base_rows),
             .config = .{
+                .owner_id = config.owner_id,
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
                 .asset_producer = config.asset_producer,
                 .enable_without_producers = config.enable_without_producers,
+                .relational_base_rows = config.relational_base_rows,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
                 .clock = config.clock,
@@ -1052,6 +1066,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.mutex.lockUncancelable(io);
         self.status_hook = hook;
         self.mutex.unlock(io);
+    }
+
+    pub fn setRelationalBaseRows(self: *EnrichmentRuntime, enabled: bool) void {
+        self.relational_base_rows.store(enabled, .monotonic);
     }
 
     fn notifyStatusHook(self: *EnrichmentRuntime) void {
@@ -1399,9 +1417,9 @@ fn processAsset(
     request: enrichment_types.GeneratedEnrichmentRequest,
     window: *GeneratedReplayWindow,
 ) !void {
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return,
     };
@@ -2073,8 +2091,10 @@ fn collectPlainDenseBatchItem(
     window: *GeneratedReplayWindow,
 ) !?PlainDenseBatchItem {
     const embedding_artifact_name = requestEmbeddingName(request);
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
+    // Relational tables read from the committed base-row keyspace. extractSourceText
+    // reads one typed column for source_field and materializes only for templates.
     const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return null,
@@ -2367,9 +2387,9 @@ fn getOrCreatePlannedRequests(
     const owned_doc_key = try runtime.alloc.dupe(u8, doc_key);
     errdefer runtime.alloc.free(owned_doc_key);
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => {
             const empty = try runtime.alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, 0);
@@ -2674,9 +2694,9 @@ fn processDenseEmbedding(
         return;
     }
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+    const raw = storeGetDocumentAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return,
     };
@@ -2796,8 +2816,10 @@ fn processSparseEmbedding(
         return;
     }
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
+    // Relational tables read from the committed base-row keyspace. extractSourceText
+    // reads one typed column for source_field and materializes only for templates.
     const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return,
@@ -3615,6 +3637,33 @@ fn storeGetAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
     return try runtime.alloc.dupe(u8, raw);
 }
 
+fn runtimeUsesRelationalBaseRows(runtime: *EnrichmentRuntime) bool {
+    return if (comptime builtin.os.tag == .freestanding)
+        runtime.relational_base_rows
+    else
+        runtime.relational_base_rows.load(.monotonic);
+}
+
+/// Read a DOCUMENT store value and materialize it as JSON. Relational tables
+/// read from the relational row keyspace and require a typed row there; there
+/// is no supported JSON blob fallback for this new storage mode.
+fn storeGetDocumentAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
+    const raw = try storeGetAlloc(runtime, key);
+    if (runtimeUsesRelationalBaseRows(runtime)) {
+        defer runtime.alloc.free(raw);
+        return try relational_row_codec.reconstructValueAlloc(runtime.alloc, raw);
+    }
+    return try relational_row_codec.materializeOwnedDocumentValueAlloc(runtime.alloc, raw);
+}
+
+fn documentSourceStoreKeyAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8) ![]u8 {
+    const relational_base_rows = runtimeUsesRelationalBaseRows(runtime);
+    return if (relational_base_rows)
+        try internal_keys.relationalRowKeyAlloc(runtime.alloc, doc_key)
+    else
+        try internal_keys.documentKeyAlloc(runtime.alloc, doc_key);
+}
+
 fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
@@ -3651,7 +3700,14 @@ fn remoteRenderConfig(
 
 /// Extract the source text for an enrichment request from a document.
 /// If the request has a source_template, renders the full document through the
-/// Handlebars template. Otherwise, extracts the single source_field from the JSON.
+/// Handlebars template. Otherwise, extracts the single source_field.
+///
+/// `raw_doc` is the value as stored: a JSON blob (document mode) or a serialized
+/// relational typed row. The single-field path takes Seam B — it reads just the
+/// requested column straight from the typed row via `findCellByPath`, skipping
+/// the full reconstruct-then-reparse. The template path needs the whole
+/// document, so the row is materialized to JSON first (Seam A). A document-mode
+/// blob takes the JSON paths directly.
 fn extractSourceText(
     alloc: Allocator,
     config: Config,
@@ -3659,11 +3715,13 @@ fn extractSourceText(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]const u8 {
     if (request.source_template.len > 0) {
-        // Render via Handlebars template
+        // Template needs the whole document: materialize a typed row to JSON.
+        const doc_json = try relational_row_codec.materializeDocumentValueAlloc(alloc, raw_doc);
+        defer alloc.free(doc_json);
         const rendered = template_remote.renderJsonToTextWithConfig(
             alloc,
             request.source_template,
-            raw_doc,
+            doc_json,
             remoteRenderConfig(config.secret_store, config.remote_content),
         ) catch return null;
         if (rendered.len == 0) {
@@ -3673,7 +3731,14 @@ fn extractSourceText(
         return rendered;
     }
 
-    // Fall back to single-field extraction
+    // Single-field path. Seam B: read just the column from a typed row.
+    if (try relational_row_codec.findCellByPath(raw_doc, request.source_field)) |cell| {
+        if (cell.value_type != .bytes_val or cell.is_json) return null;
+        return try alloc.dupe(u8, cell.value.bytes_val);
+    }
+    if (relational_row_codec.looksLikeRow(raw_doc)) return null; // row without that column
+
+    // Document-mode blob: extract the single source_field from the JSON.
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return null;
@@ -3720,10 +3785,13 @@ fn renderSourceParts(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
+    // Template rendering needs the whole document; materialize a typed row.
+    const doc_json = try relational_row_codec.materializeDocumentValueAlloc(alloc, raw_doc);
+    defer alloc.free(doc_json);
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
-        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content)) catch return null
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, doc_json, remoteRenderConfig(config.secret_store, config.remote_content)) catch return null
     else
-        template_remote.renderJsonToParts(alloc, request.source_template, raw_doc) catch return null;
+        template_remote.renderJsonToParts(alloc, request.source_template, doc_json) catch return null;
     if (parts.len == 0) {
         template.freeContentParts(alloc, parts);
         return null;
@@ -3846,6 +3914,47 @@ test "extractSourceText without template returns null for missing field" {
     };
     const result = try extractSourceText(alloc, .{}, doc, request);
     try std.testing.expect(result == null);
+}
+
+test "extractSourceText reads a single field straight from a typed row (Seam B)" {
+    const alloc = std.testing.allocator;
+    // A serialized relational typed row, not JSON. The single-field path must
+    // read the requested column directly without reconstructing the document.
+    const cells = [_]relational_row_codec.Cell{
+        .{ .path = "title", .value_type = .bytes_val, .value = .{ .bytes_val = "Hello" } },
+        .{ .path = "body", .value_type = .bytes_val, .value = .{ .bytes_val = "World" } },
+        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 12.5 } },
+    };
+    const row = try relational_row_codec.serialize(alloc, &cells);
+    defer alloc.free(row);
+
+    const request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "idx",
+        .doc_key = "doc:1",
+        .source_field = "body",
+    };
+    const result = try extractSourceText(alloc, .{}, row, request) orelse return error.TestUnexpectedResult;
+    defer alloc.free(result);
+    try std.testing.expectEqualStrings("World", result);
+
+    // A non-string column (numeric) is not valid source text -> null.
+    const numeric_request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "idx",
+        .doc_key = "doc:1",
+        .source_field = "amount",
+    };
+    try std.testing.expect((try extractSourceText(alloc, .{}, row, numeric_request)) == null);
+
+    // A column the row does not carry -> null.
+    const missing_request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "idx",
+        .doc_key = "doc:1",
+        .source_field = "nope",
+    };
+    try std.testing.expect((try extractSourceText(alloc, .{}, row, missing_request)) == null);
 }
 
 test "extractSourceText with template skips _embeddings field" {

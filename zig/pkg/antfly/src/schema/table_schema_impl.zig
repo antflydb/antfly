@@ -15,8 +15,20 @@
 const std = @import("std");
 const schema_regex = @import("antfly_regex");
 
+pub const StorageMode = enum {
+    document,
+    relational,
+
+    pub fn fromString(text: []const u8) ?StorageMode {
+        if (std.mem.eql(u8, text, "document")) return .document;
+        if (std.mem.eql(u8, text, "relational")) return .relational;
+        return null;
+    }
+};
+
 pub const TableSchema = struct {
     version: u32 = 0,
+    storage_mode: StorageMode = .document,
     default_type: []const u8 = "",
     ttl_duration_ns: u64 = 0,
     ttl_field: []const u8 = "_timestamp",
@@ -172,6 +184,8 @@ pub const DocumentProperty = struct {
     item: ?*DocumentProperty = null,
     unevaluated_items_allowed: ?bool = null,
     unevaluated_items_schema: ?*DocumentProperty = null,
+    embedded_schema: ?*DocumentProperty = null,
+    embedded_dynamic_templates: []DynamicTemplate = &.{},
 
     pub fn deinit(self: *DocumentProperty, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -253,6 +267,12 @@ pub const DocumentProperty = struct {
             unevaluated_items_schema.deinit(alloc);
             alloc.destroy(unevaluated_items_schema);
         }
+        if (self.embedded_schema) |embedded_schema| {
+            embedded_schema.deinit(alloc);
+            alloc.destroy(embedded_schema);
+        }
+        for (self.embedded_dynamic_templates) |*dynamic_template| dynamic_template.deinit(alloc);
+        if (self.embedded_dynamic_templates.len > 0) alloc.free(self.embedded_dynamic_templates);
         self.* = undefined;
     }
 };
@@ -373,6 +393,10 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     try validateSchemaValue(parsed.value);
+    var schema = try parseTableSchemaValue(alloc, parsed.value);
+    defer schema.deinit(alloc);
+    try validateParsedTtlSchema(schema);
+    try validateParsedRelationalSchema(schema);
     return try stringifyJsonValue(alloc, parsed.value);
 }
 
@@ -393,6 +417,7 @@ pub fn parseSchema(alloc: std.mem.Allocator, schema_json: []const u8) !TableSche
         owned.deinit(alloc);
     }
     try validateParsedTtlSchema(schema);
+    try validateParsedRelationalSchema(schema);
     return schema;
 }
 
@@ -603,6 +628,12 @@ fn validateSchemaValue(value: std.json.Value) !void {
     };
 
     if (root.get("version")) |version| if (version != .null) try validateNonNegativeInteger(version);
+    if (root.get("storage_mode")) |storage_mode| if (storage_mode != .null) switch (storage_mode) {
+        .string => |text| {
+            if (StorageMode.fromString(text) == null) return error.InvalidSchemaUpdateRequest;
+        },
+        else => return error.InvalidSchemaUpdateRequest,
+    };
     if (root.get("default_type")) |default_type| if (default_type != .null and default_type != .string) return error.InvalidSchemaUpdateRequest;
     if (root.get("ttl_duration_ns")) |ttl_duration_ns| if (ttl_duration_ns != .null) try validateNonNegativeInteger(ttl_duration_ns);
     if (root.get("ttl_field")) |ttl_field| if (ttl_field != .null) switch (ttl_field) {
@@ -673,6 +704,12 @@ fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.Objec
     }
     if (object.get("x-antfly-include-in-all")) |include_in_all| {
         if (include_in_all != .null) try validateAntflyIncludeInAllDefinition(include_in_all);
+    }
+    if (object.get("schema")) |embedded_schema| {
+        if (embedded_schema != .null) try validateDocumentSchemaDefinition(embedded_schema);
+    }
+    if (object.get("dynamic_templates")) |dynamic_templates| {
+        if (dynamic_templates != .null) try validateDynamicTemplates(dynamic_templates);
     }
     if (object.get("$defs")) |definitions| {
         if (definitions != .null) try validateDefinitionsDefinition(context, definitions);
@@ -1182,6 +1219,8 @@ fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]
         std.mem.eql(u8, schema_type_name, "numeric") or
         std.mem.eql(u8, schema_type_name, "boolean") or
         std.mem.eql(u8, schema_type_name, "datetime") or
+        std.mem.eql(u8, schema_type_name, "geopoint") or
+        std.mem.eql(u8, schema_type_name, "json") or
         std.mem.eql(u8, schema_type_name, "object") or
         std.mem.eql(u8, schema_type_name, "array"))
     {
@@ -1361,6 +1400,12 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("version")) |version| {
         if (version != .null) parsed.version = std.math.cast(u32, version.integer) orelse return error.InvalidSchemaUpdateRequest;
     }
+    if (root.get("storage_mode")) |storage_mode| {
+        if (storage_mode != .null) {
+            if (storage_mode != .string) return error.InvalidSchemaUpdateRequest;
+            parsed.storage_mode = StorageMode.fromString(storage_mode.string) orelse return error.InvalidSchemaUpdateRequest;
+        }
+    }
     if (root.get("default_type")) |default_type| {
         if (default_type != .null) {
             alloc.free(parsed.default_type);
@@ -1386,6 +1431,12 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("dynamic_templates")) |dynamic_templates| {
         if (dynamic_templates != .null) parsed.dynamic_templates = try parseDynamicTemplates(alloc, dynamic_templates);
     }
+    if (parsed.storage_mode == .relational) {
+        if (root.get("enforce_types")) |enforce_types| {
+            if (enforce_types != .null and !enforce_types.bool) return error.InvalidSchemaUpdateRequest;
+        }
+        parsed.enforce_types = true;
+    }
     return parsed;
 }
 
@@ -1401,6 +1452,88 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
             }
         }
     }
+}
+
+fn validateParsedRelationalSchema(schema: TableSchema) !void {
+    if (schema.storage_mode != .relational) return;
+    if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;
+    if (schema.dynamic_templates.len > 0) return error.InvalidSchemaUpdateRequest;
+    if (schema.document_schemas.len != 1) return error.InvalidSchemaUpdateRequest;
+
+    var relational_columns: usize = 0;
+    for (schema.document_schemas) |document_schema| {
+        if (document_schema.additional_properties_schema != null) return error.InvalidSchemaUpdateRequest;
+        if (document_schema.additional_properties_allowed orelse false) return error.InvalidSchemaUpdateRequest;
+        if (document_schema.pattern_properties.len > 0) return error.InvalidSchemaUpdateRequest;
+        if (document_schema.dynamic_infer_types) return error.InvalidSchemaUpdateRequest;
+
+        for (document_schema.properties) |property| {
+            try validateRelationalEmbeddedJsonProperty(property);
+            if (isRelationalStorageProperty(property)) relational_columns += 1;
+        }
+    }
+
+    if (relational_columns == 0) return error.InvalidSchemaUpdateRequest;
+}
+
+fn validateRelationalEmbeddedJsonProperty(property: DocumentProperty) !void {
+    const has_embedded_document_config = property.embedded_schema != null or property.embedded_dynamic_templates.len > 0;
+    if (has_embedded_document_config and !isExplicitJsonProperty(property)) return error.InvalidSchemaUpdateRequest;
+
+    if (property.embedded_schema) |embedded_schema| try validateRelationalEmbeddedJsonProperty(embedded_schema.*);
+    if (property.item) |item| try validateRelationalEmbeddedJsonProperty(item.*);
+    for (property.properties) |child| try validateRelationalEmbeddedJsonProperty(child);
+    for (property.prefix_items) |child| try validateRelationalEmbeddedJsonProperty(child);
+    for (property.pattern_properties) |child| try validateRelationalEmbeddedJsonProperty(child.property.*);
+    if (property.additional_properties_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    if (property.unevaluated_properties_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    if (property.unevaluated_items_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    for (property.dependent_schemas) |dependent| try validateRelationalEmbeddedJsonProperty(dependent.schema.*);
+    for (property.any_of) |child| try validateRelationalEmbeddedJsonProperty(child);
+    for (property.one_of) |child| try validateRelationalEmbeddedJsonProperty(child);
+    for (property.all_of) |child| try validateRelationalEmbeddedJsonProperty(child);
+    if (property.not_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    if (property.if_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    if (property.then_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    if (property.else_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    if (property.contains_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+}
+
+fn isExplicitJsonProperty(property: DocumentProperty) bool {
+    const field_type = property.field_type orelse return false;
+    return std.mem.eql(u8, field_type, "json");
+}
+
+fn isRelationalStorageProperty(property: DocumentProperty) bool {
+    if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "embedding")) return false;
+        if (std.mem.eql(u8, field_type, "keyword") or
+            std.mem.eql(u8, field_type, "link") or
+            std.mem.eql(u8, field_type, "string") or
+            std.mem.eql(u8, field_type, "text") or
+            std.mem.eql(u8, field_type, "html") or
+            std.mem.eql(u8, field_type, "search_as_you_type") or
+            std.mem.eql(u8, field_type, "boolean") or
+            std.mem.eql(u8, field_type, "datetime") or
+            std.mem.eql(u8, field_type, "integer") or
+            std.mem.eql(u8, field_type, "numeric") or
+            std.mem.eql(u8, field_type, "number") or
+            std.mem.eql(u8, field_type, "geopoint") or
+            std.mem.eql(u8, field_type, "geoshape") or
+            std.mem.eql(u8, field_type, "blob") or
+            std.mem.eql(u8, field_type, "json") or
+            std.mem.eql(u8, field_type, "object") or
+            std.mem.eql(u8, field_type, "array")) return true;
+        return property.integer_only;
+    }
+    if (property.integer_only) return true;
+    if (property.properties.len > 0 or
+        property.item != null or
+        (property.additional_properties_allowed orelse false) or
+        property.additional_properties_schema != null or
+        property.pattern_properties.len > 0 or
+        property.dynamic_infer_types) return true;
+    return property.const_value != null or property.enum_values.len > 0;
 }
 
 fn parseDocumentSchemas(alloc: std.mem.Allocator, value: std.json.Value) ![]DocumentSchema {
@@ -1686,6 +1819,27 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         for (include_in_all_fields) |field_name| alloc.free(field_name);
         if (include_in_all_fields.len > 0) alloc.free(include_in_all_fields);
     }
+    const embedded_schema = if (object.get("schema")) |schema_value| blk: {
+        if (schema_value == .null) break :blk null;
+        if (schema_value != .object) return error.InvalidSchemaUpdateRequest;
+        const embedded_context: SchemaContext = .{
+            .document_root = schema_value.object,
+            .scope_schema = schema_value.object,
+        };
+        break :blk try parseAnonymousProperty(alloc, embedded_context, schema_value.object);
+    } else null;
+    errdefer if (embedded_schema) |owned| {
+        owned.deinit(alloc);
+        alloc.destroy(owned);
+    };
+    const embedded_dynamic_templates: []DynamicTemplate = if (object.get("dynamic_templates")) |dynamic_templates|
+        if (dynamic_templates == .null) &[_]DynamicTemplate{} else try parseDynamicTemplates(alloc, dynamic_templates)
+    else
+        &[_]DynamicTemplate{};
+    errdefer {
+        for (embedded_dynamic_templates) |*dynamic_template| dynamic_template.deinit(alloc);
+        if (embedded_dynamic_templates.len > 0) alloc.free(embedded_dynamic_templates);
+    }
     const prefix_items: []DocumentProperty = if (object.get("prefixItems")) |prefix_items_value|
         if (prefix_items_value == .array) try parsePropertyVariants(alloc, context, prefix_items_value.array) else &[_]DocumentProperty{}
     else
@@ -1959,6 +2113,8 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .item = item,
         .unevaluated_items_allowed = unevaluated_items_allowed,
         .unevaluated_items_schema = unevaluated_items_schema,
+        .embedded_schema = embedded_schema,
+        .embedded_dynamic_templates = embedded_dynamic_templates,
     };
     if (property.dynamic_infer_types and (!(property.additional_properties_allowed orelse false) or property.additional_properties_schema != null)) {
         return error.InvalidSchemaUpdateRequest;
@@ -3386,6 +3542,32 @@ test "parse schema and validate document writes" {
     try std.testing.expectError(
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"title\":\"alpha\",\"body\":\"unexpected\"}" }}),
+    );
+}
+
+test "relational embedded document schema is scoped to explicit json columns" {
+    var parsed = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"attrs\":{\"type\":\"json\",\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true},\"dynamic_templates\":{\"metrics\":{\"path_match\":\"metrics.*\",\"mapping\":{\"type\":\"numeric\"}}}}},\"required\":[\"id\"],\"additionalProperties\":false}}}}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(StorageMode.relational, parsed.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), parsed.document_schemas[0].properties[1].embedded_dynamic_templates.len);
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\",\"schema\":{\"type\":\"object\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"attrs\":{\"type\":\"object\",\"dynamic_templates\":{\"metrics\":{\"path_match\":\"metrics.*\",\"mapping\":{\"type\":\"numeric\"}}}}},\"required\":[\"id\"],\"additionalProperties\":false}}}}",
+        ),
     );
 }
 

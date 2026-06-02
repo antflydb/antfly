@@ -16,6 +16,7 @@ pub const token = @import("token.zig");
 pub const value = @import("value.zig");
 pub const algebra = @import("algebra.zig");
 pub const law = @import("law.zig");
+pub const hll = @import("hll.zig");
 pub const fact = @import("fact.zig");
 pub const pathfact = @import("pathfact.zig");
 pub const lexical = @import("lexical.zig");
@@ -30,6 +31,7 @@ pub const ir = @import("ir.zig");
 pub const index = @import("index.zig");
 pub const planner = @import("planner.zig");
 pub const schema_capability = @import("schema_capability.zig");
+pub const relational_row_codec = @import("relational_row_codec.zig");
 pub const symbol = @import("symbol.zig");
 
 test {
@@ -51,5 +53,6 @@ test {
     _ = index;
     _ = planner;
     _ = schema_capability;
+    _ = relational_row_codec;
     _ = symbol;
 }

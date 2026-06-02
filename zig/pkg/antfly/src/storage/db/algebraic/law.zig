@@ -16,6 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const algebra = @import("algebra.zig");
 const token = @import("token.zig");
+const hll = @import("hll.zig");
 
 pub const Structure = enum {
     monoid,
@@ -36,6 +37,7 @@ pub const Id = enum {
     set_union,
     max_timestamp,
     provenance_semiring,
+    hll,
 
     pub fn parse(text: []const u8) ?Id {
         inline for (std.meta.fields(Id)) |field| {
@@ -66,6 +68,9 @@ pub fn descriptor(id: Id) Descriptor {
         .set_union => .{ .id = id, .structure = .lattice, .invertible = false },
         .max_timestamp => .{ .id = id, .structure = .lattice, .invertible = false },
         .provenance_semiring => .{ .id = id, .structure = .semiring, .invertible = false },
+        // HyperLogLog sketches union via register-wise max: a join-semilattice
+        // that cannot be inverted, and whose merge is approximate (not exact).
+        .hll => .{ .id = id, .structure = .lattice, .invertible = false, .support_required_for_delete = true, .exact_merge = false },
     };
 }
 
@@ -87,7 +92,8 @@ pub fn identityAlloc(alloc: Allocator, id: Id) ![]u8 {
         .bool_any => try alloc.dupe(u8, "false"),
         .bool_all => try alloc.dupe(u8, "true"),
         .set_union, .provenance_semiring => try token.canonicalTupleAlloc(alloc, &.{}),
-        .min, .max, .max_timestamp => try alloc.dupe(u8, ""),
+        // An empty payload is the HLL identity (an absent / all-zero sketch).
+        .min, .max, .max_timestamp, .hll => try alloc.dupe(u8, ""),
     };
 }
 
@@ -118,6 +124,7 @@ pub fn combineAlloc(alloc: Allocator, id: Id, left: ?[]const u8, right: ?[]const
         .bool_all => try boolFoldAlloc(alloc, true, left, right),
         .max_timestamp => try lexicalMaxAlloc(alloc, left, right),
         .set_union, .provenance_semiring => try tupleUnionAlloc(alloc, left, right),
+        .hll => try hllUnionAlloc(alloc, left, right),
     };
 }
 
@@ -159,6 +166,15 @@ fn lexicalMaxAlloc(alloc: Allocator, left: ?[]const u8, right: ?[]const u8) !?[]
     if (left == null) return if (right) |bytes| try alloc.dupe(u8, bytes) else null;
     if (right == null) return try alloc.dupe(u8, left.?);
     return try alloc.dupe(u8, if (std.mem.order(u8, left.?, right.?) == .lt) right.? else left.?);
+}
+
+fn hllUnionAlloc(alloc: Allocator, left: ?[]const u8, right: ?[]const u8) !?[]u8 {
+    // Empty payloads are the identity sketch; normalize them to null so the
+    // union of two absent sketches stays absent.
+    const lhs = if (left) |bytes| (if (bytes.len == 0) null else bytes) else null;
+    const rhs = if (right) |bytes| (if (bytes.len == 0) null else bytes) else null;
+    if (lhs == null and rhs == null) return null;
+    return try hll.mergeEncodedAlloc(alloc, lhs, rhs);
 }
 
 fn tupleUnionAlloc(alloc: Allocator, left: ?[]const u8, right: ?[]const u8) !?[]u8 {
@@ -275,4 +291,36 @@ test "law multiplies provenance semiring payloads explicitly" {
     try std.testing.expectEqualStrings("customer:c1", parts[0]);
     try std.testing.expectEqualStrings("order:o1", parts[1]);
     try std.testing.expectError(error.AlgebraicLawNotSemiring, multiplyAlloc(alloc, .sum, "2", "3"));
+}
+
+test "hll law unions sketches as an idempotent, non-invertible lattice" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(Structure.lattice, descriptor(.hll).structure);
+    try std.testing.expect(!descriptor(.hll).invertible);
+    try std.testing.expect(!descriptor(.hll).exact_merge);
+
+    const identity = try identityAlloc(alloc, .hll);
+    defer alloc.free(identity);
+    try std.testing.expectEqual(@as(usize, 0), identity.len);
+
+    // Build two single-value sketches and union them through the law.
+    const a = try hll.singletonEncodedAlloc(alloc, hll.default_precision, "alpha");
+    defer alloc.free(a);
+    const b = try hll.singletonEncodedAlloc(alloc, hll.default_precision, "beta");
+    defer alloc.free(b);
+
+    const union_ab = (try combineAlloc(alloc, .hll, a, b)).?;
+    defer alloc.free(union_ab);
+    try std.testing.expectEqual(@as(u64, 2), try hll.estimateEncoded(union_ab));
+
+    // Identity element leaves the sketch unchanged, and the union is idempotent.
+    const with_identity = (try combineAlloc(alloc, .hll, union_ab, identity)).?;
+    defer alloc.free(with_identity);
+    try std.testing.expectEqualSlices(u8, union_ab, with_identity);
+
+    const again = (try combineAlloc(alloc, .hll, union_ab, union_ab)).?;
+    defer alloc.free(again);
+    try std.testing.expectEqualSlices(u8, union_ab, again);
+
+    try std.testing.expectError(error.AlgebraicLawNotInvertible, invertAlloc(alloc, .hll, union_ab));
 }

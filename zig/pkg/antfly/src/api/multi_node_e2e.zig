@@ -437,7 +437,12 @@ const PublicApiStatusSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
-        const table = api_tables.deriveTableRecord(table_name, req);
+        var normalized_req = req;
+        const indexes_json = req.indexes_json orelse api_tables.default_indexes_json;
+        const prepared_indexes_json = try api_tables.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, api_tables.effectiveSchemaJson(req.schema_json));
+        defer alloc.free(prepared_indexes_json);
+        normalized_req.indexes_json = prepared_indexes_json;
+        const table = api_tables.deriveTableRecord(table_name, normalized_req);
         _ = try workflow.createTable(&self.node, table, api_tables.deriveInitialRange(table));
     }
 

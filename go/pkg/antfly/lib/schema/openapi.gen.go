@@ -24,6 +24,7 @@ const (
 	AntflyTypeGeopoint        AntflyType = "geopoint"
 	AntflyTypeGeoshape        AntflyType = "geoshape"
 	AntflyTypeHtml            AntflyType = "html"
+	AntflyTypeJson            AntflyType = "json"
 	AntflyTypeKeyword         AntflyType = "keyword"
 	AntflyTypeLink            AntflyType = "link"
 	AntflyTypeNumeric         AntflyType = "numeric"
@@ -38,6 +39,12 @@ const (
 	DynamicTemplateMatchMappingTypeNumber  DynamicTemplateMatchMappingType = "number"
 	DynamicTemplateMatchMappingTypeObject  DynamicTemplateMatchMappingType = "object"
 	DynamicTemplateMatchMappingTypeString  DynamicTemplateMatchMappingType = "string"
+)
+
+// Defines values for TableSchemaStorageMode.
+const (
+	TableSchemaStorageModeDocument   TableSchemaStorageMode = "document"
+	TableSchemaStorageModeRelational TableSchemaStorageMode = "relational"
 )
 
 // AntflyType Field type annotations for schema fields
@@ -101,6 +108,16 @@ type TableSchema struct {
 	// If false, documents not matching any type will be accepted but not indexed.
 	EnforceTypes bool `json:"enforce_types,omitempty,omitzero"`
 
+	// StorageMode Storage profile for the table.
+	// - "document" (default): schemaless JSON documents with optional,
+	//   soft schema validation. All indexes are derived from the document.
+	// - "relational": required closed schema with typed columns. Documents
+	//   must match a declared type; declared scalar properties are stored
+	//   as typed columns for columnar predicate pushdown and aggregation.
+	//   A field typed "json" stores a subtree that is still indexed like a
+	//   document. Implies enforce_types and closed document types.
+	StorageMode TableSchemaStorageMode `json:"storage_mode,omitempty,omitzero"`
+
 	// TtlDuration The duration after which documents should expire, based on the ttl_field timestamp (optional).
 	// Uses Go duration format (e.g., '24h', '7d', '168h').
 	TtlDuration string `json:"ttl_duration,omitempty,omitzero"`
@@ -112,6 +129,9 @@ type TableSchema struct {
 	// Version Version of the schema. Used for migrations.
 	Version uint32 `json:"version,omitempty,omitzero"`
 }
+
+// TableSchemaStorageMode Storage profile for the table.
+type TableSchemaStorageMode string
 
 // TemplateFieldMapping Field mapping to apply when a dynamic template matches
 type TemplateFieldMapping struct {

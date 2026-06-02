@@ -296,6 +296,25 @@ pub const TypedDocValuesReader = struct {
         return found.chunk_data[val_off] != 0;
     }
 
+    /// Get a single bytes value for a doc. Caller owns the returned slice.
+    /// Bytes are variable-length ([len: u32 LE][bytes] per doc), so the value
+    /// offset is found by walking past `pos` preceding entries rather than a
+    /// fixed stride.
+    pub fn getBytes(self: *const TypedDocValuesReader, doc_id: u32) !?[]u8 {
+        const found = try self.findDoc(doc_id) orelse return null;
+        defer self.alloc.free(found.chunk_data);
+        const num_docs = std.mem.readInt(u32, found.chunk_data[0..4], .little);
+        var off: usize = 4 + @as(usize, num_docs) * 4;
+        var i: u32 = 0;
+        while (i < found.pos) : (i += 1) {
+            const len = std.mem.readInt(u32, found.chunk_data[off..][0..4], .little);
+            off += 4 + @as(usize, len);
+        }
+        const len = std.mem.readInt(u32, found.chunk_data[off..][0..4], .little);
+        const start = off + 4;
+        return try self.alloc.dupe(u8, found.chunk_data[start .. start + @as(usize, len)]);
+    }
+
     /// Read all u64 values in a chunk. Caller owns returned slice.
     pub fn readU64Chunk(self: *const TypedDocValuesReader, chunk_idx: u32) ![]u64 {
         const chunk_data = try self.decompressChunk(chunk_idx);
@@ -480,15 +499,22 @@ test "typed doc values bytes round-trip" {
     defer writer.deinit();
 
     try writer.add(0, .{ .bytes_val = "hello" });
-    try writer.add(1, .{ .bytes_val = "world" });
+    try writer.add(1, .{ .bytes_val = "longer world value" });
 
     const data = try writer.build();
     defer alloc.free(data);
 
-    // Just verify it builds without error — bytes getters would need
-    // a separate API since they're variable length
     try std.testing.expect(data.len > 5);
     const reader = try TypedDocValuesReader.init(alloc, data);
     try std.testing.expectEqual(ValueType.bytes_val, reader.value_type);
     try std.testing.expectEqual(@as(u32, 1), reader.num_chunks);
+
+    // getBytes walks variable-length entries; verify both positions and a miss.
+    const v0 = (try reader.getBytes(0)).?;
+    defer alloc.free(v0);
+    try std.testing.expectEqualStrings("hello", v0);
+    const v1 = (try reader.getBytes(1)).?;
+    defer alloc.free(v1);
+    try std.testing.expectEqualStrings("longer world value", v1);
+    try std.testing.expect((try reader.getBytes(99)) == null);
 }

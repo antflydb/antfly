@@ -164,22 +164,13 @@ pub fn reconcileReplicaRootWithOptions(
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
         summary.dbs_opened += 1;
-        try applyTableSchemaJson(alloc, &db, table.schema_json);
+        try db.applyTableSchemaJson(alloc, table.schema_json, .{});
         const index_summary = try reconcileDbIndexes(alloc, &db, table.indexes_json);
         summary.indexes_removed += index_summary.indexes_removed;
         summary.indexes_added += index_summary.indexes_added;
         summary.enrichments_added += index_summary.enrichments_added;
     }
     return summary;
-}
-
-fn applyTableSchemaJson(alloc: std.mem.Allocator, db: *db_mod.DB, schema_json: []const u8) !void {
-    if (schema_json.len == 0) return;
-    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer @import("../storage/schema.zig").freeSchema(alloc, runtime_schema);
-    try db.setSchema(runtime_schema);
 }
 
 pub fn reconcileDbIndexes(
@@ -674,6 +665,7 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
     if (type_value != .string) return error.InvalidCreateTableRequest;
     if (std.mem.eql(u8, type_value.string, "full_text")) return .full_text;
     if (std.mem.eql(u8, type_value.string, "graph")) return .graph;
+    if (std.mem.eql(u8, type_value.string, "algebraic")) return .algebraic;
     if (std.mem.eql(u8, type_value.string, "embeddings")) {
         const sparse = if (value.object.get("sparse")) |sparse_value| switch (sparse_value) {
             .bool => sparse_value.bool,
@@ -686,10 +678,19 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
 
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {
     if (value != .object) return try alloc.dupe(u8, "{}");
-    switch (try parseIndexKind(value)) {
+    const kind = try parseIndexKind(value);
+    switch (kind) {
         .dense_vector, .sparse_vector => return try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, value),
         else => {},
     }
+
+    // Algebraic configs carry their own `version` field (config format version),
+    // which must be preserved -- unlike full-text, where `version` is the schema
+    // wrapper that gets stripped. `derive_from_schema` is also dropped here: by
+    // this point the marker should already be expanded into a concrete config,
+    // but stripping it defensively keeps an unexpanded marker from leaking into
+    // the stored config.
+    const is_algebraic = kind == .algebraic;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -700,8 +701,9 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
         if (std.mem.eql(u8, entry.key_ptr.*, "type") or
             std.mem.eql(u8, entry.key_ptr.*, "name") or
             std.mem.eql(u8, entry.key_ptr.*, "description") or
-            std.mem.eql(u8, entry.key_ptr.*, "version") or
-            std.mem.eql(u8, entry.key_ptr.*, "enrichments"))
+            std.mem.eql(u8, entry.key_ptr.*, "enrichments") or
+            (is_algebraic and std.mem.eql(u8, entry.key_ptr.*, "derive_from_schema")) or
+            (!is_algebraic and std.mem.eql(u8, entry.key_ptr.*, "version")))
         {
             continue;
         }
@@ -822,6 +824,100 @@ test "table provisioner materializes metadata indexes into hosted group dbs" {
     var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
     defer db.close();
     try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
+}
+
+test "table provisioner applies schema-derived algebraic reloads to hosted group dbs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-provisioner-algebraic-reload", .{tmp.sub_path});
+    defer alloc.free(replica_root);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+
+    const schema_v1 =
+        \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
+    ;
+    const seed_indexes = "{\"alg\":{\"type\":\"algebraic\",\"derive_from_schema\":true}}";
+    const indexes_v1 = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, "docs", seed_indexes, schema_v1);
+    defer alloc.free(indexes_v1);
+    const indexes_v2 = try tables_api.regenerateAlgebraicIndexesFromSchemaAlloc(alloc, "docs", indexes_v1, schema_v2);
+    defer alloc.free(indexes_v2);
+
+    const range = table_manager.RangeRecord{
+        .group_id = 2001,
+        .table_id = 7,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    };
+
+    _ = try reconcileReplicaRoot(
+        alloc,
+        replica_root,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = schema_v1,
+            .indexes_json = indexes_v1,
+        }},
+        &.{range},
+    );
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, replica_root, 2001);
+    defer alloc.free(db_path);
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{});
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:m", .value = "{\"old_field\":\"legacy\",\"new_field\":\"fresh\"}" }},
+            .timestamp_ns = 1,
+            .sync_level = .full_index,
+        });
+    }
+    try std.testing.expect(try groupDbHasAlgebraicDocFactScalarKeyContaining(alloc, db_path, "old_field"));
+
+    _ = try reconcileReplicaRoot(
+        alloc,
+        replica_root,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = schema_v2,
+            .indexes_json = indexes_v2,
+        }},
+        &.{range},
+    );
+
+    try std.testing.expect(!try groupDbHasAlgebraicDocFactScalarKeyContaining(alloc, db_path, "old_field"));
+    try std.testing.expect(try groupDbHasAlgebraicDocFactScalarKeyContaining(alloc, db_path, "new_field"));
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{});
+        defer db.close();
+        const alg = db.core.index_manager.algebraicIndex("alg") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqualStrings("current", alg.index.config().capability_lifecycle_status);
+    }
+}
+
+fn groupDbHasAlgebraicDocFactScalarKeyContaining(alloc: std.mem.Allocator, db_path: []const u8, needle: []const u8) !bool {
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+    const rows = try db.core.store.scanRange(alloc, "", "");
+    defer db_mod.docstore.DocStore.freeResults(alloc, rows);
+    for (rows) |row| {
+        if (std.mem.indexOf(u8, row.key, "docfact_scalar") != null and
+            std.mem.indexOf(u8, row.key, needle) != null) return true;
+    }
+    return false;
 }
 
 test "table provisioner restores local shard data from metadata restore intent" {

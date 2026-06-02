@@ -29,7 +29,6 @@ const transactions_mod = antfly.transactions;
 const aggregations_mod = db_mod.aggregations;
 const search_agg_mod = antfly.aggregation;
 const geo_mod = antfly.geo;
-const schema_mod = antfly.schema;
 const Allocator = std.mem.Allocator;
 
 fn monotonicNowNs() u64 {
@@ -2475,7 +2474,32 @@ pub export fn antfly_db_set_schema_json(
     schema_json: capi.Slice,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    const Request = struct {
+    const table_schema_json = schemaJsonForCapiSetSchemaAlloc(handle.alloc, schema_json.bytes()) catch |err| switch (err) {
+        error.OutOfMemory => return .internal,
+        else => return .invalid_argument,
+    };
+    defer handle.alloc.free(table_schema_json);
+
+    handle.db.applyTableSchemaJson(handle.alloc, table_schema_json, .{}) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+fn schemaJsonForCapiSetSchemaAlloc(alloc: Allocator, schema_json: []const u8) ![]u8 {
+    var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    defer parsed_value.deinit();
+    const root = switch (parsed_value.value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+
+    if (root.get("document_schemas") != null or root.get("storage_mode") != null) {
+        return try alloc.dupe(u8, schema_json);
+    }
+    if (root.get("dynamic_templates")) |templates| {
+        if (templates == .object) return try alloc.dupe(u8, schema_json);
+    }
+
+    const LegacyRequest = struct {
         version: u32 = 0,
         default_type: []const u8 = "_default",
         ttl_duration_ns: u64 = 0,
@@ -2495,68 +2519,72 @@ pub export fn antfly_db_set_schema_json(
             } = .{},
         } = &.{},
     };
+    var parsed_legacy = try std.json.parseFromSlice(LegacyRequest, alloc, schema_json, .{});
+    defer parsed_legacy.deinit();
 
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, schema_json.bytes(), .{}) catch return .invalid_argument;
-    defer parsed.deinit();
-
-    var templates = handle.alloc.alloc(schema_mod.DynamicTemplate, parsed.value.dynamic_templates.len) catch return .internal;
-    var initialized: usize = 0;
-    errdefer {
-        for (templates[0..initialized]) |tmpl| {
-            handle.alloc.free(tmpl.name);
-            if (tmpl.match_pattern) |value| handle.alloc.free(value);
-            if (tmpl.path_match) |value| handle.alloc.free(value);
-            handle.alloc.free(tmpl.mapping.analyzer);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"version\":");
+    try appendUnsignedJson(alloc, &out, parsed_legacy.value.version);
+    try out.appendSlice(alloc, ",\"default_type\":");
+    try appendJsonString(alloc, &out, parsed_legacy.value.default_type);
+    try out.appendSlice(alloc, ",\"ttl_duration_ns\":");
+    try appendUnsignedJson(alloc, &out, parsed_legacy.value.ttl_duration_ns);
+    try out.appendSlice(alloc, ",\"ttl_field\":");
+    try appendJsonString(alloc, &out, parsed_legacy.value.ttl_field);
+    try out.appendSlice(alloc, ",\"enforce_types\":");
+    try out.appendSlice(alloc, if (parsed_legacy.value.enforce_types) "true" else "false");
+    try out.appendSlice(alloc, ",\"dynamic_templates\":{");
+    for (parsed_legacy.value.dynamic_templates, 0..) |template, i| {
+        if (template.name.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (i > 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, template.name);
+        try out.appendSlice(alloc, ":{");
+        var field_count: usize = 0;
+        if (template.match_pattern) |pattern| {
+            try appendJsonObjectSeparator(alloc, &out, &field_count);
+            try out.appendSlice(alloc, "\"match\":");
+            try appendJsonString(alloc, &out, pattern);
         }
-        handle.alloc.free(templates);
+        if (template.path_match) |pattern| {
+            try appendJsonObjectSeparator(alloc, &out, &field_count);
+            try out.appendSlice(alloc, "\"path_match\":");
+            try appendJsonString(alloc, &out, pattern);
+        }
+        try appendJsonObjectSeparator(alloc, &out, &field_count);
+        try out.appendSlice(alloc, "\"mapping\":{\"type\":");
+        try appendJsonString(alloc, &out, template.mapping.field_type);
+        try out.appendSlice(alloc, ",\"index\":");
+        try out.appendSlice(alloc, if (template.mapping.do_index) "true" else "false");
+        try out.appendSlice(alloc, ",\"store\":");
+        try out.appendSlice(alloc, if (template.mapping.store) "true" else "false");
+        try out.appendSlice(alloc, ",\"doc_values\":");
+        try out.appendSlice(alloc, if (template.mapping.doc_values) "true" else "false");
+        try out.appendSlice(alloc, ",\"include_in_all\":");
+        try out.appendSlice(alloc, if (template.mapping.include_in_all) "true" else "false");
+        try out.appendSlice(alloc, ",\"analyzer\":");
+        try appendJsonString(alloc, &out, template.mapping.analyzer);
+        try out.appendSlice(alloc, "}}");
     }
-
-    for (parsed.value.dynamic_templates, 0..) |tmpl, i| {
-        const field_type = parseSchemaFieldType(tmpl.mapping.field_type) catch return .invalid_argument;
-        templates[i] = .{
-            .name = handle.alloc.dupe(u8, tmpl.name) catch return .internal,
-            .match_pattern = if (tmpl.match_pattern) |value| handle.alloc.dupe(u8, value) catch return .internal else null,
-            .path_match = if (tmpl.path_match) |value| handle.alloc.dupe(u8, value) catch return .internal else null,
-            .mapping = .{
-                .field_type = field_type,
-                .do_index = tmpl.mapping.do_index,
-                .store = tmpl.mapping.store,
-                .doc_values = tmpl.mapping.doc_values,
-                .include_in_all = tmpl.mapping.include_in_all,
-                .analyzer = handle.alloc.dupe(u8, tmpl.mapping.analyzer) catch return .internal,
-            },
-        };
-        initialized += 1;
-    }
-
-    const table_schema: schema_mod.TableSchema = .{
-        .version = parsed.value.version,
-        .default_type = handle.alloc.dupe(u8, parsed.value.default_type) catch return .internal,
-        .ttl_duration_ns = parsed.value.ttl_duration_ns,
-        .ttl_field = handle.alloc.dupe(u8, parsed.value.ttl_field) catch return .internal,
-        .enforce_types = parsed.value.enforce_types,
-        .dynamic_templates = templates,
-    };
-    defer schema_mod.freeSchema(handle.alloc, table_schema);
-
-    handle.db.setSchema(table_schema) catch |err| return capi.mapError(err);
-    return .ok;
+    try out.appendSlice(alloc, "}}");
+    return try out.toOwnedSlice(alloc);
 }
 
-fn parseSchemaFieldType(name: []const u8) !schema_mod.AntflyType {
-    if (std.mem.eql(u8, name, "text")) return .text;
-    if (std.mem.eql(u8, name, "keyword")) return .keyword;
-    if (std.mem.eql(u8, name, "numeric")) return .numeric;
-    if (std.mem.eql(u8, name, "embedding")) return .embedding;
-    if (std.mem.eql(u8, name, "link")) return .link;
-    if (std.mem.eql(u8, name, "boolean")) return .boolean;
-    if (std.mem.eql(u8, name, "datetime")) return .datetime;
-    if (std.mem.eql(u8, name, "geopoint")) return .geopoint;
-    if (std.mem.eql(u8, name, "geoshape")) return .geoshape;
-    if (std.mem.eql(u8, name, "blob")) return .blob;
-    if (std.mem.eql(u8, name, "html")) return .html;
-    if (std.mem.eql(u8, name, "search_as_you_type")) return .search_as_you_type;
-    return error.InvalidArgument;
+fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(escaped);
+    try out.appendSlice(alloc, escaped);
+}
+
+fn appendUnsignedJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: anytype) !void {
+    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+}
+
+fn appendJsonObjectSeparator(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), field_count: *usize) !void {
+    if (field_count.* > 0) try out.append(alloc, ',');
+    field_count.* += 1;
 }
 
 fn antflyDbExtractEnrichmentsJson(
@@ -5666,6 +5694,50 @@ test "capi batch and lookup json" {
     }, &out));
     defer antfly_db_buffer_free(out.ptr, out.len);
     try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"title\":\"ok\"") != null);
+}
+
+test "capi schema json uses table schema lifecycle" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "capi-schema-test");
+    defer alloc.free(path);
+    var handle_ptr: ?*anyopaque = null;
+    cleanupTestDir(path);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
+    defer cleanupTestDir(path);
+    defer antfly_db_close(handle_ptr);
+
+    const legacy_schema =
+        \\{
+        \\  "version": 7,
+        \\  "default_type": "doc",
+        \\  "dynamic_templates": [
+        \\    {
+        \\      "name": "ids",
+        \\      "match_pattern": "*_id",
+        \\      "mapping": {"field_type": "keyword", "doc_values": true}
+        \\    }
+        \\  ]
+        \\}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle_ptr, .{
+        .ptr = legacy_schema.ptr,
+        .len = legacy_schema.len,
+    }));
+
+    const handle = asHandle(handle_ptr).?;
+    const stored_schema_json = try handle.db.core.store.get(alloc, db_mod.local_schema_json_key);
+    defer alloc.free(stored_schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, stored_schema_json, "\"dynamic_templates\":{\"ids\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored_schema_json, "\"match\":\"*_id\"") != null);
+
+    const writes = [_]capi.WriteIntent{
+        .{
+            .key = .{ .ptr = "doc:capi-schema", .len = "doc:capi-schema".len },
+            .value = .{ .ptr = "{\"user_id\":\"u1\"}", .len = "{\"user_id\":\"u1\"}".len },
+            .is_delete = false,
+        },
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(handle_ptr, &writes, writes.len, null, 0, 1_000, 0));
 }
 
 test "capi execute graph queries honors identity read generation" {
