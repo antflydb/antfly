@@ -1805,8 +1805,10 @@ pub const Backend = struct {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
-        defer self.maintenance_job_in_flight = false;
-        _ = try self.runMaintenanceStepLocked();
+        errdefer self.maintenance_job_in_flight = false;
+        const progressed = try self.runMaintenanceStepLocked();
+        self.maintenance_job_in_flight = false;
+        if (progressed) self.scheduleMaintenanceJobIfNeededLocked();
     }
 
     fn deinitMaintenanceJob(_: *anyopaque) void {}
@@ -4224,6 +4226,97 @@ test "lsm backend schedules detached maintenance job for compaction debt" {
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
     try std.testing.expectEqualStrings("a", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:a"));
     try std.testing.expectEqualStrings("b", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
+}
+
+test "lsm backend detached maintenance jobs reschedule while debt remains" {
+    const FakeLane = struct {
+        submitted_jobs: [16]background_runtime_mod.Job = undefined,
+        submitted_count: usize = 0,
+
+        fn lane(self: *@This()) background_runtime_mod.DurableJobLane {
+            return .{
+                .ptr = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.submitted_count < self.submitted_jobs.len);
+            self.submitted_jobs[self.submitted_count] = job;
+            self.submitted_count += 1;
+        }
+
+        fn pop(self: *@This()) ?background_runtime_mod.Job {
+            if (self.submitted_count == 0) return null;
+            const job = self.submitted_jobs[0];
+            var i: usize = 1;
+            while (i < self.submitted_count) : (i += 1) {
+                self.submitted_jobs[i - 1] = self.submitted_jobs[i];
+            }
+            self.submitted_count -= 1;
+            return job;
+        }
+
+        fn drainOwner(_: *anyopaque, _: u64) void {}
+
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+
+        const vtable = background_runtime_mod.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drainOwner,
+            .poll = poll,
+        };
+    };
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var lane = FakeLane{};
+    const executor = BackgroundExecutor.initLane(lane.lane(), 783);
+    var backend = try Backend.open(std.testing.allocator, "/lsm-background-maintenance-reschedule-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .background_executor = &executor,
+    });
+    defer backend.close();
+
+    var key_buf: [16]u8 = undefined;
+    for (0..6) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "key:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, key, "value");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), lane.submitted_count);
+    try std.testing.expectEqual(@as(usize, 6), countLevelRuns(backend.runs.items, 0));
+
+    var first_job = lane.pop().?;
+    try first_job.run(first_job.ptr);
+    first_job.deinit(first_job.ptr);
+
+    try std.testing.expect(backend.maintenance_job_in_flight);
+    try std.testing.expect(backend.maintenanceScore() > 0);
+    try std.testing.expectEqual(@as(usize, 1), lane.submitted_count);
+
+    var drain_steps: usize = 0;
+    while (lane.pop()) |job_const| {
+        var job = job_const;
+        try job.run(job.ptr);
+        job.deinit(job.ptr);
+        drain_steps += 1;
+        try std.testing.expect(drain_steps < 16);
+    }
+
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expectEqual(@as(u64, 0), backend.maintenanceScore());
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
 }
 
 test "lsm backends share one threaded runtime durable lane" {

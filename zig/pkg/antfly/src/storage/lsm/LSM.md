@@ -422,6 +422,10 @@ Large-ingest guardrails:
      same work. The job runs a bounded maintenance step off the foreground path,
      so soft L0 debt can make progress without waiting for a later writer to
      call maintenance explicitly.
+   - [x] Continuation slice: a detached maintenance job that makes progress now
+     clears its in-flight bit and re-enters the same admission path while score
+     remains nonzero. Background LSM work therefore drains visible debt as a
+     sequence of bounded jobs instead of stopping after the first slice.
    - [x] Policy slice: scheduled maintenance now has a default-off
      `max_compaction_input_bytes` cap. Plan selection can skip oversized
      compactions and choose eligible smaller work instead of repeatedly
