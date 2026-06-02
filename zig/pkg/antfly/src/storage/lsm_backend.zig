@@ -1178,11 +1178,19 @@ pub const Backend = struct {
     pub fn acquireCompactionGrant(self: *Backend, work: anytype) ?compaction_scheduler_mod.Grant {
         const io_bytes = if (@hasField(@TypeOf(work), "io_bytes")) work.io_bytes else work.input_bytes;
         if (!self.canReserveMaintenanceIoBudget(io_bytes)) return null;
-        const grant = self.compaction_scheduler.tryAcquire(.{
+        var scheduler_work = compaction_scheduler_mod.Work{
             .score = work.score,
             .input_runs = work.input_runs,
             .input_bytes = work.input_bytes,
-        }, self.options.resource_manager) orelse return null;
+        };
+        if (@hasField(@TypeOf(work), "run_count") and @hasField(@TypeOf(work), "run_ids")) {
+            scheduler_work.run_count = work.run_count;
+            const copied_run_count = @min(work.run_count, scheduler_work.run_ids.len);
+            if (copied_run_count > 0) {
+                @memcpy(scheduler_work.run_ids[0..copied_run_count], work.run_ids[0..copied_run_count]);
+            }
+        }
+        const grant = self.compaction_scheduler.tryAcquire(scheduler_work, self.options.resource_manager) orelse return null;
         self.reserveMaintenanceIoBudgetAssumeAdmitted(io_bytes);
         return grant;
     }

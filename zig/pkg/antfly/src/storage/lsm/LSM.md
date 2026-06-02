@@ -410,6 +410,12 @@ Large-ingest guardrails:
      maintenance stats.
 6. [ ] Raise compaction concurrency only after the scheduler can prove selected
    jobs are non-overlapping or otherwise safe to run in parallel.
+   - [x] Safety gate slice: compaction work now carries the selected source
+     and target run IDs into the scheduler. The scheduler tracks in-flight run
+     IDs, denies overlapping candidates with `conflict_denials`, and admits
+     non-overlapping candidates when job and byte budgets allow. This does not
+     raise concurrency by itself, but it establishes the required admission
+     invariant before enabling parallel background compaction.
    - [x] Policy slice: scheduled maintenance now has a default-off
      `max_compaction_input_bytes` cap. Plan selection can skip oversized
      compactions and choose eligible smaller work instead of repeatedly

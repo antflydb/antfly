@@ -218,22 +218,41 @@ fn allowOversizedSingleCompactionInput(backend: anytype) bool {
     return backend.options.max_compaction_input_allow_oversized_single_job;
 }
 
-fn compactionWorkForPlan(runs: []const Run, plan: CompactionPlan, score: u64) struct { score: u64, input_runs: usize, input_bytes: u64, io_bytes: u64 } {
+fn compactionWorkForPlan(runs: []const Run, plan: CompactionPlan, score: u64) struct {
+    score: u64,
+    input_runs: usize,
+    input_bytes: u64,
+    io_bytes: u64,
+    run_ids: [max_remembered_compaction_run_ids]u64,
+    run_count: usize,
+} {
     var input_runs: usize = 0;
     var input_bytes: u64 = 0;
+    var run_ids: [max_remembered_compaction_run_ids]u64 = undefined;
+    var run_count: usize = 0;
     for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
         input_runs += 1;
         input_bytes +|= run.size_bytes;
+        if (run_count < run_ids.len) {
+            run_ids[run_count] = run.id;
+        }
+        run_count += 1;
     }
     for (runs[plan.target_start .. plan.target_start + plan.target_len]) |run| {
         input_runs += 1;
         input_bytes +|= run.size_bytes;
+        if (run_count < run_ids.len) {
+            run_ids[run_count] = run.id;
+        }
+        run_count += 1;
     }
     return .{
         .score = score,
         .input_runs = input_runs,
         .input_bytes = input_bytes,
         .io_bytes = input_bytes +| input_bytes,
+        .run_ids = run_ids,
+        .run_count = run_count,
     };
 }
 
