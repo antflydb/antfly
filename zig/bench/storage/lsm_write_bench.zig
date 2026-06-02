@@ -86,6 +86,7 @@ const ValuePattern = enum {
 const WorkloadSet = enum {
     all,
     hot_overwrite,
+    l0_pressure,
 };
 
 const KeySet = struct {
@@ -603,6 +604,26 @@ pub fn main(init: std.process.Init) !void {
                     }.run, random_keys, value);
                 }
 
+                if (cfg.workload_set == .l0_pressure) {
+                    var scenario = try Scenario.init(alloc, cfg, sample_index, storage_mode, batch_mode, "l0_pressure");
+                    defer scenario.deinit();
+
+                    try runTimed(out, &stdout_writer, &scenario, "load_l0_runs", keys.keys.len, struct {
+                        fn run(ctx: *Scenario, local_keys: []const []u8, local_value: []const u8) !void {
+                            try benchL0PressureLoad(ctx, local_keys, local_value);
+                        }
+                    }.run, keys.keys, value);
+
+                    if (cfg.hot_maintenance_steps > 0) {
+                        try runTimed(out, &stdout_writer, &scenario, "maintenance_l0", cfg.hot_maintenance_steps, struct {
+                            fn run(ctx: *Scenario, _: []const []u8, _: []const u8) !void {
+                                try benchMaintenance(ctx);
+                            }
+                        }.run, keys.keys, value);
+                    }
+                    continue;
+                }
+
                 {
                     const hot_len = @min(cfg.hot_keys, keys.keys.len);
                     var scenario = try Scenario.init(alloc, cfg, sample_index, storage_mode, batch_mode, "hot_overwrite");
@@ -705,6 +726,27 @@ fn benchSortedRunIngest(scenario: *Scenario, keys: []const []u8, value: []const 
         };
     }
     try scenario.backend.ingestSortedTableEntries(entries);
+}
+
+fn benchL0PressureLoad(scenario: *Scenario, keys: []const []u8, value: []const u8) !void {
+    const scratch = try scenario.allocator.alloc(u8, if (scenario.cfg.value_pattern == .keyed) scenario.cfg.value_size else 0);
+    defer scenario.allocator.free(scratch);
+
+    var start: usize = 0;
+    var op_index: usize = 0;
+    while (start < keys.len) {
+        const end = @min(start + scenario.cfg.batch_size, keys.len);
+        var txn = try scenario.backend.beginBatchWithOptions(.{ .mode = scenario.batch_mode });
+        errdefer txn.abort();
+        for (keys[start..end]) |key| {
+            const write_value = valueForWrite(scenario.cfg, value, scratch, key, op_index, 0x1357_9bdf);
+            try txn.put(bench_namespace, key, write_value);
+            op_index += 1;
+        }
+        try txn.commit();
+        try scenario.backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true });
+        start = end;
+    }
 }
 
 fn benchOverwrite(scenario: *Scenario, keys: []const []u8, value: []const u8) !void {

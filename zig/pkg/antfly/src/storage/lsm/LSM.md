@@ -153,6 +153,8 @@ Write path:
 
 - `zig build lsm-write-bench -- --samples 5 --keys 20000 --storage host --mode both > /tmp/lsm-write-before.jsonl`
 - `zig build lsm-write-bench-compare -- --before /tmp/lsm-write-before.jsonl --after /tmp/lsm-write-after.jsonl`
+- `zig build lsm-write-bench -- --samples 5 --keys 20000 --batch-size 100 --flush-threshold 100 --storage host --mode default --workload-set l0_pressure > /tmp/lsm-write-l0-before.jsonl`
+- `zig build lsm-write-bench-compare -- --before /tmp/lsm-write-l0-before.jsonl --after /tmp/lsm-write-l0-after.jsonl`
 - Add `--wal-sync-on-commit` when measuring WAL sync latency and retention
   behavior under durable commit pressure.
 - Add `--compact-threshold-runs`, `--l0-soft-limit-runs`,
@@ -351,6 +353,10 @@ Large-ingest guardrails:
      trigger/limit/background-IO policy knobs, and the comparator reports L0
      debt, level overflow, scheduler pressure, and background IO admission
      counters for before/after tuning.
+   - [x] L0-pressure benchmark slice: `lsm-write-bench --workload-set
+     l0_pressure` repeatedly flushes small batches into L0, then times bounded
+     maintenance separately so compaction trigger and write-stall policy changes
+     can be compared against real L0 debt.
    - [x] Max compaction input bytes now behaves like a target for scheduled L0
      maintenance: if no legal L0 compaction fits under the cap, the scheduler
      can admit the minimum oversized job so soft L0 debt does not get stuck
