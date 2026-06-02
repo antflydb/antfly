@@ -1207,6 +1207,10 @@ Core backend tests:
 5. Repeated open/close does not accumulate retained WAL indefinitely.
    - Drive several write / flush / reopen cycles.
    - Assert retained WAL bytes/segments stay bounded.
+   - [x] Backend coverage now drives repeated checkpointed write/reopen cycles,
+     asserts each clean reopen skips historical WAL replay, verifies retained
+     WAL bytes/segments return to zero after durable checkpoint, and confirms
+     all prior rows remain readable after the final reopen.
 
 Index-facing integration tests:
 

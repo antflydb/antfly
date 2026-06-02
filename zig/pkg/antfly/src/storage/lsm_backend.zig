@@ -4555,6 +4555,82 @@ test "lsm backend hard wal pressure forces foreground checkpoint on commit" {
     try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
 }
 
+test "lsm backend repeated checkpointed reopen cycles do not accumulate retained wal" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-repeated-checkpointed-reopen";
+    const options = Options{
+        .flush_threshold = 1024,
+        .storage = storage.storage(),
+        .wal_segment_bytes = 32,
+        .compact_threshold_runs = 100,
+    };
+
+    var cycle: usize = 0;
+    while (cycle < 3) : (cycle += 1) {
+        var backend = try Backend.open(std.testing.allocator, root_dir, options);
+        defer backend.close();
+
+        const open_stats = backend.snapshotOpenStats();
+        try std.testing.expectEqual(Backend.OpenPhase.ready, open_stats.phase);
+        try std.testing.expectEqual(@as(u64, 0), open_stats.wal_replay_records);
+        try std.testing.expectEqual(@as(u64, 0), open_stats.wal_replay_bytes);
+
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{cycle});
+        {
+            var txn = try backend.beginWrite();
+            defer txn.abort();
+            try txn.put(.{ .name = "docs" }, key, "value");
+            try txn.commit();
+        }
+
+        const before_checkpoint = backend.snapshotMaintenanceStats();
+        try std.testing.expect(before_checkpoint.wal_retained_segments > 0);
+        try std.testing.expect(before_checkpoint.wal_retained_bytes > 0);
+
+        try backend.checkpointWalAfterDurableBoundary();
+
+        const after_checkpoint = backend.snapshotMaintenanceStats();
+        try std.testing.expectEqual(@as(u64, 0), after_checkpoint.wal_retained_segments);
+        try std.testing.expectEqual(@as(u64, 0), after_checkpoint.wal_retained_bytes);
+        try std.testing.expectEqual(@as(u64, 0), after_checkpoint.wal_checkpoint_lag_segments);
+        try std.testing.expectEqual(@as(u64, 0), after_checkpoint.mutable_entries);
+        try std.testing.expectEqual(@as(u64, 0), after_checkpoint.immutable_memtables);
+
+        var read = try backend.beginRead();
+        defer read.abort();
+        var seen: usize = 0;
+        while (seen <= cycle) : (seen += 1) {
+            var seen_key_buf: [32]u8 = undefined;
+            const seen_key = try std.fmt.bufPrint(&seen_key_buf, "doc:{d}", .{seen});
+            try std.testing.expectEqualStrings("value", try read.get(.{ .name = "docs" }, seen_key));
+        }
+    }
+
+    var reopened = try Backend.open(std.testing.allocator, root_dir, options);
+    defer reopened.close();
+
+    const final_open = reopened.snapshotOpenStats();
+    try std.testing.expectEqual(Backend.OpenPhase.ready, final_open.phase);
+    try std.testing.expectEqual(@as(u64, 0), final_open.wal_replay_records);
+    try std.testing.expectEqual(@as(u64, 0), final_open.wal_replay_bytes);
+
+    const final_maintenance = reopened.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), final_maintenance.wal_retained_segments);
+    try std.testing.expectEqual(@as(u64, 0), final_maintenance.wal_retained_bytes);
+
+    var read = try reopened.beginRead();
+    defer read.abort();
+    cycle = 0;
+    while (cycle < 3) : (cycle += 1) {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{cycle});
+        try std.testing.expectEqualStrings("value", try read.get(.{ .name = "docs" }, key));
+    }
+}
+
 test "lsm backend byte flush window coalesces hot overwrites before run publication" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
