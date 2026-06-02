@@ -3743,6 +3743,8 @@ const PointRunCandidate = struct {
     run_index: usize,
 };
 
+const max_stack_point_run_candidates = 16;
+
 fn runIndicesUsePathBackedPointPrecheck(backend: anytype, runs: []Run, run_indices: []const usize) bool {
     for (run_indices) |run_index| {
         const run = &runs[run_index];
@@ -3791,6 +3793,41 @@ fn pathRunSurvivesPointPrecheck(
     return present;
 }
 
+fn readPointRunCandidate(
+    backend: anytype,
+    runs: []Run,
+    candidate: PointRunCandidate,
+    read_hint: *?BorrowedReadHint,
+    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    backend_locked: bool,
+    batch_run_indexes: ?*RunBatchIndexHandles,
+) !?[]const u8 {
+    const run = &runs[candidate.run_index];
+    if (backend.options.cache != null) {
+        const located = if (batch_run_indexes) |indexes|
+            try getFromRunWithBlockCacheBatch(backend, run, candidate.run_index, read_hint, held_blocks, namespace, key, true, indexes) orelse return null
+        else
+            try getFromRunWithBlockCache(backend, run, candidate.run_index, read_hint, held_blocks, namespace, key, true) orelse return null;
+        if (located.entry.tombstone) return error.NotFound;
+        read_hint.* = .{
+            .run_index = candidate.run_index,
+            .namespace_name = namespace.name,
+            .key = located.entry.key,
+            .entry_index = located.entry_index,
+        };
+        return located.entry.value;
+    }
+    if (try getFromRunWithLocalIndex(backend, run, held_values, value_allocator, namespace, key, backend_locked)) |value| {
+        read_hint.* = null;
+        return value;
+    }
+    return null;
+}
+
 fn getFromPathRunIndicesPrechecked(
     backend: anytype,
     runs: []Run,
@@ -3804,37 +3841,30 @@ fn getFromPathRunIndicesPrechecked(
     backend_locked: bool,
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) !?[]const u8 {
-    var candidates = std.ArrayListUnmanaged(PointRunCandidate).empty;
-    defer candidates.deinit(value_allocator);
+    var stack_candidates: [max_stack_point_run_candidates]PointRunCandidate = undefined;
+    var stack_candidate_len: usize = 0;
+    var overflow_candidates = std.ArrayListUnmanaged(PointRunCandidate).empty;
+    defer overflow_candidates.deinit(value_allocator);
 
     for (run_indices) |run_index| {
         backend.recordRunProbe();
         recordPointRunPrecheck(backend);
         if (!try pathRunSurvivesPointPrecheck(backend, &runs[run_index], run_index, namespace, key, backend_locked, batch_run_indexes)) continue;
-        try candidates.append(value_allocator, .{ .run_index = run_index });
+        if (stack_candidate_len < stack_candidates.len) {
+            stack_candidates[stack_candidate_len] = .{ .run_index = run_index };
+            stack_candidate_len += 1;
+        } else {
+            try overflow_candidates.append(value_allocator, .{ .run_index = run_index });
+        }
         recordPointRunPrecheckSurvivor(backend);
     }
 
-    for (candidates.items) |candidate| {
-        const run = &runs[candidate.run_index];
-        if (backend.options.cache != null) {
-            const located = if (batch_run_indexes) |indexes|
-                try getFromRunWithBlockCacheBatch(backend, run, candidate.run_index, read_hint, held_blocks, namespace, key, true, indexes) orelse continue
-            else
-                try getFromRunWithBlockCache(backend, run, candidate.run_index, read_hint, held_blocks, namespace, key, true) orelse continue;
-            if (located.entry.tombstone) return error.NotFound;
-            read_hint.* = .{
-                .run_index = candidate.run_index,
-                .namespace_name = namespace.name,
-                .key = located.entry.key,
-                .entry_index = located.entry_index,
-            };
-            return located.entry.value;
-        }
-        if (try getFromRunWithLocalIndex(backend, run, held_values, value_allocator, namespace, key, backend_locked)) |value| {
-            read_hint.* = null;
-            return value;
-        }
+    for (stack_candidates[0..stack_candidate_len]) |candidate| {
+        if (try readPointRunCandidate(backend, runs, candidate, read_hint, held_blocks, held_values, value_allocator, namespace, key, backend_locked, batch_run_indexes)) |value| return value;
+    }
+
+    for (overflow_candidates.items) |candidate| {
+        if (try readPointRunCandidate(backend, runs, candidate, read_hint, held_blocks, held_values, value_allocator, namespace, key, backend_locked, batch_run_indexes)) |value| return value;
     }
     return null;
 }

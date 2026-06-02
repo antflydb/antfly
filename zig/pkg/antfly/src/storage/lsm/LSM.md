@@ -266,6 +266,8 @@ Large-ingest guardrails:
      candidate runs using run bounds, run bloom, and table filter metadata
      before loading surviving blocks; `ReadStats` exposes precheck and survivor
      counters.
+   - [x] The precheck survivor list is stack-backed for the normal small
+     candidate set, with heap overflow only for unusually broad lookups.
 2. [ ] Issue concurrent block reads for surviving point-read candidates where
    precedence allows it.
    - L0/tombstone semantics require resolving by source order, not by first
