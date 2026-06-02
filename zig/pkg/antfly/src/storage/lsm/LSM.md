@@ -716,6 +716,12 @@ Task list:
      Tests cover executor installation and wake/drain of deferred immutable
      flush work through the owned threaded runtime; shared DB runtimes remain
      the default for DB-managed stores.
+   - [x] `BackendHandle` also has an opt-in dedicated internal flush worker.
+     The backend exposes a maintenance waker, deferred flush and maintenance
+     scheduling route to that worker when installed, and the worker drains
+     bounded maintenance steps until immutable flush/L0 debt is clean. Tests
+     cover wakeup, stop/join with a final drain, and soft L0 pressure
+     compaction through the handle-owned worker.
 9. [x] Add WAL-aware recovery and manifest checkpoints. Recovery should load
    durable runs from the manifest, replay WAL records after the last checkpoint
    into mutable/immutable memory state, and safely truncate or recycle WAL files
