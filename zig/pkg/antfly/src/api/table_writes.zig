@@ -8707,6 +8707,16 @@ fn removeOwnedBatchWriteByKey(
     }
 }
 
+fn findAccumulatedBatchWriteValue(
+    writes: []const db_mod.types.BatchWrite,
+    key: []const u8,
+) ?[]const u8 {
+    for (writes) |write| {
+        if (std.mem.eql(u8, write.key, key)) return write.value;
+    }
+    return null;
+}
+
 fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {
     for (shards) |shard| shard.deinit(alloc);
     alloc.free(@constCast(shards));
@@ -8729,8 +8739,10 @@ fn resolveWritesForSchemaValidation(
     }
 
     for (transforms) |transform| {
-        const existing = try db.get(alloc, transform.key);
-        defer if (existing) |body| alloc.free(body);
+        const existing_from_request = findAccumulatedBatchWriteValue(writes.items, transform.key);
+        const existing_from_db = if (existing_from_request == null) try db.get(alloc, transform.key) else null;
+        defer if (existing_from_db) |body| alloc.free(body);
+        const existing = existing_from_request orelse existing_from_db;
         const resolved = db_mod.transform.resolveDocumentTransform(alloc, existing, transform) catch |err| switch (err) {
             error.InvalidArgument => return error.InvalidBatchRequest,
             else => return err,
@@ -12064,6 +12076,46 @@ test "bound table write source rejects invalid batch transforms against persiste
             },
         }},
     }));
+}
+
+test "bound table write source validates transforms against same-batch writes" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-table-batch-transform-same-request-schema";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+
+    var source = BoundTableWriteSource.init("docs", &db);
+    var req = tables_api.CreateTableRequest{
+        .schema_json = try alloc.dupe(u8, "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"aliases\":{\"type\":\"keyword\"}}}}}}"),
+    };
+    defer req.deinit(alloc);
+    _ = try source.source().createTable(alloc, "docs", req);
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"curated\"}" }},
+        .transforms = &.{.{
+            .key = "doc:a",
+            .upsert = true,
+            .operations = &.{
+                .{ .op = .set_on_insert, .path = "body", .value_json = "\"would-be-invalid-on-insert\"" },
+                .{ .op = .add_to_set, .path = "aliases", .value_json = "\"alpha\"" },
+            },
+        }},
+    });
+
+    const stored = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"title\":\"curated\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "would-be-invalid-on-insert") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"aliases\":[\"alpha\"]") != null);
 }
 
 test "bound table write source derives ttl timestamps from ttl_field values" {
